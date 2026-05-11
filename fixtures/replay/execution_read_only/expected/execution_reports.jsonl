@@ -1,0 +1,1 @@
+{"schema_version":"1.0.0","report_id":"report:plan:risk:trans:01","plan_id":"plan:risk:trans:01","generated_at":"2026-01-01T00:00:05Z","status":"NotDispatched","leg_reports":[{"plan_leg_id":"pleg:plan:risk:trans:01:0001","status":"Skipped","source_event_refs":["event:sim:plan:risk:trans:01:0001:read-only"]}],"fills":[],"failures":[],"reconciliation_status":"NotStarted"}

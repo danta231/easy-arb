@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/incident.schema.json",
+  "title": "Incident",
+  "description": "Operational incident record. 中文：事故记录，用于无前端运行时的告警、处置和复盘。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "incident_id",
+    "severity",
+    "status",
+    "opened_at",
+    "trigger",
+    "source_event_refs",
+    "impacted",
+    "automatic_actions",
+    "manual_actions"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "incident_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "severity": {
+      "enum": [
+        "SEV0",
+        "SEV1",
+        "SEV2",
+        "SEV3"
+      ]
+    },
+    "status": {
+      "enum": [
+        "Open",
+        "Mitigating",
+        "Resolved",
+        "PostmortemRequired",
+        "Closed"
+      ]
+    },
+    "opened_at": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "closed_at": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "trigger": {
+      "$ref": "common.defs.schema.json#/$defs/ReasonCode"
+    },
+    "source_event_refs": {
+      "type": "array",
+      "description": "Event IDs that triggered or evidenced the incident. 中文：触发或证明事故的事件 ID，用于运营追溯。",
+      "minItems": 1,
+      "items": {
+        "$ref": "common.defs.schema.json#/$defs/Identifier"
+      },
+      "uniqueItems": true
+    },
+    "impacted": {
+      "$ref": "#/$defs/ImpactedScope"
+    },
+    "automatic_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/IncidentAction"
+      }
+    },
+    "manual_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/IncidentAction"
+      }
+    },
+    "root_cause": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "corrective_action": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "prevention_action": {
+      "type": "string",
+      "maxLength": 2048
+    }
+  },
+  "$defs": {
+    "ImpactedScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "venue_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "common.defs.schema.json#/$defs/Identifier"
+          },
+          "uniqueItems": true
+        },
+        "strategy_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "common.defs.schema.json#/$defs/Identifier"
+          },
+          "uniqueItems": true
+        },
+        "capital_at_risk_usd": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        }
+      }
+    },
+    "IncidentAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "action_type",
+        "timestamp"
+      ],
+      "properties": {
+        "action_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "action_type": {
+          "enum": [
+            "KillSwitchActivated",
+            "TradingPaused",
+            "VenueDisabled",
+            "StrategyDisabled",
+            "ManualReview",
+            "ReconciliationStarted",
+            "NotificationSent"
+          ]
+        },
+        "timestamp": {
+          "$ref": "common.defs.schema.json#/$defs/DateTime"
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    }
+  }
+}

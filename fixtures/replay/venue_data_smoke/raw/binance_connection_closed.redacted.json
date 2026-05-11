@@ -1,0 +1,7 @@
+{
+  "type": "connection_closed",
+  "venue": "venue:BINANCE_PUBLIC",
+  "observed_at": "2026-01-01T00:00:10Z",
+  "reason": "fixture websocket closed before next public ticker update",
+  "redacted_note": "transport metadata only; no credentials or account data"
+}

@@ -1,0 +1,4 @@
+strategy_id: "strat:demo"
+strategy_version: "1.0.0"
+code_version: "code:demo-1"
+中文说明: "未知状态事故 fixture 使用固定策略标识用于运营查询。"

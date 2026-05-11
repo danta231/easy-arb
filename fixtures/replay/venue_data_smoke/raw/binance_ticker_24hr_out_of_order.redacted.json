@@ -1,0 +1,12 @@
+{
+  "symbol": "BTCUSDT",
+  "lastPrice": "43180.00",
+  "bidPrice": "43179.90",
+  "bidQty": "1.000",
+  "askPrice": "43180.20",
+  "askQty": "0.700",
+  "closeTime": 1767225599000,
+  "lastId": 900099,
+  "count": 41,
+  "redacted_note": "negative fixture: sequence is lower than the already ingested sample"
+}

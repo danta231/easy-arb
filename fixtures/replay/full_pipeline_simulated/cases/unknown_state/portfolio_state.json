@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0.0",
+  "portfolio_state_id": "state:full-pipeline-unknown-state-01",
+  "as_of": "2026-01-01T00:00:00Z",
+  "source_event_refs": [
+    "event:venue-data:binance-public:BTCUSDT:900100:normalized"
+  ],
+  "balances": [
+    {
+      "balance_id": "bal:full-pipeline-usdc",
+      "asset_id": "asset:USDC",
+      "account_id": "acct:sim",
+      "custody_location_id": "custody:sim",
+      "free": "1000.000000",
+      "locked": "0",
+      "reserved": "0",
+      "pending": "0",
+      "borrowed": "0",
+      "lent": "0",
+      "unsettled": "0"
+    }
+  ],
+  "positions": [
+    {
+      "position_id": "pos:full-pipeline-btc-usdc",
+      "instrument_id": "inst:BTC-USDC",
+      "account_id": "acct:sim",
+      "quantity": "0.001",
+      "entry_price": "43100.00",
+      "mark_price": "43187.50",
+      "unrealized_pnl": "0.09"
+    }
+  ],
+  "reservations": [],
+  "open_orders": [],
+  "pending_transfers": [],
+  "confidence": 1,
+  "missing_data_flags": [
+    "UNKNOWN_STATE"
+  ],
+  "state_hash": "hash:portfolio:full-pipeline-unknown-state-01"
+}

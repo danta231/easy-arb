@@ -1,0 +1,38 @@
+{
+  "ledger_entry_id": "ledger:adjustment:01",
+  "journal_entry_id": "journal:adjustment:01",
+  "schema_version": "1.0.0",
+  "timestamp": "2026-01-01T00:00:08Z",
+  "namespace": "Adjustment",
+  "entry_type": "ManualAdjustment",
+  "source_event_id": "event:adjustment:01",
+  "idempotency_key": "idem:ledger:adjustment:01",
+  "strategy_id": "strat:demo",
+  "opportunity_id": "trans:01",
+  "execution_plan_id": "plan:01",
+  "adjustment_of": "ledger:01",
+  "adjustment_reason_code": "FEE_RECLASS",
+  "legs": [
+    {
+      "leg_id": "ledleg:adjustment:01",
+      "account_id": "acct:sim",
+      "asset_id": "asset:USDC",
+      "direction": "Debit",
+      "amount": "1.25",
+      "memo": "fee reclassification"
+    },
+    {
+      "leg_id": "ledleg:adjustment:02",
+      "account_id": "acct:adjustment-clearing",
+      "asset_id": "asset:USDC",
+      "direction": "Credit",
+      "amount": "1.25",
+      "memo": "fee reclassification"
+    }
+  ],
+  "balance_assertion": {
+    "balanced": true,
+    "assertion_hash": "hash:assertion:adjustment:0001",
+    "checked_by": "fixture"
+  }
+}

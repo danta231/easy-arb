@@ -1,0 +1,21 @@
+{
+  "event_id": "event:01",
+  "event_type": "AuditEvent",
+  "event_version": "1.0.0",
+  "timestamp_event": "2026-01-01T00:00:00Z",
+  "timestamp_ingested": "2026-01-01T00:00:01Z",
+  "source": "fixture",
+  "sequence": 1,
+  "source_sequence": "fixture-1",
+  "correlation_id": "corr:01",
+  "causation_id": null,
+  "schema_version": "1.0.0",
+  "venue_id": null,
+  "instrument_id": null,
+  "strategy_id": null,
+  "portfolio_state_ref": "state:01",
+  "payload": {
+    "note": "offline fixture"
+  },
+  "checksum": "hash:event:000001"
+}

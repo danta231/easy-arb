@@ -1,0 +1,12 @@
+policy_version: "risk-policy:s5-02"
+policy_hash: "hash:risk-policy:s5-02"
+policy_signature_ref: "sigref:risk-policy-unsigned"
+max_portfolio_state_age_ms: 5000
+max_fee_usd: "2"
+max_slippage_usd: "5"
+max_gas_usd: "5"
+max_total_fee_slippage_usd: "5"
+min_liquidity_confidence: "0.80"
+min_margin_buffer_usd: "0"
+max_daily_loss_usd: "100"
+中文说明: "阶段 9 正向端到端 fixture 锁定默认风控版本，不读取真实外部状态。"

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/asset.schema.json",
+  "title": "Asset",
+  "description": "Canonical asset definition. 中文：资产的权威定义，覆盖 BTC、ETH、USDC、链上包装资产、质押衍生品和抵押品等。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "asset_id",
+    "canonical_symbol",
+    "decimal_precision",
+    "risk_group",
+    "settlement_properties"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "asset_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "canonical_symbol": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "chain_identifiers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ChainIdentifier"
+      }
+    },
+    "decimal_precision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 38,
+      "description": "Display or native decimal precision. 中文：资产原生或展示精度；金额计算仍应使用定点 decimal。"
+    },
+    "risk_group": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "settlement_properties": {
+      "$ref": "#/$defs/SettlementProperties"
+    }
+  },
+  "$defs": {
+    "ChainIdentifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chain_id",
+        "address"
+      ],
+      "properties": {
+        "chain_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "SettlementProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "settlement_kind",
+        "can_be_collateral"
+      ],
+      "properties": {
+        "settlement_kind": {
+          "enum": [
+            "OffChainLedger",
+            "OnChainFinality",
+            "BridgeFinality",
+            "InternalTreasury"
+          ]
+        },
+        "can_be_collateral": {
+          "type": "boolean"
+        },
+        "min_confirmations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "finality_risk_note": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Human-readable settlement risk note. 中文：结算风险说明，不能替代结构化风险字段。"
+        }
+      }
+    }
+  }
+}

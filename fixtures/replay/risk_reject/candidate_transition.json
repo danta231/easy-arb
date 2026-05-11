@@ -1,0 +1,83 @@
+{
+  "schema_version": "1.0.0",
+  "transition_id": "trans:01",
+  "strategy_id": "strat:demo",
+  "strategy_version": "1.0.0",
+  "code_version": "code:demo-1",
+  "config_version": "arb-config-v1",
+  "created_at": "2026-01-01T00:00:02Z",
+  "input_event_refs": [
+    "event:01"
+  ],
+  "current_portfolio_state_ref": "state:01",
+  "holding_period": {
+    "kind": "Instant"
+  },
+  "legs": [
+    {
+      "leg_id": "candleg:01",
+      "leg_type": "Trade",
+      "venue_id": "venue:SIM",
+      "instrument_id": "inst:BTC-USDC",
+      "account_id": "acct:sim",
+      "side": "Buy",
+      "asset_flows": [
+        {
+          "asset_id": "asset:USDC",
+          "direction": "Out",
+          "amount": "100.00",
+          "account_id": "acct:sim"
+        }
+      ],
+      "constraints": {
+        "max_slippage_bps": "5",
+        "post_only": false
+      },
+      "failure_modes": [
+        "NoOpFailure"
+      ]
+    }
+  ],
+  "expected_post_state_delta": {
+    "asset_flows": [],
+    "position_deltas": [
+      {
+        "instrument_id": "inst:BTC-USDC",
+        "account_id": "acct:sim",
+        "quantity_delta": "0.001"
+      }
+    ]
+  },
+  "expected_economics": {
+    "expected_profit_usd": "1.230000000000000001",
+    "expected_profit_bps": "12.345678901234567890",
+    "fee_estimate_usd": "0.10",
+    "slippage_estimate_usd": "2.00",
+    "confidence": 0.95
+  },
+  "required_capital": {
+    "asset_requirements": [
+      {
+        "asset_id": "asset:USDC",
+        "direction": "Out",
+        "amount": "100.00",
+        "account_id": "acct:sim"
+      }
+    ],
+    "recovery_buffer_usd": "1.00"
+  },
+  "failure_modes": [
+    "NoOpFailure"
+  ],
+  "risk_flags": [],
+  "assumptions": [
+    {
+      "assumption_id": "asm:01",
+      "statement": "Fixture assumes deterministic offline prices.",
+      "confidence": 0.9,
+      "source_event_refs": [
+        "event:01"
+      ]
+    }
+  ]
+}

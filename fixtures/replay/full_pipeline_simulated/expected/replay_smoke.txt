@@ -1,0 +1,8 @@
+fixture_name=full_pipeline_simulated
+fixed_time=2026-01-01T00:00:03Z
+random_seed=9001
+config_hash=sha256:90cfc0c2b09cb375989d5607caa3e731a27b79f1c8dcde2635bb29ffea197662
+event_count=1
+ordered_event_ids=event:full-pipeline-simulated:start
+event_hashes=sha256:dcbf8f6540b0d5a74836a5e5f1e05d68ff9a93c911b8b6f37011c754964ec46d
+deterministic_random_draws=5046132422293850633,8653989081163558615,16927772997476007940

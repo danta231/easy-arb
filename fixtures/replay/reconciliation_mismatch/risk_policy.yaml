@@ -1,0 +1,4 @@
+policy_version: "risk-policy:s7-reconciliation"
+policy_hash: "hash:risk-policy:s7-reconciliation"
+policy_signature_ref: "sigref:risk-policy-unsigned"
+中文说明: "阶段 7 对账差异 fixture 使用只读事实，不批准任何实盘动作。"

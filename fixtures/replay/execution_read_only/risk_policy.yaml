@@ -1,0 +1,4 @@
+policy_version: "risk-policy:s5-02"
+policy_hash: "hash:risk-policy:s5-02"
+policy_signature_ref: "sigref:risk-policy-unsigned"
+中文说明: "执行只读 fixture 复用已批准风控决策，不重新访问外部状态。"

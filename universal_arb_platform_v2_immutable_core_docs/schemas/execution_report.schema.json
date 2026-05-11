@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/execution_report.schema.json",
+  "title": "ExecutionReport",
+  "description": "Canonical report of what happened during execution. 中文：执行报告记录实际发生的事情，包括部分成交、失败、未知状态和对账结果。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "report_id",
+    "plan_id",
+    "generated_at",
+    "status",
+    "leg_reports",
+    "fills",
+    "failures",
+    "reconciliation_status"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "report_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "plan_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "generated_at": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "status": {
+      "enum": [
+        "NotDispatched",
+        "Simulated",
+        "Succeeded",
+        "PartiallySucceeded",
+        "Failed",
+        "UnknownState",
+        "ManualInterventionRequired"
+      ]
+    },
+    "leg_reports": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/LegReport"
+      }
+    },
+    "fills": {
+      "type": "array",
+      "items": {
+        "$ref": "fill.schema.json"
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExecutionFailure"
+      }
+    },
+    "reconciliation_status": {
+      "enum": [
+        "NotStarted",
+        "Matched",
+        "Mismatch",
+        "Pending",
+        "Unknown"
+      ]
+    }
+  },
+  "$defs": {
+    "LegReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_leg_id",
+        "status"
+      ],
+      "properties": {
+        "plan_leg_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "status": {
+          "enum": [
+            "Skipped",
+            "Simulated",
+            "Dispatched",
+            "Acknowledged",
+            "Filled",
+            "PartiallyFilled",
+            "Cancelled",
+            "Failed",
+            "Unknown"
+          ]
+        },
+        "source_event_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "common.defs.schema.json#/$defs/Identifier"
+          }
+        }
+      }
+    },
+    "ExecutionFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "failure_id",
+        "failure_type",
+        "severity"
+      ],
+      "properties": {
+        "failure_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "plan_leg_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "failure_type": {
+          "enum": [
+            "NoOpFailure",
+            "RetryableFailure",
+            "PartialFill",
+            "LateFill",
+            "DuplicateEvent",
+            "UnknownState",
+            "StuckTransaction",
+            "VenueOutage",
+            "RateLimit",
+            "ManualInterventionRequired"
+          ]
+        },
+        "severity": {
+          "enum": [
+            "Info",
+            "Warn",
+            "RiskCritical"
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    }
+  }
+}

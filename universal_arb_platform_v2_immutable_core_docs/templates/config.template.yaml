@@ -1,0 +1,79 @@
+# Universal Arb Platform config template
+# 中文：通用套利平台配置模板。配置本身必须版本化、可审计、可签名。
+
+platform:
+  architecture_version: "v2-immutable-core"
+  execution_mode: "ReadOnly"
+  environment: "dev"
+
+governance:
+  require_signed_config: true
+  require_audit_event_for_config_change: true
+  kill_switches:
+    global: false
+    venues: {}
+    strategies: {}
+    accounts: {}
+    instruments: {}
+    assets: {}
+    chains: {}
+    execution_modes: {}
+
+venues:
+  - schema_version: "venue-capability-v1"
+    venue_id: "example_hyperliquid_like"
+    venue_name: "Example Hyperliquid-like venue"
+    enabled: false
+    capability_version: "2026-05-10"
+    market_capabilities:
+      - ProvidesPerpetuals
+      - ProvidesSpotMarkets
+      - ProvidesOrderBookMarkets
+      - ProvidesFundingRates
+    execution_capabilities:
+      - SupportsLimitOrders
+      - SupportsReduceOnly
+      - SupportsPrivateOrderStream
+    auth_modes:
+      - WalletSignatureAuth
+    data_surfaces:
+      - RESTPolling
+      - WebSocketStreaming
+      - SequenceNumbers
+    settlement_modes:
+      - SelfCustodyWallet
+      - OnChainSettlement
+    permission_model:
+      can_read_public_data: true
+      can_read_private_data: false
+      can_trade: false
+      can_withdraw: false
+      requires_ip_binding: false
+    rate_limit_model:
+      unit: "Request"
+      limit: 0
+      window_ms: 60000
+      source: "adapter-config"
+    health_model:
+      freshness_threshold_ms: 5000
+      disconnect_threshold: 3
+      unknown_state_is_critical: true
+
+strategies:
+  - strategy_id: "example_funding_rate_arb"
+    enabled: false
+    allowed_execution_modes: ["ReadOnly", "Simulated"]
+    max_holding_period: "UntilFundingTimestamp"
+
+risk:
+  policy_version: "risk-policy-v1"
+  max_daily_loss_usd: "0"
+  require_fresh_market_data_ms: 5000
+  reject_on_unknown_state: true
+  reject_on_reconciliation_mismatch: true
+
+event_sinks:
+  - type: "jsonl"
+    path: "./events.jsonl"
+  - type: "csv_summary"
+    path: "./daily_summary.csv"

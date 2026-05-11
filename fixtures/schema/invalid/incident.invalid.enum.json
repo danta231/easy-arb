@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "incident_id": "incident:01",
+  "severity": "LOW",
+  "status": "Open",
+  "opened_at": "2026-01-01T00:00:08Z",
+  "trigger": "UNKNOWN_STATE",
+  "source_event_refs": [
+    "event:01"
+  ],
+  "impacted": {},
+  "automatic_actions": [],
+  "manual_actions": []
+}

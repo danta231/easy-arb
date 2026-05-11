@@ -1,0 +1,4 @@
+strategy_id: "strat:demo"
+strategy_version: "1.0.0"
+code_version: "code:demo-1"
+中文说明: "阶段 7 对账 fixture 使用固定策略标识用于事件追踪。"

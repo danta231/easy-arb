@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0.0",
+  "asset_id": "asset:BTC",
+  "canonical_symbol": "BTC",
+  "decimal_precision": 8,
+  "risk_group": "risk:MAJOR",
+  "settlement_properties": {
+    "settlement_kind": "OffChainLedger",
+    "can_be_collateral": true
+  },
+  "unexpected_field": "must fail"
+}

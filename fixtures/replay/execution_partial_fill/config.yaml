@@ -1,0 +1,10 @@
+config_version: "arb-config-v1"
+
+execution:
+  mode: "Simulated"
+  live_execution_enabled: false
+  auto_live_enabled: false
+
+signing:
+  policy_ref: "signing-policy/null-signer-v1"
+  real_signing_enabled: false

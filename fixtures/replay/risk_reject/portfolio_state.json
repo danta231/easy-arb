@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0.0",
+  "portfolio_state_id": "state:01",
+  "as_of": "2026-01-01T00:00:00Z",
+  "source_event_refs": [
+    "event:01"
+  ],
+  "balances": [
+    {
+      "balance_id": "bal:01",
+      "asset_id": "asset:USDC",
+      "account_id": "acct:sim",
+      "custody_location_id": "custody:sim",
+      "free": "1000.000000",
+      "locked": "0",
+      "reserved": "0",
+      "pending": "0",
+      "borrowed": "0",
+      "lent": "0",
+      "unsettled": "0"
+    }
+  ],
+  "positions": [
+    {
+      "position_id": "pos:01",
+      "instrument_id": "inst:BTC-USDC",
+      "account_id": "acct:sim",
+      "quantity": "0.001",
+      "entry_price": "50000.00",
+      "mark_price": "50100.00",
+      "unrealized_pnl": "0.10"
+    }
+  ],
+  "reservations": [],
+  "open_orders": [],
+  "pending_transfers": [],
+  "confidence": 1,
+  "missing_data_flags": [],
+  "state_hash": "hash:portfolio:0001"
+}

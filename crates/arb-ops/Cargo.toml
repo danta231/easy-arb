@@ -1,0 +1,12 @@
+[package]
+name = "arb-ops"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+arb-contracts = { path = "../arb-contracts" }
+arb-eventstore = { path = "../arb-eventstore" }
+arb-reconciliation = { path = "../arb-reconciliation" }

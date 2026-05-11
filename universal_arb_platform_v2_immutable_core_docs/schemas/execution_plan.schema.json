@@ -1,0 +1,359 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/execution_plan.schema.json",
+  "title": "ExecutionPlan",
+  "description": "Risk-approved executable plan built from a candidate transition. 中文：执行计划只能由风控批准后的候选转换生成，是唯一可以进入适配器/签名器的执行合同。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "transition_id",
+    "risk_decision_id",
+    "created_at",
+    "execution_mode",
+    "idempotency_key",
+    "legs",
+    "dependency_graph",
+    "constraints",
+    "timeout_policy",
+    "cancel_policy",
+    "hedge_policy",
+    "partial_fill_policy",
+    "failure_policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "plan_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "transition_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "risk_decision_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "created_at": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "execution_mode": {
+      "enum": [
+        "ReadOnly",
+        "Simulated",
+        "ManualApproval",
+        "GuardedLive",
+        "AutonomousLive"
+      ],
+      "description": "Permission mode, not a separate architecture. 中文：执行权限模式，不改变核心管线。"
+    },
+    "idempotency_key": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "approval_event_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "legs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/ExecutionLeg"
+      }
+    },
+    "dependency_graph": {
+      "$ref": "#/$defs/DependencyGraph"
+    },
+    "constraints": {
+      "$ref": "#/$defs/ExecutionConstraints"
+    },
+    "timeout_policy": {
+      "$ref": "#/$defs/TimeoutPolicy"
+    },
+    "cancel_policy": {
+      "$ref": "#/$defs/CancelPolicy"
+    },
+    "hedge_policy": {
+      "$ref": "#/$defs/HedgePolicy"
+    },
+    "partial_fill_policy": {
+      "$ref": "#/$defs/PartialFillPolicy"
+    },
+    "failure_policy": {
+      "$ref": "#/$defs/FailurePolicy"
+    }
+  },
+  "$defs": {
+    "ExecutionLeg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_leg_id",
+        "candidate_leg_id",
+        "action_type",
+        "account_id",
+        "idempotency_key",
+        "state",
+        "failure_semantics"
+      ],
+      "properties": {
+        "plan_leg_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "candidate_leg_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "action_type": {
+          "enum": [
+            "RecordOnly",
+            "SimulatedFill",
+            "PlaceOrder",
+            "CancelOrder",
+            "Transfer",
+            "SignTransaction",
+            "SubmitTransaction",
+            "Borrow",
+            "Lend",
+            "Repay",
+            "AdjustMargin",
+            "Hedge",
+            "ManualApprovalGate"
+          ],
+          "description": "Concrete executable action type. 中文：可执行动作类型；策略输出不得直接包含这些动作。"
+        },
+        "venue_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "instrument_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "account_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "client_order_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "idempotency_key": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "$ref": "common.defs.schema.json#/$defs/Identifier"
+          }
+        },
+        "expected_asset_flows": {
+          "type": "array",
+          "items": {
+            "$ref": "common.defs.schema.json#/$defs/AssetFlow"
+          }
+        },
+        "state": {
+          "$ref": "#/$defs/ExecutionLegState"
+        },
+        "failure_semantics": {
+          "$ref": "#/$defs/FailureSemantics"
+        },
+        "dispatch_after": {
+          "$ref": "common.defs.schema.json#/$defs/DateTime"
+        }
+      }
+    },
+    "ExecutionLegState": {
+      "enum": [
+        "Prepared",
+        "WaitingDependency",
+        "Ready",
+        "Dispatched",
+        "Acknowledged",
+        "PartiallyFilled",
+        "Filled",
+        "CancelRequested",
+        "Cancelled",
+        "Failed",
+        "Unknown",
+        "Compensating",
+        "Compensated"
+      ],
+      "description": "Leg state machine value. 中文：执行腿状态机值；Rust 应使用 enum 表达并限制非法状态迁移。"
+    },
+    "FailureSemantics": {
+      "enum": [
+        "NoOpFailure",
+        "RetryableFailure",
+        "PartialFill",
+        "LateFill",
+        "DuplicateEvent",
+        "UnknownState",
+        "StuckTransaction",
+        "VenueOutage",
+        "RateLimit",
+        "ManualInterventionRequired"
+      ]
+    },
+    "DependencyGraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "edges"
+      ],
+      "properties": {
+        "edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DependencyEdge"
+          }
+        }
+      }
+    },
+    "DependencyEdge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from_leg_id",
+        "to_leg_id",
+        "condition"
+      ],
+      "properties": {
+        "from_leg_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "to_leg_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "condition": {
+          "enum": [
+            "OnSuccess",
+            "OnAcknowledged",
+            "OnFilled",
+            "OnPartialFill",
+            "OnFailure",
+            "ManualRelease"
+          ]
+        }
+      }
+    },
+    "ExecutionConstraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_notional_usd": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "slippage_limit_bps": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "max_fee_usd": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "min_receive_amount": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "requires_fresh_market_data_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        }
+      }
+    },
+    "TimeoutPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_timeout_ms",
+        "leg_timeout_ms"
+      ],
+      "properties": {
+        "plan_timeout_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        },
+        "leg_timeout_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        },
+        "unknown_state_after_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        }
+      }
+    },
+    "CancelPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default_action"
+      ],
+      "properties": {
+        "default_action": {
+          "enum": [
+            "None",
+            "CancelOpenOrders",
+            "CancelAndHedgeResidual",
+            "ManualIntervention"
+          ]
+        }
+      }
+    },
+    "HedgePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "residual_exposure_action"
+      ],
+      "properties": {
+        "residual_exposure_action": {
+          "enum": [
+            "IgnoreBelowThreshold",
+            "HedgeImmediately",
+            "HedgeAfterTimeout",
+            "ManualIntervention"
+          ]
+        },
+        "threshold_usd": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        }
+      }
+    },
+    "PartialFillPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "ContinueIfWithinBounds",
+            "CancelRemainder",
+            "HedgeFilledPortion",
+            "ManualIntervention"
+          ]
+        },
+        "max_unhedged_usd": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        }
+      }
+    },
+    "FailurePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unknown_state_action",
+        "retry_limit"
+      ],
+      "properties": {
+        "unknown_state_action": {
+          "enum": [
+            "HaltAndIncident",
+            "ReconcileThenResume",
+            "ManualIntervention"
+          ],
+          "description": "Unknown state must never be treated as success. 中文：未知状态绝不能按成功处理。"
+        },
+        "retry_limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retry_backoff_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        }
+      }
+    }
+  }
+}

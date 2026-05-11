@@ -1,0 +1,10 @@
+[package]
+name = "arb-eventstore"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+arb-contracts = { path = "../arb-contracts" }

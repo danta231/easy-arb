@@ -1,0 +1,14 @@
+config_version: "arb-config-v1"
+
+execution:
+  mode: "ReadOnly"
+  live_execution_enabled: false
+  auto_live_enabled: false
+
+kill_switch:
+  global: false
+  execution: false
+
+signing:
+  policy_ref: "signing-policy/null-signer-v1"
+  real_signing_enabled: false

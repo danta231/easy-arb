@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0.0",
+  "venue_id": "venue:SIM",
+  "capability_version": "1.0.0",
+  "market_capabilities": [],
+  "execution_capabilities": [],
+  "auth_modes": [
+    "PublicOnly"
+  ],
+  "data_surfaces": [
+    "RESTPolling"
+  ],
+  "settlement_modes": [],
+  "permission_model": {
+    "can_withdraw": true
+  },
+  "rate_limit_model": {
+    "unit": "Request",
+    "limit": 60,
+    "window_ms": 60000
+  },
+  "health_model": {
+    "freshness_threshold_ms": 5000,
+    "disconnect_threshold": 3,
+    "unknown_state_is_critical": true
+  }
+}

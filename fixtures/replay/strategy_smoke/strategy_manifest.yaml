@@ -1,0 +1,5 @@
+strategy_manifest_version: "strategy-manifest-v1"
+strategy_id: "strat:sample-spot-demo"
+strategy_version: "1.0.0"
+code_version: "code:sample-spot-demo-1"
+entrypoint: "arb-strategies::sample_spot_strategy"

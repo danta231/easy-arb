@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0.0",
+  "report_id": "report:01",
+  "plan_id": "plan:01",
+  "generated_at": "2026-01-01T00:00:05Z",
+  "status": "Done",
+  "leg_reports": [],
+  "fills": [],
+  "failures": [],
+  "reconciliation_status": "NotStarted"
+}

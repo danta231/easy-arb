@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "instrument_id": "inst:BTC-USDC",
+  "venue_id": "venue:SIM",
+  "kind": "Spot",
+  "settlement_asset_id": "asset:USDC",
+  "pricing_properties": {},
+  "execution_model": {
+    "supports_live_execution": false
+  },
+  "failure_model": {
+    "unknown_state_is_critical": true
+  }
+}

@@ -1,0 +1,2 @@
+# 中文说明: 机会记录 CSV 模板；机器读取时请跳过以 # 开头的注释行，字段中文解释见 opportunity_record.README.md。
+timestamp,strategy_id,strategy_version,transition_id,holding_period,venue_ids,instrument_ids,expected_profit_usd,expected_profit_bps,expected_apr,required_capital_usd,risk_flags,decision,reason_codes,correlation_id

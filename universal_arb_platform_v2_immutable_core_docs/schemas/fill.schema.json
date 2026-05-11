@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/fill.schema.json",
+  "title": "Fill",
+  "description": "Canonical execution fill record. 中文：成交记录必须可追踪到执行计划、执行腿、场所订单和账本分录。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fill_id",
+    "plan_id",
+    "plan_leg_id",
+    "venue_id",
+    "instrument_id",
+    "timestamp",
+    "side",
+    "price",
+    "quantity",
+    "fee",
+    "source_event_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "fill_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "plan_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "plan_leg_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "venue_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "instrument_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "venue_order_id": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "client_order_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "timestamp": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "side": {
+      "enum": [
+        "Buy",
+        "Sell",
+        "Long",
+        "Short",
+        "Receive",
+        "Pay"
+      ]
+    },
+    "price": {
+      "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+    },
+    "quantity": {
+      "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+    },
+    "fee": {
+      "$ref": "common.defs.schema.json#/$defs/AssetFlow"
+    },
+    "source_event_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "ledger_entry_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    }
+  }
+}

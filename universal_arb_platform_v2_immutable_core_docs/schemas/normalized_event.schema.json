@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/normalized_event.schema.json",
+  "title": "NormalizedEvent",
+  "description": "Canonical event envelope for all important platform facts. 中文：所有关键事实的统一事件信封；Rust 实现应先解析信封，再按 event_type 解析 payload。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "timestamp_event",
+    "timestamp_ingested",
+    "source",
+    "correlation_id",
+    "schema_version",
+    "payload",
+    "checksum"
+  ],
+  "properties": {
+    "event_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "event_type": {
+      "enum": [
+        "RawMarketDataEvent",
+        "NormalizedMarketDataEvent",
+        "VenueHealthEvent",
+        "StrategySignalEvent",
+        "CandidateOpportunityEvent",
+        "StrategyRejectEvent",
+        "RiskDecisionEvent",
+        "CapitalReservationEvent",
+        "ApprovalEvent",
+        "ExecutionPlanEvent",
+        "ExecutionDispatchEvent",
+        "ExecutionReportEvent",
+        "FillEvent",
+        "TransferEvent",
+        "FundingEvent",
+        "FeeEvent",
+        "BalanceSnapshotEvent",
+        "PositionSnapshotEvent",
+        "LedgerEntryEvent",
+        "ReconciliationEvent",
+        "IncidentEvent",
+        "AuditEvent"
+      ],
+      "description": "Closed event category list for v2 immutable core. 中文：v2 不可变核心的事件类型枚举；新增类型需要 schema 版本升级。"
+    },
+    "event_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "timestamp_event": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "timestamp_ingested": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Producer name, adapter, service, or replay job. 中文：事件生产者名称，例如适配器、服务或回放任务。"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Global append sequence assigned by the event store. 中文：事件存储分配的全局追加序号，用于确定性回放排序。"
+    },
+    "source_sequence": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Venue or source native sequence number when available. 中文：交易场所或数据源原生序列号，用于断流恢复和去重。"
+    },
+    "correlation_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "causation_id": {
+      "oneOf": [
+        {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Immediate parent event id. 中文：直接导致当前事件的父事件 ID，可为空。"
+    },
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "venue_id": {
+      "oneOf": [
+        {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "instrument_id": {
+      "oneOf": [
+        {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "strategy_id": {
+      "oneOf": [
+        {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "portfolio_state_ref": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Event-specific payload validated by the event type schema. 中文：事件类型对应的业务载荷，应再由具体 payload schema 校验。",
+      "additionalProperties": true
+    },
+    "checksum": {
+      "$ref": "common.defs.schema.json#/$defs/HashString"
+    }
+  }
+}

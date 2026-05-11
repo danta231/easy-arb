@@ -1,0 +1,10 @@
+[package]
+name = "arb-strategies"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+arb-strategy-api = { path = "../arb-strategy-api" }

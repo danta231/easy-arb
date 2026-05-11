@@ -1,0 +1,12 @@
+[package]
+name = "arb-strategy-api"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+arb-config = { path = "../arb-config" }
+arb-contracts = { path = "../arb-contracts" }
+arb-domain = { path = "../arb-domain" }

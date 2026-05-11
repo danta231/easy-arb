@@ -1,0 +1,4 @@
+policy_version: "risk-policy:s7-incident"
+policy_hash: "hash:risk-policy:s7-incident"
+policy_signature_ref: "sigref:risk-policy-unsigned"
+中文说明: "未知状态必须风险关键处理，不能当作成功。"

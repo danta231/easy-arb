@@ -1,0 +1,12 @@
+{
+  "event_id": "event:01",
+  "event_type": "AuditEvent",
+  "event_version": "1.0.0",
+  "timestamp_event": "2026-01-01T00:00:00Z",
+  "timestamp_ingested": "2026-01-01T00:00:01Z",
+  "source": "fixture",
+  "correlation_id": "corr:01",
+  "schema_version": "1.0.0",
+  "payload": {},
+  "checksum": "short"
+}

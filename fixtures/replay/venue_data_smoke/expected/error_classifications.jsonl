@@ -1,0 +1,6 @@
+{"scenario":"disconnect","class":"Disconnected","reason_code":"VENUE_UNHEALTHY","fail_closed":true,"retryable":true}
+{"scenario":"reconnecting","class":"Reconnecting","reason_code":"VENUE_UNHEALTHY","fail_closed":true,"retryable":true}
+{"scenario":"rate_limit","class":"RateLimited","reason_code":"RATE_LIMITED","fail_closed":true,"retryable":true}
+{"scenario":"duplicate","class":"DuplicateMessage","reason_code":"DUPLICATE_MESSAGE","fail_closed":false,"retryable":true}
+{"scenario":"missing_field","class":"MissingField","reason_code":"REQUIRES_MORE_DATA","fail_closed":true,"retryable":false}
+{"scenario":"out_of_order","class":"OutOfOrderMessage","reason_code":"UNKNOWN_STATE","fail_closed":true,"retryable":false}

@@ -1,0 +1,22 @@
+[package]
+name = "arb-runtime"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+arb-config = { path = "../arb-config" }
+arb-contracts = { path = "../arb-contracts" }
+arb-domain = { path = "../arb-domain" }
+arb-eventstore = { path = "../arb-eventstore" }
+arb-execution = { path = "../arb-execution" }
+arb-ledger = { path = "../arb-ledger" }
+arb-ops = { path = "../arb-ops" }
+arb-reconciliation = { path = "../arb-reconciliation" }
+arb-replay = { path = "../arb-replay" }
+arb-risk = { path = "../arb-risk" }
+arb-strategies = { path = "../arb-strategies" }
+arb-strategy-api = { path = "../arb-strategy-api" }
+arb-venue-data = { path = "../arb-venue-data" }

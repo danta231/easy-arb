@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/risk_decision.schema.json",
+  "title": "RiskDecision",
+  "description": "Canonical pre-trade or post-trade risk decision. 中文：统一风控决策记录；必须能回答使用了哪个策略、哪个状态、哪些检查、哪些阈值和哪些约束。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision_id",
+    "transition_id",
+    "evaluated_at",
+    "decision",
+    "policy_version",
+    "policy_hash",
+    "policy_signature_ref",
+    "input_state_ref",
+    "checks",
+    "constraints",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "decision_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "transition_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "evaluated_at": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "decision": {
+      "enum": [
+        "Approved",
+        "ApprovedWithConstraints",
+        "Rejected",
+        "RequiresManualApproval",
+        "RequiresMoreData",
+        "SuspendedByCircuitBreaker"
+      ]
+    },
+    "policy_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "policy_hash": {
+      "$ref": "common.defs.schema.json#/$defs/HashString"
+    },
+    "policy_signature_ref": {
+      "$ref": "common.defs.schema.json#/$defs/SignatureRef"
+    },
+    "input_state_ref": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/RiskCheckResult"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RiskConstraint"
+      }
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "$ref": "common.defs.schema.json#/$defs/ReasonCode"
+      },
+      "uniqueItems": true,
+      "description": "Machine-readable reason codes. 中文：机器可读原因码；自由文本只能作为 detail 补充。"
+    },
+    "detail": {
+      "type": "string",
+      "maxLength": 2048,
+      "description": "Supplemental human-readable explanation. 中文：人可读补充说明，不作为自动化判断依据。"
+    }
+  },
+  "$defs": {
+    "RiskCheckResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "check_type",
+        "status",
+        "severity",
+        "reason_code"
+      ],
+      "properties": {
+        "check_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "check_type": {
+          "enum": [
+            "DataFreshness",
+            "VenueHealth",
+            "RateLimitState",
+            "LiquiditySufficiency",
+            "SlippageBounds",
+            "FeeAndGasInclusion",
+            "InventoryBounds",
+            "BalanceSufficiency",
+            "CapitalReservationAvailability",
+            "MarginSufficiency",
+            "LiquidationDistance",
+            "FundingRateUncertainty",
+            "BasisWideningRisk",
+            "OneLegExecutionRisk",
+            "ChainCongestion",
+            "NonceConflict",
+            "OpenOrderConflict",
+            "StrategyExposureLimit",
+            "DailyLossLimit",
+            "DrawdownLimit",
+            "CorrelationConcentrationLimit",
+            "ReconciliationCompleteness"
+          ]
+        },
+        "status": {
+          "enum": [
+            "Pass",
+            "Fail",
+            "Warning",
+            "Unknown",
+            "NotApplicable"
+          ]
+        },
+        "severity": {
+          "enum": [
+            "Info",
+            "Warn",
+            "Block",
+            "Critical"
+          ]
+        },
+        "threshold": {
+          "$ref": "#/$defs/MeasuredValue"
+        },
+        "observed": {
+          "$ref": "#/$defs/MeasuredValue"
+        },
+        "reason_code": {
+          "$ref": "common.defs.schema.json#/$defs/ReasonCode"
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    },
+    "MeasuredValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decimal_value": {
+          "$ref": "common.defs.schema.json#/$defs/DecimalString"
+        },
+        "string_value": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Measurement unit. 中文：度量单位，例如 ms、bps、USD、blocks。"
+        }
+      }
+    },
+    "RiskConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "constraint_id",
+        "constraint_type",
+        "field_path"
+      ],
+      "properties": {
+        "constraint_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "constraint_type": {
+          "enum": [
+            "MaxNotional",
+            "MaxSlippage",
+            "MaxFee",
+            "MinLiquidity",
+            "ExecutionModeLimit",
+            "RequiresManualApproval",
+            "ReduceHoldingPeriod",
+            "ForceHedge",
+            "DisableVenue",
+            "DisableStrategy"
+          ]
+        },
+        "field_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Path in the execution plan or transition constrained by risk. 中文：风控约束作用到候选转换或执行计划中的字段路径。"
+        },
+        "limit": {
+          "$ref": "#/$defs/MeasuredValue"
+        },
+        "expires_at": {
+          "$ref": "common.defs.schema.json#/$defs/DateTime"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+
+.idea/
+.vscode/
+
+target/
+
+*.log
+*.tmp
+*.rs.bk
+
+.env
+.env.*
+!.env.example

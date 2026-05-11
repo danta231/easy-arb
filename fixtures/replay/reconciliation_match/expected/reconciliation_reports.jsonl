@@ -1,0 +1,1 @@
+{"run_id":"recon:match","status":"Matched","checked_balances":2,"checked_positions":1,"checked_fills":1,"checked_ledger_entries":1,"checked_capital_reservations":1,"difference_count":0,"incident_suggestion_count":0,"source_event_refs":["event:recon:match:ledger","event:recon:match:balance","event:recon:match:result"]}

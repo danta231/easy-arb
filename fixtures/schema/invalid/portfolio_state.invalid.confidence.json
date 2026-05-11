@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "portfolio_state_id": "state:01",
+  "as_of": "2026-01-01T00:00:00Z",
+  "source_event_refs": [],
+  "balances": [],
+  "positions": [],
+  "reservations": [],
+  "open_orders": [],
+  "pending_transfers": [],
+  "confidence": 1.5,
+  "missing_data_flags": [],
+  "state_hash": "hash:portfolio:0001"
+}

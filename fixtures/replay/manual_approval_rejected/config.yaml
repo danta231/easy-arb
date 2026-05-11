@@ -1,0 +1,18 @@
+config_version: "arb-config-v1"
+execution:
+  mode: "ManualApproval"
+  live_execution_enabled: false
+  auto_live_enabled: false
+kill_switch:
+  global: false
+  execution: false
+  strategies: []
+  venues: []
+  accounts: []
+  instruments: []
+  assets: []
+  chains: []
+  execution_modes: []
+signing:
+  policy_ref: "signing-policy/null-signer-v1"
+  real_signing_enabled: false

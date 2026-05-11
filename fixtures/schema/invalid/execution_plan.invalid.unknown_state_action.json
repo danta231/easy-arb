@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0.0",
+  "plan_id": "plan:01",
+  "transition_id": "trans:01",
+  "risk_decision_id": "risk:01",
+  "created_at": "2026-01-01T00:00:04Z",
+  "execution_mode": "ReadOnly",
+  "idempotency_key": "idem:plan:01",
+  "legs": [
+    {
+      "plan_leg_id": "pleg:01",
+      "candidate_leg_id": "candleg:01",
+      "action_type": "RecordOnly",
+      "account_id": "acct:sim",
+      "idempotency_key": "idem:leg:01",
+      "state": "Prepared",
+      "failure_semantics": "NoOpFailure"
+    }
+  ],
+  "dependency_graph": {
+    "edges": []
+  },
+  "constraints": {},
+  "timeout_policy": {
+    "plan_timeout_ms": 1000,
+    "leg_timeout_ms": 500
+  },
+  "cancel_policy": {
+    "default_action": "None"
+  },
+  "hedge_policy": {
+    "residual_exposure_action": "ManualIntervention"
+  },
+  "partial_fill_policy": {
+    "action": "ManualIntervention"
+  },
+  "failure_policy": {
+    "unknown_state_action": "TreatAsSuccess",
+    "retry_limit": 0
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0.0",
+  "transition_id": "trans:01",
+  "strategy_id": "strat:demo",
+  "strategy_version": "1.0.0",
+  "code_version": "code:demo-1",
+  "config_version": "cfg:demo-1",
+  "created_at": "2026-01-01T00:00:02Z",
+  "input_event_refs": [
+    "event:01"
+  ],
+  "current_portfolio_state_ref": "state:01",
+  "holding_period": {
+    "kind": "Instant"
+  },
+  "legs": [
+    {
+      "leg_id": "candleg:01",
+      "leg_type": "Trade",
+      "asset_flows": [],
+      "constraints": {},
+      "failure_modes": [
+        "NoOpFailure"
+      ]
+    }
+  ],
+  "expected_post_state_delta": {
+    "asset_flows": [],
+    "position_deltas": []
+  },
+  "expected_economics": {
+    "expected_profit_usd": 1.23,
+    "expected_profit_bps": "12.0",
+    "fee_estimate_usd": "0.10",
+    "slippage_estimate_usd": "0.05",
+    "confidence": 0.95
+  },
+  "required_capital": {
+    "asset_requirements": [],
+    "recovery_buffer_usd": "1.00"
+  },
+  "failure_modes": [
+    "NoOpFailure"
+  ],
+  "risk_flags": [],
+  "assumptions": [
+    {
+      "assumption_id": "asm:01",
+      "statement": "Fixture assumes deterministic offline prices.",
+      "confidence": 0.9
+    }
+  ]
+}

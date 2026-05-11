@@ -1,0 +1,11 @@
+[package]
+name = "arb-signing"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+real-signing = []
+
+[dependencies]
+arb-domain = { path = "../arb-domain" }

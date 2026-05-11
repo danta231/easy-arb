@@ -1,0 +1,4 @@
+[alias]
+xtask = "run -p xtask --"
+replay-full-pipeline = "run -p arb-runtime -- replay fixtures/replay/full_pipeline_simulated"
+health-full-pipeline = "run -p arb-runtime -- health fixtures/replay/full_pipeline_simulated"

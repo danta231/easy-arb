@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/venue_capability.schema.json",
+  "title": "VenueCapabilityDescriptor",
+  "description": "Capability-based venue descriptor, without hard-coded CEX/DEX taxonomy. 中文：以能力描述交易场所，避免把场所硬编码为 CEX/DEX 二分。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "venue_id",
+    "capability_version",
+    "market_capabilities",
+    "execution_capabilities",
+    "auth_modes",
+    "data_surfaces",
+    "settlement_modes",
+    "rate_limit_model",
+    "health_model"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "venue_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "venue_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "capability_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "market_capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MarketCapability"
+      },
+      "uniqueItems": true
+    },
+    "execution_capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExecutionCapability"
+      },
+      "uniqueItems": true
+    },
+    "auth_modes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/AuthMode"
+      },
+      "uniqueItems": true
+    },
+    "data_surfaces": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/DataSurface"
+      },
+      "uniqueItems": true
+    },
+    "settlement_modes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SettlementMode"
+      },
+      "uniqueItems": true
+    },
+    "permission_model": {
+      "$ref": "#/$defs/PermissionModel"
+    },
+    "rate_limit_model": {
+      "$ref": "#/$defs/RateLimitModel"
+    },
+    "health_model": {
+      "$ref": "#/$defs/HealthModel"
+    }
+  },
+  "$defs": {
+    "MarketCapability": {
+      "enum": [
+        "ProvidesSpotMarkets",
+        "ProvidesMarginMarkets",
+        "ProvidesPerpetuals",
+        "ProvidesDatedFutures",
+        "ProvidesOptions",
+        "ProvidesAMMPools",
+        "ProvidesOrderBookMarkets",
+        "ProvidesRFQ",
+        "ProvidesAggregatorRoutes",
+        "ProvidesFundingRates",
+        "ProvidesBorrowLend",
+        "ProvidesOraclePrices",
+        "ProvidesBridgeRoutes"
+      ]
+    },
+    "ExecutionCapability": {
+      "enum": [
+        "SupportsMarketOrders",
+        "SupportsLimitOrders",
+        "SupportsPostOnly",
+        "SupportsReduceOnly",
+        "SupportsCancelReplace",
+        "SupportsBatchOrders",
+        "SupportsAtomicSwap",
+        "SupportsOnChainTransaction",
+        "SupportsOffChainMatching",
+        "SupportsPrivateOrderStream",
+        "SupportsManualApprovalOnly"
+      ]
+    },
+    "AuthMode": {
+      "enum": [
+        "PublicOnly",
+        "APIKeyAuth",
+        "WalletSignatureAuth",
+        "SessionTokenAuth",
+        "MultiSigApproval",
+        "HardwareSignerRequired"
+      ]
+    },
+    "DataSurface": {
+      "enum": [
+        "RESTPolling",
+        "WebSocketStreaming",
+        "HistoricalCandles",
+        "HistoricalTrades",
+        "FundingHistory",
+        "PositionHistory",
+        "BalanceHistory",
+        "RateLimitHeaders",
+        "SequenceNumbers"
+      ]
+    },
+    "SettlementMode": {
+      "enum": [
+        "OnChainSettlement",
+        "OffChainCustody",
+        "SelfCustodyWallet",
+        "SubaccountModel",
+        "PortfolioMargin",
+        "IsolatedMargin",
+        "CrossMargin",
+        "ExternalCustodian",
+        "RequiresBridgeSettlement"
+      ]
+    },
+    "PermissionModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "can_read_public_data": {
+          "type": "boolean"
+        },
+        "can_read_private_data": {
+          "type": "boolean"
+        },
+        "can_trade": {
+          "type": "boolean"
+        },
+        "can_withdraw": {
+          "const": false,
+          "description": "Trading systems should not hold withdrawal permission by default. 中文：交易系统默认不应拥有提现权限。"
+        },
+        "requires_ip_binding": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RateLimitModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "limit",
+        "window_ms"
+      ],
+      "properties": {
+        "unit": {
+          "enum": [
+            "Request",
+            "Weight",
+            "Order",
+            "Connection"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "window_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Documentation or adapter source. 中文：限频规则来源，可指向官方文档或适配器配置。"
+        }
+      }
+    },
+    "HealthModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "freshness_threshold_ms",
+        "disconnect_threshold",
+        "unknown_state_is_critical"
+      ],
+      "properties": {
+        "freshness_threshold_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        },
+        "disconnect_threshold": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unknown_state_is_critical": {
+          "const": true,
+          "description": "Unknown venue state must be risk-critical. 中文：场所状态未知必须按风控关键事件处理。"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "symbol": "BTCUSDT",
+  "lastPrice": "43187.50",
+  "bidPrice": "43187.40",
+  "bidQty": "1.250",
+  "askPrice": "43188.10",
+  "askQty": "0.800",
+  "closeTime": 1767225600000,
+  "lastId": 900100,
+  "count": 42,
+  "redacted_note": "public market data only; no account identifiers, credentials, API keys, signatures or private balances"
+}

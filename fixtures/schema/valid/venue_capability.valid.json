@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0.0",
+  "venue_id": "venue:SIM",
+  "venue_name": "Offline Fixture Venue",
+  "capability_version": "1.0.0",
+  "market_capabilities": [
+    "ProvidesSpotMarkets"
+  ],
+  "execution_capabilities": [
+    "SupportsManualApprovalOnly"
+  ],
+  "auth_modes": [
+    "PublicOnly"
+  ],
+  "data_surfaces": [
+    "RESTPolling"
+  ],
+  "settlement_modes": [
+    "OffChainCustody"
+  ],
+  "permission_model": {
+    "can_read_public_data": true,
+    "can_read_private_data": false,
+    "can_trade": false,
+    "can_withdraw": false
+  },
+  "rate_limit_model": {
+    "unit": "Request",
+    "limit": 60,
+    "window_ms": 60000,
+    "source": "fixture"
+  },
+  "health_model": {
+    "freshness_threshold_ms": 5000,
+    "disconnect_threshold": 3,
+    "unknown_state_is_critical": true
+  }
+}

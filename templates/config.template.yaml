@@ -1,0 +1,27 @@
+# Universal Arb Platform runtime config template
+# 中文：运行时代码侧配置模板。默认只读、无实盘、无真实签名，不包含密钥明文。
+
+config_version: "arb-config-v1"
+
+execution:
+  # 中文：执行模式是权限策略；默认 ReadOnly 不允许账户变化。
+  mode: "ReadOnly"
+  live_execution_enabled: false
+  auto_live_enabled: false
+
+kill_switch:
+  # 中文：熔断开关由运行时读取后执行；配置读取本身不触发风控、执行或签名。
+  global: false
+  execution: false
+  strategies: []
+  venues: []
+  accounts: []
+  instruments: []
+  assets: []
+  chains: []
+  execution_modes: []
+
+signing:
+  # 中文：这里只保存签名策略引用，不保存 API secret、私钥、助记词或 token。
+  policy_ref: "signing-policy/null-signer-v1"
+  real_signing_enabled: false

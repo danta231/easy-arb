@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0.0",
+  "instrument_id": "inst:BTC-USDC",
+  "venue_id": "venue:SIM",
+  "kind": "SpotPair",
+  "base_asset_id": "asset:BTC",
+  "quote_asset_id": "asset:USDC",
+  "settlement_asset_id": "asset:USDC",
+  "tick_size": "0.01",
+  "lot_size": "0.0001",
+  "pricing_properties": {
+    "price_source": "fixture",
+    "mark_price_required": true
+  },
+  "execution_model": {
+    "supports_live_execution": false,
+    "allowed_order_types": [
+      "Market",
+      "Limit"
+    ]
+  },
+  "failure_model": {
+    "unknown_state_is_critical": true,
+    "known_failure_modes": [
+      "PartialFill",
+      "VenueOutage"
+    ]
+  }
+}

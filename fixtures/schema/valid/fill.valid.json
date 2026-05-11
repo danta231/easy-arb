@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "fill_id": "fill:01",
+  "plan_id": "plan:01",
+  "plan_leg_id": "pleg:01",
+  "venue_id": "venue:SIM",
+  "instrument_id": "inst:BTC-USDC",
+  "venue_order_id": "fixture-order-1",
+  "client_order_id": "client:01",
+  "timestamp": "2026-01-01T00:00:06Z",
+  "side": "Buy",
+  "price": "50000.00000001",
+  "quantity": "0.00100000",
+  "fee": {
+    "asset_id": "asset:USDC",
+    "direction": "Out",
+    "amount": "0.01000000"
+  },
+  "source_event_id": "event:01",
+  "ledger_entry_id": "ledger:01"
+}

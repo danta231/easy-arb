@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/instrument.schema.json",
+  "title": "Instrument",
+  "description": "Canonical instrument definition. 中文：交易、借贷、报价、结算或观察对象的统一定义。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "instrument_id",
+    "venue_id",
+    "kind",
+    "settlement_asset_id",
+    "pricing_properties",
+    "execution_model",
+    "failure_model"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "instrument_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "venue_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "kind": {
+      "enum": [
+        "SpotPair",
+        "MarginSpotPair",
+        "PerpetualSwap",
+        "DatedFuture",
+        "Option",
+        "AMMPool",
+        "OrderBookMarket",
+        "FundingStream",
+        "BorrowRateMarket",
+        "LendingRateMarket",
+        "RFQRoute",
+        "AggregatorRoute",
+        "BridgeRoute",
+        "OraclePriceFeed",
+        "SyntheticIndex",
+        "StructuredPosition"
+      ]
+    },
+    "base_asset_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "quote_asset_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "settlement_asset_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "margin_asset_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "expiry_time": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "funding_schedule": {
+      "$ref": "#/$defs/Schedule"
+    },
+    "contract_multiplier": {
+      "$ref": "common.defs.schema.json#/$defs/PositiveDecimalString"
+    },
+    "tick_size": {
+      "$ref": "common.defs.schema.json#/$defs/PositiveDecimalString"
+    },
+    "lot_size": {
+      "$ref": "common.defs.schema.json#/$defs/PositiveDecimalString"
+    },
+    "pricing_properties": {
+      "$ref": "#/$defs/PricingProperties"
+    },
+    "liquidity_model": {
+      "$ref": "#/$defs/LiquidityModel"
+    },
+    "execution_model": {
+      "$ref": "#/$defs/ExecutionModel"
+    },
+    "failure_model": {
+      "$ref": "#/$defs/FailureModel"
+    }
+  },
+  "$defs": {
+    "Schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "FixedInterval",
+            "VenueDefined",
+            "OnDemand"
+          ]
+        },
+        "interval_ms": {
+          "$ref": "common.defs.schema.json#/$defs/DurationMs"
+        }
+      }
+    },
+    "PricingProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "price_source": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "mark_price_required": {
+          "type": "boolean"
+        },
+        "index_price_required": {
+          "type": "boolean"
+        },
+        "oracle_price_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "LiquidityModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "OrderBook",
+            "AMM",
+            "RFQ",
+            "Aggregator",
+            "RateMarket",
+            "OracleOnly"
+          ]
+        },
+        "depth_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ExecutionModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supports_live_execution"
+      ],
+      "properties": {
+        "supports_live_execution": {
+          "type": "boolean"
+        },
+        "allowed_order_types": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "Market",
+              "Limit",
+              "PostOnly",
+              "ReduceOnly",
+              "RFQ",
+              "OnChainSwap"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "FailureModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unknown_state_is_critical"
+      ],
+      "properties": {
+        "unknown_state_is_critical": {
+          "const": true,
+          "description": "Instrument state uncertainty must be risk-critical. 中文：工具状态未知必须视为风控关键状态。"
+        },
+        "known_failure_modes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "PartialFill",
+              "LateFill",
+              "VenueOutage",
+              "StaleQuote",
+              "OracleDivergence",
+              "SettlementDelay",
+              "ChainReorg",
+              "ManualInterventionRequired"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

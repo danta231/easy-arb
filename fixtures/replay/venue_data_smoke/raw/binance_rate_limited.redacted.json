@@ -1,0 +1,11 @@
+{
+  "event": "rate_limited",
+  "venue": "venue:BINANCE_PUBLIC",
+  "observed_at": "2026-01-01T00:00:14Z",
+  "limit": 1200,
+  "remaining": 0,
+  "window_ms": 60000,
+  "resets_at": "2026-01-01T00:01:00Z",
+  "reason": "fixture HTTP 429 public ticker rate limit header observed",
+  "redacted_note": "public rate limit metadata only; no credentials or account data"
+}

@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/ledger_entry.schema.json",
+  "title": "LedgerEntry",
+  "description": "Append-only double-entry ledger journal entry. 中文：追加式复式账本分录；修正必须通过 reversal 或 adjustment 新分录完成，禁止原地改写。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ledger_entry_id",
+    "journal_entry_id",
+    "schema_version",
+    "timestamp",
+    "namespace",
+    "entry_type",
+    "source_event_id",
+    "idempotency_key",
+    "legs",
+    "balance_assertion"
+  ],
+  "properties": {
+    "ledger_entry_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "journal_entry_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "timestamp": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "namespace": {
+      "enum": [
+        "Live",
+        "Simulation",
+        "Backtest",
+        "Adjustment"
+      ],
+      "description": "Ledger namespace. 中文：账本命名空间，模拟和回测不得混入实盘账本。"
+    },
+    "entry_type": {
+      "enum": [
+        "TradeFill",
+        "Fee",
+        "Funding",
+        "Transfer",
+        "CapitalReservation",
+        "CapitalRelease",
+        "Borrow",
+        "Lend",
+        "Repay",
+        "RealizedPnl",
+        "UnrealizedPnlSnapshot",
+        "ReconciliationAdjustment",
+        "ManualAdjustment"
+      ]
+    },
+    "source_event_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "idempotency_key": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "strategy_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "opportunity_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "execution_plan_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "reversal_of": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "adjustment_of": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "adjustment_reason_code": {
+      "$ref": "common.defs.schema.json#/$defs/ReasonCode",
+      "description": "Machine-readable reason for an adjustment entry. 中文：调整分录必须使用机器可聚合的原因码，自由文本只能放在 memo。"
+    },
+    "legs": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "$ref": "#/$defs/LedgerLeg"
+      },
+      "description": "Debit and credit legs. 中文：复式账本的借贷腿；同一资产的借贷平衡需由实现层校验。"
+    },
+    "balance_assertion": {
+      "$ref": "#/$defs/BalanceAssertion"
+    }
+  },
+  "$defs": {
+    "LedgerLeg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "leg_id",
+        "account_id",
+        "asset_id",
+        "direction",
+        "amount"
+      ],
+      "properties": {
+        "leg_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "account_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "custody_location_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "asset_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "direction": {
+          "enum": [
+            "Debit",
+            "Credit"
+          ]
+        },
+        "amount": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "valuation_usd": {
+          "$ref": "common.defs.schema.json#/$defs/DecimalString"
+        },
+        "memo": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "BalanceAssertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "balanced",
+        "assertion_hash"
+      ],
+      "properties": {
+        "balanced": {
+          "const": true,
+          "description": "Producer asserts the journal entry balances. 中文：生产者声明该账本分录已通过平衡检查。"
+        },
+        "assertion_hash": {
+          "$ref": "common.defs.schema.json#/$defs/HashString"
+        },
+        "checked_by": {
+          "type": "string",
+          "maxLength": 128
+        }
+      }
+    }
+  }
+}

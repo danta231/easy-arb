@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0.0",
+  "incident_id": "incident:01",
+  "severity": "SEV3",
+  "status": "Open",
+  "opened_at": "2026-01-01T00:00:08Z",
+  "trigger": "UNKNOWN_STATE",
+  "source_event_refs": [
+    "event:01"
+  ],
+  "impacted": {
+    "venue_ids": [
+      "venue:SIM"
+    ],
+    "capital_at_risk_usd": "0"
+  },
+  "automatic_actions": [],
+  "manual_actions": [
+    {
+      "action_id": "iact:01",
+      "action_type": "ManualReview",
+      "timestamp": "2026-01-01T00:00:09Z",
+      "detail": "Fixture manual review action."
+    }
+  ]
+}

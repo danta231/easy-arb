@@ -1,0 +1,4 @@
+strategy_id: "strat:demo"
+strategy_version: "1.0.0"
+code_version: "code:demo-1"
+中文说明: "部分成交 fixture 使用固定策略版本和固定输入。"

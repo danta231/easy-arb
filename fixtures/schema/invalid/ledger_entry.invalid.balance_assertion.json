@@ -1,0 +1,30 @@
+{
+  "ledger_entry_id": "ledger:01",
+  "journal_entry_id": "journal:01",
+  "schema_version": "1.0.0",
+  "timestamp": "2026-01-01T00:00:07Z",
+  "namespace": "Simulation",
+  "entry_type": "TradeFill",
+  "source_event_id": "event:01",
+  "idempotency_key": "idem:ledger:01",
+  "legs": [
+    {
+      "leg_id": "ledleg:01",
+      "account_id": "acct:sim",
+      "asset_id": "asset:USDC",
+      "direction": "Debit",
+      "amount": "100.00"
+    },
+    {
+      "leg_id": "ledleg:02",
+      "account_id": "acct:sim",
+      "asset_id": "asset:USDC",
+      "direction": "Credit",
+      "amount": "100.00"
+    }
+  ],
+  "balance_assertion": {
+    "balanced": false,
+    "assertion_hash": "hash:assertion:0001"
+  }
+}

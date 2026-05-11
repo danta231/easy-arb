@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/portfolio_state.schema.json",
+  "title": "PortfolioState",
+  "description": "Normalized portfolio view across venues, accounts, custody locations, orders, transfers, reserves, and exposures. 中文：跨场所、账户、托管位置、订单、转账、预留和风险敞口的组合状态视图。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "portfolio_state_id",
+    "as_of",
+    "source_event_refs",
+    "balances",
+    "positions",
+    "reservations",
+    "open_orders",
+    "pending_transfers",
+    "confidence",
+    "missing_data_flags",
+    "state_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "$ref": "common.defs.schema.json#/$defs/Version"
+    },
+    "portfolio_state_id": {
+      "$ref": "common.defs.schema.json#/$defs/Identifier"
+    },
+    "as_of": {
+      "$ref": "common.defs.schema.json#/$defs/DateTime"
+    },
+    "source_event_refs": {
+      "type": "array",
+      "items": {
+        "$ref": "common.defs.schema.json#/$defs/Identifier"
+      }
+    },
+    "balances": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Balance"
+      }
+    },
+    "positions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Position"
+      }
+    },
+    "reservations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapitalReservation"
+      }
+    },
+    "open_orders": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OpenOrder"
+      }
+    },
+    "pending_transfers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PendingTransfer"
+      }
+    },
+    "confidence": {
+      "$ref": "common.defs.schema.json#/$defs/Confidence"
+    },
+    "missing_data_flags": {
+      "type": "array",
+      "items": {
+        "$ref": "common.defs.schema.json#/$defs/ReasonCode"
+      },
+      "uniqueItems": true
+    },
+    "state_hash": {
+      "$ref": "common.defs.schema.json#/$defs/HashString"
+    }
+  },
+  "$defs": {
+    "Balance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "balance_id",
+        "asset_id",
+        "account_id",
+        "custody_location_id",
+        "free",
+        "locked",
+        "reserved",
+        "pending",
+        "borrowed",
+        "lent",
+        "unsettled"
+      ],
+      "properties": {
+        "balance_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "asset_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "account_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "custody_location_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "free": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "locked": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "reserved": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "pending": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "borrowed": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "lent": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "unsettled": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        }
+      }
+    },
+    "Position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "position_id",
+        "instrument_id",
+        "account_id",
+        "quantity",
+        "mark_price",
+        "unrealized_pnl"
+      ],
+      "properties": {
+        "position_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "instrument_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "account_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "quantity": {
+          "$ref": "common.defs.schema.json#/$defs/DecimalString"
+        },
+        "entry_price": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "mark_price": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "unrealized_pnl": {
+          "$ref": "common.defs.schema.json#/$defs/DecimalString"
+        },
+        "liquidation_price": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        }
+      }
+    },
+    "CapitalReservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reservation_id",
+        "state",
+        "asset_id",
+        "amount",
+        "reserved_for",
+        "expires_at"
+      ],
+      "properties": {
+        "reservation_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "state": {
+          "enum": [
+            "Requested",
+            "Reserved",
+            "ConvertedToExecution",
+            "Released",
+            "Expired",
+            "ReconciledMismatch"
+          ],
+          "description": "Capital reservation state. 中文：资本预留状态；必须能证明预留是已请求、已锁定、已转执行、已释放、已过期或对账差异。"
+        },
+        "asset_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "amount": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "reserved_for": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "expires_at": {
+          "$ref": "common.defs.schema.json#/$defs/DateTime"
+        },
+        "source_event_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "ledger_entry_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        }
+      }
+    },
+    "OpenOrder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order_id",
+        "venue_id",
+        "instrument_id",
+        "status"
+      ],
+      "properties": {
+        "order_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "venue_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "instrument_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "status": {
+          "enum": [
+            "Open",
+            "PartiallyFilled",
+            "PendingCancel",
+            "Unknown"
+          ]
+        }
+      }
+    },
+    "PendingTransfer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transfer_id",
+        "asset_id",
+        "amount",
+        "status"
+      ],
+      "properties": {
+        "transfer_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "asset_id": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier"
+        },
+        "amount": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString"
+        },
+        "status": {
+          "enum": [
+            "Pending",
+            "Submitted",
+            "Confirming",
+            "Settled",
+            "Failed",
+            "Unknown"
+          ]
+        }
+      }
+    }
+  }
+}

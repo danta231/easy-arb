@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universal-arb-platform.local/schemas/common.defs.schema.json",
+  "title": "UniversalArbCommonDefinitions",
+  "description": "Shared canonical schema fragments for the universal arbitrage platform. 中文：全平台通用的规范片段，Rust 类型、事件、账本和回放都应复用这些定义。",
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{1,127}$",
+      "description": "Stable machine identifier. 中文：稳定机器标识，用于 event_id、venue_id、strategy_id 等，不承载展示文案。"
+    },
+    "Version": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:+-]{0,127}$",
+      "description": "Version label or semantic version. 中文：版本标识，可为 semver、git hash 摘要或受控配置版本。"
+    },
+    "DateTime": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 UTC timestamp. 中文：使用 RFC 3339 时间戳；落地实现应统一转为 UTC。"
+    },
+    "DurationMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Duration in milliseconds. 中文：毫秒级持续时间，禁止使用不带单位的裸数字。"
+    },
+    "DecimalString": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "description": "Arbitrary precision decimal encoded as string. 中文：十进制定点数使用字符串，Rust 禁止用 f64 表示金额、数量或价格。"
+    },
+    "NonNegativeDecimalString": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "description": "Non-negative arbitrary precision decimal encoded as string. 中文：非负十进制定点数字符串。"
+    },
+    "PositiveDecimalString": {
+      "type": "string",
+      "pattern": "^(0\\.[0-9]*[1-9][0-9]*|[1-9][0-9]*(\\.[0-9]+)?)$",
+      "description": "Positive arbitrary precision decimal encoded as string. 中文：严格大于 0 的十进制定点数字符串。"
+    },
+    "ReasonCode": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{1,63}$",
+      "description": "Enumerated reason code. 中文：机器可聚合的原因码，不能用自由文本替代。"
+    },
+    "HashString": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_:+.-]{16,160}$",
+      "description": "Canonical hash or checksum string. 中文：规范化序列化后的哈希或校验值，用于回放一致性。"
+    },
+    "SignatureRef": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_./:+-]{8,256}$",
+      "description": "Reference to a detached signature or signing record. 中文：签名记录引用，不在事件里直接存放密钥或敏感签名材料。"
+    },
+    "Confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Confidence score from 0 to 1. 中文：置信度，0 表示不可依赖，1 表示完全可信。"
+    },
+    "AssetFlow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_id",
+        "direction",
+        "amount"
+      ],
+      "properties": {
+        "asset_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "direction": {
+          "enum": [
+            "In",
+            "Out"
+          ],
+          "description": "Flow direction relative to the account or custody location. 中文：相对账户或托管位置的流入/流出方向。"
+        },
+        "amount": {
+          "$ref": "#/$defs/NonNegativeDecimalString"
+        },
+        "account_id": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "custody_location_id": {
+          "$ref": "#/$defs/Identifier"
+        }
+      }
+    },
+    "MoneyUsd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "amount_usd"
+      ],
+      "properties": {
+        "amount_usd": {
+          "$ref": "#/$defs/DecimalString"
+        },
+        "valuation_source": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Price source used for USD valuation. 中文：美元估值使用的价格来源。"
+        }
+      }
+    }
+  }
+}

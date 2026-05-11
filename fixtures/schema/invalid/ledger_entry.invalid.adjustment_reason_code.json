@@ -1,0 +1,33 @@
+{
+  "ledger_entry_id": "ledger:adjustment:bad",
+  "journal_entry_id": "journal:adjustment:bad",
+  "schema_version": "1.0.0",
+  "timestamp": "2026-01-01T00:00:08Z",
+  "namespace": "Adjustment",
+  "entry_type": "ManualAdjustment",
+  "source_event_id": "event:adjustment:bad",
+  "idempotency_key": "idem:ledger:adjustment:bad",
+  "adjustment_of": "ledger:01",
+  "adjustment_reason_code": "fee_reclass",
+  "legs": [
+    {
+      "leg_id": "ledleg:adjustment:bad:01",
+      "account_id": "acct:sim",
+      "asset_id": "asset:USDC",
+      "direction": "Debit",
+      "amount": "1.25"
+    },
+    {
+      "leg_id": "ledleg:adjustment:bad:02",
+      "account_id": "acct:adjustment-clearing",
+      "asset_id": "asset:USDC",
+      "direction": "Credit",
+      "amount": "1.25"
+    }
+  ],
+  "balance_assertion": {
+    "balanced": true,
+    "assertion_hash": "hash:assertion:adjustment:bad",
+    "checked_by": "fixture"
+  }
+}

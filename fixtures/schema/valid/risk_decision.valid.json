@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0.0",
+  "decision_id": "risk:01",
+  "transition_id": "trans:01",
+  "evaluated_at": "2026-01-01T00:00:03Z",
+  "decision": "Rejected",
+  "policy_version": "policy:demo-1",
+  "policy_hash": "hash:policy:000001",
+  "policy_signature_ref": "sigref01",
+  "input_state_ref": "state:01",
+  "checks": [
+    {
+      "check_id": "check:01",
+      "check_type": "DataFreshness",
+      "status": "Pass",
+      "severity": "Info",
+      "reason_code": "NO_EDGE"
+    }
+  ],
+  "constraints": [],
+  "reason_codes": [
+    "NO_EDGE"
+  ],
+  "detail": "Fixture decision is not an approval."
+}
