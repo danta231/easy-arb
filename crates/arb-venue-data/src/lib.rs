@@ -666,6 +666,610 @@ pub struct BinancePublicTickerBatch {
     pub quote: MarketQuote,
 }
 
+/// Binance 公共市场类型。
+///
+/// 中文说明：该枚举只用于区分公开现货行情和公开 USDⓈ-M 永续行情，不代表
+/// 账户权限，也不包含任何交易动作。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinancePublicMarket {
+    Spot,
+    UsdmPerpetual,
+}
+
+impl BinancePublicMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "Spot",
+            Self::UsdmPerpetual => "UsdmPerpetual",
+        }
+    }
+
+    fn basis_role(self) -> &'static str {
+        match self {
+            Self::Spot => "Spot",
+            Self::UsdmPerpetual => "Perp",
+        }
+    }
+
+    fn event_scope(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::UsdmPerpetual => "usdm-perp",
+        }
+    }
+
+    fn instrument_kind(self) -> InstrumentKind {
+        match self {
+            Self::Spot => InstrumentKind::SpotPair,
+            Self::UsdmPerpetual => InstrumentKind::PerpetualSwap,
+        }
+    }
+}
+
+/// Binance bookTicker 原始响应到标准化事件的输出批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinancePublicBookTickerBatch {
+    pub raw_event: NormalizedEvent,
+    pub normalized_event: NormalizedEvent,
+    pub quote: MarketQuote,
+}
+
+/// Binance USDⓈ-M premiumIndex 原始响应到标准化事件的输出批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceUsdmPremiumIndexBatch {
+    pub raw_event: NormalizedEvent,
+    pub normalized_event: NormalizedEvent,
+}
+
+/// Binance 公共 bookTicker 只读适配器。
+///
+/// 中文说明：该适配器只消费调用方传入的公开 REST 响应，不主动联网，不读取
+/// 账户，不下单、不撤单、不转账、不签名。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinancePublicBookTickerAdapter {
+    venue_id: VenueId,
+    instrument: BinancePublicInstrument,
+    market: BinancePublicMarket,
+    max_age_ms: u64,
+    latest_quote: Option<MarketQuote>,
+    health: VenueHealthSnapshot,
+}
+
+impl BinancePublicBookTickerAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        instrument: BinancePublicInstrument,
+        market: BinancePublicMarket,
+        started_at: UtcTimestamp,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let freshness = DataFreshness::new(started_at, started_at, max_age_ms)?;
+        Ok(Self {
+            venue_id: venue_id.clone(),
+            instrument,
+            market,
+            max_age_ms,
+            latest_quote: None,
+            health: VenueHealthSnapshot {
+                venue_id,
+                status: VenueHealthStatus::Healthy,
+                connection: VenueConnectionStatus::Connected,
+                reason_codes: Vec::new(),
+                rate_limit: None,
+                source_event_id: None,
+                freshness,
+            },
+        })
+    }
+
+    /// 解析 Binance bookTicker 原始响应并生成原始事件与标准化行情事件。
+    pub fn ingest_book_ticker_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BinancePublicBookTickerBatch> {
+        let raw_response_ref = raw_response_ref.into();
+        let raw = self.parse_book_ticker(raw_json, ingested_at)?;
+        let freshness = DataFreshness::new(raw.observed_at, ingested_at, self.max_age_ms)?;
+        let quote = MarketQuote {
+            venue_id: self.venue_id.clone(),
+            instrument_id: self.instrument.instrument_id.clone(),
+            last_price: None,
+            best_bid: Some(raw.best_bid),
+            best_ask: Some(raw.best_ask),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(raw.bid_size),
+            ask_size: Some(raw.ask_size),
+            source_sequence: Some(raw.source_sequence.clone()),
+            source_event_id: Some(binance_public_raw_event_id(
+                "book-ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            )),
+            freshness,
+        };
+
+        let raw_event = self.raw_book_ticker_event(&raw, &raw_response_ref, ingested_at)?;
+        let normalized_event =
+            self.normalized_book_ticker_event(&raw, &raw_event, &quote, ingested_at)?;
+
+        self.latest_quote = Some(quote.clone());
+        self.health.status = if freshness.is_stale() {
+            VenueHealthStatus::Degraded
+        } else {
+            VenueHealthStatus::Healthy
+        };
+        self.health.connection = VenueConnectionStatus::Connected;
+        self.health.reason_codes = if freshness.is_stale() {
+            vec!["DATA_STALE".to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.health.source_event_id = Some(normalized_event.event_id.as_str().to_owned());
+        self.health.freshness = freshness;
+
+        Ok(BinancePublicBookTickerBatch {
+            raw_event,
+            normalized_event,
+            quote,
+        })
+    }
+
+    fn parse_book_ticker(
+        &self,
+        raw_json: &str,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BinanceBookTickerRaw> {
+        let object = FlatJsonParser::new(raw_json).parse().map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::MalformedPayload,
+                error.to_string(),
+            ))
+        })?;
+        let symbol = required_string(
+            &object,
+            "symbol",
+            self.venue_id.clone(),
+            ReadOnlySurface::MarketData,
+        )?;
+        if symbol != self.instrument.symbol {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::UnknownExternalState,
+                format!(
+                    "raw symbol `{symbol}` does not match configured symbol `{}`",
+                    self.instrument.symbol
+                ),
+            )));
+        }
+
+        let observed_at = optional_u64(&object, "time")?
+            .map(timestamp_from_unix_millis)
+            .transpose()
+            .map_err(|detail| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::MalformedPayload,
+                    detail,
+                ))
+            })?
+            .unwrap_or(ingested_at);
+        let source_sequence = optional_u64(&object, "time")?.map_or_else(
+            || {
+                format!(
+                    "{}{:09}",
+                    ingested_at.unix_seconds(),
+                    ingested_at.nanoseconds()
+                )
+            },
+            |time_ms| time_ms.to_string(),
+        );
+
+        Ok(BinanceBookTickerRaw {
+            symbol,
+            best_bid: parse_price_field(&object, "bidPrice", &self.venue_id)?,
+            best_ask: parse_price_field(&object, "askPrice", &self.venue_id)?,
+            bid_size: parse_quantity_field(&object, "bidQty", &self.venue_id)?,
+            ask_size: parse_quantity_field(&object, "askQty", &self.venue_id)?,
+            source_sequence,
+            observed_at,
+        })
+    }
+
+    fn raw_book_ticker_event(
+        &self,
+        raw: &BinanceBookTickerRaw,
+        raw_response_ref: &str,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let payload = format!(
+            "{{\"adapter\":\"BinancePublicBookTickerAdapter\",\"basis_role\":{},\"market\":\"{}\",\"raw_response_ref\":{},\"redaction\":\"public_market_data_only_no_account_fields\",\"symbol\":{}}}",
+            json_string(self.market.basis_role()),
+            self.market.as_str(),
+            json_string(raw_response_ref),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: binance_public_raw_event_id(
+                "book-ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            event_type: NormalizedEventType::RawMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:binance-public-book-ticker".to_owned(),
+            source_sequence: Some(format!(
+                "binance:{}:{}:{}:raw",
+                self.market.event_scope(),
+                raw.symbol,
+                raw.source_sequence
+            )),
+            correlation_id: binance_public_correlation_id(
+                "book-ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+
+    fn normalized_book_ticker_event(
+        &self,
+        raw: &BinanceBookTickerRaw,
+        raw_event: &NormalizedEvent,
+        quote: &MarketQuote,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let freshness = quote.freshness;
+        let payload = format!(
+            "{{\"adapter\":\"BinancePublicBookTickerAdapter\",\"ask_size\":{},\"basis_role\":{},\"best_ask\":{},\"best_bid\":{},\"bid_size\":{},\"freshness\":{},\"kind\":\"BookTicker\",\"market\":\"{}\",\"raw_event_ref\":{},\"risk_reason_code\":{},\"venue_symbol\":{}}}",
+            json_string(&raw.ask_size.to_string()),
+            json_string(self.market.basis_role()),
+            json_string(&raw.best_ask.to_string()),
+            json_string(&raw.best_bid.to_string()),
+            json_string(&raw.bid_size.to_string()),
+            freshness_payload_json(freshness),
+            self.market.as_str(),
+            json_string(raw_event.event_id.as_str()),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: binance_public_normalized_event_id(
+                "book-ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            event_type: NormalizedEventType::NormalizedMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:binance-public-book-ticker".to_owned(),
+            source_sequence: Some(format!(
+                "binance:{}:{}:{}:normalized",
+                self.market.event_scope(),
+                raw.symbol,
+                raw.source_sequence
+            )),
+            correlation_id: binance_public_correlation_id(
+                "book-ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            causation_id: Some(raw_event.event_id.as_str().to_owned()),
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+}
+
+impl VenueReadAdapter for BinancePublicBookTickerAdapter {
+    fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+}
+
+impl MarketDataReader for BinancePublicBookTickerAdapter {
+    fn latest_quote(&self, query: &MarketDataQuery) -> VenueDataResult<Option<MarketQuote>> {
+        Ok((query.venue_id == self.venue_id
+            && query.instrument_id == self.instrument.instrument_id)
+            .then(|| self.latest_quote.clone())
+            .flatten())
+    }
+
+    fn order_book(&self, query: &MarketDataQuery) -> VenueDataResult<Option<OrderBookSnapshot>> {
+        if query.venue_id != self.venue_id || query.instrument_id != self.instrument.instrument_id {
+            return Ok(None);
+        }
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Binance public bookTicker only exposes top-of-book, not full depth".to_owned(),
+        })
+    }
+}
+
+impl BalanceReader for BinancePublicBookTickerAdapter {
+    fn balances(&self, _query: &BalanceQuery) -> VenueDataResult<Vec<VenueBalance>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::Balance,
+            reason: "public market data adapter has no account balance surface".to_owned(),
+        })
+    }
+}
+
+impl PositionReader for BinancePublicBookTickerAdapter {
+    fn positions(&self, _query: &PositionQuery) -> VenueDataResult<Vec<VenuePosition>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::Position,
+            reason: "public market data adapter has no account position surface".to_owned(),
+        })
+    }
+}
+
+impl InstrumentInfoReader for BinancePublicBookTickerAdapter {
+    fn instruments(&self, query: &InstrumentInfoQuery) -> VenueDataResult<Vec<InstrumentInfo>> {
+        if query.venue_id != self.venue_id {
+            return Ok(Vec::new());
+        }
+        if query
+            .instrument_id
+            .as_ref()
+            .is_some_and(|instrument_id| instrument_id != &self.instrument.instrument_id)
+        {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![InstrumentInfo {
+            venue_id: self.venue_id.clone(),
+            instrument_id: self.instrument.instrument_id.clone(),
+            kind: self.market.instrument_kind(),
+            base_asset_id: Some(self.instrument.base_asset_id.clone()),
+            quote_asset_id: Some(self.instrument.quote_asset_id.clone()),
+            settlement_asset_id: self.instrument.settlement_asset_id.clone(),
+            margin_asset_id: (self.market == BinancePublicMarket::UsdmPerpetual)
+                .then(|| self.instrument.settlement_asset_id.clone()),
+            tick_size: self.instrument.tick_size,
+            lot_size: self.instrument.lot_size,
+            contract_multiplier: None,
+            is_active: true,
+            source_event_id: self
+                .latest_quote
+                .as_ref()
+                .and_then(|quote| quote.source_event_id.clone()),
+            freshness: self.health.freshness,
+        }])
+    }
+}
+
+impl VenueHealthReader for BinancePublicBookTickerAdapter {
+    fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
+        if venue_id == &self.venue_id {
+            Ok(self.health.clone())
+        } else {
+            Err(VenueDataError::DataUnavailable {
+                venue_id: venue_id.clone(),
+                surface: ReadOnlySurface::VenueHealth,
+                reason: "adapter only tracks its configured venue".to_owned(),
+            })
+        }
+    }
+}
+
+/// Binance USDⓈ-M premiumIndex 只读适配器。
+///
+/// 中文说明：该适配器只解析公开 mark price、index price 和 funding rate，
+/// 不读取仓位、不签名，也不提交任何账户动作。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceUsdmPremiumIndexAdapter {
+    venue_id: VenueId,
+    instrument: BinancePublicInstrument,
+    max_age_ms: u64,
+}
+
+impl BinanceUsdmPremiumIndexAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        instrument: BinancePublicInstrument,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        Ok(Self {
+            venue_id,
+            instrument,
+            max_age_ms,
+        })
+    }
+
+    pub fn ingest_premium_index_json(
+        &self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BinanceUsdmPremiumIndexBatch> {
+        let raw_response_ref = raw_response_ref.into();
+        let raw = self.parse_premium_index(raw_json)?;
+        let freshness = DataFreshness::new(raw.observed_at, ingested_at, self.max_age_ms)?;
+        let raw_event = self.raw_premium_index_event(&raw, &raw_response_ref, ingested_at)?;
+        let normalized_event =
+            self.normalized_premium_index_event(&raw, &raw_event, freshness, ingested_at)?;
+        Ok(BinanceUsdmPremiumIndexBatch {
+            raw_event,
+            normalized_event,
+        })
+    }
+
+    fn parse_premium_index(&self, raw_json: &str) -> VenueDataResult<BinancePremiumIndexRaw> {
+        let object = FlatJsonParser::new(raw_json).parse().map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::MalformedPayload,
+                error.to_string(),
+            ))
+        })?;
+        let symbol = required_string(
+            &object,
+            "symbol",
+            self.venue_id.clone(),
+            ReadOnlySurface::MarketData,
+        )?;
+        if symbol != self.instrument.symbol {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::UnknownExternalState,
+                format!(
+                    "raw symbol `{symbol}` does not match configured symbol `{}`",
+                    self.instrument.symbol
+                ),
+            )));
+        }
+        let time_ms = required_u64(
+            &object,
+            "time",
+            self.venue_id.clone(),
+            ReadOnlySurface::MarketData,
+        )?;
+        Ok(BinancePremiumIndexRaw {
+            symbol,
+            mark_price: parse_price_field(&object, "markPrice", &self.venue_id)?,
+            index_price: parse_price_field(&object, "indexPrice", &self.venue_id)?,
+            last_funding_rate: parse_decimal_string_field(
+                &object,
+                "lastFundingRate",
+                &self.venue_id,
+            )?,
+            interest_rate: parse_decimal_string_field(&object, "interestRate", &self.venue_id)?,
+            next_funding_time_ms: required_u64(
+                &object,
+                "nextFundingTime",
+                self.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+            )?,
+            time_ms,
+            observed_at: timestamp_from_unix_millis(time_ms).map_err(|detail| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::MalformedPayload,
+                    detail,
+                ))
+            })?,
+        })
+    }
+
+    fn raw_premium_index_event(
+        &self,
+        raw: &BinancePremiumIndexRaw,
+        raw_response_ref: &str,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let payload = format!(
+            "{{\"adapter\":\"BinanceUsdmPremiumIndexAdapter\",\"basis_role\":\"Perp\",\"raw_response_ref\":{},\"redaction\":\"public_market_data_only_no_account_fields\",\"symbol\":{}}}",
+            json_string(raw_response_ref),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: binance_public_raw_event_id(
+                "premium-index",
+                BinancePublicMarket::UsdmPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            event_type: NormalizedEventType::RawMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:binance-usdm-premium-index".to_owned(),
+            source_sequence: Some(format!(
+                "binance:usdm-perp:{}:{}:raw",
+                raw.symbol, raw.time_ms
+            )),
+            correlation_id: binance_public_correlation_id(
+                "premium-index",
+                BinancePublicMarket::UsdmPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+
+    fn normalized_premium_index_event(
+        &self,
+        raw: &BinancePremiumIndexRaw,
+        raw_event: &NormalizedEvent,
+        freshness: DataFreshness,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let payload = format!(
+            "{{\"adapter\":\"BinanceUsdmPremiumIndexAdapter\",\"basis_role\":\"Perp\",\"freshness\":{},\"index_price\":{},\"interest_rate\":{},\"kind\":\"PerpPremiumIndex\",\"last_funding_rate\":{},\"mark_price\":{},\"next_funding_time_ms\":{},\"raw_event_ref\":{},\"risk_reason_code\":{},\"venue_symbol\":{}}}",
+            freshness_payload_json(freshness),
+            json_string(&raw.index_price.to_string()),
+            json_string(&raw.interest_rate),
+            json_string(&raw.last_funding_rate),
+            json_string(&raw.mark_price.to_string()),
+            raw.next_funding_time_ms,
+            json_string(raw_event.event_id.as_str()),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: binance_public_normalized_event_id(
+                "premium-index",
+                BinancePublicMarket::UsdmPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            event_type: NormalizedEventType::NormalizedMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:binance-usdm-premium-index".to_owned(),
+            source_sequence: Some(format!(
+                "binance:usdm-perp:{}:{}:normalized",
+                raw.symbol, raw.time_ms
+            )),
+            correlation_id: binance_public_correlation_id(
+                "premium-index",
+                BinancePublicMarket::UsdmPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            causation_id: Some(raw_event.event_id.as_str().to_owned()),
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+}
+
 /// Binance 公共 24hr ticker 离线只读适配器。
 ///
 /// 中文说明：这是阶段 8 的第一个场所适配器样例。它只消费调用方传入的公开
@@ -1244,6 +1848,29 @@ struct BinanceTicker24hRaw {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct BinanceBookTickerRaw {
+    symbol: String,
+    best_bid: Price,
+    best_ask: Price,
+    bid_size: Quantity,
+    ask_size: Quantity,
+    source_sequence: String,
+    observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BinancePremiumIndexRaw {
+    symbol: String,
+    mark_price: Price,
+    index_price: Price,
+    last_funding_rate: String,
+    interest_rate: String,
+    next_funding_time_ms: u64,
+    time_ms: u64,
+    observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FlatJsonValue {
     String(String),
     Number(String),
@@ -1585,6 +2212,23 @@ fn parse_quantity_field(
     })
 }
 
+fn parse_decimal_string_field(
+    object: &BTreeMap<String, FlatJsonValue>,
+    field: &'static str,
+    venue_id: &VenueId,
+) -> VenueDataResult<String> {
+    let value = required_string(object, field, venue_id.clone(), ReadOnlySurface::MarketData)?;
+    value.parse::<Decimal>().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+            ExternalErrorClass::MalformedPayload,
+            format!("field `{field}` is not a valid decimal: {error}"),
+        ))
+    })?;
+    Ok(value)
+}
+
 fn timestamp_from_unix_millis(value: u64) -> Result<UtcTimestamp, String> {
     let seconds = i64::try_from(value / 1_000)
         .map_err(|_| "closeTime milliseconds overflow i64 seconds".to_owned())?;
@@ -1603,6 +2247,42 @@ fn normalized_event_id(symbol: &str, source_sequence: u64) -> String {
 
 fn correlation_id(symbol: &str, source_sequence: u64) -> String {
     format!("corr:venue-data:binance-public:{symbol}:{source_sequence}")
+}
+
+fn binance_public_raw_event_id(
+    stream: &str,
+    market: BinancePublicMarket,
+    symbol: &str,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:binance-public:{stream}:{}:{symbol}:{source_sequence}:raw",
+        market.event_scope()
+    )
+}
+
+fn binance_public_normalized_event_id(
+    stream: &str,
+    market: BinancePublicMarket,
+    symbol: &str,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:binance-public:{stream}:{}:{symbol}:{source_sequence}:normalized",
+        market.event_scope()
+    )
+}
+
+fn binance_public_correlation_id(
+    stream: &str,
+    market: BinancePublicMarket,
+    symbol: &str,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "corr:venue-data:binance-public:{stream}:{}:{symbol}:{source_sequence}",
+        market.event_scope()
+    )
 }
 
 fn freshness_payload_json(freshness: DataFreshness) -> String {
@@ -2121,6 +2801,104 @@ mod tests {
     }
 
     #[test]
+    fn binance_public_book_ticker_maps_spot_and_perp_top_of_book() {
+        let mut spot = binance_book_adapter(
+            "venue:BINANCE-SPOT",
+            "inst:BINANCE:BTCUSDT:SPOT",
+            BinancePublicMarket::Spot,
+        );
+        let spot_batch = spot
+            .ingest_book_ticker_json(
+                r#"{"symbol":"BTCUSDT","bidPrice":"43187.40","bidQty":"1.20000000","askPrice":"43188.10","askQty":"0.80000000"}"#,
+                "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("spot book ticker");
+
+        assert_eq!(
+            spot_batch.quote.best_bid.expect("bid").to_string(),
+            "43187.40"
+        );
+        assert_eq!(
+            spot_batch.quote.best_ask.expect("ask").to_string(),
+            "43188.10"
+        );
+        assert_eq!(
+            payload_string(&spot_batch.normalized_event, "basis_role"),
+            "Spot"
+        );
+        assert_eq!(
+            canonical_normalized_event_hash(&spot_batch.normalized_event),
+            spot_batch.normalized_event.checksum.as_str()
+        );
+
+        let mut perp = binance_book_adapter(
+            "venue:BINANCE-USDM",
+            "inst:BINANCE:BTCUSDT:USDM-PERP",
+            BinancePublicMarket::UsdmPerpetual,
+        );
+        let perp_batch = perp
+            .ingest_book_ticker_json(
+                r#"{"symbol":"BTCUSDT","bidPrice":"43250.00","bidQty":"2.00000000","askPrice":"43251.00","askQty":"1.50000000","time":1767225601000}"#,
+                "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=BTCUSDT",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("perp book ticker");
+
+        assert_eq!(
+            payload_string(&perp_batch.normalized_event, "basis_role"),
+            "Perp"
+        );
+        assert_eq!(
+            perp_batch.quote.source_sequence.as_deref(),
+            Some("1767225601000")
+        );
+        let instruments = perp
+            .instruments(&InstrumentInfoQuery::new(
+                VenueId::new("venue:BINANCE-USDM").expect("venue"),
+            ))
+            .expect("instrument info");
+        assert_eq!(instruments[0].kind, InstrumentKind::PerpetualSwap);
+        assert_eq!(
+            instruments[0].margin_asset_id.as_ref().map(AssetId::as_str),
+            Some("asset:USDT")
+        );
+    }
+
+    #[test]
+    fn binance_usdm_premium_index_maps_mark_index_and_funding() {
+        let adapter = binance_premium_index_adapter();
+        let batch = adapter
+            .ingest_premium_index_json(
+                r#"{"symbol":"BTCUSDT","markPrice":"43240.12345678","indexPrice":"43190.00000000","estimatedSettlePrice":"43189.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1767254400000,"time":1767225601000}"#,
+                "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("premium index");
+
+        assert_eq!(
+            batch.raw_event.event_type,
+            NormalizedEventType::RawMarketDataEvent
+        );
+        assert_eq!(
+            batch.normalized_event.event_type,
+            NormalizedEventType::NormalizedMarketDataEvent
+        );
+        assert_eq!(
+            payload_string(&batch.normalized_event, "kind"),
+            "PerpPremiumIndex"
+        );
+        assert_eq!(
+            payload_string(&batch.normalized_event, "last_funding_rate"),
+            "0.00010000"
+        );
+        assert_eq!(
+            canonical_normalized_event_hash(&batch.normalized_event),
+            batch.normalized_event.checksum.as_str()
+        );
+    }
+
+    #[test]
     fn binance_public_ticker_marks_stale_data_for_risk() {
         let mut adapter = binance_adapter();
         let batch = adapter
@@ -2491,6 +3269,50 @@ mod tests {
             venue_id,
             instrument,
             timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter")
+    }
+
+    fn binance_book_adapter(
+        venue_id: &str,
+        instrument_id: &str,
+        market: BinancePublicMarket,
+    ) -> BinancePublicBookTickerAdapter {
+        let asset_usdt = AssetId::new("asset:USDT").expect("asset id");
+        let instrument = BinancePublicInstrument::new(
+            "BTCUSDT",
+            InstrumentId::new(instrument_id).expect("instrument id"),
+            AssetId::new("asset:BTC").expect("asset id"),
+            asset_usdt.clone(),
+            asset_usdt,
+        )
+        .expect("instrument")
+        .with_tick_size(price("0.01"))
+        .with_lot_size(quantity("0.000001"));
+        BinancePublicBookTickerAdapter::new(
+            VenueId::new(venue_id).expect("venue id"),
+            instrument,
+            market,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter")
+    }
+
+    fn binance_premium_index_adapter() -> BinanceUsdmPremiumIndexAdapter {
+        let asset_usdt = AssetId::new("asset:USDT").expect("asset id");
+        let instrument = BinancePublicInstrument::new(
+            "BTCUSDT",
+            InstrumentId::new("inst:BINANCE:BTCUSDT:USDM-PERP").expect("instrument id"),
+            AssetId::new("asset:BTC").expect("asset id"),
+            asset_usdt.clone(),
+            asset_usdt,
+        )
+        .expect("instrument");
+        BinanceUsdmPremiumIndexAdapter::new(
+            VenueId::new("venue:BINANCE-USDM").expect("venue id"),
+            instrument,
             5_000,
         )
         .expect("adapter")

@@ -152,6 +152,17 @@ fn run() -> XtaskResult<()> {
         "check-schema" => check_schema(&root),
         "check-crate-boundaries" => check_crate_boundaries(&root),
         "check-docs" => check_docs(&root),
+        "guarded-live-preflight" => {
+            let config_path = args
+                .next()
+                .unwrap_or_else(|| "templates/personal_guarded_live.preflight.yaml".to_owned());
+            if let Some(extra) = args.next() {
+                return Err(format!(
+                    "guarded-live-preflight accepts at most one config path, got extra `{extra}`"
+                ));
+            }
+            run_guarded_live_preflight(&root, &config_path)
+        }
         "replay-full-pipeline" => run_cargo_command(
             &root,
             &[
@@ -173,7 +184,7 @@ fn run() -> XtaskResult<()> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command `{other}`. Supported commands: check-schema, check-crate-boundaries, check-docs, replay-full-pipeline, quality-gate"
+            "unknown command `{other}`. Supported commands: check-schema, check-crate-boundaries, check-docs, guarded-live-preflight, replay-full-pipeline, quality-gate"
         )),
     }
 }
@@ -188,13 +199,34 @@ fn print_help() {
         "  check-crate-boundaries  Check cargo metadata against docs/23 forbidden dependencies"
     );
     println!("  check-docs              Check required docs and Chinese fixture notes");
+    println!(
+        "  guarded-live-preflight  Check a local personal guarded-live config without credentials"
+    );
     println!("  replay-full-pipeline    Run the Stage 9 full pipeline replay fixture");
     println!("  quality-gate            Run all current xtask checks");
 }
 
+fn run_guarded_live_preflight(root: &Path, config_path: &str) -> XtaskResult<()> {
+    println!("guarded-live-preflight: {config_path}");
+    println!(
+        "中文说明：该命令只读取本地配置并运行启动检查，不访问网络、不读取凭证、不提交真实账户动作。"
+    );
+    run_cargo_command(
+        root,
+        &[
+            "run",
+            "-p",
+            "arb-runtime",
+            "--",
+            "health-config",
+            config_path,
+        ],
+    )
+}
+
 fn run_cargo_command(root: &Path, args: &[&str]) -> XtaskResult<()> {
     println!("cargo {}", args.join(" "));
-    println!("中文说明：该命令只运行离线 fixture，不访问真实交易 API 或真实凭证。");
+    println!("中文说明：该命令只运行离线或只读检查，不访问真实交易 API 或真实凭证。");
     let status = Command::new("cargo")
         .args(args)
         .current_dir(root)

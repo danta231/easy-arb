@@ -24,6 +24,7 @@
 - Default development is read-only, simulated, replayable, and offline-testable.
 - Use Rust tooling and `cargo xtask ...` for project checks after stage 0.
 - Do not introduce Node.js as a formal project dependency.
+- 所有新生成或更新的文档必须使用中文；代码标识符、命令名、schema 名称和必要技术术语如需保留英文，必须同时提供中文解释。
 - Do not put secrets, API keys, private keys, tokens, or credentials in code, logs, fixtures, docs, or reports.
 - Unknown external state must fail closed and must not be treated as success.
 

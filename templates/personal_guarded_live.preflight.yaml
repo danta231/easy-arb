@@ -1,0 +1,30 @@
+# Personal guarded-live preflight runtime config
+# 中文：个人小额受控实盘预检模板。该文件不包含密钥、账户完整标识、
+# API secret、私钥、助记词、token 或 webhook secret。
+# 中文：本模板只用于本地启动检查。它显式选择 GuardedLive 配置形态，
+# 但通过 execution_modes 熔断继续阻断可变执行，不能下单、撤单、转账或签名。
+
+config_version: "arb-config-v1"
+
+execution:
+  # 中文：GuardedLive 表示准备验证受控实盘权限策略，不代表自动实盘。
+  mode: "GuardedLive"
+  live_execution_enabled: true
+  auto_live_enabled: false
+
+kill_switch:
+  # 中文：保持 GuardedLive 模式熔断，直到后续阶段和独立批准允许真实实现。
+  global: false
+  execution: false
+  strategies: ["strategy:sample-spot-v1"]
+  venues: ["venue:personal-cex-redacted"]
+  accounts: ["account:personal-cex-subaccount-redacted"]
+  instruments: ["inst:BTC-USDC"]
+  assets: ["asset:BTC", "asset:USDC"]
+  chains: []
+  execution_modes: ["GuardedLive"]
+
+signing:
+  # 中文：真实签名保持关闭；这里只保存策略引用，不保存任何签名材料。
+  policy_ref: "signing-policy/null-signer-v1"
+  real_signing_enabled: false

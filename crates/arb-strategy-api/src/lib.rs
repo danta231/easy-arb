@@ -39,8 +39,8 @@ pub use arb_config::ExecutionMode;
 use arb_contracts::{from_json_strict, ContractError};
 pub use arb_contracts::{
     to_canonical_json, AuthMode, CandidatePortfolioTransition, DataSurface, ExecutionCapability,
-    Identifier, MarketCapability, NormalizedEvent, PortfolioState, SettlementMode,
-    VenueCapabilityDescriptor,
+    Identifier, JsonValue, MarketCapability, NormalizedEvent, NormalizedEventType, PortfolioState,
+    SettlementMode, VenueCapabilityDescriptor,
 };
 use arb_domain::{DomainError, UtcTimestamp};
 

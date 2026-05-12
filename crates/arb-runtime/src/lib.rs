@@ -10,9 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arb_config::ExecutionMode as ConfigExecutionMode;
 use arb_contracts::{
@@ -20,7 +26,7 @@ use arb_contracts::{
     ExecutionMode as ContractExecutionMode, ExecutionPlan, ExecutionReport, Incident,
     LedgerDirection as ContractLedgerDirection, LedgerEntry as ContractLedgerEntry,
     LedgerEntryType as ContractLedgerEntryType, LedgerNamespace as ContractLedgerNamespace,
-    NormalizedEvent, PortfolioState, RiskDecision, VenueCapabilityDescriptor,
+    NormalizedEvent, NormalizedEventType, PortfolioState, RiskDecision, VenueCapabilityDescriptor,
 };
 use arb_domain::{
     AccountId, Amount, AssetId, CandidateTransitionId, Decimal, EventId, ExecutionPlanId,
@@ -46,14 +52,23 @@ use arb_reconciliation::{
 };
 use arb_replay::{ReplayInput, TimeSource as ReplayTimeSource};
 use arb_risk::{RiskEvaluationInput, RiskEvaluator, StaticRiskEvaluator};
-use arb_strategies::sample_spot_strategy;
+use arb_strategies::{
+    evaluate_spot_perp_basis_signal, sample_spot_strategy, spot_perp_basis_strategy,
+    SpotPerpBasisSignalInput,
+};
 use arb_strategy_api::{
     CandidateTransitionOutput, FixedTimeSource as StrategyFixedTimeSource, ReadOnlySnapshot,
-    Strategy, StrategyConfigSnapshot, StrategyInput, VenueCapabilitySnapshot,
+    Strategy, StrategyConfigSnapshot, StrategyEvaluation, StrategyInput, VenueCapabilitySnapshot,
 };
-use arb_venue_data::{BinancePublicInstrument, BinancePublicTicker24hAdapter};
+use arb_venue_data::{
+    BinancePublicBookTickerAdapter, BinancePublicInstrument, BinancePublicMarket,
+    BinancePublicTicker24hAdapter, BinanceUsdmPremiumIndexAdapter,
+};
 
 const DEFAULT_FULL_PIPELINE_FIXTURE: &str = "fixtures/replay/full_pipeline_simulated";
+const BINANCE_MARKET_DATA_BASE_URL: &str = "https://data-api.binance.vision";
+const BINANCE_SPOT_REST_BASE_URL: &str = "https://data-api.binance.vision";
+const BINANCE_USDM_FUTURES_BASE_URL: &str = "https://fapi.binance.com";
 const RAW_TICKER_FILE: &str = "raw/binance_ticker_24hr.redacted.json";
 const RAW_TICKER_REF: &str = "raw/binance_ticker_24hr.redacted.json";
 const RISK_POLICY_FILE: &str = "risk_policy.yaml";
@@ -64,7 +79,23 @@ const SIM_INSTRUMENT_ID: &str = "inst:BTC-USDC";
 const SIM_BASE_ASSET_ID: &str = "asset:BTC";
 const SIM_QUOTE_ASSET_ID: &str = "asset:USDC";
 const SIM_SETTLEMENT_ASSET_ID: &str = "asset:USDC";
+const BASIS_SYMBOL: &str = "BTCUSDT";
+const BASIS_SPOT_VENUE_ID: &str = "venue:BINANCE-SPOT";
+const BASIS_PERP_VENUE_ID: &str = "venue:BINANCE-USDM";
+const BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:SPOT";
+const BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
+const BASIS_BASE_ASSET_ID: &str = "asset:BTC";
+const BASIS_QUOTE_ASSET_ID: &str = "asset:USDT";
+const BASIS_SETTLEMENT_ASSET_ID: &str = "asset:USDT";
 const MARKET_DATA_MAX_AGE_MS: u64 = 5_000;
+const BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8796";
+const BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+const BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE: &str = "0";
+const BASIS_MONITOR_DEFAULT_NOTIONAL_USD: &str = "100.00";
+const BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS: i128 = 10;
+const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: i128 = 5;
+const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
+const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
 const RECONCILIATION_RUN_ID: &str = "recon:full-pipeline-simulated";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -92,6 +123,9 @@ pub enum RuntimeError {
     MissingFixture {
         path: PathBuf,
     },
+    LiveMarketData {
+        message: String,
+    },
     StrategyRejected {
         reason: String,
         detail: Option<String>,
@@ -117,6 +151,7 @@ impl fmt::Display for RuntimeError {
             Self::MissingFixture { path } => {
                 write!(f, "{}: expected fixture file is missing", path.display())
             }
+            Self::LiveMarketData { message } => write!(f, "live market data failed: {message}"),
             Self::StrategyRejected { reason, detail } => {
                 write!(f, "strategy rejected candidate with reason `{reason}`")?;
                 if let Some(detail) = detail {
@@ -470,6 +505,115 @@ pub struct EndToEndRunReport {
     pub comparisons: Vec<GoldenComparison>,
 }
 
+/// 单次真实只读行情 + 模拟执行运行结果。
+///
+/// 中文说明：该报告只表示公开行情被读取并进入模拟管线；它不包含真实下单、
+/// 撤单、转账、签名或任何真实账户变化。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveMarketSimulationReport {
+    pub fixture_root: PathBuf,
+    pub symbol: String,
+    pub source_url: String,
+    pub ingested_at: String,
+    pub artifacts: EndToEndArtifacts,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// 单次 Binance 现货-永续 basis 只读扫描结果。
+///
+/// 中文说明：该报告只包含公开行情、标准化事件、策略候选或拒绝诊断；不包含
+/// API key、账户余额、签名、下单、撤单或转账。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisScanReport {
+    pub symbol: String,
+    pub spot_book_ticker_url: String,
+    pub perp_book_ticker_url: String,
+    pub premium_index_url: String,
+    pub ingested_at: String,
+    pub stored_events_jsonl: String,
+    pub candidate_transitions_jsonl: String,
+    pub rejection_reason: Option<String>,
+    pub rejection_detail: Option<String>,
+    pub diagnostics: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance basis 长驻监控选项。
+///
+/// 中文说明：监控仅使用公开行情，不读取账户，不提交订单。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisMonitorOptions {
+    pub bind_addr: String,
+    pub poll_interval_secs: u64,
+    pub min_abs_funding_rate: String,
+    pub notional_usd: String,
+    pub spot_taker_fee_bps: i128,
+    pub perp_taker_fee_bps: i128,
+    pub slippage_buffer_bps: i128,
+    pub min_net_bps: i128,
+    pub once: bool,
+    pub output_dir: Option<PathBuf>,
+}
+
+impl Default for BinanceBasisMonitorOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: BASIS_MONITOR_DEFAULT_BIND_ADDR.to_owned(),
+            poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
+            min_abs_funding_rate: BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE.to_owned(),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
+            perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            min_net_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+            once: false,
+            output_dir: None,
+        }
+    }
+}
+
+/// 单个 symbol 的实时 basis 行情行。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisMarketRow {
+    pub symbol: String,
+    pub spot_bid: Option<String>,
+    pub spot_ask: Option<String>,
+    pub spot_bid_qty: Option<String>,
+    pub spot_ask_qty: Option<String>,
+    pub perp_bid: Option<String>,
+    pub perp_ask: Option<String>,
+    pub perp_bid_qty: Option<String>,
+    pub perp_ask_qty: Option<String>,
+    pub mark_price: String,
+    pub index_price: String,
+    pub last_funding_rate: String,
+    pub next_funding_time_ms: String,
+    pub gross_basis_bps: Option<String>,
+    pub total_cost_bps: Option<String>,
+    pub net_basis_bps: Option<String>,
+    pub quantity: Option<String>,
+    pub expected_profit_usd: Option<String>,
+    pub is_candidate: bool,
+    pub reason: Option<String>,
+    pub source_status: String,
+}
+
+/// Binance basis 监控快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisMonitorSnapshot {
+    pub status: String,
+    pub updated_at: String,
+    pub min_abs_funding_rate: String,
+    pub min_net_bps: String,
+    pub total_rows: usize,
+    pub candidate_count: usize,
+    pub filtered_funding_count: usize,
+    pub missing_spot_count: usize,
+    pub missing_perp_count: usize,
+    pub last_error: Option<String>,
+    pub rows: Vec<BinanceBasisMarketRow>,
+}
+
 /// 端到端管线的稳定输出。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndToEndArtifacts {
@@ -584,6 +728,15 @@ pub fn run_full_pipeline_fixture_with_options(
 /// 从配置字符串启动运行时装配服务。
 pub fn start_runtime_from_config_yaml(input: &str) -> RuntimeResult<RuntimeService> {
     let config = arb_config::ArbConfig::from_yaml_str(input)?;
+    start_runtime_with_config(&config)
+}
+
+/// 从配置文件启动运行时装配服务。
+///
+/// 中文说明：该入口只读取本地配置并运行启动检查，不访问网络、不读取凭证、
+/// 不启动真实交易 API，也不提交任何真实账户动作。
+pub fn start_runtime_from_config_path(path: impl AsRef<Path>) -> RuntimeResult<RuntimeService> {
+    let config = arb_config::ArbConfig::from_path(path)?;
     start_runtime_with_config(&config)
 }
 
@@ -852,24 +1005,46 @@ fn assemble_full_pipeline(fixture_root: &Path) -> RuntimeResult<EndToEndArtifact
     let replay = arb_replay::load_fixture(fixture_root)?;
     ensure_simulated_offline_config(replay.config())?;
 
-    let fixed_time = replay.time_source().now().to_owned();
-    let fixed_timestamp = UtcTimestamp::parse_rfc3339_z(&fixed_time)?;
+    let fixed_timestamp = UtcTimestamp::parse_rfc3339_z(replay.time_source().now())?;
+    assemble_full_pipeline_with_market_source(
+        fixture_root,
+        &replay,
+        MarketDataSource::Fixture,
+        fixed_timestamp,
+    )
+}
+
+fn assemble_full_pipeline_with_market_source(
+    fixture_root: &Path,
+    replay: &ReplayInput,
+    market_source: MarketDataSource<'_>,
+    pipeline_time: UtcTimestamp,
+) -> RuntimeResult<EndToEndArtifacts> {
+    let fixed_time = pipeline_time.to_string();
     let _temp_dir = RuntimeTempDir::new()?;
     let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
 
     for event in replay.events() {
         event_store.append(event)?;
     }
-    for event in ingest_read_only_fixture_data(fixture_root, fixed_timestamp)? {
-        event_store.append(&event)?;
+    let market_data = ingest_market_data_source(fixture_root, market_source, pipeline_time)?;
+    for event in &market_data.events {
+        event_store.append(event)?;
     }
 
     let stored_events = event_store.read_all_ordered()?;
-    let portfolio_state = build_portfolio_state_from_fixture(fixture_root, &stored_events)?;
+    let portfolio_state = build_portfolio_state_from_fixture(
+        fixture_root,
+        &stored_events,
+        market_data.portfolio_state_source_event_ref.as_deref(),
+        market_data
+            .portfolio_state_as_of
+            .map(|timestamp| timestamp.to_string()),
+    )?;
     let venue_capabilities = load_venue_capabilities(fixture_root)?;
 
     let candidate = run_strategy(
-        &replay,
+        replay,
         &stored_events,
         &portfolio_state,
         &venue_capabilities,
@@ -880,7 +1055,7 @@ fn assemble_full_pipeline(fixture_root: &Path) -> RuntimeResult<EndToEndArtifact
         &portfolio_state,
         replay.config(),
         &venue_capabilities,
-        fixed_timestamp,
+        pipeline_time,
     )?;
 
     if !risk_decision_allows_execution(&risk_decision) {
@@ -917,7 +1092,7 @@ fn assemble_full_pipeline(fixture_root: &Path) -> RuntimeResult<EndToEndArtifact
     let domain_ledger_entries = append_to_simulated_ledger(&contract_ledger_entries)?;
     let fill_snapshots = fill_snapshots_from_report(&execution_report, &contract_ledger_entries)?;
     let reconciliation_report =
-        run_reconciliation(fixed_timestamp, &domain_ledger_entries, &fill_snapshots)?;
+        run_reconciliation(pipeline_time, &domain_ledger_entries, &fill_snapshots)?;
     let operations_report = run_operations_report(
         &event_store,
         std::slice::from_ref(&risk_decision),
@@ -942,6 +1117,883 @@ fn assemble_full_pipeline(fixture_root: &Path) -> RuntimeResult<EndToEndArtifact
         incidents_jsonl: String::new(),
         operations_daily_report_md: operations_report,
     })
+}
+
+#[derive(Clone, Copy)]
+enum MarketDataSource<'a> {
+    Fixture,
+    BinancePublicTicker24h {
+        raw_json: &'a str,
+        raw_response_ref: &'a str,
+        ingested_at: UtcTimestamp,
+    },
+}
+
+struct MarketDataEvents {
+    events: Vec<NormalizedEvent>,
+    portfolio_state_source_event_ref: Option<String>,
+    portfolio_state_as_of: Option<UtcTimestamp>,
+}
+
+fn ingest_market_data_source(
+    fixture_root: &Path,
+    source: MarketDataSource<'_>,
+    default_ingested_at: UtcTimestamp,
+) -> RuntimeResult<MarketDataEvents> {
+    match source {
+        MarketDataSource::Fixture => Ok(MarketDataEvents {
+            events: ingest_read_only_fixture_data(fixture_root, default_ingested_at)?,
+            portfolio_state_source_event_ref: None,
+            portfolio_state_as_of: None,
+        }),
+        MarketDataSource::BinancePublicTicker24h {
+            raw_json,
+            raw_response_ref,
+            ingested_at,
+        } => {
+            let events =
+                ingest_binance_public_ticker_json(raw_json, raw_response_ref, ingested_at)?;
+            let live_event_ref = events
+                .last()
+                .map(|event| event.event_id.as_str().to_owned())
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: "live ticker ingestion produced no normalized event".to_owned(),
+                })?;
+            Ok(MarketDataEvents {
+                events,
+                portfolio_state_source_event_ref: Some(live_event_ref),
+                portfolio_state_as_of: Some(ingested_at),
+            })
+        }
+    }
+}
+
+/// 拉取一次公开真实行情并运行模拟管线。
+///
+/// 中文说明：当前命令只支持与主 fixture 对齐的 `BTCUSDT` 公共市场数据。
+/// 它不使用 API key，不访问账户数据，不提交真实订单，也不会更新黄金文件。
+pub fn run_live_market_simulation(
+    fixture_root: impl AsRef<Path>,
+    symbol: &str,
+    output_dir: Option<PathBuf>,
+) -> RuntimeResult<LiveMarketSimulationReport> {
+    let symbol = validate_live_market_symbol(symbol)?;
+    let fixture_root = resolve_fixture_root(fixture_root.as_ref());
+    validate_full_pipeline_context(&fixture_root)?;
+    let replay = arb_replay::load_fixture(&fixture_root)?;
+    ensure_simulated_offline_config(replay.config())?;
+
+    let source_url = binance_ticker_24h_url(&symbol);
+    let raw_json = fetch_public_json_with_curl(&source_url)?;
+    let ingested_at = current_utc_timestamp()?;
+    let artifacts = assemble_full_pipeline_with_market_source(
+        &fixture_root,
+        &replay,
+        MarketDataSource::BinancePublicTicker24h {
+            raw_json: &raw_json,
+            raw_response_ref: &source_url,
+            ingested_at,
+        },
+        ingested_at,
+    )?;
+
+    if let Some(dir) = &output_dir {
+        write_artifacts_to_dir(dir, &artifacts)?;
+    }
+
+    Ok(LiveMarketSimulationReport {
+        fixture_root,
+        symbol,
+        source_url,
+        ingested_at: ingested_at.to_string(),
+        artifacts,
+        output_dir,
+    })
+}
+
+/// 拉取一次 Binance 公开 spot/perp basis 数据并运行只读策略扫描。
+///
+/// 中文说明：该路径只访问公开 REST 端点，不使用 API key，不访问账户，不下单、
+/// 不撤单、不转账、不签名。输出是候选转换或明确拒绝原因。
+pub fn run_binance_basis_scan(
+    symbol: &str,
+    output_dir: Option<PathBuf>,
+) -> RuntimeResult<BinanceBasisScanReport> {
+    let symbol = validate_binance_basis_symbol(symbol)?;
+    let fixture_root = resolve_fixture_root(Path::new(DEFAULT_FULL_PIPELINE_FIXTURE));
+    validate_full_pipeline_context(&fixture_root)?;
+    let replay = arb_replay::load_fixture(&fixture_root)?;
+    ensure_simulated_offline_config(replay.config())?;
+
+    let spot_book_ticker_url = binance_spot_book_ticker_url(&symbol);
+    let perp_book_ticker_url = binance_usdm_book_ticker_url(&symbol);
+    let premium_index_url = binance_usdm_premium_index_url(&symbol);
+    let raw_spot_book = fetch_public_json_with_curl(&spot_book_ticker_url)?;
+    let raw_perp_book = fetch_public_json_with_curl(&perp_book_ticker_url)?;
+    let raw_premium_index = fetch_public_json_with_curl(&premium_index_url)?;
+    let ingested_at = current_utc_timestamp()?;
+
+    let raw_inputs = BinanceBasisRawInputs {
+        symbol: &symbol,
+        raw_spot_book: &raw_spot_book,
+        spot_book_ref: &spot_book_ticker_url,
+        raw_perp_book: &raw_perp_book,
+        perp_book_ref: &perp_book_ticker_url,
+        raw_premium_index: &raw_premium_index,
+        premium_index_ref: &premium_index_url,
+    };
+    let events = ingest_binance_basis_public_json(raw_inputs, ingested_at)?;
+
+    let _temp_dir = RuntimeTempDir::new()?;
+    let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
+    for event in &events {
+        event_store.append(event)?;
+    }
+    let stored_events = event_store.read_all_ordered()?;
+    let source_event_refs = events
+        .iter()
+        .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
+        .map(|event| event.event_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let portfolio_state = build_binance_basis_portfolio_state(&source_event_refs, ingested_at)?;
+    ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
+    let venue_capabilities = load_binance_basis_capabilities()?;
+    let evaluation = run_spot_perp_basis_strategy(
+        replay.config(),
+        &stored_events,
+        &portfolio_state,
+        &venue_capabilities,
+        &ingested_at.to_string(),
+    )?;
+
+    let candidate_transitions_jsonl = evaluation
+        .candidate()
+        .map(|candidate| canonical_jsonl(std::slice::from_ref(candidate)))
+        .unwrap_or_default();
+    let (rejection_reason, rejection_detail) = evaluation
+        .rejection()
+        .map(|rejection| {
+            (
+                Some(rejection.reason().as_str().to_owned()),
+                rejection.detail().map(str::to_owned),
+            )
+        })
+        .unwrap_or((None, None));
+    let diagnostics = evaluation
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| format!("{}: {}", diagnostic.code(), diagnostic.detail()))
+        .collect::<Vec<_>>();
+    let stored_events_jsonl = stored_events_jsonl(&stored_events);
+
+    let report = BinanceBasisScanReport {
+        symbol,
+        spot_book_ticker_url,
+        perp_book_ticker_url,
+        premium_index_url,
+        ingested_at: ingested_at.to_string(),
+        stored_events_jsonl,
+        candidate_transitions_jsonl,
+        rejection_reason,
+        rejection_detail,
+        diagnostics,
+        output_dir,
+    };
+    if let Some(dir) = &report.output_dir {
+        write_binance_basis_scan_artifacts(dir, &report)?;
+    }
+    Ok(report)
+}
+
+/// 运行 Binance basis 7*24 只读监控。
+///
+/// 中文说明：默认会启动本地 HTTP API，并按固定间隔刷新全量公开行情；`once`
+/// 仅用于手动验收或测试，不代表 7*24 模式。
+pub fn run_binance_basis_monitor(options: BinanceBasisMonitorOptions) -> RuntimeResult<()> {
+    validate_monitor_options(&options)?;
+    let state = Arc::new(RwLock::new(BinanceBasisMonitorSnapshot::empty(&options)));
+    if !options.once {
+        start_binance_basis_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "binance-basis-monitor: api=http://{} poll_interval_secs={} min_abs_funding_rate={} mutable_execution_started=false",
+            options.bind_addr, options.poll_interval_secs, options.min_abs_funding_rate
+        );
+    }
+
+    loop {
+        match fetch_binance_basis_monitor_snapshot(&options) {
+            Ok(snapshot) => {
+                if let Some(dir) = &options.output_dir {
+                    write_binance_basis_monitor_snapshot(dir, &snapshot)?;
+                }
+                *state.write().expect("monitor state lock poisoned") = snapshot;
+            }
+            Err(error) => {
+                if options.once {
+                    return Err(error);
+                }
+                let mut snapshot = state.write().expect("monitor state lock poisoned");
+                snapshot.status = "degraded".to_owned();
+                snapshot.last_error = Some(error.to_string());
+                snapshot.updated_at = current_utc_timestamp()
+                    .map(|timestamp| timestamp.to_string())
+                    .unwrap_or_else(|_| "unknown".to_owned());
+            }
+        }
+
+        if options.once {
+            break;
+        }
+        thread::sleep(Duration::from_secs(options.poll_interval_secs));
+    }
+    Ok(())
+}
+
+fn validate_monitor_options(options: &BinanceBasisMonitorOptions) -> RuntimeResult<()> {
+    if options.poll_interval_secs == 0 {
+        return Err(cli_arg_error("poll interval must be greater than zero"));
+    }
+    MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
+    MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    Ok(())
+}
+
+fn fetch_binance_basis_monitor_snapshot(
+    options: &BinanceBasisMonitorOptions,
+) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
+    let spot_json = fetch_public_json_with_curl(&binance_spot_book_ticker_all_url())?;
+    let perp_json = fetch_public_json_with_curl(&binance_usdm_book_ticker_all_url())?;
+    let premium_json = fetch_public_json_with_curl(&binance_usdm_premium_index_all_url())?;
+    build_binance_basis_monitor_snapshot_from_json(&spot_json, &perp_json, &premium_json, options)
+}
+
+fn build_binance_basis_monitor_snapshot_from_json(
+    spot_json: &str,
+    perp_json: &str,
+    premium_json: &str,
+    options: &BinanceBasisMonitorOptions,
+) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
+    let updated_at = current_utc_timestamp()?.to_string();
+    let min_abs_funding_rate =
+        MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
+    let spot_books = parse_book_ticker_rows(spot_json, "spot")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let perp_books = parse_book_ticker_rows(perp_json, "usdm-perp")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let premiums = parse_premium_index_rows(premium_json)?;
+
+    let mut rows = Vec::new();
+    let mut filtered_funding_count = 0_usize;
+    let mut missing_spot_count = 0_usize;
+    let mut missing_perp_count = 0_usize;
+
+    for premium in premiums {
+        if !premium.symbol.ends_with("USDT") {
+            continue;
+        }
+        let funding_rate = MonitorDecimal::parse("lastFundingRate", &premium.last_funding_rate)?;
+        if funding_rate.abs_less_than(min_abs_funding_rate) {
+            filtered_funding_count += 1;
+            continue;
+        }
+
+        let spot = spot_books.get(&premium.symbol);
+        let perp = perp_books.get(&premium.symbol);
+        let (mut source_status, reason) = match (spot, perp) {
+            (Some(_), Some(_)) => ("complete".to_owned(), None),
+            (None, Some(_)) => {
+                missing_spot_count += 1;
+                (
+                    "missing_spot".to_owned(),
+                    Some("MISSING_SPOT_BOOK_TICKER".to_owned()),
+                )
+            }
+            (Some(_), None) => {
+                missing_perp_count += 1;
+                (
+                    "missing_perp".to_owned(),
+                    Some("MISSING_PERP_BOOK_TICKER".to_owned()),
+                )
+            }
+            (None, None) => {
+                missing_spot_count += 1;
+                missing_perp_count += 1;
+                (
+                    "missing_spot_and_perp".to_owned(),
+                    Some("MISSING_SPOT_AND_PERP_BOOK_TICKER".to_owned()),
+                )
+            }
+        };
+
+        let mut signal_error = None;
+        let signal = match (spot, perp) {
+            (Some(spot), Some(perp)) => {
+                match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+                    symbol: premium.symbol.clone(),
+                    spot_best_bid: spot.bid_price.clone(),
+                    spot_best_ask: spot.ask_price.clone(),
+                    perp_best_bid: perp.bid_price.clone(),
+                    perp_best_ask: perp.ask_price.clone(),
+                    notional_usd: options.notional_usd.clone(),
+                    spot_taker_fee_bps: options.spot_taker_fee_bps,
+                    perp_taker_fee_bps: options.perp_taker_fee_bps,
+                    slippage_buffer_bps: options.slippage_buffer_bps,
+                    min_net_bps: options.min_net_bps,
+                }) {
+                    Ok(signal) => Some(signal),
+                    Err(message) => {
+                        source_status = "invalid_quote".to_owned();
+                        signal_error = Some(message);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let reason = signal
+            .as_ref()
+            .and_then(|signal| signal.reason.clone())
+            .or(signal_error)
+            .or(reason);
+
+        rows.push(BinanceBasisMarketRow {
+            symbol: premium.symbol,
+            spot_bid: spot.map(|row| row.bid_price.clone()),
+            spot_ask: spot.map(|row| row.ask_price.clone()),
+            spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
+            spot_ask_qty: spot.map(|row| row.ask_qty.clone()),
+            perp_bid: perp.map(|row| row.bid_price.clone()),
+            perp_ask: perp.map(|row| row.ask_price.clone()),
+            perp_bid_qty: perp.map(|row| row.bid_qty.clone()),
+            perp_ask_qty: perp.map(|row| row.ask_qty.clone()),
+            mark_price: premium.mark_price,
+            index_price: premium.index_price,
+            last_funding_rate: premium.last_funding_rate,
+            next_funding_time_ms: premium.next_funding_time_ms,
+            gross_basis_bps: signal.as_ref().map(|signal| signal.gross_bps.to_string()),
+            total_cost_bps: signal
+                .as_ref()
+                .map(|signal| signal.total_cost_bps.to_string()),
+            net_basis_bps: signal.as_ref().map(|signal| signal.net_bps.to_string()),
+            quantity: signal.as_ref().map(|signal| signal.quantity.clone()),
+            expected_profit_usd: signal
+                .as_ref()
+                .map(|signal| signal.expected_profit_usd.clone()),
+            is_candidate: signal.as_ref().is_some_and(|signal| signal.is_candidate),
+            reason,
+            source_status,
+        });
+    }
+
+    rows.sort_by(|left, right| {
+        monitor_optional_i128(&right.net_basis_bps)
+            .cmp(&monitor_optional_i128(&left.net_basis_bps))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
+
+    Ok(BinanceBasisMonitorSnapshot {
+        status: "healthy".to_owned(),
+        updated_at,
+        min_abs_funding_rate: options.min_abs_funding_rate.clone(),
+        min_net_bps: options.min_net_bps.to_string(),
+        total_rows: rows.len(),
+        candidate_count,
+        filtered_funding_count,
+        missing_spot_count,
+        missing_perp_count,
+        last_error: None,
+        rows,
+    })
+}
+
+fn validate_live_market_symbol(symbol: &str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if symbol == SIM_SYMBOL {
+        Ok(symbol)
+    } else {
+        Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "only {SIM_SYMBOL} is currently wired to the full-pipeline fixture; got `{symbol}`"
+            ),
+        })
+    }
+}
+
+fn validate_binance_basis_symbol(symbol: &str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if symbol == BASIS_SYMBOL {
+        Ok(symbol)
+    } else {
+        Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "only {BASIS_SYMBOL} is currently wired to the Binance spot-perp basis strategy; got `{symbol}`"
+            ),
+        })
+    }
+}
+
+fn binance_ticker_24h_url(symbol: &str) -> String {
+    format!("{BINANCE_MARKET_DATA_BASE_URL}/api/v3/ticker/24hr?symbol={symbol}")
+}
+
+fn binance_spot_book_ticker_url(symbol: &str) -> String {
+    format!("{BINANCE_SPOT_REST_BASE_URL}/api/v3/ticker/bookTicker?symbol={symbol}")
+}
+
+fn binance_spot_book_ticker_all_url() -> String {
+    format!("{BINANCE_SPOT_REST_BASE_URL}/api/v3/ticker/bookTicker")
+}
+
+fn binance_usdm_book_ticker_url(symbol: &str) -> String {
+    format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/ticker/bookTicker?symbol={symbol}")
+}
+
+fn binance_usdm_book_ticker_all_url() -> String {
+    format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/ticker/bookTicker")
+}
+
+fn binance_usdm_premium_index_url(symbol: &str) -> String {
+    format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/premiumIndex?symbol={symbol}")
+}
+
+fn binance_usdm_premium_index_all_url() -> String {
+    format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/premiumIndex")
+}
+
+fn fetch_public_json_with_curl(url: &str) -> RuntimeResult<String> {
+    let output = Command::new("curl")
+        .args(["-fsS", "--max-time", "10", url])
+        .output()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot run curl for public market data: {error}"),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("curl returned {}; stderr={}", output.status, stderr.trim()),
+        });
+    }
+
+    let body = String::from_utf8(output.stdout).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("public market data response was not UTF-8: {error}"),
+    })?;
+    if body.trim().is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: "public market data response was empty".to_owned(),
+        });
+    }
+    Ok(body)
+}
+
+fn current_utc_timestamp() -> RuntimeResult<UtcTimestamp> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("system time is before Unix epoch: {error}"),
+        })?;
+    let seconds = i64::try_from(now.as_secs()).map_err(|_| RuntimeError::LiveMarketData {
+        message: "current Unix timestamp does not fit i64".to_owned(),
+    })?;
+    Ok(UtcTimestamp::from_unix_parts(seconds, now.subsec_nanos())?)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MonitorDecimal {
+    raw: i128,
+}
+
+impl MonitorDecimal {
+    const SCALE_DIGITS: usize = 8;
+
+    fn parse(field: &'static str, value: &str) -> RuntimeResult<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("decimal field `{field}` cannot be empty"),
+            });
+        }
+        let negative = value.starts_with('-');
+        let unsigned = value.strip_prefix('-').unwrap_or(value);
+        if unsigned.is_empty() || unsigned.starts_with('.') || unsigned.ends_with('.') {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("decimal field `{field}` is malformed: `{value}`"),
+            });
+        }
+        let mut raw = 0_i128;
+        let mut dot_seen = false;
+        let mut digits_seen = false;
+        let mut fraction_digits = 0_usize;
+        for byte in unsigned.bytes() {
+            match byte {
+                b'0'..=b'9' => {
+                    digits_seen = true;
+                    if dot_seen {
+                        if fraction_digits == Self::SCALE_DIGITS {
+                            return Err(RuntimeError::LiveMarketData {
+                                message: format!(
+                                    "decimal field `{field}` exceeds {} fractional digits",
+                                    Self::SCALE_DIGITS
+                                ),
+                            });
+                        }
+                        fraction_digits += 1;
+                    }
+                    raw = raw
+                        .checked_mul(10)
+                        .and_then(|scaled| scaled.checked_add(i128::from(byte - b'0')))
+                        .ok_or_else(|| RuntimeError::LiveMarketData {
+                            message: format!("decimal field `{field}` overflowed"),
+                        })?;
+                }
+                b'.' if !dot_seen => dot_seen = true,
+                _ => {
+                    return Err(RuntimeError::LiveMarketData {
+                        message: format!("decimal field `{field}` is malformed: `{value}`"),
+                    });
+                }
+            }
+        }
+        if !digits_seen {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("decimal field `{field}` has no digits"),
+            });
+        }
+        for _ in fraction_digits..Self::SCALE_DIGITS {
+            raw = raw
+                .checked_mul(10)
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("decimal field `{field}` overflowed"),
+                })?;
+        }
+        if negative {
+            raw = raw
+                .checked_neg()
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("decimal field `{field}` overflowed"),
+                })?;
+        }
+        Ok(Self { raw })
+    }
+
+    fn abs_less_than(self, other: Self) -> bool {
+        self.raw.abs() < other.raw.abs()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MonitorBookTickerRow {
+    symbol: String,
+    bid_price: String,
+    bid_qty: String,
+    ask_price: String,
+    ask_qty: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MonitorPremiumIndexRow {
+    symbol: String,
+    mark_price: String,
+    index_price: String,
+    last_funding_rate: String,
+    next_funding_time_ms: String,
+}
+
+fn parse_book_ticker_rows(
+    input: &str,
+    source_name: &'static str,
+) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    json_object_slices(input)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_flat_json_object(object)?;
+            Ok(MonitorBookTickerRow {
+                symbol: required_json_string(&fields, "symbol", source_name)?,
+                bid_price: required_json_string(&fields, "bidPrice", source_name)?,
+                bid_qty: required_json_string(&fields, "bidQty", source_name)?,
+                ask_price: required_json_string(&fields, "askPrice", source_name)?,
+                ask_qty: required_json_string(&fields, "askQty", source_name)?,
+            })
+        })
+        .collect()
+}
+
+fn parse_premium_index_rows(input: &str) -> RuntimeResult<Vec<MonitorPremiumIndexRow>> {
+    json_object_slices(input)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_flat_json_object(object)?;
+            Ok(MonitorPremiumIndexRow {
+                symbol: required_json_string(&fields, "symbol", "premiumIndex")?,
+                mark_price: required_json_string(&fields, "markPrice", "premiumIndex")?,
+                index_price: required_json_string(&fields, "indexPrice", "premiumIndex")?,
+                last_funding_rate: required_json_string(
+                    &fields,
+                    "lastFundingRate",
+                    "premiumIndex",
+                )?,
+                next_funding_time_ms: required_json_scalar(
+                    &fields,
+                    "nextFundingTime",
+                    "premiumIndex",
+                )?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MonitorJsonScalar {
+    String(String),
+    Number(String),
+    Bool(String),
+    Null,
+}
+
+fn json_object_slices(input: &str) -> RuntimeResult<Vec<&str>> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        return Ok(vec![trimmed]);
+    }
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return Err(RuntimeError::LiveMarketData {
+            message: "expected JSON object or array of objects".to_owned(),
+        });
+    }
+
+    let mut objects = Vec::new();
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut object_start = None;
+    for (index, ch) in trimmed.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    object_start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(RuntimeError::LiveMarketData {
+                        message: "malformed JSON array: unmatched object close".to_owned(),
+                    });
+                }
+                if depth == 0 {
+                    let start = object_start.ok_or_else(|| RuntimeError::LiveMarketData {
+                        message: "malformed JSON array: missing object start".to_owned(),
+                    })?;
+                    objects.push(&trimmed[start..index + ch.len_utf8()]);
+                    object_start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || in_string {
+        return Err(RuntimeError::LiveMarketData {
+            message: "malformed JSON array".to_owned(),
+        });
+    }
+    Ok(objects)
+}
+
+fn parse_flat_json_object(input: &str) -> RuntimeResult<BTreeMap<String, MonitorJsonScalar>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(RuntimeError::LiveMarketData {
+            message: "expected JSON object".to_owned(),
+        });
+    }
+    let mut fields = BTreeMap::new();
+    let bytes = trimmed.as_bytes();
+    let mut index = 1_usize;
+    while index + 1 < bytes.len() {
+        index = skip_json_ws(bytes, index);
+        if bytes.get(index) == Some(&b'}') {
+            break;
+        }
+        let (key, after_key) = parse_json_string(trimmed, index)?;
+        index = skip_json_ws(bytes, after_key);
+        if bytes.get(index) != Some(&b':') {
+            return Err(RuntimeError::LiveMarketData {
+                message: "expected ':' after JSON object key".to_owned(),
+            });
+        }
+        index = skip_json_ws(bytes, index + 1);
+        let (value, after_value) = parse_json_scalar(trimmed, index)?;
+        fields.insert(key, value);
+        index = skip_json_ws(bytes, after_value);
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => break,
+            _ => {
+                return Err(RuntimeError::LiveMarketData {
+                    message: "expected ',' or '}' after JSON object value".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn parse_json_scalar(input: &str, index: usize) -> RuntimeResult<(MonitorJsonScalar, usize)> {
+    let bytes = input.as_bytes();
+    match bytes.get(index) {
+        Some(b'"') => {
+            let (value, after) = parse_json_string(input, index)?;
+            Ok((MonitorJsonScalar::String(value), after))
+        }
+        Some(b'n') if input[index..].starts_with("null") => {
+            Ok((MonitorJsonScalar::Null, index + 4))
+        }
+        Some(b't') if input[index..].starts_with("true") => {
+            Ok((MonitorJsonScalar::Bool("true".to_owned()), index + 4))
+        }
+        Some(b'f') if input[index..].starts_with("false") => {
+            Ok((MonitorJsonScalar::Bool("false".to_owned()), index + 5))
+        }
+        Some(_) => {
+            let mut end = index;
+            while let Some(byte) = bytes.get(end) {
+                if byte.is_ascii_whitespace() || matches!(byte, b',' | b'}') {
+                    break;
+                }
+                end += 1;
+            }
+            if end == index {
+                return Err(RuntimeError::LiveMarketData {
+                    message: "empty JSON scalar".to_owned(),
+                });
+            }
+            Ok((MonitorJsonScalar::Number(input[index..end].to_owned()), end))
+        }
+        None => Err(RuntimeError::LiveMarketData {
+            message: "unexpected end of JSON while parsing scalar".to_owned(),
+        }),
+    }
+}
+
+fn parse_json_string(input: &str, quote_start: usize) -> RuntimeResult<(String, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.get(quote_start) != Some(&b'"') {
+        return Err(RuntimeError::LiveMarketData {
+            message: "expected JSON string opening quote".to_owned(),
+        });
+    }
+    let mut out = String::new();
+    let mut index = quote_start + 1;
+    while index < input.len() {
+        let ch = input[index..]
+            .chars()
+            .next()
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "unexpected end of JSON string".to_owned(),
+            })?;
+        if ch == '"' {
+            return Ok((out, index + ch.len_utf8()));
+        }
+        if ch == '\\' {
+            let escape_index = index + ch.len_utf8();
+            let escaped = input[escape_index..].chars().next().ok_or_else(|| {
+                RuntimeError::LiveMarketData {
+                    message: "unterminated JSON escape".to_owned(),
+                }
+            })?;
+            match escaped {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    return Err(RuntimeError::LiveMarketData {
+                        message: "unicode JSON escapes are not supported in monitor parser"
+                            .to_owned(),
+                    });
+                }
+                _ => {
+                    return Err(RuntimeError::LiveMarketData {
+                        message: "unsupported JSON escape".to_owned(),
+                    });
+                }
+            }
+            index = escape_index + escaped.len_utf8();
+        } else {
+            out.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: "unterminated JSON string".to_owned(),
+    })
+}
+
+fn skip_json_ws(bytes: &[u8], mut index: usize) -> usize {
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    index
+}
+
+fn required_json_string(
+    fields: &BTreeMap<String, MonitorJsonScalar>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<String> {
+    match fields.get(field) {
+        Some(MonitorJsonScalar::String(value)) => Ok(value.clone()),
+        Some(MonitorJsonScalar::Number(value)) => Ok(value.clone()),
+        _ => Err(RuntimeError::LiveMarketData {
+            message: format!("{source} object is missing string field `{field}`"),
+        }),
+    }
+}
+
+fn required_json_scalar(
+    fields: &BTreeMap<String, MonitorJsonScalar>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<String> {
+    match fields.get(field) {
+        Some(MonitorJsonScalar::String(value))
+        | Some(MonitorJsonScalar::Number(value))
+        | Some(MonitorJsonScalar::Bool(value)) => Ok(value.clone()),
+        Some(MonitorJsonScalar::Null) | None => Err(RuntimeError::LiveMarketData {
+            message: format!("{source} object is missing scalar field `{field}`"),
+        }),
+    }
+}
+
+fn monitor_optional_i128(value: &Option<String>) -> i128 {
+    value
+        .as_deref()
+        .and_then(|value| value.parse::<i128>().ok())
+        .unwrap_or(i128::MIN)
 }
 
 fn validate_full_pipeline_context(fixture_root: &Path) -> RuntimeResult<()> {
@@ -1005,7 +2057,14 @@ fn ingest_read_only_fixture_data(
 ) -> RuntimeResult<Vec<NormalizedEvent>> {
     let raw_path = fixture_root.join(RAW_TICKER_FILE);
     let raw_json = read_utf8(&raw_path)?;
+    ingest_binance_public_ticker_json(&raw_json, RAW_TICKER_REF, ingested_at)
+}
 
+fn ingest_binance_public_ticker_json(
+    raw_json: &str,
+    raw_response_ref: &str,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<Vec<NormalizedEvent>> {
     let venue_id = VenueId::new(SIM_VENUE_ID)?;
     let instrument = BinancePublicInstrument::new(
         SIM_SYMBOL,
@@ -1020,16 +2079,135 @@ fn ingest_read_only_fixture_data(
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
-    let batch = adapter.ingest_ticker_24h_json(&raw_json, RAW_TICKER_REF, ingested_at)?;
+    let batch = adapter.ingest_ticker_24h_json(raw_json, raw_response_ref, ingested_at)?;
     Ok(vec![batch.raw_event, batch.normalized_event])
+}
+
+struct BinanceBasisRawInputs<'a> {
+    symbol: &'a str,
+    raw_spot_book: &'a str,
+    spot_book_ref: &'a str,
+    raw_perp_book: &'a str,
+    perp_book_ref: &'a str,
+    raw_premium_index: &'a str,
+    premium_index_ref: &'a str,
+}
+
+fn ingest_binance_basis_public_json(
+    inputs: BinanceBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<Vec<NormalizedEvent>> {
+    let mut spot_adapter = BinancePublicBookTickerAdapter::new(
+        VenueId::new(BASIS_SPOT_VENUE_ID)?,
+        binance_basis_instrument(inputs.symbol, BASIS_SPOT_INSTRUMENT_ID)?,
+        BinancePublicMarket::Spot,
+        ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let mut perp_adapter = BinancePublicBookTickerAdapter::new(
+        VenueId::new(BASIS_PERP_VENUE_ID)?,
+        binance_basis_instrument(inputs.symbol, BASIS_PERP_INSTRUMENT_ID)?,
+        BinancePublicMarket::UsdmPerpetual,
+        ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let premium_adapter = BinanceUsdmPremiumIndexAdapter::new(
+        VenueId::new(BASIS_PERP_VENUE_ID)?,
+        binance_basis_instrument(inputs.symbol, BASIS_PERP_INSTRUMENT_ID)?,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+
+    let spot_batch = spot_adapter.ingest_book_ticker_json(
+        inputs.raw_spot_book,
+        inputs.spot_book_ref,
+        ingested_at,
+    )?;
+    let perp_batch = perp_adapter.ingest_book_ticker_json(
+        inputs.raw_perp_book,
+        inputs.perp_book_ref,
+        ingested_at,
+    )?;
+    let premium_batch = premium_adapter.ingest_premium_index_json(
+        inputs.raw_premium_index,
+        inputs.premium_index_ref,
+        ingested_at,
+    )?;
+
+    Ok(vec![
+        spot_batch.raw_event,
+        spot_batch.normalized_event,
+        perp_batch.raw_event,
+        perp_batch.normalized_event,
+        premium_batch.raw_event,
+        premium_batch.normalized_event,
+    ])
+}
+
+fn binance_basis_instrument(
+    symbol: &str,
+    instrument_id: &str,
+) -> RuntimeResult<BinancePublicInstrument> {
+    Ok(BinancePublicInstrument::new(
+        symbol,
+        InstrumentId::new(instrument_id)?,
+        AssetId::new(BASIS_BASE_ASSET_ID)?,
+        AssetId::new(BASIS_QUOTE_ASSET_ID)?,
+        AssetId::new(BASIS_SETTLEMENT_ASSET_ID)?,
+    )?
+    .with_tick_size(Price::from_str("0.01")?)
+    .with_lot_size(Quantity::from_str("0.000001")?))
+}
+
+fn build_binance_basis_portfolio_state(
+    source_event_refs: &[String],
+    as_of: UtcTimestamp,
+) -> RuntimeResult<PortfolioState> {
+    let portfolio_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "portfolio_state_id": "state:binance-basis-public-readonly-01",
+  "as_of": {},
+  "source_event_refs": {},
+  "balances": [],
+  "positions": [],
+  "reservations": [],
+  "open_orders": [],
+  "pending_transfers": [],
+  "confidence": 0.5,
+  "missing_data_flags": [
+    "PRIVATE_BALANCE_UNAVAILABLE"
+  ],
+  "state_hash": "hash:binance-basis-public-readonly-01"
+}}"#,
+        json_string(&as_of.to_string()),
+        json_string_array(source_event_refs),
+    );
+    Ok(from_json_strict::<PortfolioState>(&portfolio_json)?)
 }
 
 fn build_portfolio_state_from_fixture(
     fixture_root: &Path,
     stored_events: &[arb_eventstore::StoredEvent],
+    source_event_ref_override: Option<&str>,
+    as_of_override: Option<String>,
 ) -> RuntimeResult<PortfolioState> {
     let path = fixture_root.join("portfolio_state.json");
-    let state = from_json_strict::<PortfolioState>(&read_utf8(&path)?)?;
+    let mut input = read_utf8(&path)?;
+    if let Some(as_of) = as_of_override {
+        input = replace_json_string_field(&input, "as_of", &as_of)?;
+    }
+    if let Some(event_ref) = source_event_ref_override {
+        input = replace_json_string_array_field(&input, "source_event_refs", &[event_ref])?;
+    }
+    let state = from_json_strict::<PortfolioState>(&input)?;
+    ensure_portfolio_state_source_refs_exist(&state, stored_events)?;
+    Ok(state)
+}
+
+fn ensure_portfolio_state_source_refs_exist(
+    state: &PortfolioState,
+    stored_events: &[arb_eventstore::StoredEvent],
+) -> RuntimeResult<()> {
     let event_ids = stored_events
         .iter()
         .map(|record| record.event.event_id.as_str().to_owned())
@@ -1047,7 +2225,152 @@ fn build_portfolio_state_from_fixture(
             });
         }
     }
-    Ok(state)
+    Ok(())
+}
+
+fn replace_json_string_field(input: &str, field: &str, value: &str) -> RuntimeResult<String> {
+    let key = format!("\"{field}\"");
+    let key_start = input.find(&key).ok_or_else(|| RuntimeError::Module {
+        module: "arb-runtime",
+        message: format!("portfolio fixture is missing string field `{field}`"),
+    })?;
+    let after_key = key_start + key.len();
+    let colon = after_key
+        + input[after_key..]
+            .find(':')
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("portfolio fixture field `{field}` is missing ':'"),
+            })?;
+    let quote_start = colon
+        + 1
+        + input[colon + 1..]
+            .find('"')
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("portfolio fixture field `{field}` is not a JSON string"),
+            })?;
+    let quote_end = json_string_end(input, quote_start)?;
+
+    let mut output = String::with_capacity(input.len() + value.len());
+    output.push_str(&input[..quote_start]);
+    output.push_str(&json_string(value));
+    output.push_str(&input[quote_end..]);
+    Ok(output)
+}
+
+fn replace_json_string_array_field(
+    input: &str,
+    field: &str,
+    values: &[&str],
+) -> RuntimeResult<String> {
+    let key = format!("\"{field}\"");
+    let key_start = input.find(&key).ok_or_else(|| RuntimeError::Module {
+        module: "arb-runtime",
+        message: format!("portfolio fixture is missing array field `{field}`"),
+    })?;
+    let after_key = key_start + key.len();
+    let colon = after_key
+        + input[after_key..]
+            .find(':')
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("portfolio fixture field `{field}` is missing ':'"),
+            })?;
+    let bracket_start = colon
+        + 1
+        + input[colon + 1..]
+            .find('[')
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("portfolio fixture field `{field}` is not a JSON array"),
+            })?;
+    let bracket_end = json_array_end(input, bracket_start)?;
+    let replacement = format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let mut output = String::with_capacity(input.len() + replacement.len());
+    output.push_str(&input[..bracket_start]);
+    output.push_str(&replacement);
+    output.push_str(&input[bracket_end..]);
+    Ok(output)
+}
+
+fn json_string_end(input: &str, quote_start: usize) -> RuntimeResult<usize> {
+    let bytes = input.as_bytes();
+    if bytes.get(quote_start) != Some(&b'"') {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: "internal JSON replacement expected a string opening quote".to_owned(),
+        });
+    }
+
+    let mut escaped = false;
+    for (offset, ch) in input[quote_start + 1..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Ok(quote_start + 1 + offset + ch.len_utf8());
+        }
+    }
+    Err(RuntimeError::Module {
+        module: "arb-runtime",
+        message: "portfolio fixture contains an unterminated JSON string".to_owned(),
+    })
+}
+
+fn json_array_end(input: &str, bracket_start: usize) -> RuntimeResult<usize> {
+    let bytes = input.as_bytes();
+    if bytes.get(bracket_start) != Some(&b'[') {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: "internal JSON replacement expected an array opening bracket".to_owned(),
+        });
+    }
+
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in input[bracket_start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.checked_sub(1).ok_or_else(|| RuntimeError::Module {
+                    module: "arb-runtime",
+                    message: "portfolio fixture has an unmatched JSON array bracket".to_owned(),
+                })?;
+                if depth == 0 {
+                    return Ok(bracket_start + offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(RuntimeError::Module {
+        module: "arb-runtime",
+        message: "portfolio fixture contains an unterminated JSON array".to_owned(),
+    })
 }
 
 fn load_venue_capabilities(fixture_root: &Path) -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
@@ -1074,6 +2397,15 @@ fn load_venue_capabilities(fixture_root: &Path) -> RuntimeResult<Vec<VenueCapabi
         });
     }
     Ok(capabilities)
+}
+
+fn load_binance_basis_capabilities() -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
+    let spot = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesSpotMarkets","ProvidesOrderBookMarkets"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":1200,"source":"binance-public-rest","unit":"Request","window_ms":60000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BINANCE-SPOT","venue_name":"Binance Spot Public REST"}"#;
+    let perp = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders","FundingHistory"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesPerpetuals","ProvidesOrderBookMarkets","ProvidesFundingRates"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":2400,"source":"binance-public-futures-rest","unit":"Request","window_ms":60000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BINANCE-USDM","venue_name":"Binance USD-M Public REST"}"#;
+    Ok(vec![
+        from_json_strict::<VenueCapabilityDescriptor>(spot)?,
+        from_json_strict::<VenueCapabilityDescriptor>(perp)?,
+    ])
 }
 
 fn run_strategy(
@@ -1105,6 +2437,26 @@ fn run_strategy(
         reason: rejection.reason().as_str().to_owned(),
         detail: rejection.detail().map(str::to_owned),
     })
+}
+
+fn run_spot_perp_basis_strategy(
+    config: &arb_config::ArbConfig,
+    stored_events: &[arb_eventstore::StoredEvent],
+    portfolio_state: &PortfolioState,
+    venue_capabilities: &[VenueCapabilityDescriptor],
+    fixed_time: &str,
+) -> RuntimeResult<StrategyEvaluation> {
+    let market_events = stored_events
+        .iter()
+        .map(|record| record.event.clone())
+        .collect::<Vec<_>>();
+    let snapshot = ReadOnlySnapshot::new(portfolio_state.clone(), market_events);
+    let capabilities = VenueCapabilitySnapshot::new(venue_capabilities.to_vec())?;
+    let config = StrategyConfigSnapshot::from_config(config)?;
+    let time = StrategyFixedTimeSource::from_rfc3339_z(fixed_time)?;
+    let input = StrategyInput::new(snapshot, capabilities, config, time);
+    let strategy = spot_perp_basis_strategy()?;
+    Ok(strategy.evaluate(&input)?)
 }
 
 fn run_risk(
@@ -1496,6 +2848,85 @@ fn write_expected_artifacts(
     Ok(comparisons)
 }
 
+fn write_artifacts_to_dir(
+    output_dir: &Path,
+    artifacts: &EndToEndArtifacts,
+) -> RuntimeResult<Vec<GoldenComparison>> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut written = Vec::new();
+    for artifact in artifacts.files() {
+        let path = output_dir.join(artifact.file_name);
+        fs::write(&path, artifact.contents).map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        written.push(GoldenComparison {
+            artifact: artifact.artifact,
+            path,
+            bytes: artifact.contents.len(),
+        });
+    }
+    Ok(written)
+}
+
+fn write_binance_basis_scan_artifacts(
+    output_dir: &Path,
+    report: &BinanceBasisScanReport,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("binance_basis_events.jsonl"),
+        &report.stored_events_jsonl,
+    )?;
+    write_utf8(
+        output_dir.join("binance_basis_candidate_transitions.jsonl"),
+        &report.candidate_transitions_jsonl,
+    )?;
+    let rejection = report
+        .rejection_reason
+        .as_ref()
+        .map(|reason| {
+            format!(
+                "reason={reason}\ndetail={}\n",
+                report.rejection_detail.as_deref().unwrap_or("")
+            )
+        })
+        .unwrap_or_default();
+    write_utf8(output_dir.join("binance_basis_rejection.txt"), &rejection)?;
+    write_utf8(
+        output_dir.join("binance_basis_diagnostics.txt"),
+        &report.diagnostics.join("\n"),
+    )?;
+    Ok(())
+}
+
+fn write_binance_basis_monitor_snapshot(
+    output_dir: &Path,
+    snapshot: &BinanceBasisMonitorSnapshot,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("binance_basis_monitor_snapshot.json"),
+        &snapshot.to_json(),
+    )
+}
+
+fn write_utf8(path: PathBuf, contents: &str) -> RuntimeResult<()> {
+    fs::write(&path, contents).map_err(|error| RuntimeError::Io {
+        path,
+        message: error.to_string(),
+    })
+}
+
 fn compare_expected_artifacts(
     fixture_root: &Path,
     artifacts: &EndToEndArtifacts,
@@ -1564,6 +2995,789 @@ fn json_string(value: &str) -> String {
     out
 }
 
+fn json_string_array(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_string(value));
+    }
+    out.push(']');
+    out
+}
+
+impl BinanceBasisMonitorSnapshot {
+    fn empty(options: &BinanceBasisMonitorOptions) -> Self {
+        Self {
+            status: "starting".to_owned(),
+            updated_at: "not-yet-updated".to_owned(),
+            min_abs_funding_rate: options.min_abs_funding_rate.clone(),
+            min_net_bps: options.min_net_bps.to_string(),
+            total_rows: 0,
+            candidate_count: 0,
+            filtered_funding_count: 0,
+            missing_spot_count: 0,
+            missing_perp_count: 0,
+            last_error: None,
+            rows: Vec::new(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"candidate_count\":{},\"filtered_funding_count\":{},\"last_error\":{},\"min_abs_funding_rate\":{},\"min_net_bps\":{},\"missing_perp_count\":{},\"missing_spot_count\":{},\"rows\":[{}],\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+            self.candidate_count,
+            self.filtered_funding_count,
+            json_option_string(&self.last_error),
+            json_string(&self.min_abs_funding_rate),
+            json_string(&self.min_net_bps),
+            self.missing_perp_count,
+            self.missing_spot_count,
+            self.rows
+                .iter()
+                .map(BinanceBasisMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string(&self.status),
+            self.total_rows,
+            json_string(&self.updated_at),
+        )
+    }
+
+    fn opportunities_json(&self) -> String {
+        format!(
+            "{{\"candidate_count\":{},\"rows\":[{}],\"status\":{},\"updated_at\":{}}}",
+            self.candidate_count,
+            self.rows
+                .iter()
+                .filter(|row| row.is_candidate)
+                .map(BinanceBasisMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string(&self.status),
+            json_string(&self.updated_at),
+        )
+    }
+
+    fn symbol_json(&self, symbol: &str) -> Option<String> {
+        let symbol = symbol.to_ascii_uppercase();
+        self.rows
+            .iter()
+            .find(|row| row.symbol == symbol)
+            .map(BinanceBasisMarketRow::to_json)
+    }
+}
+
+impl BinanceBasisMarketRow {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"expected_profit_usd\":{},\"gross_basis_bps\":{},\"index_price\":{},\"is_candidate\":{},\"last_funding_rate\":{},\"mark_price\":{},\"net_basis_bps\":{},\"next_funding_time_ms\":{},\"perp_ask\":{},\"perp_ask_qty\":{},\"perp_bid\":{},\"perp_bid_qty\":{},\"quantity\":{},\"reason\":{},\"source_status\":{},\"spot_ask\":{},\"spot_ask_qty\":{},\"spot_bid\":{},\"spot_bid_qty\":{},\"symbol\":{},\"total_cost_bps\":{}}}",
+            json_option_string(&self.expected_profit_usd),
+            json_option_string(&self.gross_basis_bps),
+            json_string(&self.index_price),
+            self.is_candidate,
+            json_string(&self.last_funding_rate),
+            json_string(&self.mark_price),
+            json_option_string(&self.net_basis_bps),
+            json_string(&self.next_funding_time_ms),
+            json_option_string(&self.perp_ask),
+            json_option_string(&self.perp_ask_qty),
+            json_option_string(&self.perp_bid),
+            json_option_string(&self.perp_bid_qty),
+            json_option_string(&self.quantity),
+            json_option_string(&self.reason),
+            json_string(&self.source_status),
+            json_option_string(&self.spot_ask),
+            json_option_string(&self.spot_ask_qty),
+            json_option_string(&self.spot_bid),
+            json_option_string(&self.spot_bid_qty),
+            json_string(&self.symbol),
+            json_option_string(&self.total_cost_bps),
+        )
+    }
+}
+
+fn json_option_string(value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .map(json_string)
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn start_binance_basis_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<BinanceBasisMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind monitor HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_basis_http_connection(stream, &state),
+                Err(error) => eprintln!("binance-basis-monitor api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+fn handle_basis_http_connection(
+    mut stream: TcpStream,
+    state: &Arc<RwLock<BinanceBasisMonitorSnapshot>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let read = match stream.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+    let route = path.split('?').next().unwrap_or(path);
+    if method != "GET" {
+        let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
+        return;
+    }
+    if route == "/" || route == "/dashboard" {
+        let _ = write_http_html(&mut stream, 200, basis_dashboard_html());
+        return;
+    }
+
+    let snapshot = state.read().expect("monitor state lock poisoned");
+    let (status, body) = if route == "/health" {
+        (
+            200,
+            format!(
+                "{{\"status\":{},\"updated_at\":{}}}",
+                json_string(&snapshot.status),
+                json_string(&snapshot.updated_at)
+            ),
+        )
+    } else if route == "/api/basis/status" {
+        (200, snapshot.to_json())
+    } else if route == "/api/basis/opportunities" {
+        (200, snapshot.opportunities_json())
+    } else if let Some(symbol) = route.strip_prefix("/api/basis/status/") {
+        match snapshot.symbol_json(symbol.trim_matches('/')) {
+            Some(row) => (200, row),
+            None => (
+                404,
+                format!(
+                    "{{\"error\":\"symbol_not_found\",\"symbol\":{}}}",
+                    json_string(symbol.trim_matches('/'))
+                ),
+            ),
+        }
+    } else {
+        (
+            404,
+            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/basis/status\",\"/api/basis/opportunities\",\"/api/basis/status/<SYMBOL>\"]}".to_owned(),
+        )
+    };
+    let _ = write_http_json(&mut stream, status, &body);
+}
+
+fn write_http_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    write_http_response(stream, status, "application/json; charset=utf-8", body)
+}
+
+fn write_http_html(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    write_http_response(stream, status, "text/html; charset=utf-8", body)
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "OK",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn basis_dashboard_html() -> &'static str {
+    r##"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>实时套利监控</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101112;
+      --band: #151719;
+      --panel: #1b1d20;
+      --panel-strong: #23262a;
+      --line: #353941;
+      --text: #f0eadc;
+      --muted: #a5a8aa;
+      --amber: #e2b650;
+      --green: #58c383;
+      --red: #e06a6a;
+      --blue: #77a7d9;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 22px 28px;
+      background: #191b1e;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .kicker {
+      margin: 0 0 6px;
+      color: var(--amber);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .pill.healthy,
+    .candidate {
+      color: var(--green);
+      border-color: rgba(88, 195, 131, 0.45);
+    }
+
+    .pill.error,
+    .negative {
+      color: var(--red);
+      border-color: rgba(224, 106, 106, 0.45);
+    }
+
+    .positive {
+      color: var(--green);
+    }
+
+    main {
+      padding: 18px 28px 32px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      min-height: 72px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 22px;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+
+    .control-bar {
+      display: grid;
+      grid-template-columns: minmax(150px, 220px) repeat(2, minmax(116px, max-content)) minmax(170px, 220px) minmax(100px, max-content) minmax(130px, max-content);
+      gap: 10px;
+      align-items: end;
+      padding: 12px;
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    label span,
+    .field-label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input[type="search"],
+    select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101214;
+      color: var(--text);
+      padding: 7px 9px;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 36px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: var(--panel);
+      white-space: nowrap;
+    }
+
+    .toggle input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--amber);
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--text);
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--amber);
+    }
+
+    .table-wrap,
+    .api-wrap {
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    .table-head,
+    .api-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+      max-height: 58vh;
+    }
+
+    table {
+      width: 100%;
+      min-width: 1180px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      height: 38px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(53, 57, 65, 0.7);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #202327;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    th:first-child,
+    td:first-child,
+    th:last-child,
+    td:last-child {
+      text-align: left;
+    }
+
+    tbody tr:hover {
+      background: rgba(226, 182, 80, 0.08);
+    }
+
+    .api-wrap {
+      margin-top: 14px;
+    }
+
+    .endpoint-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    pre {
+      margin: 0;
+      max-height: 260px;
+      overflow: auto;
+      padding: 12px;
+      background: #0c0d0e;
+      color: #d7d1c2;
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .empty-row {
+      height: 88px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 980px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status-strip {
+        justify-content: flex-start;
+        text-align: left;
+      }
+
+      .summary-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .control-bar {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      main,
+      .topbar {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .summary-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="kicker">Binance public basis</p>
+      <h1>实时套利监控</h1>
+    </div>
+    <div class="status-strip">
+      <span id="runtime-status" class="pill">starting</span>
+      <span id="updated-at">not-yet-updated</span>
+    </div>
+  </header>
+  <main>
+    <section class="summary-grid" aria-label="summary">
+      <article class="metric"><span>机会</span><strong id="metric-candidates">0</strong></article>
+      <article class="metric"><span>市场</span><strong id="metric-total">0</strong></article>
+      <article class="metric"><span>Funding 过滤</span><strong id="metric-filtered">0</strong></article>
+      <article class="metric"><span>缺现货</span><strong id="metric-missing-spot">0</strong></article>
+      <article class="metric"><span>缺永续</span><strong id="metric-missing-perp">0</strong></article>
+      <article class="metric"><span>最小净 Basis</span><strong id="metric-min-net">0</strong></article>
+    </section>
+
+    <section class="control-bar" aria-label="controls">
+      <label>
+        <span>Symbol</span>
+        <input id="symbol-filter" type="search" autocomplete="off" placeholder="BTCUSDT">
+      </label>
+      <label class="toggle"><input id="only-candidates" type="checkbox">只看机会</label>
+      <label class="toggle"><input id="only-complete" type="checkbox" checked>只看完整报价</label>
+      <label>
+        <span>排序</span>
+        <select id="sort-mode">
+          <option value="net-desc">净 Basis 降序</option>
+          <option value="funding-abs-desc">Funding 绝对值</option>
+          <option value="profit-desc">预期收益</option>
+          <option value="symbol-asc">Symbol</option>
+        </select>
+      </label>
+      <button id="refresh-button" type="button">刷新</button>
+      <label class="toggle"><input id="auto-refresh" type="checkbox" checked>自动刷新</label>
+    </section>
+
+    <section class="table-wrap" aria-label="basis table">
+      <div class="table-head">
+        <strong>行情与机会</strong>
+        <span id="api-state">waiting</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Spot Bid</th>
+              <th>Spot Ask</th>
+              <th>Perp Bid</th>
+              <th>Perp Ask</th>
+              <th>Mark</th>
+              <th>Index</th>
+              <th>Funding</th>
+              <th>Gross bps</th>
+              <th>Cost bps</th>
+              <th>Net bps</th>
+              <th>Qty</th>
+              <th>Profit USD</th>
+              <th>状态</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody id="basis-rows">
+            <tr><td class="empty-row" colspan="15">loading</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="api-wrap" aria-label="realtime api">
+      <div class="api-head">
+        <strong>实时 API</strong>
+        <div class="endpoint-grid">
+          <button type="button" data-endpoint="/api/basis/status">status</button>
+          <button type="button" data-endpoint="/api/basis/opportunities">opportunities</button>
+        </div>
+      </div>
+      <pre id="api-preview">{}</pre>
+    </section>
+  </main>
+
+  <script>
+    const statusUrl = "/api/basis/status";
+    const opportunitiesUrl = "/api/basis/opportunities";
+    const state = { snapshot: null, timer: null };
+    const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(value) {
+      return String(value ?? "-").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function numeric(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function signedClass(value) {
+      const number = numeric(value);
+      if (number === null || number === 0) return "";
+      return number > 0 ? "positive" : "negative";
+    }
+
+    async function requestJson(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        throw new Error(`invalid json from ${url}: ${error.message}`);
+      }
+      if (!response.ok) {
+        throw new Error(data.error || `http ${response.status}`);
+      }
+      return data;
+    }
+
+    function filteredRows(rows) {
+      const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
+      const onlyCandidates = $("only-candidates").checked;
+      const onlyComplete = $("only-complete").checked;
+      const sortMode = $("sort-mode").value;
+      const result = rows.filter((row) => {
+        if (symbolFilter && !row.symbol.includes(symbolFilter)) return false;
+        if (onlyCandidates && !row.is_candidate) return false;
+        if (onlyComplete && row.source_status !== "complete") return false;
+        return true;
+      });
+      result.sort((left, right) => {
+        if (sortMode === "symbol-asc") return left.symbol.localeCompare(right.symbol);
+        if (sortMode === "funding-abs-desc") {
+          return Math.abs(numeric(right.last_funding_rate) ?? 0) - Math.abs(numeric(left.last_funding_rate) ?? 0);
+        }
+        if (sortMode === "profit-desc") {
+          return (numeric(right.expected_profit_usd) ?? -Infinity) - (numeric(left.expected_profit_usd) ?? -Infinity);
+        }
+        return (numeric(right.net_basis_bps) ?? -Infinity) - (numeric(left.net_basis_bps) ?? -Infinity);
+      });
+      return result;
+    }
+
+    function renderRows(rows) {
+      const body = $("basis-rows");
+      const view = filteredRows(rows);
+      if (!view.length) {
+        body.innerHTML = `<tr><td class="empty-row" colspan="15">no rows</td></tr>`;
+        return;
+      }
+      body.innerHTML = view.map((row) => {
+        const candidateClass = row.is_candidate ? "candidate" : "";
+        return `<tr>
+          <td class="${candidateClass}">${escapeHtml(row.symbol)}</td>
+          <td>${escapeHtml(row.spot_bid)}</td>
+          <td>${escapeHtml(row.spot_ask)}</td>
+          <td>${escapeHtml(row.perp_bid)}</td>
+          <td>${escapeHtml(row.perp_ask)}</td>
+          <td>${escapeHtml(row.mark_price)}</td>
+          <td>${escapeHtml(row.index_price)}</td>
+          <td class="${signedClass(row.last_funding_rate)}">${escapeHtml(row.last_funding_rate)}</td>
+          <td class="${signedClass(row.gross_basis_bps)}">${escapeHtml(row.gross_basis_bps)}</td>
+          <td>${escapeHtml(row.total_cost_bps)}</td>
+          <td class="${signedClass(row.net_basis_bps)}">${escapeHtml(row.net_basis_bps)}</td>
+          <td>${escapeHtml(row.quantity)}</td>
+          <td class="${signedClass(row.expected_profit_usd)}">${escapeHtml(row.expected_profit_usd)}</td>
+          <td>${escapeHtml(row.source_status)}</td>
+          <td>${escapeHtml(row.reason)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function render(snapshot) {
+      $("runtime-status").textContent = snapshot.status || "unknown";
+      $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : ""}`;
+      $("updated-at").textContent = snapshot.updated_at || "not-yet-updated";
+      $("metric-candidates").textContent = snapshot.candidate_count ?? 0;
+      $("metric-total").textContent = snapshot.total_rows ?? 0;
+      $("metric-filtered").textContent = snapshot.filtered_funding_count ?? 0;
+      $("metric-missing-spot").textContent = snapshot.missing_spot_count ?? 0;
+      $("metric-missing-perp").textContent = snapshot.missing_perp_count ?? 0;
+      $("metric-min-net").textContent = snapshot.min_net_bps ?? "0";
+      $("api-state").textContent = snapshot.last_error ? snapshot.last_error : "ok";
+      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
+      renderRows(snapshot.rows || []);
+    }
+
+    async function refreshStatus() {
+      $("api-state").textContent = "loading";
+      try {
+        const snapshot = await requestJson(statusUrl);
+        state.snapshot = snapshot;
+        render(snapshot);
+      } catch (error) {
+        $("runtime-status").textContent = "error";
+        $("runtime-status").className = "pill error";
+        $("api-state").textContent = error.message;
+      }
+    }
+
+    async function previewEndpoint(url) {
+      $("api-preview").textContent = "loading";
+      try {
+        const data = await requestJson(url);
+        $("api-preview").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        $("api-preview").textContent = error.message;
+      }
+    }
+
+    function schedule() {
+      if (state.timer) clearInterval(state.timer);
+      if ($("auto-refresh").checked) {
+        state.timer = setInterval(refreshStatus, 2000);
+      }
+    }
+
+    ["symbol-filter", "only-candidates", "only-complete", "sort-mode"].forEach((id) => {
+      $(id).addEventListener("input", () => {
+        if (state.snapshot) renderRows(state.snapshot.rows || []);
+      });
+      $(id).addEventListener("change", () => {
+        if (state.snapshot) renderRows(state.snapshot.rows || []);
+      });
+    });
+    $("refresh-button").addEventListener("click", refreshStatus);
+    $("auto-refresh").addEventListener("change", schedule);
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => previewEndpoint(button.dataset.endpoint || opportunitiesUrl));
+    });
+
+    schedule();
+    refreshStatus();
+  </script>
+</body>
+</html>"##
+}
+
 struct RuntimeTempDir {
     path: PathBuf,
 }
@@ -1615,6 +3829,73 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
     if args.is_empty() || args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return Ok(help_text());
     }
+    if args[0] == "live-market-sim" {
+        let options = parse_live_market_sim_args(&args[1..])?;
+        let report = run_live_market_simulation(
+            &options.fixture_root,
+            &options.symbol,
+            options.output_dir.clone(),
+        )?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: fetched live public market data for {}; execution_mode=Simulated; mutable_execution_started=false; execution_reports={}; incidents={}{}",
+            report.symbol,
+            count_jsonl_records(&report.artifacts.execution_reports_jsonl),
+            count_jsonl_records(&report.artifacts.incidents_jsonl),
+            output_note
+        ));
+    }
+    if args[0] == "binance-basis-scan" {
+        let options = parse_binance_basis_scan_args(&args[1..])?;
+        let report = run_binance_basis_scan(&options.symbol, options.output_dir.clone())?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        let candidate_count = count_jsonl_records(&report.candidate_transitions_jsonl);
+        let outcome = report
+            .rejection_reason
+            .as_ref()
+            .map(|reason| {
+                format!(
+                    "rejected; reason={reason}; detail={}",
+                    report.rejection_detail.as_deref().unwrap_or("")
+                )
+            })
+            .unwrap_or_else(|| "candidate=true".to_owned());
+        return Ok(format!(
+            "ok: fetched Binance public spot/perp basis data for {}; {}; candidate_transitions={}; mutable_execution_started=false{}",
+            report.symbol, outcome, candidate_count, output_note
+        ));
+    }
+    if args[0] == "binance-basis-monitor" {
+        let options = parse_binance_basis_monitor_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        let output_dir = options.output_dir.clone();
+        run_binance_basis_monitor(options)?;
+        if once {
+            let output_note = output_dir
+                .as_ref()
+                .map(|path| format!("; wrote snapshot to {}", path.display()))
+                .unwrap_or_else(|| "; no snapshot written, pass --out <dir>".to_owned());
+            return Ok(format!(
+                "ok: ran one Binance basis monitor refresh; api_bind={bind_addr}; mutable_execution_started=false{output_note}"
+            ));
+        }
+        return Ok(format!(
+            "ok: Binance basis monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
     if args[0] == "health" {
         let fixture_root = args.get(1).map_or_else(
             || PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE),
@@ -1631,12 +3912,32 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             health.tasks.len()
         ));
     }
+    if args[0] == "health-config" {
+        let Some(config_path) = args.get(1) else {
+            return Err(cli_arg_error("health-config requires a config path"));
+        };
+        if args.len() > 2 {
+            return Err(cli_arg_error(
+                "health-config accepts exactly one config path",
+            ));
+        }
+        let service = start_runtime_from_config_path(config_path)?;
+        let health = service.health();
+        return Ok(format!(
+            "health-config: {}; execution_mode={}; kill_switch_triggered={}; mutable_execution_started={}; tasks={}",
+            health.status.as_str(),
+            health.execution_mode,
+            health.kill_switch_triggered,
+            health.mutable_execution_started,
+            health.tasks.len()
+        ));
+    }
 
     if args[0] != "replay" {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-monitor",
                 args[0]
             ),
         });
@@ -1670,8 +3971,225 @@ fn help_text() -> String {
         "Commands:",
         "  replay [fixture_root] [--accept]  Run S9-01 full pipeline and compare golden outputs",
         "  health [fixture_root]             Run S9-02 startup and health checks only",
+        "  health-config <config_path>       Run startup checks against a local config file",
+        "  live-market-sim [fixture_root] [--symbol BTCUSDT] [--out dir]",
+        "                                    Fetch one public market-data snapshot and run simulated execution",
+        "  binance-basis-scan [--symbol BTCUSDT] [--out dir]",
+        "                                    Fetch Binance public spot/perp data and run read-only basis strategy",
+        "  binance-basis-monitor [--bind 127.0.0.1:8796] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
+        "                                    Monitor all Binance public USDT spot/perp basis rows and serve /api/basis/status",
     ]
     .join("\n")
+}
+
+struct LiveMarketSimCliOptions {
+    fixture_root: PathBuf,
+    symbol: String,
+    output_dir: Option<PathBuf>,
+}
+
+struct BinanceBasisScanCliOptions {
+    symbol: String,
+    output_dir: Option<PathBuf>,
+}
+
+type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
+
+fn parse_live_market_sim_args(args: &[String]) -> RuntimeResult<LiveMarketSimCliOptions> {
+    let mut fixture_root = PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE);
+    let mut fixture_seen = false;
+    let mut symbol = SIM_SYMBOL.to_owned();
+    let mut output_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown live-market-sim option `{value}`"
+                )));
+            }
+            value => {
+                if fixture_seen {
+                    return Err(cli_arg_error(format!(
+                        "unexpected extra fixture path `{value}`"
+                    )));
+                }
+                fixture_root = PathBuf::from(value);
+                fixture_seen = true;
+            }
+        }
+        index += 1;
+    }
+
+    Ok(LiveMarketSimCliOptions {
+        fixture_root,
+        symbol,
+        output_dir,
+    })
+}
+
+fn parse_binance_basis_scan_args(args: &[String]) -> RuntimeResult<BinanceBasisScanCliOptions> {
+    let mut symbol = BASIS_SYMBOL.to_owned();
+    let mut output_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-basis-scan option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-basis-scan positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceBasisScanCliOptions { symbol, output_dir })
+}
+
+fn parse_binance_basis_monitor_args(
+    args: &[String],
+) -> RuntimeResult<BinanceBasisMonitorCliOptions> {
+    let mut options = BinanceBasisMonitorOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires an address"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires a value"));
+                };
+                options.poll_interval_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--interval-secs must be an integer"))?;
+            }
+            "--min-abs-funding-rate" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-abs-funding-rate requires a decimal"));
+                };
+                options.min_abs_funding_rate = value.clone();
+            }
+            "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-bps requires a value"));
+                };
+                options.min_net_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--min-net-bps must be an integer"))?;
+            }
+            "--notional-usd" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--notional-usd requires a decimal"));
+                };
+                options.notional_usd = value.clone();
+            }
+            "--spot-fee-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--spot-fee-bps requires a value"));
+                };
+                options.spot_taker_fee_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--spot-fee-bps must be an integer"))?;
+            }
+            "--perp-fee-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--perp-fee-bps requires a value"));
+                };
+                options.perp_taker_fee_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--perp-fee-bps must be an integer"))?;
+            }
+            "--slippage-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--slippage-bps requires a value"));
+                };
+                options.slippage_buffer_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--slippage-bps must be an integer"))?;
+            }
+            "--once" => options.once = true,
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                options.output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-basis-monitor option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-basis-monitor positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_monitor_options(&options)?;
+    Ok(options)
+}
+
+fn cli_arg_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::Module {
+        module: "arb-runtime",
+        message: message.into(),
+    }
+}
+
+fn count_jsonl_records(input: &str) -> usize {
+    input.lines().filter(|line| !line.trim().is_empty()).count()
 }
 
 #[cfg(test)]
@@ -1696,6 +4214,75 @@ mod tests {
 
         assert_eq!(resolved, repo_root.join(requested));
         assert!(resolved.join(RISK_POLICY_FILE).is_file());
+    }
+
+    #[test]
+    fn basis_dashboard_html_requests_realtime_api_paths() {
+        let html = basis_dashboard_html();
+
+        assert!(html.contains("/api/basis/status"));
+        assert!(html.contains("/api/basis/opportunities"));
+        assert!(html.contains("id=\"basis-rows\""));
+        assert!(html.contains("fetch(url"));
+    }
+
+    #[test]
+    fn binance_basis_monitor_snapshot_scans_all_symbols_and_filters_tiny_funding() {
+        let spot = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"},
+          {"symbol":"ETHUSDT","bidPrice":"49.90","bidQty":"3.0","askPrice":"50.00","askQty":"4.0"}
+        ]"#;
+        let perp = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778584221117},
+          {"symbol":"ETHUSDT","bidPrice":"50.10","bidQty":"3.5","askPrice":"50.20","askQty":"4.5","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"ETHUSDT","markPrice":"50.10","indexPrice":"50.00","lastFundingRate":"0.00000001","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let options = BinanceBasisMonitorOptions {
+            min_abs_funding_rate: "0.00000100".to_owned(),
+            once: true,
+            ..BinanceBasisMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_binance_basis_monitor_snapshot_from_json(spot, perp, premium, &options)
+                .expect("snapshot");
+
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.filtered_funding_count, 1);
+        assert_eq!(snapshot.candidate_count, 1);
+        assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
+        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+    }
+
+    #[test]
+    fn binance_basis_monitor_snapshot_reports_missing_spot_without_failing_open() {
+        let spot = r#"[]"#;
+        let perp = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let options = BinanceBasisMonitorOptions {
+            once: true,
+            ..BinanceBasisMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_binance_basis_monitor_snapshot_from_json(spot, perp, premium, &options)
+                .expect("snapshot");
+
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.candidate_count, 0);
+        assert_eq!(snapshot.missing_spot_count, 1);
+        assert_eq!(snapshot.rows[0].source_status, "missing_spot");
+        assert_eq!(
+            snapshot.rows[0].reason.as_deref(),
+            Some("MISSING_SPOT_BOOK_TICKER")
+        );
     }
 
     fn simulated_config_yaml() -> &'static str {
@@ -1842,6 +4429,24 @@ kill_switch:
             Some(RuntimeTaskExitReason::StartupSkipped)
         );
         assert!(mutable_task.detail.contains("熔断阻止执行模式 GuardedLive"));
+    }
+
+    #[test]
+    fn health_config_preflight_accepts_guarded_live_when_kill_switch_blocks_it() {
+        let _temp_dir = RuntimeTempDir::new().expect("temp dir");
+        let config_path = _temp_dir
+            .path()
+            .join("personal_guarded_live.preflight.yaml");
+        fs::write(&config_path, guarded_live_blocked_by_kill_switch_yaml()).expect("write config");
+
+        let service = start_runtime_from_config_path(&config_path)
+            .expect("guarded live preflight config should load while kill switch blocks it");
+        let health = service.health();
+
+        assert_eq!(health.status, RuntimeHealthStatus::Degraded);
+        assert_eq!(health.execution_mode, "GuardedLive");
+        assert!(health.kill_switch_triggered);
+        assert!(!health.mutable_execution_started);
     }
 
     #[test]

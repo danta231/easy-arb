@@ -229,7 +229,46 @@ cargo run -p arb-runtime -- replay fixtures/replay/full_pipeline_simulated/cases
 
 如果异常路径生成了执行计划，必须视为阻塞问题。
 
-## 9. 黄金输出更新
+## 9. 真实公开行情 + 模拟执行
+
+如果要先接入真实市场数据，但仍然不使用真实资金，可以运行一次性只读行情模拟：
+
+```bash
+cargo run -p arb-runtime -- live-market-sim fixtures/replay/full_pipeline_simulated --symbol BTCUSDT --out target/live-market-sim
+```
+
+当前命令语义：
+
+- 从 Binance 官方公开市场数据端点读取一次 `BTCUSDT` 24hr ticker。
+- 不使用 API key、secret、私钥、session 或 token。
+- 只把公开行情标准化为 `NormalizedEvent`。
+- 复用主 fixture 的组合状态、策略清单、风控策略和场所能力。
+- 执行模式保持 `Simulated`，只生成模拟执行报告、模拟账本分录、对账报告和运营日报。
+- 输出写入 `--out` 指定目录；不要写入 `fixtures/.../expected`，除非是明确维护黄金输出。
+
+正常安全信号示例：
+
+```text
+ok: fetched live public market data for BTCUSDT; execution_mode=Simulated; mutable_execution_started=false
+```
+
+中文说明：该命令不是确定性 replay，因为输入来自当前外部市场数据。它只能作为只读集成烟测，不能替代第 7 节的黄金回放，也不能成为默认质量门。若外部网络失败、限频、字段缺失、数据过期或未知状态出现，命令必须失败或输出风控拒绝/事故，不能按成功继续。
+
+当前限制：
+
+- 只支持与主端到端 fixture 对齐的 `BTCUSDT`。
+- 样例策略仍是演示策略，不代表真实套利收益模型。
+- 真实下单、撤单、转账和真实签名仍然禁止。
+
+查看本次模拟结果：
+
+```bash
+sed -n '1,220p' target/live-market-sim/operations_daily_report.md
+sed -n '1,120p' target/live-market-sim/risk_decisions.jsonl
+sed -n '1,120p' target/live-market-sim/execution_reports.jsonl
+```
+
+## 10. 黄金输出更新
 
 只有在有意改变业务输出、schema、规范序列化、策略、风控、执行、账本、对账或报告格式时，才允许更新黄金输出。
 
@@ -265,7 +304,7 @@ cargo run -p arb-runtime -- replay fixtures/replay/full_pipeline_simulated/cases
 - 如果 `mutable_execution_started` 变成 `true`，必须停止。
 - 如果输出包含密钥、token、签名材料或未脱敏账户信息，必须停止并删除该输出。
 
-## 10. 配置操作
+## 11. 配置操作
 
 运行时代码侧配置模板位于：
 
@@ -309,7 +348,7 @@ fixtures/replay/full_pipeline_simulated/config.yaml
 5. 是否能通过 `cargo run -p arb-runtime -- health <fixture>`。
 6. 是否能通过对应 replay。
 
-## 11. fixture 操作
+## 12. fixture 操作
 
 新增或维护 replay fixture 时，遵守以下目录形态：
 
@@ -348,7 +387,7 @@ cargo run -p arb-runtime -- replay fixtures/replay/<case_name>
 
 如果该 fixture 不是端到端运行时 fixture，而是某个模块单测 fixture，应运行对应模块测试，并在 `README.md` 中说明用途和限制。
 
-## 12. 报告和事故查看
+## 13. 报告和事故查看
 
 主路径和异常路径的运营报告位于：
 
@@ -385,7 +424,7 @@ sed -n '1,120p' fixtures/replay/full_pipeline_simulated/cases/unknown_state/expe
 - 是否没有泄露密钥、token 或签名材料。
 - 是否没有把未知状态当作成功。
 
-## 13. Codex 开发操作
+## 14. Codex 开发操作
 
 让 Codex 执行开发任务时，优先使用任务包入口：
 
@@ -417,7 +456,7 @@ sed -n '1,120p' fixtures/replay/full_pipeline_simulated/cases/unknown_state/expe
 
 如果任务修改了模块依赖、schema 字段、状态机、风控检查、执行流程、账本规则或实盘能力开关，必须同步检查相关文档是否需要更新。
 
-## 14. 常见故障处理
+## 15. 常见故障处理
 
 | 现象 | 常见原因 | 处理方式 |
 |---|---|---|
@@ -431,7 +470,7 @@ sed -n '1,120p' fixtures/replay/full_pipeline_simulated/cases/unknown_state/expe
 | 输出中出现凭证 | fixture 或日志污染 | 立即移除并轮换相关凭证；不要提交该输出。 |
 | `cargo clippy` 失败 | 代码警告被当作错误 | 修复代码或测试，不要降低 `-D warnings`。 |
 
-## 15. 实盘相关停止线
+## 16. 实盘相关停止线
 
 本仓库当前默认操作手册不提供真实资金上线步骤。以下动作必须停止并走 review 路径：
 
@@ -456,7 +495,7 @@ sed -n '1,120p' fixtures/replay/full_pipeline_simulated/cases/unknown_state/expe
 
 任一证据缺失时，保持只读、模拟或人工手动执行。
 
-## 16. 日常操作清单
+## 17. 日常操作清单
 
 只读检查：
 
@@ -470,6 +509,12 @@ cargo run -p arb-runtime -- health fixtures/replay/full_pipeline_simulated
 
 ```bash
 cargo run -p arb-runtime -- replay fixtures/replay/full_pipeline_simulated
+```
+
+真实公开行情 + 模拟执行：
+
+```bash
+cargo run -p arb-runtime -- live-market-sim fixtures/replay/full_pipeline_simulated --symbol BTCUSDT --out target/live-market-sim
 ```
 
 异常路径验收：
@@ -500,7 +545,7 @@ cargo xtask replay-full-pipeline
 - 报告是否由结构化事实生成。
 - 文档是否同步更新。
 
-## 17. 交接模板
+## 18. 交接模板
 
 长任务或上下文切换前，使用以下模板：
 
