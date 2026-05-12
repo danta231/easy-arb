@@ -23,6 +23,7 @@
 | 让 Codex 开发一个任务 | `docs/24_Codex_Development_Runbook.md` | 当前任务涉及的阶段/模块说明 | review 目录 |
 | 理解项目阶段 | `docs/22_Development_Execution_Plan.md` | `docs/23_Module_Architecture_Map.md` | schema 细节 |
 | 理解模块边界 | `docs/23_Module_Architecture_Map.md` | `docs/25_Core_Architecture_Reference.md` | review 目录 |
+| 按步骤跑本地检查和模拟 | `docs/26_Operations_Manual_CN.md` | `docs/21_State_Machines_and_Replay_Fixtures.md` | 实盘清单 |
 | 跑离线模拟 | 本文第 5 节 | `docs/21_State_Machines_and_Replay_Fixtures.md` | 实盘清单 |
 | 改 schema 或合同类型 | `docs/14_Data_Schemas_and_Contracts.md` | `schemas/*.json` | 实盘清单 |
 | 准备个人小额受控试运行 | 本文第 6 节 | `review/personal_guarded_live_evidence_collection_guide.md` | 外部审查清单，除非涉及他人/团队/商业资金 |
@@ -41,6 +42,7 @@
 
 ### 按需阅读
 
+- `docs/26_Operations_Manual_CN.md`：本地检查、健康检查、模拟回放、异常路径和黄金输出更新的操作步骤。
 - `docs/14_Data_Schemas_and_Contracts.md`：改 schema、合同结构、fixture 时读。
 - `docs/21_State_Machines_and_Replay_Fixtures.md`：改状态机、回放、事故样例时读。
 - `schemas/*.json`：权威数据合同。

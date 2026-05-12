@@ -34,8 +34,10 @@
 - `GuardedLivePersonal` 通过语义可能被误读为更广泛批准。
 - 真实签名表述需要明确默认拒绝和独立签名策略门。
 
-中文结论：文档结构已补强，但所有 owner-supplied evidence 仍需所有者提供脱敏引用。
-因此当前仍不能启动 `GuardedLivePersonal`。
+中文结论：文档结构已补强，owner-supplied evidence 已补齐到小额个人受控范围。
+`GuardedLivePersonal` 只在最终 owner decision 记录的 30 分钟、100 USDC 资金上限、
+10 USDC 单笔上限、20 USDC 单日亏损上限、最多 1 个开放动作范围内通过；这不是
+外部审查通过，也不是自动实盘批准。
 
 ## 发现与修订 / Findings
 
@@ -52,15 +54,21 @@
 
 ## 剩余阻塞 / Remaining Blockers
 
-文档结构现在更严格，但 `GuardedLivePersonal` 仍保持阻塞，直到所有者完成以下事项：
+文档结构现在更严格。2026-05-12 已记录最终 owner decision：
+`owner-note:2026-05-12-final-decision-approve-guarded-live-v1`。
+该决策只批准个人小额 `GuardedLivePersonal`，不批准自动实盘、提现权限、未单独批准的真实签名、
+第三方资金、团队资金、客户资金或商业服务。
+
+如果未来要扩大范围、提高额度、增加场所/策略/账户/工具/资产/链范围、延长持续时间、
+启用真实签名或进入自动实盘，必须重新完成以下事项：
 
 - 在证据索引中填写所有 owner-supplied 脱敏证据引用。
 - 将每个必需证据状态改为 `Pass`。
 - 重新运行最近命令证据并记录日期、结果和摘要。
 - 将试运行清单所有相关行改为 `Pass`。
-- 最后填写最终 owner decision，并明确这是个人风险接受，不是外部审查通过。
+- 最后填写新的最终 owner decision，并明确这是个人风险接受，不是外部审查通过。
 
-任何 `Not reviewed`、`Fail`、`Missing` 或缺失 evidence ID 都继续阻塞个人小额受控试运行。
+任何 `Not reviewed`、`Fail`、`Missing`、缺失 evidence ID 或超过当前最终决策范围的请求都继续阻塞个人小额受控试运行。
 
 ## 启动前必须具备的证据 / Required Evidence Before `GuardedLivePersonal`
 

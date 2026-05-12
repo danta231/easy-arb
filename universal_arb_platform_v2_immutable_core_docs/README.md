@@ -20,6 +20,7 @@
 | 我要看阶段计划 | `docs/22_Development_Execution_Plan.md` |
 | 我要看模块边界 | `docs/23_Module_Architecture_Map.md` |
 | 我要理解核心架构原则 | `docs/25_Core_Architecture_Reference.md` |
+| 我要按步骤跑本地检查和模拟 | `docs/26_Operations_Manual_CN.md` |
 | 我要改 schema 或合同类型 | `docs/14_Data_Schemas_and_Contracts.md` |
 | 我要看状态机和回放 fixture | `docs/21_State_Machines_and_Replay_Fixtures.md` |
 | 我要准备个人小额受控试运行 | `review/personal_guarded_live_evidence_collection_guide.md` |
@@ -31,6 +32,7 @@
 - `docs/22_Development_Execution_Plan.md`：阶段计划、交付点、测试方案和验收方案。
 - `docs/23_Module_Architecture_Map.md`：模块职责、输入输出、接口边界、测试责任和阶段对应关系。
 - `docs/25_Core_Architecture_Reference.md`：核心架构参考，说明不可变原则、安全治理和验收清单。
+- `docs/26_Operations_Manual_CN.md`：中文操作手册，说明本地质量门、健康检查、端到端模拟回放、异常路径和黄金输出更新。
 - `docs/14_Data_Schemas_and_Contracts.md`：权威数据合同说明。
 - `docs/21_State_Machines_and_Replay_Fixtures.md`：状态机与回放样例。
 

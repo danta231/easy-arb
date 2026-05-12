@@ -1984,6 +1984,9 @@ mod tests {
         assert_eq!(report.status(), ReconciliationStatus::IncidentRecommended);
         assert!(report.has_incident_suggestions());
         assert_eq!(report.incident_suggestions[0].status, IncidentStatus::Open);
+        assert!(report.incident_suggestions[0]
+            .suggested_actions
+            .contains(&IncidentSuggestedAction::PauseAffectedScopeUntilReviewed));
     }
 
     #[test]

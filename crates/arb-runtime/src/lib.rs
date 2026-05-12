@@ -1845,6 +1845,24 @@ kill_switch:
     }
 
     #[test]
+    fn scoped_chain_kill_switch_is_reported_without_mutable_execution() {
+        let scoped_chain =
+            simulated_config_yaml().replace("chains: []", "chains: [\"chain:main\"]");
+        let service = start_runtime_from_config_yaml(&scoped_chain)
+            .expect("scoped chain kill switch should load in simulated mode");
+        let health = service.health();
+
+        assert_eq!(health.status, RuntimeHealthStatus::Degraded);
+        assert!(health.kill_switch_triggered);
+        assert!(!health.mutable_execution_started);
+        assert!(health.checks.iter().any(|check| {
+            check.name == "circuit-breaker"
+                && check.status == RuntimeCheckStatus::Warning
+                && check.message.contains("chain:chain:main")
+        }));
+    }
+
+    #[test]
     fn live_execution_without_circuit_breaker_is_rejected() {
         let unsafe_live = guarded_live_blocked_by_kill_switch_yaml()
             .replace("execution_modes: [\"GuardedLive\"]", "execution_modes: []");

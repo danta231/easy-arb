@@ -1157,9 +1157,9 @@ kill_switch:
   strategies: ["strategy/main"]
   venues: ["venue/binance"]
   accounts: ["account/main"]
-  instruments: []
-  assets: []
-  chains: []
+  instruments: ["instrument/main"]
+  assets: ["asset/main"]
+  chains: ["chain/main"]
   execution_modes: ["GuardedLive"]
 signing:
   policy_ref: "signing-policy/null-signer-v1"
@@ -1174,6 +1174,9 @@ signing:
         assert!(config.kill_switch().blocks_strategy("strategy/main"));
         assert!(config.kill_switch().blocks_venue("venue/binance"));
         assert!(config.kill_switch().blocks_account("account/main"));
+        assert!(config.kill_switch().blocks_instrument("instrument/main"));
+        assert!(config.kill_switch().blocks_asset("asset/main"));
+        assert!(config.kill_switch().blocks_chain("chain/main"));
         assert!(!config.allows_account_changes());
     }
 

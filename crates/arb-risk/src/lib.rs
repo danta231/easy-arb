@@ -332,10 +332,20 @@ fn evaluate_with_policy(
 ) -> RiskResult<RiskDecision> {
     let mut draft = DecisionDraft::default();
     let used_venues = used_venue_ids(input.candidate);
+    let used_accounts = used_account_ids(input.candidate);
+    let used_instruments = used_instrument_ids(input.candidate);
+    let used_assets = used_asset_ids(input.candidate);
 
     check_strategy_and_input_refs(input, &mut draft);
     check_state_reference(input, &mut draft);
-    check_config(input, &used_venues, &mut draft);
+    check_config(
+        input,
+        &used_venues,
+        &used_accounts,
+        &used_instruments,
+        &used_assets,
+        &mut draft,
+    );
     check_data_freshness(input, policy, &used_venues, &mut draft)?;
     check_venue_health(input, &used_venues, &mut draft);
     check_venue_capabilities(input, &used_venues, &mut draft);
@@ -427,6 +437,9 @@ fn check_state_reference(input: RiskEvaluationInput<'_>, draft: &mut DecisionDra
 fn check_config(
     input: RiskEvaluationInput<'_>,
     used_venues: &BTreeSet<String>,
+    used_accounts: &BTreeSet<String>,
+    used_instruments: &BTreeSet<String>,
+    used_assets: &BTreeSet<String>,
     draft: &mut DecisionDraft,
 ) {
     let expected_version = input.config.version().as_str();
@@ -489,6 +502,48 @@ fn check_config(
             None,
             Some(MeasuredDraft::string(disabled_venue, "venue_id")),
             "场所被只读配置熔断，风控拒绝。",
+        );
+        return;
+    }
+    if let Some(disabled_account) = used_accounts
+        .iter()
+        .find(|account_id| kill_switch.blocks_account(account_id))
+    {
+        draft.fail(
+            "config-account",
+            RiskCheckType::StrategyExposureLimit,
+            "ACCOUNT_DISABLED",
+            None,
+            Some(MeasuredDraft::string(disabled_account, "account_id")),
+            "账户被只读配置熔断，风控拒绝。",
+        );
+        return;
+    }
+    if let Some(disabled_instrument) = used_instruments
+        .iter()
+        .find(|instrument_id| kill_switch.blocks_instrument(instrument_id))
+    {
+        draft.fail(
+            "config-instrument",
+            RiskCheckType::StrategyExposureLimit,
+            "INSTRUMENT_DISABLED",
+            None,
+            Some(MeasuredDraft::string(disabled_instrument, "instrument_id")),
+            "交易工具被只读配置熔断，风控拒绝。",
+        );
+        return;
+    }
+    if let Some(disabled_asset) = used_assets
+        .iter()
+        .find(|asset_id| kill_switch.blocks_asset(asset_id))
+    {
+        draft.fail(
+            "config-asset",
+            RiskCheckType::StrategyExposureLimit,
+            "ASSET_DISABLED",
+            None,
+            Some(MeasuredDraft::string(disabled_asset, "asset_id")),
+            "资产被只读配置熔断，风控拒绝。",
         );
         return;
     }
@@ -1427,6 +1482,73 @@ fn used_venue_ids(candidate: &CandidatePortfolioTransition) -> BTreeSet<String> 
         .filter_map(|leg| leg.venue_id.as_ref())
         .map(|venue_id| venue_id.as_str().to_owned())
         .collect()
+}
+
+fn used_account_ids(candidate: &CandidatePortfolioTransition) -> BTreeSet<String> {
+    let mut account_ids = BTreeSet::new();
+    for leg in &candidate.legs {
+        if let Some(account_id) = &leg.account_id {
+            account_ids.insert(account_id.as_str().to_owned());
+        }
+        for flow in &leg.asset_flows {
+            if let Some(account_id) = &flow.account_id {
+                account_ids.insert(account_id.as_str().to_owned());
+            }
+        }
+    }
+    for flow in &candidate.expected_post_state_delta.asset_flows {
+        if let Some(account_id) = &flow.account_id {
+            account_ids.insert(account_id.as_str().to_owned());
+        }
+    }
+    for position_delta in &candidate.expected_post_state_delta.position_deltas {
+        if let Some(account_id) = &position_delta.account_id {
+            account_ids.insert(account_id.as_str().to_owned());
+        }
+    }
+    for flow in &candidate.required_capital.asset_requirements {
+        if let Some(account_id) = &flow.account_id {
+            account_ids.insert(account_id.as_str().to_owned());
+        }
+    }
+    account_ids
+}
+
+fn used_instrument_ids(candidate: &CandidatePortfolioTransition) -> BTreeSet<String> {
+    let mut instrument_ids = BTreeSet::new();
+    for leg in &candidate.legs {
+        if let Some(instrument_id) = &leg.instrument_id {
+            instrument_ids.insert(instrument_id.as_str().to_owned());
+        }
+    }
+    for position_delta in &candidate.expected_post_state_delta.position_deltas {
+        instrument_ids.insert(position_delta.instrument_id.as_str().to_owned());
+    }
+    instrument_ids
+}
+
+fn used_asset_ids(candidate: &CandidatePortfolioTransition) -> BTreeSet<String> {
+    let mut asset_ids = BTreeSet::new();
+    for leg in &candidate.legs {
+        for flow in &leg.asset_flows {
+            asset_ids.insert(flow.asset_id.as_str().to_owned());
+        }
+    }
+    for flow in &candidate.expected_post_state_delta.asset_flows {
+        asset_ids.insert(flow.asset_id.as_str().to_owned());
+    }
+    for reserve_delta in candidate
+        .expected_post_state_delta
+        .reserve_deltas
+        .iter()
+        .flatten()
+    {
+        asset_ids.insert(reserve_delta.asset_id.as_str().to_owned());
+    }
+    for flow in &candidate.required_capital.asset_requirements {
+        asset_ids.insert(flow.asset_id.as_str().to_owned());
+    }
+    asset_ids
 }
 
 fn find_venue_capability<'a>(
@@ -2458,6 +2580,136 @@ mod tests {
     }
 
     #[test]
+    fn rejects_strategy_blocked_by_kill_switch() {
+        let candidate = test_candidate();
+        let portfolio_state = test_portfolio_state();
+        let config = test_config_with_kill_switch(
+            "ReadOnly",
+            r#"strategies: ["strat:demo"]
+  venues: []
+  accounts: []
+  instruments: []
+  assets: []
+  chains: []"#,
+        );
+        let capabilities = vec![trading_capability()];
+        let decision = evaluate_test_case(&candidate, &portfolio_state, &config, &capabilities);
+
+        assert_eq!(decision.decision, RiskDecisionKind::Rejected);
+        assert_has_check(
+            &decision,
+            RiskCheckType::StrategyExposureLimit,
+            RiskCheckStatus::Fail,
+            "STRATEGY_DISABLED",
+        );
+        assert_reason_codes(&decision, &["STRATEGY_DISABLED"]);
+    }
+
+    #[test]
+    fn rejects_venue_blocked_by_kill_switch() {
+        let candidate = test_candidate();
+        let portfolio_state = test_portfolio_state();
+        let config = test_config_with_kill_switch(
+            "ReadOnly",
+            r#"strategies: []
+  venues: ["venue:SIM"]
+  accounts: []
+  instruments: []
+  assets: []
+  chains: []"#,
+        );
+        let capabilities = vec![trading_capability()];
+        let decision = evaluate_test_case(&candidate, &portfolio_state, &config, &capabilities);
+
+        assert_eq!(decision.decision, RiskDecisionKind::Rejected);
+        assert_has_check(
+            &decision,
+            RiskCheckType::VenueHealth,
+            RiskCheckStatus::Fail,
+            "VENUE_DISABLED",
+        );
+        assert_reason_codes(&decision, &["VENUE_DISABLED"]);
+    }
+
+    #[test]
+    fn rejects_account_blocked_by_kill_switch() {
+        let candidate = test_candidate();
+        let portfolio_state = test_portfolio_state();
+        let config = test_config_with_kill_switch(
+            "ReadOnly",
+            r#"strategies: []
+  venues: []
+  accounts: ["acct:sim"]
+  instruments: []
+  assets: []
+  chains: []"#,
+        );
+        let capabilities = vec![trading_capability()];
+        let decision = evaluate_test_case(&candidate, &portfolio_state, &config, &capabilities);
+
+        assert_eq!(decision.decision, RiskDecisionKind::Rejected);
+        assert_has_check(
+            &decision,
+            RiskCheckType::StrategyExposureLimit,
+            RiskCheckStatus::Fail,
+            "ACCOUNT_DISABLED",
+        );
+        assert_reason_codes(&decision, &["ACCOUNT_DISABLED"]);
+    }
+
+    #[test]
+    fn rejects_instrument_blocked_by_kill_switch() {
+        let candidate = test_candidate();
+        let portfolio_state = test_portfolio_state();
+        let config = test_config_with_kill_switch(
+            "ReadOnly",
+            r#"strategies: []
+  venues: []
+  accounts: []
+  instruments: ["inst:BTC-USDC"]
+  assets: []
+  chains: []"#,
+        );
+        let capabilities = vec![trading_capability()];
+        let decision = evaluate_test_case(&candidate, &portfolio_state, &config, &capabilities);
+
+        assert_eq!(decision.decision, RiskDecisionKind::Rejected);
+        assert_has_check(
+            &decision,
+            RiskCheckType::StrategyExposureLimit,
+            RiskCheckStatus::Fail,
+            "INSTRUMENT_DISABLED",
+        );
+        assert_reason_codes(&decision, &["INSTRUMENT_DISABLED"]);
+    }
+
+    #[test]
+    fn rejects_asset_blocked_by_kill_switch() {
+        let candidate = test_candidate();
+        let portfolio_state = test_portfolio_state();
+        let config = test_config_with_kill_switch(
+            "ReadOnly",
+            r#"strategies: []
+  venues: []
+  accounts: []
+  instruments: []
+  assets: ["asset:USDC"]
+  chains: []"#,
+        );
+        let capabilities = vec![trading_capability()];
+        let decision = evaluate_test_case(&candidate, &portfolio_state, &config, &capabilities);
+
+        assert_eq!(decision.decision, RiskDecisionKind::Rejected);
+        assert_has_check(
+            &decision,
+            RiskCheckType::StrategyExposureLimit,
+            RiskCheckStatus::Fail,
+            "ASSET_DISABLED",
+        );
+        assert_reason_codes(&decision, &["ASSET_DISABLED"]);
+    }
+
+    #[test]
     fn requires_more_data_when_venue_capability_snapshot_is_missing() {
         let candidate = test_candidate();
         let portfolio_state = test_portfolio_state();
@@ -2597,6 +2849,18 @@ mod tests {
     }
 
     fn test_config(mode: &str) -> ArbConfig {
+        test_config_with_kill_switch(
+            mode,
+            r#"strategies: []
+  venues: []
+  accounts: []
+  instruments: []
+  assets: []
+  chains: []"#,
+        )
+    }
+
+    fn test_config_with_kill_switch(mode: &str, scoped_kill_switch_fields: &str) -> ArbConfig {
         ArbConfig::from_yaml_str(&format!(
             r#"
 config_version: "arb-config-v1"
@@ -2609,12 +2873,7 @@ execution:
 kill_switch:
   global: false
   execution: false
-  strategies: []
-  venues: []
-  accounts: []
-  instruments: []
-  assets: []
-  chains: []
+  {scoped_kill_switch_fields}
   execution_modes: []
 
 signing:
