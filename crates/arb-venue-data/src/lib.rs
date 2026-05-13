@@ -41,6 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use arb_contracts::InstrumentKind;
 use arb_contracts::{
@@ -611,6 +612,553 @@ pub trait VenueReadAdapter:
     fn venue_id(&self) -> &VenueId;
 }
 
+/// 行情传输方式。
+///
+/// 中文说明：REST 快照用于启动、补洞和重建；WebSocket 流用于低延迟更新。
+/// 两者都只能产生只读事实，不能表达下单、撤单、转账或签名。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MarketDataTransport {
+    RestSnapshot,
+    WebSocketStream,
+}
+
+impl MarketDataTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RestSnapshot => "RestSnapshot",
+            Self::WebSocketStream => "WebSocketStream",
+        }
+    }
+}
+
+/// REST + WSS 混合行情状态。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HybridMarketDataStatus {
+    AwaitingRestSnapshot,
+    SnapshotReady,
+    Streaming,
+    Reconnecting,
+    Halted,
+}
+
+impl HybridMarketDataStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingRestSnapshot => "AwaitingRestSnapshot",
+            Self::SnapshotReady => "SnapshotReady",
+            Self::Streaming => "Streaming",
+            Self::Reconnecting => "Reconnecting",
+            Self::Halted => "Halted",
+        }
+    }
+}
+
+/// 标准化后的 WebSocket 报价更新。
+///
+/// 中文说明：真实交易所的推送字段可以不同，但进入核心前必须先归一化成
+/// 单调连续的 `source_sequence`。如果适配器无法证明没有缺口，必须生成
+/// `WssGapDetected` 或返回未知外部状态，不能继续沿用可能残缺的行情。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WssQuoteUpdate {
+    pub venue_id: VenueId,
+    pub instrument_id: InstrumentId,
+    pub last_price: Option<Price>,
+    pub best_bid: Option<Price>,
+    pub best_ask: Option<Price>,
+    pub mark_price: Option<Price>,
+    pub index_price: Option<Price>,
+    pub bid_size: Option<Quantity>,
+    pub ask_size: Option<Quantity>,
+    pub source_sequence: u64,
+    pub source_event_id: Option<String>,
+    pub observed_at: UtcTimestamp,
+    pub ingested_at: UtcTimestamp,
+}
+
+/// 混合行情输入事件。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HybridMarketDataInput {
+    /// REST 启动快照或断线后重建快照。
+    RestSnapshot { quote: MarketQuote },
+    /// WSS 连接已经建立。
+    WssConnected {
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+    },
+    /// WSS 报价增量或 top-of-book 快照更新。
+    WssQuote { update: WssQuoteUpdate },
+    /// WSS 心跳。
+    WssHeartbeat {
+        source_sequence: Option<u64>,
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+    },
+    /// WSS 连接断开。
+    WssDisconnected {
+        reason: String,
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+    },
+    /// 适配器已经发现序号缺口。
+    WssGapDetected {
+        expected_sequence: Option<u64>,
+        observed_sequence: Option<u64>,
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        detail: String,
+    },
+}
+
+/// 混合行情处理结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HybridMarketDataUpdate {
+    pub status: HybridMarketDataStatus,
+    pub transport: MarketDataTransport,
+    pub quote: Option<MarketQuote>,
+    pub health: VenueHealthSnapshot,
+    pub reason_codes: Vec<String>,
+    pub fail_closed: bool,
+}
+
+/// REST + WSS 混合行情协调器。
+///
+/// 中文说明：该结构只维护只读行情状态。它要求先用 REST 快照建立基线，再接受
+/// WSS 更新；断线、乱序、缺口和未知状态都会进入不可继续交易的健康状态。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestWssMarketDataCoordinator {
+    venue_id: VenueId,
+    instrument_id: InstrumentId,
+    max_age_ms: u64,
+    status: HybridMarketDataStatus,
+    latest_quote: Option<MarketQuote>,
+    health: VenueHealthSnapshot,
+    last_wss_sequence: Option<u64>,
+}
+
+impl RestWssMarketDataCoordinator {
+    pub fn new(
+        venue_id: VenueId,
+        instrument_id: InstrumentId,
+        started_at: UtcTimestamp,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let freshness = DataFreshness::new(started_at, started_at, max_age_ms)?;
+        Ok(Self {
+            venue_id: venue_id.clone(),
+            instrument_id,
+            max_age_ms,
+            status: HybridMarketDataStatus::AwaitingRestSnapshot,
+            latest_quote: None,
+            health: VenueHealthSnapshot {
+                venue_id,
+                status: VenueHealthStatus::Unknown,
+                connection: VenueConnectionStatus::Unknown,
+                reason_codes: vec!["REST_SNAPSHOT_REQUIRED".to_owned()],
+                rate_limit: None,
+                source_event_id: None,
+                freshness,
+            },
+            last_wss_sequence: None,
+        })
+    }
+
+    pub fn status(&self) -> HybridMarketDataStatus {
+        self.status
+    }
+
+    pub fn latest_quote_snapshot(&self) -> Option<&MarketQuote> {
+        self.latest_quote.as_ref()
+    }
+
+    pub fn last_wss_sequence(&self) -> Option<u64> {
+        self.last_wss_sequence
+    }
+
+    pub fn apply(
+        &mut self,
+        input: HybridMarketDataInput,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        match input {
+            HybridMarketDataInput::RestSnapshot { quote } => self.apply_rest_snapshot(quote),
+            HybridMarketDataInput::WssConnected {
+                occurred_at,
+                ingested_at,
+            } => self.apply_wss_connected(occurred_at, ingested_at),
+            HybridMarketDataInput::WssQuote { update } => self.apply_wss_quote(update),
+            HybridMarketDataInput::WssHeartbeat {
+                source_sequence,
+                occurred_at,
+                ingested_at,
+            } => self.apply_wss_heartbeat(source_sequence, occurred_at, ingested_at),
+            HybridMarketDataInput::WssDisconnected {
+                reason,
+                occurred_at,
+                ingested_at,
+            } => self.apply_wss_disconnected(reason, occurred_at, ingested_at),
+            HybridMarketDataInput::WssGapDetected {
+                expected_sequence,
+                observed_sequence,
+                occurred_at,
+                ingested_at,
+                detail,
+            } => self.apply_wss_gap(
+                expected_sequence,
+                observed_sequence,
+                occurred_at,
+                ingested_at,
+                detail,
+            ),
+        }
+    }
+
+    fn apply_rest_snapshot(
+        &mut self,
+        quote: MarketQuote,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        self.validate_quote_identity(&quote)?;
+        self.last_wss_sequence = quote
+            .source_sequence
+            .as_deref()
+            .and_then(|sequence| sequence.parse::<u64>().ok());
+        self.status = HybridMarketDataStatus::SnapshotReady;
+        self.latest_quote = Some(quote.clone());
+        self.set_health_from_freshness(
+            VenueConnectionStatus::Connected,
+            quote.freshness,
+            quote.source_event_id.clone(),
+            vec!["REST_SNAPSHOT_READY".to_owned()],
+        );
+        Ok(self.update(
+            MarketDataTransport::RestSnapshot,
+            self.health.status != VenueHealthStatus::Healthy,
+        ))
+    }
+
+    fn apply_wss_connected(
+        &mut self,
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        let freshness = DataFreshness::new(occurred_at, ingested_at, self.max_age_ms)?;
+        if self.latest_quote.is_none() {
+            self.status = HybridMarketDataStatus::AwaitingRestSnapshot;
+            self.set_health(
+                VenueHealthStatus::Degraded,
+                VenueConnectionStatus::Connected,
+                freshness,
+                None,
+                vec!["REST_SNAPSHOT_REQUIRED".to_owned()],
+            );
+            return Ok(self.update(MarketDataTransport::WebSocketStream, true));
+        }
+
+        self.status = HybridMarketDataStatus::Streaming;
+        self.set_health_from_freshness(
+            VenueConnectionStatus::Connected,
+            freshness,
+            self.latest_quote
+                .as_ref()
+                .and_then(|quote| quote.source_event_id.clone()),
+            vec!["WSS_CONNECTED".to_owned()],
+        );
+        Ok(self.update(MarketDataTransport::WebSocketStream, false))
+    }
+
+    fn apply_wss_quote(
+        &mut self,
+        update: WssQuoteUpdate,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        if self.latest_quote.is_none() {
+            let freshness =
+                DataFreshness::new(update.observed_at, update.ingested_at, self.max_age_ms)?;
+            self.mark_unknown_wss_state(
+                freshness,
+                update.source_event_id.clone(),
+                "WSS_WITHOUT_REST_SNAPSHOT",
+            );
+            return Err(VenueDataError::UnknownExternalState {
+                venue_id: self.venue_id.clone(),
+                surface: ReadOnlySurface::MarketData,
+                detail: "WSS quote arrived before REST snapshot bootstrap".to_owned(),
+            });
+        }
+        if update.venue_id != self.venue_id || update.instrument_id != self.instrument_id {
+            let freshness =
+                DataFreshness::new(update.observed_at, update.ingested_at, self.max_age_ms)?;
+            self.mark_unknown_wss_state(freshness, update.source_event_id, "WSS_SYMBOL_MISMATCH");
+            return Err(VenueDataError::UnknownExternalState {
+                venue_id: self.venue_id.clone(),
+                surface: ReadOnlySurface::MarketData,
+                detail: "WSS quote venue or instrument does not match configured stream".to_owned(),
+            });
+        }
+
+        if let Some(previous) = self.last_wss_sequence {
+            let expected = previous
+                .checked_add(1)
+                .ok_or(VenueDataError::UnknownExternalState {
+                    venue_id: self.venue_id.clone(),
+                    surface: ReadOnlySurface::MarketData,
+                    detail: "WSS sequence overflow".to_owned(),
+                })?;
+            if update.source_sequence != expected {
+                let freshness =
+                    DataFreshness::new(update.observed_at, update.ingested_at, self.max_age_ms)?;
+                self.mark_unknown_wss_state(
+                    freshness,
+                    update.source_event_id.clone(),
+                    "WSS_SEQUENCE_GAP",
+                );
+                return Err(VenueDataError::UnknownExternalState {
+                    venue_id: self.venue_id.clone(),
+                    surface: ReadOnlySurface::MarketData,
+                    detail: format!(
+                        "WSS sequence gap expected `{expected}` observed `{}`",
+                        update.source_sequence
+                    ),
+                });
+            }
+        }
+
+        let freshness =
+            DataFreshness::new(update.observed_at, update.ingested_at, self.max_age_ms)?;
+        let quote = MarketQuote {
+            venue_id: update.venue_id,
+            instrument_id: update.instrument_id,
+            last_price: update.last_price,
+            best_bid: update.best_bid,
+            best_ask: update.best_ask,
+            mark_price: update.mark_price,
+            index_price: update.index_price,
+            bid_size: update.bid_size,
+            ask_size: update.ask_size,
+            source_sequence: Some(update.source_sequence.to_string()),
+            source_event_id: update.source_event_id,
+            freshness,
+        };
+        self.last_wss_sequence = Some(update.source_sequence);
+        self.status = HybridMarketDataStatus::Streaming;
+        self.latest_quote = Some(quote.clone());
+        self.set_health_from_freshness(
+            VenueConnectionStatus::Connected,
+            freshness,
+            quote.source_event_id.clone(),
+            vec!["WSS_QUOTE_APPLIED".to_owned()],
+        );
+        Ok(self.update(MarketDataTransport::WebSocketStream, freshness.is_stale()))
+    }
+
+    fn apply_wss_heartbeat(
+        &mut self,
+        source_sequence: Option<u64>,
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        let freshness = DataFreshness::new(occurred_at, ingested_at, self.max_age_ms)?;
+        if let (Some(previous), Some(observed)) = (self.last_wss_sequence, source_sequence) {
+            if observed < previous {
+                self.mark_unknown_wss_state(freshness, None, "WSS_HEARTBEAT_OUT_OF_ORDER");
+                return Err(VenueDataError::UnknownExternalState {
+                    venue_id: self.venue_id.clone(),
+                    surface: ReadOnlySurface::MarketData,
+                    detail: format!(
+                        "WSS heartbeat sequence `{observed}` is older than current `{previous}`"
+                    ),
+                });
+            }
+        }
+        if let Some(observed) = source_sequence {
+            self.last_wss_sequence = Some(observed);
+        }
+        if self.latest_quote.is_none() {
+            self.status = HybridMarketDataStatus::AwaitingRestSnapshot;
+            self.set_health(
+                VenueHealthStatus::Degraded,
+                VenueConnectionStatus::Connected,
+                freshness,
+                None,
+                vec![
+                    "REST_SNAPSHOT_REQUIRED".to_owned(),
+                    "WSS_HEARTBEAT".to_owned(),
+                ],
+            );
+            return Ok(self.update(MarketDataTransport::WebSocketStream, true));
+        }
+        self.status = HybridMarketDataStatus::Streaming;
+        self.set_health_from_freshness(
+            VenueConnectionStatus::Connected,
+            freshness,
+            self.latest_quote
+                .as_ref()
+                .and_then(|quote| quote.source_event_id.clone()),
+            vec!["WSS_HEARTBEAT".to_owned()],
+        );
+        Ok(self.update(MarketDataTransport::WebSocketStream, freshness.is_stale()))
+    }
+
+    fn apply_wss_disconnected(
+        &mut self,
+        reason: String,
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        let freshness = DataFreshness::new(occurred_at, ingested_at, self.max_age_ms)?;
+        self.status = HybridMarketDataStatus::Reconnecting;
+        self.set_health(
+            VenueHealthStatus::Unhealthy,
+            VenueConnectionStatus::Disconnected,
+            freshness,
+            self.latest_quote
+                .as_ref()
+                .and_then(|quote| quote.source_event_id.clone()),
+            vec!["WSS_DISCONNECTED".to_owned(), reason],
+        );
+        Ok(self.update(MarketDataTransport::WebSocketStream, true))
+    }
+
+    fn apply_wss_gap(
+        &mut self,
+        expected_sequence: Option<u64>,
+        observed_sequence: Option<u64>,
+        occurred_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        detail: String,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        let freshness = DataFreshness::new(occurred_at, ingested_at, self.max_age_ms)?;
+        let mut reason_codes = vec!["WSS_SEQUENCE_GAP".to_owned()];
+        if let Some(expected) = expected_sequence {
+            reason_codes.push(format!("expected={expected}"));
+        }
+        if let Some(observed) = observed_sequence {
+            reason_codes.push(format!("observed={observed}"));
+        }
+        if !detail.is_empty() {
+            reason_codes.push(detail);
+        }
+        self.status = HybridMarketDataStatus::Halted;
+        self.set_health(
+            VenueHealthStatus::Unhealthy,
+            VenueConnectionStatus::Unknown,
+            freshness,
+            self.latest_quote
+                .as_ref()
+                .and_then(|quote| quote.source_event_id.clone()),
+            reason_codes,
+        );
+        Ok(self.update(MarketDataTransport::WebSocketStream, true))
+    }
+
+    fn validate_quote_identity(&self, quote: &MarketQuote) -> VenueDataResult<()> {
+        if quote.venue_id != self.venue_id || quote.instrument_id != self.instrument_id {
+            return Err(VenueDataError::UnknownExternalState {
+                venue_id: self.venue_id.clone(),
+                surface: ReadOnlySurface::MarketData,
+                detail: "REST snapshot venue or instrument does not match configured stream"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn set_health_from_freshness(
+        &mut self,
+        connection: VenueConnectionStatus,
+        freshness: DataFreshness,
+        source_event_id: Option<String>,
+        mut reason_codes: Vec<String>,
+    ) {
+        let status = if freshness.is_stale() {
+            reason_codes.push("DATA_STALE".to_owned());
+            VenueHealthStatus::Degraded
+        } else {
+            VenueHealthStatus::Healthy
+        };
+        self.set_health(status, connection, freshness, source_event_id, reason_codes);
+    }
+
+    fn set_health(
+        &mut self,
+        status: VenueHealthStatus,
+        connection: VenueConnectionStatus,
+        freshness: DataFreshness,
+        source_event_id: Option<String>,
+        reason_codes: Vec<String>,
+    ) {
+        self.health = VenueHealthSnapshot {
+            venue_id: self.venue_id.clone(),
+            status,
+            connection,
+            reason_codes,
+            rate_limit: None,
+            source_event_id,
+            freshness,
+        };
+    }
+
+    fn mark_unknown_wss_state(
+        &mut self,
+        freshness: DataFreshness,
+        source_event_id: Option<String>,
+        reason_code: &str,
+    ) {
+        self.status = HybridMarketDataStatus::Halted;
+        self.set_health(
+            VenueHealthStatus::Unhealthy,
+            VenueConnectionStatus::Unknown,
+            freshness,
+            source_event_id,
+            vec![reason_code.to_owned()],
+        );
+    }
+
+    fn update(&self, transport: MarketDataTransport, fail_closed: bool) -> HybridMarketDataUpdate {
+        HybridMarketDataUpdate {
+            status: self.status,
+            transport,
+            quote: self.latest_quote.clone(),
+            health: self.health.clone(),
+            reason_codes: self.health.reason_codes.clone(),
+            fail_closed,
+        }
+    }
+}
+
+impl MarketDataReader for RestWssMarketDataCoordinator {
+    fn latest_quote(&self, query: &MarketDataQuery) -> VenueDataResult<Option<MarketQuote>> {
+        Ok(
+            (query.venue_id == self.venue_id && query.instrument_id == self.instrument_id)
+                .then(|| self.latest_quote.clone())
+                .flatten(),
+        )
+    }
+
+    fn order_book(&self, query: &MarketDataQuery) -> VenueDataResult<Option<OrderBookSnapshot>> {
+        if query.venue_id != self.venue_id || query.instrument_id != self.instrument_id {
+            return Ok(None);
+        }
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "REST+WSS coordinator currently tracks top-of-book quote, not full depth"
+                .to_owned(),
+        })
+    }
+}
+
+impl VenueHealthReader for RestWssMarketDataCoordinator {
+    fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
+        if venue_id == &self.venue_id {
+            Ok(self.health.clone())
+        } else {
+            Err(VenueDataError::DataUnavailable {
+                venue_id: venue_id.clone(),
+                surface: ReadOnlySurface::VenueHealth,
+                reason: "coordinator only tracks its configured venue".to_owned(),
+            })
+        }
+    }
+}
+
 /// Binance 公共 24hr ticker 只读工具配置。
 ///
 /// 中文说明：该配置只描述公开市场数据如何映射到平台工具，不包含 API key、
@@ -712,6 +1260,407 @@ pub struct BinancePublicBookTickerBatch {
     pub raw_event: NormalizedEvent,
     pub normalized_event: NormalizedEvent,
     pub quote: MarketQuote,
+}
+
+const BINANCE_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://data-stream.binance.vision/ws";
+const BINANCE_USDM_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.binance.com/public/ws";
+
+/// Binance 公开 `bookTicker` WSS 客户端配置。
+///
+/// 中文说明：该配置只包含公开行情 WSS 地址和工具映射，不包含 API key、listenKey、
+/// 账户、签名或任何可变执行权限。Spot 默认使用 Binance 的 market-data-only
+/// `data-stream.binance.vision`；USD-M bookTicker 默认使用 `/public` 路由。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinancePublicWssBookTickerConfig {
+    pub venue_id: VenueId,
+    pub instrument: BinancePublicInstrument,
+    pub market: BinancePublicMarket,
+    pub endpoint_base_url: String,
+    pub max_age_ms: u64,
+}
+
+impl BinancePublicWssBookTickerConfig {
+    pub fn new(
+        venue_id: VenueId,
+        instrument: BinancePublicInstrument,
+        market: BinancePublicMarket,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let endpoint_base_url = match market {
+            BinancePublicMarket::Spot => BINANCE_SPOT_PUBLIC_WSS_BASE_URL,
+            BinancePublicMarket::UsdmPerpetual => BINANCE_USDM_PUBLIC_WSS_BASE_URL,
+        };
+        Self::with_endpoint_base_url(venue_id, instrument, market, endpoint_base_url, max_age_ms)
+    }
+
+    pub fn with_endpoint_base_url(
+        venue_id: VenueId,
+        instrument: BinancePublicInstrument,
+        market: BinancePublicMarket,
+        endpoint_base_url: impl Into<String>,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let endpoint_base_url = endpoint_base_url.into();
+        if !endpoint_base_url.starts_with("wss://") {
+            return Err(VenueDataError::InvalidQuery {
+                field: "binance.wss.endpoint_base_url",
+                reason: "Binance public stream endpoint must use wss://",
+            });
+        }
+        Ok(Self {
+            venue_id,
+            instrument,
+            market,
+            endpoint_base_url: endpoint_base_url.trim_end_matches('/').to_owned(),
+            max_age_ms,
+        })
+    }
+
+    pub fn stream_name(&self) -> String {
+        format!("{}@bookTicker", self.instrument.symbol.to_ascii_lowercase())
+    }
+
+    pub fn stream_url(&self) -> String {
+        format!("{}/{}", self.endpoint_base_url, self.stream_name())
+    }
+}
+
+/// Binance 公开 `bookTicker` WSS 客户端。
+///
+/// 中文说明：客户端把真实 WSS 文本消息转换成 `RestWssMarketDataCoordinator`
+/// 可消费的只读事件。调用方必须先用 `apply_rest_snapshot` 注入 REST 快照；
+/// WSS 只负责快照后的低延迟更新。断线、重复或倒退的 updateId 会 fail closed，
+/// 调用方随后应再次走 REST 快照路径补洞或重建。
+#[derive(Debug)]
+pub struct BinancePublicWssBookTickerClient {
+    config: BinancePublicWssBookTickerConfig,
+    coordinator: RestWssMarketDataCoordinator,
+    local_sequence: u64,
+    last_exchange_update_id: Option<u64>,
+}
+
+impl BinancePublicWssBookTickerClient {
+    pub fn new(
+        config: BinancePublicWssBookTickerConfig,
+        started_at: UtcTimestamp,
+    ) -> VenueDataResult<Self> {
+        let coordinator = RestWssMarketDataCoordinator::new(
+            config.venue_id.clone(),
+            config.instrument.instrument_id.clone(),
+            started_at,
+            config.max_age_ms,
+        )?;
+        Ok(Self {
+            config,
+            coordinator,
+            local_sequence: 0,
+            last_exchange_update_id: None,
+        })
+    }
+
+    pub fn config(&self) -> &BinancePublicWssBookTickerConfig {
+        &self.config
+    }
+
+    pub fn stream_url(&self) -> String {
+        self.config.stream_url()
+    }
+
+    pub fn coordinator(&self) -> &RestWssMarketDataCoordinator {
+        &self.coordinator
+    }
+
+    pub fn coordinator_mut(&mut self) -> &mut RestWssMarketDataCoordinator {
+        &mut self.coordinator
+    }
+
+    pub fn last_exchange_update_id(&self) -> Option<u64> {
+        self.last_exchange_update_id
+    }
+
+    /// 注入 REST 启动快照或补洞快照。
+    ///
+    /// 中文说明：Binance spot REST bookTicker 不提供 WSS updateId，因此协调器使用
+    /// 本地连续序号做因果顺序；原始 REST 事件仍保留在 `source_event_id` 中。
+    pub fn apply_rest_snapshot(
+        &mut self,
+        mut quote: MarketQuote,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        self.validate_quote_identity(&quote)?;
+        quote.source_sequence = Some(self.next_local_sequence()?.to_string());
+        self.last_exchange_update_id = None;
+        self.coordinator
+            .apply(HybridMarketDataInput::RestSnapshot { quote })
+    }
+
+    /// 解析并应用一条 Binance WSS 文本消息。
+    pub fn apply_wss_text_message(
+        &mut self,
+        raw_json: &str,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        let raw = self.parse_wss_book_ticker(raw_json, ingested_at)?;
+        if let Some(previous) = self.last_exchange_update_id {
+            if raw.update_id <= previous {
+                return self.apply_non_advancing_update_gap(previous, &raw, ingested_at);
+            }
+        }
+
+        let source_sequence = self.next_local_sequence()?;
+        let update = WssQuoteUpdate {
+            venue_id: self.config.venue_id.clone(),
+            instrument_id: self.config.instrument.instrument_id.clone(),
+            last_price: None,
+            best_bid: Some(raw.best_bid),
+            best_ask: Some(raw.best_ask),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(raw.bid_size),
+            ask_size: Some(raw.ask_size),
+            source_sequence,
+            source_event_id: Some(binance_public_wss_source_event_id(
+                self.config.market,
+                &raw.symbol,
+                source_sequence,
+                raw.update_id,
+            )),
+            observed_at: raw.observed_at,
+            ingested_at,
+        };
+        let applied = self
+            .coordinator
+            .apply(HybridMarketDataInput::WssQuote { update })?;
+        self.last_exchange_update_id = Some(raw.update_id);
+        Ok(applied)
+    }
+
+    /// 连接真实 Binance WSS 并读取有限条公开 `bookTicker` 消息。
+    ///
+    /// 中文说明：这是显式联网入口，默认测试不会调用。返回的每条更新都已经进入
+    /// `RestWssMarketDataCoordinator`。如果连接失败或消息异常，调用方必须 fail closed，
+    /// 并可用 REST 快照重新启动本客户端状态。
+    pub fn read_live_wss_updates(
+        &mut self,
+        max_text_messages: usize,
+    ) -> VenueDataResult<Vec<HybridMarketDataUpdate>> {
+        if max_text_messages == 0 {
+            return Err(VenueDataError::InvalidQuery {
+                field: "binance.wss.max_text_messages",
+                reason: "must be greater than zero",
+            });
+        }
+
+        let stream_url = self.stream_url();
+        let (mut socket, _response) =
+            tungstenite::connect(stream_url.as_str()).map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.config.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::Disconnected,
+                    format!("cannot connect Binance public WSS `{stream_url}`: {error}"),
+                ))
+            })?;
+
+        let connected_at = current_utc_timestamp(&self.config.venue_id)?;
+        let mut updates = vec![self
+            .coordinator
+            .apply(HybridMarketDataInput::WssConnected {
+                occurred_at: connected_at,
+                ingested_at: connected_at,
+            })?];
+        let mut text_messages = 0_usize;
+
+        while text_messages < max_text_messages {
+            let message = match socket.read() {
+                Ok(message) => message,
+                Err(error) => {
+                    let occurred_at = current_utc_timestamp(&self.config.venue_id)?;
+                    let detail = format!("Binance public WSS read failed: {error}");
+                    let _ = self
+                        .coordinator
+                        .apply(HybridMarketDataInput::WssDisconnected {
+                            reason: detail.clone(),
+                            occurred_at,
+                            ingested_at: occurred_at,
+                        });
+                    return Err(VenueDataError::External(ClassifiedExternalError::new(
+                        self.config.venue_id.clone(),
+                        ReadOnlySurface::MarketData,
+                        ExternalErrorClass::Disconnected,
+                        detail,
+                    )));
+                }
+            };
+            match message {
+                tungstenite::Message::Text(text) => {
+                    let ingested_at = current_utc_timestamp(&self.config.venue_id)?;
+                    updates.push(self.apply_wss_text_message(&text, ingested_at)?);
+                    text_messages += 1;
+                }
+                tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {
+                    socket.flush().map_err(|error| {
+                        VenueDataError::External(ClassifiedExternalError::new(
+                            self.config.venue_id.clone(),
+                            ReadOnlySurface::MarketData,
+                            ExternalErrorClass::Disconnected,
+                            format!("Binance public WSS heartbeat flush failed: {error}"),
+                        ))
+                    })?;
+                    let occurred_at = current_utc_timestamp(&self.config.venue_id)?;
+                    updates.push(
+                        self.coordinator
+                            .apply(HybridMarketDataInput::WssHeartbeat {
+                                source_sequence: Some(self.local_sequence),
+                                occurred_at,
+                                ingested_at: occurred_at,
+                            })?,
+                    );
+                }
+                tungstenite::Message::Close(frame) => {
+                    let occurred_at = current_utc_timestamp(&self.config.venue_id)?;
+                    let reason = frame
+                        .map(|frame| frame.reason.to_string())
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or_else(|| "Binance public WSS closed".to_owned());
+                    updates.push(self.coordinator.apply(
+                        HybridMarketDataInput::WssDisconnected {
+                            reason,
+                            occurred_at,
+                            ingested_at: occurred_at,
+                        },
+                    )?);
+                    break;
+                }
+                tungstenite::Message::Binary(_) | tungstenite::Message::Frame(_) => {
+                    let occurred_at = current_utc_timestamp(&self.config.venue_id)?;
+                    updates.push(self.coordinator.apply(
+                        HybridMarketDataInput::WssGapDetected {
+                            expected_sequence: None,
+                            observed_sequence: Some(self.local_sequence),
+                            occurred_at,
+                            ingested_at: occurred_at,
+                            detail: "Binance public WSS emitted non-text payload".to_owned(),
+                        },
+                    )?);
+                    break;
+                }
+            }
+        }
+
+        Ok(updates)
+    }
+
+    fn validate_quote_identity(&self, quote: &MarketQuote) -> VenueDataResult<()> {
+        if quote.venue_id != self.config.venue_id
+            || quote.instrument_id != self.config.instrument.instrument_id
+        {
+            return Err(VenueDataError::UnknownExternalState {
+                venue_id: self.config.venue_id.clone(),
+                surface: ReadOnlySurface::MarketData,
+                detail: "REST snapshot venue or instrument does not match Binance WSS client"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn parse_wss_book_ticker(
+        &self,
+        raw_json: &str,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BinanceWssBookTickerRaw> {
+        let object = FlatJsonParser::new(raw_json).parse().map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.config.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::MalformedPayload,
+                error.to_string(),
+            ))
+        })?;
+        if let Some(FlatJsonValue::String(event_type)) = object.get("e") {
+            if event_type != "bookTicker" {
+                return Err(VenueDataError::External(ClassifiedExternalError::new(
+                    self.config.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::MalformedPayload,
+                    format!("WSS event type `{event_type}` is not bookTicker"),
+                )));
+            }
+        }
+        let symbol = required_string(
+            &object,
+            "s",
+            self.config.venue_id.clone(),
+            ReadOnlySurface::MarketData,
+        )?;
+        if symbol != self.config.instrument.symbol {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.config.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::UnknownExternalState,
+                format!(
+                    "WSS symbol `{symbol}` does not match configured symbol `{}`",
+                    self.config.instrument.symbol
+                ),
+            )));
+        }
+        let observed_at = optional_u64(&object, "T")?
+            .or(optional_u64(&object, "E")?)
+            .map(timestamp_from_unix_millis)
+            .transpose()
+            .map_err(|detail| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.config.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::MalformedPayload,
+                    detail,
+                ))
+            })?
+            .unwrap_or(ingested_at);
+
+        Ok(BinanceWssBookTickerRaw {
+            symbol,
+            update_id: required_u64(
+                &object,
+                "u",
+                self.config.venue_id.clone(),
+                ReadOnlySurface::MarketData,
+            )?,
+            best_bid: parse_price_field(&object, "b", &self.config.venue_id)?,
+            best_ask: parse_price_field(&object, "a", &self.config.venue_id)?,
+            bid_size: parse_quantity_field(&object, "B", &self.config.venue_id)?,
+            ask_size: parse_quantity_field(&object, "A", &self.config.venue_id)?,
+            observed_at,
+        })
+    }
+
+    fn apply_non_advancing_update_gap(
+        &mut self,
+        previous: u64,
+        raw: &BinanceWssBookTickerRaw,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<HybridMarketDataUpdate> {
+        self.coordinator.apply(HybridMarketDataInput::WssGapDetected {
+            expected_sequence: previous.checked_add(1),
+            observed_sequence: Some(raw.update_id),
+            occurred_at: raw.observed_at,
+            ingested_at,
+            detail: "Binance WSS bookTicker updateId did not advance; REST snapshot required for rebuild"
+                .to_owned(),
+        })
+    }
+
+    fn next_local_sequence(&mut self) -> VenueDataResult<u64> {
+        self.local_sequence =
+            self.local_sequence
+                .checked_add(1)
+                .ok_or(VenueDataError::UnknownExternalState {
+                    venue_id: self.config.venue_id.clone(),
+                    surface: ReadOnlySurface::MarketData,
+                    detail: "local Binance WSS sequence overflow".to_owned(),
+                })?;
+        Ok(self.local_sequence)
+    }
 }
 
 /// Binance USDⓈ-M premiumIndex 原始响应到标准化事件的输出批次。
@@ -1859,6 +2808,17 @@ struct BinanceBookTickerRaw {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct BinanceWssBookTickerRaw {
+    symbol: String,
+    update_id: u64,
+    best_bid: Price,
+    best_ask: Price,
+    bid_size: Quantity,
+    ask_size: Quantity,
+    observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct BinancePremiumIndexRaw {
     symbol: String,
     mark_price: Price,
@@ -2237,6 +3197,28 @@ fn timestamp_from_unix_millis(value: u64) -> Result<UtcTimestamp, String> {
     UtcTimestamp::from_unix_parts(seconds, nanos).map_err(|error| error.to_string())
 }
 
+fn current_utc_timestamp(venue_id: &VenueId) -> VenueDataResult<UtcTimestamp> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::UnknownExternalState,
+                format!("system clock is before Unix epoch: {error}"),
+            ))
+        })?;
+    let seconds = i64::try_from(duration.as_secs()).map_err(|_| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+            ExternalErrorClass::UnknownExternalState,
+            "system clock seconds overflow i64",
+        ))
+    })?;
+    UtcTimestamp::from_unix_parts(seconds, duration.subsec_nanos()).map_err(VenueDataError::from)
+}
+
 fn raw_event_id(symbol: &str, source_sequence: u64) -> String {
     format!("event:venue-data:binance-public:{symbol}:{source_sequence}:raw")
 }
@@ -2281,6 +3263,18 @@ fn binance_public_correlation_id(
 ) -> String {
     format!(
         "corr:venue-data:binance-public:{stream}:{}:{symbol}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn binance_public_wss_source_event_id(
+    market: BinancePublicMarket,
+    symbol: &str,
+    local_sequence: u64,
+    update_id: u64,
+) -> String {
+    format!(
+        "event:venue-data:binance-public:wss-book-ticker:{}:{symbol}:{local_sequence}:u{update_id}",
         market.event_scope()
     )
 }
@@ -2743,6 +3737,280 @@ mod tests {
             error.to_string(),
             "venue `venue:UNKNOWN` read-only surface `VenueHealth` is unknown: health endpoint returned indeterminate state"
         );
+    }
+
+    #[test]
+    fn hybrid_market_data_requires_rest_snapshot_before_wss_quote() {
+        let mut coordinator = hybrid_coordinator();
+
+        let error = coordinator
+            .apply(HybridMarketDataInput::WssQuote {
+                update: wss_quote_update(101, "43187.90", "43188.40"),
+            })
+            .expect_err("WSS quote without REST snapshot must fail closed");
+
+        assert!(matches!(
+            error,
+            VenueDataError::UnknownExternalState {
+                surface: ReadOnlySurface::MarketData,
+                ..
+            }
+        ));
+        assert_eq!(coordinator.status(), HybridMarketDataStatus::Halted);
+        let health = coordinator
+            .venue_health(&VenueId::new("venue:BINANCE-SPOT").expect("venue"))
+            .expect("health");
+        assert_eq!(health.status, VenueHealthStatus::Unhealthy);
+        assert_eq!(health.reason_codes, vec!["WSS_WITHOUT_REST_SNAPSHOT"]);
+    }
+
+    #[test]
+    fn hybrid_market_data_uses_rest_snapshot_then_wss_updates() {
+        let mut coordinator = hybrid_coordinator();
+
+        let snapshot_update = coordinator
+            .apply(HybridMarketDataInput::RestSnapshot {
+                quote: rest_snapshot_quote(100, "43187.40", "43188.10"),
+            })
+            .expect("REST snapshot");
+        assert_eq!(snapshot_update.transport, MarketDataTransport::RestSnapshot);
+        assert_eq!(
+            snapshot_update.status,
+            HybridMarketDataStatus::SnapshotReady
+        );
+        assert!(!snapshot_update.fail_closed);
+        assert_eq!(coordinator.last_wss_sequence(), Some(100));
+
+        let connected = coordinator
+            .apply(HybridMarketDataInput::WssConnected {
+                occurred_at: timestamp("2026-01-01T00:00:02Z"),
+                ingested_at: timestamp("2026-01-01T00:00:02Z"),
+            })
+            .expect("WSS connected");
+        assert_eq!(connected.status, HybridMarketDataStatus::Streaming);
+        assert!(!connected.fail_closed);
+
+        let stream_update = coordinator
+            .apply(HybridMarketDataInput::WssQuote {
+                update: wss_quote_update(101, "43187.90", "43188.40"),
+            })
+            .expect("WSS update");
+        assert_eq!(
+            stream_update.transport,
+            MarketDataTransport::WebSocketStream
+        );
+        assert_eq!(stream_update.status, HybridMarketDataStatus::Streaming);
+        assert!(!stream_update.fail_closed);
+
+        let quote = coordinator
+            .latest_quote(&MarketDataQuery::new(
+                VenueId::new("venue:BINANCE-SPOT").expect("venue"),
+                InstrumentId::new("inst:BINANCE:BTCUSDT:SPOT").expect("instrument"),
+            ))
+            .expect("quote read")
+            .expect("latest quote");
+        assert_eq!(quote.best_bid.expect("bid").to_string(), "43187.90");
+        assert_eq!(quote.best_ask.expect("ask").to_string(), "43188.40");
+        assert_eq!(quote.source_sequence.as_deref(), Some("101"));
+        assert_eq!(quote.freshness.status, FreshnessStatus::Fresh);
+    }
+
+    #[test]
+    fn hybrid_market_data_detects_wss_sequence_gap_and_fails_closed() {
+        let mut coordinator = hybrid_coordinator();
+        coordinator
+            .apply(HybridMarketDataInput::RestSnapshot {
+                quote: rest_snapshot_quote(100, "43187.40", "43188.10"),
+            })
+            .expect("REST snapshot");
+
+        let error = coordinator
+            .apply(HybridMarketDataInput::WssQuote {
+                update: wss_quote_update(105, "43188.00", "43188.50"),
+            })
+            .expect_err("sequence gap must fail closed");
+
+        assert!(error.to_string().contains("expected `101` observed `105`"));
+        assert_eq!(coordinator.status(), HybridMarketDataStatus::Halted);
+        let health = coordinator
+            .venue_health(&VenueId::new("venue:BINANCE-SPOT").expect("venue"))
+            .expect("health");
+        assert_eq!(health.status, VenueHealthStatus::Unhealthy);
+        assert_eq!(health.connection, VenueConnectionStatus::Unknown);
+        assert_eq!(health.reason_codes, vec!["WSS_SEQUENCE_GAP"]);
+        let quote = coordinator
+            .latest_quote_snapshot()
+            .expect("REST snapshot remains last trusted quote");
+        assert_eq!(quote.source_sequence.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn hybrid_market_data_disconnect_is_observable_and_fail_closed() {
+        let mut coordinator = hybrid_coordinator();
+        coordinator
+            .apply(HybridMarketDataInput::RestSnapshot {
+                quote: rest_snapshot_quote(100, "43187.40", "43188.10"),
+            })
+            .expect("REST snapshot");
+        coordinator
+            .apply(HybridMarketDataInput::WssConnected {
+                occurred_at: timestamp("2026-01-01T00:00:02Z"),
+                ingested_at: timestamp("2026-01-01T00:00:02Z"),
+            })
+            .expect("WSS connected");
+
+        let update = coordinator
+            .apply(HybridMarketDataInput::WssDisconnected {
+                reason: "connection closed by peer".to_owned(),
+                occurred_at: timestamp("2026-01-01T00:00:03Z"),
+                ingested_at: timestamp("2026-01-01T00:00:03Z"),
+            })
+            .expect("disconnect update");
+
+        assert_eq!(update.status, HybridMarketDataStatus::Reconnecting);
+        assert!(update.fail_closed);
+        assert_eq!(update.health.status, VenueHealthStatus::Unhealthy);
+        assert_eq!(
+            update.health.connection,
+            VenueConnectionStatus::Disconnected
+        );
+        assert!(update.reason_codes.contains(&"WSS_DISCONNECTED".to_owned()));
+    }
+
+    #[test]
+    fn binance_public_wss_book_ticker_builds_public_stream_urls() {
+        let spot = binance_wss_config(BinancePublicMarket::Spot);
+        assert_eq!(spot.stream_name(), "btcusdt@bookTicker");
+        assert_eq!(
+            spot.stream_url(),
+            "wss://data-stream.binance.vision/ws/btcusdt@bookTicker"
+        );
+
+        let usdm = binance_wss_config(BinancePublicMarket::UsdmPerpetual);
+        assert_eq!(
+            usdm.stream_url(),
+            "wss://fstream.binance.com/public/ws/btcusdt@bookTicker"
+        );
+    }
+
+    #[test]
+    fn binance_public_wss_client_requires_rest_snapshot_before_wss_text() {
+        let mut client = binance_wss_client(BinancePublicMarket::Spot);
+
+        let error = client
+            .apply_wss_text_message(
+                r#"{"u":400900217,"s":"BTCUSDT","b":"43187.90","B":"2.00000000","a":"43188.40","A":"2.50000000"}"#,
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect_err("WSS text before REST snapshot must fail closed");
+
+        assert!(matches!(
+            error,
+            VenueDataError::UnknownExternalState {
+                surface: ReadOnlySurface::MarketData,
+                ..
+            }
+        ));
+        assert_eq!(
+            client.coordinator().status(),
+            HybridMarketDataStatus::Halted
+        );
+    }
+
+    #[test]
+    fn binance_public_wss_client_applies_rest_snapshot_then_spot_update() {
+        let mut client = binance_wss_client(BinancePublicMarket::Spot);
+
+        let snapshot = client
+            .apply_rest_snapshot(rest_snapshot_quote(100, "43187.40", "43188.10"))
+            .expect("REST snapshot");
+        assert_eq!(snapshot.transport, MarketDataTransport::RestSnapshot);
+        assert_eq!(snapshot.status, HybridMarketDataStatus::SnapshotReady);
+        assert_eq!(client.coordinator().last_wss_sequence(), Some(1));
+
+        let update = client
+            .apply_wss_text_message(
+                r#"{"u":400900217,"s":"BTCUSDT","b":"43187.90","B":"2.00000000","a":"43188.40","A":"2.50000000"}"#,
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("WSS bookTicker");
+        assert_eq!(update.transport, MarketDataTransport::WebSocketStream);
+        assert_eq!(update.status, HybridMarketDataStatus::Streaming);
+        assert!(!update.fail_closed);
+        assert_eq!(client.last_exchange_update_id(), Some(400900217));
+
+        let quote = client
+            .coordinator()
+            .latest_quote(&MarketDataQuery::new(
+                VenueId::new("venue:BINANCE-SPOT").expect("venue"),
+                InstrumentId::new("inst:BINANCE:BTCUSDT:SPOT").expect("instrument"),
+            ))
+            .expect("quote read")
+            .expect("latest quote");
+        assert_eq!(quote.best_bid.expect("bid").to_string(), "43187.90");
+        assert_eq!(quote.best_ask.expect("ask").to_string(), "43188.40");
+        assert_eq!(quote.source_sequence.as_deref(), Some("2"));
+        assert_eq!(
+            quote.source_event_id.as_deref(),
+            Some("event:venue-data:binance-public:wss-book-ticker:spot:BTCUSDT:2:u400900217")
+        );
+    }
+
+    #[test]
+    fn binance_public_wss_client_accepts_usdm_event_time() {
+        let mut client = binance_wss_client(BinancePublicMarket::UsdmPerpetual);
+
+        client
+            .apply_rest_snapshot(perp_rest_snapshot_quote("43250.00", "43251.00"))
+            .expect("REST snapshot");
+        let update = client
+            .apply_wss_text_message(
+                r#"{"e":"bookTicker","u":400900300,"E":1767225602123,"T":1767225602120,"s":"BTCUSDT","b":"43250.10","B":"1.00000000","a":"43251.20","A":"1.50000000"}"#,
+                timestamp("2026-01-01T00:00:03Z"),
+            )
+            .expect("USDM WSS bookTicker");
+
+        let quote = update.quote.expect("quote");
+        assert_eq!(
+            quote.freshness.observed_at.to_string(),
+            "2026-01-01T00:00:02.12Z"
+        );
+        assert_eq!(quote.freshness.age_ms(), 880);
+        assert_eq!(quote.best_bid.expect("bid").to_string(), "43250.10");
+    }
+
+    #[test]
+    fn binance_public_wss_client_detects_duplicate_update_and_rest_rebuilds() {
+        let mut client = binance_wss_client(BinancePublicMarket::Spot);
+        client
+            .apply_rest_snapshot(rest_snapshot_quote(100, "43187.40", "43188.10"))
+            .expect("REST snapshot");
+        client
+            .apply_wss_text_message(
+                r#"{"u":400900217,"s":"BTCUSDT","b":"43187.90","B":"2.00000000","a":"43188.40","A":"2.50000000"}"#,
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("first WSS bookTicker");
+
+        let gap = client
+            .apply_wss_text_message(
+                r#"{"u":400900217,"s":"BTCUSDT","b":"43188.00","B":"2.00000000","a":"43188.50","A":"2.50000000"}"#,
+                timestamp("2026-01-01T00:00:03Z"),
+            )
+            .expect("duplicate update should be represented as fail-closed gap");
+
+        assert_eq!(gap.status, HybridMarketDataStatus::Halted);
+        assert!(gap.fail_closed);
+        assert_eq!(gap.health.status, VenueHealthStatus::Unhealthy);
+        assert!(gap.reason_codes.contains(&"WSS_SEQUENCE_GAP".to_owned()));
+
+        let rebuilt = client
+            .apply_rest_snapshot(rest_snapshot_quote(100, "43188.20", "43188.70"))
+            .expect("REST rebuild snapshot");
+        assert_eq!(rebuilt.status, HybridMarketDataStatus::SnapshotReady);
+        assert!(!rebuilt.fail_closed);
+        assert_eq!(client.last_exchange_update_id(), None);
+        assert_eq!(client.coordinator().last_wss_sequence(), Some(3));
     }
 
     #[test]
@@ -3234,6 +4502,116 @@ mod tests {
                 freshness,
             },
         }
+    }
+
+    fn hybrid_coordinator() -> RestWssMarketDataCoordinator {
+        RestWssMarketDataCoordinator::new(
+            VenueId::new("venue:BINANCE-SPOT").expect("venue id"),
+            InstrumentId::new("inst:BINANCE:BTCUSDT:SPOT").expect("instrument id"),
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("coordinator")
+    }
+
+    fn rest_snapshot_quote(sequence: u64, bid: &str, ask: &str) -> MarketQuote {
+        let freshness = DataFreshness::new(
+            timestamp("2026-01-01T00:00:00Z"),
+            timestamp("2026-01-01T00:00:01Z"),
+            5_000,
+        )
+        .expect("freshness");
+        MarketQuote {
+            venue_id: VenueId::new("venue:BINANCE-SPOT").expect("venue id"),
+            instrument_id: InstrumentId::new("inst:BINANCE:BTCUSDT:SPOT").expect("instrument id"),
+            last_price: None,
+            best_bid: Some(price(bid)),
+            best_ask: Some(price(ask)),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(quantity("1.0")),
+            ask_size: Some(quantity("1.5")),
+            source_sequence: Some(sequence.to_string()),
+            source_event_id: Some(format!("event:rest-snapshot:{sequence}")),
+            freshness,
+        }
+    }
+
+    fn perp_rest_snapshot_quote(bid: &str, ask: &str) -> MarketQuote {
+        let freshness = DataFreshness::new(
+            timestamp("2026-01-01T00:00:00Z"),
+            timestamp("2026-01-01T00:00:01Z"),
+            5_000,
+        )
+        .expect("freshness");
+        MarketQuote {
+            venue_id: VenueId::new("venue:BINANCE-USDM").expect("venue id"),
+            instrument_id: InstrumentId::new("inst:BINANCE:BTCUSDT:USDM-PERP")
+                .expect("instrument id"),
+            last_price: None,
+            best_bid: Some(price(bid)),
+            best_ask: Some(price(ask)),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(quantity("1.0")),
+            ask_size: Some(quantity("1.5")),
+            source_sequence: Some("100".to_owned()),
+            source_event_id: Some("event:rest-snapshot:usdm:100".to_owned()),
+            freshness,
+        }
+    }
+
+    fn wss_quote_update(sequence: u64, bid: &str, ask: &str) -> WssQuoteUpdate {
+        WssQuoteUpdate {
+            venue_id: VenueId::new("venue:BINANCE-SPOT").expect("venue id"),
+            instrument_id: InstrumentId::new("inst:BINANCE:BTCUSDT:SPOT").expect("instrument id"),
+            last_price: None,
+            best_bid: Some(price(bid)),
+            best_ask: Some(price(ask)),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(quantity("2.0")),
+            ask_size: Some(quantity("2.5")),
+            source_sequence: sequence,
+            source_event_id: Some(format!("event:wss-quote:{sequence}")),
+            observed_at: timestamp("2026-01-01T00:00:02Z"),
+            ingested_at: timestamp("2026-01-01T00:00:02Z"),
+        }
+    }
+
+    fn binance_wss_config(market: BinancePublicMarket) -> BinancePublicWssBookTickerConfig {
+        let (venue_id, instrument_id) = match market {
+            BinancePublicMarket::Spot => ("venue:BINANCE-SPOT", "inst:BINANCE:BTCUSDT:SPOT"),
+            BinancePublicMarket::UsdmPerpetual => {
+                ("venue:BINANCE-USDM", "inst:BINANCE:BTCUSDT:USDM-PERP")
+            }
+        };
+        let asset_usdt = AssetId::new("asset:USDT").expect("asset id");
+        let instrument = BinancePublicInstrument::new(
+            "BTCUSDT",
+            InstrumentId::new(instrument_id).expect("instrument id"),
+            AssetId::new("asset:BTC").expect("asset id"),
+            asset_usdt.clone(),
+            asset_usdt,
+        )
+        .expect("instrument")
+        .with_tick_size(price("0.01"))
+        .with_lot_size(quantity("0.000001"));
+        BinancePublicWssBookTickerConfig::new(
+            VenueId::new(venue_id).expect("venue id"),
+            instrument,
+            market,
+            5_000,
+        )
+        .expect("WSS config")
+    }
+
+    fn binance_wss_client(market: BinancePublicMarket) -> BinancePublicWssBookTickerClient {
+        BinancePublicWssBookTickerClient::new(
+            binance_wss_config(market),
+            timestamp("2026-01-01T00:00:00Z"),
+        )
+        .expect("WSS client")
     }
 
     fn timestamp(value: &str) -> UtcTimestamp {
