@@ -63,8 +63,10 @@ use arb_strategy_api::{
 use arb_venue_data::{
     BinancePublicBookTickerAdapter, BinancePublicInstrument, BinancePublicMarket,
     BinancePublicTicker24hAdapter, BinancePublicWssBookTickerClient,
-    BinancePublicWssBookTickerConfig, BinanceUsdmPremiumIndexAdapter, MarketDataQuery,
-    MarketDataReader,
+    BinancePublicWssBookTickerConfig, BinancePublicWssTextStreamClient,
+    BinanceUsdmPremiumIndexAdapter, DataFreshness, HybridMarketDataInput, HybridMarketDataStatus,
+    HybridMarketDataUpdate, MarketDataQuery, MarketDataReader, MarketDataTransport, MarketQuote,
+    RestWssMarketDataCoordinator, WssQuoteUpdate,
 };
 
 const DEFAULT_FULL_PIPELINE_FIXTURE: &str = "fixtures/replay/full_pipeline_simulated";
@@ -107,6 +109,9 @@ const BYBIT_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8797";
 const OKX_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8798";
 const HYPERLIQUID_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8799";
 const ASTER_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8800";
+const BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8801";
+const BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 const RECONCILIATION_RUN_ID: &str = "recon:full-pipeline-simulated";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -549,6 +554,22 @@ pub struct BinanceBasisScanReport {
     pub output_dir: Option<PathBuf>,
 }
 
+/// 单次 Binance 现货-永续 basis 正式模拟管线结果。
+///
+/// 中文说明：该报告把公开 basis 行情推进到候选转换、风控、模拟执行或拒绝事故、
+/// 账本、对账和运营报告。它不读取私有账户、不下单、不撤单、不转账、不签名。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisPipelineReport {
+    pub fixture_root: PathBuf,
+    pub symbol: String,
+    pub spot_book_ticker_url: String,
+    pub perp_book_ticker_url: String,
+    pub premium_index_url: String,
+    pub ingested_at: String,
+    pub artifacts: EndToEndArtifacts,
+    pub output_dir: Option<PathBuf>,
+}
+
 /// Binance basis 长驻监控选项。
 ///
 /// 中文说明：监控仅使用公开行情，不读取账户，不提交订单。
@@ -583,26 +604,36 @@ impl Default for BinanceBasisMonitorOptions {
     }
 }
 
-/// Binance `bookTicker` WSS 公开行情探测选项。
+/// Binance `bookTicker` WSS 公开行情常驻任务选项。
 ///
 /// 中文说明：该选项只允许公开行情 WSS，不读取账户、不下单、不撤单、不转账、
-/// 不签名。REST 快照始终先于 WSS，用于启动和异常后的重建。
+/// 不签名。REST 快照始终先于 WSS，用于启动和异常后的重建。默认是常驻任务；
+/// `once` 只用于手动验收旧的有限条探测路径。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceWssBookTickerProbeOptions {
+pub struct BinanceWssBookTickerMonitorOptions {
+    pub bind_addr: String,
     pub symbol: String,
     pub market: BinancePublicMarket,
     pub updates: usize,
+    pub reconnect_delay_secs: u64,
+    pub once: bool,
 }
 
-impl Default for BinanceWssBookTickerProbeOptions {
+impl Default for BinanceWssBookTickerMonitorOptions {
     fn default() -> Self {
         Self {
-            symbol: BASIS_SYMBOL.to_owned(),
+            bind_addr: BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR.to_owned(),
+            symbol: BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
             market: BinancePublicMarket::Spot,
             updates: 3,
+            reconnect_delay_secs: BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
+            once: false,
         }
     }
 }
+
+/// 兼容旧名称：历史上该命令只做有限条探测。
+pub type BinanceWssBookTickerProbeOptions = BinanceWssBookTickerMonitorOptions;
 
 /// Binance `bookTicker` WSS 公开行情探测结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -615,6 +646,43 @@ pub struct BinanceWssBookTickerProbeReport {
     pub fail_closed_count: usize,
     pub latest_best_bid: Option<String>,
     pub latest_best_ask: Option<String>,
+}
+
+/// Binance `bookTicker` WSS 最新报价快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceWssBookTickerQuoteSnapshot {
+    pub symbol: String,
+    pub venue_id: String,
+    pub instrument_id: String,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
+    pub bid_size: Option<String>,
+    pub ask_size: Option<String>,
+    pub source_sequence: Option<String>,
+    pub source_event_id: Option<String>,
+    pub observed_at: String,
+    pub ingested_at: String,
+    pub freshness_status: String,
+}
+
+/// Binance `bookTicker` WSS 常驻任务状态快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceWssBookTickerMonitorSnapshot {
+    pub status: String,
+    pub updated_at: String,
+    pub symbol: String,
+    pub market: String,
+    pub stream_url: String,
+    pub coordinator_status: String,
+    pub latest_quote: Option<BinanceWssBookTickerQuoteSnapshot>,
+    pub rows: Vec<BinanceWssBookTickerQuoteSnapshot>,
+    pub total_rows: usize,
+    pub fail_closed: bool,
+    pub fail_closed_count: u64,
+    pub disconnect_count: u64,
+    pub rest_rebuild_count: u64,
+    pub wss_update_count: u64,
+    pub last_error: Option<String>,
 }
 
 /// Bybit basis 长驻监控选项。
@@ -1530,21 +1598,68 @@ pub fn run_binance_basis_scan(
     Ok(report)
 }
 
-/// 运行一次 Binance 公开 `bookTicker` WSS 探测。
+/// 拉取一次 Binance 公开 spot/perp basis 数据并进入正式模拟管线。
 ///
-/// 中文说明：该路径先用 REST bookTicker 建立启动快照，然后连接 Binance 真实
-/// WSS 公开行情读取有限条更新。它不使用 API key、不读取账户、不产生任何账户
-/// 变更；异常时协调器会 fail closed，REST 快照仍是补洞和重建入口。
-pub fn run_binance_wss_book_ticker_probe(
-    options: BinanceWssBookTickerProbeOptions,
-) -> RuntimeResult<BinanceWssBookTickerProbeReport> {
-    validate_binance_wss_probe_options(&options)?;
-    let symbol = validate_binance_public_wss_symbol(&options.symbol)?;
-    let venue_id = binance_public_wss_venue_id(options.market)?;
-    let instrument = binance_public_wss_instrument(&symbol, options.market)?;
-    let rest_url = match options.market {
-        BinancePublicMarket::Spot => binance_spot_book_ticker_url(&symbol),
-        BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_url(&symbol),
+/// 中文说明：该入口使用公开 REST 数据创建标准化事件和候选转换，然后继续经过
+/// 风控、执行计划、模拟执行、模拟账本、对账和运营报告。缺私有余额或未知状态
+/// 必须被风控拒绝，不能当作通过。
+pub fn run_binance_basis_pipeline(
+    symbol: &str,
+    output_dir: Option<PathBuf>,
+) -> RuntimeResult<BinanceBasisPipelineReport> {
+    let symbol = validate_binance_basis_symbol(symbol)?;
+    let fixture_root = resolve_fixture_root(Path::new(DEFAULT_FULL_PIPELINE_FIXTURE));
+    validate_full_pipeline_context(&fixture_root)?;
+    let replay = arb_replay::load_fixture(&fixture_root)?;
+    ensure_simulated_offline_config(replay.config())?;
+
+    let spot_book_ticker_url = binance_spot_book_ticker_url(&symbol);
+    let perp_book_ticker_url = binance_usdm_book_ticker_url(&symbol);
+    let premium_index_url = binance_usdm_premium_index_url(&symbol);
+    let raw_spot_book = fetch_public_json_with_curl(&spot_book_ticker_url)?;
+    let raw_perp_book = fetch_public_json_with_curl(&perp_book_ticker_url)?;
+    let raw_premium_index = fetch_public_json_with_curl(&premium_index_url)?;
+    let ingested_at = current_utc_timestamp()?;
+
+    let artifacts = assemble_binance_basis_pipeline_from_raw_json(
+        &replay,
+        BinanceBasisRawInputs {
+            symbol: &symbol,
+            raw_spot_book: &raw_spot_book,
+            spot_book_ref: &spot_book_ticker_url,
+            raw_perp_book: &raw_perp_book,
+            perp_book_ref: &perp_book_ticker_url,
+            raw_premium_index: &raw_premium_index,
+            premium_index_ref: &premium_index_url,
+        },
+        ingested_at,
+    )?;
+
+    if let Some(dir) = &output_dir {
+        write_artifacts_to_dir(dir, &artifacts)?;
+    }
+
+    Ok(BinanceBasisPipelineReport {
+        fixture_root,
+        symbol,
+        spot_book_ticker_url,
+        perp_book_ticker_url,
+        premium_index_url,
+        ingested_at: ingested_at.to_string(),
+        artifacts,
+        output_dir,
+    })
+}
+
+fn bootstrap_binance_wss_book_ticker_client(
+    symbol: &str,
+    market: BinancePublicMarket,
+    venue_id: &VenueId,
+    instrument: &BinancePublicInstrument,
+) -> RuntimeResult<(BinancePublicWssBookTickerClient, HybridMarketDataUpdate)> {
+    let rest_url = match market {
+        BinancePublicMarket::Spot => binance_spot_book_ticker_url(symbol),
+        BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_url(symbol),
     };
     let raw_rest_snapshot = fetch_public_json_with_curl(&rest_url)?;
     let started_at = current_utc_timestamp()?;
@@ -1552,7 +1667,7 @@ pub fn run_binance_wss_book_ticker_probe(
     let mut rest_adapter = BinancePublicBookTickerAdapter::new(
         venue_id.clone(),
         instrument.clone(),
-        options.market,
+        market,
         started_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
@@ -1565,11 +1680,28 @@ pub fn run_binance_wss_book_ticker_probe(
     let config = BinancePublicWssBookTickerConfig::new(
         venue_id.clone(),
         instrument.clone(),
-        options.market,
+        market,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let mut client = BinancePublicWssBookTickerClient::new(config, started_at)?;
-    let _rest_update = client.apply_rest_snapshot(rest_batch.quote)?;
+    let rest_update = client.apply_rest_snapshot(rest_batch.quote)?;
+    Ok((client, rest_update))
+}
+
+/// 运行一次 Binance 公开 `bookTicker` WSS 探测。
+///
+/// 中文说明：该路径先用 REST bookTicker 建立启动快照，然后连接 Binance 真实
+/// WSS 公开行情读取有限条更新。它不使用 API key、不读取账户、不产生任何账户
+/// 变更；异常时协调器会 fail closed，REST 快照仍是补洞和重建入口。
+pub fn run_binance_wss_book_ticker_probe(
+    options: BinanceWssBookTickerProbeOptions,
+) -> RuntimeResult<BinanceWssBookTickerProbeReport> {
+    validate_binance_wss_probe_options(&options)?;
+    let symbol = validate_binance_public_wss_symbol(&options.symbol)?;
+    let venue_id = binance_public_wss_venue_id(options.market)?;
+    let instrument = binance_public_wss_instrument(&symbol, options.market)?;
+    let (mut client, _rest_update) =
+        bootstrap_binance_wss_book_ticker_client(&symbol, options.market, &venue_id, &instrument)?;
     let stream_url = client.stream_url();
     let updates = client.read_live_wss_updates(options.updates)?;
     let fail_closed_count = updates.iter().filter(|update| update.fail_closed).count();
@@ -1592,6 +1724,511 @@ pub fn run_binance_wss_book_ticker_probe(
             .as_ref()
             .and_then(|quote| quote.best_ask.map(|price| price.to_string())),
     })
+}
+
+/// 运行 Binance 公开 `bookTicker` WSS 常驻任务。
+///
+/// 中文说明：默认启动本地 HTTP API 并持续连接真实 Binance 公开 WSS。每次连接前
+/// 都先走 REST 快照；断线、读失败或异常结束后 fail closed，等待固定间隔后重新
+/// 通过 REST 快照重建，再接回 WSS。该任务不读取账户、不签名、不提交可变操作。
+pub fn run_binance_wss_book_ticker_monitor(
+    options: BinanceWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    validate_binance_wss_probe_options(&options)?;
+    let symbol_scope = normalize_binance_wss_symbol_scope(&options.symbol)?;
+    let state = Arc::new(RwLock::new(BinanceWssBookTickerMonitorSnapshot::empty(
+        &symbol_scope,
+        options.market,
+        "pending-rest-bootstrap",
+    )));
+    if !options.once {
+        start_binance_wss_book_ticker_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "binance-wss-book-ticker: api=http://{} symbol_scope={} market={} reconnect_delay_secs={} mutable_execution_started=false",
+            options.bind_addr,
+            symbol_scope,
+            options.market.as_str(),
+            options.reconnect_delay_secs,
+        );
+    }
+
+    let mut rebuild_from_rest = false;
+    loop {
+        let cycle = run_binance_wss_book_ticker_monitor_cycle(
+            &options,
+            state.clone(),
+            &symbol_scope,
+            rebuild_from_rest,
+        );
+        match cycle {
+            Ok(()) if options.once => return Ok(()),
+            Ok(()) => {}
+            Err(error) if options.once => return Err(error),
+            Err(error) => eprintln!("binance-wss-book-ticker cycle failed: {error}"),
+        }
+        rebuild_from_rest = true;
+        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+    }
+}
+
+fn run_binance_wss_book_ticker_monitor_cycle(
+    options: &BinanceWssBookTickerMonitorOptions,
+    state: Arc<RwLock<BinanceWssBookTickerMonitorSnapshot>>,
+    symbol_scope: &str,
+    rebuild_from_rest: bool,
+) -> RuntimeResult<()> {
+    if rebuild_from_rest {
+        state
+            .write()
+            .expect("Binance WSS monitor state lock poisoned")
+            .begin_rest_rebuild();
+    }
+    let mut market_state =
+        match bootstrap_binance_wss_book_ticker_all_market(symbol_scope, options.market) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                state
+                    .write()
+                    .expect("Binance WSS monitor state lock poisoned")
+                    .record_failure(
+                        format!("REST snapshot bootstrap/rebuild failed: {error}"),
+                        false,
+                    );
+                return Err(error);
+            }
+        };
+    {
+        let mut snapshot = state
+            .write()
+            .expect("Binance WSS monitor state lock poisoned");
+        snapshot.stream_url = market_state.stream_url.clone();
+        snapshot.symbol = symbol_scope.to_owned();
+        snapshot.market = options.market.as_str().to_owned();
+        snapshot.rows.clear();
+        snapshot.latest_quote = None;
+        snapshot.total_rows = 0;
+        for update in &market_state.rest_updates {
+            snapshot.record_update(update);
+        }
+    }
+
+    let connected_at = current_utc_timestamp()?;
+    for coordinator in market_state.coordinators.values_mut() {
+        let update = coordinator.apply(HybridMarketDataInput::WssConnected {
+            occurred_at: connected_at,
+            ingested_at: connected_at,
+        })?;
+        state
+            .write()
+            .expect("Binance WSS monitor state lock poisoned")
+            .record_update(&update);
+    }
+
+    let text_client = BinancePublicWssTextStreamClient::new(
+        market_state.venue_id.clone(),
+        market_state.stream_url.clone(),
+    )?;
+    let max_text_messages = if options.once {
+        options.updates
+    } else {
+        usize::MAX
+    };
+    let mut observed_wss_event = false;
+    let mut observer_error = None;
+    let read_result =
+        text_client.read_live_text_messages_observed(max_text_messages, |raw_json, ingested_at| {
+            observed_wss_event = true;
+            match apply_binance_wss_book_ticker_text(
+                raw_json,
+                ingested_at,
+                options.market,
+                &mut market_state,
+            ) {
+                Ok(Some(update)) => {
+                    let keep_going = !update.fail_closed;
+                    state
+                        .write()
+                        .expect("Binance WSS monitor state lock poisoned")
+                        .record_update(&update);
+                    keep_going
+                }
+                Ok(None) => true,
+                Err(error) => {
+                    observer_error = Some(error.to_string());
+                    state
+                        .write()
+                        .expect("Binance WSS monitor state lock poisoned")
+                        .record_failure(error.to_string(), false);
+                    false
+                }
+            }
+        });
+
+    if let Some(error) = observer_error {
+        return Err(RuntimeError::LiveMarketData { message: error });
+    }
+    match read_result {
+        Ok(()) => {
+            if !options.once {
+                state
+                    .write()
+                    .expect("Binance WSS monitor state lock poisoned")
+                    .record_stream_end();
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state
+                .write()
+                .expect("Binance WSS monitor state lock poisoned")
+                .record_failure(error.to_string(), !observed_wss_event);
+            Err(error.into())
+        }
+    }
+}
+
+struct BinanceWssBookTickerAllMarketState {
+    venue_id: VenueId,
+    stream_url: String,
+    all_symbols_scope: bool,
+    coordinators: BTreeMap<String, RestWssMarketDataCoordinator>,
+    local_sequences: BTreeMap<String, u64>,
+    last_exchange_update_ids: BTreeMap<String, u64>,
+    rest_updates: Vec<HybridMarketDataUpdate>,
+}
+
+struct BinanceWssBookTickerRuntimeRaw {
+    symbol: String,
+    update_id: u64,
+    best_bid: Price,
+    best_ask: Price,
+    bid_size: Quantity,
+    ask_size: Quantity,
+    observed_at: UtcTimestamp,
+}
+
+fn bootstrap_binance_wss_book_ticker_all_market(
+    symbol_scope: &str,
+    market: BinancePublicMarket,
+) -> RuntimeResult<BinanceWssBookTickerAllMarketState> {
+    let venue_id = binance_public_wss_venue_id(market)?;
+    let all_symbols_scope = is_binance_wss_all_symbols_scope(symbol_scope);
+    let rest_url = if all_symbols_scope {
+        match market {
+            BinancePublicMarket::Spot => binance_spot_book_ticker_all_url(),
+            BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_all_url(),
+        }
+    } else {
+        match market {
+            BinancePublicMarket::Spot => binance_spot_book_ticker_url(symbol_scope),
+            BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_url(symbol_scope),
+        }
+    };
+    let raw_rest_snapshot = fetch_public_json_with_curl(&rest_url)?;
+    let rows = prepare_binance_wss_book_ticker_rest_rows(
+        parse_book_ticker_rows(&raw_rest_snapshot, "binance bookTicker")?,
+        all_symbols_scope,
+    )?;
+    if rows.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS bookTicker REST bootstrap returned no rows for `{symbol_scope}`"
+            ),
+        });
+    }
+
+    let started_at = current_utc_timestamp()?;
+    let mut coordinators = BTreeMap::new();
+    let mut local_sequences = BTreeMap::new();
+    let mut rest_updates = Vec::with_capacity(rows.len());
+    let mut symbols = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = row.symbol.clone();
+        let instrument = binance_public_wss_instrument(&symbol, market)?;
+        let mut quote = binance_wss_rest_quote_from_row(&row, &venue_id, &instrument, started_at)?;
+        let sequence = 1_u64;
+        quote.source_sequence = Some(sequence.to_string());
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument.instrument_id.clone(),
+            started_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )?;
+        let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+        local_sequences.insert(symbol.clone(), sequence);
+        coordinators.insert(symbol.clone(), coordinator);
+        rest_updates.push(update);
+        symbols.push(symbol);
+    }
+
+    let stream_url = binance_wss_book_ticker_all_market_stream_url(market, &symbols)?;
+    Ok(BinanceWssBookTickerAllMarketState {
+        venue_id,
+        stream_url,
+        all_symbols_scope,
+        coordinators,
+        local_sequences,
+        last_exchange_update_ids: BTreeMap::new(),
+        rest_updates,
+    })
+}
+
+fn prepare_binance_wss_book_ticker_rest_rows(
+    rows: Vec<MonitorBookTickerRow>,
+    all_symbols_scope: bool,
+) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    let mut prepared = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match validate_binance_public_wss_symbol(&row.symbol) {
+            Ok(symbol) => {
+                row.symbol = symbol;
+                prepared.push(row);
+            }
+            Err(_) if all_symbols_scope => {}
+            Err(error) => return Err(error),
+        }
+    }
+    prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    Ok(prepared)
+}
+
+fn binance_wss_rest_quote_from_row(
+    row: &MonitorBookTickerRow,
+    venue_id: &VenueId,
+    instrument: &BinancePublicInstrument,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<MarketQuote> {
+    let freshness = DataFreshness::new(observed_at, observed_at, MARKET_DATA_MAX_AGE_MS)?;
+    Ok(MarketQuote {
+        venue_id: venue_id.clone(),
+        instrument_id: instrument.instrument_id.clone(),
+        last_price: None,
+        best_bid: Some(Price::from_str(&row.bid_price)?),
+        best_ask: Some(Price::from_str(&row.ask_price)?),
+        mark_price: None,
+        index_price: None,
+        bid_size: Some(Quantity::from_str(&row.bid_qty)?),
+        ask_size: Some(Quantity::from_str(&row.ask_qty)?),
+        source_sequence: None,
+        source_event_id: Some(format!("binance:rest-bookTicker:{}", row.symbol)),
+        freshness,
+    })
+}
+
+fn apply_binance_wss_book_ticker_text(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+    market: BinancePublicMarket,
+    state: &mut BinanceWssBookTickerAllMarketState,
+) -> RuntimeResult<Option<HybridMarketDataUpdate>> {
+    let mut raw = parse_binance_wss_book_ticker_runtime_raw(raw_json, ingested_at)?;
+    raw.symbol = match validate_binance_public_wss_symbol(&raw.symbol) {
+        Ok(symbol) => symbol,
+        Err(_) if state.all_symbols_scope => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !state.coordinators.contains_key(&raw.symbol) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
+                raw.symbol
+            ),
+        });
+    }
+    if let Some(previous) = state.last_exchange_update_ids.get(&raw.symbol) {
+        if raw.update_id <= *previous {
+            let update = state
+                .coordinators
+                .get_mut(&raw.symbol)
+                .expect("coordinator exists")
+                .apply(HybridMarketDataInput::WssGapDetected {
+                    expected_sequence: None,
+                    observed_sequence: state.local_sequences.get(&raw.symbol).copied(),
+                    occurred_at: raw.observed_at,
+                    ingested_at,
+                    detail: format!(
+                        "Binance WSS bookTicker updateId `{}` did not advance beyond `{previous}`; REST rebuild required",
+                        raw.update_id
+                    ),
+                })?;
+            return Ok(Some(update));
+        }
+    }
+    let local_sequence = next_binance_wss_local_sequence(state, &raw.symbol)?;
+    let instrument = binance_public_wss_instrument(&raw.symbol, market)?;
+    let update = state
+        .coordinators
+        .get_mut(&raw.symbol)
+        .expect("coordinator exists")
+        .apply(HybridMarketDataInput::WssQuote {
+            update: WssQuoteUpdate {
+                venue_id: state.venue_id.clone(),
+                instrument_id: instrument.instrument_id,
+                last_price: None,
+                best_bid: Some(raw.best_bid),
+                best_ask: Some(raw.best_ask),
+                mark_price: None,
+                index_price: None,
+                bid_size: Some(raw.bid_size),
+                ask_size: Some(raw.ask_size),
+                source_sequence: local_sequence,
+                source_event_id: Some(format!(
+                    "binance:wss-bookTicker:{}:{}:{}",
+                    market.as_str(),
+                    raw.symbol,
+                    raw.update_id
+                )),
+                observed_at: raw.observed_at,
+                ingested_at,
+            },
+        })?;
+    state
+        .last_exchange_update_ids
+        .insert(raw.symbol, raw.update_id);
+    Ok(Some(update))
+}
+
+fn next_binance_wss_local_sequence(
+    state: &mut BinanceWssBookTickerAllMarketState,
+    symbol: &str,
+) -> RuntimeResult<u64> {
+    let sequence =
+        state
+            .local_sequences
+            .get_mut(symbol)
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: format!("missing local WSS sequence for `{symbol}`"),
+            })?;
+    *sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("local Binance WSS sequence overflow for `{symbol}`"),
+        })?;
+    Ok(*sequence)
+}
+
+fn parse_binance_wss_book_ticker_runtime_raw(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<BinanceWssBookTickerRuntimeRaw> {
+    let payload = binance_wss_book_ticker_payload_json(raw_json)?;
+    let fields = parse_flat_json_object(payload)?;
+    if let Some(MonitorJsonScalar::String(event_type)) = fields.get("e") {
+        if event_type != "bookTicker" {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("WSS event type `{event_type}` is not bookTicker"),
+            });
+        }
+    }
+    let observed_at = optional_binance_wss_millis(&fields, "T")?
+        .or(optional_binance_wss_millis(&fields, "E")?)
+        .map(timestamp_from_unix_millis)
+        .transpose()?
+        .unwrap_or(ingested_at);
+    Ok(BinanceWssBookTickerRuntimeRaw {
+        symbol: required_json_string(&fields, "s", "binance wss bookTicker")?,
+        update_id: required_json_string(&fields, "u", "binance wss bookTicker")?
+            .parse::<u64>()
+            .map_err(|_| RuntimeError::LiveMarketData {
+                message: "Binance WSS bookTicker field `u` must be u64".to_owned(),
+            })?,
+        best_bid: Price::from_str(&required_json_string(
+            &fields,
+            "b",
+            "binance wss bookTicker",
+        )?)?,
+        best_ask: Price::from_str(&required_json_string(
+            &fields,
+            "a",
+            "binance wss bookTicker",
+        )?)?,
+        bid_size: Quantity::from_str(&required_json_string(
+            &fields,
+            "B",
+            "binance wss bookTicker",
+        )?)?,
+        ask_size: Quantity::from_str(&required_json_string(
+            &fields,
+            "A",
+            "binance wss bookTicker",
+        )?)?,
+        observed_at,
+    })
+}
+
+fn binance_wss_book_ticker_payload_json(raw_json: &str) -> RuntimeResult<&str> {
+    let fields = parse_json_object_value_slices(raw_json)?;
+    match fields.get("data") {
+        Some(data) => Ok(data.trim()),
+        None => Ok(raw_json.trim()),
+    }
+}
+
+fn optional_binance_wss_millis(
+    fields: &BTreeMap<String, MonitorJsonScalar>,
+    field: &'static str,
+) -> RuntimeResult<Option<u64>> {
+    match fields.get(field) {
+        Some(MonitorJsonScalar::String(value)) | Some(MonitorJsonScalar::Number(value)) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| RuntimeError::LiveMarketData {
+                message: format!("Binance WSS bookTicker field `{field}` must be u64 millis"),
+            }),
+        Some(MonitorJsonScalar::Null) | None => Ok(None),
+        Some(MonitorJsonScalar::Bool(_)) => Err(RuntimeError::LiveMarketData {
+            message: format!("Binance WSS bookTicker field `{field}` must be millis"),
+        }),
+    }
+}
+
+fn timestamp_from_unix_millis(value: u64) -> RuntimeResult<UtcTimestamp> {
+    let seconds_u64 = value / 1_000;
+    let millis = value % 1_000;
+    let seconds = i64::try_from(seconds_u64).map_err(|_| RuntimeError::LiveMarketData {
+        message: format!("Unix millis `{value}` does not fit i64 seconds"),
+    })?;
+    let nanos = u32::try_from(millis * 1_000_000).map_err(|_| RuntimeError::LiveMarketData {
+        message: format!("Unix millis `{value}` does not fit nanoseconds"),
+    })?;
+    Ok(UtcTimestamp::from_unix_parts(seconds, nanos)?)
+}
+
+fn binance_wss_book_ticker_all_market_stream_url(
+    market: BinancePublicMarket,
+    symbols: &[String],
+) -> RuntimeResult<String> {
+    match market {
+        BinancePublicMarket::Spot => {
+            if symbols.len() > 1_024 {
+                return Err(RuntimeError::LiveMarketData {
+                    message: format!(
+                        "Binance spot combined stream supports at most 1024 streams; got {}",
+                        symbols.len()
+                    ),
+                });
+            }
+            let streams = symbols
+                .iter()
+                .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
+                .collect::<Vec<_>>()
+                .join("/");
+            Ok(format!(
+                "wss://data-stream.binance.vision/stream?streams={streams}"
+            ))
+        }
+        BinancePublicMarket::UsdmPerpetual => {
+            if symbols.len() == 1 {
+                Ok(format!(
+                    "wss://fstream.binance.com/public/ws/{}@bookTicker",
+                    symbols[0].to_ascii_lowercase()
+                ))
+            } else {
+                Ok("wss://fstream.binance.com/public/ws/!bookTicker".to_owned())
+            }
+        }
+    }
 }
 
 /// 运行 Binance basis 7*24 只读监控。
@@ -2735,11 +3372,35 @@ fn validate_binance_basis_symbol(symbol: &str) -> RuntimeResult<String> {
 fn validate_binance_wss_probe_options(
     options: &BinanceWssBookTickerProbeOptions,
 ) -> RuntimeResult<()> {
+    if options.bind_addr.trim().is_empty() {
+        return Err(cli_arg_error("--bind must not be empty"));
+    }
     if options.updates == 0 {
         return Err(cli_arg_error("--updates must be greater than zero"));
     }
-    validate_binance_public_wss_symbol(&options.symbol)?;
+    if options.reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    normalize_binance_wss_symbol_scope(&options.symbol)?;
     Ok(())
+}
+
+fn normalize_binance_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if is_binance_wss_all_symbols_scope(&symbol) {
+        Ok(BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
+    } else {
+        validate_binance_public_wss_symbol(&symbol)
+    }
+}
+
+fn is_binance_wss_all_symbols_scope(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "ALL" | "ALL_USDT" | "*"
+    )
 }
 
 fn validate_binance_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {
@@ -4189,6 +4850,121 @@ struct BinanceBasisRawInputs<'a> {
     premium_index_ref: &'a str,
 }
 
+fn assemble_binance_basis_pipeline_from_raw_json(
+    replay: &ReplayInput,
+    inputs: BinanceBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<EndToEndArtifacts> {
+    let _temp_dir = RuntimeTempDir::new()?;
+    let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
+    let events = ingest_binance_basis_public_json(inputs, ingested_at)?;
+    for event in &events {
+        event_store.append(event)?;
+    }
+
+    let stored_events = event_store.read_all_ordered()?;
+    let source_event_refs = events
+        .iter()
+        .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
+        .map(|event| event.event_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let portfolio_state = build_binance_basis_portfolio_state(&source_event_refs, ingested_at)?;
+    ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
+    let venue_capabilities = load_binance_basis_capabilities()?;
+    let fixed_time = ingested_at.to_string();
+    let evaluation = run_spot_perp_basis_strategy(
+        replay.config(),
+        &stored_events,
+        &portfolio_state,
+        &venue_capabilities,
+        &fixed_time,
+    )?;
+    let Some(candidate) = evaluation.candidate().cloned() else {
+        let operations_report =
+            run_operations_report(&event_store, &[], &[], &[], &[], &[], &fixed_time)?;
+        return Ok(EndToEndArtifacts {
+            replay_smoke_txt: replay.run_smoke_replay().to_stable_text(),
+            stored_events_jsonl: stored_events_jsonl(&stored_events),
+            candidate_transitions_jsonl: String::new(),
+            risk_decisions_jsonl: String::new(),
+            execution_plans_jsonl: String::new(),
+            execution_reports_jsonl: String::new(),
+            ledger_entries_jsonl: String::new(),
+            reconciliation_reports_jsonl: String::new(),
+            incidents_jsonl: String::new(),
+            operations_daily_report_md: operations_report,
+        });
+    };
+
+    let risk_decision = run_risk(
+        &candidate,
+        &portfolio_state,
+        replay.config(),
+        &venue_capabilities,
+        ingested_at,
+    )?;
+
+    if !risk_decision_allows_execution(&risk_decision) {
+        let incidents = incidents_from_risk_rejection(&candidate, &risk_decision, &fixed_time)?;
+        let operations_report = run_operations_report(
+            &event_store,
+            std::slice::from_ref(&risk_decision),
+            &[],
+            &[],
+            &[],
+            &incidents,
+            &fixed_time,
+        )?;
+
+        return Ok(EndToEndArtifacts {
+            replay_smoke_txt: replay.run_smoke_replay().to_stable_text(),
+            stored_events_jsonl: stored_events_jsonl(&stored_events),
+            candidate_transitions_jsonl: canonical_jsonl(std::slice::from_ref(&candidate)),
+            risk_decisions_jsonl: canonical_jsonl(std::slice::from_ref(&risk_decision)),
+            execution_plans_jsonl: String::new(),
+            execution_reports_jsonl: String::new(),
+            ledger_entries_jsonl: String::new(),
+            reconciliation_reports_jsonl: String::new(),
+            incidents_jsonl: canonical_jsonl(&incidents),
+            operations_daily_report_md: operations_report,
+        });
+    }
+
+    let execution_plan =
+        run_execution_plan(&candidate, &risk_decision, replay.config(), &fixed_time)?;
+    let execution_report = simulate_execution(&execution_plan, &fixed_time)?;
+    let contract_ledger_entries =
+        simulated_ledger_entries_from_execution_report(&execution_plan, &execution_report)?;
+    let domain_ledger_entries = append_to_simulated_ledger(&contract_ledger_entries)?;
+    let fill_snapshots = fill_snapshots_from_report(&execution_report, &contract_ledger_entries)?;
+    let reconciliation_report =
+        run_reconciliation(ingested_at, &domain_ledger_entries, &fill_snapshots)?;
+    let operations_report = run_operations_report(
+        &event_store,
+        std::slice::from_ref(&risk_decision),
+        std::slice::from_ref(&execution_report),
+        &contract_ledger_entries,
+        std::slice::from_ref(&reconciliation_report),
+        &[],
+        &fixed_time,
+    )?;
+
+    Ok(EndToEndArtifacts {
+        replay_smoke_txt: replay.run_smoke_replay().to_stable_text(),
+        stored_events_jsonl: stored_events_jsonl(&stored_events),
+        candidate_transitions_jsonl: canonical_jsonl(std::slice::from_ref(&candidate)),
+        risk_decisions_jsonl: canonical_jsonl(std::slice::from_ref(&risk_decision)),
+        execution_plans_jsonl: canonical_jsonl(std::slice::from_ref(&execution_plan)),
+        execution_reports_jsonl: canonical_jsonl(std::slice::from_ref(&execution_report)),
+        ledger_entries_jsonl: canonical_jsonl(&contract_ledger_entries),
+        reconciliation_reports_jsonl: jsonl_from_lines(vec![stable_reconciliation_report_json(
+            &reconciliation_report,
+        )]),
+        incidents_jsonl: String::new(),
+        operations_daily_report_md: operations_report,
+    })
+}
+
 fn ingest_binance_basis_public_json(
     inputs: BinanceBasisRawInputs<'_>,
     ingested_at: UtcTimestamp,
@@ -5321,6 +6097,298 @@ fn json_option_string(value: &Option<String>) -> String {
         .unwrap_or_else(|| "null".to_owned())
 }
 
+fn current_utc_timestamp_string() -> String {
+    current_utc_timestamp()
+        .map(|timestamp| timestamp.to_string())
+        .unwrap_or_else(|_| "timestamp-unavailable".to_owned())
+}
+
+impl BinanceWssBookTickerQuoteSnapshot {
+    fn from_quote(quote: &MarketQuote) -> Self {
+        let symbol = quote
+            .instrument_id
+            .as_str()
+            .split(':')
+            .nth(2)
+            .unwrap_or_else(|| quote.instrument_id.as_str())
+            .to_owned();
+        Self {
+            symbol,
+            venue_id: quote.venue_id.as_str().to_owned(),
+            instrument_id: quote.instrument_id.as_str().to_owned(),
+            best_bid: quote.best_bid.map(|price| price.to_string()),
+            best_ask: quote.best_ask.map(|price| price.to_string()),
+            bid_size: quote.bid_size.map(|quantity| quantity.to_string()),
+            ask_size: quote.ask_size.map(|quantity| quantity.to_string()),
+            source_sequence: quote.source_sequence.clone(),
+            source_event_id: quote.source_event_id.clone(),
+            observed_at: quote.freshness.observed_at.to_string(),
+            ingested_at: quote.freshness.ingested_at.to_string(),
+            freshness_status: quote.freshness.status.as_str().to_owned(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"ask_size\":{},\"best_ask\":{},\"best_bid\":{},\"bid_size\":{},\"freshness_status\":{},\"ingested_at\":{},\"instrument_id\":{},\"observed_at\":{},\"source_event_id\":{},\"source_sequence\":{},\"symbol\":{},\"venue_id\":{}}}",
+            json_option_string(&self.ask_size),
+            json_option_string(&self.best_ask),
+            json_option_string(&self.best_bid),
+            json_option_string(&self.bid_size),
+            json_string(&self.freshness_status),
+            json_string(&self.ingested_at),
+            json_string(&self.instrument_id),
+            json_string(&self.observed_at),
+            json_option_string(&self.source_event_id),
+            json_option_string(&self.source_sequence),
+            json_string(&self.symbol),
+            json_string(&self.venue_id),
+        )
+    }
+}
+
+impl BinanceWssBookTickerMonitorSnapshot {
+    fn empty(symbol: &str, market: BinancePublicMarket, stream_url: &str) -> Self {
+        Self {
+            status: "starting".to_owned(),
+            updated_at: "not-yet-updated".to_owned(),
+            symbol: symbol.to_owned(),
+            market: market.as_str().to_owned(),
+            stream_url: stream_url.to_owned(),
+            coordinator_status: HybridMarketDataStatus::AwaitingRestSnapshot
+                .as_str()
+                .to_owned(),
+            latest_quote: None,
+            rows: Vec::new(),
+            total_rows: 0,
+            fail_closed: false,
+            fail_closed_count: 0,
+            disconnect_count: 0,
+            rest_rebuild_count: 0,
+            wss_update_count: 0,
+            last_error: None,
+        }
+    }
+
+    fn begin_rest_rebuild(&mut self) {
+        self.rest_rebuild_count += 1;
+        self.status = "rebuilding".to_owned();
+        self.updated_at = current_utc_timestamp_string();
+    }
+
+    fn record_update(&mut self, update: &HybridMarketDataUpdate) {
+        self.updated_at = current_utc_timestamp_string();
+        self.coordinator_status = update.status.as_str().to_owned();
+        self.status = binance_wss_monitor_status(update.status, update.fail_closed).to_owned();
+        self.fail_closed = update.fail_closed;
+        if update.fail_closed {
+            self.fail_closed_count += 1;
+            self.last_error = Some(if update.reason_codes.is_empty() {
+                "fail_closed".to_owned()
+            } else {
+                format!("fail_closed: {}", update.reason_codes.join(","))
+            });
+        } else {
+            self.last_error = None;
+        }
+        if update.status == HybridMarketDataStatus::Reconnecting {
+            self.disconnect_count += 1;
+        }
+        if update.transport == MarketDataTransport::WebSocketStream && update.quote.is_some() {
+            self.wss_update_count += 1;
+        }
+        if let Some(quote) = &update.quote {
+            let quote_snapshot = BinanceWssBookTickerQuoteSnapshot::from_quote(quote);
+            self.upsert_quote_row(quote_snapshot.clone());
+            self.latest_quote = Some(quote_snapshot);
+        }
+    }
+
+    fn upsert_quote_row(&mut self, quote: BinanceWssBookTickerQuoteSnapshot) {
+        match self.rows.iter_mut().find(|row| row.symbol == quote.symbol) {
+            Some(row) => *row = quote,
+            None => self.rows.push(quote),
+        }
+        self.rows
+            .sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        self.total_rows = self.rows.len();
+    }
+
+    fn record_failure(&mut self, detail: impl Into<String>, count_disconnect: bool) {
+        self.status = "fail_closed".to_owned();
+        self.updated_at = current_utc_timestamp_string();
+        self.fail_closed = true;
+        self.fail_closed_count += 1;
+        if count_disconnect {
+            self.disconnect_count += 1;
+        }
+        self.last_error = Some(detail.into());
+    }
+
+    fn record_stream_end(&mut self) {
+        if !self.fail_closed {
+            self.record_failure(
+                "Binance public WSS ended before reconnect; rebuilding from REST",
+                true,
+            );
+            return;
+        }
+        if self.last_error.is_none() {
+            self.last_error = Some("Binance public WSS ended; rebuilding from REST".to_owned());
+        }
+    }
+
+    fn latest_quote_json_value(&self) -> String {
+        self.latest_quote
+            .as_ref()
+            .map(BinanceWssBookTickerQuoteSnapshot::to_json)
+            .unwrap_or_else(|| "null".to_owned())
+    }
+
+    fn health_json(&self) -> String {
+        format!(
+            "{{\"disconnect_count\":{},\"fail_closed\":{},\"latest_quote\":{},\"rest_rebuild_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
+            self.disconnect_count,
+            self.fail_closed,
+            self.latest_quote_json_value(),
+            self.rest_rebuild_count,
+            json_string(&self.status),
+            self.total_rows,
+            json_string(&self.updated_at),
+            self.wss_update_count,
+        )
+    }
+
+    fn quote_json(&self) -> String {
+        format!(
+            "{{\"fail_closed\":{},\"latest_quote\":{},\"status\":{},\"updated_at\":{}}}",
+            self.fail_closed,
+            self.latest_quote_json_value(),
+            json_string(&self.status),
+            json_string(&self.updated_at),
+        )
+    }
+
+    fn quotes_json(&self) -> String {
+        format!(
+            "{{\"fail_closed\":{},\"rows\":[{}],\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+            self.fail_closed,
+            self.rows
+                .iter()
+                .map(BinanceWssBookTickerQuoteSnapshot::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string(&self.status),
+            self.total_rows,
+            json_string(&self.updated_at),
+        )
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"coordinator_status\":{},\"disconnect_count\":{},\"fail_closed\":{},\"fail_closed_count\":{},\"last_error\":{},\"latest_quote\":{},\"market\":{},\"rest_rebuild_count\":{},\"rows\":[{}],\"status\":{},\"stream_url\":{},\"symbol\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
+            json_string(&self.coordinator_status),
+            self.disconnect_count,
+            self.fail_closed,
+            self.fail_closed_count,
+            json_option_string(&self.last_error),
+            self.latest_quote_json_value(),
+            json_string(&self.market),
+            self.rest_rebuild_count,
+            self.rows
+                .iter()
+                .map(BinanceWssBookTickerQuoteSnapshot::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string(&self.status),
+            json_string(&self.stream_url),
+            json_string(&self.symbol),
+            self.total_rows,
+            json_string(&self.updated_at),
+            self.wss_update_count,
+        )
+    }
+}
+
+fn binance_wss_monitor_status(status: HybridMarketDataStatus, fail_closed: bool) -> &'static str {
+    let status = match status {
+        HybridMarketDataStatus::AwaitingRestSnapshot => "starting",
+        HybridMarketDataStatus::SnapshotReady => "snapshot_ready",
+        HybridMarketDataStatus::Streaming => "streaming",
+        HybridMarketDataStatus::Reconnecting => "reconnecting",
+        HybridMarketDataStatus::Halted => "fail_closed",
+    };
+    if fail_closed && status != "reconnecting" {
+        "fail_closed"
+    } else {
+        status
+    }
+}
+
+fn start_binance_wss_book_ticker_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<BinanceWssBookTickerMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind Binance WSS bookTicker HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_binance_wss_book_ticker_http_connection(stream, &state),
+                Err(error) => eprintln!("binance-wss-book-ticker api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+fn handle_binance_wss_book_ticker_http_connection(
+    mut stream: TcpStream,
+    state: &Arc<RwLock<BinanceWssBookTickerMonitorSnapshot>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let read = match stream.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+    let route = path.split('?').next().unwrap_or(path);
+    if method != "GET" {
+        let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
+        return;
+    }
+
+    let snapshot = state
+        .read()
+        .expect("Binance WSS monitor state lock poisoned");
+    let (status, body) = if route == "/health" {
+        (
+            if snapshot.fail_closed { 503 } else { 200 },
+            snapshot.health_json(),
+        )
+    } else if route == "/api/binance-wss-book-ticker/status" {
+        (200, snapshot.to_json())
+    } else if route == "/api/binance-wss-book-ticker/quote" {
+        (200, snapshot.quote_json())
+    } else if route == "/api/binance-wss-book-ticker/quotes" {
+        (200, snapshot.quotes_json())
+    } else if route == "/" || route == "/dashboard" {
+        let _ = write_http_html(&mut stream, 200, binance_wss_book_ticker_dashboard_html());
+        return;
+    } else {
+        (
+            404,
+            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/binance-wss-book-ticker/status\",\"/api/binance-wss-book-ticker/quote\",\"/api/binance-wss-book-ticker/quotes\"]}".to_owned(),
+        )
+    };
+    let _ = write_http_json(&mut stream, status, &body);
+}
+
 fn start_binance_basis_http_api(
     bind_addr: &str,
     state: Arc<RwLock<BinanceBasisMonitorSnapshot>>,
@@ -5731,6 +6799,510 @@ fn write_http_response(
         body.len(),
         body
     )
+}
+
+fn binance_wss_book_ticker_dashboard_html() -> &'static str {
+    r##"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Binance WSS bookTicker</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101112;
+      --band: #151719;
+      --panel: #1b1d20;
+      --panel-strong: #23262a;
+      --line: #353941;
+      --text: #f0eadc;
+      --muted: #a5a8aa;
+      --amber: #e2b650;
+      --green: #58c383;
+      --red: #e06a6a;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 22px 28px;
+      background: #191b1e;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+
+    .kicker {
+      margin: 0 0 6px;
+      color: var(--amber);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .pill.healthy,
+    .positive {
+      color: var(--green);
+      border-color: rgba(88, 195, 131, 0.45);
+    }
+
+    .pill.error,
+    .negative {
+      color: var(--red);
+      border-color: rgba(224, 106, 106, 0.45);
+    }
+
+    main {
+      padding: 18px 28px 32px;
+    }
+
+    .summary-grid,
+    .quote-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric,
+    .quote-field {
+      min-height: 72px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+
+    .metric span,
+    .quote-field span,
+    .section-head span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .metric strong,
+    .quote-field strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 22px;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+
+    .section {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .endpoint-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--text);
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--amber);
+    }
+
+    .control-bar {
+      display: grid;
+      grid-template-columns: minmax(150px, 220px) minmax(120px, max-content);
+      gap: 10px;
+      align-items: end;
+      padding: 12px;
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    label span {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input[type="search"] {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101214;
+      color: var(--text);
+      padding: 7px 9px;
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+      max-height: 52vh;
+    }
+
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      height: 38px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(53, 57, 65, 0.7);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #202327;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    th:first-child,
+    td:first-child {
+      text-align: left;
+    }
+
+    tbody tr:hover {
+      background: rgba(226, 182, 80, 0.08);
+    }
+
+    .empty-row {
+      height: 88px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    pre {
+      margin: 0;
+      max-height: 320px;
+      overflow: auto;
+      padding: 12px;
+      background: #0c0d0e;
+      color: #d7d1c2;
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 980px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status-strip {
+        justify-content: flex-start;
+        text-align: left;
+      }
+
+      .summary-grid,
+      .quote-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .control-bar {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      main,
+      .topbar {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .summary-grid,
+      .quote-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="kicker">Binance public WSS</p>
+      <h1>bookTicker 实时行情</h1>
+    </div>
+    <div class="status-strip">
+      <span id="runtime-status" class="pill">starting</span>
+      <span id="updated-at">not-yet-updated</span>
+    </div>
+  </header>
+  <main>
+    <section class="summary-grid" aria-label="summary">
+      <article class="metric"><span>Symbol</span><strong id="metric-symbol">-</strong></article>
+      <article class="metric"><span>Market</span><strong id="metric-market">-</strong></article>
+      <article class="metric"><span>fail_closed</span><strong id="metric-fail-closed">false</strong></article>
+      <article class="metric"><span>断线次数</span><strong id="metric-disconnects">0</strong></article>
+      <article class="metric"><span>REST rebuild</span><strong id="metric-rebuilds">0</strong></article>
+      <article class="metric"><span>WSS updates</span><strong id="metric-updates">0</strong></article>
+    </section>
+
+    <section class="quote-grid" aria-label="latest quote">
+      <article class="quote-field"><span>Best Bid</span><strong id="quote-bid">-</strong></article>
+      <article class="quote-field"><span>Bid Size</span><strong id="quote-bid-size">-</strong></article>
+      <article class="quote-field"><span>Best Ask</span><strong id="quote-ask">-</strong></article>
+      <article class="quote-field"><span>Ask Size</span><strong id="quote-ask-size">-</strong></article>
+      <article class="quote-field"><span>Sequence</span><strong id="quote-sequence">-</strong></article>
+      <article class="quote-field"><span>Freshness</span><strong id="quote-freshness">-</strong></article>
+    </section>
+
+    <section class="control-bar" aria-label="controls">
+      <label>
+        <span>Symbol</span>
+        <input id="symbol-filter" type="search" autocomplete="off" placeholder="BTCUSDT">
+      </label>
+      <button id="refresh-button" type="button">刷新</button>
+    </section>
+
+    <section class="section" aria-label="book ticker table">
+      <div class="section-head">
+        <strong>全部 bookTicker</strong>
+        <span id="row-count">0 rows</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Bid</th>
+              <th>Bid Size</th>
+              <th>Ask</th>
+              <th>Ask Size</th>
+              <th>Sequence</th>
+              <th>Freshness</th>
+              <th>Observed</th>
+            </tr>
+          </thead>
+          <tbody id="quote-rows">
+            <tr><td class="empty-row" colspan="8">loading</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" aria-label="stream state">
+      <div class="section-head">
+        <strong>连接状态</strong>
+        <span id="stream-url">-</span>
+      </div>
+      <pre id="state-preview">{}</pre>
+    </section>
+
+    <section class="section" aria-label="realtime api">
+      <div class="section-head">
+        <strong>实时 API</strong>
+        <div class="endpoint-grid">
+          <button type="button" data-endpoint="/health">health</button>
+          <button type="button" data-endpoint="/api/binance-wss-book-ticker/quote">quote</button>
+          <button type="button" data-endpoint="/api/binance-wss-book-ticker/quotes">quotes</button>
+          <button type="button" data-endpoint="/api/binance-wss-book-ticker/status">status</button>
+        </div>
+      </div>
+      <pre id="api-preview">{}</pre>
+    </section>
+  </main>
+
+  <script>
+    const statusUrl = "/api/binance-wss-book-ticker/status";
+    const state = { timer: null };
+    const $ = (id) => document.getElementById(id);
+
+    async function requestJson(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        throw new Error(`invalid json from ${url}: ${error.message}`);
+      }
+      if (!response.ok && url !== "/health") {
+        throw new Error(data.error || `http ${response.status}`);
+      }
+      return data;
+    }
+
+    function valueOrDash(value) {
+      return value === null || value === undefined || value === "" ? "-" : String(value);
+    }
+
+    function escapeHtml(value) {
+      return valueOrDash(value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function filteredRows(rows) {
+      const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
+      return (rows || [])
+        .filter((row) => !symbolFilter || String(row.symbol || "").includes(symbolFilter))
+        .sort((left, right) => String(left.symbol || "").localeCompare(String(right.symbol || "")));
+    }
+
+    function renderRows(rows) {
+      const body = $("quote-rows");
+      const view = filteredRows(rows);
+      $("row-count").textContent = `${view.length} / ${(rows || []).length} rows`;
+      if (!view.length) {
+        body.innerHTML = `<tr><td class="empty-row" colspan="8">no rows</td></tr>`;
+        return;
+      }
+      body.innerHTML = view.map((row) => `<tr>
+        <td>${escapeHtml(row.symbol)}</td>
+        <td>${escapeHtml(row.best_bid)}</td>
+        <td>${escapeHtml(row.bid_size)}</td>
+        <td>${escapeHtml(row.best_ask)}</td>
+        <td>${escapeHtml(row.ask_size)}</td>
+        <td>${escapeHtml(row.source_sequence)}</td>
+        <td>${escapeHtml(row.freshness_status)}</td>
+        <td>${escapeHtml(row.observed_at)}</td>
+      </tr>`).join("");
+    }
+
+    function render(snapshot) {
+      const quote = snapshot.latest_quote || {};
+      const healthy = snapshot.status === "streaming" && snapshot.fail_closed === false;
+      $("runtime-status").textContent = snapshot.status || "unknown";
+      $("runtime-status").className = `pill ${healthy ? "healthy" : "error"}`;
+      $("updated-at").textContent = snapshot.updated_at || "not-yet-updated";
+      $("metric-symbol").textContent = valueOrDash(snapshot.symbol);
+      $("metric-market").textContent = valueOrDash(snapshot.market);
+      $("metric-fail-closed").textContent = String(snapshot.fail_closed ?? false);
+      $("metric-fail-closed").className = snapshot.fail_closed ? "negative" : "positive";
+      $("metric-disconnects").textContent = snapshot.disconnect_count ?? 0;
+      $("metric-rebuilds").textContent = snapshot.rest_rebuild_count ?? 0;
+      $("metric-updates").textContent = snapshot.wss_update_count ?? 0;
+      $("quote-bid").textContent = valueOrDash(quote.best_bid);
+      $("quote-bid-size").textContent = valueOrDash(quote.bid_size);
+      $("quote-ask").textContent = valueOrDash(quote.best_ask);
+      $("quote-ask-size").textContent = valueOrDash(quote.ask_size);
+      $("quote-sequence").textContent = valueOrDash(quote.source_sequence);
+      $("quote-freshness").textContent = valueOrDash(quote.freshness_status);
+      renderRows(snapshot.rows || []);
+      $("stream-url").textContent = valueOrDash(snapshot.stream_url);
+      $("state-preview").textContent = JSON.stringify({
+        coordinator_status: snapshot.coordinator_status,
+        last_error: snapshot.last_error,
+        observed_at: quote.observed_at,
+        ingested_at: quote.ingested_at,
+        source_event_id: quote.source_event_id
+      }, null, 2);
+      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
+    }
+
+    async function refreshStatus() {
+      try {
+        const snapshot = await requestJson(statusUrl);
+        render(snapshot);
+      } catch (error) {
+        $("runtime-status").textContent = "error";
+        $("runtime-status").className = "pill error";
+        $("state-preview").textContent = error.message;
+      }
+    }
+
+    async function previewEndpoint(url) {
+      $("api-preview").textContent = "loading";
+      try {
+        const data = await requestJson(url);
+        $("api-preview").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        $("api-preview").textContent = error.message;
+      }
+    }
+
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => previewEndpoint(button.dataset.endpoint || statusUrl));
+    });
+    $("symbol-filter").addEventListener("input", refreshStatus);
+    $("refresh-button").addEventListener("click", refreshStatus);
+
+    state.timer = setInterval(refreshStatus, 2000);
+    refreshStatus();
+  </script>
+</body>
+</html>"##
 }
 
 fn basis_dashboard_html() -> &'static str {
@@ -6436,19 +8008,52 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             report.symbol, outcome, candidate_count, output_note
         ));
     }
+    if args[0] == "binance-basis-pipeline" {
+        let options = parse_binance_basis_pipeline_args(&args[1..])?;
+        let report = run_binance_basis_pipeline(&options.symbol, options.output_dir.clone())?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: ran Binance public spot/perp basis through simulated pipeline for {}; candidate_transitions={}; risk_decisions={}; execution_reports={}; incidents={}; mutable_execution_started=false{}",
+            report.symbol,
+            count_jsonl_records(&report.artifacts.candidate_transitions_jsonl),
+            count_jsonl_records(&report.artifacts.risk_decisions_jsonl),
+            count_jsonl_records(&report.artifacts.execution_reports_jsonl),
+            count_jsonl_records(&report.artifacts.incidents_jsonl),
+            output_note
+        ));
+    }
     if args[0] == "binance-wss-book-ticker" {
         let options = parse_binance_wss_book_ticker_args(&args[1..])?;
-        let report = run_binance_wss_book_ticker_probe(options)?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        if once && !is_binance_wss_all_symbols_scope(&options.symbol) {
+            let report = run_binance_wss_book_ticker_probe(options)?;
+            return Ok(format!(
+                "ok: Binance public WSS bookTicker market={} symbol={} updates={} fail_closed={} status={} bid={} ask={} stream={}; mutable_execution_started=false",
+                report.market.as_str(),
+                report.symbol,
+                report.update_count,
+                report.fail_closed_count,
+                report.coordinator_status,
+                report.latest_best_bid.as_deref().unwrap_or("null"),
+                report.latest_best_ask.as_deref().unwrap_or("null"),
+                report.stream_url
+            ));
+        }
+        run_binance_wss_book_ticker_monitor(options)?;
+        if once {
+            return Ok(format!(
+                "ok: ran one Binance public WSS bookTicker all-market monitor cycle; api_bind={bind_addr}; mutable_execution_started=false"
+            ));
+        }
         return Ok(format!(
-            "ok: Binance public WSS bookTicker market={} symbol={} updates={} fail_closed={} status={} bid={} ask={} stream={}; mutable_execution_started=false",
-            report.market.as_str(),
-            report.symbol,
-            report.update_count,
-            report.fail_closed_count,
-            report.coordinator_status,
-            report.latest_best_bid.as_deref().unwrap_or("null"),
-            report.latest_best_ask.as_deref().unwrap_or("null"),
-            report.stream_url
+            "ok: Binance public WSS bookTicker monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
     if args[0] == "binance-basis-monitor" {
@@ -6587,7 +8192,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
                 args[0]
             ),
         });
@@ -6626,8 +8231,10 @@ fn help_text() -> String {
         "                                    Fetch one public market-data snapshot and run simulated execution",
         "  binance-basis-scan [--symbol BTCUSDT] [--out dir]",
         "                                    Fetch Binance public spot/perp data and run read-only basis strategy",
-        "  binance-wss-book-ticker [--symbol BTCUSDT] [--market spot|usdm-perp] [--updates 3]",
-        "                                    Bootstrap from REST bookTicker, then read Binance public WSS bookTicker updates",
+        "  binance-basis-pipeline [--symbol BTCUSDT] [--out dir]",
+        "                                    Fetch Binance public spot/perp data and run simulated pipeline artifacts",
+        "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
+        "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
         "  binance-basis-monitor [--bind 127.0.0.1:8796] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
         "                                    Monitor all Binance public USDT spot/perp basis rows and serve /api/basis/status",
         "  bybit-basis-monitor [--bind 127.0.0.1:8797] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
@@ -6653,8 +8260,9 @@ struct BinanceBasisScanCliOptions {
     output_dir: Option<PathBuf>,
 }
 
+type BinanceBasisPipelineCliOptions = BinanceBasisScanCliOptions;
 type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
-type BinanceWssBookTickerCliOptions = BinanceWssBookTickerProbeOptions;
+type BinanceWssBookTickerCliOptions = BinanceWssBookTickerMonitorOptions;
 type BybitBasisMonitorCliOptions = BybitBasisMonitorOptions;
 type OkxBasisMonitorCliOptions = OkxBasisMonitorOptions;
 type HyperliquidBasisMonitorCliOptions = HyperliquidBasisMonitorOptions;
@@ -6746,6 +8354,46 @@ fn parse_binance_basis_scan_args(args: &[String]) -> RuntimeResult<BinanceBasisS
     Ok(BinanceBasisScanCliOptions { symbol, output_dir })
 }
 
+fn parse_binance_basis_pipeline_args(
+    args: &[String],
+) -> RuntimeResult<BinanceBasisPipelineCliOptions> {
+    let mut symbol = BASIS_SYMBOL.to_owned();
+    let mut output_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-basis-pipeline option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-basis-pipeline positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceBasisScanCliOptions { symbol, output_dir })
+}
+
 fn parse_binance_wss_book_ticker_args(
     args: &[String],
 ) -> RuntimeResult<BinanceWssBookTickerCliOptions> {
@@ -6754,6 +8402,13 @@ fn parse_binance_wss_book_ticker_args(
 
     while index < args.len() {
         match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires host:port"));
+                };
+                options.bind_addr = value.clone();
+            }
             "--symbol" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6776,6 +8431,18 @@ fn parse_binance_wss_book_ticker_args(
                 options.updates = value
                     .parse::<usize>()
                     .map_err(|_| cli_arg_error("--updates must be an integer"))?;
+            }
+            "--reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reconnect-delay-secs requires a value"));
+                };
+                options.reconnect_delay_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--reconnect-delay-secs must be an integer"))?;
+            }
+            "--once" => {
+                options.once = true;
             }
             value if value.starts_with('-') => {
                 return Err(cli_arg_error(format!(
@@ -7313,6 +8980,47 @@ mod tests {
         full_pipeline_fixture_root().join("cases").join(case_name)
     }
 
+    fn monitor_book_ticker_row(symbol: &str) -> MonitorBookTickerRow {
+        MonitorBookTickerRow {
+            symbol: symbol.to_owned(),
+            bid_price: "100.01".to_owned(),
+            bid_qty: "1.2".to_owned(),
+            ask_price: "100.02".to_owned(),
+            ask_qty: "1.3".to_owned(),
+        }
+    }
+
+    fn binance_wss_test_market_state(
+        symbol: &str,
+        all_symbols_scope: bool,
+    ) -> BinanceWssBookTickerAllMarketState {
+        let market = BinancePublicMarket::Spot;
+        let venue_id = binance_public_wss_venue_id(market).expect("venue id");
+        let instrument = binance_public_wss_instrument(symbol, market).expect("instrument");
+        let started_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument.instrument_id,
+            started_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )
+        .expect("coordinator");
+        let mut coordinators = BTreeMap::new();
+        coordinators.insert(symbol.to_owned(), coordinator);
+        let mut local_sequences = BTreeMap::new();
+        local_sequences.insert(symbol.to_owned(), 1);
+
+        BinanceWssBookTickerAllMarketState {
+            venue_id,
+            stream_url: "wss://example.test/ws".to_owned(),
+            all_symbols_scope,
+            coordinators,
+            local_sequences,
+            last_exchange_update_ids: BTreeMap::new(),
+            rest_updates: Vec::new(),
+        }
+    }
+
     #[test]
     fn repo_relative_fixture_root_resolves_from_crate_subdirectory() {
         let repo_root = workspace_root();
@@ -7337,19 +9045,180 @@ mod tests {
     #[test]
     fn binance_wss_book_ticker_args_parse_market_and_updates() {
         let args = vec![
+            "--bind".to_owned(),
+            "127.0.0.1:9901".to_owned(),
             "--symbol".to_owned(),
             "ethusdt".to_owned(),
             "--market".to_owned(),
             "usdm-perp".to_owned(),
             "--updates".to_owned(),
             "2".to_owned(),
+            "--reconnect-delay-secs".to_owned(),
+            "7".to_owned(),
+            "--once".to_owned(),
         ];
 
         let options = parse_binance_wss_book_ticker_args(&args).expect("options");
 
+        assert_eq!(options.bind_addr, "127.0.0.1:9901");
         assert_eq!(options.symbol, "ethusdt");
         assert_eq!(options.market, BinancePublicMarket::UsdmPerpetual);
         assert_eq!(options.updates, 2);
+        assert_eq!(options.reconnect_delay_secs, 7);
+        assert!(options.once);
+    }
+
+    #[test]
+    fn binance_wss_book_ticker_defaults_to_all_usdt_scope() {
+        let options = parse_binance_wss_book_ticker_args(&[]).expect("options");
+
+        assert_eq!(options.symbol, BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS);
+    }
+
+    #[test]
+    fn binance_wss_full_market_rest_rows_skip_unsupported_symbols() {
+        let rows = prepare_binance_wss_book_ticker_rest_rows(
+            vec![
+                monitor_book_ticker_row("ETHUSDT"),
+                monitor_book_ticker_row("BTCUSDT_260327"),
+                monitor_book_ticker_row("ETHBTC"),
+                monitor_book_ticker_row("btcusdt"),
+            ],
+            true,
+        )
+        .expect("full market rows");
+        let symbols = rows
+            .iter()
+            .map(|row| row.symbol.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(symbols, vec!["BTCUSDT", "ETHUSDT"]);
+    }
+
+    #[test]
+    fn binance_wss_single_symbol_rest_rows_remain_strict() {
+        let error = prepare_binance_wss_book_ticker_rest_rows(
+            vec![monitor_book_ticker_row("BTCUSDT_260327")],
+            false,
+        )
+        .expect_err("unsupported single symbol must fail closed");
+
+        assert!(error.to_string().contains("uppercase ASCII"));
+    }
+
+    #[test]
+    fn binance_wss_full_market_messages_skip_unsupported_symbols() {
+        let mut state = binance_wss_test_market_state("BTCUSDT", true);
+        let raw = r#"{"stream":"btcusdt_260327@bookTicker","data":{"u":400900302,"s":"BTCUSDT_260327","b":"43250.10","B":"1.00000000","a":"43251.20","A":"1.50000000"}}"#;
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+
+        let update = apply_binance_wss_book_ticker_text(
+            raw,
+            ingested_at,
+            BinancePublicMarket::Spot,
+            &mut state,
+        )
+        .expect("unsupported all-market symbol is skipped");
+
+        assert!(update.is_none());
+        assert_eq!(state.local_sequences.get("BTCUSDT"), Some(&1));
+    }
+
+    #[test]
+    fn binance_wss_single_symbol_messages_remain_strict() {
+        let mut state = binance_wss_test_market_state("BTCUSDT", false);
+        let raw = r#"{"stream":"btcusdt_260327@bookTicker","data":{"u":400900302,"s":"BTCUSDT_260327","b":"43250.10","B":"1.00000000","a":"43251.20","A":"1.50000000"}}"#;
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+
+        let error = apply_binance_wss_book_ticker_text(
+            raw,
+            ingested_at,
+            BinancePublicMarket::Spot,
+            &mut state,
+        )
+        .expect_err("unsupported single-symbol WSS message must fail closed");
+
+        assert!(error.to_string().contains("uppercase ASCII"));
+    }
+
+    #[test]
+    fn binance_wss_book_ticker_parses_combined_stream_payload() {
+        let raw = r#"{"stream":"btcusdt@bookTicker","data":{"u":400900301,"s":"BTCUSDT","b":"43250.10","B":"1.00000000","a":"43251.20","A":"1.50000000"}}"#;
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let parsed = parse_binance_wss_book_ticker_runtime_raw(raw, ingested_at).expect("raw");
+
+        assert_eq!(parsed.symbol, "BTCUSDT");
+        assert_eq!(parsed.update_id, 400900301);
+        assert_eq!(parsed.best_bid.to_string(), "43250.10");
+        assert_eq!(parsed.ask_size.to_string(), "1.50000000");
+    }
+
+    #[test]
+    fn binance_wss_book_ticker_all_market_stream_urls_match_market_shape() {
+        let symbols = vec!["BTCUSDT".to_owned(), "ETHUSDT".to_owned()];
+
+        let spot =
+            binance_wss_book_ticker_all_market_stream_url(BinancePublicMarket::Spot, &symbols)
+                .expect("spot url");
+        let usdm = binance_wss_book_ticker_all_market_stream_url(
+            BinancePublicMarket::UsdmPerpetual,
+            &symbols,
+        )
+        .expect("usdm url");
+
+        assert!(spot.contains("/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"));
+        assert_eq!(usdm, "wss://fstream.binance.com/public/ws/!bookTicker");
+    }
+
+    #[test]
+    fn binance_wss_monitor_snapshot_exposes_health_quote_and_counters() {
+        let mut snapshot = BinanceWssBookTickerMonitorSnapshot::empty(
+            "BTCUSDT",
+            BinancePublicMarket::Spot,
+            "wss://example.test/ws/btcusdt@bookTicker",
+        );
+        snapshot.latest_quote = Some(BinanceWssBookTickerQuoteSnapshot {
+            symbol: "BTCUSDT".to_owned(),
+            venue_id: "venue:BINANCE-SPOT".to_owned(),
+            instrument_id: "inst:BINANCE:BTCUSDT:SPOT".to_owned(),
+            best_bid: Some("100.01".to_owned()),
+            best_ask: Some("100.02".to_owned()),
+            bid_size: Some("1.2".to_owned()),
+            ask_size: Some("1.3".to_owned()),
+            source_sequence: Some("42".to_owned()),
+            source_event_id: Some("binance:wss:spot:BTCUSDT:42".to_owned()),
+            observed_at: "2026-05-13T00:00:00.000000000Z".to_owned(),
+            ingested_at: "2026-05-13T00:00:00.000000000Z".to_owned(),
+            freshness_status: "Fresh".to_owned(),
+        });
+        snapshot.record_failure("forced fail closed for test", true);
+        snapshot.begin_rest_rebuild();
+
+        let health = snapshot.health_json();
+        let quote = snapshot.quote_json();
+        let status = snapshot.to_json();
+
+        assert!(health.contains("\"fail_closed\":true"));
+        assert!(health.contains("\"disconnect_count\":1"));
+        assert!(health.contains("\"rest_rebuild_count\":1"));
+        assert!(quote.contains("\"latest_quote\""));
+        assert!(quote.contains("\"best_bid\":\"100.01\""));
+        assert!(status.contains("\"last_error\":\"forced fail closed for test\""));
+    }
+
+    #[test]
+    fn binance_wss_book_ticker_dashboard_requests_realtime_api_paths() {
+        let html = binance_wss_book_ticker_dashboard_html();
+
+        assert!(html.contains("Binance public WSS"));
+        assert!(html.contains("/health"));
+        assert!(html.contains("/api/binance-wss-book-ticker/quote"));
+        assert!(html.contains("/api/binance-wss-book-ticker/status"));
+        assert!(html.contains("/api/binance-wss-book-ticker/quotes"));
+        assert!(html.contains("id=\"metric-rebuilds\""));
+        assert!(html.contains("id=\"quote-bid\""));
+        assert!(html.contains("id=\"quote-rows\""));
     }
 
     #[test]
@@ -7440,6 +9309,43 @@ mod tests {
         assert_eq!(snapshot.candidate_count, 1);
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
         assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+    }
+
+    #[test]
+    fn binance_basis_pipeline_promotes_public_signal_to_risk_fact() {
+        let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
+        let perp = r#"{"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778630400000}"#;
+        let premium = r#"{"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let artifacts = assemble_binance_basis_pipeline_from_raw_json(
+            &replay,
+            BinanceBasisRawInputs {
+                symbol: "BTCUSDT",
+                raw_spot_book: spot,
+                spot_book_ref: "test:binance-spot-book",
+                raw_perp_book: perp,
+                perp_book_ref: "test:binance-usdm-book",
+                raw_premium_index: premium,
+                premium_index_ref: "test:binance-usdm-premium",
+            },
+            ingested_at,
+        )
+        .expect("basis pipeline artifacts");
+
+        assert!(artifacts.stored_events_jsonl.contains("venue:BINANCE-SPOT"));
+        assert!(artifacts.stored_events_jsonl.contains("venue:BINANCE-USDM"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:binance-basis-btcusdt-001"));
+        assert!(!artifacts.risk_decisions_jsonl.is_empty());
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+        assert!(artifacts.incidents_jsonl.contains("incident:"));
+        assert!(artifacts.execution_plans_jsonl.is_empty());
+        assert!(artifacts
+            .operations_daily_report_md
+            .contains("Read-only mode: true"));
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub const DEFAULT_RISK_POLICY_HASH: &str = "hash:risk-policy:s5-02";
 pub const DEFAULT_RISK_POLICY_SIGNATURE_REF: &str = "sigref:risk-policy-unsigned";
 /// 默认组合状态新鲜度阈值。
 pub const DEFAULT_MAX_PORTFOLIO_STATE_AGE_MS: u64 = 5_000;
+const MAX_MEASURED_STRING_VALUE_CHARS: usize = 256;
 
 /// 风控层统一返回类型。
 pub type RiskResult<T> = Result<T, RiskError>;
@@ -390,13 +391,13 @@ fn check_strategy_and_input_refs(input: RiskEvaluationInput<'_>, draft: &mut Dec
         "候选转换携带策略版本，风控决策可追溯到策略输出版本。",
     );
 
-    let input_refs = input
-        .candidate
-        .input_event_refs
-        .iter()
-        .map(|value| value.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
+    let input_refs = measured_list_summary(
+        input
+            .candidate
+            .input_event_refs
+            .iter()
+            .map(|value| value.as_str()),
+    );
     draft.pass(
         "input-event-refs",
         RiskCheckType::ReconciliationCompleteness,
@@ -408,6 +409,23 @@ fn check_strategy_and_input_refs(input: RiskEvaluationInput<'_>, draft: &mut Dec
         Some(MeasuredDraft::string(input_refs, "input_event_refs")),
         "候选转换携带输入事件引用，风控决策可回放。",
     );
+}
+
+fn measured_list_summary<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let values = values.into_iter().collect::<Vec<_>>();
+    let joined = values.join(",");
+    if joined.chars().count() <= MAX_MEASURED_STRING_VALUE_CHARS {
+        return joined;
+    }
+
+    let first = values.first().copied().unwrap_or("");
+    let last = values.last().copied().unwrap_or("");
+    let summary = format!("count={} first={} last={}", values.len(), first, last);
+    if summary.chars().count() <= MAX_MEASURED_STRING_VALUE_CHARS {
+        summary
+    } else {
+        format!("count={}", values.len())
+    }
 }
 
 fn check_state_reference(input: RiskEvaluationInput<'_>, draft: &mut DecisionDraft) {
@@ -2217,6 +2235,22 @@ mod tests {
         include_str!("../../../fixtures/schema/valid/portfolio_state.valid.json");
     const VENUE_CAPABILITY: &str =
         include_str!("../../../fixtures/schema/valid/venue_capability.valid.json");
+
+    #[test]
+    fn measured_list_summary_stays_within_contract_limit() {
+        let refs = (0..8)
+            .map(|index| {
+                format!(
+                    "event:venue-data:binance-public:BTCUSDT:{index}:normalized-with-long-source-reference"
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let summary = measured_list_summary(refs.iter().map(String::as_str));
+
+        assert!(summary.chars().count() <= MAX_MEASURED_STRING_VALUE_CHARS);
+        assert!(summary.contains("count=8"));
+    }
 
     #[test]
     fn approves_when_candidate_state_config_and_capabilities_match() {

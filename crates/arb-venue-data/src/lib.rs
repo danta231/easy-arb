@@ -1339,6 +1339,102 @@ pub struct BinancePublicWssBookTickerClient {
     last_exchange_update_id: Option<u64>,
 }
 
+/// Binance 公开 WSS 文本流客户端。
+///
+/// 中文说明：该客户端只负责连接公开行情 WSS 并把文本消息交给调用方，不解析账户、
+/// 不下单、不撤单、不转账、不签名。多 symbol 的状态管理由上层 runtime 完成。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinancePublicWssTextStreamClient {
+    venue_id: VenueId,
+    stream_url: String,
+}
+
+impl BinancePublicWssTextStreamClient {
+    pub fn new(venue_id: VenueId, stream_url: impl Into<String>) -> VenueDataResult<Self> {
+        let stream_url = stream_url.into();
+        if !stream_url.starts_with("wss://") {
+            return Err(VenueDataError::InvalidQuery {
+                field: "binance.wss.stream_url",
+                reason: "Binance public stream URL must use wss://",
+            });
+        }
+        Ok(Self {
+            venue_id,
+            stream_url,
+        })
+    }
+
+    pub fn stream_url(&self) -> &str {
+        &self.stream_url
+    }
+
+    /// 连接真实 Binance WSS 并按文本消息回调。
+    ///
+    /// 中文说明：观察者返回 `false` 时停止读取，调用方随后应按本地状态决定是否
+    /// fail closed 或 REST rebuild。连接层错误仍会返回分类后的只读外部错误。
+    pub fn read_live_text_messages_observed<F>(
+        &self,
+        max_text_messages: usize,
+        mut observer: F,
+    ) -> VenueDataResult<()>
+    where
+        F: FnMut(&str, UtcTimestamp) -> bool,
+    {
+        if max_text_messages == 0 {
+            return Err(VenueDataError::InvalidQuery {
+                field: "binance.wss.max_text_messages",
+                reason: "must be greater than zero",
+            });
+        }
+
+        let (mut socket, _response) =
+            tungstenite::connect(self.stream_url.as_str()).map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::Disconnected,
+                    format!(
+                        "cannot connect Binance public WSS `{}`: {error}",
+                        self.stream_url
+                    ),
+                ))
+            })?;
+        let mut text_messages = 0_usize;
+        while text_messages < max_text_messages {
+            let message = socket.read().map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::Disconnected,
+                    format!("Binance public WSS read failed: {error}"),
+                ))
+            })?;
+            match message {
+                tungstenite::Message::Text(text) => {
+                    let ingested_at = current_utc_timestamp(&self.venue_id)?;
+                    text_messages += 1;
+                    if !observer(&text, ingested_at) {
+                        break;
+                    }
+                }
+                tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {
+                    socket.flush().map_err(|error| {
+                        VenueDataError::External(ClassifiedExternalError::new(
+                            self.venue_id.clone(),
+                            ReadOnlySurface::MarketData,
+                            ExternalErrorClass::Disconnected,
+                            format!("Binance public WSS heartbeat flush failed: {error}"),
+                        ))
+                    })?;
+                }
+                tungstenite::Message::Close(_) => break,
+                tungstenite::Message::Binary(_) | tungstenite::Message::Frame(_) => break,
+            }
+        }
+        Ok(())
+    }
+}
+
 impl BinancePublicWssBookTickerClient {
     pub fn new(
         config: BinancePublicWssBookTickerConfig,
@@ -1443,6 +1539,25 @@ impl BinancePublicWssBookTickerClient {
         &mut self,
         max_text_messages: usize,
     ) -> VenueDataResult<Vec<HybridMarketDataUpdate>> {
+        let mut updates = Vec::new();
+        self.read_live_wss_updates_observed(max_text_messages, |update| {
+            updates.push(update.clone());
+        })?;
+        Ok(updates)
+    }
+
+    /// 连接真实 Binance WSS 并在每条公开 `bookTicker` 更新后回调观察者。
+    ///
+    /// 中文说明：常驻任务用该入口把协调器状态同步到本地 `/health` API。观察者
+    /// 不能改变 WSS 连接语义；连接失败、断线和异常消息仍由本客户端 fail closed。
+    pub fn read_live_wss_updates_observed<F>(
+        &mut self,
+        max_text_messages: usize,
+        mut observer: F,
+    ) -> VenueDataResult<()>
+    where
+        F: FnMut(&HybridMarketDataUpdate),
+    {
         if max_text_messages == 0 {
             return Err(VenueDataError::InvalidQuery {
                 field: "binance.wss.max_text_messages",
@@ -1462,12 +1577,13 @@ impl BinancePublicWssBookTickerClient {
             })?;
 
         let connected_at = current_utc_timestamp(&self.config.venue_id)?;
-        let mut updates = vec![self
+        let connected_update = self
             .coordinator
             .apply(HybridMarketDataInput::WssConnected {
                 occurred_at: connected_at,
                 ingested_at: connected_at,
-            })?];
+            })?;
+        observer(&connected_update);
         let mut text_messages = 0_usize;
 
         while text_messages < max_text_messages {
@@ -1482,7 +1598,8 @@ impl BinancePublicWssBookTickerClient {
                             reason: detail.clone(),
                             occurred_at,
                             ingested_at: occurred_at,
-                        });
+                        })
+                        .map(|update| observer(&update));
                     return Err(VenueDataError::External(ClassifiedExternalError::new(
                         self.config.venue_id.clone(),
                         ReadOnlySurface::MarketData,
@@ -1494,7 +1611,8 @@ impl BinancePublicWssBookTickerClient {
             match message {
                 tungstenite::Message::Text(text) => {
                     let ingested_at = current_utc_timestamp(&self.config.venue_id)?;
-                    updates.push(self.apply_wss_text_message(&text, ingested_at)?);
+                    let update = self.apply_wss_text_message(&text, ingested_at)?;
+                    observer(&update);
                     text_messages += 1;
                 }
                 tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {
@@ -1507,14 +1625,14 @@ impl BinancePublicWssBookTickerClient {
                         ))
                     })?;
                     let occurred_at = current_utc_timestamp(&self.config.venue_id)?;
-                    updates.push(
-                        self.coordinator
-                            .apply(HybridMarketDataInput::WssHeartbeat {
-                                source_sequence: Some(self.local_sequence),
-                                occurred_at,
-                                ingested_at: occurred_at,
-                            })?,
-                    );
+                    let update = self
+                        .coordinator
+                        .apply(HybridMarketDataInput::WssHeartbeat {
+                            source_sequence: Some(self.local_sequence),
+                            occurred_at,
+                            ingested_at: occurred_at,
+                        })?;
+                    observer(&update);
                 }
                 tungstenite::Message::Close(frame) => {
                     let occurred_at = current_utc_timestamp(&self.config.venue_id)?;
@@ -1522,32 +1640,34 @@ impl BinancePublicWssBookTickerClient {
                         .map(|frame| frame.reason.to_string())
                         .filter(|reason| !reason.is_empty())
                         .unwrap_or_else(|| "Binance public WSS closed".to_owned());
-                    updates.push(self.coordinator.apply(
-                        HybridMarketDataInput::WssDisconnected {
-                            reason,
-                            occurred_at,
-                            ingested_at: occurred_at,
-                        },
-                    )?);
+                    let update =
+                        self.coordinator
+                            .apply(HybridMarketDataInput::WssDisconnected {
+                                reason,
+                                occurred_at,
+                                ingested_at: occurred_at,
+                            })?;
+                    observer(&update);
                     break;
                 }
                 tungstenite::Message::Binary(_) | tungstenite::Message::Frame(_) => {
                     let occurred_at = current_utc_timestamp(&self.config.venue_id)?;
-                    updates.push(self.coordinator.apply(
-                        HybridMarketDataInput::WssGapDetected {
+                    let update = self
+                        .coordinator
+                        .apply(HybridMarketDataInput::WssGapDetected {
                             expected_sequence: None,
                             observed_sequence: Some(self.local_sequence),
                             occurred_at,
                             ingested_at: occurred_at,
                             detail: "Binance public WSS emitted non-text payload".to_owned(),
-                        },
-                    )?);
+                        })?;
+                    observer(&update);
                     break;
                 }
             }
         }
 
-        Ok(updates)
+        Ok(())
     }
 
     fn validate_quote_identity(&self, quote: &MarketQuote) -> VenueDataResult<()> {
