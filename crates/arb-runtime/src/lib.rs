@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arb_config::ExecutionMode as ConfigExecutionMode;
 use arb_contracts::{
     from_json_strict, to_canonical_json, CandidatePortfolioTransition, CanonicalJson,
-    ExecutionMode as ContractExecutionMode, ExecutionPlan, ExecutionReport, Incident,
+    ExecutionMode as ContractExecutionMode, ExecutionPlan, ExecutionReport, Incident, JsonValue,
     LedgerDirection as ContractLedgerDirection, LedgerEntry as ContractLedgerEntry,
     LedgerEntryType as ContractLedgerEntryType, LedgerNamespace as ContractLedgerNamespace,
     NormalizedEvent, NormalizedEventType, PortfolioState, RiskDecision, VenueCapabilityDescriptor,
@@ -34,8 +34,12 @@ use arb_domain::{
 };
 use arb_eventstore::{EventReader, EventWriter, JsonlEventStore};
 use arb_execution::{
-    build_execution_plan, simulate_execution, simulated_ledger_entries_from_execution_report,
-    ExecutionPlanBuildInput,
+    build_execution_plan, build_execution_plan_preview, execution_plan_hash,
+    release_manual_approval_gate, review_manual_approval, simulate_execution,
+    simulated_ledger_entries_from_execution_report, ExecutionPlanBuildInput,
+    ManualApprovalDecision, ManualApprovalGateRelease, ManualApprovalMaterial,
+    ManualApprovalRecord, ManualApprovalReviewInput, ManualApprovalStatus,
+    PendingManualApprovalPlan, PlanBuildOutcome,
 };
 use arb_ledger::{
     AdjustmentReasonCode, IdempotencyKey, JournalEntryId, LedgerBook,
@@ -44,7 +48,8 @@ use arb_ledger::{
     LedgerNamespace as DomainLedgerNamespace,
 };
 use arb_ops::{
-    InMemoryOpsFactReader, OperationsFacts, OpsCommandOutput, OpsReadOnlyCommand, ReadOnlyOpsEngine,
+    generate_manual_approval_material, InMemoryOpsFactReader, ManualApprovalAuditRecord,
+    OperationsFacts, OpsCommandOutput, OpsReadOnlyCommand, ReadOnlyOpsEngine,
 };
 use arb_reconciliation::{
     CoreReconciliationRunner, FeeAmount, FillId, FillSnapshot, ReconciliationReport,
@@ -96,6 +101,16 @@ const BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
 const BASIS_BASE_ASSET_ID: &str = "asset:BTC";
 const BASIS_QUOTE_ASSET_ID: &str = "asset:USDT";
 const BASIS_SETTLEMENT_ASSET_ID: &str = "asset:USDT";
+const BINANCE_BASIS_PIPELINE_DEFAULT_OUT: &str = "target/binance-basis-pipeline";
+const BINANCE_GUARDED_LIVE_PREVIEW_DEFAULT_OUT: &str = "target/binance-guarded-live-preview";
+const BINANCE_GUARDED_LIVE_ACCOUNT_REF: &str =
+    "account:binance-isolated-personal-cex-subaccount-redacted";
+const BINANCE_GUARDED_LIVE_STRATEGY_ID: &str = "strategy:sample-spot-v1";
+const BINANCE_GUARDED_LIVE_TRANSITION_ID: &str = "trans:binance-btcusdt-guarded-live-preview-001";
+const BINANCE_GUARDED_LIVE_NOTIONAL_USDT: &str = "10.00";
+const BINANCE_GUARDED_LIVE_DAILY_LOSS_LIMIT_USDT: &str = "20.00";
+const BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT: &str = "100.00";
+const BINANCE_GUARDED_LIVE_QUANTITY_BTC: &str = "0.000100";
 const MARKET_DATA_MAX_AGE_MS: u64 = 5_000;
 const BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8796";
 const BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
@@ -568,6 +583,68 @@ pub struct BinanceBasisPipelineReport {
     pub ingested_at: String,
     pub artifacts: EndToEndArtifacts,
     pub output_dir: Option<PathBuf>,
+}
+
+/// Binance BTCUSDT 受控试运行计划预览结果。
+///
+/// 中文说明：该结果只生成不可调度的人工审批计划预览和审计材料；不下单、
+/// 不撤单、不转账、不签名，也不释放熔断。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceGuardedLivePreviewReport {
+    pub symbol: String,
+    pub source_event_id: String,
+    pub generated_at: String,
+    pub plan_id: String,
+    pub plan_hash: String,
+    pub dispatchable_before_approval: bool,
+    pub approval_record_count: usize,
+    pub approval_status: Option<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance BTCUSDT 人工门禁释放预览结果。
+///
+/// 中文说明：该结果只消费 Approved 人工审批记录并生成门禁释放事实预览；
+/// 不分发订单、不下单、不签名、不写账本。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceManualGateReleasePreviewReport {
+    pub plan_id: String,
+    pub plan_hash: String,
+    pub approval_event_id: String,
+    pub released_manual_gate: bool,
+    pub dependent_transition_count: usize,
+    pub dispatchable_after_release: bool,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance BTCUSDT 分发前 dry run 结果。
+///
+/// 中文说明：该结果只检查人工门禁释放后的分发前阻断项；它不会调用真实执行、
+/// 真实签名、场所私有接口或账户变更路径。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinancePreDispatchDryRunReport {
+    pub plan_id: String,
+    pub plan_hash: String,
+    pub approval_event_id: String,
+    pub manual_gate_released: bool,
+    pub dispatch_allowed: bool,
+    pub blocking_reasons: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance BTCUSDT 人工确认请求。
+///
+/// 中文说明：只有调用方显式提供同一个 `expected_plan_hash` 时才会生成审批记录。
+/// 该请求不会触发真实执行或签名。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceManualApprovalDecisionRequest {
+    pub decision: ManualApprovalDecision,
+    pub expected_plan_hash: String,
+    pub approval_event_id: String,
+    pub reviewer_id: String,
+    pub decided_at: String,
+    pub expires_at: String,
+    pub reason: String,
 }
 
 /// Binance basis 长驻监控选项。
@@ -1647,6 +1724,210 @@ pub fn run_binance_basis_pipeline(
         premium_index_url,
         ingested_at: ingested_at.to_string(),
         artifacts,
+        output_dir,
+    })
+}
+
+/// 生成 Binance BTCUSDT GuardedLivePersonal 计划预览。
+///
+/// 中文说明：该函数只读取已保存的公开行情 artifact，并生成不可调度的人工审批
+/// 计划预览；它不访问私有账户、不下单、不撤单、不转账、不签名。
+pub fn run_binance_guarded_live_preview(
+    market_artifacts_dir: impl AsRef<Path>,
+    output_dir: Option<PathBuf>,
+    decision_request: Option<BinanceManualApprovalDecisionRequest>,
+) -> RuntimeResult<BinanceGuardedLivePreviewReport> {
+    let market_artifacts_dir = market_artifacts_dir.as_ref();
+    let quote = load_binance_guarded_live_spot_quote(market_artifacts_dir)?;
+    let generated_at = current_utc_timestamp()?.to_string();
+    let plan_created_at = quote.observed_at.clone();
+    let candidate = binance_guarded_live_candidate(&quote, &plan_created_at)?;
+    let risk_decision = binance_guarded_live_manual_risk_decision(&quote, &generated_at)?;
+    let outcome = build_execution_plan_preview(ExecutionPlanBuildInput::new(
+        &risk_decision,
+        &candidate,
+        ContractExecutionMode::GuardedLive,
+        &plan_created_at,
+    ))?;
+    let pending = match outcome {
+        PlanBuildOutcome::PendingManualApproval(pending) => pending,
+        PlanBuildOutcome::Schedulable(_) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message: "Binance GuardedLive preview unexpectedly produced a dispatchable plan"
+                    .to_owned(),
+            });
+        }
+    };
+    let plan_hash = execution_plan_hash(&pending.plan_preview);
+    if plan_hash != pending.approval_material.plan_hash {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: "manual approval material plan_hash does not match canonical plan hash"
+                .to_owned(),
+        });
+    }
+
+    let mut approval_records = Vec::new();
+    if let Some(request) = decision_request {
+        if request.expected_plan_hash != plan_hash {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "expected plan hash `{}` does not match current plan hash `{plan_hash}`",
+                    request.expected_plan_hash
+                ),
+            });
+        }
+        approval_records.push(review_manual_approval(
+            ManualApprovalReviewInput::new(
+                &pending,
+                &request.approval_event_id,
+                &request.reviewer_id,
+                &request.decided_at,
+                &request.expires_at,
+                request.decision,
+            )
+            .with_reason(&request.reason),
+        )?);
+    }
+    let approval_audit_records = approval_records
+        .iter()
+        .map(manual_approval_audit_record_from_execution)
+        .collect::<Vec<_>>();
+    let manual_material = generate_manual_approval_material(
+        &risk_decision,
+        &pending.plan_preview,
+        &plan_hash,
+        &approval_audit_records,
+        &generated_at,
+    )?;
+    let manual_material_md = manual_material.render_markdown()?;
+    let approval_records_jsonl = manual_approval_records_jsonl(&approval_records);
+    let confirmation_template_md = binance_manual_confirmation_template(
+        &pending.plan_preview,
+        &plan_hash,
+        &generated_at,
+        &approval_records,
+    );
+
+    let output_dir =
+        Some(output_dir.unwrap_or_else(|| PathBuf::from(BINANCE_GUARDED_LIVE_PREVIEW_DEFAULT_OUT)));
+    if let Some(dir) = &output_dir {
+        write_binance_guarded_live_preview_artifacts(
+            dir,
+            BinanceGuardedLivePreviewArtifacts {
+                candidate: &candidate,
+                risk_decision: &risk_decision,
+                plan_preview: &pending.plan_preview,
+                plan_hash: &plan_hash,
+                manual_material_md: &manual_material_md,
+                approval_records_jsonl: &approval_records_jsonl,
+                confirmation_template_md: &confirmation_template_md,
+            },
+        )?;
+    }
+
+    Ok(BinanceGuardedLivePreviewReport {
+        symbol: BASIS_SYMBOL.to_owned(),
+        source_event_id: quote.event_id,
+        generated_at,
+        plan_id: pending.plan_preview.plan_id.as_str().to_owned(),
+        plan_hash,
+        dispatchable_before_approval: pending.is_dispatchable(),
+        approval_record_count: approval_records.len(),
+        approval_status: approval_records
+            .first()
+            .map(|record| record.status.as_str().to_owned()),
+        output_dir,
+    })
+}
+
+/// 预览释放 Binance BTCUSDT 人工审批门禁。
+///
+/// 中文说明：该函数只消费本地 Approved 审批记录并生成可审计释放事实预览；
+/// 不分发订单、不下单、不撤单、不转账、不签名。
+pub fn run_binance_manual_gate_release_preview(
+    preview_dir: impl AsRef<Path>,
+    output_dir: Option<PathBuf>,
+) -> RuntimeResult<BinanceManualGateReleasePreviewReport> {
+    let preview_dir = preview_dir.as_ref();
+    let (pending, approved_record) = load_binance_manual_gate_release_inputs(preview_dir)?;
+    let release = release_manual_approval_gate(&pending, &approved_record)?;
+    let dispatchable_after_release = false;
+    let generated_at = current_utc_timestamp()?.to_string();
+    let output_dir = Some(output_dir.unwrap_or_else(|| preview_dir.to_path_buf()));
+    if let Some(dir) = &output_dir {
+        write_binance_manual_gate_release_artifacts(
+            dir,
+            &release,
+            dispatchable_after_release,
+            &generated_at,
+        )?;
+    }
+
+    Ok(BinanceManualGateReleasePreviewReport {
+        plan_id: release.plan_id,
+        plan_hash: release.plan_hash,
+        approval_event_id: release.approval_event_id,
+        released_manual_gate: release.gate_transition.to_state.as_str() == "Ready",
+        dependent_transition_count: release.dependent_transitions.len(),
+        dispatchable_after_release,
+        output_dir,
+    })
+}
+
+/// 运行 Binance BTCUSDT 分发前 dry run。
+///
+/// 中文说明：dry run 只检查释放人工门禁后的分发阻断项。当前命令必须保持
+/// fail-closed：不会调用真实交易 API，不会写账本，不会签名，不会下单。
+pub fn run_binance_pre_dispatch_dry_run(
+    preview_dir: impl AsRef<Path>,
+    config_path: impl AsRef<Path>,
+    output_dir: Option<PathBuf>,
+) -> RuntimeResult<BinancePreDispatchDryRunReport> {
+    let preview_dir = preview_dir.as_ref();
+    let config_path = config_path.as_ref();
+    let release_report = run_binance_manual_gate_release_preview(preview_dir, output_dir.clone())?;
+    let service = start_runtime_from_config_path(config_path)?;
+    let health = service.health();
+    let mut blocking_reasons = Vec::new();
+    if !release_report.released_manual_gate {
+        blocking_reasons.push("manual gate release preview is not Ready".to_owned());
+    }
+    if health.kill_switch_triggered {
+        blocking_reasons.push("kill switch is triggered for the preflight config".to_owned());
+    }
+    if !health.mutable_execution_started {
+        blocking_reasons.push("mutable execution task is not started".to_owned());
+    }
+    blocking_reasons.push(
+        "pre-dispatch dry run does not enable live-exec, real signing, private balance reads, or order dispatch"
+            .to_owned(),
+    );
+    blocking_reasons.push(
+        "approval releases only the manual gate; execution mode, capital, ledger, reconciliation, permission, and signer gates remain mandatory"
+            .to_owned(),
+    );
+    let dispatch_allowed = false;
+    let generated_at = current_utc_timestamp()?.to_string();
+    let output_dir = Some(output_dir.unwrap_or_else(|| preview_dir.to_path_buf()));
+    if let Some(dir) = &output_dir {
+        write_binance_pre_dispatch_dry_run_artifacts(
+            dir,
+            &release_report,
+            &health,
+            &blocking_reasons,
+            dispatch_allowed,
+            &generated_at,
+        )?;
+    }
+
+    Ok(BinancePreDispatchDryRunReport {
+        plan_id: release_report.plan_id,
+        plan_hash: release_report.plan_hash,
+        approval_event_id: release_report.approval_event_id,
+        manual_gate_released: release_report.released_manual_gate,
+        dispatch_allowed,
+        blocking_reasons,
         output_dir,
     })
 }
@@ -5057,6 +5338,275 @@ fn build_binance_basis_portfolio_state(
     Ok(from_json_strict::<PortfolioState>(&portfolio_json)?)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BinanceGuardedLiveQuote {
+    event_id: String,
+    observed_at: String,
+    best_bid: String,
+    best_ask: String,
+    bid_size: String,
+    ask_size: String,
+}
+
+fn load_binance_guarded_live_spot_quote(
+    market_artifacts_dir: &Path,
+) -> RuntimeResult<BinanceGuardedLiveQuote> {
+    let path = market_artifacts_dir.join("stored_events.jsonl");
+    let input = read_utf8(&path)?;
+    for (index, line) in input.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = from_json_strict::<NormalizedEvent>(line).map_err(RuntimeError::from)?;
+        let instrument_id = event
+            .instrument_id
+            .as_ref()
+            .and_then(|value| value.as_ref())
+            .map(|value| value.as_str());
+        let venue_id = event
+            .venue_id
+            .as_ref()
+            .and_then(|value| value.as_ref())
+            .map(|value| value.as_str());
+        if event.event_type == NormalizedEventType::NormalizedMarketDataEvent
+            && instrument_id == Some(BASIS_SPOT_INSTRUMENT_ID)
+            && venue_id == Some(BASIS_SPOT_VENUE_ID)
+            && payload_string(&event, "kind")? == "BookTicker"
+            && payload_string(&event, "venue_symbol")? == BASIS_SYMBOL
+        {
+            return Ok(BinanceGuardedLiveQuote {
+                event_id: event.event_id.as_str().to_owned(),
+                observed_at: event.timestamp_event.as_str().to_owned(),
+                best_bid: payload_string(&event, "best_bid")?.to_owned(),
+                best_ask: payload_string(&event, "best_ask")?.to_owned(),
+                bid_size: payload_string(&event, "bid_size")?.to_owned(),
+                ask_size: payload_string(&event, "ask_size")?.to_owned(),
+            });
+        }
+        if index > 1000 {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!(
+                    "{} contains too many events for a single preflight preview",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Err(RuntimeError::MissingFixture { path })
+}
+
+fn payload_string<'a>(event: &'a NormalizedEvent, field: &'static str) -> RuntimeResult<&'a str> {
+    match event.payload.get(field) {
+        Some(JsonValue::String(value)) => Ok(value.as_str()),
+        Some(_) => Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "normalized event `{}` payload field `{field}` is not a string",
+                event.event_id.as_str()
+            ),
+        }),
+        None => Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "normalized event `{}` is missing payload field `{field}`",
+                event.event_id.as_str()
+            ),
+        }),
+    }
+}
+
+fn binance_guarded_live_candidate(
+    quote: &BinanceGuardedLiveQuote,
+    created_at: &str,
+) -> RuntimeResult<CandidatePortfolioTransition> {
+    let candidate_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "transition_id": {transition_id},
+  "strategy_id": {strategy_id},
+  "strategy_version": "1.0.0",
+  "code_version": "code:binance-guarded-live-preview-1",
+  "config_version": "arb-config-v1",
+  "created_at": {created_at},
+  "input_event_refs": [{source_event}],
+  "current_portfolio_state_ref": "state:binance-btcusdt-guarded-live-personal-redacted",
+  "holding_period": {{"kind": "Instant"}},
+  "legs": [
+    {{
+      "leg_id": "candleg:binance-btcusdt-guarded-live-buy",
+      "leg_type": "Trade",
+      "venue_id": {venue_id},
+      "instrument_id": {instrument_id},
+      "account_id": {account_id},
+      "side": "Buy",
+      "asset_flows": [
+        {{"account_id": {account_id}, "asset_id": {quote_asset_id}, "amount": {notional}, "direction": "Out"}}
+      ],
+      "constraints": {{
+        "max_slippage_bps": "5",
+        "max_notional_usdt": {notional},
+        "post_only": false,
+        "reference_best_ask": {best_ask},
+        "reference_best_bid": {best_bid},
+        "reference_bid_size": {bid_size},
+        "reference_ask_size": {ask_size},
+        "reference_market_event_id": {source_event},
+        "owner_scope_ref": "owner-note:2026-05-13-final-decision-update-binance-btcusdt-v1"
+      }},
+      "failure_modes": ["ManualInterventionRequired", "UnknownState"]
+    }}
+  ],
+  "expected_post_state_delta": {{
+    "asset_flows": [],
+    "position_deltas": [
+      {{"account_id": {account_id}, "instrument_id": {instrument_id}, "quantity_delta": {quantity}}}
+    ]
+  }},
+  "expected_economics": {{
+    "expected_profit_usd": "0",
+    "expected_profit_bps": "0",
+    "fee_estimate_usd": "0.02",
+    "slippage_estimate_usd": "0.01",
+    "confidence": 0.5
+  }},
+  "required_capital": {{
+    "asset_requirements": [
+      {{"account_id": {account_id}, "asset_id": {quote_asset_id}, "amount": {notional}, "direction": "Out"}}
+    ],
+    "recovery_buffer_usd": "1.00"
+  }},
+  "failure_modes": ["ManualInterventionRequired", "UnknownState"],
+  "risk_flags": [],
+  "assumptions": [
+    {{
+      "assumption_id": "asm:binance-btcusdt-guarded-live-public-quote",
+      "statement": "Plan preview uses Binance public BTCUSDT spot BookTicker only; private balance, live permission and signer state must be checked before any dispatch.",
+      "confidence": 0.5,
+      "source_event_refs": [{source_event}]
+    }}
+  ]
+}}"#,
+        transition_id = json_string(BINANCE_GUARDED_LIVE_TRANSITION_ID),
+        strategy_id = json_string(BINANCE_GUARDED_LIVE_STRATEGY_ID),
+        created_at = json_string(created_at),
+        source_event = json_string(&quote.event_id),
+        venue_id = json_string(BASIS_SPOT_VENUE_ID),
+        instrument_id = json_string(BASIS_SPOT_INSTRUMENT_ID),
+        account_id = json_string(BINANCE_GUARDED_LIVE_ACCOUNT_REF),
+        quote_asset_id = json_string(BASIS_QUOTE_ASSET_ID),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+        best_ask = json_string(&quote.best_ask),
+        best_bid = json_string(&quote.best_bid),
+        bid_size = json_string(&quote.bid_size),
+        ask_size = json_string(&quote.ask_size),
+        quantity = json_string(BINANCE_GUARDED_LIVE_QUANTITY_BTC),
+    );
+    Ok(from_json_strict::<CandidatePortfolioTransition>(
+        &candidate_json,
+    )?)
+}
+
+fn binance_guarded_live_manual_risk_decision(
+    quote: &BinanceGuardedLiveQuote,
+    evaluated_at: &str,
+) -> RuntimeResult<RiskDecision> {
+    let risk_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "decision_id": "risk:trans:binance-btcusdt-guarded-live-preview-001",
+  "transition_id": {transition_id},
+  "evaluated_at": {evaluated_at},
+  "decision": "RequiresManualApproval",
+  "policy_version": "risk-policy:binance-btcusdt-guarded-live-preview-v1",
+  "policy_hash": "hash:binance-btcusdt-guarded-live-preview-v1",
+  "policy_signature_ref": "sigref:risk-policy-unsigned",
+  "input_state_ref": "state:binance-btcusdt-guarded-live-personal-redacted",
+  "checks": [
+    {{
+      "check_id": "check:binance-btcusdt:public-data-freshness",
+      "check_type": "DataFreshness",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": "5000", "unit": "ms"}},
+      "observed": {{"string_value": {observed_at}, "unit": "timestamp"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Binance public spot BookTicker is present for plan preview; freshness must be rechecked before dispatch."
+    }},
+    {{
+      "check_id": "check:binance-btcusdt:manual-approval-required",
+      "check_type": "OneLegExecutionRisk",
+      "status": "Warning",
+      "severity": "Warn",
+      "observed": {{"string_value": "owner confirmation required", "unit": "manual_gate"}},
+      "reason_code": "REQUIRES_MANUAL_APPROVAL",
+      "detail": "GuardedLivePersonal requires owner confirmation of the same plan_hash before any account-changing action."
+    }},
+    {{
+      "check_id": "check:binance-btcusdt:notional-cap",
+      "check_type": "StrategyExposureLimit",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": {per_order_limit}, "unit": "USDT"}},
+      "observed": {{"decimal_value": {notional}, "unit": "USDT"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Plan preview notional is within the 10 USDT per-order cap."
+    }},
+    {{
+      "check_id": "check:binance-btcusdt:daily-loss-cap",
+      "check_type": "DailyLossLimit",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": {daily_loss_limit}, "unit": "USDT"}},
+      "observed": {{"decimal_value": "0", "unit": "USDT"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "No live loss is recorded in this plan preview; live session must stop at the configured daily threshold."
+    }},
+    {{
+      "check_id": "check:binance-btcusdt:capital-cap",
+      "check_type": "CapitalReservationAvailability",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": {capital_limit}, "unit": "USDT"}},
+      "observed": {{"decimal_value": {notional}, "unit": "USDT"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Plan preview notional is within the GuardedLivePersonal capital cap; live private balance remains unknown and must be checked before dispatch."
+    }}
+  ],
+  "constraints": [
+    {{
+      "constraint_id": "constraint:binance-btcusdt:max-notional",
+      "constraint_type": "MaxNotional",
+      "field_path": "$.legs[0].asset_flows[0].amount",
+      "limit": {{"decimal_value": {per_order_limit}, "unit": "USDT"}}
+    }},
+    {{
+      "constraint_id": "constraint:binance-btcusdt:manual-approval",
+      "constraint_type": "RequiresManualApproval",
+      "field_path": "$.decision",
+      "limit": {{"string_value": "owner must approve the same plan_hash", "unit": "approval_requirement"}}
+    }},
+    {{
+      "constraint_id": "constraint:binance-btcusdt:capital-cap",
+      "constraint_type": "MaxNotional",
+      "field_path": "$.required_capital.asset_requirements",
+      "limit": {{"decimal_value": {capital_limit}, "unit": "USDT"}}
+    }}
+  ],
+  "reason_codes": ["REQUIRES_MANUAL_APPROVAL"],
+  "detail": "Plan preview is not dispatchable. Owner confirmation of the same plan_hash is required and does not bypass risk, kill switch, permissions, capital reservation, ledger or reconciliation."
+}}"#,
+        transition_id = json_string(BINANCE_GUARDED_LIVE_TRANSITION_ID),
+        evaluated_at = json_string(evaluated_at),
+        observed_at = json_string(&quote.observed_at),
+        per_order_limit = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+        daily_loss_limit = json_string(BINANCE_GUARDED_LIVE_DAILY_LOSS_LIMIT_USDT),
+        capital_limit = json_string(BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT),
+    );
+    Ok(from_json_strict::<RiskDecision>(&risk_json)?)
+}
+
 fn build_portfolio_state_from_fixture(
     fixture_root: &Path,
     stored_events: &[arb_eventstore::StoredEvent],
@@ -5742,6 +6292,612 @@ fn write_artifacts_to_dir(
         });
     }
     Ok(written)
+}
+
+struct BinanceGuardedLivePreviewArtifacts<'a> {
+    candidate: &'a CandidatePortfolioTransition,
+    risk_decision: &'a RiskDecision,
+    plan_preview: &'a ExecutionPlan,
+    plan_hash: &'a str,
+    manual_material_md: &'a str,
+    approval_records_jsonl: &'a str,
+    confirmation_template_md: &'a str,
+}
+
+fn write_binance_guarded_live_preview_artifacts(
+    output_dir: &Path,
+    artifacts: BinanceGuardedLivePreviewArtifacts<'_>,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("candidate_transition.json"),
+        &format!("{}\n", to_canonical_json(artifacts.candidate)),
+    )?;
+    write_utf8(
+        output_dir.join("risk_decision.json"),
+        &format!("{}\n", to_canonical_json(artifacts.risk_decision)),
+    )?;
+    write_utf8(
+        output_dir.join("plan_preview.json"),
+        &format!("{}\n", to_canonical_json(artifacts.plan_preview)),
+    )?;
+    write_utf8(
+        output_dir.join("plan_hash.txt"),
+        &format!("{}\n", artifacts.plan_hash),
+    )?;
+    write_utf8(
+        output_dir.join("manual_approval_material.md"),
+        artifacts.manual_material_md,
+    )?;
+    write_utf8(
+        output_dir.join("approval_records.jsonl"),
+        artifacts.approval_records_jsonl,
+    )?;
+    write_utf8(
+        output_dir.join("manual_confirmation_record.md"),
+        artifacts.confirmation_template_md,
+    )?;
+    Ok(())
+}
+
+fn load_binance_manual_gate_release_inputs(
+    preview_dir: &Path,
+) -> RuntimeResult<(PendingManualApprovalPlan, ManualApprovalRecord)> {
+    let plan_path = preview_dir.join("plan_preview.json");
+    let risk_path = preview_dir.join("risk_decision.json");
+    let approval_path = preview_dir.join("approval_records.jsonl");
+    let plan = from_json_strict::<ExecutionPlan>(&read_utf8(&plan_path)?)?;
+    let risk_decision = from_json_strict::<RiskDecision>(&read_utf8(&risk_path)?)?;
+    let plan_hash = execution_plan_hash(&plan);
+    let approval_records = load_manual_approval_records_jsonl(&approval_path)?;
+    let Some(approved_record) = approval_records.into_iter().find(|record| {
+        record.plan_hash == plan_hash
+            && record.status == ManualApprovalStatus::Approved
+            && record.releases_manual_gate
+    }) else {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "{} does not contain an Approved manual approval record for plan_hash {plan_hash}",
+                approval_path.display()
+            ),
+        });
+    };
+    let pending = PendingManualApprovalPlan {
+        plan_preview: plan,
+        approval_material: ManualApprovalMaterial {
+            risk_decision_id: risk_decision.decision_id.as_str().to_owned(),
+            transition_id: risk_decision.transition_id.as_str().to_owned(),
+            plan_id: approved_record.plan_id.clone(),
+            plan_hash,
+            reason_codes: risk_decision
+                .reason_codes
+                .iter()
+                .map(|code| code.as_str().to_owned())
+                .collect(),
+            approval_requirement:
+                "人工审批必须引用同一个 plan_hash；审批不能替代风控、账本、熔断或执行权限。"
+                    .to_owned(),
+        },
+    };
+    Ok((pending, approved_record))
+}
+
+fn load_manual_approval_records_jsonl(path: &Path) -> RuntimeResult<Vec<ManualApprovalRecord>> {
+    let input = read_utf8(path)?;
+    input
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(parse_manual_approval_record_json)
+        .collect()
+}
+
+fn parse_manual_approval_record_json(line: &str) -> RuntimeResult<ManualApprovalRecord> {
+    let decision = parse_manual_approval_decision(&json_string_field(line, "decision")?)?;
+    let status = parse_manual_approval_status(&json_string_field(line, "status")?)?;
+    Ok(ManualApprovalRecord {
+        record_id: json_string_field(line, "record_id")?,
+        approval_event_id: json_string_field(line, "approval_event_id")?,
+        risk_decision_id: json_string_field(line, "risk_decision_id")?,
+        transition_id: json_string_field(line, "transition_id")?,
+        plan_id: json_string_field(line, "plan_id")?,
+        plan_hash: json_string_field(line, "plan_hash")?,
+        decision,
+        status,
+        reviewer_id: json_string_field(line, "reviewer_id")?,
+        decided_at: json_string_field(line, "decided_at")?,
+        expires_at: json_string_field(line, "expires_at")?,
+        reason: json_optional_string_field(line, "reason")?,
+        duplicate_of: json_optional_string_field(line, "duplicate_of")?,
+        releases_manual_gate: json_bool_field(line, "releases_manual_gate")?,
+        controlled_next_step: json_string_field(line, "controlled_next_step")?,
+    })
+}
+
+fn parse_manual_approval_status(value: &str) -> RuntimeResult<ManualApprovalStatus> {
+    match value {
+        "Approved" => Ok(ManualApprovalStatus::Approved),
+        "Rejected" => Ok(ManualApprovalStatus::Rejected),
+        "Expired" => Ok(ManualApprovalStatus::Expired),
+        "Duplicate" => Ok(ManualApprovalStatus::Duplicate),
+        other => Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("unknown manual approval status `{other}`"),
+        }),
+    }
+}
+
+fn write_binance_manual_gate_release_artifacts(
+    output_dir: &Path,
+    release: &ManualApprovalGateRelease,
+    dispatchable_after_release: bool,
+    generated_at: &str,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("manual_gate_release_preview.json"),
+        &format!(
+            "{}\n",
+            manual_gate_release_preview_json(release, dispatchable_after_release, generated_at)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("manual_gate_release_preview.md"),
+        &manual_gate_release_preview_markdown(release, dispatchable_after_release, generated_at),
+    )
+}
+
+fn manual_gate_release_preview_json(
+    release: &ManualApprovalGateRelease,
+    dispatchable_after_release: bool,
+    generated_at: &str,
+) -> String {
+    format!(
+        "{{\"approval_event_id\":{},\"controlled_next_step\":{},\"dependent_transitions\":[{}],\"dispatchable_after_release\":{},\"gate_transition\":{},\"generated_at\":{},\"plan_hash\":{},\"plan_id\":{},\"released_manual_gate\":true,\"schema_version\":\"1.0.0\"}}",
+        json_string(&release.approval_event_id),
+        json_string(&release.controlled_next_step),
+        release
+            .dependent_transitions
+            .iter()
+            .map(execution_leg_transition_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        dispatchable_after_release,
+        execution_leg_transition_json(&release.gate_transition),
+        json_string(generated_at),
+        json_string(&release.plan_hash),
+        json_string(&release.plan_id),
+    )
+}
+
+fn execution_leg_transition_json(transition: &arb_execution::ExecutionLegTransition) -> String {
+    format!(
+        "{{\"from_state\":{},\"idempotent\":{},\"plan_leg_id\":{},\"source_event_id\":{},\"to_state\":{}}}",
+        json_string(transition.from_state.as_str()),
+        transition.idempotent,
+        json_string(&transition.plan_leg_id),
+        json_string(&transition.source_event_id),
+        json_string(transition.to_state.as_str()),
+    )
+}
+
+fn manual_gate_release_preview_markdown(
+    release: &ManualApprovalGateRelease,
+    dispatchable_after_release: bool,
+    generated_at: &str,
+) -> String {
+    format!(
+        r#"# Binance BTCUSDT Manual Gate Release Preview
+
+中文说明：本文件只记录人工审批门禁释放预览，不分发订单、不下单、不撤单、不转账、不签名。
+
+- Generated at: {generated_at}
+- Plan: {plan_id}
+- Plan hash: {plan_hash}
+- Approval event: {approval_event_id}
+- Released manual gate: true
+- Dependent transitions: {dependent_count}
+- Dispatchable after release: {dispatchable_after_release}
+- Controlled next step: {controlled_next_step}
+
+## Gate Transition
+
+- {gate_leg}: {gate_from} -> {gate_to}
+
+## Dependent Transitions
+
+{dependent_transitions}
+"#,
+        plan_id = release.plan_id,
+        plan_hash = release.plan_hash,
+        approval_event_id = release.approval_event_id,
+        dependent_count = release.dependent_transitions.len(),
+        controlled_next_step = release.controlled_next_step,
+        gate_leg = release.gate_transition.plan_leg_id,
+        gate_from = release.gate_transition.from_state.as_str(),
+        gate_to = release.gate_transition.to_state.as_str(),
+        dependent_transitions = release
+            .dependent_transitions
+            .iter()
+            .map(|transition| format!(
+                "- {}: {} -> {}",
+                transition.plan_leg_id,
+                transition.from_state.as_str(),
+                transition.to_state.as_str()
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn write_binance_pre_dispatch_dry_run_artifacts(
+    output_dir: &Path,
+    release_report: &BinanceManualGateReleasePreviewReport,
+    health: &RuntimeHealthSnapshot,
+    blocking_reasons: &[String],
+    dispatch_allowed: bool,
+    generated_at: &str,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("pre_dispatch_dry_run.json"),
+        &format!(
+            "{}\n",
+            pre_dispatch_dry_run_json(
+                release_report,
+                health,
+                blocking_reasons,
+                dispatch_allowed,
+                generated_at,
+            )
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("pre_dispatch_dry_run.md"),
+        &pre_dispatch_dry_run_markdown(
+            release_report,
+            health,
+            blocking_reasons,
+            dispatch_allowed,
+            generated_at,
+        ),
+    )
+}
+
+fn pre_dispatch_dry_run_json(
+    release_report: &BinanceManualGateReleasePreviewReport,
+    health: &RuntimeHealthSnapshot,
+    blocking_reasons: &[String],
+    dispatch_allowed: bool,
+    generated_at: &str,
+) -> String {
+    format!(
+        "{{\"approval_event_id\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"execution_mode\":{},\"generated_at\":{},\"kill_switch_triggered\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"plan_hash\":{},\"plan_id\":{},\"runtime_status\":{},\"schema_version\":\"1.0.0\"}}",
+        json_string(&release_report.approval_event_id),
+        blocking_reasons
+            .iter()
+            .map(|reason| json_string(reason))
+            .collect::<Vec<_>>()
+            .join(","),
+        dispatch_allowed,
+        json_string(&health.execution_mode),
+        json_string(generated_at),
+        health.kill_switch_triggered,
+        release_report.released_manual_gate,
+        health.mutable_execution_started,
+        json_string(&release_report.plan_hash),
+        json_string(&release_report.plan_id),
+        json_string(health.status.as_str()),
+    )
+}
+
+fn pre_dispatch_dry_run_markdown(
+    release_report: &BinanceManualGateReleasePreviewReport,
+    health: &RuntimeHealthSnapshot,
+    blocking_reasons: &[String],
+    dispatch_allowed: bool,
+    generated_at: &str,
+) -> String {
+    format!(
+        r#"# Binance BTCUSDT Pre-Dispatch Dry Run
+
+中文说明：本 dry run 只检查分发前门禁，不调用真实交易 API、不下单、不撤单、不转账、不签名。
+
+- Generated at: {generated_at}
+- Plan: {plan_id}
+- Plan hash: {plan_hash}
+- Approval event: {approval_event_id}
+- Manual gate released: {manual_gate_released}
+- Runtime status: {runtime_status}
+- Execution mode: {execution_mode}
+- Kill switch triggered: {kill_switch_triggered}
+- Mutable execution started: {mutable_execution_started}
+- Dispatch allowed: {dispatch_allowed}
+
+## Blocking Reasons
+
+{blocking_reasons}
+"#,
+        plan_id = release_report.plan_id,
+        plan_hash = release_report.plan_hash,
+        approval_event_id = release_report.approval_event_id,
+        manual_gate_released = release_report.released_manual_gate,
+        runtime_status = health.status.as_str(),
+        execution_mode = health.execution_mode,
+        kill_switch_triggered = health.kill_switch_triggered,
+        mutable_execution_started = health.mutable_execution_started,
+        blocking_reasons = blocking_reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn json_string_field(input: &str, field: &str) -> RuntimeResult<String> {
+    let value_start = json_field_value_start(input, field)?;
+    let quote_start = value_start
+        + input[value_start..]
+            .find('"')
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("JSON field `{field}` is not a string"),
+            })?;
+    if input[value_start..quote_start].trim().is_empty() {
+        let quote_end = json_string_end(input, quote_start)?;
+        decode_json_string_literal(&input[quote_start + 1..quote_end - 1])
+    } else {
+        Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("JSON field `{field}` is not a string"),
+        })
+    }
+}
+
+fn json_optional_string_field(input: &str, field: &str) -> RuntimeResult<Option<String>> {
+    if !input.contains(&format!("\"{field}\"")) {
+        return Ok(None);
+    }
+    let value_start = json_field_value_start(input, field)?;
+    if input[value_start..].trim_start().starts_with("null") {
+        Ok(None)
+    } else {
+        json_string_field(input, field).map(Some)
+    }
+}
+
+fn json_bool_field(input: &str, field: &str) -> RuntimeResult<bool> {
+    let value_start = json_field_value_start(input, field)?;
+    let value = input[value_start..].trim_start();
+    if value.starts_with("true") {
+        Ok(true)
+    } else if value.starts_with("false") {
+        Ok(false)
+    } else {
+        Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("JSON field `{field}` is not a boolean"),
+        })
+    }
+}
+
+fn json_field_value_start(input: &str, field: &str) -> RuntimeResult<usize> {
+    let key = format!("\"{field}\"");
+    let key_start = input.find(&key).ok_or_else(|| RuntimeError::Module {
+        module: "arb-runtime",
+        message: format!("JSON object is missing field `{field}`"),
+    })?;
+    let after_key = key_start + key.len();
+    let colon = after_key
+        + input[after_key..]
+            .find(':')
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("JSON field `{field}` is missing ':'"),
+            })?;
+    Ok(colon + 1)
+}
+
+fn decode_json_string_literal(input: &str) -> RuntimeResult<String> {
+    let mut output = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: "JSON string ends with a dangling escape".to_owned(),
+            });
+        };
+        match escaped {
+            '"' => output.push('"'),
+            '\\' => output.push('\\'),
+            '/' => output.push('/'),
+            'b' => output.push('\u{0008}'),
+            'f' => output.push('\u{000c}'),
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            'u' => {
+                let mut code = String::new();
+                for _ in 0..4 {
+                    let Some(hex) = chars.next() else {
+                        return Err(RuntimeError::Module {
+                            module: "arb-runtime",
+                            message: "JSON unicode escape is incomplete".to_owned(),
+                        });
+                    };
+                    code.push(hex);
+                }
+                let value =
+                    u32::from_str_radix(&code, 16).map_err(|error| RuntimeError::Module {
+                        module: "arb-runtime",
+                        message: format!("JSON unicode escape is invalid: {error}"),
+                    })?;
+                let Some(decoded) = char::from_u32(value) else {
+                    return Err(RuntimeError::Module {
+                        module: "arb-runtime",
+                        message: "JSON unicode escape is not a valid scalar value".to_owned(),
+                    });
+                };
+                output.push(decoded);
+            }
+            other => {
+                return Err(RuntimeError::Module {
+                    module: "arb-runtime",
+                    message: format!("unsupported JSON escape `\\{other}`"),
+                });
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn manual_approval_audit_record_from_execution(
+    record: &ManualApprovalRecord,
+) -> ManualApprovalAuditRecord {
+    ManualApprovalAuditRecord {
+        record_id: record.record_id.clone(),
+        approval_event_id: record.approval_event_id.clone(),
+        risk_decision_id: record.risk_decision_id.clone(),
+        transition_id: record.transition_id.clone(),
+        plan_id: record.plan_id.clone(),
+        plan_hash: record.plan_hash.clone(),
+        decision: record.decision.as_str().to_owned(),
+        status: record.status.as_str().to_owned(),
+        reviewer_id: record.reviewer_id.clone(),
+        decided_at: record.decided_at.clone(),
+        expires_at: record.expires_at.clone(),
+        reason: record.reason.clone(),
+        duplicate_of: record.duplicate_of.clone(),
+        releases_manual_gate: record.releases_manual_gate,
+        controlled_next_step: record.controlled_next_step.clone(),
+    }
+}
+
+fn manual_approval_records_jsonl(records: &[ManualApprovalRecord]) -> String {
+    jsonl_from_lines(
+        records
+            .iter()
+            .map(ManualApprovalRecord::to_audit_json)
+            .collect(),
+    )
+}
+
+fn binance_manual_confirmation_template(
+    plan: &ExecutionPlan,
+    plan_hash: &str,
+    generated_at: &str,
+    approval_records: &[ManualApprovalRecord],
+) -> String {
+    let confirmation_status = approval_records
+        .first()
+        .map(|record| record.status.as_str())
+        .unwrap_or("pending");
+    let approval_record_summary = if approval_records.is_empty() {
+        "- 无审批记录。".to_owned()
+    } else {
+        approval_records
+            .iter()
+            .map(|record| {
+                format!(
+                    "- `{}` status={} decision={} reviewer={} decided_at={} expires_at={} releases_manual_gate={}",
+                    record.record_id,
+                    record.status.as_str(),
+                    record.decision.as_str(),
+                    record.reviewer_id,
+                    record.decided_at,
+                    record.expires_at,
+                    record.releases_manual_gate
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"# Binance BTCUSDT GuardedLivePersonal 人工确认记录
+
+- 生成时间：{generated_at}
+- 交易场所：Binance spot（现货公开行情）
+- 标的：BTC-USDT / BTCUSDT
+- 结算资产：USDT
+- 目标执行模式：GuardedLive
+- 计划预览执行模式：{execution_mode}
+- 计划创建时间：{plan_created_at}
+- 计划 ID：{plan_id}
+- 计划哈希：{plan_hash}
+- 审批前是否可分发执行：false
+- 单笔名义本金上限：{notional} USDT
+- 资本上限：{capital_limit} USDT
+- 日亏损停止阈值：{daily_loss_limit} USDT
+- 账户引用：{account_ref}
+- 人工确认状态：{confirmation_status}
+
+## 审批记录
+
+{approval_record_summary}
+
+## 中文确认要求
+
+人工确认只能针对上面的同一个 `plan_hash`。如果 `plan_preview.json` 内容、行情、
+风控输出或账户状态发生变化，必须重新生成计划预览并使用新的哈希；旧确认不得沿用。
+
+批准只表示释放人工审批门禁，不等于绕过执行模式、熔断、权限、资本预留、账本、
+对账和未知状态检查。本步骤不会下单、不会撤单、不会转账、不会签名。
+
+## 记录批准或拒绝
+
+批准示例：
+
+```bash
+cargo run -p arb-runtime -- binance-guarded-live-preview \
+  --market-artifacts target/binance-basis-pipeline \
+  --out target/binance-guarded-live-preview \
+  --decision approve \
+  --expected-plan-hash {plan_hash} \
+  --approval-event-id event:approval:binance-btcusdt-001 \
+  --reviewer owner:redacted \
+  --decided-at 2026-05-13T00:00:00Z \
+  --expires-at 2026-05-13T00:05:00Z \
+  --reason "Owner approved the same plan_hash for guarded live pilot."
+```
+
+拒绝示例：
+
+```bash
+cargo run -p arb-runtime -- binance-guarded-live-preview \
+  --market-artifacts target/binance-basis-pipeline \
+  --out target/binance-guarded-live-preview \
+  --decision reject \
+  --expected-plan-hash {plan_hash} \
+  --approval-event-id event:approval:binance-btcusdt-001 \
+  --reviewer owner:redacted \
+  --decided-at 2026-05-13T00:00:00Z \
+  --expires-at 2026-05-13T00:05:00Z \
+  --reason "Owner rejected the guarded live pilot."
+```
+"#,
+        execution_mode = plan.execution_mode.as_str(),
+        plan_created_at = plan.created_at.as_str(),
+        plan_id = plan.plan_id.as_str(),
+        notional = BINANCE_GUARDED_LIVE_NOTIONAL_USDT,
+        capital_limit = BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT,
+        daily_loss_limit = BINANCE_GUARDED_LIVE_DAILY_LOSS_LIMIT_USDT,
+        account_ref = BINANCE_GUARDED_LIVE_ACCOUNT_REF,
+        confirmation_status = confirmation_status,
+        approval_record_summary = approval_record_summary,
+    )
 }
 
 fn write_binance_basis_scan_artifacts(
@@ -8028,6 +9184,80 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "binance-guarded-live-preview" {
+        let options = parse_binance_guarded_live_preview_args(&args[1..])?;
+        let report = run_binance_guarded_live_preview(
+            &options.market_artifacts_dir,
+            options.output_dir.clone(),
+            options.decision_request,
+        )?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        let approval_status = report
+            .approval_status
+            .as_deref()
+            .unwrap_or("PendingManualApproval");
+        return Ok(format!(
+            "ok: generated Binance BTCUSDT GuardedLivePersonal plan preview; plan_hash={}; dispatchable_before_approval={}; approval_records={}; approval_status={}; mutable_execution_started=false{}",
+            report.plan_hash,
+            report.dispatchable_before_approval,
+            report.approval_record_count,
+            approval_status,
+            output_note
+        ));
+    }
+    if args[0] == "binance-guarded-live-gate-release-preview" {
+        let options = parse_binance_manual_gate_release_preview_args(&args[1..])?;
+        let report = run_binance_manual_gate_release_preview(
+            &options.preview_dir,
+            options.output_dir.clone(),
+        )?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: generated Binance BTCUSDT manual gate release preview; plan_hash={}; approval_event_id={}; released_manual_gate={}; dependent_transitions={}; dispatchable_after_release={}; mutable_execution_started=false{}",
+            report.plan_hash,
+            report.approval_event_id,
+            report.released_manual_gate,
+            report.dependent_transition_count,
+            report.dispatchable_after_release,
+            output_note
+        ));
+    }
+    if args[0] == "binance-guarded-live-pre-dispatch-dry-run" {
+        let options = parse_binance_pre_dispatch_dry_run_args(&args[1..])?;
+        let report = run_binance_pre_dispatch_dry_run(
+            &options.preview_dir,
+            &options.config_path,
+            options.output_dir.clone(),
+        )?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: ran Binance BTCUSDT pre-dispatch dry run; plan_hash={}; approval_event_id={}; manual_gate_released={}; dispatch_allowed={}; blocking_reasons={}; mutable_execution_started=false{}",
+            report.plan_hash,
+            report.approval_event_id,
+            report.manual_gate_released,
+            report.dispatch_allowed,
+            report.blocking_reasons.len(),
+            output_note
+        ));
+    }
     if args[0] == "binance-wss-book-ticker" {
         let options = parse_binance_wss_book_ticker_args(&args[1..])?;
         let once = options.once;
@@ -8192,7 +9422,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
                 args[0]
             ),
         });
@@ -8233,6 +9463,12 @@ fn help_text() -> String {
         "                                    Fetch Binance public spot/perp data and run read-only basis strategy",
         "  binance-basis-pipeline [--symbol BTCUSDT] [--out dir]",
         "                                    Fetch Binance public spot/perp data and run simulated pipeline artifacts",
+        "  binance-guarded-live-preview [--market-artifacts dir] [--out dir] [--decision approve|reject --expected-plan-hash hash --approval-event-id id --reviewer id --decided-at ts --expires-at ts --reason text]",
+        "                                    Generate Binance BTCUSDT GuardedLivePersonal plan preview, plan hash, and manual confirmation audit material",
+        "  binance-guarded-live-gate-release-preview [--preview-dir dir] [--out dir]",
+        "                                    Consume Approved manual record and generate a non-dispatching manual gate release fact preview",
+        "  binance-guarded-live-pre-dispatch-dry-run [--preview-dir dir] [--config path] [--out dir]",
+        "                                    Run fail-closed pre-dispatch dry run after manual gate release preview",
         "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
         "  binance-basis-monitor [--bind 127.0.0.1:8796] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
@@ -8261,6 +9497,20 @@ struct BinanceBasisScanCliOptions {
 }
 
 type BinanceBasisPipelineCliOptions = BinanceBasisScanCliOptions;
+struct BinanceGuardedLivePreviewCliOptions {
+    market_artifacts_dir: PathBuf,
+    output_dir: Option<PathBuf>,
+    decision_request: Option<BinanceManualApprovalDecisionRequest>,
+}
+struct BinanceManualGateReleasePreviewCliOptions {
+    preview_dir: PathBuf,
+    output_dir: Option<PathBuf>,
+}
+struct BinancePreDispatchDryRunCliOptions {
+    preview_dir: PathBuf,
+    config_path: PathBuf,
+    output_dir: Option<PathBuf>,
+}
 type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
 type BinanceWssBookTickerCliOptions = BinanceWssBookTickerMonitorOptions;
 type BybitBasisMonitorCliOptions = BybitBasisMonitorOptions;
@@ -8392,6 +9642,252 @@ fn parse_binance_basis_pipeline_args(
     }
 
     Ok(BinanceBasisScanCliOptions { symbol, output_dir })
+}
+
+fn parse_binance_guarded_live_preview_args(
+    args: &[String],
+) -> RuntimeResult<BinanceGuardedLivePreviewCliOptions> {
+    let mut market_artifacts_dir = PathBuf::from(BINANCE_BASIS_PIPELINE_DEFAULT_OUT);
+    let mut output_dir = None;
+    let mut decision = None;
+    let mut expected_plan_hash = None;
+    let mut approval_event_id = None;
+    let mut reviewer_id = None;
+    let mut decided_at = None;
+    let mut expires_at = None;
+    let mut reason = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--market-artifacts" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--market-artifacts requires a directory"));
+                };
+                market_artifacts_dir = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--decision" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--decision requires approve or reject"));
+                };
+                decision = Some(parse_manual_approval_decision(value)?);
+            }
+            "--expected-plan-hash" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--expected-plan-hash requires a value"));
+                };
+                expected_plan_hash = Some(value.clone());
+            }
+            "--approval-event-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--approval-event-id requires a value"));
+                };
+                approval_event_id = Some(value.clone());
+            }
+            "--reviewer" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reviewer requires a value"));
+                };
+                reviewer_id = Some(value.clone());
+            }
+            "--decided-at" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--decided-at requires an RFC3339 UTC timestamp",
+                    ));
+                };
+                decided_at = Some(value.clone());
+            }
+            "--expires-at" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--expires-at requires an RFC3339 UTC timestamp",
+                    ));
+                };
+                expires_at = Some(value.clone());
+            }
+            "--reason" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reason requires a value"));
+                };
+                reason = Some(value.clone());
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-guarded-live-preview option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-guarded-live-preview positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let decision_request = if let Some(decision) = decision {
+        Some(BinanceManualApprovalDecisionRequest {
+            decision,
+            expected_plan_hash: expected_plan_hash.ok_or_else(|| {
+                cli_arg_error("--expected-plan-hash is required when --decision is supplied")
+            })?,
+            approval_event_id: approval_event_id.ok_or_else(|| {
+                cli_arg_error("--approval-event-id is required when --decision is supplied")
+            })?,
+            reviewer_id: reviewer_id
+                .ok_or_else(|| cli_arg_error("--reviewer is required when --decision is supplied"))?,
+            decided_at: decided_at.ok_or_else(|| {
+                cli_arg_error("--decided-at is required when --decision is supplied")
+            })?,
+            expires_at: expires_at.ok_or_else(|| {
+                cli_arg_error("--expires-at is required when --decision is supplied")
+            })?,
+            reason: reason.unwrap_or_else(|| {
+                "Manual approval decision recorded for Binance BTCUSDT GuardedLivePersonal plan preview."
+                    .to_owned()
+            }),
+        })
+    } else {
+        if expected_plan_hash.is_some()
+            || approval_event_id.is_some()
+            || reviewer_id.is_some()
+            || decided_at.is_some()
+            || expires_at.is_some()
+            || reason.is_some()
+        {
+            return Err(cli_arg_error(
+                "manual approval fields require --decision approve|reject",
+            ));
+        }
+        None
+    };
+
+    Ok(BinanceGuardedLivePreviewCliOptions {
+        market_artifacts_dir,
+        output_dir,
+        decision_request,
+    })
+}
+
+fn parse_manual_approval_decision(value: &str) -> RuntimeResult<ManualApprovalDecision> {
+    match value {
+        "approve" | "Approve" | "approved" | "Approved" => Ok(ManualApprovalDecision::Approve),
+        "reject" | "Reject" | "rejected" | "Rejected" => Ok(ManualApprovalDecision::Reject),
+        other => Err(cli_arg_error(format!(
+            "--decision expected approve or reject, got `{other}`"
+        ))),
+    }
+}
+
+fn parse_binance_manual_gate_release_preview_args(
+    args: &[String],
+) -> RuntimeResult<BinanceManualGateReleasePreviewCliOptions> {
+    let mut preview_dir = PathBuf::from(BINANCE_GUARDED_LIVE_PREVIEW_DEFAULT_OUT);
+    let mut output_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--preview-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--preview-dir requires a directory"));
+                };
+                preview_dir = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-guarded-live-gate-release-preview option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-guarded-live-gate-release-preview positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceManualGateReleasePreviewCliOptions {
+        preview_dir,
+        output_dir,
+    })
+}
+
+fn parse_binance_pre_dispatch_dry_run_args(
+    args: &[String],
+) -> RuntimeResult<BinancePreDispatchDryRunCliOptions> {
+    let mut preview_dir = PathBuf::from(BINANCE_GUARDED_LIVE_PREVIEW_DEFAULT_OUT);
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--preview-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--preview-dir requires a directory"));
+                };
+                preview_dir = PathBuf::from(value);
+            }
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-guarded-live-pre-dispatch-dry-run option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-guarded-live-pre-dispatch-dry-run positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinancePreDispatchDryRunCliOptions {
+        preview_dir,
+        config_path,
+        output_dir,
+    })
 }
 
 fn parse_binance_wss_book_ticker_args(
@@ -9346,6 +10842,118 @@ mod tests {
         assert!(artifacts
             .operations_daily_report_md
             .contains("Read-only mode: true"));
+    }
+
+    #[test]
+    fn binance_guarded_live_preview_writes_pending_manual_confirmation_artifacts() {
+        let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
+        let perp = r#"{"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778630400000}"#;
+        let premium = r#"{"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let artifacts = assemble_binance_basis_pipeline_from_raw_json(
+            &replay,
+            BinanceBasisRawInputs {
+                symbol: "BTCUSDT",
+                raw_spot_book: spot,
+                spot_book_ref: "test:binance-spot-book",
+                raw_perp_book: perp,
+                perp_book_ref: "test:binance-usdm-book",
+                raw_premium_index: premium,
+                premium_index_ref: "test:binance-usdm-premium",
+            },
+            ingested_at,
+        )
+        .expect("basis pipeline artifacts");
+        let market_dir = RuntimeTempDir::new().expect("market dir");
+        write_utf8(
+            market_dir.path().join("stored_events.jsonl"),
+            &artifacts.stored_events_jsonl,
+        )
+        .expect("stored events");
+        let output_root = RuntimeTempDir::new().expect("output dir");
+        let preview_dir = output_root.path().join("preview");
+
+        let report =
+            run_binance_guarded_live_preview(market_dir.path(), Some(preview_dir.clone()), None)
+                .expect("guarded live preview");
+
+        assert_eq!(report.symbol, "BTCUSDT");
+        assert!(report.plan_hash.starts_with("hash:sha256:"));
+        assert!(!report.dispatchable_before_approval);
+        assert_eq!(report.approval_record_count, 0);
+        assert_eq!(report.approval_status, None);
+        assert_eq!(
+            read_utf8(&preview_dir.join("plan_hash.txt"))
+                .expect("plan hash")
+                .trim(),
+            report.plan_hash
+        );
+        let confirmation =
+            read_utf8(&preview_dir.join("manual_confirmation_record.md")).expect("confirmation");
+        assert!(confirmation.contains("人工确认状态：pending"));
+        assert!(confirmation.contains(&report.plan_hash));
+        assert!(read_utf8(&preview_dir.join("approval_records.jsonl"))
+            .expect("approval records")
+            .is_empty());
+        assert!(read_utf8(&preview_dir.join("plan_preview.json"))
+            .expect("plan preview")
+            .contains("\"execution_mode\":\"ManualApproval\""));
+
+        let approved = run_binance_guarded_live_preview(
+            market_dir.path(),
+            Some(preview_dir.clone()),
+            Some(BinanceManualApprovalDecisionRequest {
+                decision: ManualApprovalDecision::Approve,
+                expected_plan_hash: report.plan_hash.clone(),
+                approval_event_id: "event:approval:test:binance-btcusdt".to_owned(),
+                reviewer_id: "owner:redacted".to_owned(),
+                decided_at: "2026-05-13T00:01:00Z".to_owned(),
+                expires_at: "2026-05-13T00:06:00Z".to_owned(),
+                reason: "Owner approved the same test plan hash.".to_owned(),
+            }),
+        )
+        .expect("approved guarded live preview");
+
+        assert_eq!(approved.plan_hash, report.plan_hash);
+        assert_eq!(approved.approval_record_count, 1);
+        assert_eq!(approved.approval_status.as_deref(), Some("Approved"));
+        assert!(read_utf8(&preview_dir.join("approval_records.jsonl"))
+            .expect("approval records")
+            .contains("\"status\":\"Approved\""));
+        assert!(
+            read_utf8(&preview_dir.join("manual_confirmation_record.md"))
+                .expect("approved confirmation")
+                .contains("人工确认状态：Approved")
+        );
+
+        let release =
+            run_binance_manual_gate_release_preview(&preview_dir, Some(preview_dir.clone()))
+                .expect("manual gate release preview");
+        assert!(release.released_manual_gate);
+        assert_eq!(release.plan_hash, report.plan_hash);
+        assert_eq!(release.dependent_transition_count, 1);
+        assert!(!release.dispatchable_after_release);
+        assert!(
+            read_utf8(&preview_dir.join("manual_gate_release_preview.json"))
+                .expect("release preview")
+                .contains("\"released_manual_gate\":true")
+        );
+
+        let config_path = output_root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_blocked_by_kill_switch_yaml()).expect("write config");
+        let dry_run =
+            run_binance_pre_dispatch_dry_run(&preview_dir, &config_path, Some(preview_dir.clone()))
+                .expect("pre-dispatch dry run");
+        assert!(dry_run.manual_gate_released);
+        assert!(!dry_run.dispatch_allowed);
+        assert!(dry_run
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("kill switch")));
+        assert!(read_utf8(&preview_dir.join("pre_dispatch_dry_run.json"))
+            .expect("dry run")
+            .contains("\"dispatch_allowed\":false"));
     }
 
     #[test]

@@ -19,8 +19,8 @@ kill_switch:
   strategies: ["strategy:sample-spot-v1"]
   venues: ["venue:personal-cex-redacted"]
   accounts: ["account:personal-cex-subaccount-redacted"]
-  instruments: ["inst:BTC-USDC"]
-  assets: ["asset:BTC", "asset:USDC"]
+  instruments: ["inst:BTC-USDT"]
+  assets: ["asset:BTC", "asset:USDT"]
   chains: []
   execution_modes: ["GuardedLive"]
 

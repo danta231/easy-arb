@@ -7,11 +7,9 @@ use std::process::{self, Command};
 type XtaskResult<T> = Result<T, String>;
 
 const DOC_ROOT: &str = "universal_arb_platform_v2_immutable_core_docs";
-const REQUIRED_DOCS: &[&str] = &[
-    "docs/24_Codex_Development_Runbook.md",
-    "docs/22_Development_Execution_Plan.md",
-    "docs/23_Module_Architecture_Map.md",
-    "docs/25_Core_Architecture_Reference.md",
+const REQUIRED_TEXT_DOCS: &[&str] = &[
+    "AGENTS.md",
+    "universal_arb_platform_v2_immutable_core_docs/README.md",
 ];
 const FIXTURE_DOCS: &[&str] = &[
     "fixtures/schema/valid/README.md",
@@ -196,9 +194,9 @@ fn print_help() {
     println!("Commands:");
     println!("  check-schema            Parse schema JSON and schema fixture JSON files");
     println!(
-        "  check-crate-boundaries  Check cargo metadata against docs/23 forbidden dependencies"
+        "  check-crate-boundaries  Check cargo metadata against built-in forbidden dependencies"
     );
-    println!("  check-docs              Check required docs and Chinese fixture notes");
+    println!("  check-docs              Check guidance notes and Chinese fixture notes");
     println!(
         "  guarded-live-preflight  Check a local personal guarded-live config without credentials"
     );
@@ -290,7 +288,7 @@ fn check_schema(root: &Path) -> XtaskResult<()> {
 
 fn check_crate_boundaries(root: &Path) -> XtaskResult<()> {
     println!("check-crate-boundaries: reading cargo metadata");
-    println!("中文说明：根据 23_Module_Architecture_Map.md 的禁止依赖表检查 workspace crate 的直接依赖。");
+    println!("中文说明：根据 xtask 内置禁止依赖表检查 workspace crate 的直接依赖。");
 
     let packages = read_workspace_metadata(root)?;
     validate_required_boundary_packages(&packages)?;
@@ -311,11 +309,13 @@ fn check_crate_boundaries(root: &Path) -> XtaskResult<()> {
 }
 
 fn check_docs(root: &Path) -> XtaskResult<()> {
-    println!("check-docs: checking required development docs");
-    println!("中文说明：文档检查当前覆盖必读文档存在性和中文说明要求。");
+    println!("check-docs: checking repository guidance notes");
+    println!(
+        "中文说明：文档检查当前覆盖 AGENTS.md、资料入口和 fixture 说明的存在性及中文说明要求。"
+    );
 
-    for doc in REQUIRED_DOCS {
-        let path = root.join(DOC_ROOT).join(doc);
+    for doc in REQUIRED_TEXT_DOCS {
+        let path = root.join(doc);
         ensure_file(&path)?;
         let contents = read_utf8(&path)?;
         if !contains_chinese(&contents) {
@@ -339,8 +339,8 @@ fn check_docs(root: &Path) -> XtaskResult<()> {
     }
 
     println!(
-        "ok: checked {} required docs and {} fixture notes",
-        REQUIRED_DOCS.len(),
+        "ok: checked {} guidance notes and {} fixture notes",
+        REQUIRED_TEXT_DOCS.len(),
         FIXTURE_DOCS.len()
     );
     Ok(())

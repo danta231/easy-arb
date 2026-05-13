@@ -1,39 +1,35 @@
 # AGENTS.md
 
-本仓库按 `universal_arb_platform_v2_immutable_core_docs/docs/24_Codex_Development_Runbook.md` 执行开发。
+本仓库已清理 `universal_arb_platform_v2_immutable_core_docs/docs` 和 `universal_arb_platform_v2_immutable_core_docs/review` 下的旧文档，不再以这些目录中的运行手册或评审材料作为开发入口。后续协作以本文件、当前代码、测试和明确的用户指令为准。
 
-## Required Reading
+## 路径规则
 
-每次开发前先读取：
+- `CODE_ROOT`（代码根目录）是仓库根目录。
+- Rust（系统编程语言）工作区、`crates/`、`fixtures/` 和 `xtask/` 放在 `CODE_ROOT` 下。
+- `universal_arb_platform_v2_immutable_core_docs/schemas` 保存 `schema`（数据结构约束）。
+- `universal_arb_platform_v2_immutable_core_docs/templates` 保存 `template`（模板）文件。
+- `docs/` 和 `review/` 当前不作为可引用文档入口；不要新增对这些旧入口的依赖，除非用户明确要求恢复。
 
-1. `universal_arb_platform_v2_immutable_core_docs/docs/24_Codex_Development_Runbook.md`
-2. `universal_arb_platform_v2_immutable_core_docs/docs/22_Development_Execution_Plan.md`
-3. `universal_arb_platform_v2_immutable_core_docs/docs/23_Module_Architecture_Map.md`
-4. `universal_arb_platform_v2_immutable_core_docs/docs/25_Core_Architecture_Reference.md`
+## 硬规则
 
-## Path Rules
+- 未经明确授权阶段，不实现真实下单、撤单、转账或真实签名。
+- 默认开发必须保持只读、模拟、可回放，并且可以离线测试。
+- 阶段 0 之后优先使用 Rust 工具链和 `cargo xtask ...`（项目本地检查命令）做验证。
+- 不要把 Node.js（JavaScript 运行时）引入为正式项目依赖。
+- 所有新生成或更新的文档必须使用中文；代码标识符、命令名、`schema`（数据结构约束）名称和必要技术术语如需保留英文，必须同时提供中文解释。
+- 不要把密钥、接口密钥、私钥、令牌或凭证写入代码、日志、样例、文档或报告。
+- 外部状态未知时必须按失败或风险状态处理，不能当作成功。
 
-- `DOC_ROOT` is `universal_arb_platform_v2_immutable_core_docs`.
-- `CODE_ROOT` is the repository root.
-- Rust workspace, `crates/`, `fixtures/`, and `xtask/` belong under `CODE_ROOT`.
-- Documentation short paths such as `docs/...` resolve under `DOC_ROOT`.
+## 工作流
 
-## Hard Rules
+每次开发先检查当前工作区状态和相关代码，再小步修改并运行与改动匹配的验证。遇到已有用户改动时必须保留并兼容，不能擅自回退。
 
-- Do not implement real order placement, cancellation, transfer, or real signing before the allowed phase.
-- Default development is read-only, simulated, replayable, and offline-testable.
-- Use Rust tooling and `cargo xtask ...` for project checks after stage 0.
-- Do not introduce Node.js as a formal project dependency.
-- 所有新生成或更新的文档必须使用中文；代码标识符、命令名、schema 名称和必要技术术语如需保留英文，必须同时提供中文解释。
-- Do not put secrets, API keys, private keys, tokens, or credentials in code, logs, fixtures, docs, or reports.
-- Unknown external state must fail closed and must not be treated as success.
+涉及 Rust 工作区的变更，优先使用：
 
-## Workflow
-
-Prefer task-package execution:
-
-```text
-请按 universal_arb_platform_v2_immutable_core_docs/docs/24_Codex_Development_Runbook.md 执行任务包 <ID>。
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Do not duplicate the runbook here. If this file conflicts with the runbook, the runbook wins unless the conflict involves real execution, signing, funds, credentials, or unsafe external state; in that case use the stricter rule.
+如果变更涉及本地项目检查入口，再运行相应的 `cargo xtask ...` 命令，并在交付说明中写明结果。
