@@ -1,14 +1,18 @@
 # Opportunity Record CSV / 机会记录 CSV
 
-`opportunity_record.csv` is a machine-readable header template. Its column names intentionally remain stable English identifiers so CSV importers and downstream scripts do not break.
+中文说明：`opportunity_record.csv` 是机器可读的 CSV（逗号分隔值）表头模板。字段名保持稳定英文标识，避免破坏 CSV 导入器和下游脚本；中文解释放在本文档中。
 
-中文说明：`opportunity_record.csv` 是机器可读表头模板。字段名保持稳定英文标识，避免破坏 CSV 导入器和下游脚本；中文解释放在本文档中。
+English note: `opportunity_record.csv` keeps stable English column names for importers and downstream scripts.
 
-CSV readers should skip lines beginning with `#`.
+## 读取规则
 
-中文说明：CSV 读取器应跳过以 `#` 开头的注释行。
+- CSV 读取器应跳过以 `#` 开头的注释行。
+- 字段值不得包含密钥、接口密钥、私钥、令牌、会话或完整账户标识。
+- 未知外部状态不能写成成功；应写入明确的 `decision`（决策）和 `reason_codes`（原因码）。
 
-| Column | 中文解释 |
+## 字段说明
+
+| Column / 字段 | 中文解释 |
 |---|---|
 | `timestamp` | 记录时间戳 |
 | `strategy_id` | 策略 ID |
