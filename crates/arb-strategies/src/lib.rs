@@ -19,19 +19,19 @@ const SAMPLE_CODE_VERSION: &str = "code:sample-spot-demo-1";
 const SAMPLE_VENUE_ID: &str = "venue:SIM";
 const SAMPLE_INSTRUMENT_ID: &str = "inst:BTC-USDC";
 const SAMPLE_TRANSITION_ID: &str = "trans:sample-spot-001";
-const BASIS_STRATEGY_ID: &str = "strat:binance-spot-perp-basis";
-const BASIS_STRATEGY_VERSION: &str = "1.0.0";
-const BASIS_CODE_VERSION: &str = "code:binance-spot-perp-basis-1";
-const BASIS_SPOT_VENUE_ID: &str = "venue:BINANCE-SPOT";
-const BASIS_PERP_VENUE_ID: &str = "venue:BINANCE-USDM";
-const BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:SPOT";
-const BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
-const BASIS_TRANSITION_ID: &str = "trans:binance-basis-btcusdt-001";
-const BASIS_NOTIONAL_USD: &str = "100.00";
-const BASIS_SPOT_TAKER_FEE_BPS: i128 = 10;
-const BASIS_PERP_TAKER_FEE_BPS: i128 = 5;
-const BASIS_SLIPPAGE_BUFFER_BPS: i128 = 5;
-const BASIS_MIN_NET_BPS: i128 = 5;
+const BINANCE_BASIS_STRATEGY_ID: &str = "strat:binance-spot-perp-basis";
+const SPOT_PERP_BASIS_STRATEGY_VERSION: &str = "1.0.0";
+const BINANCE_BASIS_CODE_VERSION: &str = "code:binance-spot-perp-basis-1";
+const BINANCE_BASIS_SPOT_VENUE_ID: &str = "venue:BINANCE-SPOT";
+const BINANCE_BASIS_PERP_VENUE_ID: &str = "venue:BINANCE-USDM";
+const BINANCE_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:SPOT";
+const BINANCE_BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
+const BINANCE_BASIS_TRANSITION_ID: &str = "trans:binance-basis-btcusdt-001";
+const DEFAULT_BASIS_NOTIONAL_USD: &str = "100.00";
+const DEFAULT_BASIS_SPOT_TAKER_FEE_BPS: i128 = 10;
+const DEFAULT_BASIS_PERP_TAKER_FEE_BPS: i128 = 5;
+const DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS: i128 = 5;
+const DEFAULT_BASIS_MIN_NET_BPS: i128 = 5;
 const BYBIT_BASIS_STRATEGY_ID: &str = "strat:bybit-spot-perp-basis";
 const BYBIT_BASIS_CODE_VERSION: &str = "code:bybit-spot-perp-basis-1";
 const BYBIT_BASIS_SPOT_VENUE_ID: &str = "venue:BYBIT-SPOT";
@@ -311,9 +311,9 @@ impl SpotPerpBasisStrategyConfig {
     pub fn binance_btcusdt() -> Self {
         Self {
             instance: StrategyInstanceConfig {
-                strategy_id: BASIS_STRATEGY_ID.to_owned(),
-                strategy_version: BASIS_STRATEGY_VERSION.to_owned(),
-                code_version: BASIS_CODE_VERSION.to_owned(),
+                strategy_id: BINANCE_BASIS_STRATEGY_ID.to_owned(),
+                strategy_version: SPOT_PERP_BASIS_STRATEGY_VERSION.to_owned(),
+                code_version: BINANCE_BASIS_CODE_VERSION.to_owned(),
                 strategy_label: "spot-perp basis strategy".to_owned(),
                 venue_family_label: "Binance".to_owned(),
             },
@@ -322,8 +322,8 @@ impl SpotPerpBasisStrategyConfig {
                 base_asset_id: "asset:BTC".to_owned(),
                 quote_asset_id: "asset:USDT".to_owned(),
                 spot: BasisLegConfig {
-                    venue_id: BASIS_SPOT_VENUE_ID.to_owned(),
-                    instrument_id: BASIS_SPOT_INSTRUMENT_ID.to_owned(),
+                    venue_id: BINANCE_BASIS_SPOT_VENUE_ID.to_owned(),
+                    instrument_id: BINANCE_BASIS_SPOT_INSTRUMENT_ID.to_owned(),
                     account_id: "acct:binance-basis-readonly".to_owned(),
                     leg_id: "candleg:binance-basis-buy-spot-btcusdt".to_owned(),
                     basis_role: "Spot".to_owned(),
@@ -332,8 +332,8 @@ impl SpotPerpBasisStrategyConfig {
                     instrument_label: "spot".to_owned(),
                 },
                 perp: BasisLegConfig {
-                    venue_id: BASIS_PERP_VENUE_ID.to_owned(),
-                    instrument_id: BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                    venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+                    instrument_id: BINANCE_BASIS_PERP_INSTRUMENT_ID.to_owned(),
                     account_id: "acct:binance-basis-readonly".to_owned(),
                     leg_id: "candleg:binance-basis-short-usdm-perp-btcusdt".to_owned(),
                     basis_role: "Perp".to_owned(),
@@ -343,14 +343,14 @@ impl SpotPerpBasisStrategyConfig {
                 },
             },
             economics: BasisEconomicsConfig {
-                notional_usd: BASIS_NOTIONAL_USD.to_owned(),
-                spot_taker_fee_bps: BASIS_SPOT_TAKER_FEE_BPS,
-                perp_taker_fee_bps: BASIS_PERP_TAKER_FEE_BPS,
-                slippage_buffer_bps: BASIS_SLIPPAGE_BUFFER_BPS,
-                min_net_bps: BASIS_MIN_NET_BPS,
+                notional_usd: DEFAULT_BASIS_NOTIONAL_USD.to_owned(),
+                spot_taker_fee_bps: DEFAULT_BASIS_SPOT_TAKER_FEE_BPS,
+                perp_taker_fee_bps: DEFAULT_BASIS_PERP_TAKER_FEE_BPS,
+                slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
+                min_net_bps: DEFAULT_BASIS_MIN_NET_BPS,
             },
             output: BasisOutputConfig {
-                transition_id: BASIS_TRANSITION_ID.to_owned(),
+                transition_id: BINANCE_BASIS_TRANSITION_ID.to_owned(),
                 assumption_id: "asm:binance-basis-public-data-readonly".to_owned(),
                 premium_index_label: "premiumIndex".to_owned(),
                 expected_economics_confidence: "0.72".to_owned(),
@@ -366,7 +366,7 @@ impl SpotPerpBasisStrategyConfig {
         Self {
             instance: StrategyInstanceConfig {
                 strategy_id: BYBIT_BASIS_STRATEGY_ID.to_owned(),
-                strategy_version: BASIS_STRATEGY_VERSION.to_owned(),
+                strategy_version: SPOT_PERP_BASIS_STRATEGY_VERSION.to_owned(),
                 code_version: BYBIT_BASIS_CODE_VERSION.to_owned(),
                 strategy_label: "bybit spot-perp basis strategy".to_owned(),
                 venue_family_label: "Bybit".to_owned(),
@@ -397,11 +397,11 @@ impl SpotPerpBasisStrategyConfig {
                 },
             },
             economics: BasisEconomicsConfig {
-                notional_usd: BASIS_NOTIONAL_USD.to_owned(),
-                spot_taker_fee_bps: BASIS_SPOT_TAKER_FEE_BPS,
-                perp_taker_fee_bps: BASIS_PERP_TAKER_FEE_BPS,
-                slippage_buffer_bps: BASIS_SLIPPAGE_BUFFER_BPS,
-                min_net_bps: BASIS_MIN_NET_BPS,
+                notional_usd: DEFAULT_BASIS_NOTIONAL_USD.to_owned(),
+                spot_taker_fee_bps: DEFAULT_BASIS_SPOT_TAKER_FEE_BPS,
+                perp_taker_fee_bps: DEFAULT_BASIS_PERP_TAKER_FEE_BPS,
+                slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
+                min_net_bps: DEFAULT_BASIS_MIN_NET_BPS,
             },
             output: BasisOutputConfig {
                 transition_id: BYBIT_BASIS_TRANSITION_ID.to_owned(),
@@ -1623,8 +1623,8 @@ mod tests {
         let context = basis_test_context(vec![
             basis_book_event(
                 "spot",
-                BASIS_SPOT_VENUE_ID,
-                BASIS_SPOT_INSTRUMENT_ID,
+                BINANCE_BASIS_SPOT_VENUE_ID,
+                BINANCE_BASIS_SPOT_INSTRUMENT_ID,
                 "Spot",
                 "99.90",
                 "100.00",
@@ -1632,8 +1632,8 @@ mod tests {
             ),
             basis_book_event(
                 "perp",
-                BASIS_PERP_VENUE_ID,
-                BASIS_PERP_INSTRUMENT_ID,
+                BINANCE_BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_INSTRUMENT_ID,
                 "Perp",
                 "101.00",
                 "101.10",
@@ -1645,7 +1645,10 @@ mod tests {
         let evaluation = strategy.evaluate(&context).expect("evaluation");
 
         let candidate = evaluation.candidate().expect("candidate");
-        assert_eq!(candidate.transition_id.as_str(), BASIS_TRANSITION_ID);
+        assert_eq!(
+            candidate.transition_id.as_str(),
+            BINANCE_BASIS_TRANSITION_ID
+        );
         assert_eq!(candidate.legs.len(), 2);
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
@@ -1682,12 +1685,15 @@ mod tests {
         let default_alias = spot_perp_basis_strategy().expect("default strategy");
 
         for strategy in [&direct, &binance, &default_alias] {
-            assert_eq!(strategy.metadata().strategy_id(), BASIS_STRATEGY_ID);
+            assert_eq!(strategy.metadata().strategy_id(), BINANCE_BASIS_STRATEGY_ID);
             assert_eq!(
                 strategy.metadata().strategy_version(),
-                BASIS_STRATEGY_VERSION
+                SPOT_PERP_BASIS_STRATEGY_VERSION
             );
-            assert_eq!(strategy.metadata().code_version(), BASIS_CODE_VERSION);
+            assert_eq!(
+                strategy.metadata().code_version(),
+                BINANCE_BASIS_CODE_VERSION
+            );
             assert_eq!(
                 strategy.config(),
                 &SpotPerpBasisStrategyConfig::binance_btcusdt()
@@ -1701,8 +1707,8 @@ mod tests {
         let context = basis_test_context(vec![
             basis_book_event(
                 "spot",
-                BASIS_SPOT_VENUE_ID,
-                BASIS_SPOT_INSTRUMENT_ID,
+                BINANCE_BASIS_SPOT_VENUE_ID,
+                BINANCE_BASIS_SPOT_INSTRUMENT_ID,
                 "Spot",
                 "99.90",
                 "100.00",
@@ -1710,8 +1716,8 @@ mod tests {
             ),
             basis_book_event(
                 "perp",
-                BASIS_PERP_VENUE_ID,
-                BASIS_PERP_INSTRUMENT_ID,
+                BINANCE_BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_INSTRUMENT_ID,
                 "Perp",
                 "100.15",
                 "100.20",
@@ -1740,8 +1746,8 @@ mod tests {
         let context = basis_test_context(vec![
             basis_book_event(
                 "spot",
-                BASIS_SPOT_VENUE_ID,
-                BASIS_SPOT_INSTRUMENT_ID,
+                BINANCE_BASIS_SPOT_VENUE_ID,
+                BINANCE_BASIS_SPOT_INSTRUMENT_ID,
                 "Spot",
                 "99.90",
                 "100.00",
@@ -1749,8 +1755,8 @@ mod tests {
             ),
             basis_book_event(
                 "perp",
-                BASIS_PERP_VENUE_ID,
-                BASIS_PERP_INSTRUMENT_ID,
+                BINANCE_BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_INSTRUMENT_ID,
                 "Perp",
                 "101.00",
                 "101.10",
@@ -2122,17 +2128,17 @@ mod tests {
             match (venue_id, capability) {
                 (SAMPLE_VENUE_ID, MarketCapability::ProvidesSpotMarkets) => self.has_spot,
                 (
-                    BASIS_SPOT_VENUE_ID | BYBIT_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_VENUE_ID | BYBIT_BASIS_SPOT_VENUE_ID,
                     MarketCapability::ProvidesSpotMarkets
                     | MarketCapability::ProvidesOrderBookMarkets,
                 ) => self.has_basis_spot,
                 (
-                    BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
+                    BINANCE_BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
                     MarketCapability::ProvidesPerpetuals
                     | MarketCapability::ProvidesOrderBookMarkets,
                 ) => self.has_basis_perp,
                 (
-                    BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
+                    BINANCE_BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
                     MarketCapability::ProvidesFundingRates,
                 ) => self.has_basis_funding,
                 _ => false,
@@ -2145,8 +2151,8 @@ mod tests {
             }
             match venue_id {
                 SAMPLE_VENUE_ID => self.has_rest,
-                BASIS_SPOT_VENUE_ID
-                | BASIS_PERP_VENUE_ID
+                BINANCE_BASIS_SPOT_VENUE_ID
+                | BINANCE_BASIS_PERP_VENUE_ID
                 | BYBIT_BASIS_SPOT_VENUE_ID
                 | BYBIT_BASIS_PERP_VENUE_ID => self.has_basis_rest,
                 _ => false,
@@ -2182,7 +2188,7 @@ mod tests {
         fn strategy_disabled(&self, strategy_id: &str) -> bool {
             matches!(
                 strategy_id,
-                SAMPLE_STRATEGY_ID | BASIS_STRATEGY_ID | BYBIT_BASIS_STRATEGY_ID
+                SAMPLE_STRATEGY_ID | BINANCE_BASIS_STRATEGY_ID | BYBIT_BASIS_STRATEGY_ID
             ) && self.disabled_strategy
         }
 
@@ -2190,8 +2196,8 @@ mod tests {
             matches!(
                 venue_id,
                 SAMPLE_VENUE_ID
-                    | BASIS_SPOT_VENUE_ID
-                    | BASIS_PERP_VENUE_ID
+                    | BINANCE_BASIS_SPOT_VENUE_ID
+                    | BINANCE_BASIS_PERP_VENUE_ID
                     | BYBIT_BASIS_SPOT_VENUE_ID
                     | BYBIT_BASIS_PERP_VENUE_ID
             ) && self.disabled_venue
@@ -2304,8 +2310,8 @@ mod tests {
 
     fn basis_premium_event(last_funding_rate: &str, risk_reason_code: &str) -> NormalizedEvent {
         basis_premium_event_for(
-            BASIS_PERP_VENUE_ID,
-            BASIS_PERP_INSTRUMENT_ID,
+            BINANCE_BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_INSTRUMENT_ID,
             last_funding_rate,
             risk_reason_code,
         )

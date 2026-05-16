@@ -1000,6 +1000,14 @@ pub mod real {
 
     /// Binance REST API key 认证头名称。
     pub const BINANCE_API_KEY_HEADER: &str = "X-MBX-APIKEY";
+    /// Bybit REST API key 认证头名称。
+    pub const BYBIT_API_KEY_HEADER: &str = "X-BAPI-API-KEY";
+    /// Bybit REST timestamp 认证头名称。
+    pub const BYBIT_TIMESTAMP_HEADER: &str = "X-BAPI-TIMESTAMP";
+    /// Bybit REST signature 认证头名称。
+    pub const BYBIT_SIGNATURE_HEADER: &str = "X-BAPI-SIGN";
+    /// Bybit REST recvWindow 认证头名称。
+    pub const BYBIT_RECV_WINDOW_HEADER: &str = "X-BAPI-RECV-WINDOW";
 
     /// 真实签名提供方接口。
     ///
@@ -1014,6 +1022,18 @@ pub mod real {
         ) -> SigningResult<BinanceSignedEndpoint>;
     }
 
+    /// Bybit 真实签名提供方接口。
+    ///
+    /// 中文说明：Bybit V5 签名串包含 API key，因此策略校验和审计摘要必须先基于
+    /// 非密钥 payload 完成；只有策略允许真实签名后才读取 Bybit 凭证。
+    pub trait BybitRealSigningProvider {
+        fn sign_bybit_hmac(
+            &self,
+            input: BybitHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<BybitSignedEndpoint>;
+    }
+
     /// Binance 凭证提供方。
     ///
     /// 中文说明：外部 secret provider 通过实现该 trait 接入。trait 不提供日志
@@ -1025,11 +1045,29 @@ pub mod real {
         ) -> SigningResult<BinanceApiCredentials>;
     }
 
+    /// Bybit 凭证提供方。
+    ///
+    /// 中文说明：该 trait 与 Binance 凭证 provider 分开，防止不同交易所误用同一组
+    /// 环境变量或 secret 引用。
+    pub trait BybitCredentialProvider {
+        fn load_bybit_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<BybitApiCredentials>;
+    }
+
     /// Binance 时间戳提供方。
     ///
     /// 中文说明：Binance signed endpoint 要求 `timestamp` 参数。默认实现使用
     /// 当前系统时间的毫秒时间戳；测试或外部运行时可注入受控时间源。
     pub trait BinanceTimestampProvider {
+        fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
+    }
+
+    /// Bybit 时间戳提供方。
+    ///
+    /// 中文说明：Bybit signed endpoint 要求 `X-BAPI-TIMESTAMP` 使用 UTC 毫秒时间戳。
+    pub trait BybitTimestampProvider {
         fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
     }
 
@@ -1081,6 +1119,57 @@ pub mod real {
             let api_key = read_env_secret(&self.api_key_env, audit_ref)?;
             let secret_key = read_env_secret(&self.secret_key_env, audit_ref)?;
             BinanceApiCredentials::new(api_key, secret_key)
+        }
+    }
+
+    /// 使用环境变量读取 Bybit 凭证的 provider。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct EnvBybitCredentialProvider {
+        api_key_env: EnvSecretName,
+        secret_key_env: EnvSecretName,
+    }
+
+    impl EnvBybitCredentialProvider {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Self::from_env_names("BYBIT_API_KEY", "BYBIT_API_SECRET")
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key_env: EnvSecretName::new(api_key_env)?,
+                secret_key_env: EnvSecretName::new(secret_key_env)?,
+            })
+        }
+
+        pub fn api_key_env(&self) -> &EnvSecretName {
+            &self.api_key_env
+        }
+
+        pub fn secret_key_env(&self) -> &EnvSecretName {
+            &self.secret_key_env
+        }
+    }
+
+    impl fmt::Debug for EnvBybitCredentialProvider {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("EnvBybitCredentialProvider")
+                .field("api_key_env", &self.api_key_env)
+                .field("secret_key_env", &self.secret_key_env)
+                .finish()
+        }
+    }
+
+    impl BybitCredentialProvider for EnvBybitCredentialProvider {
+        fn load_bybit_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<BybitApiCredentials> {
+            let api_key = read_env_secret(&self.api_key_env, audit_ref)?;
+            let secret_key = read_env_secret(&self.secret_key_env, audit_ref)?;
+            BybitApiCredentials::new(api_key, secret_key)
         }
     }
 
@@ -1141,8 +1230,31 @@ pub mod real {
         }
     }
 
+    /// 系统时间戳提供方。
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct SystemBybitTimestampProvider;
+
+    impl BybitTimestampProvider for SystemBybitTimestampProvider {
+        fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+                SigningError::ClockUnavailable {
+                    audit_ref: audit_ref.clone(),
+                }
+            })?;
+            u64::try_from(duration.as_millis()).map_err(|_| SigningError::ClockUnavailable {
+                audit_ref: audit_ref.clone(),
+            })
+        }
+    }
+
     /// Binance HMAC-SHA256 签名提供方。
     pub struct BinanceHmacSha256SigningProvider<C, T> {
+        credentials: C,
+        timestamp: T,
+    }
+
+    /// Bybit HMAC-SHA256 签名提供方。
+    pub struct BybitHmacSha256SigningProvider<C, T> {
         credentials: C,
         timestamp: T,
     }
@@ -1153,7 +1265,28 @@ pub mod real {
         SystemBinanceTimestampProvider,
     >;
 
+    /// 默认 Bybit 真实签名 provider 类型。
+    pub type BybitRealSigningProviderFromEnv =
+        BybitHmacSha256SigningProvider<EnvBybitCredentialProvider, SystemBybitTimestampProvider>;
+
     impl<C, T> BinanceHmacSha256SigningProvider<C, T> {
+        pub fn new(credentials: C, timestamp: T) -> Self {
+            Self {
+                credentials,
+                timestamp,
+            }
+        }
+
+        pub fn credentials(&self) -> &C {
+            &self.credentials
+        }
+
+        pub fn timestamp_provider(&self) -> &T {
+            &self.timestamp
+        }
+    }
+
+    impl<C, T> BybitHmacSha256SigningProvider<C, T> {
         pub fn new(credentials: C, timestamp: T) -> Self {
             Self {
                 credentials,
@@ -1189,9 +1322,37 @@ pub mod real {
         }
     }
 
+    impl BybitRealSigningProviderFromEnv {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvBybitCredentialProvider::from_default_env()?,
+                SystemBybitTimestampProvider,
+            ))
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvBybitCredentialProvider::from_env_names(api_key_env, secret_key_env)?,
+                SystemBybitTimestampProvider,
+            ))
+        }
+    }
+
     impl<C, T> fmt::Debug for BinanceHmacSha256SigningProvider<C, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("BinanceHmacSha256SigningProvider")
+                .field("credentials", &"<redacted>")
+                .field("timestamp", &"<configured>")
+                .finish()
+        }
+    }
+
+    impl<C, T> fmt::Debug for BybitHmacSha256SigningProvider<C, T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BybitHmacSha256SigningProvider")
                 .field("credentials", &"<redacted>")
                 .field("timestamp", &"<configured>")
                 .finish()
@@ -1243,6 +1404,60 @@ pub mod real {
                 timestamp_millis,
                 signed_query: SecretString::new("signed_query", signed_query)?,
                 signature: BinanceHmacSignature(SecretString::new("signature", signature)?),
+                request,
+                success,
+            })
+        }
+    }
+
+    impl<C, T> BybitRealSigningProvider for BybitHmacSha256SigningProvider<C, T>
+    where
+        C: BybitCredentialProvider,
+        T: BybitTimestampProvider,
+    {
+        fn sign_bybit_hmac(
+            &self,
+            input: BybitHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<BybitSignedEndpoint> {
+            let pending_audit_ref = input.pending_audit_ref()?;
+            let timestamp_millis = self.timestamp.timestamp_millis(&pending_audit_ref)?;
+            let public_payload = input.public_payload(timestamp_millis);
+            let payload_digest = SigningPayloadDigest::new(format!(
+                "sha256:{}",
+                sha256_hex(public_payload.as_bytes())
+            ))?;
+            let request = input.clone().into_signing_request(payload_digest);
+            policy.validate_request(&request)?;
+
+            if policy.mode() != SigningPolicyMode::RealSigningEnabled {
+                return Err(SigningError::RealSigningPolicyNotEnabled {
+                    audit_ref: request.audit_ref(),
+                });
+            }
+
+            let credentials = self
+                .credentials
+                .load_bybit_credentials(&request.audit_ref())?;
+            let canonical_payload = input
+                .canonical_payload(timestamp_millis, credentials.api_key.expose_for_transport());
+            let signature = hmac_sha256_hex(
+                credentials.secret_key.expose_bytes(),
+                canonical_payload.as_bytes(),
+            );
+            let signature_ref = SignatureRef::new(format!(
+                "signature-ref/bybit-hmac/{}",
+                ascii_suffix(request.payload_digest().as_str(), 24)
+            ))?;
+            let success = SigningSuccess::new(request.audit_ref(), signature_ref);
+
+            Ok(BybitSignedEndpoint {
+                api_key: credentials.api_key,
+                timestamp_millis,
+                recv_window_ms: input.recv_window_ms,
+                payload_kind: input.payload_kind,
+                payload: SecretString::new("bybit_payload", input.payload)?,
+                signature: BybitHmacSignature(SecretString::new("signature", signature)?),
                 request,
                 success,
             })
@@ -1359,6 +1574,147 @@ pub mod real {
         }
     }
 
+    /// Bybit 签名 payload 类型。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BybitSigningPayloadKind {
+        QueryString,
+        JsonBody,
+    }
+
+    impl BybitSigningPayloadKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::QueryString => "query_string",
+                Self::JsonBody => "json_body",
+            }
+        }
+    }
+
+    /// Bybit HMAC 签名输入。
+    ///
+    /// 中文说明：输入只包含非密钥请求上下文、`recvWindow` 和待发送 query/body。
+    /// Provider 会按 Bybit V5 规则补充 timestamp/API key 并生成签名头。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct BybitHmacSigningInput {
+        request_id: SigningRequestId,
+        policy_ref: SigningPolicyRef,
+        purpose: SigningPurpose,
+        venue_id: VenueId,
+        account_id: AccountId,
+        audit_context: SigningAuditContext,
+        recv_window_ms: u64,
+        payload_kind: BybitSigningPayloadKind,
+        payload: String,
+    }
+
+    impl BybitHmacSigningInput {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            request_id: SigningRequestId,
+            policy_ref: SigningPolicyRef,
+            purpose: SigningPurpose,
+            venue_id: VenueId,
+            account_id: AccountId,
+            recv_window_ms: u64,
+            payload_kind: BybitSigningPayloadKind,
+            payload: impl Into<String>,
+        ) -> SigningResult<Self> {
+            let payload = payload.into();
+            validate_bybit_recv_window(recv_window_ms)?;
+            validate_bybit_signing_payload(&payload)?;
+            Ok(Self {
+                request_id,
+                policy_ref,
+                purpose,
+                venue_id,
+                account_id,
+                audit_context: SigningAuditContext::default(),
+                recv_window_ms,
+                payload_kind,
+                payload,
+            })
+        }
+
+        pub fn with_audit_context(mut self, audit_context: SigningAuditContext) -> Self {
+            self.audit_context = audit_context;
+            self
+        }
+
+        pub fn request_id(&self) -> &SigningRequestId {
+            &self.request_id
+        }
+
+        pub fn policy_ref(&self) -> &SigningPolicyRef {
+            &self.policy_ref
+        }
+
+        pub fn recv_window_ms(&self) -> u64 {
+            self.recv_window_ms
+        }
+
+        pub fn payload_kind(&self) -> BybitSigningPayloadKind {
+            self.payload_kind
+        }
+
+        pub fn payload(&self) -> &str {
+            &self.payload
+        }
+
+        fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
+            SigningAuditRef::new(format!(
+                "signing-audit/{}/pending",
+                self.request_id.as_str()
+            ))
+        }
+
+        fn public_payload(&self, timestamp_millis: u64) -> String {
+            format!(
+                "{}{}{}",
+                timestamp_millis, self.recv_window_ms, self.payload
+            )
+        }
+
+        fn canonical_payload(&self, timestamp_millis: u64, api_key: &str) -> String {
+            format!(
+                "{}{}{}{}",
+                timestamp_millis, api_key, self.recv_window_ms, self.payload
+            )
+        }
+
+        fn into_signing_request(self, payload_digest: SigningPayloadDigest) -> SigningRequest {
+            SigningRequest::new(
+                self.request_id,
+                self.policy_ref,
+                self.purpose,
+                self.venue_id,
+                self.account_id,
+                payload_digest,
+            )
+            .with_audit_context(self.audit_context)
+        }
+    }
+
+    impl fmt::Debug for BybitHmacSigningInput {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BybitHmacSigningInput")
+                .field("request_id", &self.request_id)
+                .field("policy_ref", &self.policy_ref.redacted())
+                .field("purpose", &self.purpose)
+                .field(
+                    "venue_id",
+                    &RedactedValue::from_reference(self.venue_id.as_str()),
+                )
+                .field(
+                    "account_id",
+                    &RedactedValue::from_reference(self.account_id.as_str()),
+                )
+                .field("recv_window_ms", &self.recv_window_ms)
+                .field("payload_kind", &self.payload_kind)
+                .field("payload", &"<redacted>")
+                .finish()
+        }
+    }
+
     /// Binance query/body 参数。
     #[derive(Clone, Eq, PartialEq)]
     pub struct BinanceRequestParam {
@@ -1436,6 +1792,43 @@ pub mod real {
         }
     }
 
+    /// Bybit API 凭证。
+    ///
+    /// 中文说明：该类型只在内存中短暂持有 Bybit API key 和 secret key。`Debug`
+    /// 不输出原文；secret key 用完后随对象 drop 清零。
+    pub struct BybitApiCredentials {
+        api_key: BybitApiKey,
+        secret_key: BybitSecretKey,
+    }
+
+    impl BybitApiCredentials {
+        pub fn new(
+            api_key: impl Into<String>,
+            secret_key: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key: BybitApiKey::new(api_key)?,
+                secret_key: BybitSecretKey::new(secret_key)?,
+            })
+        }
+
+        pub fn from_parts(api_key: BybitApiKey, secret_key: BybitSecretKey) -> Self {
+            Self {
+                api_key,
+                secret_key,
+            }
+        }
+    }
+
+    impl fmt::Debug for BybitApiCredentials {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BybitApiCredentials")
+                .field("api_key", &"<redacted>")
+                .field("secret_key", &"<redacted>")
+                .finish()
+        }
+    }
+
     /// Binance API key。
     pub struct BinanceApiKey(SecretString);
 
@@ -1452,6 +1845,25 @@ pub mod real {
     impl fmt::Debug for BinanceApiKey {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("BinanceApiKey(<redacted>)")
+        }
+    }
+
+    /// Bybit API key。
+    pub struct BybitApiKey(SecretString);
+
+    impl BybitApiKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self(SecretString::new("api_key", value.into())?))
+        }
+
+        pub fn expose_for_transport(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for BybitApiKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BybitApiKey(<redacted>)")
         }
     }
 
@@ -1478,6 +1890,29 @@ pub mod real {
         }
     }
 
+    /// Bybit API secret。
+    pub struct BybitSecretKey(SecretBytes);
+
+    impl BybitSecretKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Self::from_bytes(value.into().into_bytes())
+        }
+
+        pub fn from_bytes(value: Vec<u8>) -> SigningResult<Self> {
+            Ok(Self(SecretBytes::new("secret_key", value)?))
+        }
+
+        fn expose_bytes(&self) -> &[u8] {
+            self.0.expose_bytes()
+        }
+    }
+
+    impl fmt::Debug for BybitSecretKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BybitSecretKey(<redacted>)")
+        }
+    }
+
     /// HMAC signature（哈希消息认证码签名）。
     pub struct BinanceHmacSignature(SecretString);
 
@@ -1490,6 +1925,21 @@ pub mod real {
     impl fmt::Debug for BinanceHmacSignature {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("BinanceHmacSignature(<redacted>)")
+        }
+    }
+
+    /// Bybit HMAC signature（哈希消息认证码签名）。
+    pub struct BybitHmacSignature(SecretString);
+
+    impl BybitHmacSignature {
+        pub fn as_str(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for BybitHmacSignature {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BybitHmacSignature(<redacted>)")
         }
     }
 
@@ -1547,6 +1997,98 @@ pub mod real {
                 .field("api_key_header_value", &"<redacted>")
                 .field("signed_query", &"<redacted>")
                 .field("timestamp_millis", &self.timestamp_millis)
+                .field("signing_request", &self.signing_request())
+                .field("signing_success", &self.signing_success())
+                .finish()
+        }
+    }
+
+    /// 已签名 Bybit endpoint 传输材料。
+    ///
+    /// 中文说明：该对象包含 HTTP 发送所需的 Bybit 认证头、待发送 query/body 和
+    /// signature。它不能被直接显示；`Debug` 会脱敏。
+    pub struct BybitSignedEndpoint {
+        api_key: BybitApiKey,
+        timestamp_millis: u64,
+        recv_window_ms: u64,
+        payload_kind: BybitSigningPayloadKind,
+        payload: SecretString,
+        signature: BybitHmacSignature,
+        request: SigningRequest,
+        success: SigningSuccess,
+    }
+
+    impl BybitSignedEndpoint {
+        pub fn api_key_header_name(&self) -> &'static str {
+            BYBIT_API_KEY_HEADER
+        }
+
+        pub fn api_key_header_value(&self) -> &str {
+            self.api_key.expose_for_transport()
+        }
+
+        pub fn timestamp_header_name(&self) -> &'static str {
+            BYBIT_TIMESTAMP_HEADER
+        }
+
+        pub fn signature_header_name(&self) -> &'static str {
+            BYBIT_SIGNATURE_HEADER
+        }
+
+        pub fn recv_window_header_name(&self) -> &'static str {
+            BYBIT_RECV_WINDOW_HEADER
+        }
+
+        pub fn timestamp_millis(&self) -> u64 {
+            self.timestamp_millis
+        }
+
+        pub fn recv_window_ms(&self) -> u64 {
+            self.recv_window_ms
+        }
+
+        pub fn payload_kind(&self) -> BybitSigningPayloadKind {
+            self.payload_kind
+        }
+
+        pub fn payload_for_transport(&self) -> &str {
+            self.payload.expose_str()
+        }
+
+        pub fn signature_header_value(&self) -> &str {
+            self.signature.as_str()
+        }
+
+        pub fn signature(&self) -> &BybitHmacSignature {
+            &self.signature
+        }
+
+        pub fn signing_request(&self) -> &SigningRequest {
+            &self.request
+        }
+
+        pub fn signing_success(&self) -> &SigningSuccess {
+            &self.success
+        }
+
+        pub fn redacted_log_entry(&self) -> RedactedSigningLogEntry {
+            RedactedSigningLogEntry::from_success(&self.request, &self.success)
+        }
+    }
+
+    impl fmt::Debug for BybitSignedEndpoint {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BybitSignedEndpoint")
+                .field("api_key_header_name", &BYBIT_API_KEY_HEADER)
+                .field("api_key_header_value", &"<redacted>")
+                .field("timestamp_header_name", &BYBIT_TIMESTAMP_HEADER)
+                .field("signature_header_name", &BYBIT_SIGNATURE_HEADER)
+                .field("recv_window_header_name", &BYBIT_RECV_WINDOW_HEADER)
+                .field("timestamp_millis", &self.timestamp_millis)
+                .field("recv_window_ms", &self.recv_window_ms)
+                .field("payload_kind", &self.payload_kind)
+                .field("payload", &"<redacted>")
+                .field("signature", &"<redacted>")
                 .field("signing_request", &self.signing_request())
                 .field("signing_success", &self.signing_success())
                 .finish()
@@ -1741,6 +2283,36 @@ pub mod real {
             return Err(SigningError::InvalidRequest {
                 field: "binance_param_value",
                 reason: "parameter value contains a control byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bybit_recv_window(value: u64) -> SigningResult<()> {
+        if (1..=60_000).contains(&value) {
+            Ok(())
+        } else {
+            Err(SigningError::InvalidRequest {
+                field: "bybit_recv_window",
+                reason: "recvWindow must be between 1 and 60000 milliseconds",
+            })
+        }
+    }
+
+    fn validate_bybit_signing_payload(value: &str) -> SigningResult<()> {
+        if value.len() > 8192 {
+            return Err(SigningError::InvalidRequest {
+                field: "bybit_payload",
+                reason: "payload is too long",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "bybit_payload",
+                reason: "payload contains a control byte",
             });
         }
         Ok(())
@@ -2175,6 +2747,76 @@ mod tests {
 
     #[cfg(feature = "real-signing")]
     #[test]
+    fn real_signing_build_exposes_bybit_hmac_provider() {
+        use crate::real::{
+            BybitHmacSha256SigningProvider, BybitRealSigningProvider, BybitSigningPayloadKind,
+            BybitTimestampProvider, BYBIT_API_KEY_HEADER, BYBIT_RECV_WINDOW_HEADER,
+            BYBIT_SIGNATURE_HEADER, BYBIT_TIMESTAMP_HEADER,
+        };
+
+        let policy_ref = SigningPolicyRef::new("kms-policy/bybit-hmac-unit").expect("policy ref");
+        let policy = SigningPolicy::real_signing_enabled(policy_ref.clone());
+        let input = crate::real::BybitHmacSigningInput::new(
+            SigningRequestId::new("signing-request/bybit-hmac-unit").expect("request id"),
+            policy_ref,
+            SigningPurpose::SubmitOrder,
+            VenueId::new("venue:BYBIT-LINEAR").expect("venue id"),
+            AccountId::new("account/paper-bybit").expect("account id"),
+            5_000,
+            BybitSigningPayloadKind::JsonBody,
+            r#"{"category":"linear","symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"1","price":"0.1","timeInForce":"PostOnly"}"#,
+        )
+        .expect("bybit input");
+        let signer = BybitHmacSha256SigningProvider::new(
+            GeneratedCredentialProvider { seed: 7 },
+            FixedTimestamp(1_700_000_000_123),
+        );
+
+        let signed = signer
+            .sign_bybit_hmac(input, &policy)
+            .expect("real-signing feature should sign Bybit payload");
+
+        assert_eq!(signed.api_key_header_name(), BYBIT_API_KEY_HEADER);
+        assert_eq!(signed.timestamp_header_name(), BYBIT_TIMESTAMP_HEADER);
+        assert_eq!(signed.signature_header_name(), BYBIT_SIGNATURE_HEADER);
+        assert_eq!(signed.recv_window_header_name(), BYBIT_RECV_WINDOW_HEADER);
+        assert_eq!(signed.timestamp_millis(), 1_700_000_000_123);
+        assert_eq!(signed.recv_window_ms(), 5_000);
+        assert!(signed
+            .payload_for_transport()
+            .contains("\"category\":\"linear\""));
+        assert_eq!(signed.signature().as_str().len(), 64);
+        assert!(signed
+            .signature()
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+
+        let raw_api_key = signed.api_key_header_value().to_owned();
+        let raw_signature = signed.signature().as_str().to_owned();
+        let raw_payload = signed.payload_for_transport().to_owned();
+        let rendered_debug = format!("{signed:?}");
+        let rendered_log = signed.redacted_log_entry().to_string();
+
+        assert!(!rendered_debug.contains(&raw_api_key));
+        assert!(!rendered_debug.contains(&raw_signature));
+        assert!(!rendered_debug.contains(&raw_payload));
+        assert!(!rendered_log.contains(&raw_api_key));
+        assert!(!rendered_log.contains(&raw_signature));
+        assert!(!rendered_log.contains(&raw_payload));
+        assert_eq!(
+            signed.redacted_log_entry().status(),
+            SigningAttemptStatus::Signed
+        );
+
+        fn _assert_timestamp_provider<T: BybitTimestampProvider>(provider: T) -> T {
+            provider
+        }
+        let _ = _assert_timestamp_provider(FixedTimestamp(1));
+    }
+
+    #[cfg(feature = "real-signing")]
+    #[test]
     fn binance_params_reserve_signature_and_timestamp_for_boundary() {
         use crate::real::BinanceRequestParam;
 
@@ -2223,6 +2865,13 @@ mod tests {
     }
 
     #[cfg(feature = "real-signing")]
+    impl crate::real::BybitTimestampProvider for FixedTimestamp {
+        fn timestamp_millis(&self, _audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
     #[derive(Clone, Copy, Debug)]
     struct GeneratedCredentialProvider {
         seed: u8,
@@ -2237,6 +2886,19 @@ mod tests {
             crate::real::BinanceApiCredentials::new(
                 generated_ascii(48, self.seed),
                 generated_ascii(64, self.seed.wrapping_add(19)),
+            )
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
+    impl crate::real::BybitCredentialProvider for GeneratedCredentialProvider {
+        fn load_bybit_credentials(
+            &self,
+            _audit_ref: &SigningAuditRef,
+        ) -> SigningResult<crate::real::BybitApiCredentials> {
+            crate::real::BybitApiCredentials::new(
+                generated_ascii(48, self.seed),
+                generated_ascii(64, self.seed.wrapping_add(23)),
             )
         }
     }

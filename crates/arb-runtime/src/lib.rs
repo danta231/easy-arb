@@ -75,32 +75,35 @@ use arb_venue_data::{
     BinancePublicTicker24hAdapter, BinancePublicWssBookTickerClient,
     BinancePublicWssBookTickerConfig, BinancePublicWssTextStreamClient,
     BinanceUsdmPremiumIndexAdapter, BybitLinearPremiumIndexAdapter, BybitPublicInstrument,
-    BybitPublicMarket, BybitPublicTickerAdapter, DataFreshness, HybridMarketDataInput,
-    HybridMarketDataStatus, HybridMarketDataUpdate, MarketDataQuery, MarketDataReader,
-    MarketDataTransport, MarketQuote, RestWssMarketDataCoordinator, WssQuoteUpdate,
+    BybitPublicMarket, BybitPublicTickerAdapter, BybitPublicWssTextStreamClient, DataFreshness,
+    HybridMarketDataInput, HybridMarketDataStatus, HybridMarketDataUpdate, MarketDataQuery,
+    MarketDataReader, MarketDataTransport, MarketQuote, RestWssMarketDataCoordinator,
+    WssQuoteUpdate,
 };
 
 #[cfg(feature = "live-exec")]
 use arb_signing::real::{
-    BinanceHmacSigningInput, BinanceRequestParam, RealSigningProvider, RealSigningProviderFromEnv,
+    BinanceHmacSigningInput, BinanceRequestParam, BybitHmacSigningInput, BybitRealSigningProvider,
+    BybitRealSigningProviderFromEnv, BybitSigningPayloadKind, RealSigningProvider,
+    RealSigningProviderFromEnv,
 };
 #[cfg(feature = "live-exec")]
 use arb_signing::{SigningPolicy, SigningPolicyRef, SigningPurpose, SigningRequestId};
 #[cfg(feature = "live-exec")]
 use arb_venue_data::{
     BalanceQuery, BalanceReader, BinancePrivateAccountAdapter, BinancePrivateAccountMarket,
-    VenueBalance,
+    BybitPrivateAccountAdapter, BybitPrivateAccountMarket, VenueBalance,
 };
 #[cfg(feature = "live-exec")]
 use arb_venue_exec::{
     build_execution_dispatch_plan, live, parse_binance_spot_execution_report_update,
-    parse_binance_usdm_order_trade_update, BinancePrivateOrderMarket, CancelOrder,
+    parse_binance_usdm_order_trade_update, parse_bybit_private_order_stream_update, CancelOrder,
     CancelOrderRequest, ConfirmOrderStatus, ConfirmOrderStatusRequest, DispatchKillSwitch,
     ExecutionDispatchPlan, ExecutionDispatchPolicy, ExternalActionRef,
     IdempotencyKey as ExecIdempotencyKey, MutableActionKind, MutableActionReceipt,
     MutableActionStatus, MutableOrderType, OrderConfirmationSource, OrderConfirmationStatus,
-    OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate, PrivateOrderUpdate,
-    SubmitOrder, SubmitOrderRequest, VenueExecError,
+    OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate, PrivateOrderMarket,
+    PrivateOrderUpdate, SubmitOrder, SubmitOrderRequest, VenueExecError,
 };
 
 const DEFAULT_FULL_PIPELINE_FIXTURE: &str = "fixtures/replay/full_pipeline_simulated";
@@ -123,10 +126,10 @@ const SIM_BASE_ASSET_ID: &str = "asset:BTC";
 const SIM_QUOTE_ASSET_ID: &str = "asset:USDC";
 const SIM_SETTLEMENT_ASSET_ID: &str = "asset:USDC";
 const BASIS_SYMBOL: &str = "BTCUSDT";
-const BASIS_SPOT_VENUE_ID: &str = "venue:BINANCE-SPOT";
-const BASIS_PERP_VENUE_ID: &str = "venue:BINANCE-USDM";
-const BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:SPOT";
-const BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
+const BINANCE_BASIS_SPOT_VENUE_ID: &str = "venue:BINANCE-SPOT";
+const BINANCE_BASIS_PERP_VENUE_ID: &str = "venue:BINANCE-USDM";
+const BINANCE_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:SPOT";
+const BINANCE_BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
 const BYBIT_BASIS_SPOT_VENUE_ID: &str = "venue:BYBIT-SPOT";
 const BYBIT_BASIS_PERP_VENUE_ID: &str = "venue:BYBIT-LINEAR";
 const BYBIT_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:SPOT";
@@ -140,14 +143,24 @@ const BINANCE_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str = "target/binance-guarded
 #[cfg(feature = "live-exec")]
 const BINANCE_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
     "target/binance-basis-guarded-live-auto-once";
+#[cfg(feature = "live-exec")]
+const BYBIT_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
+    "target/bybit-basis-guarded-live-auto-once";
 const BINANCE_GUARDED_LIVE_ACCOUNT_REF: &str =
     "account:binance-isolated-personal-cex-subaccount-redacted";
+#[cfg(feature = "live-exec")]
+const BYBIT_GUARDED_LIVE_ACCOUNT_REF: &str =
+    "account:bybit-unified-personal-cex-subaccount-redacted";
 const BINANCE_GUARDED_LIVE_STRATEGY_ID: &str = "strategy:sample-spot-v1";
 const BINANCE_GUARDED_LIVE_TRANSITION_ID: &str = "trans:binance-btcusdt-guarded-live-preview-001";
 #[cfg(feature = "live-exec")]
 const BINANCE_BASIS_LIVE_STRATEGY_ID: &str = "strat:binance-spot-perp-basis";
 #[cfg(feature = "live-exec")]
 const BINANCE_BASIS_LIVE_TRANSITION_ID: &str = "trans:binance-basis-guarded-live-auto-001";
+#[cfg(feature = "live-exec")]
+const BYBIT_BASIS_LIVE_STRATEGY_ID: &str = "strat:bybit-spot-linear-basis";
+#[cfg(feature = "live-exec")]
+const BYBIT_BASIS_LIVE_TRANSITION_ID: &str = "trans:bybit-basis-guarded-live-auto-001";
 const BINANCE_GUARDED_LIVE_NOTIONAL_USDT: &str = "10.00";
 const BINANCE_GUARDED_LIVE_DAILY_LOSS_LIMIT_USDT: &str = "20.00";
 const BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT: &str = "100.00";
@@ -168,6 +181,11 @@ const ASTER_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8800";
 const BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8801";
 const BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+const BYBIT_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8802";
+const BYBIT_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+const BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+const BYBIT_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/spot";
+const BYBIT_LINEAR_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const RECONCILIATION_RUN_ID: &str = "recon:full-pipeline-simulated";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -751,12 +769,13 @@ pub struct BinanceGuardedLiveAutoOnceReport {
     pub output_dir: Option<PathBuf>,
 }
 
-/// Binance spot-perp basis 双腿单周期自动链路选项。
+/// spot-perp basis 双腿单周期自动链路选项。
 ///
-/// 中文说明：这是套利链路入口，必须同时生成 spot buy 和 USD-M perp short 两腿。
-/// 默认只 dry run；真实下单必须显式设置 `execute_live` 和确认标志。
+/// 中文说明：这是跨现货和永续的通用套利链路入口。具体交易所、账户、执行市场
+/// 和行情来源由上层 venue profile 或命令入口提供；真实下单必须显式设置
+/// `execute_live` 和确认标志。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceBasisGuardedLiveAutoOnceOptions {
+pub struct BasisGuardedLiveAutoOnceOptions {
     pub config_path: PathBuf,
     pub output_dir: Option<PathBuf>,
     pub min_net_bps: i128,
@@ -769,9 +788,9 @@ pub struct BinanceBasisGuardedLiveAutoOnceOptions {
     pub acknowledge_basis_live_orders: bool,
 }
 
-/// Binance spot-perp basis 双腿单周期自动链路结果。
+/// spot-perp basis 双腿单周期自动链路结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceBasisGuardedLiveAutoOnceReport {
+pub struct BasisGuardedLiveAutoOnceReport {
     pub symbol: String,
     pub strategy_id: String,
     pub spot_event_id: Option<String>,
@@ -797,6 +816,21 @@ pub struct BinanceBasisGuardedLiveAutoOnceReport {
     pub blocking_reasons: Vec<String>,
     pub output_dir: Option<PathBuf>,
 }
+
+/// Binance spot-perp basis 双腿单周期自动链路选项。
+pub type BinanceBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
+
+/// Binance spot-perp basis 双腿单周期自动链路结果。
+pub type BinanceBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
+
+/// Bybit spot-linear basis 双腿单周期自动链路选项。
+///
+/// 中文说明：字段语义与 Binance basis 自动链路一致；交易场所替换为 Bybit Spot
+/// 和 Bybit Linear，真实下单仍必须显式设置 `execute_live` 和确认标志。
+pub type BybitBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
+
+/// Bybit spot-linear basis 双腿单周期自动链路结果。
+pub type BybitBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
 
 /// Binance BTCUSDT 人工确认请求。
 ///
@@ -878,6 +912,35 @@ impl Default for BinanceWssBookTickerMonitorOptions {
 /// 兼容旧名称：历史上该命令只做有限条探测。
 pub type BinanceWssBookTickerProbeOptions = BinanceWssBookTickerMonitorOptions;
 
+/// Bybit V5 `orderbook.1` WSS 公开行情常驻任务选项。
+///
+/// 中文说明：该选项只允许公开行情 WSS。Bybit V5 连接后通过公开 topic 订阅
+/// `orderbook.1.<symbol>`，不读取账户、不下单、不撤单、不转账、不签名。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitWssBookTickerMonitorOptions {
+    pub bind_addr: String,
+    pub symbol: String,
+    pub market: BybitPublicMarket,
+    pub updates: usize,
+    pub reconnect_delay_secs: u64,
+    pub once: bool,
+}
+
+impl Default for BybitWssBookTickerMonitorOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: BYBIT_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR.to_owned(),
+            symbol: BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+            market: BybitPublicMarket::Spot,
+            updates: 3,
+            reconnect_delay_secs: BYBIT_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
+            once: false,
+        }
+    }
+}
+
+pub type BybitWssBookTickerProbeOptions = BybitWssBookTickerMonitorOptions;
+
 /// Binance `bookTicker` WSS 公开行情探测结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinanceWssBookTickerProbeReport {
@@ -891,9 +954,22 @@ pub struct BinanceWssBookTickerProbeReport {
     pub latest_best_ask: Option<String>,
 }
 
-/// Binance `bookTicker` WSS 最新报价快照。
+/// Bybit V5 `orderbook.1` WSS 公开行情探测结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceWssBookTickerQuoteSnapshot {
+pub struct BybitWssBookTickerProbeReport {
+    pub symbol: String,
+    pub market: BybitPublicMarket,
+    pub stream_url: String,
+    pub coordinator_status: String,
+    pub update_count: usize,
+    pub fail_closed_count: usize,
+    pub latest_best_bid: Option<String>,
+    pub latest_best_ask: Option<String>,
+}
+
+/// 公开 WSS top-of-book 最新报价快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicTopOfBookQuoteSnapshot {
     pub symbol: String,
     pub venue_id: String,
     pub instrument_id: String,
@@ -908,17 +984,17 @@ pub struct BinanceWssBookTickerQuoteSnapshot {
     pub freshness_status: String,
 }
 
-/// Binance `bookTicker` WSS 常驻任务状态快照。
+/// 公开 WSS top-of-book 常驻任务状态快照。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceWssBookTickerMonitorSnapshot {
+pub struct PublicTopOfBookMonitorSnapshot {
     pub status: String,
     pub updated_at: String,
     pub symbol: String,
     pub market: String,
     pub stream_url: String,
     pub coordinator_status: String,
-    pub latest_quote: Option<BinanceWssBookTickerQuoteSnapshot>,
-    pub rows: Vec<BinanceWssBookTickerQuoteSnapshot>,
+    pub latest_quote: Option<PublicTopOfBookQuoteSnapshot>,
+    pub rows: Vec<PublicTopOfBookQuoteSnapshot>,
     pub total_rows: usize,
     pub fail_closed: bool,
     pub fail_closed_count: u64,
@@ -2454,8 +2530,8 @@ fn run_binance_guarded_live_auto_once_from_spot_json(
 
 /// 运行一次 Binance spot-perp basis 双腿自动套利链路。
 pub fn run_binance_basis_guarded_live_auto_once(
-    options: BinanceBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceReport> {
+    options: BasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
     #[cfg(feature = "live-exec")]
     {
         run_binance_basis_guarded_live_auto_once_live(options)
@@ -2471,10 +2547,29 @@ pub fn run_binance_basis_guarded_live_auto_once(
     }
 }
 
+/// 运行一次 Bybit spot-linear basis 双腿自动套利链路。
+pub fn run_bybit_basis_guarded_live_auto_once(
+    options: BybitBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_bybit_basis_guarded_live_auto_once_live(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message:
+                "当前 arb-runtime 未使用 live-exec feature 构建，拒绝 Bybit basis 实盘自动链路"
+                    .to_owned(),
+        })
+    }
+}
+
 #[cfg(feature = "live-exec")]
 fn run_binance_basis_guarded_live_auto_once_live(
-    options: BinanceBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceReport> {
+    options: BasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
     let spot_url = binance_spot_book_ticker_url(BASIS_SYMBOL);
     let perp_url = binance_usdm_book_ticker_url(BASIS_SYMBOL);
     let premium_url = binance_usdm_premium_index_url(BASIS_SYMBOL);
@@ -2504,19 +2599,19 @@ fn run_binance_basis_guarded_live_auto_once_live(
             let spot_snapshot = fetch_binance_basis_wss_monitor_book_ticker_json(
                 spot_monitor,
                 BinancePublicMarket::Spot,
-                BASIS_SPOT_VENUE_ID,
-                BASIS_SPOT_INSTRUMENT_ID,
+                BINANCE_BASIS_SPOT_VENUE_ID,
+                BINANCE_BASIS_SPOT_INSTRUMENT_ID,
             )?;
             let perp_snapshot = fetch_binance_basis_wss_monitor_book_ticker_json(
                 perp_monitor,
                 BinancePublicMarket::UsdmPerpetual,
-                BASIS_PERP_VENUE_ID,
-                BASIS_PERP_INSTRUMENT_ID,
+                BINANCE_BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_INSTRUMENT_ID,
             )?;
             (
-                spot_snapshot.raw_book_ticker_json,
+                spot_snapshot.raw_ticker_json,
                 spot_snapshot.source_ref,
-                perp_snapshot.raw_book_ticker_json,
+                perp_snapshot.raw_ticker_json,
                 perp_snapshot.source_ref,
             )
         } else {
@@ -2542,9 +2637,78 @@ fn run_binance_basis_guarded_live_auto_once_live(
 }
 
 #[cfg(feature = "live-exec")]
+fn run_bybit_basis_guarded_live_auto_once_live(
+    options: BybitBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+    let spot_url = bybit_spot_tickers_url();
+    let linear_url = bybit_linear_tickers_url();
+    let wss_monitor_urls = match (
+        options.spot_wss_monitor_url.as_deref(),
+        options.perp_wss_monitor_url.as_deref(),
+    ) {
+        (Some(spot_monitor), Some(perp_monitor)) => Some((spot_monitor, perp_monitor)),
+        (None, None) if !options.execute_live => None,
+        (None, None) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "真实 Bybit basis 自动下单必须提供 --spot-wss-monitor-url 和 --perp-wss-monitor-url"
+                        .to_owned(),
+            });
+        }
+        _ => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "Bybit basis 自动链路必须同时提供 --spot-wss-monitor-url 和 --perp-wss-monitor-url"
+                        .to_owned(),
+            });
+        }
+    };
+    let (raw_spot, spot_ref, raw_linear, linear_ref) =
+        if let Some((spot_monitor, linear_monitor)) = wss_monitor_urls {
+            let raw_linear_rest = fetch_public_json_with_curl(&linear_url)?;
+            let spot_snapshot = fetch_bybit_basis_wss_monitor_ticker_json(
+                spot_monitor,
+                BybitPublicMarket::Spot,
+                BYBIT_BASIS_SPOT_VENUE_ID,
+                BYBIT_BASIS_SPOT_INSTRUMENT_ID,
+                None,
+            )?;
+            let linear_snapshot = fetch_bybit_basis_wss_monitor_ticker_json(
+                linear_monitor,
+                BybitPublicMarket::LinearPerpetual,
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                Some(&raw_linear_rest),
+            )?;
+            (
+                spot_snapshot.raw_ticker_json,
+                spot_snapshot.source_ref,
+                linear_snapshot.raw_ticker_json,
+                linear_snapshot.source_ref,
+            )
+        } else {
+            (
+                fetch_public_json_with_curl(&spot_url)?,
+                spot_url.clone(),
+                fetch_public_json_with_curl(&linear_url)?,
+                linear_url.clone(),
+            )
+        };
+    let ingested_at = current_utc_timestamp()?;
+    run_bybit_basis_guarded_live_auto_once_from_json(
+        &raw_spot,
+        &spot_ref,
+        &raw_linear,
+        &linear_ref,
+        ingested_at,
+        options,
+    )
+}
+
+#[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct BinanceBasisWssMonitorBookTicker {
-    raw_book_ticker_json: String,
+struct BasisWssMonitorTickerJson {
+    raw_ticker_json: String,
     source_ref: String,
 }
 
@@ -2554,15 +2718,15 @@ fn fetch_binance_basis_wss_monitor_book_ticker_json(
     market: BinancePublicMarket,
     expected_venue_id: &str,
     expected_instrument_id: &str,
-) -> RuntimeResult<BinanceBasisWssMonitorBookTicker> {
+) -> RuntimeResult<BasisWssMonitorTickerJson> {
     let endpoint = normalize_binance_wss_monitor_status_url(monitor_url);
     let raw_monitor_snapshot = fetch_public_json_with_curl(&endpoint)?;
     let fetched_at = current_utc_timestamp()?;
-    let quote = parse_binance_wss_monitor_quote_for_basis(
+    let quote = parse_public_wss_monitor_quote_for_basis(
         &raw_monitor_snapshot,
         &endpoint,
         BASIS_SYMBOL,
-        market,
+        market.as_str(),
         expected_venue_id,
         expected_instrument_id,
         fetched_at,
@@ -2571,85 +2735,127 @@ fn fetch_binance_basis_wss_monitor_book_ticker_json(
         .source_event_id
         .as_deref()
         .unwrap_or("missing-source-event-id");
-    Ok(BinanceBasisWssMonitorBookTicker {
-        raw_book_ticker_json: binance_wss_monitor_quote_to_book_ticker_json(&quote)?,
+    Ok(BasisWssMonitorTickerJson {
+        raw_ticker_json: public_wss_monitor_quote_to_binance_book_ticker_json(&quote)?,
+        source_ref: format!("wss-monitor:{endpoint}#{source_event_id}"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_bybit_basis_wss_monitor_ticker_json(
+    monitor_url: &str,
+    market: BybitPublicMarket,
+    expected_venue_id: &str,
+    expected_instrument_id: &str,
+    linear_premium_rest_json: Option<&str>,
+) -> RuntimeResult<BasisWssMonitorTickerJson> {
+    let endpoint = normalize_bybit_wss_monitor_status_url(monitor_url);
+    let raw_monitor_snapshot = fetch_public_json_with_curl(&endpoint)?;
+    let fetched_at = current_utc_timestamp()?;
+    let quote = parse_public_wss_monitor_quote_for_basis(
+        &raw_monitor_snapshot,
+        &endpoint,
+        BASIS_SYMBOL,
+        market.as_str(),
+        expected_venue_id,
+        expected_instrument_id,
+        fetched_at,
+    )?;
+    let source_event_id = quote
+        .source_event_id
+        .as_deref()
+        .unwrap_or("missing-source-event-id");
+    Ok(BasisWssMonitorTickerJson {
+        raw_ticker_json: public_wss_monitor_quote_to_bybit_ticker_json(
+            &quote,
+            market,
+            linear_premium_rest_json,
+        )?,
         source_ref: format!("wss-monitor:{endpoint}#{source_event_id}"),
     })
 }
 
 #[cfg(feature = "live-exec")]
 fn normalize_binance_wss_monitor_status_url(input: &str) -> String {
+    normalize_public_wss_monitor_status_url(input, "/api/binance-wss-book-ticker")
+}
+
+#[cfg(feature = "live-exec")]
+fn normalize_bybit_wss_monitor_status_url(input: &str) -> String {
+    normalize_public_wss_monitor_status_url(input, "/api/bybit-wss-book-ticker")
+}
+
+#[cfg(feature = "live-exec")]
+fn normalize_public_wss_monitor_status_url(input: &str, api_path: &str) -> String {
     let mut url = input.trim().trim_end_matches('/').to_owned();
     if !url.starts_with("http://") && !url.starts_with("https://") {
         url = format!("http://{url}");
     }
-    if url.ends_with("/api/binance-wss-book-ticker") {
+    let api_path_with_slash = format!("{api_path}/");
+    if url.ends_with(api_path) {
         format!("{url}/status")
-    } else if url.contains("/api/binance-wss-book-ticker/") || url.ends_with("/health") {
+    } else if url.contains(&api_path_with_slash) || url.ends_with("/health") {
         url
     } else {
-        format!("{url}/api/binance-wss-book-ticker/status")
+        format!("{url}{api_path}/status")
     }
 }
 
 #[cfg(feature = "live-exec")]
 #[allow(clippy::too_many_arguments)]
-fn parse_binance_wss_monitor_quote_for_basis(
+fn parse_public_wss_monitor_quote_for_basis(
     raw_json: &str,
     monitor_ref: &str,
     symbol: &str,
-    expected_market: BinancePublicMarket,
+    expected_market: &str,
     expected_venue_id: &str,
     expected_instrument_id: &str,
     fetched_at: UtcTimestamp,
-) -> RuntimeResult<BinanceWssBookTickerQuoteSnapshot> {
+) -> RuntimeResult<PublicTopOfBookQuoteSnapshot> {
     let fields = parse_json_object_value_slices(raw_json)?;
-    let status = required_json_value_string(&fields, "status", "Binance WSS monitor")?;
+    let status = required_json_value_string(&fields, "status", "Public WSS monitor")?;
     if status != "streaming" {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` status is `{status}`, not streaming"
+                "Public WSS monitor `{monitor_ref}` status is `{status}`, not streaming"
             ),
         });
     }
-    if optional_json_bool(&fields, "fail_closed", "Binance WSS monitor")?.unwrap_or(true) {
+    if optional_json_bool(&fields, "fail_closed", "Public WSS monitor")?.unwrap_or(true) {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` is fail-closed or lacks fail_closed state"
+                "Public WSS monitor `{monitor_ref}` is fail-closed or lacks fail_closed state"
             ),
         });
     }
-    if let Some(error) = optional_json_value_string(&fields, "last_error", "Binance WSS monitor")? {
+    if let Some(error) = optional_json_value_string(&fields, "last_error", "Public WSS monitor")? {
         if !error.trim().is_empty() {
             return Err(RuntimeError::LiveMarketData {
-                message: format!(
-                    "Binance WSS monitor `{monitor_ref}` reports last_error `{error}`"
-                ),
+                message: format!("Public WSS monitor `{monitor_ref}` reports last_error `{error}`"),
             });
         }
     }
-    if let Some(market) = optional_json_value_string(&fields, "market", "Binance WSS monitor")? {
-        if market != expected_market.as_str() {
+    if let Some(market) = optional_json_value_string(&fields, "market", "Public WSS monitor")? {
+        if market != expected_market {
             return Err(RuntimeError::LiveMarketData {
                 message: format!(
-                    "Binance WSS monitor `{monitor_ref}` market `{market}` does not match expected `{}`",
-                    expected_market.as_str()
+                    "Public WSS monitor `{monitor_ref}` market `{market}` does not match expected `{expected_market}`"
                 ),
             });
         }
     }
     if let Some(wss_updates) =
-        optional_json_value_u64(&fields, "wss_update_count", "Binance WSS monitor")?
+        optional_json_value_u64(&fields, "wss_update_count", "Public WSS monitor")?
     {
         if wss_updates == 0 {
             return Err(RuntimeError::LiveMarketData {
-                message: format!("Binance WSS monitor `{monitor_ref}` has no WSS updates yet"),
+                message: format!("Public WSS monitor `{monitor_ref}` has no WSS updates yet"),
             });
         }
     }
 
-    let quote = find_binance_wss_monitor_quote(&fields, symbol, monitor_ref)?;
-    ensure_binance_wss_monitor_quote_usable(
+    let quote = find_public_wss_monitor_quote(&fields, symbol, monitor_ref)?;
+    ensure_public_wss_monitor_quote_usable(
         &quote,
         monitor_ref,
         symbol,
@@ -2678,14 +2884,14 @@ fn optional_json_value_u64(
 }
 
 #[cfg(feature = "live-exec")]
-fn find_binance_wss_monitor_quote(
+fn find_public_wss_monitor_quote(
     fields: &BTreeMap<String, &str>,
     symbol: &str,
     monitor_ref: &str,
-) -> RuntimeResult<BinanceWssBookTickerQuoteSnapshot> {
+) -> RuntimeResult<PublicTopOfBookQuoteSnapshot> {
     if let Some(rows_value) = fields.get("rows") {
         for row in json_array_value_slices(rows_value)? {
-            let quote = parse_binance_wss_monitor_quote_snapshot(row)?;
+            let quote = parse_public_wss_monitor_quote_snapshot(row)?;
             if quote.symbol == symbol {
                 return Ok(quote);
             }
@@ -2693,65 +2899,65 @@ fn find_binance_wss_monitor_quote(
     }
     if let Some(value) = fields.get("latest_quote") {
         if value.trim() != "null" {
-            let quote = parse_binance_wss_monitor_quote_snapshot(value)?;
+            let quote = parse_public_wss_monitor_quote_snapshot(value)?;
             if quote.symbol == symbol {
                 return Ok(quote);
             }
         }
     }
     Err(RuntimeError::LiveMarketData {
-        message: format!("Binance WSS monitor `{monitor_ref}` lacks quote row for `{symbol}`"),
+        message: format!("Public WSS monitor `{monitor_ref}` lacks quote row for `{symbol}`"),
     })
 }
 
 #[cfg(feature = "live-exec")]
-fn parse_binance_wss_monitor_quote_snapshot(
+fn parse_public_wss_monitor_quote_snapshot(
     value: &str,
-) -> RuntimeResult<BinanceWssBookTickerQuoteSnapshot> {
+) -> RuntimeResult<PublicTopOfBookQuoteSnapshot> {
     let fields = parse_json_object_value_slices(value)?;
-    Ok(BinanceWssBookTickerQuoteSnapshot {
-        symbol: required_json_value_string(&fields, "symbol", "Binance WSS monitor quote")?,
-        venue_id: required_json_value_string(&fields, "venue_id", "Binance WSS monitor quote")?,
+    Ok(PublicTopOfBookQuoteSnapshot {
+        symbol: required_json_value_string(&fields, "symbol", "Public WSS monitor quote")?,
+        venue_id: required_json_value_string(&fields, "venue_id", "Public WSS monitor quote")?,
         instrument_id: required_json_value_string(
             &fields,
             "instrument_id",
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
         )?,
-        best_bid: optional_json_value_string(&fields, "best_bid", "Binance WSS monitor quote")?,
-        best_ask: optional_json_value_string(&fields, "best_ask", "Binance WSS monitor quote")?,
-        bid_size: optional_json_value_string(&fields, "bid_size", "Binance WSS monitor quote")?,
-        ask_size: optional_json_value_string(&fields, "ask_size", "Binance WSS monitor quote")?,
+        best_bid: optional_json_value_string(&fields, "best_bid", "Public WSS monitor quote")?,
+        best_ask: optional_json_value_string(&fields, "best_ask", "Public WSS monitor quote")?,
+        bid_size: optional_json_value_string(&fields, "bid_size", "Public WSS monitor quote")?,
+        ask_size: optional_json_value_string(&fields, "ask_size", "Public WSS monitor quote")?,
         source_sequence: optional_json_value_string(
             &fields,
             "source_sequence",
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
         )?,
         source_event_id: optional_json_value_string(
             &fields,
             "source_event_id",
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
         )?,
         observed_at: required_json_value_string(
             &fields,
             "observed_at",
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
         )?,
         ingested_at: required_json_value_string(
             &fields,
             "ingested_at",
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
         )?,
         freshness_status: required_json_value_string(
             &fields,
             "freshness_status",
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
         )?,
     })
 }
 
 #[cfg(feature = "live-exec")]
-fn ensure_binance_wss_monitor_quote_usable(
-    quote: &BinanceWssBookTickerQuoteSnapshot,
+fn ensure_public_wss_monitor_quote_usable(
+    quote: &PublicTopOfBookQuoteSnapshot,
     monitor_ref: &str,
     symbol: &str,
     expected_venue_id: &str,
@@ -2761,7 +2967,7 @@ fn ensure_binance_wss_monitor_quote_usable(
     if quote.symbol != symbol {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` quote symbol `{}` does not match `{symbol}`",
+                "Public WSS monitor `{monitor_ref}` quote symbol `{}` does not match `{symbol}`",
                 quote.symbol
             ),
         });
@@ -2769,7 +2975,7 @@ fn ensure_binance_wss_monitor_quote_usable(
     if quote.venue_id != expected_venue_id || quote.instrument_id != expected_instrument_id {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` quote identity `{}` `{}` does not match `{expected_venue_id}` `{expected_instrument_id}`",
+                "Public WSS monitor `{monitor_ref}` quote identity `{}` `{}` does not match `{expected_venue_id}` `{expected_instrument_id}`",
                 quote.venue_id, quote.instrument_id
             ),
         });
@@ -2777,7 +2983,7 @@ fn ensure_binance_wss_monitor_quote_usable(
     if quote.freshness_status != "Fresh" {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` quote freshness is `{}`",
+                "Public WSS monitor `{monitor_ref}` quote freshness is `{}`",
                 quote.freshness_status
             ),
         });
@@ -2787,13 +2993,13 @@ fn ensure_binance_wss_monitor_quote_usable(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: format!("Binance WSS monitor `{monitor_ref}` quote lacks source_sequence"),
+            message: format!("Public WSS monitor `{monitor_ref}` quote lacks source_sequence"),
         })?;
     source_sequence
         .parse::<u64>()
         .map_err(|error| RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` source_sequence `{source_sequence}` is not numeric: {error}"
+                "Public WSS monitor `{monitor_ref}` source_sequence `{source_sequence}` is not numeric: {error}"
             ),
         })?;
     let source_event_id = quote
@@ -2802,13 +3008,13 @@ fn ensure_binance_wss_monitor_quote_usable(
         .filter(|value| value.contains(":wss-book-ticker:"))
         .ok_or_else(|| RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` latest `{symbol}` quote is not from WSS bookTicker"
+                "Public WSS monitor `{monitor_ref}` latest `{symbol}` quote is not from WSS bookTicker"
             ),
         })?;
     if !source_event_id.contains(symbol) {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` source event `{source_event_id}` does not include `{symbol}`"
+                "Public WSS monitor `{monitor_ref}` source event `{source_event_id}` does not include `{symbol}`"
             ),
         });
     }
@@ -2849,7 +3055,7 @@ fn required_quote_field<'a>(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: format!("Binance WSS monitor `{monitor_ref}` quote lacks `{field}`"),
+            message: format!("Public WSS monitor `{monitor_ref}` quote lacks `{field}`"),
         })
 }
 
@@ -2864,16 +3070,14 @@ fn ensure_timestamp_within_max_age(
     let fetched_ms = runtime_timestamp_millis(fetched_at)?;
     if observed_ms > fetched_ms + 1_000 {
         return Err(RuntimeError::LiveMarketData {
-            message: format!(
-                "Binance WSS monitor `{monitor_ref}` quote `{field}` is in the future"
-            ),
+            message: format!("Public WSS monitor `{monitor_ref}` quote `{field}` is in the future"),
         });
     }
     let age_ms = fetched_ms.saturating_sub(observed_ms);
     if age_ms > i128::from(MARKET_DATA_MAX_AGE_MS) {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Binance WSS monitor `{monitor_ref}` quote `{field}` age {age_ms}ms exceeds {MARKET_DATA_MAX_AGE_MS}ms"
+                "Public WSS monitor `{monitor_ref}` quote `{field}` age {age_ms}ms exceeds {MARKET_DATA_MAX_AGE_MS}ms"
             ),
         });
     }
@@ -2891,35 +3095,128 @@ fn runtime_timestamp_millis(timestamp: UtcTimestamp) -> RuntimeResult<i128> {
 }
 
 #[cfg(feature = "live-exec")]
-fn binance_wss_monitor_quote_to_book_ticker_json(
-    quote: &BinanceWssBookTickerQuoteSnapshot,
+fn public_wss_monitor_quote_to_binance_book_ticker_json(
+    quote: &PublicTopOfBookQuoteSnapshot,
 ) -> RuntimeResult<String> {
     let observed_at = UtcTimestamp::from_str(&quote.observed_at)?;
     Ok(format!(
         "{{\"askPrice\":{},\"askQty\":{},\"bidPrice\":{},\"bidQty\":{},\"symbol\":{},\"time\":{}}}",
         json_string(required_quote_field(
             &quote.best_ask,
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
             "best_ask"
         )?),
         json_string(required_quote_field(
             &quote.ask_size,
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
             "ask_size"
         )?),
         json_string(required_quote_field(
             &quote.best_bid,
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
             "best_bid"
         )?),
         json_string(required_quote_field(
             &quote.bid_size,
-            "Binance WSS monitor quote",
+            "Public WSS monitor quote",
             "bid_size"
         )?),
         json_string(&quote.symbol),
         runtime_timestamp_millis(observed_at)?
     ))
+}
+
+#[cfg(feature = "live-exec")]
+fn public_wss_monitor_quote_to_bybit_ticker_json(
+    quote: &PublicTopOfBookQuoteSnapshot,
+    market: BybitPublicMarket,
+    linear_premium_rest_json: Option<&str>,
+) -> RuntimeResult<String> {
+    let observed_at = UtcTimestamp::from_str(&quote.observed_at)?;
+    let time_ms = runtime_timestamp_millis(observed_at)?;
+    let premium_fields = if market == BybitPublicMarket::LinearPerpetual {
+        let raw_linear = linear_premium_rest_json.ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "Bybit linear WSS quote conversion requires REST ticker premium fields"
+                .to_owned(),
+        })?;
+        let fields = bybit_linear_premium_fields_from_rest(raw_linear, &quote.symbol)?;
+        format!(
+            ",\"fundingRate\":{},\"indexPrice\":{},\"markPrice\":{},\"nextFundingTime\":{}",
+            json_string(&fields.funding_rate),
+            json_string(&fields.index_price),
+            json_string(&fields.mark_price),
+            fields.next_funding_time_ms
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "{{\"retCode\":0,\"retExtInfo\":{{}},\"retMsg\":\"OK\",\"result\":{{\"category\":{},\"list\":[{{\"ask1Price\":{},\"ask1Size\":{},\"bid1Price\":{},\"bid1Size\":{},\"symbol\":{}{}}}]}},\"time\":{}}}",
+        json_string(bybit_public_market_category(market)),
+        json_string(required_quote_field(
+            &quote.best_ask,
+            "Bybit WSS monitor quote",
+            "best_ask"
+        )?),
+        json_string(required_quote_field(
+            &quote.ask_size,
+            "Bybit WSS monitor quote",
+            "ask_size"
+        )?),
+        json_string(required_quote_field(
+            &quote.best_bid,
+            "Bybit WSS monitor quote",
+            "best_bid"
+        )?),
+        json_string(required_quote_field(
+            &quote.bid_size,
+            "Bybit WSS monitor quote",
+            "bid_size"
+        )?),
+        json_string(&quote.symbol),
+        premium_fields,
+        time_ms
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BybitLinearPremiumTickerFields {
+    mark_price: String,
+    index_price: String,
+    funding_rate: String,
+    next_funding_time_ms: String,
+}
+
+#[cfg(feature = "live-exec")]
+fn bybit_linear_premium_fields_from_rest(
+    raw_json: &str,
+    symbol: &str,
+) -> RuntimeResult<BybitLinearPremiumTickerFields> {
+    for object in bybit_response_list_object_slices(raw_json, "bybit linear tickers", "linear")? {
+        let fields = parse_json_object_value_slices(object)?;
+        let row_symbol = required_json_value_string(&fields, "symbol", "bybit linear tickers")?;
+        if row_symbol != symbol {
+            continue;
+        }
+        return Ok(BybitLinearPremiumTickerFields {
+            mark_price: required_json_value_string(&fields, "markPrice", "bybit linear tickers")?,
+            index_price: required_json_value_string(&fields, "indexPrice", "bybit linear tickers")?,
+            funding_rate: required_json_value_string(
+                &fields,
+                "fundingRate",
+                "bybit linear tickers",
+            )?,
+            next_funding_time_ms: required_json_value_string(
+                &fields,
+                "nextFundingTime",
+                "bybit linear tickers",
+            )?,
+        });
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("Bybit linear ticker REST response lacks premium row for `{symbol}`"),
+    })
 }
 
 #[cfg(feature = "live-exec")]
@@ -2932,8 +3229,8 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     raw_premium: &str,
     premium_ref: &str,
     ingested_at: UtcTimestamp,
-    options: BinanceBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceReport> {
+    options: BasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
     let output_root = options
         .output_dir
         .clone()
@@ -2987,7 +3284,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
     }
     if !blocking_reasons.is_empty() {
-        let report = BinanceBasisGuardedLiveAutoOnceReport {
+        let report = BasisGuardedLiveAutoOnceReport {
             symbol: BASIS_SYMBOL.to_owned(),
             strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
             spot_event_id: Some(context.spot_event_id),
@@ -3013,13 +3310,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
             blocking_reasons,
             output_dir,
         };
-        write_binance_basis_guarded_live_auto_once_artifacts(
-            &output_root,
-            &report,
-            &[],
-            &[],
-            None,
-        )?;
+        write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
         return Ok(report);
     }
 
@@ -3116,7 +3407,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     let mut execution_report = None;
     let mut dispatch_attempted = false;
     let mut primary_submit_receipt_count = 0usize;
-    let mut protection = BinanceBasisLiveProtection::default();
+    let mut protection = BasisLiveProtection::default();
     if options.execute_live && dispatch_blocking.is_empty() {
         if !options.acknowledge_basis_live_orders {
             return Err(RuntimeError::UnsafeConfig {
@@ -3135,7 +3426,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
             &ingested_at,
             "basis-pre-spot",
             BinancePrivateAccountMarket::Spot,
-            BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_VENUE_ID,
             "https://api.binance.com",
             "/api/v3/account",
         )?;
@@ -3150,7 +3441,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
             &ingested_at,
             "basis-pre-usdm",
             BinancePrivateAccountMarket::UsdmFutures,
-            BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_VENUE_ID,
             BINANCE_USDM_FUTURES_BASE_URL,
             "/fapi/v3/account",
         )?;
@@ -3163,22 +3454,25 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         let private_order_events = options
             .private_order_events_dir
             .as_ref()
-            .map(|path| BinancePrivateOrderEventStore::from_dir(path))
+            .map(|path| PrivateOrderEventStore::from_dir(path))
             .transpose()?;
         dispatch_attempted = true;
         let mut spot_adapter = build_binance_spot_live_adapter(&signing_policy)?;
         let mut usdm_adapter = build_binance_usdm_live_adapter(&signing_policy)?;
         let protection_suffix = ingested_at.unix_seconds().to_string();
-        let outcome = execute_binance_basis_live_dispatch(
+        let outcome = execute_basis_live_dispatch(
             dispatch_plan,
             &mut spot_adapter,
             &mut usdm_adapter,
-            BinanceBasisLiveDispatchContext {
+            BasisLiveDispatchContext {
                 plan: Some(&pending.plan_preview),
                 generated_at: &generated_at,
                 spot_unwind_limit_price: Price::from_str(&context.spot_bid)?,
                 protection_suffix: &protection_suffix,
                 private_order_events: private_order_events.as_ref(),
+                spot_market: PrivateOrderMarket::Spot,
+                perp_market: PrivateOrderMarket::UsdmFutures,
+                order_query_event_prefix: "event:binance:basis-order-query",
             },
         )?;
         receipts = outcome.receipts;
@@ -3213,7 +3507,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         )?);
     }
 
-    let report = BinanceBasisGuardedLiveAutoOnceReport {
+    let report = BasisGuardedLiveAutoOnceReport {
         symbol: BASIS_SYMBOL.to_owned(),
         strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
         spot_event_id: Some(context.spot_event_id),
@@ -3244,20 +3538,328 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         blocking_reasons: dispatch_blocking,
         output_dir,
     };
-    write_binance_basis_guarded_live_auto_once_artifacts(
+    write_basis_guarded_live_auto_once_artifacts(
         &live_dir,
         &report,
         &receipts,
         &confirmations,
         execution_report.as_ref(),
     )?;
-    write_binance_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn run_bybit_basis_guarded_live_auto_once_from_json(
+    raw_spot: &str,
+    spot_ref: &str,
+    raw_linear: &str,
+    linear_ref: &str,
+    ingested_at: UtcTimestamp,
+    options: BybitBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(BYBIT_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+    let market_dir = output_root.join("market");
+    let preview_dir = output_root.join("preview");
+    let live_dir = output_root.join("live-dispatch");
+    let output_dir = Some(output_root.clone());
+    let context = write_bybit_basis_guarded_live_auto_market_artifacts(
+        BybitBasisRawInputs {
+            symbol: BASIS_SYMBOL,
+            raw_spot_ticker: raw_spot,
+            spot_ticker_ref: spot_ref,
+            raw_linear_ticker: raw_linear,
+            linear_ticker_ref: linear_ref,
+        },
+        ingested_at,
+        options.min_net_bps,
+        &market_dir,
+    )?;
+    let mut blocking_reasons = Vec::new();
+    if !context.signal.is_candidate {
+        blocking_reasons.push(
+            context
+                .signal
+                .reason
+                .clone()
+                .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
+        );
+    }
+    if let Some(max_spot_ask) = &options.max_spot_ask {
+        if Decimal::from_str(&context.spot_ask)? > Decimal::from_str(max_spot_ask)? {
+            blocking_reasons.push(format!(
+                "spot leg blocked: spot_ask={} is above max_spot_ask={max_spot_ask}",
+                context.spot_ask
+            ));
+        }
+    } else if options.execute_live {
+        blocking_reasons.push("live basis execution requires --max-spot-ask".to_owned());
+    }
+    if let Some(min_perp_bid) = &options.min_perp_bid {
+        if Decimal::from_str(&context.perp_bid)? < Decimal::from_str(min_perp_bid)? {
+            blocking_reasons.push(format!(
+                "perp leg blocked: perp_bid={} is below min_perp_bid={min_perp_bid}",
+                context.perp_bid
+            ));
+        }
+    } else if options.execute_live {
+        blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
+    }
+    if !blocking_reasons.is_empty() {
+        let report = BybitBasisGuardedLiveAutoOnceReport {
+            symbol: BASIS_SYMBOL.to_owned(),
+            strategy_id: BYBIT_BASIS_LIVE_STRATEGY_ID.to_owned(),
+            spot_event_id: Some(context.spot_event_id),
+            perp_event_id: Some(context.perp_event_id),
+            premium_event_id: Some(context.premium_event_id),
+            spot_ask: Some(context.spot_ask),
+            perp_bid: Some(context.perp_bid),
+            net_bps: Some(context.signal.net_bps),
+            signal_allowed: false,
+            plan_hash: None,
+            approval_event_id: None,
+            manual_gate_released: false,
+            dispatch_attempted: false,
+            dispatch_allowed: false,
+            planned_order_count: 0,
+            submitted_receipt_count: 0,
+            private_confirmation_count: 0,
+            protection_attempted: false,
+            protection_actions: Vec::new(),
+            protection_receipt_count: 0,
+            residual_risk: None,
+            execution_report_status: None,
+            blocking_reasons,
+            output_dir,
+        };
+        write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+        return Ok(report);
+    }
+
+    let generated_at = ingested_at.to_string();
+    let candidate = bybit_basis_guarded_live_candidate(
+        &context,
+        &generated_at,
+        &ingested_at.unix_seconds().to_string(),
+    )?;
+    let risk_decision = bybit_basis_guarded_live_manual_risk_decision(
+        &context,
+        &generated_at,
+        options.min_net_bps,
+    )?;
+    let pending = match build_execution_plan_preview(ExecutionPlanBuildInput::new(
+        &risk_decision,
+        &candidate,
+        ContractExecutionMode::GuardedLive,
+        &generated_at,
+    ))? {
+        PlanBuildOutcome::PendingManualApproval(pending) => pending,
+        PlanBuildOutcome::Schedulable(_) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "Bybit basis guarded live auto unexpectedly produced dispatchable plan before approval"
+                        .to_owned(),
+            });
+        }
+    };
+    fs::create_dir_all(&preview_dir).map_err(|error| RuntimeError::Io {
+        path: preview_dir.clone(),
+        message: error.to_string(),
+    })?;
+    write_binance_guarded_live_preview_artifacts(
+        &preview_dir,
+        BinanceGuardedLivePreviewArtifacts {
+            candidate: &candidate,
+            risk_decision: &risk_decision,
+            plan_preview: &pending.plan_preview,
+            plan_hash: &execution_plan_hash(&pending.plan_preview),
+            manual_material_md: "",
+            approval_records_jsonl: "",
+            confirmation_template_md: "",
+        },
+    )?;
+    let plan_hash = execution_plan_hash(&pending.plan_preview);
+    let approved_record = review_manual_approval(
+        ManualApprovalReviewInput::new(
+            &pending,
+            &format!(
+                "event:approval:auto-live:bybit-basis:{}",
+                ingested_at.unix_seconds()
+            ),
+            "system:basis-guarded-live-auto-strategy",
+            &generated_at,
+            &UtcTimestamp::from_unix_parts(ingested_at.unix_seconds() + 300, 0)?.to_string(),
+            ManualApprovalDecision::Approve,
+        )
+        .with_reason("Automatic Bybit basis strategy approved both spot and linear perp legs for the same fresh plan hash."),
+    )?;
+    write_utf8(
+        preview_dir.join("approval_records.jsonl"),
+        &manual_approval_records_jsonl(std::slice::from_ref(&approved_record)),
+    )?;
+    let release = release_manual_approval_gate(&pending, &approved_record)?;
+    write_binance_manual_gate_release_artifacts(&preview_dir, &release, false, &generated_at)?;
+
+    let config = arb_config::ArbConfig::from_path(&options.config_path)?;
+    let service = start_runtime_with_config(&config)?;
+    let health = service.health();
+    let mut dispatch_blocking = live_dispatch_blocking_reasons(
+        &config,
+        &pending.plan_preview,
+        &release,
+        &plan_hash,
+        &health,
+    );
+    let dispatch_plan = if dispatch_blocking.is_empty() {
+        let dispatch_policy = live_dispatch_policy_from_config(&config)?;
+        let dispatch_plan =
+            build_execution_dispatch_plan(&pending.plan_preview, &dispatch_policy, ingested_at)?;
+        if dispatch_plan.requests.len() != 2 {
+            dispatch_blocking.push(format!(
+                "basis arbitrage requires exactly two order legs, got {}",
+                dispatch_plan.requests.len()
+            ));
+        }
+        Some(dispatch_plan)
+    } else {
+        None
+    };
+
+    let mut receipts = Vec::new();
+    let mut confirmations = Vec::new();
+    let mut execution_report = None;
+    let mut dispatch_attempted = false;
+    let mut primary_submit_receipt_count = 0usize;
+    let mut protection = BasisLiveProtection::default();
+    if options.execute_live && dispatch_blocking.is_empty() {
+        if !options.acknowledge_basis_live_orders {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "缺少 --i-understand-basis-live-orders，拒绝进入 Bybit 双腿真实套利下单链路"
+                        .to_owned(),
+            });
+        }
+        let dispatch_plan = dispatch_plan
+            .as_ref()
+            .ok_or_else(|| RuntimeError::UnsafeConfig {
+                message: "Bybit 双腿套利分发计划缺失，拒绝进入真实下单链路".to_owned(),
+            })?;
+        let signing_policy = signing_policy_from_config(&config)?;
+        let unified_account = fetch_bybit_unified_private_account_snapshot(
+            &signing_policy,
+            &ingested_at,
+            "basis-pre-unified",
+        )?;
+        ensure_asset_balance_covers_amount(
+            "Bybit Unified",
+            &unified_account.balances,
+            BASIS_QUOTE_ASSET_ID,
+            BINANCE_GUARDED_LIVE_NOTIONAL_USDT,
+        )?;
+        let private_order_events = options
+            .private_order_events_dir
+            .as_ref()
+            .map(|path| PrivateOrderEventStore::from_dir(path))
+            .transpose()?;
+        dispatch_attempted = true;
+        let mut spot_adapter = build_bybit_spot_live_adapter(&signing_policy)?;
+        let mut linear_adapter = build_bybit_linear_live_adapter(&signing_policy)?;
+        let protection_suffix = ingested_at.unix_seconds().to_string();
+        let outcome = execute_basis_live_dispatch(
+            dispatch_plan,
+            &mut spot_adapter,
+            &mut linear_adapter,
+            BasisLiveDispatchContext {
+                plan: Some(&pending.plan_preview),
+                generated_at: &generated_at,
+                spot_unwind_limit_price: Price::from_str(&context.spot_bid)?,
+                protection_suffix: &protection_suffix,
+                private_order_events: private_order_events.as_ref(),
+                spot_market: PrivateOrderMarket::BybitSpot,
+                perp_market: PrivateOrderMarket::BybitLinear,
+                order_query_event_prefix: "event:bybit:basis-order-query",
+            },
+        )?;
+        receipts = outcome.receipts;
+        confirmations = outcome.confirmations;
+        execution_report = outcome.execution_report;
+        primary_submit_receipt_count = outcome.primary_submit_receipt_count;
+        protection = outcome.protection;
+        dispatch_blocking.extend(outcome.blocking_reasons);
+        if execution_report.is_none() && dispatch_blocking.is_empty() {
+            execution_report = Some(arb_execution::execution_report_from_private_confirmations(
+                arb_execution::PrivateExecutionReportInput::new(
+                    &pending.plan_preview,
+                    &generated_at,
+                    &confirmations,
+                ),
+            )?);
+        }
+    } else if !options.execute_live {
+        dispatch_blocking.push(
+            "Bybit basis chain ran in dry-run mode; pass --execute-live and --i-understand-basis-live-orders to submit both real legs"
+                .to_owned(),
+        );
+    }
+
+    if execution_report.is_none() && dispatch_blocking.is_empty() && options.execute_live {
+        execution_report = Some(arb_execution::execution_report_from_private_confirmations(
+            arb_execution::PrivateExecutionReportInput::new(
+                &pending.plan_preview,
+                &generated_at,
+                &confirmations,
+            ),
+        )?);
+    }
+
+    let report = BybitBasisGuardedLiveAutoOnceReport {
+        symbol: BASIS_SYMBOL.to_owned(),
+        strategy_id: BYBIT_BASIS_LIVE_STRATEGY_ID.to_owned(),
+        spot_event_id: Some(context.spot_event_id),
+        perp_event_id: Some(context.perp_event_id),
+        premium_event_id: Some(context.premium_event_id),
+        spot_ask: Some(context.spot_ask),
+        perp_bid: Some(context.perp_bid),
+        net_bps: Some(context.signal.net_bps),
+        signal_allowed: true,
+        plan_hash: Some(plan_hash),
+        approval_event_id: Some(release.approval_event_id),
+        manual_gate_released: true,
+        dispatch_attempted,
+        dispatch_allowed: dispatch_blocking.is_empty(),
+        planned_order_count: dispatch_plan
+            .as_ref()
+            .map(|plan| plan.requests.len())
+            .unwrap_or(0),
+        submitted_receipt_count: primary_submit_receipt_count,
+        private_confirmation_count: confirmations.len(),
+        protection_attempted: protection.attempted,
+        protection_actions: protection.actions,
+        protection_receipt_count: protection.receipt_count,
+        residual_risk: protection.residual_risk,
+        execution_report_status: execution_report
+            .as_ref()
+            .map(|report| report.status.as_str().to_owned()),
+        blocking_reasons: dispatch_blocking,
+        output_dir,
+    };
+    write_basis_guarded_live_auto_once_artifacts(
+        &live_dir,
+        &report,
+        &receipts,
+        &confirmations,
+        execution_report.as_ref(),
+    )?;
+    write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
     Ok(report)
 }
 
 #[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct BinanceBasisLiveProtection {
+struct BasisLiveProtection {
     attempted: bool,
     actions: Vec<String>,
     receipt_count: usize,
@@ -3265,7 +3867,7 @@ struct BinanceBasisLiveProtection {
 }
 
 #[cfg(feature = "live-exec")]
-impl BinanceBasisLiveProtection {
+impl BasisLiveProtection {
     fn record_action(&mut self, action: impl Into<String>) {
         self.attempted = true;
         self.actions.push(action.into());
@@ -3282,62 +3884,64 @@ impl BinanceBasisLiveProtection {
 
 #[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Default)]
-struct BinanceBasisLiveExecutionOutcome {
+struct BasisLiveExecutionOutcome {
     receipts: Vec<MutableActionReceipt>,
     confirmations: Vec<arb_execution::PrivateOrderConfirmation>,
     execution_report: Option<ExecutionReport>,
     primary_submit_receipt_count: usize,
-    protection: BinanceBasisLiveProtection,
+    protection: BasisLiveProtection,
     blocking_reasons: Vec<String>,
 }
 
 #[cfg(feature = "live-exec")]
 #[derive(Clone, Copy)]
-struct BinanceBasisLiveDispatchContext<'a> {
+struct BasisLiveDispatchContext<'a> {
     plan: Option<&'a ExecutionPlan>,
     generated_at: &'a str,
     spot_unwind_limit_price: Price,
     protection_suffix: &'a str,
-    private_order_events: Option<&'a BinancePrivateOrderEventStore>,
+    private_order_events: Option<&'a PrivateOrderEventStore>,
+    spot_market: PrivateOrderMarket,
+    perp_market: PrivateOrderMarket,
+    order_query_event_prefix: &'a str,
 }
 
 #[cfg(feature = "live-exec")]
-impl<'a> BinanceBasisLiveDispatchContext<'a> {
-    fn order_context(
-        self,
-        market: BinancePrivateOrderMarket,
-    ) -> BinanceBasisOrderConfirmContext<'a> {
-        BinanceBasisOrderConfirmContext {
+impl<'a> BasisLiveDispatchContext<'a> {
+    fn order_context(self, market: PrivateOrderMarket) -> BasisOrderConfirmContext<'a> {
+        BasisOrderConfirmContext {
             protection_suffix: self.protection_suffix,
             private_order_events: self.private_order_events,
             market,
+            order_query_event_prefix: self.order_query_event_prefix,
         }
     }
 }
 
 #[cfg(feature = "live-exec")]
 #[derive(Clone, Copy)]
-struct BinanceBasisOrderConfirmContext<'a> {
+struct BasisOrderConfirmContext<'a> {
     protection_suffix: &'a str,
-    private_order_events: Option<&'a BinancePrivateOrderEventStore>,
-    market: BinancePrivateOrderMarket,
+    private_order_events: Option<&'a PrivateOrderEventStore>,
+    market: PrivateOrderMarket,
+    order_query_event_prefix: &'a str,
 }
 
 #[cfg(feature = "live-exec")]
-fn execute_binance_basis_live_dispatch<S, U>(
+fn execute_basis_live_dispatch<S, U>(
     dispatch_plan: &ExecutionDispatchPlan,
     spot_adapter: &mut S,
     usdm_adapter: &mut U,
-    context: BinanceBasisLiveDispatchContext<'_>,
-) -> RuntimeResult<BinanceBasisLiveExecutionOutcome>
+    context: BasisLiveDispatchContext<'_>,
+) -> RuntimeResult<BasisLiveExecutionOutcome>
 where
     S: SubmitOrder + CancelOrder + ConfirmOrderStatus,
     U: SubmitOrder + CancelOrder + ConfirmOrderStatus,
 {
-    let (spot, perp) = binance_basis_planned_legs(dispatch_plan)?;
-    let spot_context = context.order_context(BinancePrivateOrderMarket::Spot);
-    let perp_context = context.order_context(BinancePrivateOrderMarket::UsdmFutures);
-    let mut outcome = BinanceBasisLiveExecutionOutcome::default();
+    let (spot, perp) = basis_planned_legs(dispatch_plan, context.spot_market, context.perp_market)?;
+    let spot_context = context.order_context(context.spot_market);
+    let perp_context = context.order_context(context.perp_market);
+    let mut outcome = BasisLiveExecutionOutcome::default();
 
     let spot_receipt = match spot_adapter.submit_order(spot.request.clone()) {
         Ok(receipt) => {
@@ -3364,6 +3968,7 @@ where
         "spot-after-submit",
         spot_context.private_order_events,
         spot_context.market,
+        spot_context.order_query_event_prefix,
     ) {
         Ok(update) => {
             outcome
@@ -3507,6 +4112,7 @@ where
         "perp-after-submit",
         perp_context.private_order_events,
         perp_context.market,
+        perp_context.order_query_event_prefix,
     ) {
         Ok(update) => {
             outcome
@@ -3662,15 +4268,19 @@ where
 }
 
 #[cfg(feature = "live-exec")]
-fn binance_basis_planned_legs(
+fn basis_planned_legs(
     dispatch_plan: &ExecutionDispatchPlan,
+    spot_market: PrivateOrderMarket,
+    perp_market: PrivateOrderMarket,
 ) -> RuntimeResult<(&PlannedSubmitOrder, &PlannedSubmitOrder)> {
+    let expected_spot_venue = basis_private_order_market_venue_id(spot_market);
+    let expected_perp_venue = basis_private_order_market_venue_id(perp_market);
     let spot = dispatch_plan
         .requests
         .iter()
         .find(|planned| {
             planned.basis_leg_role.as_deref() == Some("spot_buy")
-                || planned.request.venue_id.as_str() == BASIS_SPOT_VENUE_ID
+                || planned.request.venue_id.as_str() == expected_spot_venue
         })
         .ok_or_else(|| RuntimeError::UnsafeConfig {
             message: "双腿套利分发计划缺少 spot buy 腿".to_owned(),
@@ -3680,12 +4290,22 @@ fn binance_basis_planned_legs(
         .iter()
         .find(|planned| {
             planned.basis_leg_role.as_deref() == Some("perp_short")
-                || planned.request.venue_id.as_str() == BASIS_PERP_VENUE_ID
+                || planned.request.venue_id.as_str() == expected_perp_venue
         })
         .ok_or_else(|| RuntimeError::UnsafeConfig {
-            message: "双腿套利分发计划缺少 USD-M perp short 腿".to_owned(),
+            message: "双腿套利分发计划缺少 perp short 腿".to_owned(),
         })?;
     Ok((spot, perp))
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_private_order_market_venue_id(market: PrivateOrderMarket) -> &'static str {
+    match market {
+        PrivateOrderMarket::Spot => BINANCE_BASIS_SPOT_VENUE_ID,
+        PrivateOrderMarket::UsdmFutures => BINANCE_BASIS_PERP_VENUE_ID,
+        PrivateOrderMarket::BybitSpot => BYBIT_BASIS_SPOT_VENUE_ID,
+        PrivateOrderMarket::BybitLinear => BYBIT_BASIS_PERP_VENUE_ID,
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -3694,8 +4314,9 @@ fn confirm_planned_receipt_with_private_stream_or_order_query<A>(
     planned: &PlannedSubmitOrder,
     receipt: &MutableActionReceipt,
     scope: &str,
-    private_order_events: Option<&BinancePrivateOrderEventStore>,
-    market: BinancePrivateOrderMarket,
+    private_order_events: Option<&PrivateOrderEventStore>,
+    market: PrivateOrderMarket,
+    order_query_event_prefix: &str,
 ) -> RuntimeResult<PrivateOrderUpdate>
 where
     A: ConfirmOrderStatus,
@@ -3713,6 +4334,7 @@ where
         scope,
         private_order_events,
         market,
+        order_query_event_prefix,
     )
 }
 
@@ -3722,8 +4344,9 @@ fn confirm_planned_order_ref_with_private_stream_or_order_query<A>(
     planned: &PlannedSubmitOrder,
     order_ref: OrderReference,
     scope: &str,
-    private_order_events: Option<&BinancePrivateOrderEventStore>,
-    market: BinancePrivateOrderMarket,
+    private_order_events: Option<&PrivateOrderEventStore>,
+    market: PrivateOrderMarket,
+    order_query_event_prefix: &str,
 ) -> RuntimeResult<PrivateOrderUpdate>
 where
     A: ConfirmOrderStatus,
@@ -3733,7 +4356,13 @@ where
             return Ok(update);
         }
     }
-    confirm_planned_order_ref_with_order_query(adapter, planned, order_ref, scope)
+    confirm_planned_order_ref_with_order_query(
+        adapter,
+        planned,
+        order_ref,
+        scope,
+        order_query_event_prefix,
+    )
 }
 
 #[cfg(feature = "live-exec")]
@@ -3742,6 +4371,7 @@ fn confirm_planned_order_ref_with_order_query<A>(
     planned: &PlannedSubmitOrder,
     order_ref: OrderReference,
     scope: &str,
+    order_query_event_prefix: &str,
 ) -> RuntimeResult<PrivateOrderUpdate>
 where
     A: ConfirmOrderStatus,
@@ -3752,62 +4382,68 @@ where
             planned.request.account_id.clone(),
             planned.request.instrument_id.clone(),
             order_ref,
-            format!(
-                "event:binance:basis-order-query:{}:{}",
-                scope, planned.plan_leg_id
-            ),
+            format!("{order_query_event_prefix}:{scope}:{}", planned.plan_leg_id),
         ))
         .map_err(RuntimeError::from)
 }
 
 #[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Default)]
-struct BinancePrivateOrderEventStore {
+struct PrivateOrderEventStore {
     spot_events: Vec<String>,
     usdm_events: Vec<String>,
+    bybit_spot_events: Vec<String>,
+    bybit_linear_events: Vec<String>,
 }
 
 #[cfg(feature = "live-exec")]
-impl BinancePrivateOrderEventStore {
+impl PrivateOrderEventStore {
     fn from_dir(path: &Path) -> RuntimeResult<Self> {
         Ok(Self {
             spot_events: read_optional_jsonl_lines(&path.join("spot_user_data.jsonl"))?,
             usdm_events: read_optional_jsonl_lines(&path.join("usdm_user_data.jsonl"))?,
+            bybit_spot_events: read_optional_jsonl_files(
+                path,
+                &[
+                    "bybit_spot_user_data.jsonl",
+                    "bybit_spot_order.jsonl",
+                    "bybit_spot_private_order.jsonl",
+                ],
+            )?,
+            bybit_linear_events: read_optional_jsonl_files(
+                path,
+                &[
+                    "bybit_linear_user_data.jsonl",
+                    "bybit_linear_order.jsonl",
+                    "bybit_linear_private_order.jsonl",
+                ],
+            )?,
         })
     }
 
     fn latest_update_for_planned(
         &self,
         planned: &PlannedSubmitOrder,
-        market: BinancePrivateOrderMarket,
+        market: PrivateOrderMarket,
     ) -> RuntimeResult<Option<PrivateOrderUpdate>> {
         let events = match market {
-            BinancePrivateOrderMarket::Spot => &self.spot_events,
-            BinancePrivateOrderMarket::UsdmFutures => &self.usdm_events,
-            BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear => {
-                return Err(RuntimeError::UnsafeConfig {
-                    message: "Binance private order event store does not support Bybit markets"
-                        .to_owned(),
-                });
-            }
+            PrivateOrderMarket::Spot => &self.spot_events,
+            PrivateOrderMarket::UsdmFutures => &self.usdm_events,
+            PrivateOrderMarket::BybitSpot => &self.bybit_spot_events,
+            PrivateOrderMarket::BybitLinear => &self.bybit_linear_events,
         };
         let Some(expected_client_order_id) = planned.request.client_order_id.as_ref() else {
             return Ok(None);
         };
         for (index, line) in events.iter().enumerate().rev() {
-            let event_type = json_string_field(line, "e")?;
-            if !binance_private_order_event_type_matches(market, &event_type) {
+            if !private_order_event_line_may_match(line, market)? {
                 continue;
             }
-            let update = parse_binance_private_order_event_line(
+            let update = parse_private_order_event_line(
                 line,
                 market,
                 planned,
-                format!(
-                    "event:binance:user-data-stream:{}:{}",
-                    binance_private_order_market_token(market),
-                    index
-                ),
+                private_order_stream_source_event_id(market, index),
             )?;
             if update.instrument_id != planned.request.instrument_id
                 || update.venue_id != planned.request.venue_id
@@ -3828,6 +4464,29 @@ impl BinancePrivateOrderEventStore {
 }
 
 #[cfg(feature = "live-exec")]
+fn private_order_event_line_may_match(
+    line: &str,
+    market: PrivateOrderMarket,
+) -> RuntimeResult<bool> {
+    match market {
+        PrivateOrderMarket::Spot | PrivateOrderMarket::UsdmFutures => {
+            let Ok(event_type) = json_string_field(line, "e") else {
+                return Ok(false);
+            };
+            Ok(binance_private_order_event_type_matches(
+                market,
+                &event_type,
+            ))
+        }
+        PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear => {
+            Ok(json_optional_string_field(line, "topic")?
+                .map(|topic| topic.starts_with("order"))
+                .unwrap_or(true))
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn read_optional_jsonl_lines(path: &Path) -> RuntimeResult<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -3842,53 +4501,101 @@ fn read_optional_jsonl_lines(path: &Path) -> RuntimeResult<Vec<String>> {
 }
 
 #[cfg(feature = "live-exec")]
-fn binance_private_order_event_type_matches(
-    market: BinancePrivateOrderMarket,
-    event_type: &str,
-) -> bool {
+fn read_optional_jsonl_files(path: &Path, file_names: &[&str]) -> RuntimeResult<Vec<String>> {
+    let mut lines = Vec::new();
+    for file_name in file_names {
+        lines.extend(read_optional_jsonl_lines(&path.join(file_name))?);
+    }
+    Ok(lines)
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_private_order_event_type_matches(market: PrivateOrderMarket, event_type: &str) -> bool {
     match market {
-        BinancePrivateOrderMarket::Spot => event_type == "executionReport",
-        BinancePrivateOrderMarket::UsdmFutures => event_type == "ORDER_TRADE_UPDATE",
-        BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear => false,
+        PrivateOrderMarket::Spot => event_type == "executionReport",
+        PrivateOrderMarket::UsdmFutures => event_type == "ORDER_TRADE_UPDATE",
+        PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear => false,
     }
 }
 
 #[cfg(feature = "live-exec")]
-fn parse_binance_private_order_event_line(
+fn parse_private_order_event_line(
     line: &str,
-    market: BinancePrivateOrderMarket,
+    market: PrivateOrderMarket,
     planned: &PlannedSubmitOrder,
     source_event_id: String,
 ) -> RuntimeResult<PrivateOrderUpdate> {
     match market {
-        BinancePrivateOrderMarket::Spot => parse_binance_spot_execution_report_update(
-            planned.request.venue_id.clone(),
-            planned.request.account_id.clone(),
-            source_event_id,
-            line,
-        ),
-        BinancePrivateOrderMarket::UsdmFutures => parse_binance_usdm_order_trade_update(
-            planned.request.venue_id.clone(),
-            planned.request.account_id.clone(),
-            source_event_id,
-            line,
-        ),
-        BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear => {
-            return Err(RuntimeError::UnsafeConfig {
-                message: "Binance private order parser does not support Bybit markets".to_owned(),
-            });
+        PrivateOrderMarket::Spot => {
+            let event_type = json_string_field(line, "e")?;
+            if !binance_private_order_event_type_matches(market, &event_type) {
+                return Err(RuntimeError::LiveMarketData {
+                    message: format!(
+                        "Binance private event type `{event_type}` does not match `{}`",
+                        private_order_market_token(market)
+                    ),
+                });
+            }
+            parse_binance_spot_execution_report_update(
+                planned.request.venue_id.clone(),
+                planned.request.account_id.clone(),
+                source_event_id,
+                line,
+            )
+            .map_err(RuntimeError::from)
+        }
+        PrivateOrderMarket::UsdmFutures => {
+            let event_type = json_string_field(line, "e")?;
+            if !binance_private_order_event_type_matches(market, &event_type) {
+                return Err(RuntimeError::LiveMarketData {
+                    message: format!(
+                        "Binance private event type `{event_type}` does not match `{}`",
+                        private_order_market_token(market)
+                    ),
+                });
+            }
+            parse_binance_usdm_order_trade_update(
+                planned.request.venue_id.clone(),
+                planned.request.account_id.clone(),
+                source_event_id,
+                line,
+            )
+            .map_err(RuntimeError::from)
+        }
+        PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear => {
+            parse_bybit_private_order_stream_update(
+                market,
+                planned.request.venue_id.clone(),
+                planned.request.account_id.clone(),
+                source_event_id,
+                line,
+            )
+            .map_err(RuntimeError::from)
         }
     }
-    .map_err(RuntimeError::from)
 }
 
 #[cfg(feature = "live-exec")]
-fn binance_private_order_market_token(market: BinancePrivateOrderMarket) -> &'static str {
+fn private_order_market_token(market: PrivateOrderMarket) -> &'static str {
     match market {
-        BinancePrivateOrderMarket::Spot => "spot",
-        BinancePrivateOrderMarket::UsdmFutures => "usdm",
-        BinancePrivateOrderMarket::BybitSpot => "bybit-spot",
-        BinancePrivateOrderMarket::BybitLinear => "bybit-linear",
+        PrivateOrderMarket::Spot => "spot",
+        PrivateOrderMarket::UsdmFutures => "usdm",
+        PrivateOrderMarket::BybitSpot => "bybit-spot",
+        PrivateOrderMarket::BybitLinear => "bybit-linear",
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn private_order_stream_source_event_id(market: PrivateOrderMarket, index: usize) -> String {
+    match market {
+        PrivateOrderMarket::Spot | PrivateOrderMarket::UsdmFutures => format!(
+            "event:binance:user-data-stream:{}:{index}",
+            private_order_market_token(market)
+        ),
+        PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear => format!(
+            "event:bybit:private-order-stream:{}:{index}",
+            private_order_market_token(market)
+        ),
     }
 }
 
@@ -3919,8 +4626,8 @@ fn attempt_cancel_live_order<A>(
     planned: &PlannedSubmitOrder,
     receipt: &MutableActionReceipt,
     reason: &str,
-    context: BinanceBasisOrderConfirmContext<'_>,
-    outcome: &mut BinanceBasisLiveExecutionOutcome,
+    context: BasisOrderConfirmContext<'_>,
+    outcome: &mut BasisLiveExecutionOutcome,
 ) -> RuntimeResult<Option<PrivateOrderUpdate>>
 where
     A: CancelOrder + ConfirmOrderStatus,
@@ -3975,6 +4682,7 @@ where
         &format!("cancel:{reason}"),
         context.private_order_events,
         context.market,
+        context.order_query_event_prefix,
     ) {
         Ok(update) => {
             outcome.confirmations.push(private_confirmation_from_update(
@@ -4018,8 +4726,8 @@ fn attempt_spot_unwind<S>(
     quantity: Quantity,
     limit_price: Price,
     reason: &str,
-    context: BinanceBasisOrderConfirmContext<'_>,
-    outcome: &mut BinanceBasisLiveExecutionOutcome,
+    context: BasisOrderConfirmContext<'_>,
+    outcome: &mut BasisLiveExecutionOutcome,
 ) -> RuntimeResult<()>
 where
     S: SubmitOrder + ConfirmOrderStatus,
@@ -4071,7 +4779,8 @@ where
         &receipt,
         &format!("spot-unwind:{reason}"),
         context.private_order_events,
-        BinancePrivateOrderMarket::Spot,
+        context.market,
+        context.order_query_event_prefix,
     ) {
         Ok(update) => {
             if update.status != OrderConfirmationStatus::Filled {
@@ -4180,10 +4889,10 @@ fn run_binance_guarded_live_dispatch_live(
             ));
         } else {
             let planned = &dispatch_plan.requests[0];
-            if planned.request.venue_id.as_str() != BASIS_SPOT_VENUE_ID {
+            if planned.request.venue_id.as_str() != BINANCE_BASIS_SPOT_VENUE_ID {
                 blocking_reasons.push(format!(
                     "当前 GuardedLive 实盘入口只允许 venue `{}`，收到 `{}`",
-                    BASIS_SPOT_VENUE_ID, planned.request.venue_id
+                    BINANCE_BASIS_SPOT_VENUE_ID, planned.request.venue_id
                 ));
             } else {
                 let receipt = adapter.submit_order(planned.request.clone())?;
@@ -4332,7 +5041,7 @@ pub fn run_binance_wss_book_ticker_monitor(
 ) -> RuntimeResult<()> {
     validate_binance_wss_probe_options(&options)?;
     let symbol_scope = normalize_binance_wss_symbol_scope(&options.symbol)?;
-    let state = Arc::new(RwLock::new(BinanceWssBookTickerMonitorSnapshot::empty(
+    let state = Arc::new(RwLock::new(PublicTopOfBookMonitorSnapshot::empty(
         &symbol_scope,
         options.market,
         "pending-rest-bootstrap",
@@ -4369,14 +5078,14 @@ pub fn run_binance_wss_book_ticker_monitor(
 
 fn run_binance_wss_book_ticker_monitor_cycle(
     options: &BinanceWssBookTickerMonitorOptions,
-    state: Arc<RwLock<BinanceWssBookTickerMonitorSnapshot>>,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
     symbol_scope: &str,
     rebuild_from_rest: bool,
 ) -> RuntimeResult<()> {
     if rebuild_from_rest {
         state
             .write()
-            .expect("Binance WSS monitor state lock poisoned")
+            .expect("Public WSS monitor state lock poisoned")
             .begin_rest_rebuild();
     }
     let mut market_state =
@@ -4385,7 +5094,7 @@ fn run_binance_wss_book_ticker_monitor_cycle(
             Err(error) => {
                 state
                     .write()
-                    .expect("Binance WSS monitor state lock poisoned")
+                    .expect("Public WSS monitor state lock poisoned")
                     .record_failure(
                         format!("REST snapshot bootstrap/rebuild failed: {error}"),
                         false,
@@ -4396,7 +5105,7 @@ fn run_binance_wss_book_ticker_monitor_cycle(
     {
         let mut snapshot = state
             .write()
-            .expect("Binance WSS monitor state lock poisoned");
+            .expect("Public WSS monitor state lock poisoned");
         snapshot.stream_url = market_state.stream_url.clone();
         snapshot.symbol = symbol_scope.to_owned();
         snapshot.market = options.market.as_str().to_owned();
@@ -4416,7 +5125,7 @@ fn run_binance_wss_book_ticker_monitor_cycle(
         })?;
         state
             .write()
-            .expect("Binance WSS monitor state lock poisoned")
+            .expect("Public WSS monitor state lock poisoned")
             .record_update(&update);
     }
 
@@ -4444,7 +5153,7 @@ fn run_binance_wss_book_ticker_monitor_cycle(
                     let keep_going = !update.fail_closed;
                     state
                         .write()
-                        .expect("Binance WSS monitor state lock poisoned")
+                        .expect("Public WSS monitor state lock poisoned")
                         .record_update(&update);
                     keep_going
                 }
@@ -4453,7 +5162,7 @@ fn run_binance_wss_book_ticker_monitor_cycle(
                     observer_error = Some(error.to_string());
                     state
                         .write()
-                        .expect("Binance WSS monitor state lock poisoned")
+                        .expect("Public WSS monitor state lock poisoned")
                         .record_failure(error.to_string(), false);
                     false
                 }
@@ -4468,7 +5177,7 @@ fn run_binance_wss_book_ticker_monitor_cycle(
             if !options.once {
                 state
                     .write()
-                    .expect("Binance WSS monitor state lock poisoned")
+                    .expect("Public WSS monitor state lock poisoned")
                     .record_stream_end();
             }
             Ok(())
@@ -4476,16 +5185,258 @@ fn run_binance_wss_book_ticker_monitor_cycle(
         Err(error) => {
             state
                 .write()
-                .expect("Binance WSS monitor state lock poisoned")
+                .expect("Public WSS monitor state lock poisoned")
                 .record_failure(error.to_string(), !observed_wss_event);
             Err(error.into())
         }
     }
 }
 
-struct BinanceWssBookTickerAllMarketState {
+/// 运行一次 Bybit V5 公开 `orderbook.1` WSS 探测。
+pub fn run_bybit_wss_book_ticker_probe(
+    options: BybitWssBookTickerProbeOptions,
+) -> RuntimeResult<BybitWssBookTickerProbeReport> {
+    validate_bybit_wss_probe_options(&options)?;
+    let symbol = validate_bybit_public_wss_symbol(&options.symbol)?;
+    let venue_id = bybit_public_wss_venue_id(options.market)?;
+    let instrument = bybit_public_wss_instrument(&symbol, options.market)?;
+    let mut market_state = bootstrap_bybit_wss_book_ticker_all_market(&symbol, options.market)?;
+    let connected_at = current_utc_timestamp()?;
+    for coordinator in market_state.coordinators.values_mut() {
+        let _ = coordinator.apply(HybridMarketDataInput::WssConnected {
+            occurred_at: connected_at,
+            ingested_at: connected_at,
+        })?;
+    }
+    let text_client = BybitPublicWssTextStreamClient::new(
+        market_state.venue_id.clone(),
+        market_state.stream_url.clone(),
+    )?;
+    let subscribe_args = market_state.subscribe_args.clone();
+    let mut updates = Vec::new();
+    let mut observer_error = None;
+    text_client.read_live_text_messages_observed(
+        &subscribe_args,
+        options.updates,
+        |raw_json, ingested_at| match apply_bybit_wss_book_ticker_text(
+            raw_json,
+            ingested_at,
+            options.market,
+            &mut market_state,
+        ) {
+            Ok(Some(update)) => {
+                let keep_going = !update.fail_closed;
+                updates.push(update);
+                keep_going
+            }
+            Ok(None) => true,
+            Err(error) => {
+                observer_error = Some(error.to_string());
+                false
+            }
+        },
+    )?;
+    if let Some(error) = observer_error {
+        return Err(RuntimeError::LiveMarketData { message: error });
+    }
+    let fail_closed_count = updates.iter().filter(|update| update.fail_closed).count();
+    let latest_quote = market_state
+        .coordinators
+        .get(&symbol)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("Bybit WSS coordinator missing symbol `{symbol}`"),
+        })?
+        .latest_quote(&MarketDataQuery::new(
+            venue_id,
+            instrument.instrument_id.clone(),
+        ))?;
+
+    Ok(BybitWssBookTickerProbeReport {
+        symbol,
+        market: options.market,
+        stream_url: market_state.stream_url,
+        coordinator_status: market_state
+            .coordinators
+            .values()
+            .next()
+            .map(|coordinator| coordinator.status().as_str().to_owned())
+            .unwrap_or_else(|| "missing".to_owned()),
+        update_count: updates.len(),
+        fail_closed_count,
+        latest_best_bid: latest_quote
+            .as_ref()
+            .and_then(|quote| quote.best_bid.map(|price| price.to_string())),
+        latest_best_ask: latest_quote
+            .as_ref()
+            .and_then(|quote| quote.best_ask.map(|price| price.to_string())),
+    })
+}
+
+/// 运行 Bybit V5 公开 `orderbook.1` WSS 常驻任务。
+pub fn run_bybit_wss_book_ticker_monitor(
+    options: BybitWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    validate_bybit_wss_probe_options(&options)?;
+    let symbol_scope = normalize_bybit_wss_symbol_scope(&options.symbol)?;
+    let state = Arc::new(RwLock::new(
+        PublicTopOfBookMonitorSnapshot::empty_with_market(
+            &symbol_scope,
+            options.market.as_str(),
+            "pending-rest-bootstrap",
+        ),
+    ));
+    if !options.once {
+        start_bybit_wss_book_ticker_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "bybit-wss-book-ticker: api=http://{} symbol_scope={} market={} reconnect_delay_secs={} mutable_execution_started=false",
+            options.bind_addr,
+            symbol_scope,
+            options.market.as_str(),
+            options.reconnect_delay_secs,
+        );
+    }
+
+    let mut rebuild_from_rest = false;
+    loop {
+        let cycle = run_bybit_wss_book_ticker_monitor_cycle(
+            &options,
+            state.clone(),
+            &symbol_scope,
+            rebuild_from_rest,
+        );
+        match cycle {
+            Ok(()) if options.once => return Ok(()),
+            Ok(()) => {}
+            Err(error) if options.once => return Err(error),
+            Err(error) => eprintln!("bybit-wss-book-ticker cycle failed: {error}"),
+        }
+        rebuild_from_rest = true;
+        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+    }
+}
+
+fn run_bybit_wss_book_ticker_monitor_cycle(
+    options: &BybitWssBookTickerMonitorOptions,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+    symbol_scope: &str,
+    rebuild_from_rest: bool,
+) -> RuntimeResult<()> {
+    if rebuild_from_rest {
+        state
+            .write()
+            .expect("Bybit WSS monitor state lock poisoned")
+            .begin_rest_rebuild();
+    }
+    let mut market_state =
+        match bootstrap_bybit_wss_book_ticker_all_market(symbol_scope, options.market) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                state
+                    .write()
+                    .expect("Bybit WSS monitor state lock poisoned")
+                    .record_failure(
+                        format!("REST snapshot bootstrap/rebuild failed: {error}"),
+                        false,
+                    );
+                return Err(error);
+            }
+        };
+    {
+        let mut snapshot = state
+            .write()
+            .expect("Bybit WSS monitor state lock poisoned");
+        snapshot.stream_url = market_state.stream_url.clone();
+        snapshot.symbol = symbol_scope.to_owned();
+        snapshot.market = options.market.as_str().to_owned();
+        snapshot.rows.clear();
+        snapshot.latest_quote = None;
+        snapshot.total_rows = 0;
+        for update in &market_state.rest_updates {
+            snapshot.record_update(update);
+        }
+    }
+
+    let connected_at = current_utc_timestamp()?;
+    for coordinator in market_state.coordinators.values_mut() {
+        let update = coordinator.apply(HybridMarketDataInput::WssConnected {
+            occurred_at: connected_at,
+            ingested_at: connected_at,
+        })?;
+        state
+            .write()
+            .expect("Bybit WSS monitor state lock poisoned")
+            .record_update(&update);
+    }
+
+    let text_client = BybitPublicWssTextStreamClient::new(
+        market_state.venue_id.clone(),
+        market_state.stream_url.clone(),
+    )?;
+    let subscribe_args = market_state.subscribe_args.clone();
+    let max_text_messages = if options.once {
+        options.updates
+    } else {
+        usize::MAX
+    };
+    let mut observed_wss_event = false;
+    let mut observer_error = None;
+    let read_result = text_client.read_live_text_messages_observed(
+        &subscribe_args,
+        max_text_messages,
+        |raw_json, ingested_at| match apply_bybit_wss_book_ticker_text(
+            raw_json,
+            ingested_at,
+            options.market,
+            &mut market_state,
+        ) {
+            Ok(Some(update)) => {
+                observed_wss_event = true;
+                let keep_going = !update.fail_closed;
+                state
+                    .write()
+                    .expect("Bybit WSS monitor state lock poisoned")
+                    .record_update(&update);
+                keep_going
+            }
+            Ok(None) => true,
+            Err(error) => {
+                observer_error = Some(error.to_string());
+                state
+                    .write()
+                    .expect("Bybit WSS monitor state lock poisoned")
+                    .record_failure(error.to_string(), false);
+                false
+            }
+        },
+    );
+
+    if let Some(error) = observer_error {
+        return Err(RuntimeError::LiveMarketData { message: error });
+    }
+    match read_result {
+        Ok(()) => {
+            if !options.once {
+                state
+                    .write()
+                    .expect("Bybit WSS monitor state lock poisoned")
+                    .record_stream_end_with_label("Bybit public WSS");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state
+                .write()
+                .expect("Bybit WSS monitor state lock poisoned")
+                .record_failure(error.to_string(), !observed_wss_event);
+            Err(error.into())
+        }
+    }
+}
+
+struct PublicTopOfBookAllMarketState {
     venue_id: VenueId,
     stream_url: String,
+    subscribe_args: Vec<String>,
     all_symbols_scope: bool,
     coordinators: BTreeMap<String, RestWssMarketDataCoordinator>,
     local_sequences: BTreeMap<String, u64>,
@@ -4493,7 +5444,7 @@ struct BinanceWssBookTickerAllMarketState {
     rest_updates: Vec<HybridMarketDataUpdate>,
 }
 
-struct BinanceWssBookTickerRuntimeRaw {
+struct PublicTopOfBookRuntimeRaw {
     symbol: String,
     update_id: u64,
     best_bid: Price,
@@ -4506,7 +5457,7 @@ struct BinanceWssBookTickerRuntimeRaw {
 fn bootstrap_binance_wss_book_ticker_all_market(
     symbol_scope: &str,
     market: BinancePublicMarket,
-) -> RuntimeResult<BinanceWssBookTickerAllMarketState> {
+) -> RuntimeResult<PublicTopOfBookAllMarketState> {
     let venue_id = binance_public_wss_venue_id(market)?;
     let all_symbols_scope = is_binance_wss_all_symbols_scope(symbol_scope);
     let rest_url = if all_symbols_scope {
@@ -4558,9 +5509,10 @@ fn bootstrap_binance_wss_book_ticker_all_market(
     }
 
     let stream_url = binance_wss_book_ticker_all_market_stream_url(market, &symbols)?;
-    Ok(BinanceWssBookTickerAllMarketState {
+    Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url,
+        subscribe_args: Vec::new(),
         all_symbols_scope,
         coordinators,
         local_sequences,
@@ -4580,6 +5532,99 @@ fn prepare_binance_wss_book_ticker_rest_rows(
                 row.symbol = symbol;
                 prepared.push(row);
             }
+            Err(_) if all_symbols_scope => {}
+            Err(error) => return Err(error),
+        }
+    }
+    prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    Ok(prepared)
+}
+
+fn bootstrap_bybit_wss_book_ticker_all_market(
+    symbol_scope: &str,
+    market: BybitPublicMarket,
+) -> RuntimeResult<PublicTopOfBookAllMarketState> {
+    let venue_id = bybit_public_wss_venue_id(market)?;
+    let all_symbols_scope = is_bybit_wss_all_symbols_scope(symbol_scope);
+    let raw_rest_snapshot = match market {
+        BybitPublicMarket::Spot => fetch_public_json_with_curl(&bybit_spot_tickers_url())?,
+        BybitPublicMarket::LinearPerpetual => {
+            fetch_public_json_with_curl(&bybit_linear_tickers_url())?
+        }
+    };
+    let rows = match market {
+        BybitPublicMarket::Spot => parse_bybit_spot_ticker_rows(&raw_rest_snapshot)?,
+        BybitPublicMarket::LinearPerpetual => parse_bybit_linear_ticker_rows(&raw_rest_snapshot)?
+            .into_iter()
+            .map(|row| MonitorBookTickerRow {
+                symbol: row.symbol,
+                bid_price: row.bid_price,
+                bid_qty: row.bid_qty,
+                ask_price: row.ask_price,
+                ask_qty: row.ask_qty,
+            })
+            .collect(),
+    };
+    let rows = prepare_bybit_wss_book_ticker_rest_rows(rows, symbol_scope, all_symbols_scope)?;
+    if rows.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Bybit WSS orderbook REST bootstrap returned no rows for `{symbol_scope}`"
+            ),
+        });
+    }
+
+    let started_at = current_utc_timestamp()?;
+    let mut coordinators = BTreeMap::new();
+    let mut local_sequences = BTreeMap::new();
+    let mut rest_updates = Vec::with_capacity(rows.len());
+    let mut subscribe_args = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = row.symbol.clone();
+        let instrument = bybit_public_wss_instrument(&symbol, market)?;
+        let mut quote =
+            bybit_wss_rest_quote_from_row(&row, &venue_id, &instrument, market, started_at)?;
+        let sequence = 1_u64;
+        quote.source_sequence = Some(sequence.to_string());
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument.instrument_id.clone(),
+            started_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )?;
+        let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+        local_sequences.insert(symbol.clone(), sequence);
+        coordinators.insert(symbol.clone(), coordinator);
+        rest_updates.push(update);
+        subscribe_args.push(bybit_wss_orderbook_topic(&symbol));
+    }
+
+    Ok(PublicTopOfBookAllMarketState {
+        venue_id,
+        stream_url: bybit_wss_book_ticker_public_stream_url(market),
+        subscribe_args,
+        all_symbols_scope,
+        coordinators,
+        local_sequences,
+        last_exchange_update_ids: BTreeMap::new(),
+        rest_updates,
+    })
+}
+
+fn prepare_bybit_wss_book_ticker_rest_rows(
+    rows: Vec<MonitorBookTickerRow>,
+    symbol_scope: &str,
+    all_symbols_scope: bool,
+) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    let mut prepared = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match validate_bybit_public_wss_symbol(&row.symbol) {
+            Ok(symbol) if all_symbols_scope || symbol == symbol_scope => {
+                row.symbol = symbol;
+                prepared.push(row);
+            }
+            Ok(_) => {}
             Err(_) if all_symbols_scope => {}
             Err(error) => return Err(error),
         }
@@ -4612,11 +5657,39 @@ fn binance_wss_rest_quote_from_row(
     })
 }
 
+fn bybit_wss_rest_quote_from_row(
+    row: &MonitorBookTickerRow,
+    venue_id: &VenueId,
+    instrument: &BybitPublicInstrument,
+    market: BybitPublicMarket,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<MarketQuote> {
+    let freshness = DataFreshness::new(observed_at, observed_at, MARKET_DATA_MAX_AGE_MS)?;
+    Ok(MarketQuote {
+        venue_id: venue_id.clone(),
+        instrument_id: instrument.instrument_id.clone(),
+        last_price: None,
+        best_bid: Some(Price::from_str(&row.bid_price)?),
+        best_ask: Some(Price::from_str(&row.ask_price)?),
+        mark_price: None,
+        index_price: None,
+        bid_size: Some(Quantity::from_str(&row.bid_qty)?),
+        ask_size: Some(Quantity::from_str(&row.ask_qty)?),
+        source_sequence: None,
+        source_event_id: Some(format!(
+            "bybit:rest-tickers:{}:{}",
+            bybit_public_market_event_scope(market),
+            row.symbol
+        )),
+        freshness,
+    })
+}
+
 fn apply_binance_wss_book_ticker_text(
     raw_json: &str,
     ingested_at: UtcTimestamp,
     market: BinancePublicMarket,
-    state: &mut BinanceWssBookTickerAllMarketState,
+    state: &mut PublicTopOfBookAllMarketState,
 ) -> RuntimeResult<Option<HybridMarketDataUpdate>> {
     let mut raw = parse_binance_wss_book_ticker_runtime_raw(raw_json, ingested_at)?;
     raw.symbol = match validate_binance_public_wss_symbol(&raw.symbol) {
@@ -4651,7 +5724,7 @@ fn apply_binance_wss_book_ticker_text(
             return Ok(Some(update));
         }
     }
-    let local_sequence = next_binance_wss_local_sequence(state, &raw.symbol)?;
+    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
     let instrument = binance_public_wss_instrument(&raw.symbol, market)?;
     let update = state
         .coordinators
@@ -4685,8 +5758,83 @@ fn apply_binance_wss_book_ticker_text(
     Ok(Some(update))
 }
 
-fn next_binance_wss_local_sequence(
-    state: &mut BinanceWssBookTickerAllMarketState,
+fn apply_bybit_wss_book_ticker_text(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+    market: BybitPublicMarket,
+    state: &mut PublicTopOfBookAllMarketState,
+) -> RuntimeResult<Option<HybridMarketDataUpdate>> {
+    let Some(mut raw) = parse_bybit_wss_book_ticker_runtime_raw(raw_json, ingested_at)? else {
+        return Ok(None);
+    };
+    raw.symbol = match validate_bybit_public_wss_symbol(&raw.symbol) {
+        Ok(symbol) => symbol,
+        Err(_) if state.all_symbols_scope => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !state.coordinators.contains_key(&raw.symbol) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Bybit WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
+                raw.symbol
+            ),
+        });
+    }
+    if let Some(previous) = state.last_exchange_update_ids.get(&raw.symbol) {
+        if raw.update_id <= *previous {
+            let update = state
+                .coordinators
+                .get_mut(&raw.symbol)
+                .expect("coordinator exists")
+                .apply(HybridMarketDataInput::WssGapDetected {
+                    expected_sequence: None,
+                    observed_sequence: state.local_sequences.get(&raw.symbol).copied(),
+                    occurred_at: raw.observed_at,
+                    ingested_at,
+                    detail: format!(
+                        "Bybit WSS orderbook updateId `{}` did not advance beyond `{previous}`; REST rebuild required",
+                        raw.update_id
+                    ),
+                })?;
+            return Ok(Some(update));
+        }
+    }
+    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
+    let instrument = bybit_public_wss_instrument(&raw.symbol, market)?;
+    let update = state
+        .coordinators
+        .get_mut(&raw.symbol)
+        .expect("coordinator exists")
+        .apply(HybridMarketDataInput::WssQuote {
+            update: WssQuoteUpdate {
+                venue_id: state.venue_id.clone(),
+                instrument_id: instrument.instrument_id,
+                last_price: None,
+                best_bid: Some(raw.best_bid),
+                best_ask: Some(raw.best_ask),
+                mark_price: None,
+                index_price: None,
+                bid_size: Some(raw.bid_size),
+                ask_size: Some(raw.ask_size),
+                source_sequence: local_sequence,
+                source_event_id: Some(format!(
+                    "bybit:wss-book-ticker:{}:{}:{}",
+                    bybit_public_market_event_scope(market),
+                    raw.symbol,
+                    raw.update_id
+                )),
+                observed_at: raw.observed_at,
+                ingested_at,
+            },
+        })?;
+    state
+        .last_exchange_update_ids
+        .insert(raw.symbol, raw.update_id);
+    Ok(Some(update))
+}
+
+fn next_public_wss_local_sequence(
+    state: &mut PublicTopOfBookAllMarketState,
     symbol: &str,
 ) -> RuntimeResult<u64> {
     let sequence =
@@ -4704,10 +5852,136 @@ fn next_binance_wss_local_sequence(
     Ok(*sequence)
 }
 
+fn parse_bybit_wss_book_ticker_runtime_raw(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<Option<PublicTopOfBookRuntimeRaw>> {
+    let root = parse_json_object_value_slices(raw_json)?;
+    if let Some(op) = optional_json_value_string(&root, "op", "bybit wss")? {
+        if op == "subscribe" || op == "pong" {
+            return Ok(None);
+        }
+    }
+    let Some(data) = root.get("data") else {
+        return Ok(None);
+    };
+    let topic = optional_json_value_string(&root, "topic", "bybit wss")?.unwrap_or_default();
+    if !topic.starts_with("orderbook.1.") && !topic.starts_with("tickers.") {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(data)?;
+    let symbol = required_json_value_string(&fields, "s", "bybit wss orderbook")
+        .or_else(|_| required_json_value_string(&fields, "symbol", "bybit wss ticker"))?;
+    let update_id = optional_json_scalar_u64(&fields, "u", "bybit wss orderbook")?
+        .or(optional_json_scalar_u64(
+            &fields,
+            "seq",
+            "bybit wss orderbook",
+        )?)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "Bybit WSS orderbook lacks `u` or `seq` update id".to_owned(),
+        })?;
+    let (best_bid, bid_size) = if let Some(bids) = fields.get("b") {
+        bybit_wss_first_price_size(bids, "bid")?
+    } else {
+        (
+            Price::from_str(&required_json_value_string(
+                &fields,
+                "bid1Price",
+                "bybit wss ticker",
+            )?)?,
+            Quantity::from_str(&required_json_value_string(
+                &fields,
+                "bid1Size",
+                "bybit wss ticker",
+            )?)?,
+        )
+    };
+    let (best_ask, ask_size) = if let Some(asks) = fields.get("a") {
+        bybit_wss_first_price_size(asks, "ask")?
+    } else {
+        (
+            Price::from_str(&required_json_value_string(
+                &fields,
+                "ask1Price",
+                "bybit wss ticker",
+            )?)?,
+            Quantity::from_str(&required_json_value_string(
+                &fields,
+                "ask1Size",
+                "bybit wss ticker",
+            )?)?,
+        )
+    };
+    let observed_at = optional_json_scalar_u64(&root, "ts", "bybit wss")?
+        .or(optional_json_scalar_u64(&fields, "ts", "bybit wss")?)
+        .map(timestamp_from_unix_millis)
+        .transpose()?
+        .unwrap_or(ingested_at);
+    Ok(Some(PublicTopOfBookRuntimeRaw {
+        symbol,
+        update_id,
+        best_bid,
+        best_ask,
+        bid_size,
+        ask_size,
+        observed_at,
+    }))
+}
+
+fn bybit_wss_first_price_size(value: &str, side: &'static str) -> RuntimeResult<(Price, Quantity)> {
+    let levels = json_array_value_slices(value)?;
+    let first = levels
+        .first()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("Bybit WSS orderbook `{side}` side is empty"),
+        })?
+        .trim();
+    let fields = json_array_value_slices(first)?;
+    if fields.len() < 2 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("Bybit WSS orderbook `{side}` level lacks price or size"),
+        });
+    }
+    let price = decode_json_scalar_string(fields[0], "bybit wss price")?;
+    let size = decode_json_scalar_string(fields[1], "bybit wss size")?;
+    Ok((Price::from_str(&price)?, Quantity::from_str(&size)?))
+}
+
+fn optional_json_scalar_u64(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<Option<u64>> {
+    let Some(value) = fields.get(field) else {
+        return Ok(None);
+    };
+    decode_json_scalar_string(value, source)?
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("{source} field `{field}` is not u64: {error}"),
+        })
+}
+
+fn decode_json_scalar_string(value: &str, source: &'static str) -> RuntimeResult<String> {
+    let value = value.trim();
+    if value.starts_with('"') {
+        let quote_end = json_string_end(value, 0)?;
+        decode_json_string_literal(&value[1..quote_end - 1])
+    } else if value.starts_with('{') || value.starts_with('[') {
+        Err(RuntimeError::LiveMarketData {
+            message: format!("{source} expected scalar but received nested JSON"),
+        })
+    } else {
+        Ok(value.trim_end_matches(',').to_owned())
+    }
+}
+
 fn parse_binance_wss_book_ticker_runtime_raw(
     raw_json: &str,
     ingested_at: UtcTimestamp,
-) -> RuntimeResult<BinanceWssBookTickerRuntimeRaw> {
+) -> RuntimeResult<PublicTopOfBookRuntimeRaw> {
     let payload = binance_wss_book_ticker_payload_json(raw_json)?;
     let fields = parse_flat_json_object(payload)?;
     if let Some(MonitorJsonScalar::String(event_type)) = fields.get("e") {
@@ -4722,7 +5996,7 @@ fn parse_binance_wss_book_ticker_runtime_raw(
         .map(timestamp_from_unix_millis)
         .transpose()?
         .unwrap_or(ingested_at);
-    Ok(BinanceWssBookTickerRuntimeRaw {
+    Ok(PublicTopOfBookRuntimeRaw {
         symbol: required_json_string(&fields, "s", "binance wss bookTicker")?,
         update_id: required_json_string(&fields, "u", "binance wss bookTicker")?
             .parse::<u64>()
@@ -5996,6 +7270,22 @@ fn validate_binance_wss_probe_options(
     Ok(())
 }
 
+fn validate_bybit_wss_probe_options(options: &BybitWssBookTickerProbeOptions) -> RuntimeResult<()> {
+    if options.bind_addr.trim().is_empty() {
+        return Err(cli_arg_error("--bind must not be empty"));
+    }
+    if options.updates == 0 {
+        return Err(cli_arg_error("--updates must be greater than zero"));
+    }
+    if options.reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    normalize_bybit_wss_symbol_scope(&options.symbol)?;
+    Ok(())
+}
+
 fn normalize_binance_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
     let symbol = symbol.trim().to_ascii_uppercase();
     if is_binance_wss_all_symbols_scope(&symbol) {
@@ -6006,6 +7296,22 @@ fn normalize_binance_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
 }
 
 fn is_binance_wss_all_symbols_scope(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "ALL" | "ALL_USDT" | "*"
+    )
+}
+
+fn normalize_bybit_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if is_bybit_wss_all_symbols_scope(&symbol) {
+        Ok(BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
+    } else {
+        validate_bybit_public_wss_symbol(&symbol)
+    }
+}
+
+fn is_bybit_wss_all_symbols_scope(symbol: &str) -> bool {
     matches!(
         symbol.trim().to_ascii_uppercase().as_str(),
         "ALL" | "ALL_USDT" | "*"
@@ -6033,6 +7339,27 @@ fn validate_binance_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {
     Ok(symbol)
 }
 
+fn validate_bybit_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if symbol.len() < 3 || symbol.len() > 32 {
+        return Err(cli_arg_error("Bybit WSS symbol length must be 3..=32"));
+    }
+    if !symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(cli_arg_error(
+            "Bybit WSS symbol must contain only uppercase ASCII letters and digits",
+        ));
+    }
+    if !symbol.ends_with("USDT") {
+        return Err(cli_arg_error(
+            "current Bybit WSS monitor maps only USDT-quoted public instruments",
+        ));
+    }
+    Ok(symbol)
+}
+
 fn parse_binance_public_wss_market(value: &str) -> RuntimeResult<BinancePublicMarket> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spot" => Ok(BinancePublicMarket::Spot),
@@ -6043,10 +7370,28 @@ fn parse_binance_public_wss_market(value: &str) -> RuntimeResult<BinancePublicMa
     }
 }
 
+fn parse_bybit_public_wss_market(value: &str) -> RuntimeResult<BybitPublicMarket> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "spot" => Ok(BybitPublicMarket::Spot),
+        "linear" | "linear-perp" | "linear_perp" | "perp" => Ok(BybitPublicMarket::LinearPerpetual),
+        _ => Err(cli_arg_error(
+            "--market must be `spot` or `linear-perp` for Bybit WSS bookTicker",
+        )),
+    }
+}
+
 fn binance_public_wss_venue_id(market: BinancePublicMarket) -> RuntimeResult<VenueId> {
     let value = match market {
         BinancePublicMarket::Spot => "venue:BINANCE-SPOT",
         BinancePublicMarket::UsdmPerpetual => "venue:BINANCE-USDM",
+    };
+    Ok(VenueId::new(value)?)
+}
+
+fn bybit_public_wss_venue_id(market: BybitPublicMarket) -> RuntimeResult<VenueId> {
+    let value = match market {
+        BybitPublicMarket::Spot => BYBIT_BASIS_SPOT_VENUE_ID,
+        BybitPublicMarket::LinearPerpetual => BYBIT_BASIS_PERP_VENUE_ID,
     };
     Ok(VenueId::new(value)?)
 }
@@ -6074,6 +7419,58 @@ fn binance_public_wss_instrument(
         asset_usdt,
     )
     .map_err(RuntimeError::from)
+}
+
+fn bybit_public_wss_instrument(
+    symbol: &str,
+    market: BybitPublicMarket,
+) -> RuntimeResult<BybitPublicInstrument> {
+    let symbol = validate_bybit_public_wss_symbol(symbol)?;
+    let base = symbol
+        .strip_suffix("USDT")
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| cli_arg_error("Bybit WSS symbol must have a non-empty USDT base asset"))?
+        .to_owned();
+    let asset_usdt = AssetId::new("asset:USDT")?;
+    let instrument_id = match market {
+        BybitPublicMarket::Spot => format!("inst:BYBIT:{symbol}:SPOT"),
+        BybitPublicMarket::LinearPerpetual => format!("inst:BYBIT:{symbol}:LINEAR-PERP"),
+    };
+    BybitPublicInstrument::new(
+        symbol,
+        InstrumentId::new(instrument_id)?,
+        AssetId::new(format!("asset:{base}"))?,
+        asset_usdt.clone(),
+        asset_usdt,
+    )
+    .map_err(RuntimeError::from)
+}
+
+fn bybit_public_market_event_scope(market: BybitPublicMarket) -> &'static str {
+    match market {
+        BybitPublicMarket::Spot => "spot",
+        BybitPublicMarket::LinearPerpetual => "linear-perp",
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn bybit_public_market_category(market: BybitPublicMarket) -> &'static str {
+    match market {
+        BybitPublicMarket::Spot => "spot",
+        BybitPublicMarket::LinearPerpetual => "linear",
+    }
+}
+
+fn bybit_wss_orderbook_topic(symbol: &str) -> String {
+    format!("orderbook.1.{symbol}")
+}
+
+fn bybit_wss_book_ticker_public_stream_url(market: BybitPublicMarket) -> String {
+    match market {
+        BybitPublicMarket::Spot => BYBIT_SPOT_PUBLIC_WSS_BASE_URL,
+        BybitPublicMarket::LinearPerpetual => BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+    }
+    .to_owned()
 }
 
 fn binance_ticker_24h_url(symbol: &str) -> String {
@@ -7953,22 +9350,22 @@ fn ingest_binance_basis_public_json(
     ingested_at: UtcTimestamp,
 ) -> RuntimeResult<Vec<NormalizedEvent>> {
     let mut spot_adapter = BinancePublicBookTickerAdapter::new(
-        VenueId::new(BASIS_SPOT_VENUE_ID)?,
-        binance_basis_instrument(inputs.symbol, BASIS_SPOT_INSTRUMENT_ID)?,
+        VenueId::new(BINANCE_BASIS_SPOT_VENUE_ID)?,
+        binance_basis_instrument(inputs.symbol, BINANCE_BASIS_SPOT_INSTRUMENT_ID)?,
         BinancePublicMarket::Spot,
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let mut perp_adapter = BinancePublicBookTickerAdapter::new(
-        VenueId::new(BASIS_PERP_VENUE_ID)?,
-        binance_basis_instrument(inputs.symbol, BASIS_PERP_INSTRUMENT_ID)?,
+        VenueId::new(BINANCE_BASIS_PERP_VENUE_ID)?,
+        binance_basis_instrument(inputs.symbol, BINANCE_BASIS_PERP_INSTRUMENT_ID)?,
         BinancePublicMarket::UsdmPerpetual,
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let premium_adapter = BinanceUsdmPremiumIndexAdapter::new(
-        VenueId::new(BASIS_PERP_VENUE_ID)?,
-        binance_basis_instrument(inputs.symbol, BASIS_PERP_INSTRUMENT_ID)?,
+        VenueId::new(BINANCE_BASIS_PERP_VENUE_ID)?,
+        binance_basis_instrument(inputs.symbol, BINANCE_BASIS_PERP_INSTRUMENT_ID)?,
         MARKET_DATA_MAX_AGE_MS,
     )?;
 
@@ -8161,8 +9558,8 @@ fn load_binance_guarded_live_spot_quote(
             .and_then(|value| value.as_ref())
             .map(|value| value.as_str());
         if event.event_type == NormalizedEventType::NormalizedMarketDataEvent
-            && instrument_id == Some(BASIS_SPOT_INSTRUMENT_ID)
-            && venue_id == Some(BASIS_SPOT_VENUE_ID)
+            && instrument_id == Some(BINANCE_BASIS_SPOT_INSTRUMENT_ID)
+            && venue_id == Some(BINANCE_BASIS_SPOT_VENUE_ID)
             && payload_string(&event, "kind")? == "BookTicker"
             && payload_string(&event, "venue_symbol")? == BASIS_SYMBOL
         {
@@ -8199,8 +9596,8 @@ fn write_binance_guarded_live_auto_market_artifacts(
         message: error.to_string(),
     })?;
     let mut adapter = BinancePublicBookTickerAdapter::new(
-        VenueId::new(BASIS_SPOT_VENUE_ID)?,
-        binance_basis_instrument(BASIS_SYMBOL, BASIS_SPOT_INSTRUMENT_ID)?,
+        VenueId::new(BINANCE_BASIS_SPOT_VENUE_ID)?,
+        binance_basis_instrument(BASIS_SYMBOL, BINANCE_BASIS_SPOT_INSTRUMENT_ID)?,
         BinancePublicMarket::Spot,
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
@@ -8257,11 +9654,96 @@ fn write_binance_basis_guarded_live_auto_market_artifacts(
         &format!("{}\n", inputs.raw_premium_index),
     )?;
 
-    let spot =
-        find_binance_basis_book_event(&events, BASIS_SPOT_VENUE_ID, BASIS_SPOT_INSTRUMENT_ID)?;
-    let perp =
-        find_binance_basis_book_event(&events, BASIS_PERP_VENUE_ID, BASIS_PERP_INSTRUMENT_ID)?;
+    let spot = find_binance_basis_book_event(
+        &events,
+        BINANCE_BASIS_SPOT_VENUE_ID,
+        BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+    )?;
+    let perp = find_binance_basis_book_event(
+        &events,
+        BINANCE_BASIS_PERP_VENUE_ID,
+        BINANCE_BASIS_PERP_INSTRUMENT_ID,
+    )?;
     let premium = find_binance_basis_premium_event(&events)?;
+    let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+        symbol: BASIS_SYMBOL.to_owned(),
+        spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
+        spot_best_ask: payload_string(spot, "best_ask")?.to_owned(),
+        perp_best_bid: payload_string(perp, "best_bid")?.to_owned(),
+        perp_best_ask: payload_string(perp, "best_ask")?.to_owned(),
+        notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
+        spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
+        perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+        min_net_bps,
+    })
+    .map_err(|message| RuntimeError::Module {
+        module: "arb-strategies",
+        message,
+    })?;
+
+    Ok(BinanceBasisGuardedLiveSignalContext {
+        spot_event_id: spot.event_id.as_str().to_owned(),
+        perp_event_id: perp.event_id.as_str().to_owned(),
+        premium_event_id: premium.event_id.as_str().to_owned(),
+        observed_at: ingested_at.to_string(),
+        spot_bid: payload_string(spot, "best_bid")?.to_owned(),
+        spot_ask: payload_string(spot, "best_ask")?.to_owned(),
+        spot_bid_size: payload_string(spot, "bid_size")?.to_owned(),
+        spot_ask_size: payload_string(spot, "ask_size")?.to_owned(),
+        perp_bid: payload_string(perp, "best_bid")?.to_owned(),
+        perp_ask: payload_string(perp, "best_ask")?.to_owned(),
+        perp_bid_size: payload_string(perp, "bid_size")?.to_owned(),
+        perp_ask_size: payload_string(perp, "ask_size")?.to_owned(),
+        last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
+        mark_price: payload_string(premium, "mark_price")?.to_owned(),
+        index_price: payload_string(premium, "index_price")?.to_owned(),
+        next_funding_time_ms: payload_scalar_text(premium, "next_funding_time_ms")?,
+        signal,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn write_bybit_basis_guarded_live_auto_market_artifacts(
+    inputs: BybitBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+    min_net_bps: i128,
+    output_dir: &Path,
+) -> RuntimeResult<BinanceBasisGuardedLiveSignalContext> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let events = ingest_bybit_basis_public_json(inputs, ingested_at)?;
+    write_utf8(
+        output_dir.join("stored_events.jsonl"),
+        &canonical_jsonl(&events),
+    )?;
+    write_utf8(
+        output_dir.join("spot_ticker.raw.json"),
+        &format!("{}\n", inputs.raw_spot_ticker),
+    )?;
+    write_utf8(
+        output_dir.join("linear_ticker.raw.json"),
+        &format!("{}\n", inputs.raw_linear_ticker),
+    )?;
+
+    let spot = find_binance_basis_book_event(
+        &events,
+        BYBIT_BASIS_SPOT_VENUE_ID,
+        BYBIT_BASIS_SPOT_INSTRUMENT_ID,
+    )?;
+    let perp = find_binance_basis_book_event(
+        &events,
+        BYBIT_BASIS_PERP_VENUE_ID,
+        BYBIT_BASIS_PERP_INSTRUMENT_ID,
+    )?;
+    let premium = find_basis_premium_event(
+        &events,
+        BYBIT_BASIS_PERP_VENUE_ID,
+        BYBIT_BASIS_PERP_INSTRUMENT_ID,
+        "Bybit basis premium index",
+    )?;
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: BASIS_SYMBOL.to_owned(),
         spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
@@ -8324,12 +9806,27 @@ fn find_binance_basis_book_event<'a>(
         })
         .ok_or_else(|| RuntimeError::Module {
             module: "arb-runtime",
-            message: format!("missing Binance basis book event for {venue_id} {instrument_id}"),
+            message: format!("missing basis book event for {venue_id} {instrument_id}"),
         })
 }
 
 #[cfg(feature = "live-exec")]
 fn find_binance_basis_premium_event(events: &[NormalizedEvent]) -> RuntimeResult<&NormalizedEvent> {
+    find_basis_premium_event(
+        events,
+        BINANCE_BASIS_PERP_VENUE_ID,
+        BINANCE_BASIS_PERP_INSTRUMENT_ID,
+        "Binance basis premium index",
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn find_basis_premium_event<'a>(
+    events: &'a [NormalizedEvent],
+    venue_id: &str,
+    instrument_id: &str,
+    label: &str,
+) -> RuntimeResult<&'a NormalizedEvent> {
     events
         .iter()
         .find(|event| {
@@ -8338,17 +9835,17 @@ fn find_binance_basis_premium_event(events: &[NormalizedEvent]) -> RuntimeResult
                     .venue_id
                     .as_ref()
                     .and_then(|value| value.as_ref())
-                    .is_some_and(|value| value.as_str() == BASIS_PERP_VENUE_ID)
+                    .is_some_and(|value| value.as_str() == venue_id)
                 && event
                     .instrument_id
                     .as_ref()
                     .and_then(|value| value.as_ref())
-                    .is_some_and(|value| value.as_str() == BASIS_PERP_INSTRUMENT_ID)
+                    .is_some_and(|value| value.as_str() == instrument_id)
                 && payload_string(event, "kind").is_ok_and(|kind| kind == "PerpPremiumIndex")
         })
         .ok_or_else(|| RuntimeError::Module {
             module: "arb-runtime",
-            message: "missing Binance basis premium index event".to_owned(),
+            message: format!("missing {label} event"),
         })
 }
 
@@ -8469,8 +9966,8 @@ fn binance_guarded_live_candidate(
         strategy_id = json_string(BINANCE_GUARDED_LIVE_STRATEGY_ID),
         created_at = json_string(created_at),
         source_event = json_string(&quote.event_id),
-        venue_id = json_string(BASIS_SPOT_VENUE_ID),
-        instrument_id = json_string(BASIS_SPOT_INSTRUMENT_ID),
+        venue_id = json_string(BINANCE_BASIS_SPOT_VENUE_ID),
+        instrument_id = json_string(BINANCE_BASIS_SPOT_INSTRUMENT_ID),
         account_id = json_string(BINANCE_GUARDED_LIVE_ACCOUNT_REF),
         quote_asset_id = json_string(BASIS_QUOTE_ASSET_ID),
         notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
@@ -8626,6 +10123,7 @@ fn binance_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "venue_symbol": {venue_symbol},
         "reference_best_ask": {spot_ask},
         "reference_best_bid": {spot_bid},
         "reference_bid_size": {spot_bid_size},
@@ -8651,6 +10149,7 @@ fn binance_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "venue_symbol": {venue_symbol},
         "reference_best_ask": {perp_ask},
         "reference_best_bid": {perp_bid},
         "reference_bid_size": {perp_bid_size},
@@ -8706,11 +10205,12 @@ fn binance_basis_guarded_live_candidate(
         spot_event = json_string(&context.spot_event_id),
         perp_event = json_string(&context.perp_event_id),
         premium_event = json_string(&context.premium_event_id),
-        spot_venue = json_string(BASIS_SPOT_VENUE_ID),
-        perp_venue = json_string(BASIS_PERP_VENUE_ID),
-        spot_instrument = json_string(BASIS_SPOT_INSTRUMENT_ID),
-        perp_instrument = json_string(BASIS_PERP_INSTRUMENT_ID),
+        spot_venue = json_string(BINANCE_BASIS_SPOT_VENUE_ID),
+        perp_venue = json_string(BINANCE_BASIS_PERP_VENUE_ID),
+        spot_instrument = json_string(BINANCE_BASIS_SPOT_INSTRUMENT_ID),
+        perp_instrument = json_string(BINANCE_BASIS_PERP_INSTRUMENT_ID),
         account_id = json_string(BINANCE_GUARDED_LIVE_ACCOUNT_REF),
+        venue_symbol = json_string(BASIS_SYMBOL),
         quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
         base_asset = json_string(BASIS_BASE_ASSET_ID),
         notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
@@ -8821,6 +10321,254 @@ fn binance_basis_guarded_live_manual_risk_decision(
   "detail": "Automatic basis signal is a two-leg arbitrage candidate, but dispatch remains gated by same-plan approval, private balances, kill switch, permissions, confirmation and reconciliation."
 }}"#,
         transition_id = json_string(BINANCE_BASIS_LIVE_TRANSITION_ID),
+        evaluated_at = json_string(evaluated_at),
+        observed_at = json_string(&context.observed_at),
+        min_net_bps = json_string(&min_net_bps.to_string()),
+        net_bps = json_string(&context.signal.net_bps.to_string()),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+    );
+    Ok(from_json_strict::<RiskDecision>(&risk_json)?)
+}
+
+#[cfg(feature = "live-exec")]
+fn bybit_basis_guarded_live_candidate(
+    context: &BinanceBasisGuardedLiveSignalContext,
+    created_at: &str,
+    client_order_suffix: &str,
+) -> RuntimeResult<CandidatePortfolioTransition> {
+    let short_quantity = format!("-{}", context.signal.quantity);
+    let spot_client_order_id = format!("rvbS{client_order_suffix}");
+    let perp_client_order_id = format!("rvbP{client_order_suffix}");
+    let candidate_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "transition_id": {transition_id},
+  "strategy_id": {strategy_id},
+  "strategy_version": "1.0.0",
+  "code_version": "code:bybit-basis-guarded-live-auto-1",
+  "config_version": "arb-config-v1",
+  "created_at": {created_at},
+  "input_event_refs": [{spot_event},{perp_event},{premium_event}],
+  "current_portfolio_state_ref": "state:bybit-basis-guarded-live-private-redacted",
+  "holding_period": {{"kind": "UntilBasisConvergence"}},
+  "legs": [
+    {{
+      "leg_id": "candleg:bybit-basis-live-buy-spot-btcusdt",
+      "leg_type": "Trade",
+      "venue_id": {spot_venue},
+      "instrument_id": {spot_instrument},
+      "account_id": {account_id},
+      "side": "Buy",
+      "asset_flows": [
+        {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}},
+        {{"account_id": {account_id}, "asset_id": {base_asset}, "amount": {quantity}, "direction": "In"}}
+      ],
+      "constraints": {{
+        "basis_leg_role": "spot_buy",
+        "client_order_id": {spot_client_order_id},
+        "gross_basis_bps": {gross_bps},
+        "max_slippage_bps": "5",
+        "net_basis_bps": {net_bps},
+        "notional_usdt": {notional},
+        "post_only": false,
+        "venue_symbol": {venue_symbol},
+        "reference_best_ask": {spot_ask},
+        "reference_best_bid": {spot_bid},
+        "reference_bid_size": {spot_bid_size},
+        "reference_ask_size": {spot_ask_size},
+        "reference_market_event_id": {spot_event}
+      }},
+      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+    }},
+    {{
+      "leg_id": "candleg:bybit-basis-live-short-linear-btcusdt",
+      "leg_type": "Trade",
+      "venue_id": {perp_venue},
+      "instrument_id": {perp_instrument},
+      "account_id": {account_id},
+      "side": "Short",
+      "asset_flows": [],
+      "constraints": {{
+        "basis_leg_role": "perp_short",
+        "client_order_id": {perp_client_order_id},
+        "gross_basis_bps": {gross_bps},
+        "last_funding_rate": {last_funding_rate},
+        "max_slippage_bps": "5",
+        "net_basis_bps": {net_bps},
+        "notional_usdt": {notional},
+        "post_only": false,
+        "venue_symbol": {venue_symbol},
+        "reference_best_ask": {perp_ask},
+        "reference_best_bid": {perp_bid},
+        "reference_bid_size": {perp_bid_size},
+        "reference_ask_size": {perp_ask_size},
+        "reference_market_event_id": {perp_event},
+        "reference_premium_event_id": {premium_event}
+      }},
+      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+    }}
+  ],
+  "expected_post_state_delta": {{
+    "asset_flows": [
+      {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}},
+      {{"account_id": {account_id}, "asset_id": {base_asset}, "amount": {quantity}, "direction": "In"}}
+    ],
+    "position_deltas": [
+      {{"account_id": {account_id}, "instrument_id": {spot_instrument}, "quantity_delta": {quantity}}},
+      {{"account_id": {account_id}, "instrument_id": {perp_instrument}, "quantity_delta": {short_quantity}}}
+    ]
+  }},
+  "expected_economics": {{
+    "expected_profit_usd": {expected_profit_usd},
+    "expected_profit_bps": {net_bps},
+    "fee_estimate_usd": {fee_estimate_usd},
+    "slippage_estimate_usd": {slippage_estimate_usd},
+    "confidence": 0.60
+  }},
+  "required_capital": {{
+    "asset_requirements": [
+      {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}}
+    ],
+    "recovery_buffer_usd": "1.00"
+  }},
+  "funding_impact": {{
+    "summary": {funding_summary},
+    "impact_usd": "0",
+    "confidence": 0.50
+  }},
+  "failure_modes": ["PartialFill", "ManualInterventionRequired", "UnknownState"],
+  "risk_flags": ["FundingRateUnstable", "BasisWidening", "OneLegExecutionRisk"],
+  "assumptions": [
+    {{
+      "assumption_id": "asm:bybit-basis-live-public-signal",
+      "statement": "Automatic live basis signal uses Bybit public spot/linear ticker data; unified account balance and both execution venues must be checked before dispatch.",
+      "confidence": 0.50,
+      "source_event_refs": [{spot_event},{perp_event},{premium_event}]
+    }}
+  ]
+}}"#,
+        transition_id = json_string(BYBIT_BASIS_LIVE_TRANSITION_ID),
+        strategy_id = json_string(BYBIT_BASIS_LIVE_STRATEGY_ID),
+        created_at = json_string(created_at),
+        spot_event = json_string(&context.spot_event_id),
+        perp_event = json_string(&context.perp_event_id),
+        premium_event = json_string(&context.premium_event_id),
+        spot_venue = json_string(BYBIT_BASIS_SPOT_VENUE_ID),
+        perp_venue = json_string(BYBIT_BASIS_PERP_VENUE_ID),
+        spot_instrument = json_string(BYBIT_BASIS_SPOT_INSTRUMENT_ID),
+        perp_instrument = json_string(BYBIT_BASIS_PERP_INSTRUMENT_ID),
+        account_id = json_string(BYBIT_GUARDED_LIVE_ACCOUNT_REF),
+        venue_symbol = json_string(BASIS_SYMBOL),
+        quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
+        base_asset = json_string(BASIS_BASE_ASSET_ID),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+        quantity = json_string(&context.signal.quantity),
+        short_quantity = json_string(&short_quantity),
+        spot_client_order_id = json_string(&spot_client_order_id),
+        perp_client_order_id = json_string(&perp_client_order_id),
+        gross_bps = json_string(&context.signal.gross_bps.to_string()),
+        net_bps = json_string(&context.signal.net_bps.to_string()),
+        spot_ask = json_string(&context.spot_ask),
+        spot_bid = json_string(&context.spot_bid),
+        spot_bid_size = json_string(&context.spot_bid_size),
+        spot_ask_size = json_string(&context.spot_ask_size),
+        perp_ask = json_string(&context.perp_ask),
+        perp_bid = json_string(&context.perp_bid),
+        perp_bid_size = json_string(&context.perp_bid_size),
+        perp_ask_size = json_string(&context.perp_ask_size),
+        last_funding_rate = json_string(&context.last_funding_rate),
+        expected_profit_usd = json_string(&context.signal.expected_profit_usd),
+        fee_estimate_usd = json_string(&context.signal.fee_estimate_usd),
+        slippage_estimate_usd = json_string(&context.signal.slippage_estimate_usd),
+        funding_summary = json_string(&format!(
+            "lastFundingRate={}, mark_price={}, index_price={}, nextFundingTimeMs={}",
+            context.last_funding_rate,
+            context.mark_price,
+            context.index_price,
+            context.next_funding_time_ms
+        )),
+    );
+    Ok(from_json_strict::<CandidatePortfolioTransition>(
+        &candidate_json,
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn bybit_basis_guarded_live_manual_risk_decision(
+    context: &BinanceBasisGuardedLiveSignalContext,
+    evaluated_at: &str,
+    min_net_bps: i128,
+) -> RuntimeResult<RiskDecision> {
+    let risk_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "decision_id": "risk:trans:bybit-basis-guarded-live-auto-001",
+  "transition_id": {transition_id},
+  "evaluated_at": {evaluated_at},
+  "decision": "RequiresManualApproval",
+  "policy_version": "risk-policy:bybit-basis-guarded-live-auto-v1",
+  "policy_hash": "hash:bybit-basis-guarded-live-auto-v1",
+  "policy_signature_ref": "sigref:risk-policy-unsigned",
+  "input_state_ref": "state:bybit-basis-guarded-live-private-redacted",
+  "checks": [
+    {{
+      "check_id": "check:bybit-basis-live:public-data-freshness",
+      "check_type": "DataFreshness",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": "5000", "unit": "ms"}},
+      "observed": {{"string_value": {observed_at}, "unit": "timestamp"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Bybit spot/linear public ticker data is present for this fresh automatic basis signal."
+    }},
+    {{
+      "check_id": "check:bybit-basis-live:net-basis",
+      "check_type": "StrategyExposureLimit",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": {min_net_bps}, "unit": "bps"}},
+      "observed": {{"decimal_value": {net_bps}, "unit": "bps"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Public basis signal net_bps passed the automatic strategy threshold before private checks."
+    }},
+    {{
+      "check_id": "check:bybit-basis-live:manual-gate",
+      "check_type": "OneLegExecutionRisk",
+      "status": "Warning",
+      "severity": "Warn",
+      "observed": {{"string_value": "two-leg basis live order path requires guarded approval fact", "unit": "manual_gate"}},
+      "reason_code": "REQUIRES_MANUAL_APPROVAL",
+      "detail": "Spot buy and linear perp short must share the same plan_hash and still pass private balance, kill switch and execution gates."
+    }},
+    {{
+      "check_id": "check:bybit-basis-live:notional-cap",
+      "check_type": "StrategyExposureLimit",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": {notional}, "unit": "USDT"}},
+      "observed": {{"decimal_value": {notional}, "unit": "USDT"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Each leg uses the configured small notional cap."
+    }}
+  ],
+  "constraints": [
+    {{
+      "constraint_id": "constraint:bybit-basis-live:max-notional",
+      "constraint_type": "MaxNotional",
+      "field_path": "$.required_capital.asset_requirements",
+      "limit": {{"decimal_value": {notional}, "unit": "USDT"}}
+    }},
+    {{
+      "constraint_id": "constraint:bybit-basis-live:manual-approval",
+      "constraint_type": "RequiresManualApproval",
+      "field_path": "$.decision",
+      "limit": {{"string_value": "automatic guarded approval must reference the same plan_hash", "unit": "approval_requirement"}}
+    }}
+  ],
+  "reason_codes": ["REQUIRES_MANUAL_APPROVAL"],
+  "detail": "Automatic Bybit basis signal is a two-leg arbitrage candidate, but dispatch remains gated by same-plan approval, private balances, kill switch, permissions, confirmation and reconciliation."
+}}"#,
+        transition_id = json_string(BYBIT_BASIS_LIVE_TRANSITION_ID),
         evaluated_at = json_string(evaluated_at),
         observed_at = json_string(&context.observed_at),
         min_net_bps = json_string(&min_net_bps.to_string()),
@@ -9978,7 +11726,7 @@ fn build_binance_spot_live_adapter(
 > {
     Ok(live::BinanceSpotExecAdapter::new(
         live::BinanceExecConfig::spot(
-            VenueId::new(BASIS_SPOT_VENUE_ID)?,
+            VenueId::new(BINANCE_BASIS_SPOT_VENUE_ID)?,
             AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
             "https://api.binance.com",
             signing_policy.clone(),
@@ -9996,13 +11744,49 @@ fn build_binance_usdm_live_adapter(
 > {
     Ok(live::BinanceUsdmExecAdapter::new(
         live::BinanceExecConfig::usdm_futures(
-            VenueId::new(BASIS_PERP_VENUE_ID)?,
+            VenueId::new(BINANCE_BASIS_PERP_VENUE_ID)?,
             AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
             BINANCE_USDM_FUTURES_BASE_URL,
             signing_policy.clone(),
         )?,
         RealSigningProviderFromEnv::from_default_env()?,
         live::BinanceCurlExecTransport::default(),
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn build_bybit_spot_live_adapter(
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<
+    live::BybitSpotExecAdapter<BybitRealSigningProviderFromEnv, live::BybitCurlExecTransport>,
+> {
+    Ok(live::BybitSpotExecAdapter::new(
+        live::BybitExecConfig::spot(
+            VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?,
+            AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
+            BYBIT_REST_BASE_URL,
+            signing_policy.clone(),
+        )?,
+        BybitRealSigningProviderFromEnv::from_default_env()?,
+        live::BybitCurlExecTransport::default(),
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn build_bybit_linear_live_adapter(
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<
+    live::BybitLinearExecAdapter<BybitRealSigningProviderFromEnv, live::BybitCurlExecTransport>,
+> {
+    Ok(live::BybitLinearExecAdapter::new(
+        live::BybitExecConfig::linear_perpetual(
+            VenueId::new(BYBIT_BASIS_PERP_VENUE_ID)?,
+            AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
+            BYBIT_REST_BASE_URL,
+            signing_policy.clone(),
+        )?,
+        BybitRealSigningProviderFromEnv::from_default_env()?,
+        live::BybitCurlExecTransport::default(),
     )?)
 }
 
@@ -10077,10 +11861,52 @@ fn fetch_binance_spot_private_account_snapshot(
         ingested_at,
         scope,
         BinancePrivateAccountMarket::Spot,
-        BASIS_SPOT_VENUE_ID,
+        BINANCE_BASIS_SPOT_VENUE_ID,
         "https://api.binance.com",
         "/api/v3/account",
     )
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_bybit_unified_private_account_snapshot(
+    signing_policy: &SigningPolicy,
+    ingested_at: &UtcTimestamp,
+    scope: &str,
+) -> RuntimeResult<BinancePrivateAccountSnapshot> {
+    let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
+    let signed = signer.sign_bybit_hmac(
+        BybitHmacSigningInput::new(
+            SigningRequestId::new(format!("signing-request/bybit-live/account/{scope}"))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?,
+            AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
+            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            BybitSigningPayloadKind::QueryString,
+            "accountType=UNIFIED",
+        )?,
+        signing_policy,
+    )?;
+    let endpoint = "/v5/account/wallet-balance";
+    let raw_json = fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, endpoint, &signed)?;
+    let mut adapter = BybitPrivateAccountAdapter::new(
+        VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?,
+        AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
+        BybitPrivateAccountMarket::UnifiedAccount,
+        *ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let raw_ref = format!("bybit-private-account:{scope}:{endpoint}");
+    let batch = adapter.ingest_unified_wallet_balance_json(&raw_json, raw_ref, *ingested_at)?;
+    let balances = adapter.balances(
+        &BalanceQuery::new(VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?)
+            .for_account(AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?)
+            .for_asset(AssetId::new(BASIS_QUOTE_ASSET_ID)?),
+    )?;
+    Ok(BinancePrivateAccountSnapshot {
+        balance_event_json: to_canonical_json(&batch.balance_event),
+        balances,
+    })
 }
 
 #[cfg(feature = "live-exec")]
@@ -10094,7 +11920,7 @@ fn ensure_private_balance_covers_plan(
         .find(|leg| {
             leg.venue_id
                 .as_ref()
-                .is_some_and(|venue| venue.as_str() == BASIS_SPOT_VENUE_ID)
+                .is_some_and(|venue| venue.as_str() == BINANCE_BASIS_SPOT_VENUE_ID)
         })
         .and_then(|leg| leg.notional_usd.as_ref())
         .map(|value| value.as_str())
@@ -10351,6 +12177,107 @@ fn fetch_signed_binance_get_with_curl(
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_signed_bybit_get_with_curl(
+    base_url: &str,
+    endpoint: &str,
+    signed: &arb_signing::real::BybitSignedEndpoint,
+) -> RuntimeResult<String> {
+    let payload = signed.payload_for_transport();
+    let url = if payload.is_empty() {
+        format!("{base_url}{endpoint}")
+    } else {
+        format!("{base_url}{endpoint}?{payload}")
+    };
+    let headers = [
+        (
+            signed.api_key_header_name(),
+            signed.api_key_header_value().to_owned(),
+        ),
+        (
+            signed.timestamp_header_name(),
+            signed.timestamp_millis().to_string(),
+        ),
+        (
+            signed.signature_header_name(),
+            signed.signature_header_value().to_owned(),
+        ),
+        (
+            signed.recv_window_header_name(),
+            signed.recv_window_ms().to_string(),
+        ),
+    ];
+    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(&url)?);
+    for (name, value) in headers {
+        let header = format!("{name}: {value}");
+        config.push_str("header = \"");
+        config.push_str(&curl_config_quote_runtime(&header)?);
+        config.push_str("\"\n");
+    }
+    let mut child = Command::new("curl")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--request")
+        .arg("GET")
+        .arg("--connect-timeout")
+        .arg("10")
+        .arg("--max-time")
+        .arg("30")
+        .arg("--write-out")
+        .arg("\n__ARB_BYBIT_HTTP_STATUS__:%{http_code}")
+        .arg("--config")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot start curl for Bybit private signed GET: {error}"),
+        })?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "curl stdin unavailable for Bybit private signed GET".to_owned(),
+        })?
+        .write_all(config.as_bytes())
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot write curl config for Bybit private signed GET: {error}"),
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("curl failed for Bybit private signed GET: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(RuntimeError::LiveMarketData {
+            message: "curl failed before a reliable Bybit private HTTP response was available"
+                .to_owned(),
+        });
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let Some((body, status)) = rendered.rsplit_once("\n__ARB_BYBIT_HTTP_STATUS__:") else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Bybit private signed GET lacked HTTP status marker".to_owned(),
+        });
+    };
+    let status_code = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: "Bybit private signed GET returned malformed HTTP status".to_owned(),
+        })?;
+    if !(200..=299).contains(&status_code) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Bybit private signed GET returned HTTP {status_code}: {}",
+                response_snippet(body)
+            ),
+        });
+    }
+    Ok(body.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
 fn curl_config_quote_runtime(value: &str) -> RuntimeResult<String> {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -10485,9 +12412,9 @@ fn optional_json_string_universal(value: Option<&str>) -> String {
 }
 
 #[cfg(feature = "live-exec")]
-fn write_binance_basis_guarded_live_auto_once_artifacts(
+fn write_basis_guarded_live_auto_once_artifacts(
     output_dir: &Path,
-    report: &BinanceBasisGuardedLiveAutoOnceReport,
+    report: &BasisGuardedLiveAutoOnceReport,
     receipts: &[MutableActionReceipt],
     confirmations: &[arb_execution::PrivateOrderConfirmation],
     execution_report: Option<&ExecutionReport>,
@@ -10521,7 +12448,7 @@ fn write_binance_basis_guarded_live_auto_once_artifacts(
 }
 
 #[cfg(feature = "live-exec")]
-fn basis_auto_once_report_json(report: &BinanceBasisGuardedLiveAutoOnceReport) -> String {
+fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> String {
     format!(
         "{{\"approval_event_id\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"net_bps\":{},\"perp_bid\":{},\"perp_event_id\":{},\"planned_order_count\":{},\"plan_hash\":{},\"premium_event_id\":{},\"private_confirmation_count\":{},\"protection_actions\":[{}],\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"spot_ask\":{},\"spot_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
         optional_json_string_universal(report.approval_event_id.as_deref()),
@@ -10564,7 +12491,18 @@ fn basis_auto_once_report_json(report: &BinanceBasisGuardedLiveAutoOnceReport) -
 }
 
 #[cfg(feature = "live-exec")]
-fn basis_auto_once_report_markdown(report: &BinanceBasisGuardedLiveAutoOnceReport) -> String {
+fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> String {
+    let (title, description) = if report.strategy_id == BYBIT_BASIS_LIVE_STRATEGY_ID {
+        (
+            "Bybit Basis GuardedLive Auto Once",
+            "本文件记录 Bybit spot-linear basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 linear perp short，两腿下单需要显式实盘确认。",
+        )
+    } else {
+        (
+            "Binance Basis GuardedLive Auto Once",
+            "本文件记录 Binance spot-perp basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 USD-M perp short，两腿下单需要显式实盘确认。",
+        )
+    };
     let reasons = if report.blocking_reasons.is_empty() {
         "- none".to_owned()
     } else {
@@ -10586,9 +12524,9 @@ fn basis_auto_once_report_markdown(report: &BinanceBasisGuardedLiveAutoOnceRepor
             .join("\n")
     };
     format!(
-        r#"# Binance Basis GuardedLive Auto Once
+        r#"# {title}
 
-中文说明：本文件记录 Binance spot-perp basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 USD-M perp short，两腿下单需要显式实盘确认。
+中文说明：{description}
 
 - Symbol: {symbol}
 - Strategy: {strategy_id}
@@ -10640,6 +12578,8 @@ fn basis_auto_once_report_markdown(report: &BinanceBasisGuardedLiveAutoOnceRepor
         execution_report_status = report.execution_report_status.as_deref().unwrap_or("none"),
         protection_actions = protection_actions,
         reasons = reasons,
+        title = title,
+        description = description,
     )
 }
 
@@ -11501,7 +13441,7 @@ fn current_utc_timestamp_string() -> String {
         .unwrap_or_else(|_| "timestamp-unavailable".to_owned())
 }
 
-impl BinanceWssBookTickerQuoteSnapshot {
+impl PublicTopOfBookQuoteSnapshot {
     fn from_quote(quote: &MarketQuote) -> Self {
         let symbol = quote
             .instrument_id
@@ -11545,13 +13485,17 @@ impl BinanceWssBookTickerQuoteSnapshot {
     }
 }
 
-impl BinanceWssBookTickerMonitorSnapshot {
+impl PublicTopOfBookMonitorSnapshot {
     fn empty(symbol: &str, market: BinancePublicMarket, stream_url: &str) -> Self {
+        Self::empty_with_market(symbol, market.as_str(), stream_url)
+    }
+
+    fn empty_with_market(symbol: &str, market: &str, stream_url: &str) -> Self {
         Self {
             status: "starting".to_owned(),
             updated_at: "not-yet-updated".to_owned(),
             symbol: symbol.to_owned(),
-            market: market.as_str().to_owned(),
+            market: market.to_owned(),
             stream_url: stream_url.to_owned(),
             coordinator_status: HybridMarketDataStatus::AwaitingRestSnapshot
                 .as_str()
@@ -11577,7 +13521,7 @@ impl BinanceWssBookTickerMonitorSnapshot {
     fn record_update(&mut self, update: &HybridMarketDataUpdate) {
         self.updated_at = current_utc_timestamp_string();
         self.coordinator_status = update.status.as_str().to_owned();
-        self.status = binance_wss_monitor_status(update.status, update.fail_closed).to_owned();
+        self.status = public_wss_monitor_status(update.status, update.fail_closed).to_owned();
         self.fail_closed = update.fail_closed;
         if update.fail_closed {
             self.fail_closed_count += 1;
@@ -11596,13 +13540,13 @@ impl BinanceWssBookTickerMonitorSnapshot {
             self.wss_update_count += 1;
         }
         if let Some(quote) = &update.quote {
-            let quote_snapshot = BinanceWssBookTickerQuoteSnapshot::from_quote(quote);
+            let quote_snapshot = PublicTopOfBookQuoteSnapshot::from_quote(quote);
             self.upsert_quote_row(quote_snapshot.clone());
             self.latest_quote = Some(quote_snapshot);
         }
     }
 
-    fn upsert_quote_row(&mut self, quote: BinanceWssBookTickerQuoteSnapshot) {
+    fn upsert_quote_row(&mut self, quote: PublicTopOfBookQuoteSnapshot) {
         match self.rows.iter_mut().find(|row| row.symbol == quote.symbol) {
             Some(row) => *row = quote,
             None => self.rows.push(quote),
@@ -11624,22 +13568,26 @@ impl BinanceWssBookTickerMonitorSnapshot {
     }
 
     fn record_stream_end(&mut self) {
+        self.record_stream_end_with_label("Binance public WSS");
+    }
+
+    fn record_stream_end_with_label(&mut self, label: &str) {
         if !self.fail_closed {
             self.record_failure(
-                "Binance public WSS ended before reconnect; rebuilding from REST",
+                format!("{label} ended before reconnect; rebuilding from REST"),
                 true,
             );
             return;
         }
         if self.last_error.is_none() {
-            self.last_error = Some("Binance public WSS ended; rebuilding from REST".to_owned());
+            self.last_error = Some(format!("{label} ended; rebuilding from REST"));
         }
     }
 
     fn latest_quote_json_value(&self) -> String {
         self.latest_quote
             .as_ref()
-            .map(BinanceWssBookTickerQuoteSnapshot::to_json)
+            .map(PublicTopOfBookQuoteSnapshot::to_json)
             .unwrap_or_else(|| "null".to_owned())
     }
 
@@ -11673,7 +13621,7 @@ impl BinanceWssBookTickerMonitorSnapshot {
             self.fail_closed,
             self.rows
                 .iter()
-                .map(BinanceWssBookTickerQuoteSnapshot::to_json)
+                .map(PublicTopOfBookQuoteSnapshot::to_json)
                 .collect::<Vec<_>>()
                 .join(","),
             json_string(&self.status),
@@ -11695,7 +13643,7 @@ impl BinanceWssBookTickerMonitorSnapshot {
             self.rest_rebuild_count,
             self.rows
                 .iter()
-                .map(BinanceWssBookTickerQuoteSnapshot::to_json)
+                .map(PublicTopOfBookQuoteSnapshot::to_json)
                 .collect::<Vec<_>>()
                 .join(","),
             json_string(&self.status),
@@ -11708,7 +13656,7 @@ impl BinanceWssBookTickerMonitorSnapshot {
     }
 }
 
-fn binance_wss_monitor_status(status: HybridMarketDataStatus, fail_closed: bool) -> &'static str {
+fn public_wss_monitor_status(status: HybridMarketDataStatus, fail_closed: bool) -> &'static str {
     let status = match status {
         HybridMarketDataStatus::AwaitingRestSnapshot => "starting",
         HybridMarketDataStatus::SnapshotReady => "snapshot_ready",
@@ -11725,7 +13673,7 @@ fn binance_wss_monitor_status(status: HybridMarketDataStatus, fail_closed: bool)
 
 fn start_binance_wss_book_ticker_http_api(
     bind_addr: &str,
-    state: Arc<RwLock<BinanceWssBookTickerMonitorSnapshot>>,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
 ) -> RuntimeResult<thread::JoinHandle<()>> {
     let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
         message: format!("cannot bind Binance WSS bookTicker HTTP API on {bind_addr}: {error}"),
@@ -11743,7 +13691,7 @@ fn start_binance_wss_book_ticker_http_api(
 
 fn handle_binance_wss_book_ticker_http_connection(
     mut stream: TcpStream,
-    state: &Arc<RwLock<BinanceWssBookTickerMonitorSnapshot>>,
+    state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
 ) {
     let mut buffer = [0_u8; 8192];
     let read = match stream.read(&mut buffer) {
@@ -11763,7 +13711,7 @@ fn handle_binance_wss_book_ticker_http_connection(
 
     let snapshot = state
         .read()
-        .expect("Binance WSS monitor state lock poisoned");
+        .expect("Public WSS monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
             if snapshot.fail_closed { 503 } else { 200 },
@@ -11782,6 +13730,69 @@ fn handle_binance_wss_book_ticker_http_connection(
         (
             404,
             "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/binance-wss-book-ticker/status\",\"/api/binance-wss-book-ticker/quote\",\"/api/binance-wss-book-ticker/quotes\"]}".to_owned(),
+        )
+    };
+    let _ = write_http_json(&mut stream, status, &body);
+}
+
+fn start_bybit_wss_book_ticker_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind Bybit WSS bookTicker HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_bybit_wss_book_ticker_http_connection(stream, &state),
+                Err(error) => eprintln!("bybit-wss-book-ticker api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+fn handle_bybit_wss_book_ticker_http_connection(
+    mut stream: TcpStream,
+    state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let read = match stream.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+    let route = path.split('?').next().unwrap_or(path);
+    if method != "GET" {
+        let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
+        return;
+    }
+
+    let snapshot = state.read().expect("Bybit WSS monitor state lock poisoned");
+    let (status, body) = if route == "/health" {
+        (
+            if snapshot.fail_closed { 503 } else { 200 },
+            snapshot.health_json(),
+        )
+    } else if route == "/api/bybit-wss-book-ticker/status" {
+        (200, snapshot.to_json())
+    } else if route == "/api/bybit-wss-book-ticker/quote" {
+        (200, snapshot.quote_json())
+    } else if route == "/api/bybit-wss-book-ticker/quotes" {
+        (200, snapshot.quotes_json())
+    } else if route == "/" || route == "/dashboard" {
+        let html = bybit_wss_book_ticker_dashboard_html();
+        let _ = write_http_html(&mut stream, 200, &html);
+        return;
+    } else {
+        (
+            404,
+            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/bybit-wss-book-ticker/status\",\"/api/bybit-wss-book-ticker/quote\",\"/api/bybit-wss-book-ticker/quotes\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -12701,6 +14712,16 @@ fn binance_wss_book_ticker_dashboard_html() -> &'static str {
   </script>
 </body>
 </html>"##
+}
+
+fn bybit_wss_book_ticker_dashboard_html() -> String {
+    binance_wss_book_ticker_dashboard_html()
+        .replace("Binance public WSS", "Bybit public WSS")
+        .replace("bookTicker 实时行情", "orderbook.1 实时行情")
+        .replace(
+            "/api/binance-wss-book-ticker/",
+            "/api/bybit-wss-book-ticker/",
+        )
 }
 
 fn basis_dashboard_html() -> &'static str {
@@ -13623,6 +15644,35 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "bybit-basis-guarded-live-auto-once" {
+        let options = parse_bybit_basis_guarded_live_auto_once_args(&args[1..])?;
+        let report = run_bybit_basis_guarded_live_auto_once(options)?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: Bybit basis auto-once completed; signal_allowed={}; net_bps={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
+            report.signal_allowed,
+            report
+                .net_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            report.planned_order_count,
+            report.dispatch_attempted,
+            report.dispatch_allowed,
+            report.submitted_receipt_count,
+            report.private_confirmation_count,
+            report.protection_attempted,
+            report.protection_receipt_count,
+            report.residual_risk.as_deref().unwrap_or("none"),
+            report.blocking_reasons.len(),
+            output_note
+        ));
+    }
     if args[0] == "binance-wss-book-ticker" {
         let options = parse_binance_wss_book_ticker_args(&args[1..])?;
         let once = options.once;
@@ -13649,6 +15699,34 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         }
         return Ok(format!(
             "ok: Binance public WSS bookTicker monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
+    if args[0] == "bybit-wss-book-ticker" {
+        let options = parse_bybit_wss_book_ticker_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        if once && !is_bybit_wss_all_symbols_scope(&options.symbol) {
+            let report = run_bybit_wss_book_ticker_probe(options)?;
+            return Ok(format!(
+                "ok: Bybit public WSS orderbook.1 market={} symbol={} updates={} fail_closed={} status={} bid={} ask={} stream={}; mutable_execution_started=false",
+                report.market.as_str(),
+                report.symbol,
+                report.update_count,
+                report.fail_closed_count,
+                report.coordinator_status,
+                report.latest_best_bid.as_deref().unwrap_or("null"),
+                report.latest_best_ask.as_deref().unwrap_or("null"),
+                report.stream_url
+            ));
+        }
+        run_bybit_wss_book_ticker_monitor(options)?;
+        if once {
+            return Ok(format!(
+                "ok: ran one Bybit public WSS orderbook.1 monitor cycle; api_bind={bind_addr}; mutable_execution_started=false"
+            ));
+        }
+        return Ok(format!(
+            "ok: Bybit public WSS orderbook.1 monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
     if args[0] == "binance-basis-monitor" {
@@ -13787,7 +15865,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
                 args[0]
             ),
         });
@@ -13844,8 +15922,12 @@ fn help_text() -> String {
         "                                    Single-leg smoke path: fetch fresh Binance BTCUSDT spot quote, then dry-run or explicitly submit live",
         "  binance-basis-guarded-live-auto-once [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Binance Spot and short Binance USD-M perp after guarded live gates; live mode requires WSS monitor quotes",
+        "  bybit-basis-guarded-live-auto-once [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Two-leg basis path: buy Bybit Spot and short Bybit Linear perp after guarded live gates; live mode requires WSS monitor quotes",
         "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
+        "  bybit-wss-book-ticker [--bind 127.0.0.1:8802] [--symbol ALL_USDT|BTCUSDT] [--market spot|linear-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
+        "                                    Run Bybit public WSS orderbook.1 all-market monitor and serve /dashboard",
         "  binance-basis-monitor [--bind 127.0.0.1:8796] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
         "                                    Monitor all Binance public USDT spot/perp basis rows and serve /api/basis/status",
         "  bybit-basis-monitor [--bind 127.0.0.1:8797] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
@@ -13890,9 +15972,11 @@ struct BinancePreDispatchDryRunCliOptions {
 }
 type BinanceGuardedLiveDispatchCliOptions = BinanceGuardedLiveDispatchOptions;
 type BinanceGuardedLiveAutoOnceCliOptions = BinanceGuardedLiveAutoOnceOptions;
-type BinanceBasisGuardedLiveAutoOnceCliOptions = BinanceBasisGuardedLiveAutoOnceOptions;
+type BinanceBasisGuardedLiveAutoOnceCliOptions = BasisGuardedLiveAutoOnceOptions;
+type BybitBasisGuardedLiveAutoOnceCliOptions = BybitBasisGuardedLiveAutoOnceOptions;
 type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
 type BinanceWssBookTickerCliOptions = BinanceWssBookTickerMonitorOptions;
+type BybitWssBookTickerCliOptions = BybitWssBookTickerMonitorOptions;
 type BybitBasisMonitorCliOptions = BybitBasisMonitorOptions;
 type OkxBasisMonitorCliOptions = OkxBasisMonitorOptions;
 type HyperliquidBasisMonitorCliOptions = HyperliquidBasisMonitorOptions;
@@ -14571,7 +16655,7 @@ fn parse_binance_basis_guarded_live_auto_once_args(
         index += 1;
     }
 
-    Ok(BinanceBasisGuardedLiveAutoOnceOptions {
+    Ok(BasisGuardedLiveAutoOnceOptions {
         config_path,
         output_dir,
         min_net_bps,
@@ -14582,6 +16666,21 @@ fn parse_binance_basis_guarded_live_auto_once_args(
         private_order_events_dir,
         execute_live,
         acknowledge_basis_live_orders,
+    })
+}
+
+fn parse_bybit_basis_guarded_live_auto_once_args(
+    args: &[String],
+) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceCliOptions> {
+    parse_binance_basis_guarded_live_auto_once_args(args).map_err(|error| match error {
+        RuntimeError::Module { module, message } => RuntimeError::Module {
+            module,
+            message: message.replace(
+                "binance-basis-guarded-live-auto-once",
+                "bybit-basis-guarded-live-auto-once",
+            ),
+        },
+        other => other,
     })
 }
 
@@ -14650,6 +16749,74 @@ fn parse_binance_wss_book_ticker_args(
     }
 
     validate_binance_wss_probe_options(&options)?;
+    Ok(options)
+}
+
+fn parse_bybit_wss_book_ticker_args(
+    args: &[String],
+) -> RuntimeResult<BybitWssBookTickerCliOptions> {
+    let mut options = BybitWssBookTickerProbeOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires host:port"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                options.symbol = value.clone();
+            }
+            "--market" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--market requires spot or linear-perp"));
+                };
+                options.market = parse_bybit_public_wss_market(value)?;
+            }
+            "--updates" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--updates requires a value"));
+                };
+                options.updates = value
+                    .parse::<usize>()
+                    .map_err(|_| cli_arg_error("--updates must be an integer"))?;
+            }
+            "--reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reconnect-delay-secs requires a value"));
+                };
+                options.reconnect_delay_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--reconnect-delay-secs must be an integer"))?;
+            }
+            "--once" => {
+                options.once = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown bybit-wss-book-ticker option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected bybit-wss-book-ticker positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_bybit_wss_probe_options(&options)?;
     Ok(options)
 }
 
@@ -15184,7 +17351,7 @@ mod tests {
     fn binance_wss_test_market_state(
         symbol: &str,
         all_symbols_scope: bool,
-    ) -> BinanceWssBookTickerAllMarketState {
+    ) -> PublicTopOfBookAllMarketState {
         let market = BinancePublicMarket::Spot;
         let venue_id = binance_public_wss_venue_id(market).expect("venue id");
         let instrument = binance_public_wss_instrument(symbol, market).expect("instrument");
@@ -15201,9 +17368,54 @@ mod tests {
         let mut local_sequences = BTreeMap::new();
         local_sequences.insert(symbol.to_owned(), 1);
 
-        BinanceWssBookTickerAllMarketState {
+        PublicTopOfBookAllMarketState {
             venue_id,
             stream_url: "wss://example.test/ws".to_owned(),
+            subscribe_args: Vec::new(),
+            all_symbols_scope,
+            coordinators,
+            local_sequences,
+            last_exchange_update_ids: BTreeMap::new(),
+            rest_updates: Vec::new(),
+        }
+    }
+
+    fn bybit_wss_test_market_state(
+        symbol: &str,
+        all_symbols_scope: bool,
+    ) -> PublicTopOfBookAllMarketState {
+        let market = BybitPublicMarket::Spot;
+        let venue_id = bybit_public_wss_venue_id(market).expect("venue id");
+        let instrument = bybit_public_wss_instrument(symbol, market).expect("instrument");
+        let started_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument.instrument_id.clone(),
+            started_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )
+        .expect("coordinator");
+        let mut rest_quote = bybit_wss_rest_quote_from_row(
+            &monitor_book_ticker_row(symbol),
+            &venue_id,
+            &instrument,
+            market,
+            started_at,
+        )
+        .expect("rest quote");
+        rest_quote.source_sequence = Some("1".to_owned());
+        coordinator
+            .apply(HybridMarketDataInput::RestSnapshot { quote: rest_quote })
+            .expect("rest snapshot");
+        let mut coordinators = BTreeMap::new();
+        coordinators.insert(symbol.to_owned(), coordinator);
+        let mut local_sequences = BTreeMap::new();
+        local_sequences.insert(symbol.to_owned(), 1);
+
+        PublicTopOfBookAllMarketState {
+            venue_id,
+            stream_url: BYBIT_SPOT_PUBLIC_WSS_BASE_URL.to_owned(),
+            subscribe_args: vec![bybit_wss_orderbook_topic(symbol)],
             all_symbols_scope,
             coordinators,
             local_sequences,
@@ -15346,6 +17558,88 @@ mod tests {
     }
 
     #[test]
+    fn bybit_wss_args_parse_market_and_defaults() {
+        let args = vec![
+            "--bind".to_owned(),
+            "127.0.0.1:9902".to_owned(),
+            "--symbol".to_owned(),
+            "ethusdt".to_owned(),
+            "--market".to_owned(),
+            "linear-perp".to_owned(),
+            "--updates".to_owned(),
+            "4".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let options = parse_bybit_wss_book_ticker_args(&args).expect("options");
+
+        assert_eq!(options.bind_addr, "127.0.0.1:9902");
+        assert_eq!(options.symbol, "ethusdt");
+        assert_eq!(options.market, BybitPublicMarket::LinearPerpetual);
+        assert_eq!(options.updates, 4);
+        assert!(options.once);
+        assert_eq!(
+            parse_bybit_wss_book_ticker_args(&[])
+                .expect("defaults")
+                .symbol,
+            BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        );
+    }
+
+    #[test]
+    fn bybit_wss_orderbook_message_updates_quote() {
+        let mut state = bybit_wss_test_market_state("BTCUSDT", false);
+        let raw = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1778630400123,"data":{"s":"BTCUSDT","b":[["43250.10","1.00000000"]],"a":[["43251.20","1.50000000"]],"u":400900301,"seq":9001}}"#;
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+
+        let update =
+            apply_bybit_wss_book_ticker_text(raw, ingested_at, BybitPublicMarket::Spot, &mut state)
+                .expect("bybit wss update")
+                .expect("quote update");
+
+        let quote = update.quote.expect("quote");
+        assert_eq!(quote.best_bid.expect("bid").to_string(), "43250.10");
+        assert_eq!(quote.ask_size.expect("ask size").to_string(), "1.50000000");
+        assert_eq!(quote.source_sequence.as_deref(), Some("2"));
+        assert_eq!(
+            quote.source_event_id.as_deref(),
+            Some("bybit:wss-book-ticker:spot:BTCUSDT:400900301")
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_wss_monitor_quote_converts_to_linear_ticker_with_premium_fields() {
+        let quote = PublicTopOfBookQuoteSnapshot {
+            symbol: "BTCUSDT".to_owned(),
+            venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+            instrument_id: BYBIT_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+            best_bid: Some("43250.10".to_owned()),
+            best_ask: Some("43251.20".to_owned()),
+            bid_size: Some("1.0".to_owned()),
+            ask_size: Some("1.5".to_owned()),
+            source_sequence: Some("2".to_owned()),
+            source_event_id: Some("bybit:wss-book-ticker:linear-perp:BTCUSDT:400900301".to_owned()),
+            observed_at: "2026-05-13T00:00:00.123Z".to_owned(),
+            ingested_at: "2026-05-13T00:00:00.123Z".to_owned(),
+            freshness_status: "Fresh".to_owned(),
+        };
+        let raw_linear_rest = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","bid1Price":"43000.00","bid1Size":"0.5","ask1Price":"43001.00","ask1Size":"0.6","markPrice":"43249.90","indexPrice":"43240.00","fundingRate":"0.0001","nextFundingTime":"1778716800000"}]},"retExtInfo":{},"time":1778688000123}"#;
+
+        let ticker = public_wss_monitor_quote_to_bybit_ticker_json(
+            &quote,
+            BybitPublicMarket::LinearPerpetual,
+            Some(raw_linear_rest),
+        )
+        .expect("ticker json");
+
+        assert!(ticker.contains("\"category\":\"linear\""));
+        assert!(ticker.contains("\"bid1Price\":\"43250.10\""));
+        assert!(ticker.contains("\"markPrice\":\"43249.90\""));
+        assert!(ticker.contains("\"fundingRate\":\"0.0001\""));
+    }
+
+    #[test]
     fn binance_wss_book_ticker_all_market_stream_urls_match_market_shape() {
         let symbols = vec!["BTCUSDT".to_owned(), "ETHUSDT".to_owned()];
 
@@ -15364,12 +17658,12 @@ mod tests {
 
     #[test]
     fn binance_wss_monitor_snapshot_exposes_health_quote_and_counters() {
-        let mut snapshot = BinanceWssBookTickerMonitorSnapshot::empty(
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty(
             "BTCUSDT",
             BinancePublicMarket::Spot,
             "wss://example.test/ws/btcusdt@bookTicker",
         );
-        snapshot.latest_quote = Some(BinanceWssBookTickerQuoteSnapshot {
+        snapshot.latest_quote = Some(PublicTopOfBookQuoteSnapshot {
             symbol: "BTCUSDT".to_owned(),
             venue_id: "venue:BINANCE-SPOT".to_owned(),
             instrument_id: "inst:BINANCE:BTCUSDT:SPOT".to_owned(),
@@ -15423,17 +17717,18 @@ mod tests {
           }]
         }"#;
 
-        let quote = parse_binance_wss_monitor_quote_for_basis(
+        let quote = parse_public_wss_monitor_quote_for_basis(
             raw,
             "http://127.0.0.1:8801/api/binance-wss-book-ticker/status",
             BASIS_SYMBOL,
-            BinancePublicMarket::Spot,
-            BASIS_SPOT_VENUE_ID,
-            BASIS_SPOT_INSTRUMENT_ID,
+            BinancePublicMarket::Spot.as_str(),
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
             UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at"),
         )
         .expect("monitor quote");
-        let book = binance_wss_monitor_quote_to_book_ticker_json(&quote).expect("book ticker json");
+        let book =
+            public_wss_monitor_quote_to_binance_book_ticker_json(&quote).expect("book ticker json");
 
         assert!(book.contains("\"symbol\":\"BTCUSDT\""));
         assert!(book.contains("\"bidPrice\":\"100.01\""));
@@ -15466,13 +17761,13 @@ mod tests {
           }
         }"#;
 
-        let error = parse_binance_wss_monitor_quote_for_basis(
+        let error = parse_public_wss_monitor_quote_for_basis(
             raw,
             "http://127.0.0.1:8801/api/binance-wss-book-ticker/status",
             BASIS_SYMBOL,
-            BinancePublicMarket::Spot,
-            BASIS_SPOT_VENUE_ID,
-            BASIS_SPOT_INSTRUMENT_ID,
+            BinancePublicMarket::Spot.as_str(),
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
             UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at"),
         )
         .expect_err("REST bootstrap quote must be rejected for live execution");
@@ -16080,7 +18375,7 @@ mod tests {
             premium,
             "test:binance-usdm-premium",
             ingested_at,
-            BinanceBasisGuardedLiveAutoOnceOptions {
+            BasisGuardedLiveAutoOnceOptions {
                 config_path,
                 output_dir: Some(root.path().join("basis-auto")),
                 min_net_bps: 5,
@@ -16118,11 +18413,64 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bybit_basis_guarded_live_auto_once_builds_two_leg_dry_run() {
+        let spot = r#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"ETHUSDT","bid1Price":"49.90","bid1Size":"3.0","ask1Price":"50.00","ask1Size":"4.0"},{"symbol":"BTCUSDT","bid1Price":"99.90","bid1Size":"1.0","ask1Price":"100.00","ask1Size":"2.0"}]},"retExtInfo":{},"time":1778630400000}"#;
+        let linear = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","bid1Price":"101.00","bid1Size":"1.5","ask1Price":"101.10","ask1Size":"2.5","markPrice":"101.00","indexPrice":"100.00","fundingRate":"0.00010000","nextFundingTime":"1778659200000"}]},"retExtInfo":{},"time":1778630400000}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_bybit_basis_guarded_live_auto_once_from_json(
+            spot,
+            "test:bybit-spot-ticker",
+            linear,
+            "test:bybit-linear-ticker",
+            ingested_at,
+            BybitBasisGuardedLiveAutoOnceOptions {
+                config_path,
+                output_dir: Some(root.path().join("bybit-basis-auto")),
+                min_net_bps: 5,
+                max_spot_ask: Some("101.00".to_owned()),
+                min_perp_bid: Some("100.50".to_owned()),
+                spot_wss_monitor_url: None,
+                perp_wss_monitor_url: None,
+                private_order_events_dir: None,
+                execute_live: false,
+                acknowledge_basis_live_orders: false,
+            },
+        )
+        .expect("Bybit basis auto once dry run");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.strategy_id, BYBIT_BASIS_LIVE_STRATEGY_ID);
+        assert_eq!(report.planned_order_count, 2);
+        assert!(report.manual_gate_released);
+        assert!(!report.dispatch_attempted);
+        assert!(!report.dispatch_allowed);
+        assert!(report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("dry-run mode")));
+        let output_dir = report.output_dir.as_ref().expect("output dir");
+        let plan_preview =
+            read_utf8(&output_dir.join("preview/plan_preview.json")).expect("plan preview");
+        assert!(plan_preview.contains(BYBIT_BASIS_SPOT_VENUE_ID));
+        assert!(plan_preview.contains(BYBIT_BASIS_PERP_VENUE_ID));
+        assert!(plan_preview.contains("\"basis_leg_role\":\"spot_buy\""));
+        assert!(plan_preview.contains("\"basis_leg_role\":\"perp_short\""));
+        let report_md =
+            read_utf8(&output_dir.join("basis_auto_once_report.md")).expect("auto report markdown");
+        assert!(report_md.contains("Bybit Basis GuardedLive Auto Once"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_basis_live_dispatch_unwinds_spot_when_perp_rejected_after_spot_fill() {
         let spot = test_basis_planned_order(
             "spot_buy",
-            BASIS_SPOT_VENUE_ID,
-            BASIS_SPOT_INSTRUMENT_ID,
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
             OrderSide::Buy,
             "0.100",
             "100.00",
@@ -16131,8 +18479,8 @@ mod tests {
         );
         let perp = test_basis_planned_order(
             "perp_short",
-            BASIS_PERP_VENUE_ID,
-            BASIS_PERP_INSTRUMENT_ID,
+            BINANCE_BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_INSTRUMENT_ID,
             OrderSide::Sell,
             "0.100",
             "101.00",
@@ -16147,29 +18495,29 @@ mod tests {
             vec![
                 Ok(test_mutable_receipt(
                     MutableActionKind::SubmitOrder,
-                    BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
                     "spot-submit",
                 )),
                 Ok(test_mutable_receipt(
                     MutableActionKind::SubmitOrder,
-                    BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
                     "spot-unwind",
                 )),
             ],
             vec![],
             vec![
                 Ok(test_private_order_update(
-                    arb_venue_exec::BinancePrivateOrderMarket::Spot,
-                    BASIS_SPOT_VENUE_ID,
-                    BASIS_SPOT_INSTRUMENT_ID,
+                    arb_venue_exec::PrivateOrderMarket::Spot,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_INSTRUMENT_ID,
                     OrderConfirmationStatus::Filled,
                     Some("0.100"),
                     Some(OrderSide::Buy),
                 )),
                 Ok(test_private_order_update(
-                    arb_venue_exec::BinancePrivateOrderMarket::Spot,
-                    BASIS_SPOT_VENUE_ID,
-                    BASIS_SPOT_INSTRUMENT_ID,
+                    arb_venue_exec::PrivateOrderMarket::Spot,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_INSTRUMENT_ID,
                     OrderConfirmationStatus::Filled,
                     Some("0.100"),
                     Some(OrderSide::Sell),
@@ -16178,7 +18526,7 @@ mod tests {
         );
         let mut usdm_adapter = ScriptedBasisLiveAdapter::new(
             vec![Err(VenueExecError::ExternalRejected {
-                venue_id: VenueId::new(BASIS_PERP_VENUE_ID).expect("venue"),
+                venue_id: VenueId::new(BINANCE_BASIS_PERP_VENUE_ID).expect("venue"),
                 endpoint: "/fapi/v1/order".to_owned(),
                 status_code: 400,
                 reason: "fixture perp reject".to_owned(),
@@ -16187,16 +18535,19 @@ mod tests {
             vec![],
         );
 
-        let outcome = execute_binance_basis_live_dispatch(
+        let outcome = execute_basis_live_dispatch(
             &dispatch_plan,
             &mut spot_adapter,
             &mut usdm_adapter,
-            BinanceBasisLiveDispatchContext {
+            BasisLiveDispatchContext {
                 plan: None,
                 generated_at: "2026-05-13T00:00:00Z",
                 spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
                 protection_suffix: "1778630400",
                 private_order_events: None,
+                spot_market: PrivateOrderMarket::Spot,
+                perp_market: PrivateOrderMarket::UsdmFutures,
+                order_query_event_prefix: "event:binance:basis-order-query",
             },
         )
         .expect("protected dispatch outcome");
@@ -16232,8 +18583,8 @@ mod tests {
     fn binance_basis_live_dispatch_prefers_private_stream_confirmations() {
         let spot = test_basis_planned_order(
             "spot_buy",
-            BASIS_SPOT_VENUE_ID,
-            BASIS_SPOT_INSTRUMENT_ID,
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
             OrderSide::Buy,
             "0.100",
             "100.00",
@@ -16242,8 +18593,8 @@ mod tests {
         );
         let perp = test_basis_planned_order(
             "perp_short",
-            BASIS_PERP_VENUE_ID,
-            BASIS_PERP_INSTRUMENT_ID,
+            BINANCE_BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_INSTRUMENT_ID,
             OrderSide::Sell,
             "0.100",
             "101.00",
@@ -16265,12 +18616,11 @@ mod tests {
             r#"{"e":"ORDER_TRADE_UPDATE","E":1778630400000,"o":{"s":"BTCUSDT","c":"rvbP1778630400","S":"SELL","x":"TRADE","X":"FILLED","i":202,"l":"0.100","z":"0.100","L":"101.00","n":"0.01","N":"USDT","T":1778630400000}}"#,
         )
         .expect("write usdm private stream");
-        let private_events =
-            BinancePrivateOrderEventStore::from_dir(temp.path()).expect("private events");
+        let private_events = PrivateOrderEventStore::from_dir(temp.path()).expect("private events");
         let mut spot_adapter = ScriptedBasisLiveAdapter::new(
             vec![Ok(test_mutable_receipt(
                 MutableActionKind::SubmitOrder,
-                BASIS_SPOT_VENUE_ID,
+                BINANCE_BASIS_SPOT_VENUE_ID,
                 "spot-submit",
             ))],
             vec![],
@@ -16279,23 +18629,26 @@ mod tests {
         let mut usdm_adapter = ScriptedBasisLiveAdapter::new(
             vec![Ok(test_mutable_receipt(
                 MutableActionKind::SubmitOrder,
-                BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_VENUE_ID,
                 "perp-submit",
             ))],
             vec![],
             vec![],
         );
 
-        let outcome = execute_binance_basis_live_dispatch(
+        let outcome = execute_basis_live_dispatch(
             &dispatch_plan,
             &mut spot_adapter,
             &mut usdm_adapter,
-            BinanceBasisLiveDispatchContext {
+            BasisLiveDispatchContext {
                 plan: None,
                 generated_at: "2026-05-13T00:00:00Z",
                 spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
                 protection_suffix: "1778630400",
                 private_order_events: Some(&private_events),
+                spot_market: PrivateOrderMarket::Spot,
+                perp_market: PrivateOrderMarket::UsdmFutures,
+                order_query_event_prefix: "event:binance:basis-order-query",
             },
         )
         .expect("private stream dispatch outcome");
@@ -16303,6 +18656,195 @@ mod tests {
         assert_eq!(outcome.primary_submit_receipt_count, 2);
         assert!(outcome.blocking_reasons.is_empty());
         assert_eq!(outcome.confirmations.len(), 2);
+        assert!(outcome
+            .confirmations
+            .iter()
+            .all(|confirmation| confirmation.source
+                == arb_execution::PrivateOrderConfirmationSource::PrivateStream));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_basis_live_dispatch_uses_bybit_order_query_markets() {
+        let spot = test_basis_planned_order_for_account(
+            "spot_buy",
+            BYBIT_BASIS_SPOT_VENUE_ID,
+            BYBIT_BASIS_SPOT_INSTRUMENT_ID,
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvbS1778630400",
+            "idem:test:bybit-basis:spot",
+        );
+        let linear = test_basis_planned_order_for_account(
+            "perp_short",
+            BYBIT_BASIS_PERP_VENUE_ID,
+            BYBIT_BASIS_PERP_INSTRUMENT_ID,
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvbP1778630400",
+            "idem:test:bybit-basis:linear",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:bybit-basis-dispatch".to_owned(),
+            requests: vec![spot, linear],
+        };
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BYBIT_BASIS_SPOT_VENUE_ID,
+                "bybit-spot-submit",
+            ))],
+            vec![],
+            vec![Ok(test_private_order_update(
+                arb_venue_exec::PrivateOrderMarket::BybitSpot,
+                BYBIT_BASIS_SPOT_VENUE_ID,
+                BYBIT_BASIS_SPOT_INSTRUMENT_ID,
+                OrderConfirmationStatus::Filled,
+                Some("0.100"),
+                Some(OrderSide::Buy),
+            ))],
+        );
+        let mut linear_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BYBIT_BASIS_PERP_VENUE_ID,
+                "bybit-linear-submit",
+            ))],
+            vec![],
+            vec![Ok(test_private_order_update(
+                arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                OrderConfirmationStatus::Filled,
+                Some("0.100"),
+                Some(OrderSide::Sell),
+            ))],
+        );
+
+        let outcome = execute_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut linear_adapter,
+            BasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630400",
+                private_order_events: None,
+                spot_market: PrivateOrderMarket::BybitSpot,
+                perp_market: PrivateOrderMarket::BybitLinear,
+                order_query_event_prefix: "event:bybit:basis-order-query",
+            },
+        )
+        .expect("Bybit dispatch outcome");
+
+        assert_eq!(outcome.primary_submit_receipt_count, 2);
+        assert!(outcome.blocking_reasons.is_empty());
+        assert_eq!(outcome.confirmations.len(), 2);
+        assert_eq!(spot_adapter.confirmed.len(), 1);
+        assert_eq!(linear_adapter.confirmed.len(), 1);
+        assert!(spot_adapter.confirmed[0]
+            .source_event_id
+            .starts_with("event:bybit:basis-order-query:spot-after-submit"));
+        assert!(linear_adapter.confirmed[0]
+            .source_event_id
+            .starts_with("event:bybit:basis-order-query:perp-after-submit"));
+        assert_eq!(
+            spot_adapter.confirmed[0].account_id.as_str(),
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF
+        );
+        assert_eq!(
+            linear_adapter.confirmed[0].venue_id.as_str(),
+            BYBIT_BASIS_PERP_VENUE_ID
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_basis_live_dispatch_prefers_bybit_private_stream_confirmations() {
+        let spot = test_basis_planned_order_for_account(
+            "spot_buy",
+            BYBIT_BASIS_SPOT_VENUE_ID,
+            BYBIT_BASIS_SPOT_INSTRUMENT_ID,
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvbS1778630400",
+            "idem:test:bybit-basis:spot-stream",
+        );
+        let linear = test_basis_planned_order_for_account(
+            "perp_short",
+            BYBIT_BASIS_PERP_VENUE_ID,
+            BYBIT_BASIS_PERP_INSTRUMENT_ID,
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvbP1778630400",
+            "idem:test:bybit-basis:linear-stream",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:bybit-basis-private-stream".to_owned(),
+            requests: vec![spot, linear],
+        };
+        let temp = RuntimeTempDir::new().expect("private events dir");
+        write_utf8(
+            temp.path().join("bybit_spot_order.jsonl"),
+            r#"{"topic":"order","creationTime":1778630400000,"data":[{"category":"spot","symbol":"BTCUSDT","orderId":"301","orderLinkId":"rvbS1778630400","side":"Buy","orderStatus":"Filled","cumExecQty":"0.100","avgPrice":"100.00","cumExecFee":"0.01","feeCurrency":"USDT","updatedTime":"1778630400000"}]}"#,
+        )
+        .expect("write bybit spot private stream");
+        write_utf8(
+            temp.path().join("bybit_linear_order.jsonl"),
+            r#"{"topic":"order","creationTime":1778630400000,"data":[{"category":"linear","symbol":"BTCUSDT","orderId":"302","orderLinkId":"rvbP1778630400","side":"Sell","orderStatus":"Filled","cumExecQty":"0.100","avgPrice":"101.00","cumExecFee":"0.01","feeCurrency":"USDT","updatedTime":"1778630400000"}]}"#,
+        )
+        .expect("write bybit linear private stream");
+        let private_events = PrivateOrderEventStore::from_dir(temp.path()).expect("private events");
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BYBIT_BASIS_SPOT_VENUE_ID,
+                "bybit-spot-submit",
+            ))],
+            vec![],
+            vec![],
+        );
+        let mut linear_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BYBIT_BASIS_PERP_VENUE_ID,
+                "bybit-linear-submit",
+            ))],
+            vec![],
+            vec![],
+        );
+
+        let outcome = execute_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut linear_adapter,
+            BasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630400",
+                private_order_events: Some(&private_events),
+                spot_market: PrivateOrderMarket::BybitSpot,
+                perp_market: PrivateOrderMarket::BybitLinear,
+                order_query_event_prefix: "event:bybit:basis-order-query",
+            },
+        )
+        .expect("Bybit private stream dispatch outcome");
+
+        assert_eq!(outcome.primary_submit_receipt_count, 2);
+        assert!(outcome.blocking_reasons.is_empty());
+        assert_eq!(outcome.confirmations.len(), 2);
+        assert!(spot_adapter.confirmed.is_empty());
+        assert!(linear_adapter.confirmed.is_empty());
         assert!(outcome
             .confirmations
             .iter()
@@ -16322,6 +18864,7 @@ mod tests {
             std::collections::VecDeque<Result<PrivateOrderUpdate, arb_venue_exec::VenueExecError>>,
         submitted: Vec<SubmitOrderRequest>,
         cancelled: Vec<CancelOrderRequest>,
+        confirmed: Vec<ConfirmOrderStatusRequest>,
     }
 
     #[cfg(feature = "live-exec")]
@@ -16337,6 +18880,7 @@ mod tests {
                 confirm_results: confirm_results.into(),
                 submitted: Vec::new(),
                 cancelled: Vec::new(),
+                confirmed: Vec::new(),
             }
         }
     }
@@ -16371,8 +18915,9 @@ mod tests {
     impl ConfirmOrderStatus for ScriptedBasisLiveAdapter {
         fn confirm_order_status(
             &mut self,
-            _request: ConfirmOrderStatusRequest,
+            request: ConfirmOrderStatusRequest,
         ) -> arb_venue_exec::VenueExecResult<PrivateOrderUpdate> {
+            self.confirmed.push(request);
             self.confirm_results
                 .pop_front()
                 .expect("scripted confirmation result")
@@ -16391,6 +18936,32 @@ mod tests {
         client_order_id: &str,
         idempotency_key: &str,
     ) -> PlannedSubmitOrder {
+        test_basis_planned_order_for_account(
+            basis_leg_role,
+            venue_id,
+            instrument_id,
+            BINANCE_GUARDED_LIVE_ACCOUNT_REF,
+            side,
+            quantity,
+            limit_price,
+            client_order_id,
+            idempotency_key,
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[allow(clippy::too_many_arguments)]
+    fn test_basis_planned_order_for_account(
+        basis_leg_role: &str,
+        venue_id: &str,
+        instrument_id: &str,
+        account_id: &str,
+        side: OrderSide,
+        quantity: &str,
+        limit_price: &str,
+        client_order_id: &str,
+        idempotency_key: &str,
+    ) -> PlannedSubmitOrder {
         PlannedSubmitOrder {
             plan_leg_id: format!("pleg:test:{basis_leg_role}"),
             venue_symbol: BASIS_SYMBOL.to_owned(),
@@ -16398,7 +18969,7 @@ mod tests {
             notional_usd: Amount::from_str("10.00").expect("notional"),
             request: SubmitOrderRequest::new(
                 VenueId::new(venue_id).expect("venue"),
-                AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF).expect("account"),
+                AccountId::new(account_id).expect("account"),
                 InstrumentId::new(instrument_id).expect("instrument"),
                 side,
                 MutableOrderType::Limit,
@@ -16441,7 +19012,7 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     fn test_private_order_update(
-        market: arb_venue_exec::BinancePrivateOrderMarket,
+        market: arb_venue_exec::PrivateOrderMarket,
         venue_id: &str,
         instrument_id: &str,
         status: OrderConfirmationStatus,
@@ -16450,16 +19021,22 @@ mod tests {
     ) -> PrivateOrderUpdate {
         let quantity = filled_quantity.map(|value| Quantity::from_str(value).expect("quantity"));
         let order_id_prefix = match market {
-            arb_venue_exec::BinancePrivateOrderMarket::Spot => "binance:spot",
-            arb_venue_exec::BinancePrivateOrderMarket::UsdmFutures => "binance:usdm",
-            arb_venue_exec::BinancePrivateOrderMarket::BybitSpot => "bybit-spot",
-            arb_venue_exec::BinancePrivateOrderMarket::BybitLinear => "bybit-linear",
+            arb_venue_exec::PrivateOrderMarket::Spot => "binance:spot",
+            arb_venue_exec::PrivateOrderMarket::UsdmFutures => "binance:usdm",
+            arb_venue_exec::PrivateOrderMarket::BybitSpot => "bybit-spot",
+            arb_venue_exec::PrivateOrderMarket::BybitLinear => "bybit-linear",
+        };
+        let account_id = match market {
+            arb_venue_exec::PrivateOrderMarket::Spot
+            | arb_venue_exec::PrivateOrderMarket::UsdmFutures => BINANCE_GUARDED_LIVE_ACCOUNT_REF,
+            arb_venue_exec::PrivateOrderMarket::BybitSpot
+            | arb_venue_exec::PrivateOrderMarket::BybitLinear => BYBIT_GUARDED_LIVE_ACCOUNT_REF,
         };
         PrivateOrderUpdate {
             source: OrderConfirmationSource::OrderQuery,
             market,
             venue_id: VenueId::new(venue_id).expect("venue"),
-            account_id: AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF).expect("account"),
+            account_id: AccountId::new(account_id).expect("account"),
             instrument_id: InstrumentId::new(instrument_id).expect("instrument"),
             symbol: BASIS_SYMBOL.to_owned(),
             source_event_id: format!("event:test:order-update:{}", status.as_str()),
@@ -16503,7 +19080,7 @@ mod tests {
             premium,
             "test:binance-usdm-premium",
             ingested_at,
-            BinanceBasisGuardedLiveAutoOnceOptions {
+            BasisGuardedLiveAutoOnceOptions {
                 config_path: root.path().join("unused.yaml"),
                 output_dir: Some(root.path().join("basis-auto")),
                 min_net_bps: 5,

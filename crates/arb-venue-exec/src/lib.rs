@@ -277,17 +277,17 @@ impl OrderConfirmationStatus {
 
 /// 私有订单市场。
 ///
-/// 中文说明：历史上该枚举先服务 Binance，因此保留原类型名；新增场所只能用于
-/// 私有确认和执行适配边界，不能被策略或风控层直接依赖。
+/// 中文说明：该枚举只描述执行适配和私有确认边界上的市场类型，不能被策略或
+/// 风控层直接依赖。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BinancePrivateOrderMarket {
+pub enum PrivateOrderMarket {
     Spot,
     UsdmFutures,
     BybitSpot,
     BybitLinear,
 }
 
-impl BinancePrivateOrderMarket {
+impl PrivateOrderMarket {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Spot => "Spot",
@@ -339,7 +339,7 @@ pub struct PrivateOrderFillUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrivateOrderUpdate {
     pub source: OrderConfirmationSource,
-    pub market: BinancePrivateOrderMarket,
+    pub market: PrivateOrderMarket,
     pub venue_id: VenueId,
     pub account_id: AccountId,
     pub instrument_id: InstrumentId,
@@ -1458,7 +1458,7 @@ pub fn parse_binance_spot_execution_report_update(
         });
     }
     parse_binance_private_order_fields(
-        BinancePrivateOrderMarket::Spot,
+        PrivateOrderMarket::Spot,
         OrderConfirmationSource::PrivateStream,
         venue_id,
         account_id,
@@ -1486,7 +1486,7 @@ pub fn parse_binance_usdm_order_trade_update(
         reason: "Binance USD-M ORDER_TRADE_UPDATE lacks order payload",
     })?;
     parse_binance_private_order_fields(
-        BinancePrivateOrderMarket::UsdmFutures,
+        PrivateOrderMarket::UsdmFutures,
         OrderConfirmationSource::PrivateStream,
         venue_id,
         account_id,
@@ -1497,7 +1497,7 @@ pub fn parse_binance_usdm_order_trade_update(
 
 /// 解析 Binance signed REST 查单响应。
 pub fn parse_binance_order_query_confirmation(
-    market: BinancePrivateOrderMarket,
+    market: PrivateOrderMarket,
     venue_id: VenueId,
     account_id: AccountId,
     source_event_id: impl Into<String>,
@@ -1505,7 +1505,7 @@ pub fn parse_binance_order_query_confirmation(
 ) -> VenueExecResult<PrivateOrderUpdate> {
     if matches!(
         market,
-        BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear
+        PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear
     ) {
         return Err(VenueExecError::InvalidRequest {
             field: "market",
@@ -1527,7 +1527,7 @@ pub fn parse_binance_order_query_confirmation(
 /// 中文说明：Bybit 下单 REST 回执仍不能代表最终成交；该函数只把私有查单返回的
 /// 订单状态转换为统一确认模型，供运行时在下单后显式确认。
 pub fn parse_bybit_order_query_confirmation(
-    market: BinancePrivateOrderMarket,
+    market: PrivateOrderMarket,
     venue_id: VenueId,
     account_id: AccountId,
     source_event_id: impl Into<String>,
@@ -1569,8 +1569,54 @@ pub fn parse_bybit_order_query_confirmation(
     )
 }
 
+/// 解析 Bybit V5 private order stream 的订单更新。
+///
+/// 中文说明：Bybit 私有订单流仍只作为确认来源，不代表 runtime 可跳过执行门禁。
+/// 若事件缺少明确 `category`，则只在 topic 明确携带 `spot` 或 `linear` 时接受。
+pub fn parse_bybit_private_order_stream_update(
+    market: PrivateOrderMarket,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    let topic = required_json_field(body, "topic")?;
+    if !topic.starts_with("order") {
+        return Err(VenueExecError::InvalidRequest {
+            field: "topic",
+            reason: "Bybit private order stream update must use an order topic",
+        });
+    }
+    let data = json_array_field(body, "data").ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "Bybit private order stream update lacks data array",
+    })?;
+    let order = first_json_object_in_array(data).ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "Bybit private order stream data contains no order object",
+    })?;
+    let category = json_field_value(order, "category")
+        .or_else(|| bybit_category_from_order_topic(&topic).map(str::to_owned))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "category",
+            reason: "Bybit private order stream update lacks category",
+        })?;
+    validate_bybit_order_category(market, &category)?;
+    let fallback_time =
+        json_field_value(body, "creationTime").or_else(|| json_field_value(body, "ts"));
+    parse_bybit_private_order_fields(
+        market,
+        OrderConfirmationSource::PrivateStream,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        order,
+        fallback_time.as_deref(),
+    )
+}
+
 fn parse_binance_private_order_fields(
-    market: BinancePrivateOrderMarket,
+    market: PrivateOrderMarket,
     source: OrderConfirmationSource,
     venue_id: VenueId,
     account_id: AccountId,
@@ -1643,7 +1689,7 @@ fn parse_binance_private_order_fields(
 }
 
 fn parse_bybit_private_order_fields(
-    market: BinancePrivateOrderMarket,
+    market: PrivateOrderMarket,
     source: OrderConfirmationSource,
     venue_id: VenueId,
     account_id: AccountId,
@@ -2052,13 +2098,14 @@ fn binance_private_side(value: &str) -> VenueExecResult<OrderSide> {
 }
 
 fn validate_bybit_order_category(
-    market: BinancePrivateOrderMarket,
+    market: PrivateOrderMarket,
     category: &str,
 ) -> VenueExecResult<()> {
     match (market, category) {
-        (BinancePrivateOrderMarket::BybitSpot, "spot")
-        | (BinancePrivateOrderMarket::BybitLinear, "linear") => Ok(()),
-        (BinancePrivateOrderMarket::Spot | BinancePrivateOrderMarket::UsdmFutures, _) => {
+        (PrivateOrderMarket::BybitSpot, "spot") | (PrivateOrderMarket::BybitLinear, "linear") => {
+            Ok(())
+        }
+        (PrivateOrderMarket::Spot | PrivateOrderMarket::UsdmFutures, _) => {
             Err(VenueExecError::InvalidRequest {
                 field: "market",
                 reason: "Bybit order confirmation requires a Bybit private order market",
@@ -2068,6 +2115,16 @@ fn validate_bybit_order_category(
             field: "category",
             reason: "Bybit order query category does not match configured market",
         }),
+    }
+}
+
+fn bybit_category_from_order_topic(topic: &str) -> Option<&'static str> {
+    if topic == "order.spot" || topic.ends_with(".spot") {
+        Some("spot")
+    } else if topic == "order.linear" || topic.ends_with(".linear") {
+        Some("linear")
+    } else {
+        None
     }
 }
 
@@ -2297,18 +2354,21 @@ pub mod live {
 
     use arb_domain::{AccountId, InstrumentId, OrderId, VenueId};
     use arb_signing::real::{
-        BinanceHmacSigningInput, BinanceRequestParam, BinanceSignedEndpoint, RealSigningProvider,
+        BinanceHmacSigningInput, BinanceRequestParam, BinanceSignedEndpoint, BybitHmacSigningInput,
+        BybitRealSigningProvider, BybitSignedEndpoint, BybitSigningPayloadKind,
+        RealSigningProvider,
     };
     use arb_signing::{SigningPolicy, SigningPurpose, SigningRequestId};
 
     use super::{
-        parse_binance_order_query_confirmation, unknown_status_report, BinancePrivateOrderMarket,
-        CancelOrder, CancelOrderRequest, ConfirmOrderStatus, ConfirmOrderStatusRequest,
-        ExternalActionRef, ExternalOrderId, IdempotencyKey, MutableActionId, MutableActionKind,
-        MutableActionReceipt, MutableActionStatus, MutableActionStatusReport, MutableOrderType,
-        OrderReference, OrderSide, PrivateOrderUpdate, QueryActionStatus, QueryActionStatusRequest,
-        RequestFingerprint, RequestTransfer, SubmitOrder, SubmitOrderRequest, TransferRequest,
-        VenueExecError, VenueExecResult,
+        parse_binance_order_query_confirmation, parse_bybit_order_query_confirmation,
+        unknown_status_report, CancelOrder, CancelOrderRequest, ConfirmOrderStatus,
+        ConfirmOrderStatusRequest, ExternalActionRef, ExternalOrderId, IdempotencyKey,
+        MutableActionId, MutableActionKind, MutableActionReceipt, MutableActionStatus,
+        MutableActionStatusReport, MutableOrderType, OrderReference, OrderSide, PrivateOrderMarket,
+        PrivateOrderUpdate, QueryActionStatus, QueryActionStatusRequest, RequestFingerprint,
+        RequestTransfer, SubmitOrder, SubmitOrderRequest, TransferRequest, VenueExecError,
+        VenueExecResult,
     };
 
     /// Binance Spot 下单、撤单和查单 endpoint。
@@ -3488,10 +3548,10 @@ pub mod live {
         Ok(raw_order_id)
     }
 
-    fn private_market_from_exec_market(market: BinanceExecMarket) -> BinancePrivateOrderMarket {
+    fn private_market_from_exec_market(market: BinanceExecMarket) -> PrivateOrderMarket {
         match market {
-            BinanceExecMarket::Spot => BinancePrivateOrderMarket::Spot,
-            BinanceExecMarket::UsdmFutures => BinancePrivateOrderMarket::UsdmFutures,
+            BinanceExecMarket::Spot => PrivateOrderMarket::Spot,
+            BinanceExecMarket::UsdmFutures => PrivateOrderMarket::UsdmFutures,
         }
     }
 
@@ -3713,6 +3773,1534 @@ pub mod live {
         };
         VenueId::new(value).expect("static Binance transport venue ID")
     }
+
+    /// Bybit V5 下单 endpoint。
+    pub const BYBIT_ORDER_CREATE_ENDPOINT: &str = "/v5/order/create";
+    /// Bybit V5 撤单 endpoint。
+    pub const BYBIT_ORDER_CANCEL_ENDPOINT: &str = "/v5/order/cancel";
+    /// Bybit V5 查单 endpoint。
+    pub const BYBIT_ORDER_REALTIME_ENDPOINT: &str = "/v5/order/realtime";
+    /// 默认 Bybit signed endpoint 接收窗口。
+    pub const DEFAULT_BYBIT_RECV_WINDOW_MS: u64 = 5_000;
+    const MAX_BYBIT_RECV_WINDOW_MS: u64 = 60_000;
+    const CURL_BYBIT_STATUS_MARKER: &str = "\n__ARB_BYBIT_HTTP_STATUS__:";
+
+    /// Bybit 可变执行市场。
+    ///
+    /// 中文说明：该枚举只覆盖当前接入范围内的现货和 USDT 线性永续执行路径。
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub enum BybitExecMarket {
+        Spot,
+        LinearPerpetual,
+    }
+
+    impl BybitExecMarket {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Spot => "Spot",
+                Self::LinearPerpetual => "LinearPerpetual",
+            }
+        }
+
+        fn token(self) -> &'static str {
+            match self {
+                Self::Spot => "bybit-spot",
+                Self::LinearPerpetual => "bybit-linear",
+            }
+        }
+
+        fn category(self) -> &'static str {
+            match self {
+                Self::Spot => "spot",
+                Self::LinearPerpetual => "linear",
+            }
+        }
+
+        fn expected_instrument_suffix(self) -> &'static str {
+            match self {
+                Self::Spot => "SPOT",
+                Self::LinearPerpetual => "LINEAR-PERP",
+            }
+        }
+    }
+
+    impl fmt::Display for BybitExecMarket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    /// Bybit 执行适配器配置。
+    ///
+    /// 中文说明：配置只保存 endpoint、账户引用、签名策略和接收窗口，不保存
+    /// API key、secret key、签名 payload 或任何凭证原文。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct BybitExecConfig {
+        market: BybitExecMarket,
+        venue_id: VenueId,
+        account_id: AccountId,
+        base_url: String,
+        recv_window_ms: u64,
+        signing_policy: SigningPolicy,
+    }
+
+    impl BybitExecConfig {
+        pub fn spot(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            Self::new(
+                BybitExecMarket::Spot,
+                venue_id,
+                account_id,
+                base_url,
+                DEFAULT_BYBIT_RECV_WINDOW_MS,
+                signing_policy,
+            )
+        }
+
+        pub fn linear_perpetual(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            Self::new(
+                BybitExecMarket::LinearPerpetual,
+                venue_id,
+                account_id,
+                base_url,
+                DEFAULT_BYBIT_RECV_WINDOW_MS,
+                signing_policy,
+            )
+        }
+
+        pub fn new(
+            market: BybitExecMarket,
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            recv_window_ms: u64,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            validate_bybit_recv_window(recv_window_ms)?;
+            Ok(Self {
+                market,
+                venue_id,
+                account_id,
+                base_url: normalize_bybit_base_url(base_url.into())?,
+                recv_window_ms,
+                signing_policy,
+            })
+        }
+
+        pub fn with_recv_window_ms(mut self, recv_window_ms: u64) -> VenueExecResult<Self> {
+            validate_bybit_recv_window(recv_window_ms)?;
+            self.recv_window_ms = recv_window_ms;
+            Ok(self)
+        }
+
+        pub fn market(&self) -> BybitExecMarket {
+            self.market
+        }
+
+        pub fn venue_id(&self) -> &VenueId {
+            &self.venue_id
+        }
+
+        pub fn account_id(&self) -> &AccountId {
+            &self.account_id
+        }
+
+        pub fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        pub fn recv_window_ms(&self) -> u64 {
+            self.recv_window_ms
+        }
+
+        pub fn signing_policy(&self) -> &SigningPolicy {
+            &self.signing_policy
+        }
+    }
+
+    /// Bybit signed REST HTTP 方法。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BybitExecHttpMethod {
+        Get,
+        Post,
+    }
+
+    impl BybitExecHttpMethod {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Get => "GET",
+                Self::Post => "POST",
+            }
+        }
+    }
+
+    impl fmt::Display for BybitExecHttpMethod {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    /// 已签名 Bybit HTTP 请求。
+    ///
+    /// 中文说明：transport 只能通过该对象取得发送所需的认证头和 query/body。
+    /// `Debug` 永远脱敏，避免日志输出凭证或签名材料。
+    pub struct BybitSignedRequest<'a> {
+        market: BybitExecMarket,
+        method: BybitExecHttpMethod,
+        base_url: &'a str,
+        endpoint: &'static str,
+        signed_endpoint: &'a BybitSignedEndpoint,
+    }
+
+    impl BybitSignedRequest<'_> {
+        pub fn market(&self) -> BybitExecMarket {
+            self.market
+        }
+
+        pub fn method(&self) -> BybitExecHttpMethod {
+            self.method
+        }
+
+        pub fn base_url(&self) -> &str {
+            self.base_url
+        }
+
+        pub fn endpoint(&self) -> &'static str {
+            self.endpoint
+        }
+
+        pub fn api_key_header_name(&self) -> &'static str {
+            self.signed_endpoint.api_key_header_name()
+        }
+
+        pub fn api_key_header_value(&self) -> &str {
+            self.signed_endpoint.api_key_header_value()
+        }
+
+        pub fn timestamp_header_name(&self) -> &'static str {
+            self.signed_endpoint.timestamp_header_name()
+        }
+
+        pub fn signature_header_name(&self) -> &'static str {
+            self.signed_endpoint.signature_header_name()
+        }
+
+        pub fn recv_window_header_name(&self) -> &'static str {
+            self.signed_endpoint.recv_window_header_name()
+        }
+
+        pub fn timestamp_millis(&self) -> u64 {
+            self.signed_endpoint.timestamp_millis()
+        }
+
+        pub fn recv_window_ms(&self) -> u64 {
+            self.signed_endpoint.recv_window_ms()
+        }
+
+        pub fn payload_kind(&self) -> BybitSigningPayloadKind {
+            self.signed_endpoint.payload_kind()
+        }
+
+        pub fn payload_for_transport(&self) -> &str {
+            self.signed_endpoint.payload_for_transport()
+        }
+
+        pub fn signature_header_value(&self) -> &str {
+            self.signed_endpoint.signature_header_value()
+        }
+    }
+
+    impl fmt::Debug for BybitSignedRequest<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BybitSignedRequest")
+                .field("market", &self.market)
+                .field("method", &self.method)
+                .field("base_url", &self.base_url)
+                .field("endpoint", &self.endpoint)
+                .field("api_key_header_name", &self.api_key_header_name())
+                .field("api_key_header_value", &"<redacted>")
+                .field("timestamp_header_name", &self.timestamp_header_name())
+                .field("signature_header_name", &self.signature_header_name())
+                .field("recv_window_header_name", &self.recv_window_header_name())
+                .field("timestamp_millis", &self.timestamp_millis())
+                .field("recv_window_ms", &self.recv_window_ms())
+                .field("payload_kind", &self.payload_kind())
+                .field("payload", &"<redacted>")
+                .field("signature", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Bybit transport 返回。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct BybitExecHttpResponse {
+        status_code: u16,
+        body: String,
+    }
+
+    impl BybitExecHttpResponse {
+        pub fn new(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+            }
+        }
+
+        pub fn status_code(&self) -> u16 {
+            self.status_code
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        pub fn is_success(&self) -> bool {
+            (200..=299).contains(&self.status_code)
+        }
+    }
+
+    /// Bybit 可变执行 transport。
+    ///
+    /// 中文说明：适配器负责风控之后的请求映射、签名和幂等；具体 HTTP/TLS、
+    /// 重试、限频和代理由运行时注入的 transport 实现。transport 遇到网络
+    /// 断连或不确定提交状态时必须返回 `UnknownExternalState` 类错误。
+    pub trait BybitExecTransport {
+        fn send_signed(
+            &mut self,
+            request: BybitSignedRequest<'_>,
+        ) -> VenueExecResult<BybitExecHttpResponse>;
+    }
+
+    /// 使用系统 `curl` 发送 Bybit signed REST 请求的真实 transport。
+    ///
+    /// 中文说明：该实现把 URL、认证头和 body 通过 `curl --config -` 的标准输入
+    /// 传给 curl，避免把凭证材料暴露在进程命令行参数中。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct BybitCurlExecTransport {
+        connect_timeout_secs: u64,
+        max_time_secs: u64,
+    }
+
+    impl BybitCurlExecTransport {
+        pub fn new(connect_timeout_secs: u64, max_time_secs: u64) -> VenueExecResult<Self> {
+            if connect_timeout_secs == 0 || max_time_secs == 0 {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "curl_timeout",
+                    reason: "curl timeouts must be greater than zero",
+                });
+            }
+            Ok(Self {
+                connect_timeout_secs,
+                max_time_secs,
+            })
+        }
+
+        pub fn connect_timeout_secs(&self) -> u64 {
+            self.connect_timeout_secs
+        }
+
+        pub fn max_time_secs(&self) -> u64 {
+            self.max_time_secs
+        }
+    }
+
+    impl Default for BybitCurlExecTransport {
+        fn default() -> Self {
+            Self {
+                connect_timeout_secs: 10,
+                max_time_secs: 30,
+            }
+        }
+    }
+
+    impl BybitExecTransport for BybitCurlExecTransport {
+        fn send_signed(
+            &mut self,
+            request: BybitSignedRequest<'_>,
+        ) -> VenueExecResult<BybitExecHttpResponse> {
+            let venue_id = bybit_transport_venue_id(request.market());
+            let url = bybit_signed_request_url(&request)?;
+            let config = bybit_curl_config(&request, &url)?;
+            let mut child = Command::new("curl")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--request")
+                .arg(request.method().as_str())
+                .arg("--connect-timeout")
+                .arg(self.connect_timeout_secs.to_string())
+                .arg("--max-time")
+                .arg(self.max_time_secs.to_string())
+                .arg("--write-out")
+                .arg(format!("{CURL_BYBIT_STATUS_MARKER}%{{http_code}}"))
+                .arg("--config")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "failed to start curl for Bybit signed REST request".to_owned(),
+                })?;
+
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "curl stdin is unavailable for Bybit signed REST request".to_owned(),
+                })?
+                .write_all(config.as_bytes())
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "failed to write curl config for Bybit signed REST request".to_owned(),
+                })?;
+
+            let output =
+                child
+                    .wait_with_output()
+                    .map_err(|_| VenueExecError::UnknownExternalState {
+                        venue_id: venue_id.clone(),
+                        detail: "curl transport did not return a Bybit signed REST response"
+                            .to_owned(),
+                    })?;
+            if !output.status.success() {
+                return Err(VenueExecError::UnknownExternalState {
+                    venue_id,
+                    detail: "curl transport failed before a reliable HTTP response was available"
+                        .to_owned(),
+                });
+            }
+
+            parse_bybit_curl_http_response(&output.stdout, request.market())
+        }
+    }
+
+    /// Bybit Spot 可变执行适配器。
+    pub struct BybitSpotExecAdapter<S, T> {
+        inner: BybitExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> BybitSpotExecAdapter<S, T> {
+        pub fn new(config: BybitExecConfig, signer: S, transport: T) -> VenueExecResult<Self> {
+            ensure_bybit_config_market(&config, BybitExecMarket::Spot)?;
+            Ok(Self {
+                inner: BybitExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &BybitExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for BybitSpotExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BybitSpotExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    /// Bybit 线性永续可变执行适配器。
+    pub struct BybitLinearExecAdapter<S, T> {
+        inner: BybitExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> BybitLinearExecAdapter<S, T> {
+        pub fn new(config: BybitExecConfig, signer: S, transport: T) -> VenueExecResult<Self> {
+            ensure_bybit_config_market(&config, BybitExecMarket::LinearPerpetual)?;
+            Ok(Self {
+                inner: BybitExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &BybitExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for BybitLinearExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BybitLinearExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    impl<S, T> SubmitOrder for BybitSpotExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.submit_order(request)
+        }
+    }
+
+    impl<S, T> CancelOrder for BybitSpotExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.cancel_order(request)
+        }
+    }
+
+    impl<S, T> QueryActionStatus for BybitSpotExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            self.inner.query_action_status(request)
+        }
+    }
+
+    impl<S, T> ConfirmOrderStatus for BybitSpotExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.inner.confirm_order_status(request)
+        }
+    }
+
+    impl<S, T> RequestTransfer for BybitSpotExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.request_transfer(request)
+        }
+    }
+
+    impl<S, T> SubmitOrder for BybitLinearExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.submit_order(request)
+        }
+    }
+
+    impl<S, T> CancelOrder for BybitLinearExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.cancel_order(request)
+        }
+    }
+
+    impl<S, T> QueryActionStatus for BybitLinearExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            self.inner.query_action_status(request)
+        }
+    }
+
+    impl<S, T> ConfirmOrderStatus for BybitLinearExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.inner.confirm_order_status(request)
+        }
+    }
+
+    impl<S, T> RequestTransfer for BybitLinearExecAdapter<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.request_transfer(request)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BybitExecAdapterCore<S, T> {
+        config: BybitExecConfig,
+        signer: S,
+        transport: T,
+        records_by_key: BTreeMap<IdempotencyKey, LiveActionRecord>,
+        key_by_action_id: BTreeMap<MutableActionId, IdempotencyKey>,
+        orders_by_client_id: BTreeMap<OrderId, BybitKnownOrder>,
+        orders_by_external_id: BTreeMap<ExternalOrderId, BybitKnownOrder>,
+        next_sequence: u64,
+    }
+
+    impl<S, T> BybitExecAdapterCore<S, T> {
+        fn new(config: BybitExecConfig, signer: S, transport: T) -> Self {
+            Self {
+                config,
+                signer,
+                transport,
+                records_by_key: BTreeMap::new(),
+                key_by_action_id: BTreeMap::new(),
+                orders_by_client_id: BTreeMap::new(),
+                orders_by_external_id: BTreeMap::new(),
+                next_sequence: 0,
+            }
+        }
+
+        fn config(&self) -> &BybitExecConfig {
+            &self.config
+        }
+
+        fn transport(&self) -> &T {
+            &self.transport
+        }
+
+        fn transport_mut(&mut self) -> &mut T {
+            &mut self.transport
+        }
+
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            Ok(match request {
+                QueryActionStatusRequest::ByActionId(action_id) => {
+                    if let Some(key) = self.key_by_action_id.get(&action_id) {
+                        self.report_for_key(key)
+                    } else {
+                        unknown_status_report(Some(action_id), None)
+                    }
+                }
+                QueryActionStatusRequest::ByIdempotencyKey(key) => self.report_for_key(&key),
+            })
+        }
+
+        fn report_for_key(&self, key: &IdempotencyKey) -> MutableActionStatusReport {
+            self.records_by_key.get(key).map_or_else(
+                || unknown_status_report(None, Some(key.clone())),
+                |record| super::status_report_from_receipt(&record.receipt),
+            )
+        }
+
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.from_account_id)?;
+            Err(VenueExecError::InvalidRequest {
+                field: "transfer",
+                reason: "Bybit live transfer is not implemented by this execution adapter",
+            })
+        }
+
+        fn ensure_request_scope(
+            &self,
+            venue_id: &VenueId,
+            account_id: &AccountId,
+        ) -> VenueExecResult<()> {
+            if venue_id != &self.config.venue_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "venue_id",
+                    reason: "request venue does not match Bybit execution adapter config",
+                });
+            }
+            if account_id != &self.config.account_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "account_id",
+                    reason: "request account does not match Bybit execution adapter config",
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl<S, T> BybitExecAdapterCore<S, T>
+    where
+        S: BybitRealSigningProvider,
+        T: BybitExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            request.validate()?;
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+
+            let symbol = bybit_symbol_from_instrument(self.config.market, &request.instrument_id)?;
+            let body = bybit_order_create_body(&self.config, &symbol, &request)?;
+            let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
+            let signed = self.sign(
+                SigningPurpose::SubmitOrder,
+                &action_id,
+                BybitSigningPayloadKind::JsonBody,
+                body,
+            )?;
+            let response = self.dispatch_signed(
+                BybitExecHttpMethod::Post,
+                BYBIT_ORDER_CREATE_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_business_success(BYBIT_ORDER_CREATE_ENDPOINT, &response)?;
+
+            let known_order = bybit_known_order_from_response(
+                self.config.market,
+                &symbol,
+                request.client_order_id.clone(),
+                response.body(),
+                &action_id,
+            )?;
+            let external_ref = known_order
+                .external_order_id
+                .clone()
+                .map(ExternalActionRef::Order);
+            let receipt = MutableActionReceipt {
+                action_id,
+                kind: MutableActionKind::SubmitOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref,
+                duplicate: false,
+                simulated: false,
+            };
+
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            self.record_known_order(known_order);
+            Ok(receipt)
+        }
+
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+
+            let known_order = self.lookup_known_order(&request.order_ref).ok_or(
+                VenueExecError::InvalidRequest {
+                    field: "order_ref",
+                    reason: "Bybit cancel requires an order previously submitted through this adapter so its symbol is known",
+                },
+            )?;
+            let body = bybit_cancel_order_body(&self.config, &request, known_order)?;
+            let action_id = self.next_action_id(MutableActionKind::CancelOrder)?;
+            let signed = self.sign(
+                SigningPurpose::CancelOrder,
+                &action_id,
+                BybitSigningPayloadKind::JsonBody,
+                body,
+            )?;
+            let response = self.dispatch_signed(
+                BybitExecHttpMethod::Post,
+                BYBIT_ORDER_CANCEL_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_business_success(BYBIT_ORDER_CANCEL_ENDPOINT, &response)?;
+
+            let receipt = MutableActionReceipt {
+                action_id: action_id.clone(),
+                kind: MutableActionKind::CancelOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref: Some(ExternalActionRef::Cancel(action_id)),
+                duplicate: false,
+                simulated: false,
+            };
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            Ok(receipt)
+        }
+
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let symbol = bybit_symbol_from_instrument(self.config.market, &request.instrument_id)?;
+            let query = bybit_query_order_payload(&self.config, &symbol, &request.order_ref)?;
+            let signing_request_id = SigningRequestId::new(format!(
+                "signing-request/bybit-exec/query-order/{}",
+                request.source_event_id
+            ))
+            .map_err(signing_error)?;
+            let signed = self.sign_with_request_id(
+                SigningPurpose::QueryOrder,
+                signing_request_id,
+                BybitSigningPayloadKind::QueryString,
+                query,
+            )?;
+            let response = self.dispatch_signed(
+                BybitExecHttpMethod::Get,
+                BYBIT_ORDER_REALTIME_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_http_success(BYBIT_ORDER_REALTIME_ENDPOINT, &response)?;
+            parse_bybit_order_query_confirmation(
+                private_market_from_bybit_exec_market(self.config.market),
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                request.source_event_id,
+                response.body(),
+            )
+        }
+
+        fn duplicate_receipt(
+            &self,
+            idempotency_key: &IdempotencyKey,
+            fingerprint: &RequestFingerprint,
+        ) -> VenueExecResult<Option<MutableActionReceipt>> {
+            let Some(existing) = self.records_by_key.get(idempotency_key) else {
+                return Ok(None);
+            };
+            if existing.fingerprint != *fingerprint {
+                return Err(VenueExecError::IdempotencyConflict {
+                    idempotency_key: idempotency_key.clone(),
+                    existing_fingerprint: existing.fingerprint.0.clone(),
+                    incoming_fingerprint: fingerprint.0.clone(),
+                });
+            }
+
+            let mut receipt = existing.receipt.clone();
+            receipt.duplicate = true;
+            Ok(Some(receipt))
+        }
+
+        fn next_action_id(&mut self, kind: MutableActionKind) -> VenueExecResult<MutableActionId> {
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("Bybit mutable action sequence overflowed");
+            MutableActionId::new(format!(
+                "{}:{}:{}",
+                self.config.market.token(),
+                kind.as_str(),
+                self.next_sequence
+            ))
+        }
+
+        fn sign(
+            &self,
+            purpose: SigningPurpose,
+            action_id: &MutableActionId,
+            payload_kind: BybitSigningPayloadKind,
+            payload: String,
+        ) -> VenueExecResult<BybitSignedEndpoint> {
+            self.sign_with_request_id(
+                purpose,
+                SigningRequestId::new(format!("signing-request/bybit-exec/{}", action_id.as_str()))
+                    .map_err(signing_error)?,
+                payload_kind,
+                payload,
+            )
+        }
+
+        fn sign_with_request_id(
+            &self,
+            purpose: SigningPurpose,
+            signing_request_id: SigningRequestId,
+            payload_kind: BybitSigningPayloadKind,
+            payload: String,
+        ) -> VenueExecResult<BybitSignedEndpoint> {
+            let input = BybitHmacSigningInput::new(
+                signing_request_id,
+                self.config.signing_policy.policy_ref().clone(),
+                purpose,
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                self.config.recv_window_ms,
+                payload_kind,
+                payload,
+            )
+            .map_err(signing_error)?;
+            self.signer
+                .sign_bybit_hmac(input, &self.config.signing_policy)
+                .map_err(signing_error)
+        }
+
+        fn dispatch_signed(
+            &mut self,
+            method: BybitExecHttpMethod,
+            endpoint: &'static str,
+            signed_endpoint: &BybitSignedEndpoint,
+        ) -> VenueExecResult<BybitExecHttpResponse> {
+            let request = BybitSignedRequest {
+                market: self.config.market,
+                method,
+                base_url: &self.config.base_url,
+                endpoint,
+                signed_endpoint,
+            };
+            self.transport.send_signed(request)
+        }
+
+        fn ensure_http_success(
+            &self,
+            endpoint: &'static str,
+            response: &BybitExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            if response.is_success() {
+                return Ok(());
+            }
+            Err(VenueExecError::ExternalRejected {
+                venue_id: self.config.venue_id.clone(),
+                endpoint: endpoint.to_owned(),
+                status_code: response.status_code(),
+                reason: response_body_snippet(response.body()),
+            })
+        }
+
+        fn ensure_business_success(
+            &self,
+            endpoint: &'static str,
+            response: &BybitExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            self.ensure_http_success(endpoint, response)?;
+            match json_field_value(response.body(), "retCode").as_deref() {
+                Some("0") => Ok(()),
+                Some(ret_code) => Err(VenueExecError::ExternalRejected {
+                    venue_id: self.config.venue_id.clone(),
+                    endpoint: endpoint.to_owned(),
+                    status_code: response.status_code(),
+                    reason: format!(
+                        "Bybit retCode={ret_code}: {}",
+                        json_field_value(response.body(), "retMsg")
+                            .unwrap_or_else(|| "missing retMsg".to_owned())
+                    ),
+                }),
+                None => Err(VenueExecError::UnknownExternalState {
+                    venue_id: self.config.venue_id.clone(),
+                    detail: format!("Bybit response from {endpoint} lacks retCode"),
+                }),
+            }
+        }
+
+        fn record_action(
+            &mut self,
+            idempotency_key: IdempotencyKey,
+            fingerprint: RequestFingerprint,
+            receipt: MutableActionReceipt,
+        ) {
+            self.key_by_action_id
+                .insert(receipt.action_id.clone(), idempotency_key.clone());
+            self.records_by_key.insert(
+                idempotency_key,
+                LiveActionRecord {
+                    fingerprint,
+                    receipt,
+                },
+            );
+        }
+
+        fn record_known_order(&mut self, known_order: BybitKnownOrder) {
+            if let Some(client_order_id) = known_order.client_order_id.clone() {
+                self.orders_by_client_id
+                    .insert(client_order_id, known_order.clone());
+            }
+            if let Some(external_order_id) = known_order.external_order_id.clone() {
+                self.orders_by_external_id
+                    .insert(external_order_id, known_order);
+            }
+        }
+
+        fn lookup_known_order(&self, order_ref: &OrderReference) -> Option<&BybitKnownOrder> {
+            match order_ref {
+                OrderReference::ClientOrderId(order_id) => self.orders_by_client_id.get(order_id),
+                OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct BybitKnownOrder {
+        symbol: String,
+        order_id_param: Option<String>,
+        client_order_id: Option<OrderId>,
+        external_order_id: Option<ExternalOrderId>,
+    }
+
+    fn ensure_bybit_config_market(
+        config: &BybitExecConfig,
+        expected: BybitExecMarket,
+    ) -> VenueExecResult<()> {
+        if config.market == expected {
+            Ok(())
+        } else {
+            Err(VenueExecError::InvalidRequest {
+                field: "market",
+                reason: "Bybit execution adapter received config for a different market",
+            })
+        }
+    }
+
+    fn validate_bybit_recv_window(recv_window_ms: u64) -> VenueExecResult<()> {
+        if (1..=MAX_BYBIT_RECV_WINDOW_MS).contains(&recv_window_ms) {
+            Ok(())
+        } else {
+            Err(VenueExecError::InvalidRequest {
+                field: "recv_window_ms",
+                reason: "Bybit recvWindow must be between 1 and 60000 milliseconds",
+            })
+        }
+    }
+
+    fn normalize_bybit_base_url(value: String) -> VenueExecResult<String> {
+        let trimmed = value.trim().trim_end_matches('/').to_owned();
+        if trimmed.is_empty() {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Bybit base URL cannot be empty",
+            });
+        }
+        if trimmed
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Bybit base URL contains a control byte",
+            });
+        }
+        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://127.0.0.1")) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Bybit base URL must use https or an explicit localhost test URL",
+            });
+        }
+        Ok(trimmed)
+    }
+
+    fn bybit_order_create_body(
+        config: &BybitExecConfig,
+        symbol: &str,
+        request: &SubmitOrderRequest,
+    ) -> VenueExecResult<String> {
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "category", config.market.category())?;
+        push_json_string_field(&mut body, &mut first, "symbol", symbol)?;
+        push_json_string_field(&mut body, &mut first, "side", bybit_side(request.side))?;
+        match request.order_type {
+            MutableOrderType::Market => {
+                push_json_string_field(&mut body, &mut first, "orderType", "Market")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "qty",
+                    &request.quantity.to_string(),
+                )?;
+                if config.market == BybitExecMarket::Spot {
+                    push_json_string_field(&mut body, &mut first, "marketUnit", "baseCoin")?;
+                }
+            }
+            MutableOrderType::Limit => {
+                push_json_string_field(&mut body, &mut first, "orderType", "Limit")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "qty",
+                    &request.quantity.to_string(),
+                )?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "price",
+                    &request
+                        .limit_price
+                        .expect("validated limit order price")
+                        .to_string(),
+                )?;
+                push_json_string_field(&mut body, &mut first, "timeInForce", "GTC")?;
+            }
+            MutableOrderType::PostOnly => {
+                push_json_string_field(&mut body, &mut first, "orderType", "Limit")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "qty",
+                    &request.quantity.to_string(),
+                )?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "price",
+                    &request
+                        .limit_price
+                        .expect("validated post-only order price")
+                        .to_string(),
+                )?;
+                push_json_string_field(&mut body, &mut first, "timeInForce", "PostOnly")?;
+            }
+        }
+        if let Some(client_order_id) = &request.client_order_id {
+            validate_bybit_client_order_id(client_order_id.as_str())?;
+            push_json_string_field(
+                &mut body,
+                &mut first,
+                "orderLinkId",
+                client_order_id.as_str(),
+            )?;
+        }
+        body.push('}');
+        Ok(body)
+    }
+
+    fn bybit_cancel_order_body(
+        config: &BybitExecConfig,
+        request: &CancelOrderRequest,
+        known_order: &BybitKnownOrder,
+    ) -> VenueExecResult<String> {
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "category", config.market.category())?;
+        push_json_string_field(&mut body, &mut first, "symbol", known_order.symbol.as_str())?;
+        match &request.order_ref {
+            OrderReference::VenueOrderId(_) => {
+                if let Some(order_id) = &known_order.order_id_param {
+                    push_json_string_field(&mut body, &mut first, "orderId", order_id)?;
+                } else if let Some(client_order_id) = &known_order.client_order_id {
+                    push_json_string_field(
+                        &mut body,
+                        &mut first,
+                        "orderLinkId",
+                        client_order_id.as_str(),
+                    )?;
+                } else {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "known Bybit venue order lacks orderId and orderLinkId",
+                    });
+                }
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_bybit_client_order_id(client_order_id.as_str())?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "orderLinkId",
+                    client_order_id.as_str(),
+                )?;
+            }
+        }
+        body.push('}');
+        Ok(body)
+    }
+
+    fn bybit_query_order_payload(
+        config: &BybitExecConfig,
+        symbol: &str,
+        order_ref: &OrderReference,
+    ) -> VenueExecResult<String> {
+        let mut params = vec![
+            ("category".to_owned(), config.market.category().to_owned()),
+            ("symbol".to_owned(), symbol.to_owned()),
+        ];
+        match order_ref {
+            OrderReference::VenueOrderId(order_id) => {
+                let raw_order_id = bybit_order_id_param_from_external(config.market, order_id)?;
+                params.push(("orderId".to_owned(), raw_order_id.to_owned()));
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_bybit_client_order_id(client_order_id.as_str())?;
+                params.push((
+                    "orderLinkId".to_owned(),
+                    client_order_id.as_str().to_owned(),
+                ));
+            }
+        }
+        Ok(query_string_from_pairs(&params))
+    }
+
+    fn bybit_order_id_param_from_external(
+        market: BybitExecMarket,
+        order_id: &ExternalOrderId,
+    ) -> VenueExecResult<&str> {
+        let expected_prefix = format!("{}:order:", market.token());
+        let value = order_id.as_str();
+        let Some(raw_order_id) = value.strip_prefix(&expected_prefix) else {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Bybit venue order ref must come from the same market adapter",
+            });
+        };
+        validate_bybit_order_id(raw_order_id)?;
+        Ok(raw_order_id)
+    }
+
+    fn private_market_from_bybit_exec_market(market: BybitExecMarket) -> PrivateOrderMarket {
+        match market {
+            BybitExecMarket::Spot => PrivateOrderMarket::BybitSpot,
+            BybitExecMarket::LinearPerpetual => PrivateOrderMarket::BybitLinear,
+        }
+    }
+
+    fn bybit_symbol_from_instrument(
+        market: BybitExecMarket,
+        instrument_id: &InstrumentId,
+    ) -> VenueExecResult<String> {
+        let value = instrument_id.as_str();
+        let mut parts = value.split(':');
+        let prefix = parts.next();
+        let venue = parts.next();
+        let symbol = parts.next();
+        let suffix = parts.next();
+        if parts.next().is_some()
+            || prefix != Some("inst")
+            || venue != Some("BYBIT")
+            || suffix != Some(market.expected_instrument_suffix())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "instrument_id",
+                reason: "Bybit execution requires instrument IDs shaped as inst:BYBIT:<SYMBOL>:SPOT or inst:BYBIT:<SYMBOL>:LINEAR-PERP",
+            });
+        }
+        let symbol = symbol.expect("symbol checked above");
+        validate_bybit_symbol(symbol)?;
+        Ok(symbol.to_owned())
+    }
+
+    fn validate_bybit_symbol(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 32 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "symbol",
+                reason: "Bybit symbol must be 1 to 32 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "symbol",
+                reason: "Bybit symbol must use uppercase ASCII letters and digits",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bybit_client_order_id(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 36 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "Bybit orderLinkId must be 1 to 36 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "Bybit orderLinkId must use ASCII letters, digits, dash or underscore",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bybit_order_id(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 96 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Bybit orderId must be 1 to 96 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Bybit orderId contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn bybit_known_order_from_response(
+        market: BybitExecMarket,
+        symbol: &str,
+        client_order_id: Option<OrderId>,
+        body: &str,
+        action_id: &MutableActionId,
+    ) -> VenueExecResult<BybitKnownOrder> {
+        let order_id_param = json_field_value(body, "orderId").filter(|value| !value.is_empty());
+        let response_client_order_id = json_field_value(body, "orderLinkId")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| OrderId::new(value).ok());
+        let client_order_id = client_order_id.or(response_client_order_id);
+        let external_order_id = if let Some(order_id) = &order_id_param {
+            Some(ExternalOrderId::new(format!(
+                "{}:order:{order_id}",
+                market.token()
+            ))?)
+        } else if let Some(client_order_id) = &client_order_id {
+            Some(ExternalOrderId::new(format!(
+                "{}:client:{}",
+                market.token(),
+                client_order_id.as_str()
+            ))?)
+        } else {
+            Some(ExternalOrderId::new(format!(
+                "{}:action:{}",
+                market.token(),
+                action_id.as_str()
+            ))?)
+        };
+        Ok(BybitKnownOrder {
+            symbol: symbol.to_owned(),
+            order_id_param,
+            client_order_id,
+            external_order_id,
+        })
+    }
+
+    fn bybit_side(side: OrderSide) -> &'static str {
+        match side {
+            OrderSide::Buy => "Buy",
+            OrderSide::Sell => "Sell",
+        }
+    }
+
+    fn push_json_string_field(
+        body: &mut String,
+        first: &mut bool,
+        name: &str,
+        value: &str,
+    ) -> VenueExecResult<()> {
+        if !*first {
+            body.push(',');
+        }
+        *first = false;
+        body.push('"');
+        body.push_str(name);
+        body.push_str("\":\"");
+        push_json_escaped(body, value)?;
+        body.push('"');
+        Ok(())
+    }
+
+    fn push_json_escaped(body: &mut String, value: &str) -> VenueExecResult<()> {
+        for byte in value.bytes() {
+            match byte {
+                b'"' => body.push_str("\\\""),
+                b'\\' => body.push_str("\\\\"),
+                0 | b'\n' | b'\r' => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "json_body",
+                        reason: "JSON value contains an unsupported control byte",
+                    });
+                }
+                byte if byte.is_ascii_control() => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "json_body",
+                        reason: "JSON value contains an unsupported control byte",
+                    });
+                }
+                _ => body.push(byte as char),
+            }
+        }
+        Ok(())
+    }
+
+    fn query_string_from_pairs(pairs: &[(String, String)]) -> String {
+        let mut query = String::new();
+        for (index, (name, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                query.push('&');
+            }
+            query.push_str(&url_encode_component(name));
+            query.push('=');
+            query.push_str(&url_encode_component(value));
+        }
+        query
+    }
+
+    fn url_encode_component(value: &str) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(*byte as char);
+            } else {
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+        encoded
+    }
+
+    fn bybit_signed_request_url(request: &BybitSignedRequest<'_>) -> VenueExecResult<String> {
+        let base = request.base_url();
+        let endpoint = request.endpoint();
+        if endpoint.is_empty() || !endpoint.starts_with('/') {
+            return Err(VenueExecError::InvalidRequest {
+                field: "endpoint",
+                reason: "Bybit signed REST endpoint must be an absolute path",
+            });
+        }
+        match request.payload_kind() {
+            BybitSigningPayloadKind::QueryString if !request.payload_for_transport().is_empty() => {
+                Ok(format!(
+                    "{base}{endpoint}?{}",
+                    request.payload_for_transport()
+                ))
+            }
+            _ => Ok(format!("{base}{endpoint}")),
+        }
+    }
+
+    fn bybit_curl_config(request: &BybitSignedRequest<'_>, url: &str) -> VenueExecResult<String> {
+        let mut config = format!("url = \"{}\"\n", curl_config_quote(url)?);
+        push_curl_header(
+            &mut config,
+            request.api_key_header_name(),
+            request.api_key_header_value(),
+        )?;
+        push_curl_header(
+            &mut config,
+            request.timestamp_header_name(),
+            &request.timestamp_millis().to_string(),
+        )?;
+        push_curl_header(
+            &mut config,
+            request.signature_header_name(),
+            request.signature_header_value(),
+        )?;
+        push_curl_header(
+            &mut config,
+            request.recv_window_header_name(),
+            &request.recv_window_ms().to_string(),
+        )?;
+        if request.payload_kind() == BybitSigningPayloadKind::JsonBody {
+            push_curl_header(&mut config, "Content-Type", "application/json")?;
+            config.push_str("data = \"");
+            config.push_str(&curl_config_quote(request.payload_for_transport())?);
+            config.push_str("\"\n");
+        }
+        Ok(config)
+    }
+
+    fn push_curl_header(config: &mut String, name: &str, value: &str) -> VenueExecResult<()> {
+        let header = format!("{name}: {value}");
+        config.push_str("header = \"");
+        config.push_str(&curl_config_quote(&header)?);
+        config.push_str("\"\n");
+        Ok(())
+    }
+
+    fn parse_bybit_curl_http_response(
+        stdout: &[u8],
+        market: BybitExecMarket,
+    ) -> VenueExecResult<BybitExecHttpResponse> {
+        let output = String::from_utf8_lossy(stdout);
+        let Some((body, status)) = output.rsplit_once(CURL_BYBIT_STATUS_MARKER) else {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: bybit_transport_venue_id(market),
+                detail: "curl transport response lacked an HTTP status marker".to_owned(),
+            });
+        };
+        let status_code =
+            status
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: bybit_transport_venue_id(market),
+                    detail: "curl transport returned a malformed HTTP status".to_owned(),
+                })?;
+        if status_code == 0 {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: bybit_transport_venue_id(market),
+                detail: "curl transport did not receive an HTTP response from Bybit".to_owned(),
+            });
+        }
+        Ok(BybitExecHttpResponse::new(status_code, body.to_owned()))
+    }
+
+    fn bybit_transport_venue_id(market: BybitExecMarket) -> VenueId {
+        let value = match market {
+            BybitExecMarket::Spot => "venue:BYBIT-SPOT",
+            BybitExecMarket::LinearPerpetual => "venue:BYBIT-LINEAR",
+        };
+        VenueId::new(value).expect("static Bybit transport venue ID")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3890,7 +5478,7 @@ mod tests {
         .expect("spot private order update");
 
         assert_eq!(update.source, OrderConfirmationSource::PrivateStream);
-        assert_eq!(update.market, BinancePrivateOrderMarket::Spot);
+        assert_eq!(update.market, PrivateOrderMarket::Spot);
         assert_eq!(update.status, OrderConfirmationStatus::Filled);
         assert_eq!(update.instrument_id.as_str(), "inst:BINANCE:BTCUSDT:SPOT");
         assert_eq!(
@@ -3926,7 +5514,7 @@ mod tests {
         )
         .expect("usdm private order update");
 
-        assert_eq!(update.market, BinancePrivateOrderMarket::UsdmFutures);
+        assert_eq!(update.market, PrivateOrderMarket::UsdmFutures);
         assert_eq!(update.status, OrderConfirmationStatus::PartiallyFilled);
         assert_eq!(
             update.instrument_id.as_str(),
@@ -3942,7 +5530,7 @@ mod tests {
     #[test]
     fn binance_order_query_confirms_status_without_treating_rest_submit_as_final() {
         let update = parse_binance_order_query_confirmation(
-            BinancePrivateOrderMarket::Spot,
+            PrivateOrderMarket::Spot,
             venue("venue:BINANCE-SPOT"),
             account("account:binance-unit"),
             "event:binance:spot:query:1",
@@ -3959,7 +5547,7 @@ mod tests {
     #[test]
     fn bybit_order_query_confirms_filled_linear_order() {
         let update = parse_bybit_order_query_confirmation(
-            BinancePrivateOrderMarket::BybitLinear,
+            PrivateOrderMarket::BybitLinear,
             venue("venue:BYBIT-LINEAR"),
             account("account:bybit-unit"),
             "event:bybit:linear:query:filled",
@@ -3968,7 +5556,7 @@ mod tests {
         .expect("bybit order query confirmation");
 
         assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
-        assert_eq!(update.market, BinancePrivateOrderMarket::BybitLinear);
+        assert_eq!(update.market, PrivateOrderMarket::BybitLinear);
         assert_eq!(update.status, OrderConfirmationStatus::Filled);
         assert_eq!(update.side, Some(OrderSide::Sell));
         assert_eq!(
@@ -4008,7 +5596,7 @@ mod tests {
     #[test]
     fn bybit_order_query_fails_closed_on_nonzero_ret_code() {
         let err = parse_bybit_order_query_confirmation(
-            BinancePrivateOrderMarket::BybitLinear,
+            PrivateOrderMarket::BybitLinear,
             venue("venue:BYBIT-LINEAR"),
             account("account:bybit-unit"),
             "event:bybit:linear:query:rejected",
@@ -4020,9 +5608,60 @@ mod tests {
     }
 
     #[test]
+    fn bybit_private_order_stream_confirms_filled_linear_order() {
+        let update = parse_bybit_private_order_stream_update(
+            PrivateOrderMarket::BybitLinear,
+            venue("venue:BYBIT-LINEAR"),
+            account("account:bybit-unit"),
+            "event:bybit:private-order-stream:linear:1",
+            r#"{"topic":"order","id":"stream-1","creationTime":1700000002500,"data":[{"category":"linear","symbol":"BTCUSDT","orderId":"123456789","orderLinkId":"client:bybit:1","side":"Sell","orderStatus":"Filled","cumExecQty":"0.001","avgPrice":"43100.50","cumExecFee":"0.0100","feeCurrency":"USDT","updatedTime":"1700000002500"}]}"#,
+        )
+        .expect("bybit private stream update");
+
+        assert_eq!(update.source, OrderConfirmationSource::PrivateStream);
+        assert_eq!(update.market, PrivateOrderMarket::BybitLinear);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(
+            update.instrument_id.as_str(),
+            "inst:BYBIT:BTCUSDT:LINEAR-PERP"
+        );
+        assert_eq!(
+            update.client_order_id.as_ref().expect("client id").as_str(),
+            "client:bybit:1"
+        );
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.001"
+        );
+    }
+
+    #[test]
+    fn bybit_private_order_stream_rejects_category_market_mismatch() {
+        let err = parse_bybit_private_order_stream_update(
+            PrivateOrderMarket::BybitSpot,
+            venue("venue:BYBIT-SPOT"),
+            account("account:bybit-unit"),
+            "event:bybit:private-order-stream:spot:mismatch",
+            r#"{"topic":"order.linear","creationTime":1700000002500,"data":[{"symbol":"BTCUSDT","orderId":"123456789","orderLinkId":"client:bybit:1","side":"Buy","orderStatus":"New","cumExecQty":"0","updatedTime":"1700000002500"}]}"#,
+        )
+        .expect_err("topic category and configured market must match");
+
+        assert!(matches!(
+            err,
+            VenueExecError::InvalidRequest {
+                field: "category",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn bybit_order_query_rejects_category_market_mismatch() {
         let err = parse_bybit_order_query_confirmation(
-            BinancePrivateOrderMarket::BybitSpot,
+            PrivateOrderMarket::BybitSpot,
             venue("venue:BYBIT-SPOT"),
             account("account:bybit-unit"),
             "event:bybit:spot:query:mismatch",
@@ -4381,6 +6020,219 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bybit_linear_adapter_signs_post_only_submit_without_final_confirmation() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-submit-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffa","orderLinkId":"bybitUnit1"},"retExtInfo":{},"time":1700000000124}"#,
+            ),
+        )
+        .unwrap();
+
+        let request = SubmitOrderRequest::new(
+            venue("venue:BYBIT-LINEAR"),
+            account("account:bybit-unit"),
+            instrument("inst:BYBIT:BTCUSDT:LINEAR-PERP"),
+            OrderSide::Sell,
+            MutableOrderType::PostOnly,
+            quantity("0.001").unwrap(),
+            Some(price("43100.50").unwrap()),
+            Some(OrderId::new("bybitUnit1").unwrap()),
+            IdempotencyKey::new("idem:bybit:linear:submit:1").unwrap(),
+        );
+
+        let receipt = adapter
+            .submit_order(request.clone())
+            .expect("signed Bybit order dispatches");
+        let duplicate = adapter
+            .submit_order(request)
+            .expect("duplicate Bybit order is idempotent");
+
+        assert_eq!(receipt.status, MutableActionStatus::Accepted);
+        assert!(!receipt.simulated);
+        assert_eq!(duplicate.action_id, receipt.action_id);
+        assert!(duplicate.duplicate);
+        assert_eq!(adapter.transport().calls.len(), 1);
+        assert_eq!(
+            receipt.external_ref,
+            Some(ExternalActionRef::Order(
+                ExternalOrderId::new("bybit-linear:order:c6f055d9-7f21-4079-913d-e6523a9cfffa")
+                    .unwrap()
+            ))
+        );
+
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.market, live::BybitExecMarket::LinearPerpetual);
+        assert_eq!(call.method, live::BybitExecHttpMethod::Post);
+        assert_eq!(call.endpoint, live::BYBIT_ORDER_CREATE_ENDPOINT);
+        assert_eq!(call.api_key_header_name, "X-BAPI-API-KEY");
+        assert_eq!(call.timestamp_millis, 1_700_000_000_123);
+        assert_eq!(call.recv_window_ms, live::DEFAULT_BYBIT_RECV_WINDOW_MS);
+        assert!(call.payload.contains(r#""category":"linear""#));
+        assert!(call.payload.contains(r#""side":"Sell""#));
+        assert!(call.payload.contains(r#""timeInForce":"PostOnly""#));
+        assert!(call.payload.contains(r#""orderLinkId":"bybitUnit1""#));
+        assert_eq!(call.signature.len(), 64);
+        assert!(!call.debug.contains(&call.api_key_header_value));
+        assert!(!call.debug.contains(&call.signature));
+        assert!(!call.debug.contains(&call.payload));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_spot_market_order_sets_base_coin_market_unit() {
+        let mut adapter = live::BybitSpotExecAdapter::new(
+            live::BybitExecConfig::spot(
+                venue("venue:BYBIT-SPOT"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-spot-submit-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"1523347543495541248","orderLinkId":"bybitSpot1"},"retExtInfo":{},"time":1700000000124}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BYBIT-SPOT"),
+                account("account:bybit-unit"),
+                instrument("inst:BYBIT:BTCUSDT:SPOT"),
+                OrderSide::Buy,
+                MutableOrderType::Market,
+                quantity("0.001").unwrap(),
+                None,
+                Some(OrderId::new("bybitSpot1").unwrap()),
+                IdempotencyKey::new("idem:bybit:spot:market:1").unwrap(),
+            ))
+            .expect("spot market order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.market, live::BybitExecMarket::Spot);
+        assert!(call.payload.contains(r#""category":"spot""#));
+        assert!(call.payload.contains(r#""orderType":"Market""#));
+        assert!(call.payload.contains(r#""marketUnit":"baseCoin""#));
+        assert!(!call.payload.contains(r#""price":"#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_cancel_uses_signed_post_after_known_submit() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-cancel-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffa","orderLinkId":"bybitUnit2"},"retExtInfo":{},"time":1700000000124}"#,
+            ),
+        )
+        .unwrap();
+
+        let submit = adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                instrument("inst:BYBIT:BTCUSDT:LINEAR-PERP"),
+                OrderSide::Buy,
+                MutableOrderType::Limit,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("bybitUnit2").unwrap()),
+                IdempotencyKey::new("idem:bybit:linear:submit:2").unwrap(),
+            ))
+            .expect("submit before cancel");
+        adapter.transport_mut().body = r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffa","orderLinkId":"bybitUnit2"},"retExtInfo":{},"time":1700000001124}"#.to_owned();
+
+        let order_ref = match submit.external_ref.expect("order ref") {
+            ExternalActionRef::Order(order_id) => OrderReference::VenueOrderId(order_id),
+            _ => panic!("submit should return order ref"),
+        };
+        let cancel = adapter
+            .cancel_order(CancelOrderRequest::new(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                order_ref,
+                IdempotencyKey::new("idem:bybit:linear:cancel:2").unwrap(),
+            ))
+            .expect("cancel dispatches");
+
+        assert_eq!(cancel.kind, MutableActionKind::CancelOrder);
+        assert_eq!(adapter.transport().calls.len(), 2);
+        let call = &adapter.transport().calls[1];
+        assert_eq!(call.method, live::BybitExecHttpMethod::Post);
+        assert_eq!(call.endpoint, live::BYBIT_ORDER_CANCEL_ENDPOINT);
+        assert!(call.payload.contains(r#""category":"linear""#));
+        assert!(call
+            .payload
+            .contains(r#""orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffa""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_order_query_uses_signed_get_confirmation_path() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-query-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffa","orderLinkId":"bybitUnit3","side":"Buy","orderStatus":"Filled","cumExecQty":"0.001","avgPrice":"43100.50","cumExecFee":"0.01","feeCurrency":"USDT","updatedTime":"1700000001500"}]},"retExtInfo":{},"time":1700000002000}"#,
+            ),
+        )
+        .unwrap();
+
+        let update = adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                instrument("inst:BYBIT:BTCUSDT:LINEAR-PERP"),
+                OrderReference::VenueOrderId(
+                    ExternalOrderId::new("bybit-linear:order:c6f055d9-7f21-4079-913d-e6523a9cfffa")
+                        .unwrap(),
+                ),
+                "event:bybit:linear:query:filled",
+            ))
+            .expect("signed Bybit query confirms order");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.market, PrivateOrderMarket::BybitLinear);
+        assert_eq!(adapter.transport().calls.len(), 1);
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.method, live::BybitExecHttpMethod::Get);
+        assert_eq!(call.endpoint, live::BYBIT_ORDER_REALTIME_ENDPOINT);
+        assert!(call.payload.contains("category=linear"));
+        assert!(call.payload.contains("symbol=BTCUSDT"));
+        assert!(call
+            .payload
+            .contains("orderId=c6f055d9-7f21-4079-913d-e6523a9cfffa"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_adapter_rejects_wrong_market_instrument_before_transport() {
         let mut adapter = live::BinanceSpotExecAdapter::new(
             live::BinanceExecConfig::spot(
@@ -4631,11 +6483,41 @@ mod tests {
     }
 
     #[cfg(feature = "live-exec")]
+    fn bybit_signing_policy(value: &str) -> arb_signing::SigningPolicy {
+        arb_signing::SigningPolicy::real_signing_enabled(
+            arb_signing::SigningPolicyRef::new(value).expect("policy ref"),
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn bybit_test_signer(
+        timestamp_millis: u64,
+    ) -> arb_signing::real::BybitHmacSha256SigningProvider<
+        GeneratedBinanceCredentialProvider,
+        FixedBinanceTimestamp,
+    > {
+        arb_signing::real::BybitHmacSha256SigningProvider::new(
+            GeneratedBinanceCredentialProvider,
+            FixedBinanceTimestamp(timestamp_millis),
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
     #[derive(Clone, Copy, Debug)]
     struct FixedBinanceTimestamp(u64);
 
     #[cfg(feature = "live-exec")]
     impl arb_signing::real::BinanceTimestampProvider for FixedBinanceTimestamp {
+        fn timestamp_millis(
+            &self,
+            _audit_ref: &arb_signing::SigningAuditRef,
+        ) -> arb_signing::SigningResult<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl arb_signing::real::BybitTimestampProvider for FixedBinanceTimestamp {
         fn timestamp_millis(
             &self,
             _audit_ref: &arb_signing::SigningAuditRef,
@@ -4657,6 +6539,19 @@ mod tests {
             arb_signing::real::BinanceApiCredentials::new(
                 "test-api-key-binance-exec-unit",
                 "test-api-secret-binance-exec-unit",
+            )
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl arb_signing::real::BybitCredentialProvider for GeneratedBinanceCredentialProvider {
+        fn load_bybit_credentials(
+            &self,
+            _audit_ref: &arb_signing::SigningAuditRef,
+        ) -> arb_signing::SigningResult<arb_signing::real::BybitApiCredentials> {
+            arb_signing::real::BybitApiCredentials::new(
+                "test-api-key-bybit-exec-unit",
+                "test-api-secret-bybit-exec-unit",
             )
         }
     }
@@ -4708,6 +6603,65 @@ mod tests {
                 debug: format!("{request:?}"),
             });
             Ok(live::BinanceExecHttpResponse::new(
+                self.status_code,
+                self.body.clone(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedBybitCall {
+        market: live::BybitExecMarket,
+        method: live::BybitExecHttpMethod,
+        endpoint: &'static str,
+        api_key_header_name: String,
+        api_key_header_value: String,
+        timestamp_millis: u64,
+        recv_window_ms: u64,
+        payload: String,
+        signature: String,
+        debug: String,
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordingBybitTransport {
+        status_code: u16,
+        body: String,
+        calls: Vec<RecordedBybitCall>,
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl RecordingBybitTransport {
+        fn ok(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl live::BybitExecTransport for RecordingBybitTransport {
+        fn send_signed(
+            &mut self,
+            request: live::BybitSignedRequest<'_>,
+        ) -> VenueExecResult<live::BybitExecHttpResponse> {
+            self.calls.push(RecordedBybitCall {
+                market: request.market(),
+                method: request.method(),
+                endpoint: request.endpoint(),
+                api_key_header_name: request.api_key_header_name().to_owned(),
+                api_key_header_value: request.api_key_header_value().to_owned(),
+                timestamp_millis: request.timestamp_millis(),
+                recv_window_ms: request.recv_window_ms(),
+                payload: request.payload_for_transport().to_owned(),
+                signature: request.signature_header_value().to_owned(),
+                debug: format!("{request:?}"),
+            });
+            Ok(live::BybitExecHttpResponse::new(
                 self.status_code,
                 self.body.clone(),
             ))
