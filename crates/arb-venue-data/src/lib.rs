@@ -1262,6 +1262,115 @@ pub struct BinancePublicBookTickerBatch {
     pub quote: MarketQuote,
 }
 
+/// Bybit 公共 V5 ticker 只读工具配置。
+///
+/// 中文说明：该配置只描述公开市场数据如何映射到平台工具，不包含 API key、
+/// 账户、签名或任何可变执行能力。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitPublicInstrument {
+    pub symbol: String,
+    pub instrument_id: InstrumentId,
+    pub base_asset_id: AssetId,
+    pub quote_asset_id: AssetId,
+    pub settlement_asset_id: AssetId,
+    pub tick_size: Option<Price>,
+    pub lot_size: Option<Quantity>,
+}
+
+impl BybitPublicInstrument {
+    pub fn new(
+        symbol: impl Into<String>,
+        instrument_id: InstrumentId,
+        base_asset_id: AssetId,
+        quote_asset_id: AssetId,
+        settlement_asset_id: AssetId,
+    ) -> VenueDataResult<Self> {
+        let symbol = symbol.into();
+        validate_bybit_symbol(&symbol)?;
+        Ok(Self {
+            symbol,
+            instrument_id,
+            base_asset_id,
+            quote_asset_id,
+            settlement_asset_id,
+            tick_size: None,
+            lot_size: None,
+        })
+    }
+
+    pub fn with_tick_size(mut self, tick_size: Price) -> Self {
+        self.tick_size = Some(tick_size);
+        self
+    }
+
+    pub fn with_lot_size(mut self, lot_size: Quantity) -> Self {
+        self.lot_size = Some(lot_size);
+        self
+    }
+}
+
+/// Bybit 公共市场类型。
+///
+/// 中文说明：该枚举只用于区分公开现货行情和公开 USDT 线性永续行情，不代表
+/// 账户权限，也不包含任何交易动作。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BybitPublicMarket {
+    Spot,
+    LinearPerpetual,
+}
+
+impl BybitPublicMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "Spot",
+            Self::LinearPerpetual => "LinearPerp",
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::LinearPerpetual => "linear",
+        }
+    }
+
+    fn basis_role(self) -> &'static str {
+        match self {
+            Self::Spot => "Spot",
+            Self::LinearPerpetual => "Perp",
+        }
+    }
+
+    fn event_scope(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::LinearPerpetual => "linear-perp",
+        }
+    }
+
+    fn instrument_kind(self) -> InstrumentKind {
+        match self {
+            Self::Spot => InstrumentKind::SpotPair,
+            Self::LinearPerpetual => InstrumentKind::PerpetualSwap,
+        }
+    }
+}
+
+/// Bybit 公共 ticker 原始响应到标准化事件的输出批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitPublicTickerBatch {
+    pub raw_event: NormalizedEvent,
+    pub normalized_event: NormalizedEvent,
+    pub quote: MarketQuote,
+}
+
+/// Bybit 线性永续 premium index 标准化事件输出批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitLinearPremiumIndexBatch {
+    pub raw_event: NormalizedEvent,
+    pub normalized_event: NormalizedEvent,
+}
+
 const BINANCE_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://data-stream.binance.vision/ws";
 const BINANCE_USDM_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.binance.com/public/ws";
 
@@ -2339,6 +2448,481 @@ impl BinanceUsdmPremiumIndexAdapter {
     }
 }
 
+/// Bybit 公共 V5 ticker 只读适配器。
+///
+/// 中文说明：该适配器只消费调用方传入的公开 REST 响应，不主动联网，不读取
+/// 账户，不下单、不撤单、不转账、不签名。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitPublicTickerAdapter {
+    venue_id: VenueId,
+    instrument: BybitPublicInstrument,
+    market: BybitPublicMarket,
+    max_age_ms: u64,
+    latest_quote: Option<MarketQuote>,
+    health: VenueHealthSnapshot,
+}
+
+impl BybitPublicTickerAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        instrument: BybitPublicInstrument,
+        market: BybitPublicMarket,
+        started_at: UtcTimestamp,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let freshness = DataFreshness::new(started_at, started_at, max_age_ms)?;
+        Ok(Self {
+            venue_id: venue_id.clone(),
+            instrument,
+            market,
+            max_age_ms,
+            latest_quote: None,
+            health: VenueHealthSnapshot {
+                venue_id,
+                status: VenueHealthStatus::Healthy,
+                connection: VenueConnectionStatus::Connected,
+                reason_codes: Vec::new(),
+                rate_limit: None,
+                source_event_id: None,
+                freshness,
+            },
+        })
+    }
+
+    /// 解析 Bybit V5 `market/tickers` 原始响应并生成原始事件与标准化行情事件。
+    pub fn ingest_ticker_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BybitPublicTickerBatch> {
+        let raw_response_ref = raw_response_ref.into();
+        let raw = self.parse_ticker(raw_json)?;
+        let freshness = DataFreshness::new(raw.observed_at, ingested_at, self.max_age_ms)?;
+        let quote = MarketQuote {
+            venue_id: self.venue_id.clone(),
+            instrument_id: self.instrument.instrument_id.clone(),
+            last_price: None,
+            best_bid: Some(raw.best_bid),
+            best_ask: Some(raw.best_ask),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(raw.bid_size),
+            ask_size: Some(raw.ask_size),
+            source_sequence: Some(raw.source_sequence.clone()),
+            source_event_id: Some(bybit_public_raw_event_id(
+                "ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            )),
+            freshness,
+        };
+
+        let raw_event = self.raw_ticker_event(&raw, &raw_response_ref, ingested_at)?;
+        let normalized_event =
+            self.normalized_ticker_event(&raw, &raw_event, &quote, ingested_at)?;
+
+        self.latest_quote = Some(quote.clone());
+        self.health.status = if freshness.is_stale() {
+            VenueHealthStatus::Degraded
+        } else {
+            VenueHealthStatus::Healthy
+        };
+        self.health.connection = VenueConnectionStatus::Connected;
+        self.health.reason_codes = if freshness.is_stale() {
+            vec!["DATA_STALE".to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.health.source_event_id = Some(normalized_event.event_id.as_str().to_owned());
+        self.health.freshness = freshness;
+
+        Ok(BybitPublicTickerBatch {
+            raw_event,
+            normalized_event,
+            quote,
+        })
+    }
+
+    fn parse_ticker(&self, raw_json: &str) -> VenueDataResult<BybitTickerRaw> {
+        let raw = parse_bybit_v5_ticker_row(
+            raw_json,
+            &self.venue_id,
+            self.market,
+            &self.instrument.symbol,
+        )?;
+        let best_bid = parse_price_field(&raw.row, "bid1Price", &self.venue_id)?;
+        let best_ask = parse_price_field(&raw.row, "ask1Price", &self.venue_id)?;
+        let bid_size = parse_quantity_field(&raw.row, "bid1Size", &self.venue_id)?;
+        let ask_size = parse_quantity_field(&raw.row, "ask1Size", &self.venue_id)?;
+        Ok(BybitTickerRaw {
+            symbol: raw.symbol,
+            best_bid,
+            best_ask,
+            bid_size,
+            ask_size,
+            source_sequence: raw.time_ms.to_string(),
+            observed_at: raw.observed_at,
+        })
+    }
+
+    fn raw_ticker_event(
+        &self,
+        raw: &BybitTickerRaw,
+        raw_response_ref: &str,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let payload = format!(
+            "{{\"adapter\":\"BybitPublicTickerAdapter\",\"basis_role\":{},\"category\":{},\"market\":\"{}\",\"raw_response_ref\":{},\"redaction\":\"public_market_data_only_no_account_fields\",\"symbol\":{}}}",
+            json_string(self.market.basis_role()),
+            json_string(self.market.category()),
+            self.market.as_str(),
+            json_string(raw_response_ref),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: bybit_public_raw_event_id(
+                "ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            event_type: NormalizedEventType::RawMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:bybit-public-ticker".to_owned(),
+            source_sequence: Some(format!(
+                "bybit:{}:{}:{}:raw",
+                self.market.event_scope(),
+                raw.symbol,
+                raw.source_sequence
+            )),
+            correlation_id: bybit_public_correlation_id(
+                "ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+
+    fn normalized_ticker_event(
+        &self,
+        raw: &BybitTickerRaw,
+        raw_event: &NormalizedEvent,
+        quote: &MarketQuote,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let freshness = quote.freshness;
+        let payload = format!(
+            "{{\"adapter\":\"BybitPublicTickerAdapter\",\"ask_size\":{},\"basis_role\":{},\"best_ask\":{},\"best_bid\":{},\"bid_size\":{},\"freshness\":{},\"kind\":\"BookTicker\",\"market\":\"{}\",\"raw_event_ref\":{},\"risk_reason_code\":{},\"venue_symbol\":{}}}",
+            json_string(&raw.ask_size.to_string()),
+            json_string(self.market.basis_role()),
+            json_string(&raw.best_ask.to_string()),
+            json_string(&raw.best_bid.to_string()),
+            json_string(&raw.bid_size.to_string()),
+            freshness_payload_json(freshness),
+            self.market.as_str(),
+            json_string(raw_event.event_id.as_str()),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: bybit_public_normalized_event_id(
+                "ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            event_type: NormalizedEventType::NormalizedMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:bybit-public-ticker".to_owned(),
+            source_sequence: Some(format!(
+                "bybit:{}:{}:{}:normalized",
+                self.market.event_scope(),
+                raw.symbol,
+                raw.source_sequence
+            )),
+            correlation_id: bybit_public_correlation_id(
+                "ticker",
+                self.market,
+                &raw.symbol,
+                &raw.source_sequence,
+            ),
+            causation_id: Some(raw_event.event_id.as_str().to_owned()),
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+}
+
+impl VenueReadAdapter for BybitPublicTickerAdapter {
+    fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+}
+
+impl MarketDataReader for BybitPublicTickerAdapter {
+    fn latest_quote(&self, query: &MarketDataQuery) -> VenueDataResult<Option<MarketQuote>> {
+        Ok((query.venue_id == self.venue_id
+            && query.instrument_id == self.instrument.instrument_id)
+            .then(|| self.latest_quote.clone())
+            .flatten())
+    }
+
+    fn order_book(&self, query: &MarketDataQuery) -> VenueDataResult<Option<OrderBookSnapshot>> {
+        if query.venue_id != self.venue_id || query.instrument_id != self.instrument.instrument_id {
+            return Ok(None);
+        }
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Bybit public ticker only exposes top-of-book, not full depth".to_owned(),
+        })
+    }
+}
+
+impl BalanceReader for BybitPublicTickerAdapter {
+    fn balances(&self, _query: &BalanceQuery) -> VenueDataResult<Vec<VenueBalance>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::Balance,
+            reason: "public market data adapter has no account balance surface".to_owned(),
+        })
+    }
+}
+
+impl PositionReader for BybitPublicTickerAdapter {
+    fn positions(&self, _query: &PositionQuery) -> VenueDataResult<Vec<VenuePosition>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::Position,
+            reason: "public market data adapter has no account position surface".to_owned(),
+        })
+    }
+}
+
+impl InstrumentInfoReader for BybitPublicTickerAdapter {
+    fn instruments(&self, query: &InstrumentInfoQuery) -> VenueDataResult<Vec<InstrumentInfo>> {
+        if query.venue_id != self.venue_id {
+            return Ok(Vec::new());
+        }
+        if query
+            .instrument_id
+            .as_ref()
+            .is_some_and(|instrument_id| instrument_id != &self.instrument.instrument_id)
+        {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![InstrumentInfo {
+            venue_id: self.venue_id.clone(),
+            instrument_id: self.instrument.instrument_id.clone(),
+            kind: self.market.instrument_kind(),
+            base_asset_id: Some(self.instrument.base_asset_id.clone()),
+            quote_asset_id: Some(self.instrument.quote_asset_id.clone()),
+            settlement_asset_id: self.instrument.settlement_asset_id.clone(),
+            margin_asset_id: (self.market == BybitPublicMarket::LinearPerpetual)
+                .then(|| self.instrument.settlement_asset_id.clone()),
+            tick_size: self.instrument.tick_size,
+            lot_size: self.instrument.lot_size,
+            contract_multiplier: None,
+            is_active: true,
+            source_event_id: self
+                .latest_quote
+                .as_ref()
+                .and_then(|quote| quote.source_event_id.clone()),
+            freshness: self.health.freshness,
+        }])
+    }
+}
+
+impl VenueHealthReader for BybitPublicTickerAdapter {
+    fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
+        if venue_id == &self.venue_id {
+            Ok(self.health.clone())
+        } else {
+            Err(VenueDataError::DataUnavailable {
+                venue_id: venue_id.clone(),
+                surface: ReadOnlySurface::VenueHealth,
+                reason: "adapter only tracks its configured venue".to_owned(),
+            })
+        }
+    }
+}
+
+/// Bybit 线性永续 premium index 只读适配器。
+///
+/// 中文说明：Bybit V5 把 mark price、index price 和 funding rate 放在
+/// `market/tickers?category=linear` 响应中。该适配器只解析公开字段，不读取仓位、
+/// 不签名，也不提交任何账户动作。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitLinearPremiumIndexAdapter {
+    venue_id: VenueId,
+    instrument: BybitPublicInstrument,
+    max_age_ms: u64,
+}
+
+impl BybitLinearPremiumIndexAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        instrument: BybitPublicInstrument,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        Ok(Self {
+            venue_id,
+            instrument,
+            max_age_ms,
+        })
+    }
+
+    pub fn ingest_premium_index_json(
+        &self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BybitLinearPremiumIndexBatch> {
+        let raw_response_ref = raw_response_ref.into();
+        let raw = self.parse_premium_index(raw_json)?;
+        let freshness = DataFreshness::new(raw.observed_at, ingested_at, self.max_age_ms)?;
+        let raw_event = self.raw_premium_index_event(&raw, &raw_response_ref, ingested_at)?;
+        let normalized_event =
+            self.normalized_premium_index_event(&raw, &raw_event, freshness, ingested_at)?;
+        Ok(BybitLinearPremiumIndexBatch {
+            raw_event,
+            normalized_event,
+        })
+    }
+
+    fn parse_premium_index(&self, raw_json: &str) -> VenueDataResult<BybitPremiumIndexRaw> {
+        let raw = parse_bybit_v5_ticker_row(
+            raw_json,
+            &self.venue_id,
+            BybitPublicMarket::LinearPerpetual,
+            &self.instrument.symbol,
+        )?;
+        let mark_price = parse_price_field(&raw.row, "markPrice", &self.venue_id)?;
+        let index_price = parse_price_field(&raw.row, "indexPrice", &self.venue_id)?;
+        let last_funding_rate =
+            parse_decimal_string_field(&raw.row, "fundingRate", &self.venue_id)?;
+        let next_funding_time_ms = required_u64(
+            &raw.row,
+            "nextFundingTime",
+            self.venue_id.clone(),
+            ReadOnlySurface::MarketData,
+        )?;
+        Ok(BybitPremiumIndexRaw {
+            symbol: raw.symbol,
+            mark_price,
+            index_price,
+            last_funding_rate,
+            next_funding_time_ms,
+            time_ms: raw.time_ms,
+            observed_at: raw.observed_at,
+        })
+    }
+
+    fn raw_premium_index_event(
+        &self,
+        raw: &BybitPremiumIndexRaw,
+        raw_response_ref: &str,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let payload = format!(
+            "{{\"adapter\":\"BybitLinearPremiumIndexAdapter\",\"basis_role\":\"Perp\",\"category\":\"linear\",\"raw_response_ref\":{},\"redaction\":\"public_market_data_only_no_account_fields\",\"symbol\":{}}}",
+            json_string(raw_response_ref),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: bybit_public_raw_event_id(
+                "premium-index",
+                BybitPublicMarket::LinearPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            event_type: NormalizedEventType::RawMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:bybit-linear-premium-index".to_owned(),
+            source_sequence: Some(format!(
+                "bybit:linear-perp:{}:{}:raw",
+                raw.symbol, raw.time_ms
+            )),
+            correlation_id: bybit_public_correlation_id(
+                "premium-index",
+                BybitPublicMarket::LinearPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+
+    fn normalized_premium_index_event(
+        &self,
+        raw: &BybitPremiumIndexRaw,
+        raw_event: &NormalizedEvent,
+        freshness: DataFreshness,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<NormalizedEvent> {
+        let payload = format!(
+            "{{\"adapter\":\"BybitLinearPremiumIndexAdapter\",\"basis_role\":\"Perp\",\"freshness\":{},\"index_price\":{},\"kind\":\"PerpPremiumIndex\",\"last_funding_rate\":{},\"mark_price\":{},\"next_funding_time_ms\":{},\"raw_event_ref\":{},\"risk_reason_code\":{},\"venue_symbol\":{}}}",
+            freshness_payload_json(freshness),
+            json_string(&raw.index_price.to_string()),
+            json_string(&raw.last_funding_rate),
+            json_string(&raw.mark_price.to_string()),
+            raw.next_funding_time_ms,
+            json_string(raw_event.event_id.as_str()),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+            json_string(&raw.symbol),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: bybit_public_normalized_event_id(
+                "premium-index",
+                BybitPublicMarket::LinearPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            event_type: NormalizedEventType::NormalizedMarketDataEvent,
+            timestamp_event: raw.observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:bybit-linear-premium-index".to_owned(),
+            source_sequence: Some(format!(
+                "bybit:linear-perp:{}:{}:normalized",
+                raw.symbol, raw.time_ms
+            )),
+            correlation_id: bybit_public_correlation_id(
+                "premium-index",
+                BybitPublicMarket::LinearPerpetual,
+                &raw.symbol,
+                &raw.time_ms.to_string(),
+            ),
+            causation_id: Some(raw_event.event_id.as_str().to_owned()),
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: Some(self.instrument.instrument_id.as_str().to_owned()),
+            payload_json: payload,
+        })
+    }
+}
+
 /// Binance 公共 24hr ticker 离线只读适配器。
 ///
 /// 中文说明：这是阶段 8 的第一个场所适配器样例。它只消费调用方传入的公开
@@ -2929,6 +3513,52 @@ pub struct BinancePrivateBalanceBatch {
 /// Binance 私有账户仓位快照批次。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinancePrivatePositionBatch {
+    pub position_event: NormalizedEvent,
+    pub positions: Vec<VenuePosition>,
+}
+
+/// Bybit 私有账户只读市场类型。
+///
+/// 中文说明：该枚举只描述账户快照来源，不表达交易、撤单、划转或签名能力。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BybitPrivateAccountMarket {
+    UnifiedAccount,
+    LinearPerpetual,
+}
+
+impl BybitPrivateAccountMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnifiedAccount => "UnifiedAccount",
+            Self::LinearPerpetual => "LinearPerpetual",
+        }
+    }
+
+    fn event_scope(self) -> &'static str {
+        match self {
+            Self::UnifiedAccount => "unified",
+            Self::LinearPerpetual => "linear-perp",
+        }
+    }
+
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::UnifiedAccount => "/v5/account/wallet-balance",
+            Self::LinearPerpetual => "/v5/position/list",
+        }
+    }
+}
+
+/// Bybit 私有账户余额快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitPrivateBalanceBatch {
+    pub balance_event: NormalizedEvent,
+    pub balances: Vec<VenueBalance>,
+}
+
+/// Bybit 私有账户仓位快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitPrivatePositionBatch {
     pub position_event: NormalizedEvent,
     pub positions: Vec<VenuePosition>,
 }
@@ -3623,6 +4253,617 @@ impl VenueHealthReader for BinancePrivateAccountAdapter {
     }
 }
 
+/// Bybit 私有账户只读适配器。
+///
+/// 中文说明：该适配器只消费调用方已经获取到的私有账户 JSON 响应，负责把
+/// V5 私有只读响应映射为余额和仓位快照。它不持有 API key，不生成签名，
+/// 不主动联网，也不提供下单、撤单、划转或改杠杆等可变动作。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BybitPrivateAccountAdapter {
+    venue_id: VenueId,
+    account_id: AccountId,
+    market: BybitPrivateAccountMarket,
+    max_age_ms: u64,
+    balances: Vec<VenueBalance>,
+    positions: Vec<VenuePosition>,
+    health: VenueHealthSnapshot,
+}
+
+impl BybitPrivateAccountAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        account_id: AccountId,
+        market: BybitPrivateAccountMarket,
+        started_at: UtcTimestamp,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let freshness = DataFreshness::new(started_at, started_at, max_age_ms)?;
+        Ok(Self {
+            venue_id: venue_id.clone(),
+            account_id,
+            market,
+            max_age_ms,
+            balances: Vec::new(),
+            positions: Vec::new(),
+            health: VenueHealthSnapshot {
+                venue_id,
+                status: VenueHealthStatus::Unknown,
+                connection: VenueConnectionStatus::Unknown,
+                reason_codes: vec!["PRIVATE_ACCOUNT_NOT_INGESTED".to_owned()],
+                rate_limit: None,
+                source_event_id: None,
+                freshness,
+            },
+        })
+    }
+
+    pub fn market(&self) -> BybitPrivateAccountMarket {
+        self.market
+    }
+
+    pub fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// 解析 Bybit V5 `/v5/account/wallet-balance` 响应为统一账户余额快照。
+    pub fn ingest_unified_wallet_balance_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BybitPrivateBalanceBatch> {
+        self.ensure_market(
+            BybitPrivateAccountMarket::UnifiedAccount,
+            "bybit.unified.wallet_balance",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let object =
+            parse_bybit_private_object(raw_json, &self.venue_id, ReadOnlySurface::Balance)?;
+        validate_bybit_v5_ret_code(&object, &self.venue_id, ReadOnlySurface::Balance)?;
+        let time_ms = required_u64(
+            &object,
+            "time",
+            self.venue_id.clone(),
+            ReadOnlySurface::Balance,
+        )?;
+        let observed_at = timestamp_from_unix_millis(time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = time_ms.to_string();
+        let balance_event_id =
+            bybit_private_event_id("balance", self.market, &self.account_id, &source_sequence);
+        let result = required_object_field(
+            &object,
+            "result",
+            self.venue_id.clone(),
+            ReadOnlySurface::Balance,
+        )?;
+        let accounts = required_array(
+            result,
+            "list",
+            self.venue_id.clone(),
+            ReadOnlySurface::Balance,
+        )?;
+
+        let mut balances = Vec::new();
+        let mut found_unified = false;
+        for (account_index, value) in accounts.iter().enumerate() {
+            let account = required_object_value(
+                value,
+                "list",
+                account_index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            let account_type = required_string(
+                account,
+                "accountType",
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            if account_type != "UNIFIED" {
+                continue;
+            }
+            found_unified = true;
+            let coins = required_array(
+                account,
+                "coin",
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            for (coin_index, value) in coins.iter().enumerate() {
+                let coin = required_object_value(
+                    value,
+                    "coin",
+                    coin_index,
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Balance,
+                )?;
+                let asset = required_string(
+                    coin,
+                    "coin",
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Balance,
+                )?;
+                validate_bybit_asset_symbol(&asset)?;
+                balances.push(VenueBalance {
+                    venue_id: self.venue_id.clone(),
+                    account_id: self.account_id.clone(),
+                    asset_id: bybit_asset_id(&asset)?,
+                    free: parse_bybit_wallet_free(coin, &self.venue_id)?,
+                    locked: parse_optional_amount_surface_field(
+                        coin,
+                        "locked",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    reserved: parse_optional_amount_surface_field(
+                        coin,
+                        "totalOrderIM",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    pending: zero_amount(),
+                    borrowed: parse_optional_amount_surface_field(
+                        coin,
+                        "borrowAmount",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    lent: zero_amount(),
+                    unsettled: parse_optional_amount_surface_field(
+                        coin,
+                        "spotHedgingQty",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    source_event_id: Some(balance_event_id.clone()),
+                    freshness,
+                });
+            }
+        }
+
+        if !found_unified {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MissingField,
+                "Bybit wallet-balance response contains no UNIFIED account row",
+            )));
+        }
+
+        let balance_event = self.balance_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &balances,
+        )?;
+        self.balances = balances.clone();
+        self.update_health(freshness, balance_event.event_id.as_str());
+
+        Ok(BybitPrivateBalanceBatch {
+            balance_event,
+            balances,
+        })
+    }
+
+    /// 解析 Bybit V5 `/v5/position/list?category=linear` 响应为线性永续仓位快照。
+    pub fn ingest_linear_position_list_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BybitPrivatePositionBatch> {
+        self.ensure_market(
+            BybitPrivateAccountMarket::LinearPerpetual,
+            "bybit.linear.position_list",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let object =
+            parse_bybit_private_object(raw_json, &self.venue_id, ReadOnlySurface::Position)?;
+        validate_bybit_v5_ret_code(&object, &self.venue_id, ReadOnlySurface::Position)?;
+        let top_time_ms = required_u64(
+            &object,
+            "time",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        let result = required_object_field(
+            &object,
+            "result",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        let category = required_string(
+            result,
+            "category",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        if category != "linear" {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::UnknownExternalState,
+                format!("Bybit position/list category `{category}` is not `linear`"),
+            )));
+        }
+        let position_values = required_array(
+            result,
+            "list",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+
+        let mut max_update_time_ms = top_time_ms;
+        let mut position_objects = Vec::with_capacity(position_values.len());
+        for (index, value) in position_values.iter().enumerate() {
+            let position_object = required_object_value(
+                value,
+                "list",
+                index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            if let Some(update_time_ms) = optional_u64(position_object, "updatedTime")? {
+                max_update_time_ms = max_update_time_ms.max(update_time_ms);
+            }
+            position_objects.push(position_object);
+        }
+
+        let observed_at = timestamp_from_unix_millis(max_update_time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = max_update_time_ms.to_string();
+        let position_event_id =
+            bybit_private_event_id("position", self.market, &self.account_id, &source_sequence);
+
+        let mut positions = Vec::new();
+        for position_object in position_objects {
+            let size = parse_decimal_surface_field(
+                position_object,
+                "size",
+                &self.venue_id,
+                ReadOnlySurface::Position,
+            )?;
+            if size.is_zero() {
+                continue;
+            }
+            let side = required_string(
+                position_object,
+                "side",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let quantity = bybit_signed_position_quantity(size, &side)?;
+            let symbol = required_string(
+                position_object,
+                "symbol",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            validate_bybit_symbol(&symbol)?;
+            positions.push(VenuePosition {
+                venue_id: self.venue_id.clone(),
+                position_id: Some(bybit_linear_position_id(&self.account_id, &symbol, &side)?),
+                account_id: self.account_id.clone(),
+                instrument_id: bybit_linear_instrument_id(&symbol)?,
+                quantity,
+                entry_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "avgPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                mark_price: parse_price_surface_field(
+                    position_object,
+                    "markPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                unrealized_pnl: parse_pnl_surface_field_any(
+                    position_object,
+                    &["unrealisedPnl", "unrealizedPnl"],
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                liquidation_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "liqPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                source_event_id: Some(position_event_id.clone()),
+                freshness,
+            });
+        }
+
+        let position_event = self.position_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &positions,
+        )?;
+        self.positions = positions.clone();
+        self.update_health(freshness, position_event.event_id.as_str());
+
+        Ok(BybitPrivatePositionBatch {
+            position_event,
+            positions,
+        })
+    }
+
+    pub fn classify_http_status(
+        &self,
+        surface: ReadOnlySurface,
+        status_code: u16,
+        detail: impl Into<String>,
+    ) -> ClassifiedExternalError {
+        let class = match status_code {
+            408 | 504 => ExternalErrorClass::Timeout,
+            429 => ExternalErrorClass::RateLimited,
+            500..=599 => ExternalErrorClass::Disconnected,
+            _ => ExternalErrorClass::UnknownExternalState,
+        };
+        ClassifiedExternalError::new(self.venue_id.clone(), surface, class, detail)
+    }
+
+    fn ensure_market(
+        &self,
+        expected: BybitPrivateAccountMarket,
+        field: &'static str,
+    ) -> VenueDataResult<()> {
+        if self.market == expected {
+            Ok(())
+        } else {
+            Err(VenueDataError::InvalidQuery {
+                field,
+                reason: "adapter was configured for a different Bybit private account market",
+            })
+        }
+    }
+
+    fn balance_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        balances: &[VenueBalance],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let asset_ids = balances
+            .iter()
+            .map(|balance| balance.asset_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"BybitPrivateAccountAdapter\",\"asset_ids\":{},\"balance_count\":{},\"endpoint\":{},\"freshness\":{},\"kind\":\"BybitPrivateBalanceSnapshot\",\"market\":\"{}\",\"raw_response_ref\":{},\"redaction\":\"private_account_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            json_string_array(asset_ids.iter().map(String::as_str)),
+            balances.len(),
+            json_string(self.market.endpoint()),
+            freshness_payload_json(freshness),
+            self.market.as_str(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: bybit_private_event_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::BalanceSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:bybit-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "bybit:private:{}:{}:{source_sequence}:balance",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: bybit_private_correlation_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn position_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        positions: &[VenuePosition],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let instrument_ids = positions
+            .iter()
+            .map(|position| position.instrument_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"BybitPrivateAccountAdapter\",\"endpoint\":{},\"freshness\":{},\"instrument_ids\":{},\"kind\":\"BybitPrivatePositionSnapshot\",\"market\":\"{}\",\"position_count\":{},\"raw_response_ref\":{},\"redaction\":\"private_position_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            json_string(self.market.endpoint()),
+            freshness_payload_json(freshness),
+            json_string_array(instrument_ids.iter().map(String::as_str)),
+            self.market.as_str(),
+            positions.len(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: bybit_private_event_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::PositionSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:bybit-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "bybit:private:{}:{}:{source_sequence}:position",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: bybit_private_correlation_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn update_health(&mut self, freshness: DataFreshness, source_event_id: &str) {
+        self.health.status = if freshness.is_stale() {
+            VenueHealthStatus::Degraded
+        } else {
+            VenueHealthStatus::Healthy
+        };
+        self.health.connection = VenueConnectionStatus::Connected;
+        self.health.reason_codes = if freshness.is_stale() {
+            vec!["DATA_STALE".to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.health.source_event_id = Some(source_event_id.to_owned());
+        self.health.freshness = freshness;
+    }
+}
+
+impl VenueReadAdapter for BybitPrivateAccountAdapter {
+    fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+}
+
+impl MarketDataReader for BybitPrivateAccountAdapter {
+    fn latest_quote(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<MarketQuote>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Bybit private account adapter has no market data surface".to_owned(),
+        })
+    }
+
+    fn order_book(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<OrderBookSnapshot>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Bybit private account adapter has no order book surface".to_owned(),
+        })
+    }
+}
+
+impl BalanceReader for BybitPrivateAccountAdapter {
+    fn balances(&self, query: &BalanceQuery) -> VenueDataResult<Vec<VenueBalance>> {
+        Ok(self
+            .balances
+            .iter()
+            .filter(|balance| balance.venue_id == query.venue_id)
+            .filter(|balance| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &balance.account_id)
+            })
+            .filter(|balance| {
+                query
+                    .asset_id
+                    .as_ref()
+                    .is_none_or(|asset_id| asset_id == &balance.asset_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl PositionReader for BybitPrivateAccountAdapter {
+    fn positions(&self, query: &PositionQuery) -> VenueDataResult<Vec<VenuePosition>> {
+        Ok(self
+            .positions
+            .iter()
+            .filter(|position| position.venue_id == query.venue_id)
+            .filter(|position| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &position.account_id)
+            })
+            .filter(|position| {
+                query
+                    .instrument_id
+                    .as_ref()
+                    .is_none_or(|instrument_id| instrument_id == &position.instrument_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl InstrumentInfoReader for BybitPrivateAccountAdapter {
+    fn instruments(&self, _query: &InstrumentInfoQuery) -> VenueDataResult<Vec<InstrumentInfo>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::InstrumentInfo,
+            reason: "Bybit private account adapter does not define instrument metadata".to_owned(),
+        })
+    }
+}
+
+impl VenueHealthReader for BybitPrivateAccountAdapter {
+    fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
+        if venue_id == &self.venue_id {
+            Ok(self.health.clone())
+        } else {
+            Err(VenueDataError::DataUnavailable {
+                venue_id: venue_id.clone(),
+                surface: ReadOnlySurface::VenueHealth,
+                reason: "adapter only tracks its configured venue".to_owned(),
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EventEnvelope {
     event_id: String,
@@ -3682,6 +4923,36 @@ struct BinancePremiumIndexRaw {
     last_funding_rate: String,
     interest_rate: String,
     next_funding_time_ms: u64,
+    time_ms: u64,
+    observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BybitTickerRaw {
+    symbol: String,
+    best_bid: Price,
+    best_ask: Price,
+    bid_size: Quantity,
+    ask_size: Quantity,
+    source_sequence: String,
+    observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BybitPremiumIndexRaw {
+    symbol: String,
+    mark_price: Price,
+    index_price: Price,
+    last_funding_rate: String,
+    next_funding_time_ms: u64,
+    time_ms: u64,
+    observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BybitTickerRow {
+    symbol: String,
+    row: BTreeMap<String, FlatJsonValue>,
     time_ms: u64,
     observed_at: UtcTimestamp,
 }
@@ -3959,6 +5230,44 @@ fn validate_binance_symbol(symbol: &str) -> VenueDataResult<()> {
     Ok(())
 }
 
+fn validate_bybit_symbol(symbol: &str) -> VenueDataResult<()> {
+    if symbol.len() < 3 || symbol.len() > 32 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "bybit.symbol",
+            reason: "symbol length must be 3..=32",
+        });
+    }
+    if !symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "bybit.symbol",
+            reason: "symbol must contain only uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
+}
+
+fn validate_bybit_asset_symbol(asset: &str) -> VenueDataResult<()> {
+    if asset.is_empty() || asset.len() > 32 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "bybit.asset",
+            reason: "asset symbol length must be 1..=32",
+        });
+    }
+    if !asset
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "bybit.asset",
+            reason: "asset symbol must contain only uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
+}
+
 fn validate_binance_asset_symbol(asset: &str) -> VenueDataResult<()> {
     if asset.is_empty() || asset.len() > 32 {
         return Err(VenueDataError::InvalidQuery {
@@ -4002,6 +5311,147 @@ fn parse_binance_private_object(
             error.to_string(),
         ))
     })
+}
+
+fn parse_bybit_private_object(
+    raw_json: &str,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<BTreeMap<String, FlatJsonValue>> {
+    FlatJsonParser::new(raw_json).parse().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            error.to_string(),
+        ))
+    })
+}
+
+fn validate_bybit_v5_ret_code(
+    object: &BTreeMap<String, FlatJsonValue>,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<()> {
+    let ret_code = required_u64(object, "retCode", venue_id.clone(), surface)?;
+    if ret_code == 0 {
+        return Ok(());
+    }
+    let ret_msg = optional_string(object, "retMsg", venue_id.clone(), surface)?
+        .unwrap_or_else(|| "missing retMsg".to_owned());
+    Err(VenueDataError::External(ClassifiedExternalError::new(
+        venue_id.clone(),
+        surface,
+        ExternalErrorClass::UnknownExternalState,
+        format!("Bybit V5 private response returned retCode={ret_code}: {ret_msg}"),
+    )))
+}
+
+fn parse_bybit_v5_ticker_row(
+    raw_json: &str,
+    venue_id: &VenueId,
+    market: BybitPublicMarket,
+    expected_symbol: &str,
+) -> VenueDataResult<BybitTickerRow> {
+    let object = FlatJsonParser::new(raw_json).parse().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+            ExternalErrorClass::MalformedPayload,
+            error.to_string(),
+        ))
+    })?;
+    let ret_code = required_u64(
+        &object,
+        "retCode",
+        venue_id.clone(),
+        ReadOnlySurface::MarketData,
+    )?;
+    if ret_code != 0 {
+        let ret_msg = optional_string(
+            &object,
+            "retMsg",
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+        )?
+        .unwrap_or_else(|| "missing retMsg".to_owned());
+        return Err(VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+            ExternalErrorClass::UnknownExternalState,
+            format!("Bybit V5 ticker returned retCode={ret_code}: {ret_msg}"),
+        )));
+    }
+
+    let time_ms = required_u64(
+        &object,
+        "time",
+        venue_id.clone(),
+        ReadOnlySurface::MarketData,
+    )?;
+    let observed_at = timestamp_from_unix_millis(time_ms).map_err(|detail| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+            ExternalErrorClass::MalformedPayload,
+            detail,
+        ))
+    })?;
+    let result = required_object_field(
+        &object,
+        "result",
+        venue_id.clone(),
+        ReadOnlySurface::MarketData,
+    )?;
+    let category = required_string(
+        result,
+        "category",
+        venue_id.clone(),
+        ReadOnlySurface::MarketData,
+    )?;
+    if category != market.category() {
+        return Err(VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+            ExternalErrorClass::UnknownExternalState,
+            format!(
+                "Bybit V5 ticker category `{category}` does not match configured category `{}`",
+                market.category()
+            ),
+        )));
+    }
+
+    let list = required_array(
+        result,
+        "list",
+        venue_id.clone(),
+        ReadOnlySurface::MarketData,
+    )?;
+    for (index, value) in list.iter().enumerate() {
+        let row = required_object_value(
+            value,
+            "list",
+            index,
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+        )?;
+        let symbol = required_string(row, "symbol", venue_id.clone(), ReadOnlySurface::MarketData)?;
+        if symbol == expected_symbol {
+            return Ok(BybitTickerRow {
+                symbol,
+                row: row.clone(),
+                time_ms,
+                observed_at,
+            });
+        }
+    }
+
+    Err(VenueDataError::External(ClassifiedExternalError::new(
+        venue_id.clone(),
+        ReadOnlySurface::MarketData,
+        ExternalErrorClass::UnknownExternalState,
+        format!("Bybit V5 ticker list does not contain configured symbol `{expected_symbol}`"),
+    )))
 }
 
 fn required_string(
@@ -4058,6 +5508,29 @@ fn required_array<'a>(
             surface,
             ExternalErrorClass::MalformedPayload,
             format!("field `{field}` must be an array"),
+        ))),
+        None => Err(VenueDataError::External(ClassifiedExternalError::new(
+            venue_id,
+            surface,
+            ExternalErrorClass::MissingField,
+            format!("required field `{field}` is missing"),
+        ))),
+    }
+}
+
+fn required_object_field<'a>(
+    object: &'a BTreeMap<String, FlatJsonValue>,
+    field: &'static str,
+    venue_id: VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<&'a BTreeMap<String, FlatJsonValue>> {
+    match object.get(field) {
+        Some(FlatJsonValue::Object(value)) => Ok(value),
+        Some(_) => Err(VenueDataError::External(ClassifiedExternalError::new(
+            venue_id,
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            format!("field `{field}` must be an object"),
         ))),
         None => Err(VenueDataError::External(ClassifiedExternalError::new(
             venue_id,
@@ -4226,6 +5699,25 @@ fn parse_amount_surface_field(
         })
 }
 
+fn parse_optional_amount_surface_field(
+    object: &BTreeMap<String, FlatJsonValue>,
+    field: &'static str,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<Amount> {
+    let Some(value) = optional_decimal_text(object, field, venue_id, surface)? else {
+        return Ok(zero_amount());
+    };
+    value.parse::<Amount>().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            format!("field `{field}` is not a valid non-negative amount: {error}"),
+        ))
+    })
+}
+
 fn parse_decimal_surface_field(
     object: &BTreeMap<String, FlatJsonValue>,
     field: &'static str,
@@ -4363,14 +5855,39 @@ fn zero_amount() -> Amount {
     Amount::new(Decimal::from_scaled_atoms(0, 0)).expect("zero is a valid amount")
 }
 
+fn parse_bybit_wallet_free(
+    object: &BTreeMap<String, FlatJsonValue>,
+    venue_id: &VenueId,
+) -> VenueDataResult<Amount> {
+    if object.contains_key("availableToWithdraw") {
+        return parse_amount_surface_field(
+            object,
+            "availableToWithdraw",
+            venue_id,
+            ReadOnlySurface::Balance,
+        );
+    }
+    parse_amount_surface_field(object, "walletBalance", venue_id, ReadOnlySurface::Balance)
+}
+
 fn binance_asset_id(asset: &str) -> VenueDataResult<AssetId> {
     validate_binance_asset_symbol(asset)?;
+    AssetId::new(format!("asset:{asset}")).map_err(VenueDataError::from)
+}
+
+fn bybit_asset_id(asset: &str) -> VenueDataResult<AssetId> {
+    validate_bybit_asset_symbol(asset)?;
     AssetId::new(format!("asset:{asset}")).map_err(VenueDataError::from)
 }
 
 fn binance_usdm_instrument_id(symbol: &str) -> VenueDataResult<InstrumentId> {
     validate_binance_symbol(symbol)?;
     InstrumentId::new(format!("inst:BINANCE:{symbol}:USDM-PERP")).map_err(VenueDataError::from)
+}
+
+fn bybit_linear_instrument_id(symbol: &str) -> VenueDataResult<InstrumentId> {
+    validate_bybit_symbol(symbol)?;
+    InstrumentId::new(format!("inst:BYBIT:{symbol}:LINEAR-PERP")).map_err(VenueDataError::from)
 }
 
 fn binance_usdm_position_id(
@@ -4386,6 +5903,42 @@ fn binance_usdm_position_id(
         position_side.to_ascii_lowercase()
     ))
     .map_err(VenueDataError::from)
+}
+
+fn bybit_linear_position_id(
+    account_id: &AccountId,
+    symbol: &str,
+    side: &str,
+) -> VenueDataResult<PositionId> {
+    validate_bybit_symbol(symbol)?;
+    let side = match side {
+        "Buy" => "long",
+        "Sell" => "short",
+        _ => {
+            return Err(VenueDataError::InvalidQuery {
+                field: "bybit.position.side",
+                reason: "position side must be Buy or Sell for non-zero size",
+            });
+        }
+    };
+    PositionId::new(format!(
+        "pos:{}:bybit-linear:{symbol}:{side}",
+        account_id.as_str()
+    ))
+    .map_err(VenueDataError::from)
+}
+
+fn bybit_signed_position_quantity(size: Decimal, side: &str) -> VenueDataResult<Decimal> {
+    match side {
+        "Buy" => Ok(size),
+        "Sell" => Decimal::from_scaled_atoms(0, 0)
+            .checked_sub(size)
+            .map_err(VenueDataError::from),
+        _ => Err(VenueDataError::InvalidQuery {
+            field: "bybit.position.side",
+            reason: "position side must be Buy or Sell for non-zero size",
+        }),
+    }
 }
 
 fn timestamp_from_unix_millis(value: u64) -> Result<UtcTimestamp, String> {
@@ -4466,6 +6019,42 @@ fn binance_public_correlation_id(
     )
 }
 
+fn bybit_public_raw_event_id(
+    stream: &str,
+    market: BybitPublicMarket,
+    symbol: &str,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:bybit-public:{stream}:{}:{symbol}:{source_sequence}:raw",
+        market.event_scope()
+    )
+}
+
+fn bybit_public_normalized_event_id(
+    stream: &str,
+    market: BybitPublicMarket,
+    symbol: &str,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:bybit-public:{stream}:{}:{symbol}:{source_sequence}:normalized",
+        market.event_scope()
+    )
+}
+
+fn bybit_public_correlation_id(
+    stream: &str,
+    market: BybitPublicMarket,
+    symbol: &str,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "corr:venue-data:bybit-public:{stream}:{}:{symbol}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
 fn binance_public_wss_source_event_id(
     market: BinancePublicMarket,
     symbol: &str,
@@ -4498,6 +6087,30 @@ fn binance_private_correlation_id(
 ) -> String {
     format!(
         "corr:venue-data:binance-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn bybit_private_event_id(
+    kind: &str,
+    market: BybitPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:bybit-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn bybit_private_correlation_id(
+    kind: &str,
+    market: BybitPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "corr:venue-data:bybit-private:{kind}:{}:{account_id}:{source_sequence}",
         market.event_scope()
     )
 }
@@ -5402,6 +7015,132 @@ mod tests {
     }
 
     #[test]
+    fn bybit_public_ticker_maps_spot_and_linear_top_of_book() {
+        let mut spot = bybit_ticker_adapter(
+            "venue:BYBIT-SPOT",
+            "inst:BYBIT:BTCUSDT:SPOT",
+            BybitPublicMarket::Spot,
+        );
+        let spot_batch = spot
+            .ingest_ticker_json(
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"ETHUSDT","bid1Price":"50.00","bid1Size":"3.0","ask1Price":"50.10","ask1Size":"4.0"},{"symbol":"BTCUSDT","bid1Price":"43187.40","bid1Size":"1.20000000","ask1Price":"43188.10","ask1Size":"0.80000000"}]},"retExtInfo":{},"time":1767225601000}"#,
+                "https://api.bybit.com/v5/market/tickers?category=spot",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("spot ticker");
+
+        assert_eq!(
+            spot_batch.quote.best_bid.expect("bid").to_string(),
+            "43187.40"
+        );
+        assert_eq!(
+            payload_string(&spot_batch.normalized_event, "basis_role"),
+            "Spot"
+        );
+        assert_eq!(
+            payload_string(&spot_batch.normalized_event, "market"),
+            "Spot"
+        );
+        assert_eq!(
+            spot_batch.quote.source_sequence.as_deref(),
+            Some("1767225601000")
+        );
+        assert_eq!(
+            canonical_normalized_event_hash(&spot_batch.normalized_event),
+            spot_batch.normalized_event.checksum.as_str()
+        );
+
+        let mut linear = bybit_ticker_adapter(
+            "venue:BYBIT-LINEAR",
+            "inst:BYBIT:BTCUSDT:LINEAR-PERP",
+            BybitPublicMarket::LinearPerpetual,
+        );
+        let linear_batch = linear
+            .ingest_ticker_json(
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","bid1Price":"43250.00","bid1Size":"2.00000000","ask1Price":"43251.00","ask1Size":"1.50000000","markPrice":"43240.12345678","indexPrice":"43190.00000000","fundingRate":"0.00010000","nextFundingTime":"1767254400000"}]},"retExtInfo":{},"time":1767225601000}"#,
+                "https://api.bybit.com/v5/market/tickers?category=linear",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("linear ticker");
+
+        assert_eq!(
+            payload_string(&linear_batch.normalized_event, "basis_role"),
+            "Perp"
+        );
+        assert_eq!(
+            payload_string(&linear_batch.normalized_event, "market"),
+            "LinearPerp"
+        );
+        let instruments = linear
+            .instruments(&InstrumentInfoQuery::new(
+                VenueId::new("venue:BYBIT-LINEAR").expect("venue"),
+            ))
+            .expect("instrument info");
+        assert_eq!(instruments[0].kind, InstrumentKind::PerpetualSwap);
+        assert_eq!(
+            instruments[0].margin_asset_id.as_ref().map(AssetId::as_str),
+            Some("asset:USDT")
+        );
+    }
+
+    #[test]
+    fn bybit_linear_ticker_maps_mark_index_and_funding() {
+        let adapter = bybit_premium_index_adapter();
+        let batch = adapter
+            .ingest_premium_index_json(
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","bid1Price":"43250.00","bid1Size":"2.00000000","ask1Price":"43251.00","ask1Size":"1.50000000","markPrice":"43240.12345678","indexPrice":"43190.00000000","fundingRate":"0.00010000","nextFundingTime":"1767254400000"}]},"retExtInfo":{},"time":1767225601000}"#,
+                "https://api.bybit.com/v5/market/tickers?category=linear",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("premium index");
+
+        assert_eq!(
+            batch.raw_event.event_type,
+            NormalizedEventType::RawMarketDataEvent
+        );
+        assert_eq!(
+            batch.normalized_event.event_type,
+            NormalizedEventType::NormalizedMarketDataEvent
+        );
+        assert_eq!(
+            payload_string(&batch.normalized_event, "kind"),
+            "PerpPremiumIndex"
+        );
+        assert_eq!(
+            payload_string(&batch.normalized_event, "last_funding_rate"),
+            "0.00010000"
+        );
+        assert_eq!(
+            canonical_normalized_event_hash(&batch.normalized_event),
+            batch.normalized_event.checksum.as_str()
+        );
+    }
+
+    #[test]
+    fn bybit_public_ticker_rejects_failed_ret_code() {
+        let mut adapter = bybit_ticker_adapter(
+            "venue:BYBIT-SPOT",
+            "inst:BYBIT:BTCUSDT:SPOT",
+            BybitPublicMarket::Spot,
+        );
+        let error = adapter
+            .ingest_ticker_json(
+                r#"{"retCode":10001,"retMsg":"symbol invalid","result":{"category":"spot","list":[]},"retExtInfo":{},"time":1767225601000}"#,
+                "https://api.bybit.com/v5/market/tickers?category=spot",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect_err("non-zero retCode must fail closed");
+
+        assert!(matches!(
+            error,
+            VenueDataError::External(ClassifiedExternalError {
+                class: ExternalErrorClass::UnknownExternalState,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn binance_public_ticker_marks_stale_data_for_risk() {
         let mut adapter = binance_adapter();
         let batch = adapter
@@ -5705,6 +7444,116 @@ mod tests {
         let error = expect_external(error);
         assert_eq!(error.surface, ReadOnlySurface::Position);
         assert_eq!(error.class, ExternalErrorClass::MissingField);
+        assert!(error.fail_closed);
+    }
+
+    #[test]
+    fn bybit_private_unified_wallet_maps_balances_without_credentials() {
+        let mut adapter = bybit_private_unified_adapter();
+        let batch = adapter
+            .ingest_unified_wallet_balance_json(
+                r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":"USDT","walletBalance":"1000.00000000","availableToWithdraw":"975.00000000","locked":"10.00000000","borrowAmount":"5.00000000","totalOrderIM":"15.00000000"},{"coin":"BTC","walletBalance":"0.50000000","availableToWithdraw":"0.40000000","locked":"0.05000000","borrowAmount":"0","totalOrderIM":"0.05000000"}]}]},"retExtInfo":{},"time":1767225601000}"#,
+                "redacted:bybit-wallet-balance",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("wallet balance snapshot");
+
+        assert_eq!(
+            batch.balance_event.event_type,
+            NormalizedEventType::BalanceSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&batch.balance_event, "endpoint"),
+            "/v5/account/wallet-balance"
+        );
+        assert_eq!(
+            payload_string(&batch.balance_event, "risk_reason_code"),
+            "CHECK_PASSED"
+        );
+        assert_eq!(batch.balances.len(), 2);
+
+        let usdt = adapter
+            .balances(
+                &BalanceQuery::new(VenueId::new("venue:BYBIT-PRIVATE").expect("venue"))
+                    .for_account(AccountId::new("account:bybit-read-only").expect("account"))
+                    .for_asset(AssetId::new("asset:USDT").expect("asset")),
+            )
+            .expect("balances");
+        assert_eq!(usdt.len(), 1);
+        assert_eq!(usdt[0].free.to_string(), "975.00000000");
+        assert_eq!(usdt[0].locked.to_string(), "10.00000000");
+        assert_eq!(usdt[0].reserved.to_string(), "15.00000000");
+        assert_eq!(usdt[0].borrowed.to_string(), "5.00000000");
+        assert_eq!(
+            usdt[0].source_event_id.as_deref(),
+            Some(batch.balance_event.event_id.as_str())
+        );
+
+        let rendered = to_canonical_json(&batch.balance_event);
+        assert!(!rendered.contains("975.00000000"));
+        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn bybit_private_linear_maps_signed_position_list() {
+        let mut adapter = bybit_private_linear_adapter();
+        let batch = adapter
+            .ingest_linear_position_list_json(
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","side":"Sell","size":"1.000","avgPrice":"43100.00","markPrice":"43250.50","unrealisedPnl":"-150.50","liqPrice":"45000.00","updatedTime":"1767225601500"},{"symbol":"ETHUSDT","side":"Buy","size":"0","avgPrice":"0","markPrice":"2500.00","unrealisedPnl":"0","liqPrice":"","updatedTime":"1767225601500"}]},"retExtInfo":{},"time":1767225601000}"#,
+                "redacted:bybit-linear-positions",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("position list snapshot");
+
+        assert_eq!(
+            batch.position_event.event_type,
+            NormalizedEventType::PositionSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&batch.position_event, "endpoint"),
+            "/v5/position/list"
+        );
+        assert_eq!(batch.positions.len(), 1);
+        let position = &batch.positions[0];
+        assert_eq!(
+            position.instrument_id.as_str(),
+            "inst:BYBIT:BTCUSDT:LINEAR-PERP"
+        );
+        assert_eq!(position.quantity.to_string(), "-1.000");
+        assert_eq!(position.mark_price.to_string(), "43250.50");
+        assert_eq!(position.unrealized_pnl.to_string(), "-150.50");
+        assert_eq!(
+            position.liquidation_price.expect("liq").to_string(),
+            "45000.00"
+        );
+
+        let queried = adapter
+            .positions(
+                &PositionQuery::new(VenueId::new("venue:BYBIT-LINEAR-PRIVATE").expect("venue"))
+                    .for_account(AccountId::new("account:bybit-read-only").expect("account"))
+                    .for_instrument(
+                        InstrumentId::new("inst:BYBIT:BTCUSDT:LINEAR-PERP").expect("instrument"),
+                    ),
+            )
+            .expect("positions");
+        assert_eq!(queried, batch.positions);
+    }
+
+    #[test]
+    fn bybit_private_ret_code_fails_closed() {
+        let mut adapter = bybit_private_unified_adapter();
+        let error = adapter
+            .ingest_unified_wallet_balance_json(
+                r#"{"retCode":10001,"retMsg":"request parameter error","result":{"list":[]},"retExtInfo":{},"time":1767225601000}"#,
+                "redacted:bybit-wallet-balance",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect_err("non-zero retCode must fail closed");
+
+        let error = expect_external(error);
+        assert_eq!(error.surface, ReadOnlySurface::Balance);
+        assert_eq!(error.class, ExternalErrorClass::UnknownExternalState);
         assert!(error.fail_closed);
     }
 
@@ -6071,6 +7920,50 @@ mod tests {
         .expect("adapter")
     }
 
+    fn bybit_ticker_adapter(
+        venue_id: &str,
+        instrument_id: &str,
+        market: BybitPublicMarket,
+    ) -> BybitPublicTickerAdapter {
+        let asset_usdt = AssetId::new("asset:USDT").expect("asset id");
+        let instrument = BybitPublicInstrument::new(
+            "BTCUSDT",
+            InstrumentId::new(instrument_id).expect("instrument id"),
+            AssetId::new("asset:BTC").expect("asset id"),
+            asset_usdt.clone(),
+            asset_usdt,
+        )
+        .expect("instrument")
+        .with_tick_size(price("0.01"))
+        .with_lot_size(quantity("0.000001"));
+        BybitPublicTickerAdapter::new(
+            VenueId::new(venue_id).expect("venue id"),
+            instrument,
+            market,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter")
+    }
+
+    fn bybit_premium_index_adapter() -> BybitLinearPremiumIndexAdapter {
+        let asset_usdt = AssetId::new("asset:USDT").expect("asset id");
+        let instrument = BybitPublicInstrument::new(
+            "BTCUSDT",
+            InstrumentId::new("inst:BYBIT:BTCUSDT:LINEAR-PERP").expect("instrument id"),
+            AssetId::new("asset:BTC").expect("asset id"),
+            asset_usdt.clone(),
+            asset_usdt,
+        )
+        .expect("instrument");
+        BybitLinearPremiumIndexAdapter::new(
+            VenueId::new("venue:BYBIT-LINEAR").expect("venue id"),
+            instrument,
+            5_000,
+        )
+        .expect("adapter")
+    }
+
     fn binance_private_spot_adapter() -> BinancePrivateAccountAdapter {
         BinancePrivateAccountAdapter::new(
             VenueId::new("venue:BINANCE-SPOT-PRIVATE").expect("venue"),
@@ -6091,6 +7984,28 @@ mod tests {
             5_000,
         )
         .expect("private usdm adapter")
+    }
+
+    fn bybit_private_unified_adapter() -> BybitPrivateAccountAdapter {
+        BybitPrivateAccountAdapter::new(
+            VenueId::new("venue:BYBIT-PRIVATE").expect("venue"),
+            AccountId::new("account:bybit-read-only").expect("account"),
+            BybitPrivateAccountMarket::UnifiedAccount,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("private unified adapter")
+    }
+
+    fn bybit_private_linear_adapter() -> BybitPrivateAccountAdapter {
+        BybitPrivateAccountAdapter::new(
+            VenueId::new("venue:BYBIT-LINEAR-PRIVATE").expect("venue"),
+            AccountId::new("account:bybit-read-only").expect("account"),
+            BybitPrivateAccountMarket::LinearPerpetual,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("private linear adapter")
     }
 
     fn fixture_rate_limit() -> RateLimitSnapshot {

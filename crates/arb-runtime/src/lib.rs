@@ -74,9 +74,10 @@ use arb_venue_data::{
     BinancePublicBookTickerAdapter, BinancePublicInstrument, BinancePublicMarket,
     BinancePublicTicker24hAdapter, BinancePublicWssBookTickerClient,
     BinancePublicWssBookTickerConfig, BinancePublicWssTextStreamClient,
-    BinanceUsdmPremiumIndexAdapter, DataFreshness, HybridMarketDataInput, HybridMarketDataStatus,
-    HybridMarketDataUpdate, MarketDataQuery, MarketDataReader, MarketDataTransport, MarketQuote,
-    RestWssMarketDataCoordinator, WssQuoteUpdate,
+    BinanceUsdmPremiumIndexAdapter, BybitLinearPremiumIndexAdapter, BybitPublicInstrument,
+    BybitPublicMarket, BybitPublicTickerAdapter, DataFreshness, HybridMarketDataInput,
+    HybridMarketDataStatus, HybridMarketDataUpdate, MarketDataQuery, MarketDataReader,
+    MarketDataTransport, MarketQuote, RestWssMarketDataCoordinator, WssQuoteUpdate,
 };
 
 #[cfg(feature = "live-exec")]
@@ -126,6 +127,10 @@ const BASIS_SPOT_VENUE_ID: &str = "venue:BINANCE-SPOT";
 const BASIS_PERP_VENUE_ID: &str = "venue:BINANCE-USDM";
 const BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:SPOT";
 const BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
+const BYBIT_BASIS_SPOT_VENUE_ID: &str = "venue:BYBIT-SPOT";
+const BYBIT_BASIS_PERP_VENUE_ID: &str = "venue:BYBIT-LINEAR";
+const BYBIT_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:SPOT";
+const BYBIT_BASIS_PERP_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:LINEAR-PERP";
 const BASIS_BASE_ASSET_ID: &str = "asset:BTC";
 const BASIS_QUOTE_ASSET_ID: &str = "asset:USDT";
 const BASIS_SETTLEMENT_ASSET_ID: &str = "asset:USDT";
@@ -624,6 +629,18 @@ pub struct BinanceBasisPipelineReport {
     pub artifacts: EndToEndArtifacts,
     pub output_dir: Option<PathBuf>,
 }
+
+/// 单次 Bybit 现货-线性永续 basis 只读扫描结果。
+///
+/// 中文说明：字段语义与 Binance 扫描报告一致，URL 指向 Bybit 公开 REST ticker
+/// 端点；不包含 API key、账户余额、签名、下单、撤单或转账。
+pub type BybitBasisScanReport = BinanceBasisScanReport;
+
+/// 单次 Bybit 现货-线性永续 basis 正式模拟管线结果。
+///
+/// 中文说明：字段语义与 Binance 管线报告一致，公共行情来自 Bybit V5 ticker；
+/// 后续仍进入同一条只读策略、风控和模拟执行管线。
+pub type BybitBasisPipelineReport = BinanceBasisPipelineReport;
 
 /// Binance BTCUSDT 受控试运行计划预览结果。
 ///
@@ -1889,6 +1906,148 @@ pub fn run_binance_basis_pipeline(
     }
 
     Ok(BinanceBasisPipelineReport {
+        fixture_root,
+        symbol,
+        spot_book_ticker_url,
+        perp_book_ticker_url,
+        premium_index_url,
+        ingested_at: ingested_at.to_string(),
+        artifacts,
+        output_dir,
+    })
+}
+
+/// 拉取一次 Bybit 公开 spot/linear-perp basis 数据并运行只读策略扫描。
+///
+/// 中文说明：该路径只访问公开 REST 端点，不使用 API key，不访问账户，不下单、
+/// 不撤单、不转账、不签名。输出是候选转换或明确拒绝原因。
+pub fn run_bybit_basis_scan(
+    symbol: &str,
+    output_dir: Option<PathBuf>,
+) -> RuntimeResult<BybitBasisScanReport> {
+    let symbol = validate_bybit_basis_symbol(symbol)?;
+    let fixture_root = resolve_fixture_root(Path::new(DEFAULT_FULL_PIPELINE_FIXTURE));
+    validate_full_pipeline_context(&fixture_root)?;
+    let replay = arb_replay::load_fixture(&fixture_root)?;
+    ensure_simulated_offline_config(replay.config())?;
+
+    let spot_book_ticker_url = bybit_spot_tickers_url();
+    let perp_book_ticker_url = bybit_linear_tickers_url();
+    let premium_index_url = perp_book_ticker_url.clone();
+    let raw_spot_ticker = fetch_public_json_with_curl(&spot_book_ticker_url)?;
+    let raw_linear_ticker = fetch_public_json_with_curl(&perp_book_ticker_url)?;
+    let ingested_at = current_utc_timestamp()?;
+
+    let raw_inputs = BybitBasisRawInputs {
+        symbol: &symbol,
+        raw_spot_ticker: &raw_spot_ticker,
+        spot_ticker_ref: &spot_book_ticker_url,
+        raw_linear_ticker: &raw_linear_ticker,
+        linear_ticker_ref: &perp_book_ticker_url,
+    };
+    let events = ingest_bybit_basis_public_json(raw_inputs, ingested_at)?;
+    let spec = BasisPipelineSpec::bybit_btcusdt()?;
+
+    let _temp_dir = RuntimeTempDir::new()?;
+    let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
+    for event in &events {
+        event_store.append(event)?;
+    }
+    let stored_events = event_store.read_all_ordered()?;
+    let source_event_refs = events
+        .iter()
+        .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
+        .map(|event| event.event_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let portfolio_state =
+        build_public_basis_portfolio_state(&spec, &source_event_refs, ingested_at)?;
+    ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
+    let evaluation = run_spot_perp_basis_strategy(
+        replay.config(),
+        &stored_events,
+        &portfolio_state,
+        &ingested_at.to_string(),
+        &spec,
+    )?;
+
+    let candidate_transitions_jsonl = evaluation
+        .candidate()
+        .map(|candidate| canonical_jsonl(std::slice::from_ref(candidate)))
+        .unwrap_or_default();
+    let (rejection_reason, rejection_detail) = evaluation
+        .rejection()
+        .map(|rejection| {
+            (
+                Some(rejection.reason().as_str().to_owned()),
+                rejection.detail().map(str::to_owned),
+            )
+        })
+        .unwrap_or((None, None));
+    let diagnostics = evaluation
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| format!("{}: {}", diagnostic.code(), diagnostic.detail()))
+        .collect::<Vec<_>>();
+    let stored_events_jsonl = stored_events_jsonl(&stored_events);
+
+    let report = BybitBasisScanReport {
+        symbol,
+        spot_book_ticker_url,
+        perp_book_ticker_url,
+        premium_index_url,
+        ingested_at: ingested_at.to_string(),
+        stored_events_jsonl,
+        candidate_transitions_jsonl,
+        rejection_reason,
+        rejection_detail,
+        diagnostics,
+        output_dir,
+    };
+    if let Some(dir) = &report.output_dir {
+        write_bybit_basis_scan_artifacts(dir, &report)?;
+    }
+    Ok(report)
+}
+
+/// 拉取一次 Bybit 公开 spot/linear-perp basis 数据并进入正式模拟管线。
+///
+/// 中文说明：该入口使用公开 REST 数据创建标准化事件和候选转换，然后继续经过
+/// 风控、执行计划、模拟执行、模拟账本、对账和运营报告。缺私有余额或未知状态
+/// 必须被风控拒绝，不能当作通过。
+pub fn run_bybit_basis_pipeline(
+    symbol: &str,
+    output_dir: Option<PathBuf>,
+) -> RuntimeResult<BybitBasisPipelineReport> {
+    let symbol = validate_bybit_basis_symbol(symbol)?;
+    let fixture_root = resolve_fixture_root(Path::new(DEFAULT_FULL_PIPELINE_FIXTURE));
+    validate_full_pipeline_context(&fixture_root)?;
+    let replay = arb_replay::load_fixture(&fixture_root)?;
+    ensure_simulated_offline_config(replay.config())?;
+
+    let spot_book_ticker_url = bybit_spot_tickers_url();
+    let perp_book_ticker_url = bybit_linear_tickers_url();
+    let premium_index_url = perp_book_ticker_url.clone();
+    let raw_spot_ticker = fetch_public_json_with_curl(&spot_book_ticker_url)?;
+    let raw_linear_ticker = fetch_public_json_with_curl(&perp_book_ticker_url)?;
+    let ingested_at = current_utc_timestamp()?;
+
+    let artifacts = assemble_bybit_basis_pipeline_from_raw_json(
+        &replay,
+        BybitBasisRawInputs {
+            symbol: &symbol,
+            raw_spot_ticker: &raw_spot_ticker,
+            spot_ticker_ref: &spot_book_ticker_url,
+            raw_linear_ticker: &raw_linear_ticker,
+            linear_ticker_ref: &perp_book_ticker_url,
+        },
+        ingested_at,
+    )?;
+
+    if let Some(dir) = &output_dir {
+        write_artifacts_to_dir(dir, &artifacts)?;
+    }
+
+    Ok(BybitBasisPipelineReport {
         fixture_root,
         symbol,
         spot_book_ticker_url,
@@ -3625,6 +3784,12 @@ impl BinancePrivateOrderEventStore {
         let events = match market {
             BinancePrivateOrderMarket::Spot => &self.spot_events,
             BinancePrivateOrderMarket::UsdmFutures => &self.usdm_events,
+            BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear => {
+                return Err(RuntimeError::UnsafeConfig {
+                    message: "Binance private order event store does not support Bybit markets"
+                        .to_owned(),
+                });
+            }
         };
         let Some(expected_client_order_id) = planned.request.client_order_id.as_ref() else {
             return Ok(None);
@@ -3684,6 +3849,7 @@ fn binance_private_order_event_type_matches(
     match market {
         BinancePrivateOrderMarket::Spot => event_type == "executionReport",
         BinancePrivateOrderMarket::UsdmFutures => event_type == "ORDER_TRADE_UPDATE",
+        BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear => false,
     }
 }
 
@@ -3707,6 +3873,11 @@ fn parse_binance_private_order_event_line(
             source_event_id,
             line,
         ),
+        BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear => {
+            return Err(RuntimeError::UnsafeConfig {
+                message: "Binance private order parser does not support Bybit markets".to_owned(),
+            });
+        }
     }
     .map_err(RuntimeError::from)
 }
@@ -3716,6 +3887,8 @@ fn binance_private_order_market_token(market: BinancePrivateOrderMarket) -> &'st
     match market {
         BinancePrivateOrderMarket::Spot => "spot",
         BinancePrivateOrderMarket::UsdmFutures => "usdm",
+        BinancePrivateOrderMarket::BybitSpot => "bybit-spot",
+        BinancePrivateOrderMarket::BybitLinear => "bybit-linear",
     }
 }
 
@@ -5792,6 +5965,19 @@ fn validate_binance_basis_symbol(symbol: &str) -> RuntimeResult<String> {
     }
 }
 
+fn validate_bybit_basis_symbol(symbol: &str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if symbol == BASIS_SYMBOL {
+        Ok(symbol)
+    } else {
+        Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "only {BASIS_SYMBOL} is currently wired to the Bybit spot-perp basis strategy; got `{symbol}`"
+            ),
+        })
+    }
+}
+
 fn validate_binance_wss_probe_options(
     options: &BinanceWssBookTickerProbeOptions,
 ) -> RuntimeResult<()> {
@@ -7274,6 +7460,15 @@ struct BinanceBasisRawInputs<'a> {
     premium_index_ref: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct BybitBasisRawInputs<'a> {
+    symbol: &'a str,
+    raw_spot_ticker: &'a str,
+    spot_ticker_ref: &'a str,
+    raw_linear_ticker: &'a str,
+    linear_ticker_ref: &'a str,
+}
+
 /// basis 管线实例输入。
 ///
 /// 中文说明：运行时只依赖这里注入的策略配置和场所能力，不再在策略执行入口
@@ -7376,6 +7571,16 @@ fn assemble_binance_basis_pipeline_from_raw_json(
 ) -> RuntimeResult<EndToEndArtifacts> {
     let events = ingest_binance_basis_public_json(inputs, ingested_at)?;
     let spec = BasisPipelineSpec::binance_btcusdt()?;
+    assemble_public_basis_pipeline_from_normalized_events(replay, &spec, events, ingested_at)
+}
+
+fn assemble_bybit_basis_pipeline_from_raw_json(
+    replay: &ReplayInput,
+    inputs: BybitBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<EndToEndArtifacts> {
+    let events = ingest_bybit_basis_public_json(inputs, ingested_at)?;
+    let spec = BasisPipelineSpec::bybit_btcusdt()?;
     assemble_public_basis_pipeline_from_normalized_events(replay, &spec, events, ingested_at)
 }
 
@@ -7499,6 +7704,250 @@ pub fn assemble_public_basis_pipeline_from_normalized_events(
     })
 }
 
+/// 将 basis monitor 的完整行情行提升为策略可消费的标准化事件。
+///
+/// 中文说明：monitor row 是面向 dashboard 的只读快照；该函数只做合同边界转换，
+/// 不重新计算策略信号、不绕过风控。转换后的事件可以直接交给
+/// `assemble_public_basis_pipeline_from_normalized_events`。
+pub fn basis_monitor_row_to_normalized_events(
+    spec: &BasisPipelineSpec,
+    row: &BinanceBasisMarketRow,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<Vec<NormalizedEvent>> {
+    if row.symbol != spec.strategy_config.symbol.symbol {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "basis monitor row symbol {} does not match strategy symbol {}",
+                row.symbol, spec.strategy_config.symbol.symbol
+            ),
+        });
+    }
+    if row.source_status != "complete" {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "basis monitor row {} is not complete: {}",
+                row.symbol, row.source_status
+            ),
+        });
+    }
+
+    let observed_at = observed_at.to_string();
+    let event_prefix = format!(
+        "event:runtime:basis-monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, row.symbol
+    );
+    let correlation_id = format!(
+        "corr:runtime:basis-monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, row.symbol
+    );
+    let source_prefix = format!(
+        "monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, row.symbol
+    );
+    let checksum_prefix = format!(
+        "hash:basis-monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, row.symbol
+    );
+
+    let spot_bid = required_monitor_row_field(row, "spot_bid", &row.spot_bid)?;
+    let spot_ask = required_monitor_row_field(row, "spot_ask", &row.spot_ask)?;
+    let spot_bid_qty = required_monitor_row_field(row, "spot_bid_qty", &row.spot_bid_qty)?;
+    let spot_ask_qty = required_monitor_row_field(row, "spot_ask_qty", &row.spot_ask_qty)?;
+    let perp_bid = required_monitor_row_field(row, "perp_bid", &row.perp_bid)?;
+    let perp_ask = required_monitor_row_field(row, "perp_ask", &row.perp_ask)?;
+    let perp_bid_qty = required_monitor_row_field(row, "perp_bid_qty", &row.perp_bid_qty)?;
+    let perp_ask_qty = required_monitor_row_field(row, "perp_ask_qty", &row.perp_ask_qty)?;
+    let mark_price = required_monitor_row_text(row, "mark_price", &row.mark_price)?;
+    let index_price = required_monitor_row_text(row, "index_price", &row.index_price)?;
+    let last_funding_rate =
+        required_monitor_row_text(row, "last_funding_rate", &row.last_funding_rate)?;
+    let next_funding_time_ms =
+        required_monitor_row_text(row, "next_funding_time_ms", &row.next_funding_time_ms)?;
+
+    let spot = monitor_book_ticker_event_json(
+        &format!("{event_prefix}:spot-book"),
+        &correlation_id,
+        &format!("{source_prefix}:spot-book"),
+        &format!("{checksum_prefix}:spot-book"),
+        &observed_at,
+        &spec.strategy_config.symbol.spot.venue_id,
+        &spec.strategy_config.symbol.spot.instrument_id,
+        &spec.strategy_config.symbol.spot.basis_role,
+        &row.symbol,
+        "Spot",
+        spot_bid,
+        spot_ask,
+        spot_bid_qty,
+        spot_ask_qty,
+    );
+    let perp = monitor_book_ticker_event_json(
+        &format!("{event_prefix}:perp-book"),
+        &correlation_id,
+        &format!("{source_prefix}:perp-book"),
+        &format!("{checksum_prefix}:perp-book"),
+        &observed_at,
+        &spec.strategy_config.symbol.perp.venue_id,
+        &spec.strategy_config.symbol.perp.instrument_id,
+        &spec.strategy_config.symbol.perp.basis_role,
+        &row.symbol,
+        "Perp",
+        perp_bid,
+        perp_ask,
+        perp_bid_qty,
+        perp_ask_qty,
+    );
+    let premium = monitor_premium_index_event_json(
+        &format!("{event_prefix}:premium"),
+        &correlation_id,
+        &format!("{source_prefix}:premium"),
+        &format!("{checksum_prefix}:premium"),
+        &observed_at,
+        &spec.strategy_config.symbol.perp.venue_id,
+        &spec.strategy_config.symbol.perp.instrument_id,
+        &row.symbol,
+        mark_price,
+        index_price,
+        last_funding_rate,
+        next_funding_time_ms,
+    );
+
+    Ok(vec![
+        from_json_strict::<NormalizedEvent>(&spot)?,
+        from_json_strict::<NormalizedEvent>(&perp)?,
+        from_json_strict::<NormalizedEvent>(&premium)?,
+    ])
+}
+
+/// 从全市场 basis monitor 快照中提取当前策略实例可消费的候选事件。
+///
+/// 中文说明：一个 monitor snapshot 可以包含多个 symbol；单个策略实例只消费与
+/// 自己配置一致的候选行。匹配 symbol 但数据不完整的候选行会失败关闭。
+pub fn basis_monitor_snapshot_candidate_events(
+    spec: &BasisPipelineSpec,
+    snapshot: &BinanceBasisMonitorSnapshot,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<Vec<NormalizedEvent>> {
+    let mut events = Vec::new();
+    for row in snapshot
+        .rows
+        .iter()
+        .filter(|row| row.is_candidate && row.symbol == spec.strategy_config.symbol.symbol)
+    {
+        events.extend(basis_monitor_row_to_normalized_events(
+            spec,
+            row,
+            observed_at,
+        )?);
+    }
+    Ok(events)
+}
+
+fn required_monitor_row_field<'a>(
+    row: &BinanceBasisMarketRow,
+    field: &'static str,
+    value: &'a Option<String>,
+) -> RuntimeResult<&'a str> {
+    value
+        .as_deref()
+        .and_then(|value| (!value.trim().is_empty()).then_some(value))
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "basis monitor row {} is missing required field `{field}`",
+                row.symbol
+            ),
+        })
+}
+
+fn required_monitor_row_text<'a>(
+    row: &BinanceBasisMarketRow,
+    field: &'static str,
+    value: &'a str,
+) -> RuntimeResult<&'a str> {
+    if value.trim().is_empty() {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "basis monitor row {} is missing required field `{field}`",
+                row.symbol
+            ),
+        });
+    }
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_book_ticker_event_json(
+    event_id: &str,
+    correlation_id: &str,
+    source_sequence: &str,
+    checksum: &str,
+    observed_at: &str,
+    venue_id: &str,
+    instrument_id: &str,
+    basis_role: &str,
+    venue_symbol: &str,
+    market: &str,
+    best_bid: &str,
+    best_ask: &str,
+    bid_size: &str,
+    ask_size: &str,
+) -> String {
+    format!(
+        r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"basis-monitor","ask_size":{},"basis_role":{},"best_ask":{},"best_bid":{},"bid_size":{},"freshness":"Fresh","kind":"BookTicker","market":{},"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"basis-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
+        json_string(checksum),
+        json_string(correlation_id),
+        json_string(event_id),
+        json_string(instrument_id),
+        json_string(ask_size),
+        json_string(basis_role),
+        json_string(best_ask),
+        json_string(best_bid),
+        json_string(bid_size),
+        json_string(market),
+        json_string(venue_symbol),
+        json_string(source_sequence),
+        json_string(observed_at),
+        json_string(observed_at),
+        json_string(venue_id),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_premium_index_event_json(
+    event_id: &str,
+    correlation_id: &str,
+    source_sequence: &str,
+    checksum: &str,
+    observed_at: &str,
+    venue_id: &str,
+    instrument_id: &str,
+    venue_symbol: &str,
+    mark_price: &str,
+    index_price: &str,
+    last_funding_rate: &str,
+    next_funding_time_ms: &str,
+) -> String {
+    format!(
+        r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"basis-monitor","basis_role":"Perp","index_price":{},"kind":"PerpPremiumIndex","last_funding_rate":{},"mark_price":{},"next_funding_time_ms":{},"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"basis-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
+        json_string(checksum),
+        json_string(correlation_id),
+        json_string(event_id),
+        json_string(instrument_id),
+        json_string(index_price),
+        json_string(last_funding_rate),
+        json_string(mark_price),
+        json_string(next_funding_time_ms),
+        json_string(venue_symbol),
+        json_string(source_sequence),
+        json_string(observed_at),
+        json_string(observed_at),
+        json_string(venue_id),
+    )
+}
+
 fn ingest_binance_basis_public_json(
     inputs: BinanceBasisRawInputs<'_>,
     ingested_at: UtcTimestamp,
@@ -7549,11 +7998,76 @@ fn ingest_binance_basis_public_json(
     ])
 }
 
+fn ingest_bybit_basis_public_json(
+    inputs: BybitBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<Vec<NormalizedEvent>> {
+    let mut spot_adapter = BybitPublicTickerAdapter::new(
+        VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?,
+        bybit_basis_instrument(inputs.symbol, BYBIT_BASIS_SPOT_INSTRUMENT_ID)?,
+        BybitPublicMarket::Spot,
+        ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let mut linear_adapter = BybitPublicTickerAdapter::new(
+        VenueId::new(BYBIT_BASIS_PERP_VENUE_ID)?,
+        bybit_basis_instrument(inputs.symbol, BYBIT_BASIS_PERP_INSTRUMENT_ID)?,
+        BybitPublicMarket::LinearPerpetual,
+        ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let premium_adapter = BybitLinearPremiumIndexAdapter::new(
+        VenueId::new(BYBIT_BASIS_PERP_VENUE_ID)?,
+        bybit_basis_instrument(inputs.symbol, BYBIT_BASIS_PERP_INSTRUMENT_ID)?,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+
+    let spot_batch = spot_adapter.ingest_ticker_json(
+        inputs.raw_spot_ticker,
+        inputs.spot_ticker_ref,
+        ingested_at,
+    )?;
+    let linear_batch = linear_adapter.ingest_ticker_json(
+        inputs.raw_linear_ticker,
+        inputs.linear_ticker_ref,
+        ingested_at,
+    )?;
+    let premium_batch = premium_adapter.ingest_premium_index_json(
+        inputs.raw_linear_ticker,
+        inputs.linear_ticker_ref,
+        ingested_at,
+    )?;
+
+    Ok(vec![
+        spot_batch.raw_event,
+        spot_batch.normalized_event,
+        linear_batch.raw_event,
+        linear_batch.normalized_event,
+        premium_batch.raw_event,
+        premium_batch.normalized_event,
+    ])
+}
+
 fn binance_basis_instrument(
     symbol: &str,
     instrument_id: &str,
 ) -> RuntimeResult<BinancePublicInstrument> {
     Ok(BinancePublicInstrument::new(
+        symbol,
+        InstrumentId::new(instrument_id)?,
+        AssetId::new(BASIS_BASE_ASSET_ID)?,
+        AssetId::new(BASIS_QUOTE_ASSET_ID)?,
+        AssetId::new(BASIS_SETTLEMENT_ASSET_ID)?,
+    )?
+    .with_tick_size(Price::from_str("0.01")?)
+    .with_lot_size(Quantity::from_str("0.000001")?))
+}
+
+fn bybit_basis_instrument(
+    symbol: &str,
+    instrument_id: &str,
+) -> RuntimeResult<BybitPublicInstrument> {
+    Ok(BybitPublicInstrument::new(
         symbol,
         InstrumentId::new(instrument_id)?,
         AssetId::new(BASIS_BASE_ASSET_ID)?,
@@ -10628,6 +11142,40 @@ fn write_binance_basis_scan_artifacts(
     Ok(())
 }
 
+fn write_bybit_basis_scan_artifacts(
+    output_dir: &Path,
+    report: &BybitBasisScanReport,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("bybit_basis_events.jsonl"),
+        &report.stored_events_jsonl,
+    )?;
+    write_utf8(
+        output_dir.join("bybit_basis_candidate_transitions.jsonl"),
+        &report.candidate_transitions_jsonl,
+    )?;
+    let rejection = report
+        .rejection_reason
+        .as_ref()
+        .map(|reason| {
+            format!(
+                "reason={reason}\ndetail={}\n",
+                report.rejection_detail.as_deref().unwrap_or("")
+            )
+        })
+        .unwrap_or_default();
+    write_utf8(output_dir.join("bybit_basis_rejection.txt"), &rejection)?;
+    write_utf8(
+        output_dir.join("bybit_basis_diagnostics.txt"),
+        &report.diagnostics.join("\n"),
+    )?;
+    Ok(())
+}
+
 fn write_binance_basis_monitor_snapshot(
     output_dir: &Path,
     snapshot: &BinanceBasisMonitorSnapshot,
@@ -12878,6 +13426,52 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "bybit-basis-scan" {
+        let options = parse_bybit_basis_scan_args(&args[1..])?;
+        let report = run_bybit_basis_scan(&options.symbol, options.output_dir.clone())?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        let candidate_count = count_jsonl_records(&report.candidate_transitions_jsonl);
+        let outcome = report
+            .rejection_reason
+            .as_ref()
+            .map(|reason| {
+                format!(
+                    "rejected; reason={reason}; detail={}",
+                    report.rejection_detail.as_deref().unwrap_or("")
+                )
+            })
+            .unwrap_or_else(|| "candidate=true".to_owned());
+        return Ok(format!(
+            "ok: fetched Bybit public spot/linear-perp basis data for {}; {}; candidate_transitions={}; mutable_execution_started=false{}",
+            report.symbol, outcome, candidate_count, output_note
+        ));
+    }
+    if args[0] == "bybit-basis-pipeline" {
+        let options = parse_bybit_basis_pipeline_args(&args[1..])?;
+        let report = run_bybit_basis_pipeline(&options.symbol, options.output_dir.clone())?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: ran Bybit public spot/linear-perp basis through simulated pipeline for {}; candidate_transitions={}; risk_decisions={}; execution_reports={}; incidents={}; mutable_execution_started=false{}",
+            report.symbol,
+            count_jsonl_records(&report.artifacts.candidate_transitions_jsonl),
+            count_jsonl_records(&report.artifacts.risk_decisions_jsonl),
+            count_jsonl_records(&report.artifacts.execution_reports_jsonl),
+            count_jsonl_records(&report.artifacts.incidents_jsonl),
+            output_note
+        ));
+    }
     if args[0] == "binance-guarded-live-preview" {
         let options = parse_binance_guarded_live_preview_args(&args[1..])?;
         let report = run_binance_guarded_live_preview(
@@ -13193,7 +13787,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
                 args[0]
             ),
         });
@@ -13234,6 +13828,10 @@ fn help_text() -> String {
         "                                    Fetch Binance public spot/perp data and run read-only basis strategy",
         "  binance-basis-pipeline [--symbol BTCUSDT] [--out dir]",
         "                                    Fetch Binance public spot/perp data and run simulated pipeline artifacts",
+        "  bybit-basis-scan [--symbol BTCUSDT] [--out dir]",
+        "                                    Fetch Bybit public spot/linear-perp data and run read-only basis strategy",
+        "  bybit-basis-pipeline [--symbol BTCUSDT] [--out dir]",
+        "                                    Fetch Bybit public spot/linear-perp data and run simulated pipeline artifacts",
         "  binance-guarded-live-preview [--market-artifacts dir] [--out dir] [--decision approve|reject --expected-plan-hash hash --approval-event-id id --reviewer id --decided-at ts --expires-at ts --reason text]",
         "                                    Generate Binance BTCUSDT GuardedLivePersonal plan preview, plan hash, and manual confirmation audit material",
         "  binance-guarded-live-gate-release-preview [--preview-dir dir] [--out dir]",
@@ -13274,6 +13872,8 @@ struct BinanceBasisScanCliOptions {
 }
 
 type BinanceBasisPipelineCliOptions = BinanceBasisScanCliOptions;
+type BybitBasisScanCliOptions = BinanceBasisScanCliOptions;
+type BybitBasisPipelineCliOptions = BinanceBasisScanCliOptions;
 struct BinanceGuardedLivePreviewCliOptions {
     market_artifacts_dir: PathBuf,
     output_dir: Option<PathBuf>,
@@ -13415,6 +14015,82 @@ fn parse_binance_basis_pipeline_args(
             value => {
                 return Err(cli_arg_error(format!(
                     "unexpected binance-basis-pipeline positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceBasisScanCliOptions { symbol, output_dir })
+}
+
+fn parse_bybit_basis_scan_args(args: &[String]) -> RuntimeResult<BybitBasisScanCliOptions> {
+    let mut symbol = BASIS_SYMBOL.to_owned();
+    let mut output_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown bybit-basis-scan option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected bybit-basis-scan positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceBasisScanCliOptions { symbol, output_dir })
+}
+
+fn parse_bybit_basis_pipeline_args(args: &[String]) -> RuntimeResult<BybitBasisPipelineCliOptions> {
+    let mut symbol = BASIS_SYMBOL.to_owned();
+    let mut output_dir = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown bybit-basis-pipeline option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected bybit-basis-pipeline positional argument `{value}`"
                 )));
             }
         }
@@ -14987,6 +15663,197 @@ mod tests {
     }
 
     #[test]
+    fn bybit_basis_pipeline_promotes_public_ticker_json_to_risk_fact() {
+        let spot = r#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"ETHUSDT","bid1Price":"49.90","bid1Size":"3.0","ask1Price":"50.00","ask1Size":"4.0"},{"symbol":"BTCUSDT","bid1Price":"99.90","bid1Size":"1.0","ask1Price":"100.00","ask1Size":"2.0"}]},"retExtInfo":{},"time":1778630400000}"#;
+        let linear = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","bid1Price":"101.00","bid1Size":"1.5","ask1Price":"101.10","ask1Size":"2.5","markPrice":"101.00","indexPrice":"100.00","fundingRate":"0.00010000","nextFundingTime":"1778659200000"}]},"retExtInfo":{},"time":1778630400000}"#;
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let artifacts = assemble_bybit_basis_pipeline_from_raw_json(
+            &replay,
+            BybitBasisRawInputs {
+                symbol: "BTCUSDT",
+                raw_spot_ticker: spot,
+                spot_ticker_ref: "test:bybit-spot-ticker",
+                raw_linear_ticker: linear,
+                linear_ticker_ref: "test:bybit-linear-ticker",
+            },
+            ingested_at,
+        )
+        .expect("basis pipeline artifacts");
+
+        assert!(artifacts.stored_events_jsonl.contains("venue:BYBIT-SPOT"));
+        assert!(artifacts.stored_events_jsonl.contains("venue:BYBIT-LINEAR"));
+        assert!(artifacts
+            .stored_events_jsonl
+            .contains("adapter:bybit-linear-premium-index"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:bybit-basis-btcusdt-001"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("strat:bybit-spot-perp-basis"));
+        assert!(!artifacts.risk_decisions_jsonl.is_empty());
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+        assert!(artifacts.execution_plans_jsonl.is_empty());
+    }
+
+    #[test]
+    fn bybit_basis_monitor_row_can_feed_standard_basis_pipeline() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec = BasisPipelineSpec::bybit_btcusdt().expect("basis spec");
+        let row = BinanceBasisMarketRow {
+            symbol: "BTCUSDT".to_owned(),
+            spot_bid: Some("99.90".to_owned()),
+            spot_ask: Some("100.00".to_owned()),
+            spot_bid_qty: Some("1.0".to_owned()),
+            spot_ask_qty: Some("2.0".to_owned()),
+            perp_bid: Some("101.00".to_owned()),
+            perp_ask: Some("101.10".to_owned()),
+            perp_bid_qty: Some("1.5".to_owned()),
+            perp_ask_qty: Some("2.5".to_owned()),
+            mark_price: "101.00".to_owned(),
+            index_price: "100.00".to_owned(),
+            last_funding_rate: "0.00010000".to_owned(),
+            next_funding_time_ms: "1778659200000".to_owned(),
+            gross_basis_bps: Some("100".to_owned()),
+            total_cost_bps: Some("20".to_owned()),
+            net_basis_bps: Some("80".to_owned()),
+            quantity: Some("1".to_owned()),
+            expected_profit_usd: Some("0.8".to_owned()),
+            is_candidate: true,
+            reason: None,
+            source_status: "complete".to_owned(),
+        };
+
+        let events =
+            basis_monitor_row_to_normalized_events(&spec, &row, ingested_at).expect("events");
+        let artifacts = assemble_public_basis_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("basis pipeline artifacts");
+
+        assert!(artifacts
+            .stored_events_jsonl
+            .contains("event:runtime:basis-monitor:strat:bybit-spot-perp-basis:BTCUSDT:spot-book"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:bybit-basis-btcusdt-001"));
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+    }
+
+    #[test]
+    fn binance_basis_monitor_snapshot_candidates_feed_standard_basis_pipeline() {
+        let spot = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"},
+          {"symbol":"ETHUSDT","bidPrice":"49.90","bidQty":"3.0","askPrice":"50.00","askQty":"4.0"}
+        ]"#;
+        let perp = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778584221117},
+          {"symbol":"ETHUSDT","bidPrice":"50.10","bidQty":"3.5","askPrice":"50.20","askQty":"4.5","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"ETHUSDT","markPrice":"50.10","indexPrice":"50.00","lastFundingRate":"0.00000001","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let options = BinanceBasisMonitorOptions {
+            min_abs_funding_rate: "0.00000100".to_owned(),
+            once: true,
+            ..BinanceBasisMonitorOptions::default()
+        };
+        let snapshot =
+            build_binance_basis_monitor_snapshot_from_json(spot, perp, premium, &options)
+                .expect("snapshot");
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec = BasisPipelineSpec::binance_btcusdt().expect("basis spec");
+
+        let events =
+            basis_monitor_snapshot_candidate_events(&spec, &snapshot, ingested_at).expect("events");
+        let artifacts = assemble_public_basis_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("basis pipeline artifacts");
+
+        assert!(artifacts.stored_events_jsonl.contains(
+            "event:runtime:basis-monitor:strat:binance-spot-perp-basis:BTCUSDT:spot-book"
+        ));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:binance-basis-btcusdt-001"));
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+    }
+
+    #[test]
+    fn basis_monitor_snapshot_candidate_events_filter_symbol_and_fail_closed() {
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec = BasisPipelineSpec::binance_btcusdt().expect("basis spec");
+        let other_symbol_snapshot = BinanceBasisMonitorSnapshot {
+            status: "healthy".to_owned(),
+            updated_at: ingested_at.to_string(),
+            min_abs_funding_rate: "0".to_owned(),
+            min_net_bps: "5".to_owned(),
+            total_rows: 1,
+            candidate_count: 1,
+            filtered_funding_count: 0,
+            missing_spot_count: 0,
+            missing_perp_count: 0,
+            last_error: None,
+            rows: vec![BinanceBasisMarketRow {
+                symbol: "ETHUSDT".to_owned(),
+                spot_bid: None,
+                spot_ask: None,
+                spot_bid_qty: None,
+                spot_ask_qty: None,
+                perp_bid: None,
+                perp_ask: None,
+                perp_bid_qty: None,
+                perp_ask_qty: None,
+                mark_price: String::new(),
+                index_price: String::new(),
+                last_funding_rate: String::new(),
+                next_funding_time_ms: String::new(),
+                gross_basis_bps: Some("100".to_owned()),
+                total_cost_bps: Some("20".to_owned()),
+                net_basis_bps: Some("80".to_owned()),
+                quantity: Some("1".to_owned()),
+                expected_profit_usd: Some("0.8".to_owned()),
+                is_candidate: true,
+                reason: None,
+                source_status: "missing_spot".to_owned(),
+            }],
+        };
+        let events =
+            basis_monitor_snapshot_candidate_events(&spec, &other_symbol_snapshot, ingested_at)
+                .expect("other symbol candidates are ignored by this strategy instance");
+        assert!(events.is_empty());
+
+        let matching_incomplete_snapshot = BinanceBasisMonitorSnapshot {
+            rows: vec![BinanceBasisMarketRow {
+                symbol: "BTCUSDT".to_owned(),
+                is_candidate: true,
+                source_status: "missing_spot".to_owned(),
+                ..other_symbol_snapshot.rows[0].clone()
+            }],
+            ..other_symbol_snapshot
+        };
+        let error = basis_monitor_snapshot_candidate_events(
+            &spec,
+            &matching_incomplete_snapshot,
+            ingested_at,
+        )
+        .expect_err("matching incomplete candidate must fail closed");
+        assert!(error.to_string().contains("not complete"));
+    }
+
+    #[test]
     fn basis_pipeline_spec_rejects_missing_strategy_venue_capability() {
         let capabilities = load_bybit_basis_capabilities()
             .expect("capabilities")
@@ -15582,9 +16449,11 @@ mod tests {
         side: Option<OrderSide>,
     ) -> PrivateOrderUpdate {
         let quantity = filled_quantity.map(|value| Quantity::from_str(value).expect("quantity"));
-        let market_token = match market {
-            arb_venue_exec::BinancePrivateOrderMarket::Spot => "spot",
-            arb_venue_exec::BinancePrivateOrderMarket::UsdmFutures => "usdm",
+        let order_id_prefix = match market {
+            arb_venue_exec::BinancePrivateOrderMarket::Spot => "binance:spot",
+            arb_venue_exec::BinancePrivateOrderMarket::UsdmFutures => "binance:usdm",
+            arb_venue_exec::BinancePrivateOrderMarket::BybitSpot => "bybit-spot",
+            arb_venue_exec::BinancePrivateOrderMarket::BybitLinear => "bybit-linear",
         };
         PrivateOrderUpdate {
             source: OrderConfirmationSource::OrderQuery,
@@ -15599,7 +16468,7 @@ mod tests {
             execution_type: Some("TRADE".to_owned()),
             side,
             venue_order_id: Some(
-                arb_venue_exec::ExternalOrderId::new(format!("binance:{market_token}:order:1"))
+                arb_venue_exec::ExternalOrderId::new(format!("{order_id_prefix}:order:1"))
                     .expect("venue order id"),
             ),
             exchange_order_id: Some("1".to_owned()),

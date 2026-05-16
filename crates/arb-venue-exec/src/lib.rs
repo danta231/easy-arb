@@ -275,11 +275,16 @@ impl OrderConfirmationStatus {
     }
 }
 
-/// Binance 私有订单市场。
+/// 私有订单市场。
+///
+/// 中文说明：历史上该枚举先服务 Binance，因此保留原类型名；新增场所只能用于
+/// 私有确认和执行适配边界，不能被策略或风控层直接依赖。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinancePrivateOrderMarket {
     Spot,
     UsdmFutures,
+    BybitSpot,
+    BybitLinear,
 }
 
 impl BinancePrivateOrderMarket {
@@ -287,6 +292,8 @@ impl BinancePrivateOrderMarket {
         match self {
             Self::Spot => "Spot",
             Self::UsdmFutures => "UsdmFutures",
+            Self::BybitSpot => "BybitSpot",
+            Self::BybitLinear => "BybitLinear",
         }
     }
 
@@ -294,6 +301,8 @@ impl BinancePrivateOrderMarket {
         match self {
             Self::Spot => "spot",
             Self::UsdmFutures => "usdm",
+            Self::BybitSpot => "bybit-spot",
+            Self::BybitLinear => "bybit-linear",
         }
     }
 
@@ -301,6 +310,15 @@ impl BinancePrivateOrderMarket {
         match self {
             Self::Spot => "SPOT",
             Self::UsdmFutures => "USDM-PERP",
+            Self::BybitSpot => "SPOT",
+            Self::BybitLinear => "LINEAR-PERP",
+        }
+    }
+
+    fn venue_family(self) -> &'static str {
+        match self {
+            Self::Spot | Self::UsdmFutures => "BINANCE",
+            Self::BybitSpot | Self::BybitLinear => "BYBIT",
         }
     }
 }
@@ -1485,6 +1503,15 @@ pub fn parse_binance_order_query_confirmation(
     source_event_id: impl Into<String>,
     body: &str,
 ) -> VenueExecResult<PrivateOrderUpdate> {
+    if matches!(
+        market,
+        BinancePrivateOrderMarket::BybitSpot | BinancePrivateOrderMarket::BybitLinear
+    ) {
+        return Err(VenueExecError::InvalidRequest {
+            field: "market",
+            reason: "Binance order confirmation requires a Binance private order market",
+        });
+    }
     parse_binance_private_order_fields(
         market,
         OrderConfirmationSource::OrderQuery,
@@ -1492,6 +1519,53 @@ pub fn parse_binance_order_query_confirmation(
         account_id,
         source_event_id.into(),
         body,
+    )
+}
+
+/// 解析 Bybit V5 REST 查单响应。
+///
+/// 中文说明：Bybit 下单 REST 回执仍不能代表最终成交；该函数只把私有查单返回的
+/// 订单状态转换为统一确认模型，供运行时在下单后显式确认。
+pub fn parse_bybit_order_query_confirmation(
+    market: BinancePrivateOrderMarket,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    let ret_code = required_json_field(body, "retCode")?;
+    if ret_code != "0" {
+        return Err(VenueExecError::UnknownExternalState {
+            venue_id,
+            detail: format!(
+                "Bybit order query returned retCode={ret_code}: {}",
+                json_field_value(body, "retMsg").unwrap_or_else(|| "missing retMsg".to_owned())
+            ),
+        });
+    }
+    let result = json_object_field(body, "result").ok_or(VenueExecError::InvalidRequest {
+        field: "result",
+        reason: "Bybit order query response lacks result object",
+    })?;
+    let category = required_json_field(result, "category")?;
+    validate_bybit_order_category(market, &category)?;
+    let list = json_array_field(result, "list").ok_or(VenueExecError::InvalidRequest {
+        field: "list",
+        reason: "Bybit order query response lacks result.list array",
+    })?;
+    let order = first_json_object_in_array(list).ok_or(VenueExecError::InvalidRequest {
+        field: "list",
+        reason: "Bybit order query result.list contains no order object",
+    })?;
+    let fallback_time = json_field_value(body, "time");
+    parse_bybit_private_order_fields(
+        market,
+        OrderConfirmationSource::OrderQuery,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        order,
+        fallback_time.as_deref(),
     )
 }
 
@@ -1566,6 +1640,133 @@ fn parse_binance_private_order_fields(
         cumulative_filled_quantity,
         last_fill,
     })
+}
+
+fn parse_bybit_private_order_fields(
+    market: BinancePrivateOrderMarket,
+    source: OrderConfirmationSource,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: String,
+    body: &str,
+    fallback_time_ms: Option<&str>,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_token("source_event_id", &source_event_id)?;
+    let symbol = required_json_field(body, "symbol")?;
+    validate_bybit_private_symbol(&symbol)?;
+    let status_text = required_json_field(body, "orderStatus")?;
+    let status = bybit_order_confirmation_status(&status_text);
+    let event_time = bybit_event_time(body, fallback_time_ms)?;
+    let exchange_order_id = json_field_value(body, "orderId");
+    let venue_order_id = exchange_order_id
+        .as_ref()
+        .map(|order_id| ExternalOrderId::new(format!("{}:order:{order_id}", market.token())))
+        .transpose()?;
+    let client_order_id = json_field_value(body, "orderLinkId")
+        .filter(|value| !value.is_empty())
+        .map(OrderId::new)
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let side = json_field_value(body, "side")
+        .map(|side| bybit_private_side(&side))
+        .transpose()?;
+    let cumulative_filled_quantity = json_field_value(body, "cumExecQty")
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_quantity("cumulative_filled_quantity", &value))
+        .transpose()?;
+    let instrument_id = InstrumentId::new(format!(
+        "inst:{}:{}:{}",
+        market.venue_family(),
+        symbol,
+        market.instrument_suffix()
+    ))
+    .map_err(domain_invalid_request)?;
+    let last_fill = parse_bybit_private_fill(
+        source,
+        &source_event_id,
+        &event_time,
+        body,
+        cumulative_filled_quantity,
+    )?;
+
+    Ok(PrivateOrderUpdate {
+        source,
+        market,
+        venue_id,
+        account_id,
+        instrument_id,
+        symbol,
+        source_event_id,
+        event_time,
+        status,
+        execution_type: json_field_value(body, "execType"),
+        side,
+        venue_order_id,
+        exchange_order_id,
+        client_order_id,
+        cumulative_filled_quantity,
+        last_fill,
+    })
+}
+
+fn parse_bybit_private_fill(
+    source: OrderConfirmationSource,
+    source_event_id: &str,
+    event_time: &str,
+    body: &str,
+    cumulative_filled_quantity: Option<Quantity>,
+) -> VenueExecResult<Option<PrivateOrderFillUpdate>> {
+    let quantity_text = json_field_value(body, "lastExecQty").or_else(|| {
+        if source == OrderConfirmationSource::OrderQuery {
+            json_field_value(body, "cumExecQty")
+        } else {
+            None
+        }
+    });
+    let Some(quantity_text) = quantity_text else {
+        return Ok(None);
+    };
+    if !decimal_text_is_positive(&quantity_text) {
+        return Ok(None);
+    }
+    let price = json_field_value(body, "lastExecPrice")
+        .or_else(|| {
+            if source == OrderConfirmationSource::OrderQuery {
+                json_field_value(body, "avgPrice").or_else(|| json_field_value(body, "price"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "0".to_owned());
+    let fee_amount = json_field_value(body, "cumExecFee")
+        .or_else(|| json_field_value(body, "execFee"))
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_amount("fee_amount", &value))
+        .transpose()?;
+    let fee_asset_id = json_field_value(body, "feeCurrency")
+        .or_else(|| json_field_value(body, "execFeeToken"))
+        .filter(|value| !value.is_empty())
+        .map(|value| AssetId::new(format!("asset:{value}")))
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let quantity = parse_quantity("last_fill_quantity", &quantity_text)?;
+    if let Some(cumulative) = cumulative_filled_quantity {
+        if quantity > cumulative {
+            return Err(VenueExecError::InvalidRequest {
+                field: "last_fill_quantity",
+                reason: "last fill quantity exceeds cumulative filled quantity",
+            });
+        }
+    }
+    Ok(Some(PrivateOrderFillUpdate {
+        source_event_id: source_event_id.to_owned(),
+        timestamp: event_time.to_owned(),
+        price,
+        quantity: quantity_text,
+        fee_asset_id,
+        fee_amount,
+        trade_id: json_field_value(body, "execId"),
+    }))
 }
 
 fn parse_binance_private_fill(
@@ -1695,6 +1896,76 @@ fn json_object_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
     None
 }
 
+fn json_array_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
+    let pattern = format!("\"{field}\"");
+    let mut rest = body.get(body.find(&pattern)? + pattern.len()..)?;
+    rest = rest.trim_start();
+    rest = rest.strip_prefix(':')?.trim_start();
+    let start = rest.find('[')?;
+    let bytes = rest.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start) {
+        let byte = *byte;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest.get(start..=index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn first_json_object_in_array(array: &str) -> Option<&str> {
+    let start = array.find('{')?;
+    let bytes = array.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start) {
+        let byte = *byte;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return array.get(start..=index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn binance_event_time(body: &str) -> VenueExecResult<String> {
     let millis = json_field_value(body, "T")
         .or_else(|| json_field_value(body, "E"))
@@ -1702,6 +1973,17 @@ fn binance_event_time(body: &str) -> VenueExecResult<String> {
         .ok_or(VenueExecError::InvalidRequest {
             field: "event_time",
             reason: "Binance private order update lacks event time",
+        })?;
+    binance_millis_to_utc(&millis)
+}
+
+fn bybit_event_time(body: &str, fallback_time_ms: Option<&str>) -> VenueExecResult<String> {
+    let millis = json_field_value(body, "updatedTime")
+        .or_else(|| json_field_value(body, "createdTime"))
+        .or_else(|| fallback_time_ms.map(str::to_owned))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "event_time",
+            reason: "Bybit private order update lacks event time",
         })?;
     binance_millis_to_utc(&millis)
 }
@@ -1723,6 +2005,18 @@ fn binance_millis_to_utc(value: &str) -> VenueExecResult<String> {
         .to_string())
 }
 
+fn bybit_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
+    match value {
+        "New" | "Created" | "Untriggered" => OrderConfirmationStatus::Acknowledged,
+        "PartiallyFilled" => OrderConfirmationStatus::PartiallyFilled,
+        "Filled" => OrderConfirmationStatus::Filled,
+        "Cancelled" | "Canceled" => OrderConfirmationStatus::Cancelled,
+        "Rejected" | "Deactivated" => OrderConfirmationStatus::Rejected,
+        "Expired" => OrderConfirmationStatus::Expired,
+        _ => OrderConfirmationStatus::Unknown,
+    }
+}
+
 fn binance_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
     match value {
         "NEW" => OrderConfirmationStatus::Acknowledged,
@@ -1735,6 +2029,17 @@ fn binance_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
     }
 }
 
+fn bybit_private_side(value: &str) -> VenueExecResult<OrderSide> {
+    match value {
+        "Buy" => Ok(OrderSide::Buy),
+        "Sell" => Ok(OrderSide::Sell),
+        _ => Err(VenueExecError::InvalidRequest {
+            field: "side",
+            reason: "Bybit order side must be Buy or Sell",
+        }),
+    }
+}
+
 fn binance_private_side(value: &str) -> VenueExecResult<OrderSide> {
     match value {
         "BUY" => Ok(OrderSide::Buy),
@@ -1744,6 +2049,45 @@ fn binance_private_side(value: &str) -> VenueExecResult<OrderSide> {
             reason: "Binance order side must be BUY or SELL",
         }),
     }
+}
+
+fn validate_bybit_order_category(
+    market: BinancePrivateOrderMarket,
+    category: &str,
+) -> VenueExecResult<()> {
+    match (market, category) {
+        (BinancePrivateOrderMarket::BybitSpot, "spot")
+        | (BinancePrivateOrderMarket::BybitLinear, "linear") => Ok(()),
+        (BinancePrivateOrderMarket::Spot | BinancePrivateOrderMarket::UsdmFutures, _) => {
+            Err(VenueExecError::InvalidRequest {
+                field: "market",
+                reason: "Bybit order confirmation requires a Bybit private order market",
+            })
+        }
+        _ => Err(VenueExecError::InvalidRequest {
+            field: "category",
+            reason: "Bybit order query category does not match configured market",
+        }),
+    }
+}
+
+fn validate_bybit_private_symbol(value: &str) -> VenueExecResult<()> {
+    if value.is_empty() || value.len() > 32 {
+        return Err(VenueExecError::InvalidRequest {
+            field: "symbol",
+            reason: "Bybit symbol must be 1 to 32 bytes",
+        });
+    }
+    if value
+        .bytes()
+        .any(|byte| !(byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+    {
+        return Err(VenueExecError::InvalidRequest {
+            field: "symbol",
+            reason: "Bybit symbol must use uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
 }
 
 fn validate_binance_private_symbol(value: &str) -> VenueExecResult<()> {
@@ -3610,6 +3954,89 @@ mod tests {
         assert_eq!(update.status, OrderConfirmationStatus::Acknowledged);
         assert!(!update.status.is_terminal());
         assert!(update.last_fill.is_none());
+    }
+
+    #[test]
+    fn bybit_order_query_confirms_filled_linear_order() {
+        let update = parse_bybit_order_query_confirmation(
+            BinancePrivateOrderMarket::BybitLinear,
+            venue("venue:BYBIT-LINEAR"),
+            account("account:bybit-unit"),
+            "event:bybit:linear:query:filled",
+            r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","orderId":"123456789","orderLinkId":"client:bybit:1","side":"Sell","orderStatus":"Filled","cumExecQty":"0.001","avgPrice":"43100.50","cumExecFee":"0.0100","feeCurrency":"USDT","updatedTime":"1700000001500"}]},"retExtInfo":{},"time":1700000002000}"#,
+        )
+        .expect("bybit order query confirmation");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.market, BinancePrivateOrderMarket::BybitLinear);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.side, Some(OrderSide::Sell));
+        assert_eq!(
+            update.instrument_id.as_str(),
+            "inst:BYBIT:BTCUSDT:LINEAR-PERP"
+        );
+        assert_eq!(
+            update
+                .venue_order_id
+                .as_ref()
+                .expect("venue order id")
+                .as_str(),
+            "bybit-linear:order:123456789"
+        );
+        assert_eq!(
+            update.client_order_id.as_ref().expect("client id").as_str(),
+            "client:bybit:1"
+        );
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.001"
+        );
+        let fill = update.last_fill.expect("filled query carries fill summary");
+        assert_eq!(fill.timestamp, "2023-11-14T22:13:21.5Z");
+        assert_eq!(fill.price, "43100.50");
+        assert_eq!(fill.quantity, "0.001");
+        assert_eq!(
+            fill.fee_asset_id.as_ref().expect("fee asset").as_str(),
+            "asset:USDT"
+        );
+        assert_eq!(fill.fee_amount.expect("fee amount").to_string(), "0.0100");
+    }
+
+    #[test]
+    fn bybit_order_query_fails_closed_on_nonzero_ret_code() {
+        let err = parse_bybit_order_query_confirmation(
+            BinancePrivateOrderMarket::BybitLinear,
+            venue("venue:BYBIT-LINEAR"),
+            account("account:bybit-unit"),
+            "event:bybit:linear:query:rejected",
+            r#"{"retCode":10001,"retMsg":"request parameter error","result":{"category":"linear","list":[]},"time":1700000002000}"#,
+        )
+        .expect_err("non-zero Bybit retCode fails closed");
+
+        assert!(matches!(err, VenueExecError::UnknownExternalState { .. }));
+    }
+
+    #[test]
+    fn bybit_order_query_rejects_category_market_mismatch() {
+        let err = parse_bybit_order_query_confirmation(
+            BinancePrivateOrderMarket::BybitSpot,
+            venue("venue:BYBIT-SPOT"),
+            account("account:bybit-unit"),
+            "event:bybit:spot:query:mismatch",
+            r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","orderId":"123456789","side":"Buy","orderStatus":"New","cumExecQty":"0","updatedTime":"1700000001500"}]},"time":1700000002000}"#,
+        )
+        .expect_err("category and configured market must match");
+
+        assert!(matches!(
+            err,
+            VenueExecError::InvalidRequest {
+                field: "category",
+                ..
+            }
+        ));
     }
 
     #[test]
