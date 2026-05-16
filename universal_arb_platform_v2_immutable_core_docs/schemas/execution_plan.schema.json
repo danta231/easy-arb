@@ -133,6 +133,51 @@
         "client_order_id": {
           "$ref": "common.defs.schema.json#/$defs/Identifier"
         },
+        "venue_symbol": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier",
+          "description": "Venue-native trading symbol approved for this order leg. 中文：场所原生交易 symbol（交易对代码），用于分发前白名单校验。"
+        },
+        "side": {
+          "enum": [
+            "Buy",
+            "Sell",
+            "Long",
+            "Short",
+            "Deposit",
+            "Withdraw",
+            "Borrow",
+            "Lend",
+            "Repay",
+            "Receive",
+            "Pay",
+            "None"
+          ],
+          "description": "Order side copied from the approved candidate leg. 中文：从已批准候选腿固化到执行计划的订单方向。"
+        },
+        "order_type": {
+          "enum": [
+            "Market",
+            "Limit",
+            "PostOnly"
+          ],
+          "description": "Mutable order type for adapter mapping. 中文：进入适配器前使用的订单类型。"
+        },
+        "quantity": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString",
+          "description": "Base quantity for order submission. 中文：提交订单使用的基础数量。"
+        },
+        "limit_price": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString",
+          "description": "Limit or post-only price; omitted for market orders. 中文：限价或只挂单价格，市价单不得携带。"
+        },
+        "notional_usd": {
+          "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString",
+          "description": "USD-equivalent notional for final small-size cap checks. 中文：用于最终小额名义金额上限校验的美元等值 notional（名义金额）。"
+        },
+        "basis_leg_role": {
+          "$ref": "common.defs.schema.json#/$defs/Identifier",
+          "description": "Basis-specific role such as spot_buy or perp_short. 中文：basis（现货/永续基差）场景的腿角色，例如 spot_buy（买现货）或 perp_short（做空永续）。"
+        },
         "idempotency_key": {
           "$ref": "common.defs.schema.json#/$defs/Identifier"
         },

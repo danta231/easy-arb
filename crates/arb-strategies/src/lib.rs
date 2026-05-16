@@ -32,6 +32,13 @@ const BASIS_SPOT_TAKER_FEE_BPS: i128 = 10;
 const BASIS_PERP_TAKER_FEE_BPS: i128 = 5;
 const BASIS_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MIN_NET_BPS: i128 = 5;
+const BYBIT_BASIS_STRATEGY_ID: &str = "strat:bybit-spot-perp-basis";
+const BYBIT_BASIS_CODE_VERSION: &str = "code:bybit-spot-perp-basis-1";
+const BYBIT_BASIS_SPOT_VENUE_ID: &str = "venue:BYBIT-SPOT";
+const BYBIT_BASIS_PERP_VENUE_ID: &str = "venue:BYBIT-LINEAR";
+const BYBIT_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:SPOT";
+const BYBIT_BASIS_PERP_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:LINEAR-PERP";
+const BYBIT_BASIS_TRANSITION_ID: &str = "trans:bybit-basis-btcusdt-001";
 const FIXED_SCALE: i128 = 100_000_000;
 const FIXED_SCALE_DIGITS: usize = 8;
 
@@ -287,26 +294,213 @@ pub fn sample_spot_strategy() -> StrategyApiResult<SampleSpotStrategy> {
     SampleSpotStrategy::new()
 }
 
-/// Binance 现货-永续 basis 只读策略。
+/// spot-perp basis 策略实例配置。
 ///
-/// 中文说明：策略只读取已经标准化的 Binance 公共行情事件，计算买现货、做空
-/// USDⓈ-M 永续的正向 basis 是否在扣除静态手续费和滑点缓冲后仍为正。它只输出
-/// 候选组合转换或拒绝原因，不下单、不签名、不访问账户。
+/// 中文说明：算法只读取这里提供的场所、合约、账户和输出参数；策略层不关心
+/// 具体交易所 API，也不持有任何可变执行能力。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpotPerpBasisStrategyConfig {
+    pub instance: StrategyInstanceConfig,
+    pub symbol: BasisSymbolConfig,
+    pub economics: BasisEconomicsConfig,
+    pub output: BasisOutputConfig,
+}
+
+impl SpotPerpBasisStrategyConfig {
+    /// 返回当前兼容的 Binance BTCUSDT 默认配置。
+    pub fn binance_btcusdt() -> Self {
+        Self {
+            instance: StrategyInstanceConfig {
+                strategy_id: BASIS_STRATEGY_ID.to_owned(),
+                strategy_version: BASIS_STRATEGY_VERSION.to_owned(),
+                code_version: BASIS_CODE_VERSION.to_owned(),
+                strategy_label: "spot-perp basis strategy".to_owned(),
+                venue_family_label: "Binance".to_owned(),
+            },
+            symbol: BasisSymbolConfig {
+                symbol: "BTCUSDT".to_owned(),
+                base_asset_id: "asset:BTC".to_owned(),
+                quote_asset_id: "asset:USDT".to_owned(),
+                spot: BasisLegConfig {
+                    venue_id: BASIS_SPOT_VENUE_ID.to_owned(),
+                    instrument_id: BASIS_SPOT_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:binance-basis-readonly".to_owned(),
+                    leg_id: "candleg:binance-basis-buy-spot-btcusdt".to_owned(),
+                    basis_role: "Spot".to_owned(),
+                    basis_leg_role: "spot_buy".to_owned(),
+                    venue_label: "Binance spot".to_owned(),
+                    instrument_label: "spot".to_owned(),
+                },
+                perp: BasisLegConfig {
+                    venue_id: BASIS_PERP_VENUE_ID.to_owned(),
+                    instrument_id: BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:binance-basis-readonly".to_owned(),
+                    leg_id: "candleg:binance-basis-short-usdm-perp-btcusdt".to_owned(),
+                    basis_role: "Perp".to_owned(),
+                    basis_leg_role: "perp_short".to_owned(),
+                    venue_label: "Binance USD-M".to_owned(),
+                    instrument_label: "USD-M perp".to_owned(),
+                },
+            },
+            economics: BasisEconomicsConfig {
+                notional_usd: BASIS_NOTIONAL_USD.to_owned(),
+                spot_taker_fee_bps: BASIS_SPOT_TAKER_FEE_BPS,
+                perp_taker_fee_bps: BASIS_PERP_TAKER_FEE_BPS,
+                slippage_buffer_bps: BASIS_SLIPPAGE_BUFFER_BPS,
+                min_net_bps: BASIS_MIN_NET_BPS,
+            },
+            output: BasisOutputConfig {
+                transition_id: BASIS_TRANSITION_ID.to_owned(),
+                assumption_id: "asm:binance-basis-public-data-readonly".to_owned(),
+                premium_index_label: "premiumIndex".to_owned(),
+                expected_economics_confidence: "0.72".to_owned(),
+                funding_impact_confidence: "0.6".to_owned(),
+                assumption_confidence: "0.72".to_owned(),
+                recovery_buffer_usd: "1.00".to_owned(),
+            },
+        }
+    }
+
+    /// 返回 Bybit BTCUSDT 参数化策略配置。
+    pub fn bybit_btcusdt() -> Self {
+        Self {
+            instance: StrategyInstanceConfig {
+                strategy_id: BYBIT_BASIS_STRATEGY_ID.to_owned(),
+                strategy_version: BASIS_STRATEGY_VERSION.to_owned(),
+                code_version: BYBIT_BASIS_CODE_VERSION.to_owned(),
+                strategy_label: "bybit spot-perp basis strategy".to_owned(),
+                venue_family_label: "Bybit".to_owned(),
+            },
+            symbol: BasisSymbolConfig {
+                symbol: "BTCUSDT".to_owned(),
+                base_asset_id: "asset:BTC".to_owned(),
+                quote_asset_id: "asset:USDT".to_owned(),
+                spot: BasisLegConfig {
+                    venue_id: BYBIT_BASIS_SPOT_VENUE_ID.to_owned(),
+                    instrument_id: BYBIT_BASIS_SPOT_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:bybit-basis-readonly".to_owned(),
+                    leg_id: "candleg:bybit-basis-buy-spot-btcusdt".to_owned(),
+                    basis_role: "Spot".to_owned(),
+                    basis_leg_role: "spot_buy".to_owned(),
+                    venue_label: "Bybit spot".to_owned(),
+                    instrument_label: "spot".to_owned(),
+                },
+                perp: BasisLegConfig {
+                    venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                    instrument_id: BYBIT_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:bybit-basis-readonly".to_owned(),
+                    leg_id: "candleg:bybit-basis-short-linear-perp-btcusdt".to_owned(),
+                    basis_role: "Perp".to_owned(),
+                    basis_leg_role: "perp_short".to_owned(),
+                    venue_label: "Bybit linear".to_owned(),
+                    instrument_label: "linear perp".to_owned(),
+                },
+            },
+            economics: BasisEconomicsConfig {
+                notional_usd: BASIS_NOTIONAL_USD.to_owned(),
+                spot_taker_fee_bps: BASIS_SPOT_TAKER_FEE_BPS,
+                perp_taker_fee_bps: BASIS_PERP_TAKER_FEE_BPS,
+                slippage_buffer_bps: BASIS_SLIPPAGE_BUFFER_BPS,
+                min_net_bps: BASIS_MIN_NET_BPS,
+            },
+            output: BasisOutputConfig {
+                transition_id: BYBIT_BASIS_TRANSITION_ID.to_owned(),
+                assumption_id: "asm:bybit-basis-public-data-readonly".to_owned(),
+                premium_index_label: "premiumIndex".to_owned(),
+                expected_economics_confidence: "0.72".to_owned(),
+                funding_impact_confidence: "0.6".to_owned(),
+                assumption_confidence: "0.72".to_owned(),
+                recovery_buffer_usd: "1.00".to_owned(),
+            },
+        }
+    }
+}
+
+/// 策略身份和实例文案。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrategyInstanceConfig {
+    pub strategy_id: String,
+    pub strategy_version: String,
+    pub code_version: String,
+    pub strategy_label: String,
+    pub venue_family_label: String,
+}
+
+/// 单个 basis 交易对配置。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasisSymbolConfig {
+    pub symbol: String,
+    pub base_asset_id: String,
+    pub quote_asset_id: String,
+    pub spot: BasisLegConfig,
+    pub perp: BasisLegConfig,
+}
+
+/// basis 单腿配置。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasisLegConfig {
+    pub venue_id: String,
+    pub instrument_id: String,
+    pub account_id: String,
+    pub leg_id: String,
+    pub basis_role: String,
+    pub basis_leg_role: String,
+    pub venue_label: String,
+    pub instrument_label: String,
+}
+
+/// basis 静态经济参数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasisEconomicsConfig {
+    pub notional_usd: String,
+    pub spot_taker_fee_bps: i128,
+    pub perp_taker_fee_bps: i128,
+    pub slippage_buffer_bps: i128,
+    pub min_net_bps: i128,
+}
+
+/// candidate 输出参数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasisOutputConfig {
+    pub transition_id: String,
+    pub assumption_id: String,
+    pub premium_index_label: String,
+    pub expected_economics_confidence: String,
+    pub funding_impact_confidence: String,
+    pub assumption_confidence: String,
+    pub recovery_buffer_usd: String,
+}
+
+/// 参数化现货-永续 basis 只读策略。
+///
+/// 中文说明：策略只读取已经标准化的公共行情事件，计算买现货、做空永续的
+/// 正向 basis 是否在扣除静态手续费和滑点缓冲后仍为正。它只输出候选组合转换或
+/// 拒绝原因，不下单、不签名、不访问账户。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpotPerpBasisStrategy {
     metadata: StrategyMetadata,
+    config: SpotPerpBasisStrategyConfig,
 }
 
 impl SpotPerpBasisStrategy {
     /// 创建 Binance spot-perp basis 只读策略。
     pub fn new() -> StrategyApiResult<Self> {
-        Ok(Self {
-            metadata: StrategyMetadata::new(
-                BASIS_STRATEGY_ID,
-                BASIS_STRATEGY_VERSION,
-                BASIS_CODE_VERSION,
-            )?,
-        })
+        Self::with_config(SpotPerpBasisStrategyConfig::binance_btcusdt())
+    }
+
+    /// 使用显式配置创建 spot-perp basis 只读策略。
+    pub fn with_config(config: SpotPerpBasisStrategyConfig) -> StrategyApiResult<Self> {
+        let metadata = StrategyMetadata::new(
+            &config.instance.strategy_id,
+            &config.instance.strategy_version,
+            &config.instance.code_version,
+        )?;
+        Ok(Self { metadata, config })
+    }
+
+    /// 返回当前策略实例配置。
+    pub fn config(&self) -> &SpotPerpBasisStrategyConfig {
+        &self.config
     }
 
     fn reject(
@@ -333,37 +527,54 @@ impl SpotPerpBasisStrategy {
         &self,
         context: &dyn StrategyReadContext,
     ) -> StrategyApiResult<Option<StrategyEvaluation>> {
+        let spot = &self.config.symbol.spot;
+        let perp = &self.config.symbol.perp;
         let required_market = [
             (
-                BASIS_SPOT_VENUE_ID,
+                spot,
                 MarketCapability::ProvidesSpotMarkets,
-                "Binance spot venue lacks ProvidesSpotMarkets capability",
+                format!(
+                    "{} venue lacks ProvidesSpotMarkets capability",
+                    spot.venue_label
+                ),
             ),
             (
-                BASIS_SPOT_VENUE_ID,
+                spot,
                 MarketCapability::ProvidesOrderBookMarkets,
-                "Binance spot venue lacks ProvidesOrderBookMarkets capability",
+                format!(
+                    "{} venue lacks ProvidesOrderBookMarkets capability",
+                    spot.venue_label
+                ),
             ),
             (
-                BASIS_PERP_VENUE_ID,
+                perp,
                 MarketCapability::ProvidesPerpetuals,
-                "Binance USD-M venue lacks ProvidesPerpetuals capability",
+                format!(
+                    "{} venue lacks ProvidesPerpetuals capability",
+                    perp.venue_label
+                ),
             ),
             (
-                BASIS_PERP_VENUE_ID,
+                perp,
                 MarketCapability::ProvidesOrderBookMarkets,
-                "Binance USD-M venue lacks ProvidesOrderBookMarkets capability",
+                format!(
+                    "{} venue lacks ProvidesOrderBookMarkets capability",
+                    perp.venue_label
+                ),
             ),
             (
-                BASIS_PERP_VENUE_ID,
+                perp,
                 MarketCapability::ProvidesFundingRates,
-                "Binance USD-M venue lacks ProvidesFundingRates capability",
+                format!(
+                    "{} venue lacks ProvidesFundingRates capability",
+                    perp.venue_label
+                ),
             ),
         ];
-        for (venue_id, capability, detail) in required_market {
+        for (leg, capability, detail) in required_market {
             if !context
                 .capabilities()
-                .has_market_capability(venue_id, &capability)
+                .has_market_capability(&leg.venue_id, &capability)
             {
                 return Ok(Some(self.reject(
                     context,
@@ -373,15 +584,15 @@ impl SpotPerpBasisStrategy {
             }
         }
 
-        for venue_id in [BASIS_SPOT_VENUE_ID, BASIS_PERP_VENUE_ID] {
+        for leg in [spot, perp] {
             if !context
                 .capabilities()
-                .has_data_surface(venue_id, &DataSurface::RestPolling)
+                .has_data_surface(&leg.venue_id, &DataSurface::RestPolling)
             {
                 return Ok(Some(self.reject(
                     context,
                     StrategyRejectReason::VenueCapabilityMissing,
-                    format!("{venue_id} lacks RESTPolling data surface"),
+                    format!("{} lacks RESTPolling data surface", leg.venue_id),
                 )?));
             }
         }
@@ -394,26 +605,33 @@ impl SpotPerpBasisStrategy {
         context: &dyn StrategyReadContext,
         opportunity: &BasisOpportunity,
     ) -> StrategyApiResult<CandidatePortfolioTransition> {
+        let config = &self.config;
+        let spot_leg = &config.symbol.spot;
+        let perp_leg = &config.symbol.perp;
         let input_event_refs = source_event_refs(context);
         let input_event_refs_json = json_string_array(&input_event_refs);
         let config_version = context.config().config_version();
-        let quantity = opportunity.quantity.format_trimmed();
-        let expected_profit_usd = opportunity.expected_profit_usd.format_trimmed();
-        let fee_estimate_usd = opportunity.fee_estimate_usd.format_trimmed();
-        let slippage_estimate_usd = opportunity.slippage_estimate_usd.format_trimmed();
-        let gross_bps = opportunity.gross_bps.to_string();
-        let net_bps = opportunity.net_bps.to_string();
-        let total_cost_bps = opportunity.total_cost_bps.to_string();
+        let quantity = &opportunity.signal.quantity;
+        let expected_profit_usd = &opportunity.signal.expected_profit_usd;
+        let fee_estimate_usd = &opportunity.signal.fee_estimate_usd;
+        let slippage_estimate_usd = &opportunity.signal.slippage_estimate_usd;
+        let gross_bps = opportunity.signal.gross_bps.to_string();
+        let net_bps = opportunity.signal.net_bps.to_string();
+        let total_cost_bps = opportunity.signal.total_cost_bps.to_string();
         let assumption = format!(
-            "Read-only Binance public data signal: buy spot at {}, short USD-M perp at {}, gross_basis_bps={}, total_cost_bps={}, net_basis_bps={}. Static fee/slippage assumptions must be replaced with account-specific checks before any order path.",
+            "Read-only {} public data signal: buy {} at {}, short {} at {}, gross_basis_bps={}, total_cost_bps={}, net_basis_bps={}. Static fee/slippage assumptions must be replaced with account-specific checks before any order path.",
+            config.instance.venue_family_label,
+            spot_leg.instrument_label,
             opportunity.spot.best_ask.format_trimmed(),
+            perp_leg.instrument_label,
             opportunity.perp.best_bid.format_trimmed(),
             gross_bps,
             total_cost_bps,
             net_bps
         );
         let funding_summary = format!(
-            "Public premiumIndex lastFundingRate={}, mark_price={}, index_price={}, nextFundingTimeMs={}.",
+            "Public {} lastFundingRate={}, mark_price={}, index_price={}, nextFundingTimeMs={}.",
+            config.output.premium_index_label,
             opportunity.premium.last_funding_rate,
             opportunity.premium.mark_price.format_trimmed(),
             opportunity.premium.index_price.format_trimmed(),
@@ -436,28 +654,28 @@ impl SpotPerpBasisStrategy {
   }},
   "legs": [
     {{
-      "leg_id": "candleg:binance-basis-buy-spot-btcusdt",
+      "leg_id": {},
       "leg_type": "Trade",
-      "venue_id": "venue:BINANCE-SPOT",
-      "instrument_id": "inst:BINANCE:BTCUSDT:SPOT",
-      "account_id": "acct:binance-basis-readonly",
+      "venue_id": {},
+      "instrument_id": {},
+      "account_id": {},
       "side": "Buy",
       "asset_flows": [
         {{
-          "asset_id": "asset:USDT",
+          "asset_id": {},
           "direction": "Out",
           "amount": {},
-          "account_id": "acct:binance-basis-readonly"
+          "account_id": {}
         }},
         {{
-          "asset_id": "asset:BTC",
+          "asset_id": {},
           "direction": "In",
           "amount": {},
-          "account_id": "acct:binance-basis-readonly"
+          "account_id": {}
         }}
       ],
       "constraints": {{
-        "basis_leg_role": "spot_buy",
+        "basis_leg_role": {},
         "gross_basis_bps": {},
         "max_slippage_bps": {},
         "net_basis_bps": {},
@@ -473,15 +691,15 @@ impl SpotPerpBasisStrategy {
       ]
     }},
     {{
-      "leg_id": "candleg:binance-basis-short-usdm-perp-btcusdt",
+      "leg_id": {},
       "leg_type": "Trade",
-      "venue_id": "venue:BINANCE-USDM",
-      "instrument_id": "inst:BINANCE:BTCUSDT:USDM-PERP",
-      "account_id": "acct:binance-basis-readonly",
+      "venue_id": {},
+      "instrument_id": {},
+      "account_id": {},
       "side": "Short",
       "asset_flows": [],
       "constraints": {{
-        "basis_leg_role": "perp_short",
+        "basis_leg_role": {},
         "gross_basis_bps": {},
         "last_funding_rate": {},
         "max_slippage_bps": {},
@@ -502,27 +720,27 @@ impl SpotPerpBasisStrategy {
   "expected_post_state_delta": {{
     "asset_flows": [
       {{
-        "asset_id": "asset:USDT",
+        "asset_id": {},
         "direction": "Out",
         "amount": {},
-        "account_id": "acct:binance-basis-readonly"
+        "account_id": {}
       }},
       {{
-        "asset_id": "asset:BTC",
+        "asset_id": {},
         "direction": "In",
         "amount": {},
-        "account_id": "acct:binance-basis-readonly"
+        "account_id": {}
       }}
     ],
     "position_deltas": [
       {{
-        "instrument_id": "inst:BINANCE:BTCUSDT:SPOT",
-        "account_id": "acct:binance-basis-readonly",
+        "instrument_id": {},
+        "account_id": {},
         "quantity_delta": {}
       }},
       {{
-        "instrument_id": "inst:BINANCE:BTCUSDT:USDM-PERP",
-        "account_id": "acct:binance-basis-readonly",
+        "instrument_id": {},
+        "account_id": {},
         "quantity_delta": {}
       }}
     ]
@@ -532,23 +750,23 @@ impl SpotPerpBasisStrategy {
     "expected_profit_bps": {},
     "fee_estimate_usd": {},
     "slippage_estimate_usd": {},
-    "confidence": 0.72
+    "confidence": {}
   }},
   "required_capital": {{
     "asset_requirements": [
       {{
-        "asset_id": "asset:USDT",
+        "asset_id": {},
         "direction": "Out",
         "amount": {},
-        "account_id": "acct:binance-basis-readonly"
+        "account_id": {}
       }}
     ],
-    "recovery_buffer_usd": "1.00"
+    "recovery_buffer_usd": {}
   }},
   "funding_impact": {{
     "summary": {},
     "impact_usd": "0",
-    "confidence": 0.6
+    "confidence": {}
   }},
   "failure_modes": [
     "PartialFill",
@@ -562,14 +780,14 @@ impl SpotPerpBasisStrategy {
   ],
   "assumptions": [
     {{
-      "assumption_id": "asm:binance-basis-public-data-readonly",
+      "assumption_id": {},
       "statement": {},
-      "confidence": 0.72,
+      "confidence": {},
       "source_event_refs": {}
     }}
   ]
 }}"#,
-            json_string(BASIS_TRANSITION_ID),
+            json_string(&config.output.transition_id),
             json_string(self.metadata.strategy_id()),
             json_string(self.metadata.strategy_version()),
             json_string(self.metadata.code_version()),
@@ -577,35 +795,64 @@ impl SpotPerpBasisStrategy {
             json_string(&context.time().now_rfc3339_z()),
             input_event_refs_json,
             json_string(context.snapshot().portfolio_state_id()),
-            json_string(BASIS_NOTIONAL_USD),
-            json_string(&quantity),
+            json_string(&spot_leg.leg_id),
+            json_string(&spot_leg.venue_id),
+            json_string(&spot_leg.instrument_id),
+            json_string(&spot_leg.account_id),
+            json_string(&config.symbol.quote_asset_id),
+            json_string(&config.economics.notional_usd),
+            json_string(&spot_leg.account_id),
+            json_string(&config.symbol.base_asset_id),
+            json_string(quantity),
+            json_string(&spot_leg.account_id),
+            json_string(&spot_leg.basis_leg_role),
             json_string(&gross_bps),
-            json_string(&BASIS_SLIPPAGE_BUFFER_BPS.to_string()),
+            json_string(&config.economics.slippage_buffer_bps.to_string()),
             json_string(&net_bps),
-            json_string(BASIS_NOTIONAL_USD),
+            json_string(&config.economics.notional_usd),
             json_string(&opportunity.spot.best_ask.format_trimmed()),
             json_string(&opportunity.spot.best_bid.format_trimmed()),
             json_string(&opportunity.spot.event_id),
+            json_string(&perp_leg.leg_id),
+            json_string(&perp_leg.venue_id),
+            json_string(&perp_leg.instrument_id),
+            json_string(&perp_leg.account_id),
+            json_string(&perp_leg.basis_leg_role),
             json_string(&gross_bps),
             json_string(&opportunity.premium.last_funding_rate),
-            json_string(&BASIS_SLIPPAGE_BUFFER_BPS.to_string()),
+            json_string(&config.economics.slippage_buffer_bps.to_string()),
             json_string(&net_bps),
-            json_string(BASIS_NOTIONAL_USD),
+            json_string(&config.economics.notional_usd),
             json_string(&opportunity.perp.best_ask.format_trimmed()),
             json_string(&opportunity.perp.best_bid.format_trimmed()),
             json_string(&opportunity.perp.event_id),
             json_string(&opportunity.premium.event_id),
-            json_string(BASIS_NOTIONAL_USD),
-            json_string(&quantity),
-            json_string(&quantity),
+            json_string(&config.symbol.quote_asset_id),
+            json_string(&config.economics.notional_usd),
+            json_string(&spot_leg.account_id),
+            json_string(&config.symbol.base_asset_id),
+            json_string(quantity),
+            json_string(&spot_leg.account_id),
+            json_string(&spot_leg.instrument_id),
+            json_string(&spot_leg.account_id),
+            json_string(quantity),
+            json_string(&perp_leg.instrument_id),
+            json_string(&perp_leg.account_id),
             json_string(&format!("-{quantity}")),
-            json_string(&expected_profit_usd),
+            json_string(expected_profit_usd),
             json_string(&net_bps),
-            json_string(&fee_estimate_usd),
-            json_string(&slippage_estimate_usd),
-            json_string(BASIS_NOTIONAL_USD),
+            json_string(fee_estimate_usd),
+            json_string(slippage_estimate_usd),
+            config.output.expected_economics_confidence.as_str(),
+            json_string(&config.symbol.quote_asset_id),
+            json_string(&config.economics.notional_usd),
+            json_string(&spot_leg.account_id),
+            json_string(&config.output.recovery_buffer_usd),
             json_string(&funding_summary),
+            config.output.funding_impact_confidence.as_str(),
+            json_string(&config.output.assumption_id),
             json_string(&assumption),
+            config.output.assumption_confidence.as_str(),
             json_string_array(&input_event_refs),
         );
 
@@ -639,15 +886,18 @@ impl Strategy for SpotPerpBasisStrategy {
             return self.reject(
                 context,
                 StrategyRejectReason::ConfigDisabled,
-                "spot-perp basis strategy is disabled by read-only config",
+                format!(
+                    "{} is disabled by read-only config",
+                    self.config.instance.strategy_label
+                ),
             );
         }
-        for venue_id in [BASIS_SPOT_VENUE_ID, BASIS_PERP_VENUE_ID] {
-            if context.config().venue_disabled(venue_id) {
+        for leg in [&self.config.symbol.spot, &self.config.symbol.perp] {
+            if context.config().venue_disabled(&leg.venue_id) {
                 return self.reject(
                     context,
                     StrategyRejectReason::ConfigDisabled,
-                    format!("{venue_id} is disabled by read-only config"),
+                    format!("{} is disabled by read-only config", leg.venue_id),
                 );
             }
         }
@@ -664,9 +914,10 @@ impl Strategy for SpotPerpBasisStrategy {
 
         let spot = match latest_basis_book_ticker(
             context,
-            BASIS_SPOT_VENUE_ID,
-            BASIS_SPOT_INSTRUMENT_ID,
-            "Spot",
+            &self.config.symbol.spot.venue_id,
+            &self.config.symbol.spot.instrument_id,
+            &self.config.symbol.spot.basis_role,
+            &self.config.instance.venue_family_label,
         ) {
             Ok(quote) => quote,
             Err(detail) => {
@@ -675,16 +926,22 @@ impl Strategy for SpotPerpBasisStrategy {
         };
         let perp = match latest_basis_book_ticker(
             context,
-            BASIS_PERP_VENUE_ID,
-            BASIS_PERP_INSTRUMENT_ID,
-            "Perp",
+            &self.config.symbol.perp.venue_id,
+            &self.config.symbol.perp.instrument_id,
+            &self.config.symbol.perp.basis_role,
+            &self.config.instance.venue_family_label,
         ) {
             Ok(quote) => quote,
             Err(detail) => {
                 return self.reject(context, StrategyRejectReason::MissingData, detail);
             }
         };
-        let premium = match latest_basis_premium_index(context) {
+        let premium = match latest_basis_premium_index(
+            context,
+            &self.config.symbol.perp.venue_id,
+            &self.config.symbol.perp.instrument_id,
+            &self.config.instance.venue_family_label,
+        ) {
             Ok(premium) => premium,
             Err(detail) => {
                 return self.reject(context, StrategyRejectReason::MissingData, detail);
@@ -694,79 +951,57 @@ impl Strategy for SpotPerpBasisStrategy {
             return self.reject(
                 context,
                 StrategyRejectReason::DataStale,
-                "one or more required Binance public market events are stale",
-            );
-        }
-
-        let notional =
-            match FixedDecimal::parse_non_negative("basis_notional_usd", BASIS_NOTIONAL_USD) {
-                Ok(value) => value,
-                Err(detail) => {
-                    return self.reject(context, StrategyRejectReason::UnknownState, detail)
-                }
-            };
-        let gross_bps = match gross_basis_bps(perp.best_bid, spot.best_ask) {
-            Ok(value) => value,
-            Err(detail) => return self.reject(context, StrategyRejectReason::UnknownState, detail),
-        };
-        let total_cost_bps =
-            BASIS_SPOT_TAKER_FEE_BPS + BASIS_PERP_TAKER_FEE_BPS + BASIS_SLIPPAGE_BUFFER_BPS;
-        let net_bps = gross_bps - total_cost_bps;
-        if net_bps < BASIS_MIN_NET_BPS {
-            return self.reject(
-                context,
-                StrategyRejectReason::NoCandidate,
                 format!(
-                    "basis net_bps={net_bps} below minimum {BASIS_MIN_NET_BPS}; gross_bps={gross_bps}, total_cost_bps={total_cost_bps}"
+                    "one or more required {} public market events are stale",
+                    self.config.instance.venue_family_label
                 ),
             );
         }
 
-        let quantity = match FixedDecimal::quantity_for_notional(notional, spot.best_ask) {
-            Ok(value) => value,
+        let signal = match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: self.config.symbol.symbol.clone(),
+            spot_best_bid: spot.best_bid.format_trimmed(),
+            spot_best_ask: spot.best_ask.format_trimmed(),
+            perp_best_bid: perp.best_bid.format_trimmed(),
+            perp_best_ask: perp.best_ask.format_trimmed(),
+            notional_usd: self.config.economics.notional_usd.clone(),
+            spot_taker_fee_bps: self.config.economics.spot_taker_fee_bps,
+            perp_taker_fee_bps: self.config.economics.perp_taker_fee_bps,
+            slippage_buffer_bps: self.config.economics.slippage_buffer_bps,
+            min_net_bps: self.config.economics.min_net_bps,
+        }) {
+            Ok(signal) => signal,
             Err(detail) => return self.reject(context, StrategyRejectReason::UnknownState, detail),
         };
-        let expected_profit_usd = match FixedDecimal::usd_from_bps(notional, net_bps) {
-            Ok(value) => value,
-            Err(detail) => return self.reject(context, StrategyRejectReason::UnknownState, detail),
-        };
-        let fee_estimate_usd = match FixedDecimal::usd_from_bps(
-            notional,
-            BASIS_SPOT_TAKER_FEE_BPS + BASIS_PERP_TAKER_FEE_BPS,
-        ) {
-            Ok(value) => value,
-            Err(detail) => return self.reject(context, StrategyRejectReason::UnknownState, detail),
-        };
-        let slippage_estimate_usd =
-            match FixedDecimal::usd_from_bps(notional, BASIS_SLIPPAGE_BUFFER_BPS) {
-                Ok(value) => value,
-                Err(detail) => {
-                    return self.reject(context, StrategyRejectReason::UnknownState, detail);
-                }
-            };
+        if !signal.is_candidate {
+            return self.reject(
+                context,
+                StrategyRejectReason::NoCandidate,
+                signal
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
+            );
+        }
 
         let opportunity = BasisOpportunity {
             spot,
             perp,
             premium,
-            quantity,
-            gross_bps,
-            total_cost_bps,
-            net_bps,
-            expected_profit_usd,
-            fee_estimate_usd,
-            slippage_estimate_usd,
+            signal,
         };
         let candidate = self.build_candidate(context, &opportunity)?;
         validate_candidate_for_context(context, self.metadata(), &candidate)?;
         let diagnostic = StrategyDiagnostic::new(
             "SPOT_PERP_BASIS_CANDIDATE",
             format!(
-                "candidate {BASIS_TRANSITION_ID} emitted using Binance spot ask {}, perp bid {}, gross_bps {}, net_bps {}",
+                "candidate {} emitted using {} spot ask {}, perp bid {}, gross_bps {}, net_bps {}",
+                self.config.output.transition_id,
+                self.config.instance.venue_family_label,
                 opportunity.spot.best_ask.format_trimmed(),
                 opportunity.perp.best_bid.format_trimmed(),
-                opportunity.gross_bps,
-                opportunity.net_bps
+                opportunity.signal.gross_bps,
+                opportunity.signal.net_bps
             ),
             context.time().now(),
         )?;
@@ -775,8 +1010,18 @@ impl Strategy for SpotPerpBasisStrategy {
 }
 
 /// 返回 Binance spot-perp basis 只读策略。
-pub fn spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
+pub fn binance_spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
     SpotPerpBasisStrategy::new()
+}
+
+/// 返回 Bybit spot-perp basis 参数化只读策略。
+pub fn bybit_spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
+    SpotPerpBasisStrategy::with_config(SpotPerpBasisStrategyConfig::bybit_btcusdt())
+}
+
+/// 返回默认 spot-perp basis 只读策略；当前默认保持为 Binance。
+pub fn spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
+    binance_spot_perp_basis_strategy()
 }
 
 /// spot-perp basis 只读信号输入。
@@ -1004,13 +1249,7 @@ struct BasisOpportunity {
     spot: BasisBookTickerInput,
     perp: BasisBookTickerInput,
     premium: BasisPremiumIndexInput,
-    quantity: FixedDecimal,
-    gross_bps: i128,
-    total_cost_bps: i128,
-    net_bps: i128,
-    expected_profit_usd: FixedDecimal,
-    fee_estimate_usd: FixedDecimal,
-    slippage_estimate_usd: FixedDecimal,
+    signal: SpotPerpBasisSignal,
 }
 
 fn latest_basis_book_ticker(
@@ -1018,6 +1257,7 @@ fn latest_basis_book_ticker(
     venue_id: &str,
     instrument_id: &str,
     basis_role: &str,
+    venue_family_label: &str,
 ) -> Result<BasisBookTickerInput, String> {
     let event = context
         .snapshot()
@@ -1027,7 +1267,7 @@ fn latest_basis_book_ticker(
         .find(|event| is_basis_book_ticker_event(event, venue_id, instrument_id, basis_role))
         .ok_or_else(|| {
             format!(
-                "missing Binance {basis_role} BookTicker event for venue {venue_id} instrument {instrument_id}"
+                "missing {venue_family_label} {basis_role} BookTicker event for venue {venue_id} instrument {instrument_id}"
             )
         })?;
 
@@ -1041,16 +1281,19 @@ fn latest_basis_book_ticker(
 
 fn latest_basis_premium_index(
     context: &dyn StrategyReadContext,
+    venue_id: &str,
+    instrument_id: &str,
+    venue_family_label: &str,
 ) -> Result<BasisPremiumIndexInput, String> {
     let event = context
         .snapshot()
         .market_events()
         .iter()
         .rev()
-        .find(is_basis_premium_index_event)
+        .find(|event| is_basis_premium_index_event(event, venue_id, instrument_id))
         .ok_or_else(|| {
             format!(
-                "missing Binance PerpPremiumIndex event for venue {BASIS_PERP_VENUE_ID} instrument {BASIS_PERP_INSTRUMENT_ID}"
+                "missing {venue_family_label} PerpPremiumIndex event for venue {venue_id} instrument {instrument_id}"
             )
         })?;
 
@@ -1093,10 +1336,14 @@ fn is_basis_book_ticker_event(
         && payload_string(event, "basis_role").is_some_and(|role| role == basis_role)
 }
 
-fn is_basis_premium_index_event(event: &&NormalizedEvent) -> bool {
+fn is_basis_premium_index_event(
+    event: &NormalizedEvent,
+    venue_id: &str,
+    instrument_id: &str,
+) -> bool {
     event.event_type == NormalizedEventType::NormalizedMarketDataEvent
-        && nullable_identifier_matches(&event.venue_id, BASIS_PERP_VENUE_ID)
-        && nullable_identifier_matches(&event.instrument_id, BASIS_PERP_INSTRUMENT_ID)
+        && nullable_identifier_matches(&event.venue_id, venue_id)
+        && nullable_identifier_matches(&event.instrument_id, instrument_id)
         && payload_string(event, "kind").is_some_and(|kind| kind == "PerpPremiumIndex")
 }
 
@@ -1429,6 +1676,26 @@ mod tests {
     }
 
     #[test]
+    fn spot_perp_basis_default_factories_keep_binance_metadata() {
+        let direct = SpotPerpBasisStrategy::new().expect("direct strategy");
+        let binance = binance_spot_perp_basis_strategy().expect("binance strategy");
+        let default_alias = spot_perp_basis_strategy().expect("default strategy");
+
+        for strategy in [&direct, &binance, &default_alias] {
+            assert_eq!(strategy.metadata().strategy_id(), BASIS_STRATEGY_ID);
+            assert_eq!(
+                strategy.metadata().strategy_version(),
+                BASIS_STRATEGY_VERSION
+            );
+            assert_eq!(strategy.metadata().code_version(), BASIS_CODE_VERSION);
+            assert_eq!(
+                strategy.config(),
+                &SpotPerpBasisStrategyConfig::binance_btcusdt()
+            );
+        }
+    }
+
+    #[test]
     fn spot_perp_basis_strategy_rejects_when_costs_remove_opportunity() {
         let strategy = SpotPerpBasisStrategy::new().expect("strategy");
         let context = basis_test_context(vec![
@@ -1499,6 +1766,186 @@ mod tests {
             evaluation.rejection().expect("rejection").reason().as_str(),
             StrategyRejectReason::DataStale.as_str()
         );
+    }
+
+    #[test]
+    fn bybit_spot_perp_basis_strategy_outputs_configured_candidate() {
+        let strategy = bybit_spot_perp_basis_strategy().expect("strategy");
+        let context = bybit_basis_test_context("CHECK_PASSED", "101.00", "101.10", "CHECK_PASSED");
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        let candidate = evaluation.candidate().expect("candidate");
+        assert_eq!(candidate.transition_id.as_str(), BYBIT_BASIS_TRANSITION_ID);
+        assert_eq!(candidate.strategy_id.as_str(), BYBIT_BASIS_STRATEGY_ID);
+        assert_eq!(candidate.code_version.as_str(), BYBIT_BASIS_CODE_VERSION);
+        assert_eq!(candidate.legs.len(), 2);
+        assert_eq!(
+            candidate.legs[0].leg_id.as_str(),
+            "candleg:bybit-basis-buy-spot-btcusdt"
+        );
+        assert_eq!(
+            candidate.legs[0]
+                .venue_id
+                .as_ref()
+                .expect("spot venue")
+                .as_str(),
+            BYBIT_BASIS_SPOT_VENUE_ID
+        );
+        assert_eq!(
+            candidate.legs[0]
+                .instrument_id
+                .as_ref()
+                .expect("spot instrument")
+                .as_str(),
+            BYBIT_BASIS_SPOT_INSTRUMENT_ID
+        );
+        assert_eq!(
+            candidate.legs[0]
+                .account_id
+                .as_ref()
+                .expect("spot account")
+                .as_str(),
+            "acct:bybit-basis-readonly"
+        );
+        assert_eq!(
+            leg_constraint(candidate, 0, "basis_leg_role"),
+            Some("spot_buy")
+        );
+        assert_eq!(
+            candidate.legs[1].leg_id.as_str(),
+            "candleg:bybit-basis-short-linear-perp-btcusdt"
+        );
+        assert_eq!(
+            candidate.legs[1]
+                .venue_id
+                .as_ref()
+                .expect("perp venue")
+                .as_str(),
+            BYBIT_BASIS_PERP_VENUE_ID
+        );
+        assert_eq!(
+            candidate.legs[1]
+                .instrument_id
+                .as_ref()
+                .expect("perp instrument")
+                .as_str(),
+            BYBIT_BASIS_PERP_INSTRUMENT_ID
+        );
+        assert_eq!(
+            candidate.legs[1]
+                .account_id
+                .as_ref()
+                .expect("perp account")
+                .as_str(),
+            "acct:bybit-basis-readonly"
+        );
+        assert_eq!(
+            leg_constraint(candidate, 1, "basis_leg_role"),
+            Some("perp_short")
+        );
+        assert_eq!(
+            candidate.expected_post_state_delta.position_deltas[0]
+                .instrument_id
+                .as_str(),
+            BYBIT_BASIS_SPOT_INSTRUMENT_ID
+        );
+        assert_eq!(
+            candidate.expected_post_state_delta.position_deltas[1]
+                .instrument_id
+                .as_str(),
+            BYBIT_BASIS_PERP_INSTRUMENT_ID
+        );
+        assert!(evaluation.rejection().is_none());
+    }
+
+    #[test]
+    fn bybit_spot_perp_basis_strategy_rejects_missing_capability() {
+        let strategy = bybit_spot_perp_basis_strategy().expect("strategy");
+        let mut context =
+            bybit_basis_test_context("CHECK_PASSED", "101.00", "101.10", "CHECK_PASSED");
+        context.capabilities.has_basis_spot = false;
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        assert!(evaluation.candidate().is_none());
+        let rejection = evaluation.rejection().expect("rejection");
+        assert_eq!(
+            rejection.reason().as_str(),
+            StrategyRejectReason::VenueCapabilityMissing.as_str()
+        );
+        assert!(rejection
+            .detail()
+            .expect("detail")
+            .contains("Bybit spot venue lacks ProvidesSpotMarkets capability"));
+    }
+
+    #[test]
+    fn bybit_spot_perp_basis_strategy_rejects_missing_event() {
+        let strategy = bybit_spot_perp_basis_strategy().expect("strategy");
+        let context = basis_test_context(vec![
+            basis_book_event(
+                "bybit-perp",
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                "Perp",
+                "101.00",
+                "101.10",
+                "CHECK_PASSED",
+            ),
+            basis_premium_event_for(
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                "0.00010000",
+                "CHECK_PASSED",
+            ),
+        ]);
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        assert!(evaluation.candidate().is_none());
+        let rejection = evaluation.rejection().expect("rejection");
+        assert_eq!(
+            rejection.reason().as_str(),
+            StrategyRejectReason::MissingData.as_str()
+        );
+        assert!(rejection
+            .detail()
+            .expect("detail")
+            .contains("missing Bybit Spot BookTicker event"));
+    }
+
+    #[test]
+    fn bybit_spot_perp_basis_strategy_rejects_stale_public_data() {
+        let strategy = bybit_spot_perp_basis_strategy().expect("strategy");
+        let context = bybit_basis_test_context("DATA_STALE", "101.00", "101.10", "CHECK_PASSED");
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        assert!(evaluation.candidate().is_none());
+        assert_eq!(
+            evaluation.rejection().expect("rejection").reason().as_str(),
+            StrategyRejectReason::DataStale.as_str()
+        );
+    }
+
+    #[test]
+    fn bybit_spot_perp_basis_strategy_rejects_when_net_basis_below_threshold() {
+        let strategy = bybit_spot_perp_basis_strategy().expect("strategy");
+        let context = bybit_basis_test_context("CHECK_PASSED", "100.15", "100.20", "CHECK_PASSED");
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        assert!(evaluation.candidate().is_none());
+        let rejection = evaluation.rejection().expect("rejection");
+        assert_eq!(
+            rejection.reason().as_str(),
+            StrategyRejectReason::NoCandidate.as_str()
+        );
+        assert!(rejection
+            .detail()
+            .expect("detail")
+            .contains("below minimum"));
     }
 
     #[test]
@@ -1591,7 +2038,16 @@ mod tests {
         candidate: &'a CandidatePortfolioTransition,
         key: &str,
     ) -> Option<&'a str> {
-        match candidate.legs[0].constraints.get(key)? {
+        leg_constraint(candidate, 0, key)
+    }
+
+    fn leg_constraint<'a>(
+        candidate: &'a CandidatePortfolioTransition,
+        leg_index: usize,
+        key: &str,
+    ) -> Option<&'a str> {
+        let leg = candidate.legs.get(leg_index)?;
+        match leg.constraints.get(key)? {
             JsonValue::String(value) => Some(value.as_str()),
             _ => None,
         }
@@ -1666,18 +2122,19 @@ mod tests {
             match (venue_id, capability) {
                 (SAMPLE_VENUE_ID, MarketCapability::ProvidesSpotMarkets) => self.has_spot,
                 (
-                    BASIS_SPOT_VENUE_ID,
+                    BASIS_SPOT_VENUE_ID | BYBIT_BASIS_SPOT_VENUE_ID,
                     MarketCapability::ProvidesSpotMarkets
                     | MarketCapability::ProvidesOrderBookMarkets,
                 ) => self.has_basis_spot,
                 (
-                    BASIS_PERP_VENUE_ID,
+                    BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
                     MarketCapability::ProvidesPerpetuals
                     | MarketCapability::ProvidesOrderBookMarkets,
                 ) => self.has_basis_perp,
-                (BASIS_PERP_VENUE_ID, MarketCapability::ProvidesFundingRates) => {
-                    self.has_basis_funding
-                }
+                (
+                    BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
+                    MarketCapability::ProvidesFundingRates,
+                ) => self.has_basis_funding,
                 _ => false,
             }
         }
@@ -1688,7 +2145,10 @@ mod tests {
             }
             match venue_id {
                 SAMPLE_VENUE_ID => self.has_rest,
-                BASIS_SPOT_VENUE_ID | BASIS_PERP_VENUE_ID => self.has_basis_rest,
+                BASIS_SPOT_VENUE_ID
+                | BASIS_PERP_VENUE_ID
+                | BYBIT_BASIS_SPOT_VENUE_ID
+                | BYBIT_BASIS_PERP_VENUE_ID => self.has_basis_rest,
                 _ => false,
             }
         }
@@ -1720,13 +2180,20 @@ mod tests {
         }
 
         fn strategy_disabled(&self, strategy_id: &str) -> bool {
-            matches!(strategy_id, SAMPLE_STRATEGY_ID | BASIS_STRATEGY_ID) && self.disabled_strategy
+            matches!(
+                strategy_id,
+                SAMPLE_STRATEGY_ID | BASIS_STRATEGY_ID | BYBIT_BASIS_STRATEGY_ID
+            ) && self.disabled_strategy
         }
 
         fn venue_disabled(&self, venue_id: &str) -> bool {
             matches!(
                 venue_id,
-                SAMPLE_VENUE_ID | BASIS_SPOT_VENUE_ID | BASIS_PERP_VENUE_ID
+                SAMPLE_VENUE_ID
+                    | BASIS_SPOT_VENUE_ID
+                    | BASIS_PERP_VENUE_ID
+                    | BYBIT_BASIS_SPOT_VENUE_ID
+                    | BYBIT_BASIS_PERP_VENUE_ID
             ) && self.disabled_venue
         }
     }
@@ -1758,6 +2225,40 @@ mod tests {
             },
             time: FixedTimeSource::from_rfc3339_z("2026-01-01T00:00:02Z").expect("fixed time"),
         }
+    }
+
+    fn bybit_basis_test_context(
+        spot_risk_reason_code: &str,
+        perp_best_bid: &str,
+        perp_best_ask: &str,
+        premium_risk_reason_code: &str,
+    ) -> TestContext {
+        basis_test_context(vec![
+            basis_book_event(
+                "bybit-spot",
+                BYBIT_BASIS_SPOT_VENUE_ID,
+                BYBIT_BASIS_SPOT_INSTRUMENT_ID,
+                "Spot",
+                "99.90",
+                "100.00",
+                spot_risk_reason_code,
+            ),
+            basis_book_event(
+                "bybit-perp",
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                "Perp",
+                perp_best_bid,
+                perp_best_ask,
+                "CHECK_PASSED",
+            ),
+            basis_premium_event_for(
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                "0.00010000",
+                premium_risk_reason_code,
+            ),
+        ])
     }
 
     fn basis_book_event(
@@ -1802,6 +2303,20 @@ mod tests {
     }
 
     fn basis_premium_event(last_funding_rate: &str, risk_reason_code: &str) -> NormalizedEvent {
+        basis_premium_event_for(
+            BASIS_PERP_VENUE_ID,
+            BASIS_PERP_INSTRUMENT_ID,
+            last_funding_rate,
+            risk_reason_code,
+        )
+    }
+
+    fn basis_premium_event_for(
+        venue_id: &str,
+        instrument_id: &str,
+        last_funding_rate: &str,
+        risk_reason_code: &str,
+    ) -> NormalizedEvent {
         normalized_event_from_json_strict(&format!(
             r#"{{
   "event_id": "event:basis-test:premium-index",
@@ -1813,8 +2328,8 @@ mod tests {
   "source_sequence": "basis-test:premium-index",
   "correlation_id": "corr:basis-test:premium-index",
   "schema_version": "1.0.0",
-  "venue_id": "venue:BINANCE-USDM",
-  "instrument_id": "inst:BINANCE:BTCUSDT:USDM-PERP",
+  "venue_id": {},
+  "instrument_id": {},
   "payload": {{
     "basis_role": "Perp",
     "index_price": "100.00",
@@ -1826,6 +2341,8 @@ mod tests {
   }},
   "checksum": "sha256:fixture-basis-premium-index"
 }}"#,
+            json_string(venue_id),
+            json_string(instrument_id),
             json_string(last_funding_rate),
             json_string(risk_reason_code),
         ))

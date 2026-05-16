@@ -90,9 +90,11 @@ dependencies = [
  "arb-reconciliation",
  "arb-replay",
  "arb-risk",
+ "arb-signing",
  "arb-strategies",
  "arb-strategy-api",
  "arb-venue-data",
+ "arb-venue-exec",
 ]
 
 [[package]]
@@ -131,7 +133,9 @@ dependencies = [
 name = "arb-venue-exec"
 version = "0.1.0"
 dependencies = [
+ "arb-contracts",
  "arb-domain",
+ "arb-signing",
 ]
 
 [[package]]

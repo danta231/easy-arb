@@ -5,6 +5,12 @@ edition.workspace = true
 
 [features]
 default = []
+live-exec = [
+    "dep:arb-signing",
+    "dep:arb-venue-exec",
+    "arb-signing/real-signing",
+    "arb-venue-exec/live-exec",
+]
 
 [dependencies]
 arb-config = { path = "../arb-config" }
@@ -20,3 +26,5 @@ arb-risk = { path = "../arb-risk" }
 arb-strategies = { path = "../arb-strategies" }
 arb-strategy-api = { path = "../arb-strategy-api" }
 arb-venue-data = { path = "../arb-venue-data" }
+arb-signing = { path = "../arb-signing", default-features = false, optional = true }
+arb-venue-exec = { path = "../arb-venue-exec", default-features = false, optional = true }

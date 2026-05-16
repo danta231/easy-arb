@@ -6,17 +6,18 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
 use arb_contracts::{
     from_json_strict, to_canonical_json, CancelDefaultAction, CandidatePortfolioTransition,
     CapitalReservation, CapitalReservationState, ContractError, ExecutionActionType,
-    ExecutionFailureSeverity, ExecutionLegState, ExecutionMode, ExecutionPlan, ExecutionReport,
-    ExecutionReportStatus, FailureMode, FillSide, HedgeResidualAction, LedgerEntry,
-    LegReportStatus, PartialFillAction, PortfolioState, ReconciliationStatus, RiskCheckType,
-    RiskConstraint, RiskConstraintType, RiskDecision, RiskDecisionKind, TransitionLeg,
-    TransitionLegType,
+    ExecutionFailureSeverity, ExecutionLegState, ExecutionMode, ExecutionOrderType, ExecutionPlan,
+    ExecutionReport, ExecutionReportStatus, FailureMode, FillSide, HedgeResidualAction, Incident,
+    LedgerEntry, LedgerNamespace, LegReportStatus, PartialFillAction, PortfolioState,
+    ReconciliationStatus, RiskCheckType, RiskConstraint, RiskConstraintType, RiskDecision,
+    RiskDecisionKind, TransitionLeg, TransitionLegType, TransitionSide,
 };
 
 /// 执行层统一返回类型。
@@ -741,6 +742,185 @@ impl SimulatedUnknown {
     }
 }
 
+/// 私有订单确认来源。
+///
+/// 中文说明：REST 下单回执不是最终成交事实；只有私有订单流或查单结果能进入
+/// 执行报告生成路径。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateOrderConfirmationSource {
+    PrivateStream,
+    OrderQuery,
+}
+
+impl PrivateOrderConfirmationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrivateStream => "PrivateStream",
+            Self::OrderQuery => "OrderQuery",
+        }
+    }
+}
+
+/// 私有订单确认状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateOrderConfirmationStatus {
+    Acknowledged,
+    Filled,
+    PartiallyFilled,
+    Cancelled,
+    Rejected,
+    Expired,
+    Unknown,
+}
+
+impl PrivateOrderConfirmationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Acknowledged => "Acknowledged",
+            Self::Filled => "Filled",
+            Self::PartiallyFilled => "PartiallyFilled",
+            Self::Cancelled => "Cancelled",
+            Self::Rejected => "Rejected",
+            Self::Expired => "Expired",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// 私有成交明细。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateExecutionFill {
+    pub side: FillSide,
+    pub price: String,
+    pub quantity: String,
+    pub fee_asset_id: String,
+    pub fee_amount: String,
+    pub source_event_id: String,
+    pub timestamp: Option<String>,
+    pub venue_order_id: Option<String>,
+    pub client_order_id: Option<String>,
+    pub ledger_entry_id: Option<String>,
+}
+
+impl PrivateExecutionFill {
+    pub fn new(
+        side: FillSide,
+        price: impl Into<String>,
+        quantity: impl Into<String>,
+        fee_asset_id: impl Into<String>,
+        fee_amount: impl Into<String>,
+        source_event_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            side,
+            price: price.into(),
+            quantity: quantity.into(),
+            fee_asset_id: fee_asset_id.into(),
+            fee_amount: fee_amount.into(),
+            source_event_id: source_event_id.into(),
+            timestamp: None,
+            venue_order_id: None,
+            client_order_id: None,
+            ledger_entry_id: None,
+        }
+    }
+
+    pub fn with_timestamp(mut self, timestamp: impl Into<String>) -> Self {
+        self.timestamp = Some(timestamp.into());
+        self
+    }
+
+    pub fn with_venue_order_id(mut self, venue_order_id: impl Into<String>) -> Self {
+        self.venue_order_id = Some(venue_order_id.into());
+        self
+    }
+
+    pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Self {
+        self.client_order_id = Some(client_order_id.into());
+        self
+    }
+
+    pub fn with_ledger_entry_id(mut self, ledger_entry_id: impl Into<String>) -> Self {
+        self.ledger_entry_id = Some(ledger_entry_id.into());
+        self
+    }
+}
+
+/// 单个执行腿的私有订单确认。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateOrderConfirmation {
+    pub plan_leg_id: String,
+    pub status: PrivateOrderConfirmationStatus,
+    pub source: PrivateOrderConfirmationSource,
+    pub source_event_refs: Vec<String>,
+    pub venue_order_id: Option<String>,
+    pub client_order_id: Option<String>,
+    pub fills: Vec<PrivateExecutionFill>,
+    pub detail: Option<String>,
+}
+
+impl PrivateOrderConfirmation {
+    pub fn new(
+        plan_leg_id: impl Into<String>,
+        status: PrivateOrderConfirmationStatus,
+        source: PrivateOrderConfirmationSource,
+        source_event_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan_leg_id: plan_leg_id.into(),
+            status,
+            source,
+            source_event_refs: vec![source_event_id.into()],
+            venue_order_id: None,
+            client_order_id: None,
+            fills: Vec::new(),
+            detail: None,
+        }
+    }
+
+    pub fn with_venue_order_id(mut self, venue_order_id: impl Into<String>) -> Self {
+        self.venue_order_id = Some(venue_order_id.into());
+        self
+    }
+
+    pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Self {
+        self.client_order_id = Some(client_order_id.into());
+        self
+    }
+
+    pub fn with_fill(mut self, fill: PrivateExecutionFill) -> Self {
+        self.fills.push(fill);
+        self
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// 私有确认生成执行报告的输入。
+#[derive(Clone, Copy)]
+pub struct PrivateExecutionReportInput<'a> {
+    pub plan: &'a ExecutionPlan,
+    pub generated_at: &'a str,
+    pub confirmations: &'a [PrivateOrderConfirmation],
+}
+
+impl<'a> PrivateExecutionReportInput<'a> {
+    pub fn new(
+        plan: &'a ExecutionPlan,
+        generated_at: &'a str,
+        confirmations: &'a [PrivateOrderConfirmation],
+    ) -> Self {
+        Self {
+            plan,
+            generated_at,
+            confirmations,
+        }
+    }
+}
+
 /// 模拟执行输出。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimulatedExecution {
@@ -866,6 +1046,17 @@ pub fn simulate_execution_with_script(
     StaticSimulatedExecutor.simulate(input)
 }
 
+/// 用私有订单确认生成执行报告。
+///
+/// 中文说明：该入口不消费 REST 下单回执。调用方必须先用私有 user data stream
+/// 或查单结果证明订单状态；缺失确认、确认未终态或成交明细不足都会按未知状态
+/// 或人工处理输出，不能被汇总成最终成功。
+pub fn execution_report_from_private_confirmations(
+    input: PrivateExecutionReportInput<'_>,
+) -> ExecutionResult<ExecutionReport> {
+    build_private_execution_report(input)
+}
+
 /// 将模拟执行结果转换为模拟账本分录输入。
 ///
 /// 中文说明：执行模块只生成 `LedgerEntry` 合同对象，调用方可以把这些对象交给
@@ -873,6 +1064,78 @@ pub fn simulate_execution_with_script(
 pub fn simulated_ledger_entries_from_execution_report(
     plan: &ExecutionPlan,
     report: &ExecutionReport,
+) -> ExecutionResult<Vec<LedgerEntry>> {
+    ledger_entries_from_execution_report(plan, report, LedgerNamespace::Simulation)
+}
+
+/// 将私有确认后的执行报告转换为实盘账本分录输入。
+///
+/// 中文说明：只有已经进入 `ExecutionReport.fills` 的私有流/查单确认成交会生成
+/// `Live`（实盘）命名空间分录；未知订单状态不会凭 REST 回执入账。
+pub fn private_ledger_entries_from_execution_report(
+    plan: &ExecutionPlan,
+    report: &ExecutionReport,
+) -> ExecutionResult<Vec<LedgerEntry>> {
+    ledger_entries_from_execution_report(plan, report, LedgerNamespace::Live)
+}
+
+/// 从私有确认后的失败或未知执行报告生成事故记录。
+pub fn incidents_from_private_execution_report(
+    plan: &ExecutionPlan,
+    report: &ExecutionReport,
+    opened_at: &str,
+) -> ExecutionResult<Vec<Incident>> {
+    if report.failures.is_empty()
+        && matches!(
+            &report.status,
+            ExecutionReportStatus::Succeeded | ExecutionReportStatus::Simulated
+        )
+    {
+        return Ok(Vec::new());
+    }
+
+    let source_event_refs = private_execution_incident_source_refs(report);
+    let venue_ids = private_execution_incident_venues(plan);
+    let trigger = private_execution_incident_trigger(report);
+    let severity = private_execution_incident_severity(report);
+    let incident_id = format!("incident:{}:private-execution", report.report_id.as_str());
+    let detail = private_execution_incident_detail(report);
+
+    let incident_json = format!(
+        "{{\"automatic_actions\":[{{\"action_id\":{},\"action_type\":\"TradingPaused\",\"detail\":{},\"timestamp\":{} }},{{\"action_id\":{},\"action_type\":\"ReconciliationStarted\",\"detail\":{},\"timestamp\":{} }}],\"impacted\":{{\"capital_at_risk_usd\":{},\"venue_ids\":[{}]}},\"incident_id\":{},\"manual_actions\":[{{\"action_id\":{},\"action_type\":\"ManualReview\",\"detail\":{},\"timestamp\":{} }}],\"opened_at\":{},\"schema_version\":{},\"severity\":{},\"source_event_refs\":[{}],\"status\":\"Open\",\"trigger\":{}}}",
+        json_string(&format!("iact:{}:pause", report.report_id.as_str())),
+        json_string("Private execution confirmation failed closed; trading must remain paused for affected scope."),
+        json_string(opened_at),
+        json_string(&format!("iact:{}:reconcile", report.report_id.as_str())),
+        json_string("Start reconciliation from private stream, order query, fills and ledger entries before any retry."),
+        json_string(opened_at),
+        json_string(private_execution_capital_at_risk(plan)),
+        venue_ids
+            .iter()
+            .map(|venue_id| json_string(venue_id))
+            .collect::<Vec<_>>()
+            .join(","),
+        json_string(&incident_id),
+        json_string(&format!("iact:{}:manual", report.report_id.as_str())),
+        json_string(&detail),
+        json_string(opened_at),
+        json_string(opened_at),
+        json_string(report.schema_version.as_str()),
+        json_string(severity),
+        source_event_refs
+            .iter()
+            .map(|event_id| json_string(event_id))
+            .collect::<Vec<_>>()
+            .join(","),
+        json_string(trigger),
+    );
+    Ok(vec![from_json_strict::<Incident>(&incident_json)?])
+}
+
+fn ledger_entries_from_execution_report(
+    plan: &ExecutionPlan,
+    report: &ExecutionReport,
+    namespace: LedgerNamespace,
 ) -> ExecutionResult<Vec<LedgerEntry>> {
     if plan.plan_id != report.plan_id {
         return Err(ExecutionError::ExecutionReportPlanMismatch {
@@ -888,7 +1151,7 @@ pub fn simulated_ledger_entries_from_execution_report(
     report
         .fills
         .iter()
-        .map(|fill| render_simulated_ledger_entry(plan, report, fill))
+        .map(|fill| render_ledger_entry(plan, report, fill, &namespace))
         .collect()
 }
 
@@ -1706,15 +1969,16 @@ fn build_plan_contract(
             ));
         }
 
-        leg_json.push(render_execution_leg(
-            input.execution_mode(),
+        leg_json.push(render_execution_leg(ExecutionLegRenderInput {
+            execution_mode: input.execution_mode(),
+            candidate: input.candidate,
             leg,
-            &plan_id,
-            &plan_leg_id,
-            &dependencies,
-            &initial_state,
+            plan_id: &plan_id,
+            plan_leg_id: &plan_leg_id,
+            dependencies: &dependencies,
+            initial_state: &initial_state,
             pending_manual_approval,
-        ));
+        }));
         previous_plan_leg_id = Some(plan_leg_id);
     }
 
@@ -1808,22 +2072,26 @@ fn render_manual_gate_leg(input: &ExecutionPlanBuildInput<'_>, gate_id: &str) ->
     )
 }
 
-fn render_execution_leg(
-    execution_mode: &ExecutionMode,
-    leg: &TransitionLeg,
-    plan_id: &str,
-    plan_leg_id: &str,
-    dependencies: &[String],
-    initial_state: &ExecutionLegState,
+struct ExecutionLegRenderInput<'a> {
+    execution_mode: &'a ExecutionMode,
+    candidate: &'a CandidatePortfolioTransition,
+    leg: &'a TransitionLeg,
+    plan_id: &'a str,
+    plan_leg_id: &'a str,
+    dependencies: &'a [String],
+    initial_state: &'a ExecutionLegState,
     pending_manual_approval: bool,
-) -> String {
-    let action_type = if pending_manual_approval {
+}
+
+fn render_execution_leg(input: ExecutionLegRenderInput<'_>) -> String {
+    let leg = input.leg;
+    let action_type = if input.pending_manual_approval {
         intended_action_type(&leg.leg_type)
     } else {
-        scheduled_action_type(execution_mode, &leg.leg_type)
+        scheduled_action_type(input.execution_mode, &leg.leg_type)
     };
     let mut fields = vec![
-        render_pair("plan_leg_id", json_string(plan_leg_id)),
+        render_pair("plan_leg_id", json_string(input.plan_leg_id)),
         render_pair("candidate_leg_id", json_string(leg.leg_id.as_str())),
         render_pair("action_type", json_string(action_type.as_str())),
     ];
@@ -1840,16 +2108,46 @@ fn render_execution_leg(
         "account_id",
         json_string(leg.account_id.as_ref().expect("validated").as_str()),
     ));
+    if let Some(venue_symbol) = execution_venue_symbol(leg) {
+        fields.push(render_pair("venue_symbol", json_string(&venue_symbol)));
+    }
+    if let Some(side) = &leg.side {
+        fields.push(render_pair("side", json_string(side.as_str())));
+    }
+    if requires_order_intent(&action_type) {
+        if let Some(order_type) = execution_order_type(leg) {
+            fields.push(render_pair("order_type", json_string(order_type.as_str())));
+        }
+        if let Some(quantity) = execution_quantity(input.candidate, leg) {
+            fields.push(render_pair("quantity", json_string(&quantity)));
+        }
+        if let Some(limit_price) = execution_limit_price(leg) {
+            fields.push(render_pair("limit_price", json_string(&limit_price)));
+        }
+        if let Some(notional) = execution_notional_usd(leg) {
+            fields.push(render_pair("notional_usd", json_string(&notional)));
+        }
+        if let Some(client_order_id) = string_constraint(leg, "client_order_id") {
+            fields.push(render_pair(
+                "client_order_id",
+                json_string(&client_order_id),
+            ));
+        }
+    }
+    if let Some(role) = string_constraint(leg, "basis_leg_role") {
+        fields.push(render_pair("basis_leg_role", json_string(&role)));
+    }
     fields.push(render_pair(
         "idempotency_key",
-        json_string(&format!("idem:{plan_id}:{}", leg.leg_id.as_str())),
+        json_string(&format!("idem:{}:{}", input.plan_id, leg.leg_id.as_str())),
     ));
-    if !dependencies.is_empty() {
+    if !input.dependencies.is_empty() {
         fields.push(render_pair(
             "depends_on",
             format!(
                 "[{}]",
-                dependencies
+                input
+                    .dependencies
                     .iter()
                     .map(|dependency| json_string(dependency))
                     .collect::<Vec<_>>()
@@ -1863,12 +2161,115 @@ fn render_execution_leg(
             to_canonical_json(&leg.asset_flows),
         ));
     }
-    fields.push(render_pair("state", json_string(initial_state.as_str())));
+    fields.push(render_pair(
+        "state",
+        json_string(input.initial_state.as_str()),
+    ));
     fields.push(render_pair(
         "failure_semantics",
         json_string(selected_failure_mode(&leg.failure_modes).as_str()),
     ));
     format!("{{{}}}", fields.join(","))
+}
+
+fn requires_order_intent(action_type: &ExecutionActionType) -> bool {
+    matches!(
+        action_type,
+        ExecutionActionType::PlaceOrder | ExecutionActionType::Hedge
+    )
+}
+
+fn execution_order_type(leg: &TransitionLeg) -> Option<ExecutionOrderType> {
+    if bool_constraint(leg, "post_only") == Some(true) {
+        Some(ExecutionOrderType::PostOnly)
+    } else if execution_limit_price(leg).is_some() {
+        Some(ExecutionOrderType::Limit)
+    } else if leg.leg_type == TransitionLegType::Trade || leg.leg_type == TransitionLegType::Hedge {
+        Some(ExecutionOrderType::Market)
+    } else {
+        None
+    }
+}
+
+fn execution_quantity(
+    candidate: &CandidatePortfolioTransition,
+    leg: &TransitionLeg,
+) -> Option<String> {
+    let instrument_id = leg.instrument_id.as_ref()?;
+    let account_id = leg.account_id.as_ref().map(|id| id.as_str());
+    candidate
+        .expected_post_state_delta
+        .position_deltas
+        .iter()
+        .find(|delta| {
+            delta.instrument_id.as_str() == instrument_id.as_str()
+                && delta.account_id.as_ref().map(|id| id.as_str()) == account_id
+        })
+        .map(|delta| non_negative_decimal_abs(delta.quantity_delta.as_str()))
+}
+
+fn execution_limit_price(leg: &TransitionLeg) -> Option<String> {
+    if let Some(value) = string_constraint(leg, "limit_price") {
+        return Some(value);
+    }
+    match leg.side.as_ref()? {
+        TransitionSide::Buy | TransitionSide::Long => string_constraint(leg, "reference_best_ask")
+            .or_else(|| string_constraint(leg, "reference_last_price")),
+        TransitionSide::Sell | TransitionSide::Short => {
+            string_constraint(leg, "reference_best_bid")
+                .or_else(|| string_constraint(leg, "reference_last_price"))
+        }
+        _ => None,
+    }
+}
+
+fn execution_notional_usd(leg: &TransitionLeg) -> Option<String> {
+    string_constraint(leg, "notional_usd")
+        .or_else(|| string_constraint(leg, "notional_usdt"))
+        .or_else(|| string_constraint(leg, "max_notional_usdt"))
+        .or_else(|| {
+            leg.asset_flows
+                .iter()
+                .find(|flow| flow.direction.as_str() == "Out")
+                .map(|flow| flow.amount.as_str().to_owned())
+        })
+}
+
+fn execution_venue_symbol(leg: &TransitionLeg) -> Option<String> {
+    string_constraint(leg, "venue_symbol").or_else(|| {
+        let instrument_id = leg.instrument_id.as_ref()?.as_str();
+        let mut parts = instrument_id.split(':');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some("inst"), Some("BINANCE"), Some(symbol), Some(_)) if parts.next().is_none() => {
+                Some(symbol.to_owned())
+            }
+            (Some("inst"), Some(symbol), None, None) => Some(symbol.to_owned()),
+            _ => None,
+        }
+    })
+}
+
+fn string_constraint(leg: &TransitionLeg, field_name: &str) -> Option<String> {
+    leg.constraints
+        .get(field_name)
+        .and_then(|value| match value {
+            arb_contracts::JsonValue::String(value) => Some(value.clone()),
+            arb_contracts::JsonValue::Number(value) => Some(value.as_str().to_owned()),
+            _ => None,
+        })
+}
+
+fn bool_constraint(leg: &TransitionLeg, field_name: &str) -> Option<bool> {
+    leg.constraints
+        .get(field_name)
+        .and_then(|value| match value {
+            arb_contracts::JsonValue::Bool(value) => Some(*value),
+            _ => None,
+        })
+}
+
+fn non_negative_decimal_abs(value: &str) -> String {
+    value.strip_prefix('-').unwrap_or(value).to_owned()
 }
 
 fn render_dependency_edge(from_leg_id: &str, to_leg_id: &str, condition: &str) -> String {
@@ -2201,6 +2602,345 @@ fn build_read_only_report(
 }
 
 #[derive(Default)]
+struct PrivateExecutionAggregate {
+    leg_reports: Vec<String>,
+    fills: Vec<String>,
+    failures: Vec<String>,
+    any_fill: bool,
+    any_partial: bool,
+    any_failure: bool,
+    any_unknown: bool,
+    any_pending: bool,
+    order_leg_count: usize,
+    filled_order_leg_count: usize,
+}
+
+fn build_private_execution_report(
+    input: PrivateExecutionReportInput<'_>,
+) -> ExecutionResult<ExecutionReport> {
+    if input.generated_at.trim().is_empty() {
+        return Err(ExecutionError::MissingRequiredField {
+            field: "generated_at",
+            detail: "private execution report time must be explicit".to_owned(),
+        });
+    }
+
+    let mut aggregate = PrivateExecutionAggregate::default();
+    for (index, leg) in input.plan.legs.iter().enumerate() {
+        if !is_private_order_leg(leg) {
+            aggregate.leg_reports.push(render_leg_report(
+                leg.plan_leg_id.as_str(),
+                LegReportStatus::Skipped,
+                &[],
+            ));
+            continue;
+        }
+        aggregate.order_leg_count += 1;
+        let confirmation = input
+            .confirmations
+            .iter()
+            .rev()
+            .find(|confirmation| confirmation.plan_leg_id == leg.plan_leg_id.as_str());
+        apply_private_confirmation(
+            input.plan,
+            input.generated_at,
+            index,
+            leg,
+            confirmation,
+            &mut aggregate,
+        )?;
+    }
+
+    let status = private_execution_report_status(&aggregate);
+    let reconciliation_status = private_execution_reconciliation_status(&aggregate);
+    build_execution_report_contract(
+        input.plan,
+        input.generated_at,
+        status,
+        &aggregate.leg_reports,
+        &aggregate.fills,
+        &aggregate.failures,
+        reconciliation_status,
+    )
+}
+
+fn apply_private_confirmation(
+    plan: &ExecutionPlan,
+    generated_at: &str,
+    index: usize,
+    leg: &arb_contracts::ExecutionLeg,
+    confirmation: Option<&PrivateOrderConfirmation>,
+    aggregate: &mut PrivateExecutionAggregate,
+) -> ExecutionResult<()> {
+    let Some(confirmation) = confirmation else {
+        let event_id = format!(
+            "event:private:{}:{:04}:missing-confirmation",
+            plan.plan_id.as_str(),
+            index + 1
+        );
+        aggregate.failures.push(render_failure(
+            plan,
+            index,
+            Some(leg.plan_leg_id.as_str()),
+            FailureMode::UnknownState,
+            ExecutionFailureSeverity::RiskCritical,
+            "没有私有订单流或查单确认，REST 回执不能证明最终订单状态。",
+            "private-missing",
+        ));
+        aggregate.leg_reports.push(render_leg_report(
+            leg.plan_leg_id.as_str(),
+            LegReportStatus::Unknown,
+            &[event_id],
+        ));
+        aggregate.any_unknown = true;
+        aggregate.any_failure = true;
+        return Ok(());
+    };
+
+    let refs = private_confirmation_refs(confirmation);
+    match confirmation.status {
+        PrivateOrderConfirmationStatus::Acknowledged => {
+            aggregate.any_pending = true;
+            aggregate.leg_reports.push(render_leg_report(
+                leg.plan_leg_id.as_str(),
+                LegReportStatus::Acknowledged,
+                &refs,
+            ));
+            aggregate.failures.push(render_failure(
+                plan,
+                index,
+                Some(leg.plan_leg_id.as_str()),
+                FailureMode::ManualInterventionRequired,
+                ExecutionFailureSeverity::Warn,
+                "私有确认只证明订单已被场所接受，尚未证明最终成交、撤单或拒单状态。",
+                "private-pending",
+            ));
+        }
+        PrivateOrderConfirmationStatus::Filled => {
+            if confirmation.fills.is_empty() {
+                aggregate.any_unknown = true;
+                aggregate.any_failure = true;
+                aggregate.failures.push(render_failure(
+                    plan,
+                    index,
+                    Some(leg.plan_leg_id.as_str()),
+                    FailureMode::UnknownState,
+                    ExecutionFailureSeverity::RiskCritical,
+                    "查单或私有流显示已成交，但没有可入账成交明细；必须对账后处理。",
+                    "private-fill-missing",
+                ));
+                aggregate.leg_reports.push(render_leg_report(
+                    leg.plan_leg_id.as_str(),
+                    LegReportStatus::Unknown,
+                    &refs,
+                ));
+                return Ok(());
+            }
+            push_private_fills(plan, generated_at, index, leg, confirmation, aggregate)?;
+            aggregate.filled_order_leg_count += 1;
+            aggregate.leg_reports.push(render_leg_report(
+                leg.plan_leg_id.as_str(),
+                LegReportStatus::Filled,
+                &refs,
+            ));
+        }
+        PrivateOrderConfirmationStatus::PartiallyFilled => {
+            if confirmation.fills.is_empty() {
+                aggregate.any_unknown = true;
+                aggregate.any_failure = true;
+                aggregate.failures.push(render_failure(
+                    plan,
+                    index,
+                    Some(leg.plan_leg_id.as_str()),
+                    FailureMode::UnknownState,
+                    ExecutionFailureSeverity::RiskCritical,
+                    "私有确认显示部分成交，但没有可入账成交明细。",
+                    "private-partial-missing",
+                ));
+                aggregate.leg_reports.push(render_leg_report(
+                    leg.plan_leg_id.as_str(),
+                    LegReportStatus::Unknown,
+                    &refs,
+                ));
+                return Ok(());
+            }
+            push_private_fills(plan, generated_at, index, leg, confirmation, aggregate)?;
+            aggregate.any_partial = true;
+            aggregate.any_failure = true;
+            aggregate.failures.push(render_failure(
+                plan,
+                index,
+                Some(leg.plan_leg_id.as_str()),
+                FailureMode::PartialFill,
+                ExecutionFailureSeverity::Warn,
+                confirmation
+                    .detail
+                    .as_deref()
+                    .unwrap_or("私有确认显示部分成交；剩余敞口必须进入撤单、对冲或人工处理。"),
+                "private-partial",
+            ));
+            aggregate.leg_reports.push(render_leg_report(
+                leg.plan_leg_id.as_str(),
+                LegReportStatus::PartiallyFilled,
+                &refs,
+            ));
+        }
+        PrivateOrderConfirmationStatus::Cancelled => {
+            if !confirmation.fills.is_empty() {
+                push_private_fills(plan, generated_at, index, leg, confirmation, aggregate)?;
+                aggregate.any_partial = true;
+            }
+            aggregate.any_failure = true;
+            aggregate.failures.push(render_failure(
+                plan,
+                index,
+                Some(leg.plan_leg_id.as_str()),
+                if confirmation.fills.is_empty() {
+                    FailureMode::NoOpFailure
+                } else {
+                    FailureMode::PartialFill
+                },
+                ExecutionFailureSeverity::Warn,
+                confirmation
+                    .detail
+                    .as_deref()
+                    .unwrap_or("私有确认显示订单已取消；不能作为完整成交成功处理。"),
+                "private-cancelled",
+            ));
+            aggregate.leg_reports.push(render_leg_report(
+                leg.plan_leg_id.as_str(),
+                LegReportStatus::Cancelled,
+                &refs,
+            ));
+        }
+        PrivateOrderConfirmationStatus::Rejected | PrivateOrderConfirmationStatus::Expired => {
+            aggregate.any_failure = true;
+            aggregate.failures.push(render_failure(
+                plan,
+                index,
+                Some(leg.plan_leg_id.as_str()),
+                FailureMode::RetryableFailure,
+                ExecutionFailureSeverity::RiskCritical,
+                confirmation.detail.as_deref().unwrap_or_else(|| {
+                    if confirmation.status == PrivateOrderConfirmationStatus::Rejected {
+                        "私有确认显示订单被场所拒绝。"
+                    } else {
+                        "私有确认显示订单已过期。"
+                    }
+                }),
+                if confirmation.status == PrivateOrderConfirmationStatus::Rejected {
+                    "private-rejected"
+                } else {
+                    "private-expired"
+                },
+            ));
+            aggregate.leg_reports.push(render_leg_report(
+                leg.plan_leg_id.as_str(),
+                LegReportStatus::Failed,
+                &refs,
+            ));
+        }
+        PrivateOrderConfirmationStatus::Unknown => {
+            aggregate.any_unknown = true;
+            aggregate.any_failure = true;
+            aggregate.failures.push(render_failure(
+                plan,
+                index,
+                Some(leg.plan_leg_id.as_str()),
+                FailureMode::UnknownState,
+                ExecutionFailureSeverity::RiskCritical,
+                confirmation
+                    .detail
+                    .as_deref()
+                    .unwrap_or("私有流或查单返回未知状态；必须失败闭合并对账。"),
+                "private-unknown",
+            ));
+            aggregate.leg_reports.push(render_leg_report(
+                leg.plan_leg_id.as_str(),
+                LegReportStatus::Unknown,
+                &refs,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn push_private_fills(
+    plan: &ExecutionPlan,
+    generated_at: &str,
+    index: usize,
+    leg: &arb_contracts::ExecutionLeg,
+    confirmation: &PrivateOrderConfirmation,
+    aggregate: &mut PrivateExecutionAggregate,
+) -> ExecutionResult<()> {
+    for (fill_index, fill) in confirmation.fills.iter().enumerate() {
+        aggregate.fills.push(render_private_fill(
+            plan,
+            leg,
+            index,
+            fill_index,
+            generated_at,
+            confirmation,
+            fill,
+        )?);
+    }
+    aggregate.any_fill = true;
+    Ok(())
+}
+
+fn is_private_order_leg(leg: &arb_contracts::ExecutionLeg) -> bool {
+    matches!(
+        leg.action_type,
+        ExecutionActionType::PlaceOrder | ExecutionActionType::Hedge
+    )
+}
+
+fn private_confirmation_refs(confirmation: &PrivateOrderConfirmation) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    for event_id in &confirmation.source_event_refs {
+        refs.insert(event_id.clone());
+    }
+    for fill in &confirmation.fills {
+        refs.insert(fill.source_event_id.clone());
+    }
+    refs.into_iter().collect()
+}
+
+fn private_execution_report_status(aggregate: &PrivateExecutionAggregate) -> ExecutionReportStatus {
+    if aggregate.any_unknown {
+        ExecutionReportStatus::UnknownState
+    } else if aggregate.any_pending {
+        ExecutionReportStatus::ManualInterventionRequired
+    } else if aggregate.any_partial || (aggregate.any_fill && aggregate.any_failure) {
+        ExecutionReportStatus::PartiallySucceeded
+    } else if aggregate.any_failure {
+        ExecutionReportStatus::Failed
+    } else if aggregate.order_leg_count > 0
+        && aggregate.filled_order_leg_count == aggregate.order_leg_count
+    {
+        ExecutionReportStatus::Succeeded
+    } else {
+        ExecutionReportStatus::NotDispatched
+    }
+}
+
+fn private_execution_reconciliation_status(
+    aggregate: &PrivateExecutionAggregate,
+) -> ReconciliationStatus {
+    if aggregate.any_unknown {
+        ReconciliationStatus::Unknown
+    } else if aggregate.any_pending || aggregate.any_partial || aggregate.any_failure {
+        ReconciliationStatus::Pending
+    } else if aggregate.order_leg_count > 0
+        && aggregate.filled_order_leg_count == aggregate.order_leg_count
+    {
+        ReconciliationStatus::Matched
+    } else {
+        ReconciliationStatus::NotStarted
+    }
+}
+
+#[derive(Default)]
 struct SimulationAggregate {
     leg_reports: Vec<String>,
     fills: Vec<String>,
@@ -2278,13 +3018,24 @@ fn default_simulation_outcome(
     }
 
     SimulationLegOutcome::FullFill(SimulatedFill::new(
-        FillSide::Buy,
+        fill_side_from_execution_leg(leg),
         "1",
         "1",
         default_fee_asset_id(leg),
         "0",
         format!("event:sim:{}:{:04}:fill", plan.plan_id.as_str(), index + 1),
     ))
+}
+
+fn fill_side_from_execution_leg(leg: &arb_contracts::ExecutionLeg) -> FillSide {
+    match leg.side.as_ref() {
+        Some(TransitionSide::Sell) => FillSide::Sell,
+        Some(TransitionSide::Long) => FillSide::Long,
+        Some(TransitionSide::Short) => FillSide::Short,
+        Some(TransitionSide::Receive) => FillSide::Receive,
+        Some(TransitionSide::Pay) => FillSide::Pay,
+        _ => FillSide::Buy,
+    }
 }
 
 fn default_fee_asset_id(leg: &arb_contracts::ExecutionLeg) -> String {
@@ -2840,6 +3591,88 @@ fn render_fill(
     Ok(format!("{{{}}}", fields.join(",")))
 }
 
+fn render_private_fill(
+    plan: &ExecutionPlan,
+    leg: &arb_contracts::ExecutionLeg,
+    leg_index: usize,
+    fill_index: usize,
+    generated_at: &str,
+    confirmation: &PrivateOrderConfirmation,
+    fill: &PrivateExecutionFill,
+) -> ExecutionResult<String> {
+    let venue_id = leg
+        .venue_id
+        .as_ref()
+        .ok_or_else(|| ExecutionError::MissingRequiredField {
+            field: "execution_plan.legs[].venue_id",
+            detail: format!(
+                "private order leg `{}` must carry a venue_id",
+                leg.plan_leg_id.as_str()
+            ),
+        })?;
+    let instrument_id =
+        leg.instrument_id
+            .as_ref()
+            .ok_or_else(|| ExecutionError::MissingRequiredField {
+                field: "execution_plan.legs[].instrument_id",
+                detail: format!(
+                    "private order leg `{}` must carry an instrument_id",
+                    leg.plan_leg_id.as_str()
+                ),
+            })?;
+    let timestamp = fill.timestamp.as_deref().unwrap_or(generated_at);
+    let venue_order_id = fill
+        .venue_order_id
+        .as_deref()
+        .or(confirmation.venue_order_id.as_deref());
+    let client_order_id = fill
+        .client_order_id
+        .as_deref()
+        .or(confirmation.client_order_id.as_deref())
+        .or_else(|| leg.client_order_id.as_ref().map(|id| id.as_str()));
+
+    let mut fields = vec![
+        render_pair("schema_version", json_string(plan.schema_version.as_str())),
+        render_pair(
+            "fill_id",
+            json_string(&format!(
+                "fill:{}:{:04}:private:{:04}",
+                plan.plan_id.as_str(),
+                leg_index + 1,
+                fill_index + 1
+            )),
+        ),
+        render_pair("plan_id", json_string(plan.plan_id.as_str())),
+        render_pair("plan_leg_id", json_string(leg.plan_leg_id.as_str())),
+        render_pair("venue_id", json_string(venue_id.as_str())),
+        render_pair("instrument_id", json_string(instrument_id.as_str())),
+        render_pair("timestamp", json_string(timestamp)),
+        render_pair("side", json_string(fill.side.as_str())),
+        render_pair("price", json_string(&fill.price)),
+        render_pair("quantity", json_string(&fill.quantity)),
+        render_pair(
+            "fee",
+            format!(
+                "{{\"account_id\":{},\"amount\":{},\"asset_id\":{},\"direction\":\"Out\"}}",
+                json_string(leg.account_id.as_str()),
+                json_string(&fill.fee_amount),
+                json_string(&fill.fee_asset_id),
+            ),
+        ),
+        render_pair("source_event_id", json_string(&fill.source_event_id)),
+    ];
+    if let Some(venue_order_id) = venue_order_id {
+        fields.push(render_pair("venue_order_id", json_string(venue_order_id)));
+    }
+    if let Some(client_order_id) = client_order_id {
+        fields.push(render_pair("client_order_id", json_string(client_order_id)));
+    }
+    if let Some(ledger_entry_id) = &fill.ledger_entry_id {
+        fields.push(render_pair("ledger_entry_id", json_string(ledger_entry_id)));
+    }
+    Ok(format!("{{{}}}", fields.join(",")))
+}
+
 fn render_failure(
     plan: &ExecutionPlan,
     index: usize,
@@ -2869,10 +3702,11 @@ fn render_failure(
     format!("{{{}}}", fields.join(","))
 }
 
-fn render_simulated_ledger_entry(
+fn render_ledger_entry(
     plan: &ExecutionPlan,
     report: &ExecutionReport,
     fill: &arb_contracts::Fill,
+    namespace: &LedgerNamespace,
 ) -> ExecutionResult<LedgerEntry> {
     let account_id =
         fill.fee
@@ -2889,23 +3723,35 @@ fn render_simulated_ledger_entry(
         .ledger_entry_id
         .as_ref()
         .map(|entry_id| entry_id.as_str().to_owned())
-        .unwrap_or_else(|| format!("ledger:sim:{}", fill.fill_id.as_str()));
+        .unwrap_or_else(|| {
+            format!(
+                "ledger:{}:{}",
+                ledger_namespace_token(namespace),
+                fill.fill_id.as_str()
+            )
+        });
     let journal_entry_id = format!("journal:{}", ledger_entry_id);
     let idempotency_key = format!("idem:{}", ledger_entry_id);
     let debit_leg_id = format!("ledleg:{}:debit", fill.fill_id.as_str());
     let credit_leg_id = format!("ledleg:{}:credit", fill.fill_id.as_str());
-    let assertion_hash = format!("hash:sim-ledger:{}", fill.fill_id.as_str());
+    let assertion_hash = format!(
+        "hash:{}-ledger:{}",
+        ledger_namespace_token(namespace),
+        fill.fill_id.as_str()
+    );
     let memo = format!(
-        "simulated ledger input for report {}",
+        "{} ledger input for report {}",
+        ledger_namespace_memo_prefix(namespace),
         report.report_id.as_str()
     );
 
     let ledger_json = format!(
-        "{{\"ledger_entry_id\":{},\"journal_entry_id\":{},\"schema_version\":{},\"timestamp\":{},\"namespace\":\"Simulation\",\"entry_type\":\"TradeFill\",\"source_event_id\":{},\"idempotency_key\":{},\"opportunity_id\":{},\"execution_plan_id\":{},\"legs\":[{{\"leg_id\":{},\"account_id\":{},\"asset_id\":{},\"direction\":\"Debit\",\"amount\":{},\"memo\":{}}},{{\"leg_id\":{},\"account_id\":{},\"asset_id\":{},\"direction\":\"Credit\",\"amount\":{},\"memo\":{}}}],\"balance_assertion\":{{\"balanced\":true,\"assertion_hash\":{},\"checked_by\":\"arb-execution\"}}}}",
+        "{{\"ledger_entry_id\":{},\"journal_entry_id\":{},\"schema_version\":{},\"timestamp\":{},\"namespace\":{},\"entry_type\":\"TradeFill\",\"source_event_id\":{},\"idempotency_key\":{},\"opportunity_id\":{},\"execution_plan_id\":{},\"legs\":[{{\"leg_id\":{},\"account_id\":{},\"asset_id\":{},\"direction\":\"Debit\",\"amount\":{},\"memo\":{}}},{{\"leg_id\":{},\"account_id\":{},\"asset_id\":{},\"direction\":\"Credit\",\"amount\":{},\"memo\":{}}}],\"balance_assertion\":{{\"balanced\":true,\"assertion_hash\":{},\"checked_by\":\"arb-execution\"}}}}",
         json_string(&ledger_entry_id),
         json_string(&journal_entry_id),
         json_string(report.schema_version.as_str()),
         json_string(fill.timestamp.as_str()),
+        json_string(namespace.as_str()),
         json_string(fill.source_event_id.as_str()),
         json_string(&idempotency_key),
         json_string(plan.transition_id.as_str()),
@@ -2924,6 +3770,105 @@ fn render_simulated_ledger_entry(
     );
 
     Ok(from_json_strict::<LedgerEntry>(&ledger_json)?)
+}
+
+fn ledger_namespace_token(namespace: &LedgerNamespace) -> &'static str {
+    match namespace {
+        LedgerNamespace::Live => "live",
+        LedgerNamespace::Simulation => "sim",
+        LedgerNamespace::Backtest => "backtest",
+        LedgerNamespace::Adjustment => "adjustment",
+    }
+}
+
+fn ledger_namespace_memo_prefix(namespace: &LedgerNamespace) -> &'static str {
+    match namespace {
+        LedgerNamespace::Live => "private confirmed live",
+        LedgerNamespace::Simulation => "simulated",
+        LedgerNamespace::Backtest => "backtest",
+        LedgerNamespace::Adjustment => "adjustment",
+    }
+}
+
+fn private_execution_incident_source_refs(report: &ExecutionReport) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    for leg_report in &report.leg_reports {
+        if let Some(source_event_refs) = &leg_report.source_event_refs {
+            for event_id in source_event_refs {
+                refs.insert(event_id.as_str().to_owned());
+            }
+        }
+    }
+    for fill in &report.fills {
+        refs.insert(fill.source_event_id.as_str().to_owned());
+    }
+    if refs.is_empty() {
+        refs.insert(report.report_id.as_str().to_owned());
+    }
+    refs.into_iter().collect()
+}
+
+fn private_execution_incident_venues(plan: &ExecutionPlan) -> Vec<String> {
+    let mut venue_ids = BTreeSet::new();
+    for leg in &plan.legs {
+        if let Some(venue_id) = &leg.venue_id {
+            venue_ids.insert(venue_id.as_str().to_owned());
+        }
+    }
+    if venue_ids.is_empty() {
+        venue_ids.insert("venue:UNKNOWN".to_owned());
+    }
+    venue_ids.into_iter().collect()
+}
+
+fn private_execution_capital_at_risk(plan: &ExecutionPlan) -> &str {
+    plan.constraints
+        .max_notional_usd
+        .as_ref()
+        .map(|value| value.as_str())
+        .unwrap_or("0")
+}
+
+fn private_execution_incident_trigger(report: &ExecutionReport) -> &'static str {
+    match &report.status {
+        ExecutionReportStatus::UnknownState => "EXECUTION_UNKNOWN_STATE",
+        ExecutionReportStatus::PartiallySucceeded => "EXECUTION_PARTIAL_FILL",
+        ExecutionReportStatus::ManualInterventionRequired => "EXECUTION_MANUAL_REVIEW",
+        ExecutionReportStatus::Failed => "EXECUTION_FAILED",
+        _ => "EXECUTION_RECONCILIATION_REQUIRED",
+    }
+}
+
+fn private_execution_incident_severity(report: &ExecutionReport) -> &'static str {
+    if report
+        .failures
+        .iter()
+        .any(|failure| failure.severity == ExecutionFailureSeverity::RiskCritical)
+        || report.status == ExecutionReportStatus::UnknownState
+    {
+        "SEV1"
+    } else if report
+        .failures
+        .iter()
+        .any(|failure| failure.severity == ExecutionFailureSeverity::Warn)
+    {
+        "SEV2"
+    } else {
+        "SEV3"
+    }
+}
+
+fn private_execution_incident_detail(report: &ExecutionReport) -> String {
+    if let Some(failure) = report.failures.first() {
+        if let Some(detail) = &failure.detail {
+            return detail.clone();
+        }
+        return format!(
+            "Private execution report contains `{}` failure.",
+            failure.failure_type.as_str()
+        );
+    }
+    "Private execution report requires reconciliation before retry.".to_owned()
 }
 
 fn build_execution_report_contract(
@@ -3662,6 +4607,122 @@ mod tests {
         let ledger_entries = simulated_ledger_entries_from_execution_report(&plan, &result.report)
             .expect("unknown report without fills has no ledger entries");
         assert!(ledger_entries.is_empty());
+    }
+
+    #[test]
+    fn private_stream_fill_generates_succeeded_report_live_ledger_and_no_incident() {
+        let plan = pending_manual_plan().plan_preview;
+        let order_leg = &plan.legs[1];
+        let confirmation = PrivateOrderConfirmation::new(
+            order_leg.plan_leg_id.as_str(),
+            PrivateOrderConfirmationStatus::Filled,
+            PrivateOrderConfirmationSource::PrivateStream,
+            "event:binance:spot:execution-report:fill",
+        )
+        .with_venue_order_id("binance:spot:order:12345")
+        .with_client_order_id("client:spot:1")
+        .with_fill(
+            PrivateExecutionFill::new(
+                FillSide::Buy,
+                "43100.50",
+                "0.001",
+                "asset:USDC",
+                "0.01",
+                "event:binance:spot:execution-report:fill",
+            )
+            .with_timestamp("2026-01-01T00:00:05Z"),
+        );
+
+        let report = execution_report_from_private_confirmations(PrivateExecutionReportInput::new(
+            &plan,
+            "2026-01-01T00:00:06Z",
+            std::slice::from_ref(&confirmation),
+        ))
+        .expect("private confirmation report");
+
+        assert_eq!(report.status, ExecutionReportStatus::Succeeded);
+        assert_eq!(report.reconciliation_status, ReconciliationStatus::Matched);
+        assert_eq!(report.fills.len(), 1);
+        assert_eq!(
+            report.fills[0].venue_order_id.as_deref(),
+            Some("binance:spot:order:12345")
+        );
+        assert!(report.failures.is_empty());
+
+        let ledger_entries = private_ledger_entries_from_execution_report(&plan, &report)
+            .expect("private fills can generate live ledger input");
+        assert_eq!(ledger_entries.len(), 1);
+        assert_eq!(ledger_entries[0].namespace, LedgerNamespace::Live);
+        assert_eq!(
+            ledger_entries[0].execution_plan_id,
+            Some(report.plan_id.clone())
+        );
+
+        let incidents =
+            incidents_from_private_execution_report(&plan, &report, "2026-01-01T00:00:07Z")
+                .expect("incident generation");
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn private_acknowledgement_only_is_not_final_success() {
+        let plan = pending_manual_plan().plan_preview;
+        let order_leg = &plan.legs[1];
+        let confirmation = PrivateOrderConfirmation::new(
+            order_leg.plan_leg_id.as_str(),
+            PrivateOrderConfirmationStatus::Acknowledged,
+            PrivateOrderConfirmationSource::OrderQuery,
+            "event:binance:spot:query:new",
+        );
+
+        let report = execution_report_from_private_confirmations(PrivateExecutionReportInput::new(
+            &plan,
+            "2026-01-01T00:00:06Z",
+            std::slice::from_ref(&confirmation),
+        ))
+        .expect("ack-only report");
+
+        assert_eq!(
+            report.status,
+            ExecutionReportStatus::ManualInterventionRequired
+        );
+        assert_eq!(report.reconciliation_status, ReconciliationStatus::Pending);
+        assert!(report.fills.is_empty());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].failure_type,
+            FailureMode::ManualInterventionRequired
+        );
+
+        let ledger_entries = private_ledger_entries_from_execution_report(&plan, &report)
+            .expect("ack-only report has no private fills to ledger");
+        assert!(ledger_entries.is_empty());
+        let incidents =
+            incidents_from_private_execution_report(&plan, &report, "2026-01-01T00:00:07Z")
+                .expect("ack-only incident");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].trigger.as_str(), "EXECUTION_MANUAL_REVIEW");
+    }
+
+    #[test]
+    fn missing_private_confirmation_enters_unknown_state() {
+        let plan = pending_manual_plan().plan_preview;
+        let report = execution_report_from_private_confirmations(PrivateExecutionReportInput::new(
+            &plan,
+            "2026-01-01T00:00:06Z",
+            &[],
+        ))
+        .expect("missing confirmation report");
+
+        assert_eq!(report.status, ExecutionReportStatus::UnknownState);
+        assert_eq!(report.reconciliation_status, ReconciliationStatus::Unknown);
+        assert_eq!(report.leg_reports[1].status, LegReportStatus::Unknown);
+        assert_eq!(report.failures[0].failure_type, FailureMode::UnknownState);
+        let incidents =
+            incidents_from_private_execution_report(&plan, &report, "2026-01-01T00:00:07Z")
+                .expect("unknown incident");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].trigger.as_str(), "EXECUTION_UNKNOWN_STATE");
     }
 
     #[test]

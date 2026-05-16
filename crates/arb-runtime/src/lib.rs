@@ -1,8 +1,9 @@
 //! `arb-runtime` 端到端离线装配入口。
 //!
-//! 中文说明：运行时只负责把已有模块按固定 fixture 装配起来。策略规则、风控
-//! 规则、账本规则和执行状态机规则仍由对应 crate 提供；本 crate 不连接真实
-//! 交易 API，不下单、不撤单、不转账、不签名。
+//! 中文说明：默认构建只负责把已有模块按固定 fixture 装配起来。策略规则、风控
+//! 规则、账本规则和执行状态机规则仍由对应 crate 提供；默认 feature 不连接真实
+//! 交易 API，不下单、不撤单、不转账、不签名。只有显式启用 `live-exec` feature
+//! 并通过运行时熔断、审批、签名和确认门禁后，才暴露受控实盘分发入口。
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +29,8 @@ use arb_contracts::{
     LedgerEntryType as ContractLedgerEntryType, LedgerNamespace as ContractLedgerNamespace,
     NormalizedEvent, NormalizedEventType, PortfolioState, RiskDecision, VenueCapabilityDescriptor,
 };
+#[cfg(feature = "live-exec")]
+use arb_domain::OrderId;
 use arb_domain::{
     AccountId, Amount, AssetId, CandidateTransitionId, Decimal, EventId, ExecutionPlanId,
     InstrumentId, LedgerEntryId, Price, Quantity, StrategyId, UtcTimestamp, VenueId,
@@ -57,9 +60,11 @@ use arb_reconciliation::{
 };
 use arb_replay::{ReplayInput, TimeSource as ReplayTimeSource};
 use arb_risk::{RiskEvaluationInput, RiskEvaluator, StaticRiskEvaluator};
+#[cfg(feature = "live-exec")]
+use arb_strategies::SpotPerpBasisSignal;
 use arb_strategies::{
-    evaluate_spot_perp_basis_signal, sample_spot_strategy, spot_perp_basis_strategy,
-    SpotPerpBasisSignalInput,
+    evaluate_spot_perp_basis_signal, sample_spot_strategy, SpotPerpBasisSignalInput,
+    SpotPerpBasisStrategy, SpotPerpBasisStrategyConfig,
 };
 use arb_strategy_api::{
     CandidateTransitionOutput, FixedTimeSource as StrategyFixedTimeSource, ReadOnlySnapshot,
@@ -72,6 +77,29 @@ use arb_venue_data::{
     BinanceUsdmPremiumIndexAdapter, DataFreshness, HybridMarketDataInput, HybridMarketDataStatus,
     HybridMarketDataUpdate, MarketDataQuery, MarketDataReader, MarketDataTransport, MarketQuote,
     RestWssMarketDataCoordinator, WssQuoteUpdate,
+};
+
+#[cfg(feature = "live-exec")]
+use arb_signing::real::{
+    BinanceHmacSigningInput, BinanceRequestParam, RealSigningProvider, RealSigningProviderFromEnv,
+};
+#[cfg(feature = "live-exec")]
+use arb_signing::{SigningPolicy, SigningPolicyRef, SigningPurpose, SigningRequestId};
+#[cfg(feature = "live-exec")]
+use arb_venue_data::{
+    BalanceQuery, BalanceReader, BinancePrivateAccountAdapter, BinancePrivateAccountMarket,
+    VenueBalance,
+};
+#[cfg(feature = "live-exec")]
+use arb_venue_exec::{
+    build_execution_dispatch_plan, live, parse_binance_spot_execution_report_update,
+    parse_binance_usdm_order_trade_update, BinancePrivateOrderMarket, CancelOrder,
+    CancelOrderRequest, ConfirmOrderStatus, ConfirmOrderStatusRequest, DispatchKillSwitch,
+    ExecutionDispatchPlan, ExecutionDispatchPolicy, ExternalActionRef,
+    IdempotencyKey as ExecIdempotencyKey, MutableActionKind, MutableActionReceipt,
+    MutableActionStatus, MutableOrderType, OrderConfirmationSource, OrderConfirmationStatus,
+    OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate, PrivateOrderUpdate,
+    SubmitOrder, SubmitOrderRequest, VenueExecError,
 };
 
 const DEFAULT_FULL_PIPELINE_FIXTURE: &str = "fixtures/replay/full_pipeline_simulated";
@@ -103,10 +131,18 @@ const BASIS_QUOTE_ASSET_ID: &str = "asset:USDT";
 const BASIS_SETTLEMENT_ASSET_ID: &str = "asset:USDT";
 const BINANCE_BASIS_PIPELINE_DEFAULT_OUT: &str = "target/binance-basis-pipeline";
 const BINANCE_GUARDED_LIVE_PREVIEW_DEFAULT_OUT: &str = "target/binance-guarded-live-preview";
+const BINANCE_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str = "target/binance-guarded-live-auto-once";
+#[cfg(feature = "live-exec")]
+const BINANCE_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
+    "target/binance-basis-guarded-live-auto-once";
 const BINANCE_GUARDED_LIVE_ACCOUNT_REF: &str =
     "account:binance-isolated-personal-cex-subaccount-redacted";
 const BINANCE_GUARDED_LIVE_STRATEGY_ID: &str = "strategy:sample-spot-v1";
 const BINANCE_GUARDED_LIVE_TRANSITION_ID: &str = "trans:binance-btcusdt-guarded-live-preview-001";
+#[cfg(feature = "live-exec")]
+const BINANCE_BASIS_LIVE_STRATEGY_ID: &str = "strat:binance-spot-perp-basis";
+#[cfg(feature = "live-exec")]
+const BINANCE_BASIS_LIVE_TRANSITION_ID: &str = "trans:binance-basis-guarded-live-auto-001";
 const BINANCE_GUARDED_LIVE_NOTIONAL_USDT: &str = "10.00";
 const BINANCE_GUARDED_LIVE_DAILY_LOSS_LIMIT_USDT: &str = "20.00";
 const BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT: &str = "100.00";
@@ -236,6 +272,10 @@ module_error_from!(arb_replay::ReplayError, "arb-replay");
 module_error_from!(arb_risk::RiskError, "arb-risk");
 module_error_from!(arb_strategy_api::StrategyApiError, "arb-strategy-api");
 module_error_from!(arb_venue_data::VenueDataError, "arb-venue-data");
+#[cfg(feature = "live-exec")]
+module_error_from!(arb_signing::SigningError, "arb-signing");
+#[cfg(feature = "live-exec")]
+module_error_from!(arb_venue_exec::VenueExecError, "arb-venue-exec");
 
 /// 运行选项。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -628,6 +668,115 @@ pub struct BinancePreDispatchDryRunReport {
     pub approval_event_id: String,
     pub manual_gate_released: bool,
     pub dispatch_allowed: bool,
+    pub blocking_reasons: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance BTCUSDT 受控实盘分发选项。
+///
+/// 中文说明：该选项只由显式 CLI 确认构造。`acknowledge_live_orders` 必须为 true，
+/// 否则运行时不会读取凭证、签名或提交真实订单。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceGuardedLiveDispatchOptions {
+    pub preview_dir: PathBuf,
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub acknowledge_live_orders: bool,
+}
+
+/// Binance BTCUSDT 受控实盘分发结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceGuardedLiveDispatchReport {
+    pub plan_id: String,
+    pub plan_hash: String,
+    pub approval_event_id: String,
+    pub dispatch_allowed: bool,
+    pub submitted_receipt_count: usize,
+    pub private_confirmation_count: usize,
+    pub pre_account_balance_event_id: Option<String>,
+    pub post_account_balance_event_id: Option<String>,
+    pub execution_report_status: Option<String>,
+    pub blocking_reasons: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance BTCUSDT 单周期自动链路选项。
+///
+/// 中文说明：该入口每次从最新公开行情重新生成计划和审批事实。默认只 dry run；
+/// 只有 `execute_live` 和 `acknowledge_auto_live_orders` 同时为 true 才会进入真实下单。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceGuardedLiveAutoOnceOptions {
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub max_ask: Option<String>,
+    pub execute_live: bool,
+    pub acknowledge_auto_live_orders: bool,
+}
+
+/// Binance BTCUSDT 单周期自动链路结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceGuardedLiveAutoOnceReport {
+    pub symbol: String,
+    pub strategy_id: String,
+    pub source_event_id: Option<String>,
+    pub best_ask: Option<String>,
+    pub max_ask: Option<String>,
+    pub signal_allowed: bool,
+    pub plan_hash: Option<String>,
+    pub approval_event_id: Option<String>,
+    pub manual_gate_released: bool,
+    pub dispatch_attempted: bool,
+    pub dispatch_allowed: bool,
+    pub submitted_receipt_count: usize,
+    pub private_confirmation_count: usize,
+    pub execution_report_status: Option<String>,
+    pub blocking_reasons: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance spot-perp basis 双腿单周期自动链路选项。
+///
+/// 中文说明：这是套利链路入口，必须同时生成 spot buy 和 USD-M perp short 两腿。
+/// 默认只 dry run；真实下单必须显式设置 `execute_live` 和确认标志。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisGuardedLiveAutoOnceOptions {
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub min_net_bps: i128,
+    pub max_spot_ask: Option<String>,
+    pub min_perp_bid: Option<String>,
+    pub spot_wss_monitor_url: Option<String>,
+    pub perp_wss_monitor_url: Option<String>,
+    pub private_order_events_dir: Option<PathBuf>,
+    pub execute_live: bool,
+    pub acknowledge_basis_live_orders: bool,
+}
+
+/// Binance spot-perp basis 双腿单周期自动链路结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisGuardedLiveAutoOnceReport {
+    pub symbol: String,
+    pub strategy_id: String,
+    pub spot_event_id: Option<String>,
+    pub perp_event_id: Option<String>,
+    pub premium_event_id: Option<String>,
+    pub spot_ask: Option<String>,
+    pub perp_bid: Option<String>,
+    pub net_bps: Option<i128>,
+    pub signal_allowed: bool,
+    pub plan_hash: Option<String>,
+    pub approval_event_id: Option<String>,
+    pub manual_gate_released: bool,
+    pub dispatch_attempted: bool,
+    pub dispatch_allowed: bool,
+    pub planned_order_count: usize,
+    pub submitted_receipt_count: usize,
+    pub private_confirmation_count: usize,
+    pub protection_attempted: bool,
+    pub protection_actions: Vec<String>,
+    pub protection_receipt_count: usize,
+    pub residual_risk: Option<String>,
+    pub execution_report_status: Option<String>,
     pub blocking_reasons: Vec<String>,
     pub output_dir: Option<PathBuf>,
 }
@@ -1209,10 +1358,17 @@ fn run_startup_checks(config: &arb_config::ArbConfig) -> Vec<RuntimeCheck> {
 
 fn check_real_signing_disabled(config: &arb_config::ArbConfig) -> RuntimeCheck {
     if config.signing().real_signing_enabled() {
-        RuntimeCheck::fail(
-            "real-signing",
-            "阶段 9 运行时禁止真实签名；real_signing_enabled 必须为 false",
-        )
+        if cfg!(feature = "live-exec") {
+            RuntimeCheck::pass(
+                "real-signing",
+                "真实签名已显式开启，live-exec 构建允许继续实盘预检",
+            )
+        } else {
+            RuntimeCheck::fail(
+                "real-signing",
+                "默认运行时禁止真实签名；real_signing_enabled 必须为 false，或使用 live-exec 构建",
+            )
+        }
     } else {
         RuntimeCheck::pass("real-signing", "真实签名关闭，使用空签名策略引用")
     }
@@ -1232,10 +1388,20 @@ fn check_execution_permission(config: &arb_config::ArbConfig) -> RuntimeCheck {
             "execution-permission",
             format!("执行模式 {mode} 已被熔断阻止；可变执行任务保持跳过"),
         )
-    } else {
+    } else if !cfg!(feature = "live-exec") {
         RuntimeCheck::fail(
             "execution-permission",
-            format!("执行模式 {mode} 会请求可变账户权限，但阶段 9 运行时不能启动可变执行"),
+            format!("执行模式 {mode} 会请求可变账户权限，但阶段 9 运行时不能启动可变执行；默认构建必须保持关闭，或使用 live-exec 构建"),
+        )
+    } else if !config.signing().real_signing_enabled() {
+        RuntimeCheck::fail(
+            "execution-permission",
+            format!("执行模式 {mode} 会请求可变账户权限，但 real_signing_enabled 未开启"),
+        )
+    } else {
+        RuntimeCheck::pass(
+            "execution-permission",
+            format!("执行模式 {mode} 已通过 live-exec 可变执行启动预检"),
         )
     }
 }
@@ -1314,10 +1480,15 @@ fn append_mutable_execution_task(config: &arb_config::ArbConfig, tasks: &mut Run
             TASK_MUTABLE_EXECUTION,
             format!("执行模式 {mode} 不允许真实账户变化；未启动可变执行适配器"),
         );
+    } else if cfg!(feature = "live-exec") {
+        tasks.push_running(
+            TASK_MUTABLE_EXECUTION,
+            "live-exec 构建已装配可变执行任务；具体下单仍需显式分发命令、审批和确认门禁",
+        );
     } else {
         tasks.push_failed(
             TASK_MUTABLE_EXECUTION,
-            "启动检查应在可变执行被允许前拒绝阶段 9 运行时",
+            "启动检查应在默认构建允许可变执行前拒绝运行时",
         );
     }
 }
@@ -1613,6 +1784,7 @@ pub fn run_binance_basis_scan(
         premium_index_ref: &premium_index_url,
     };
     let events = ingest_binance_basis_public_json(raw_inputs, ingested_at)?;
+    let spec = BasisPipelineSpec::binance_btcusdt()?;
 
     let _temp_dir = RuntimeTempDir::new()?;
     let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
@@ -1625,15 +1797,15 @@ pub fn run_binance_basis_scan(
         .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
         .map(|event| event.event_id.as_str().to_owned())
         .collect::<Vec<_>>();
-    let portfolio_state = build_binance_basis_portfolio_state(&source_event_refs, ingested_at)?;
+    let portfolio_state =
+        build_public_basis_portfolio_state(&spec, &source_event_refs, ingested_at)?;
     ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
-    let venue_capabilities = load_binance_basis_capabilities()?;
     let evaluation = run_spot_perp_basis_strategy(
         replay.config(),
         &stored_events,
         &portfolio_state,
-        &venue_capabilities,
         &ingested_at.to_string(),
+        &spec,
     )?;
 
     let candidate_transitions_jsonl = evaluation
@@ -1930,6 +2102,1976 @@ pub fn run_binance_pre_dispatch_dry_run(
         blocking_reasons,
         output_dir,
     })
+}
+
+/// 运行 Binance BTCUSDT GuardedLive 受控实盘分发。
+///
+/// 中文说明：默认构建始终拒绝。`live-exec` 构建会先检查人工审批、熔断、真实签名、
+/// 私有账户余额和分发白名单；真实 REST 下单后仍必须通过私有查单确认生成执行报告。
+pub fn run_binance_guarded_live_dispatch(
+    options: BinanceGuardedLiveDispatchOptions,
+) -> RuntimeResult<BinanceGuardedLiveDispatchReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_binance_guarded_live_dispatch_live(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "当前 arb-runtime 未使用 live-exec feature 构建，拒绝真实 Binance 下单"
+                .to_owned(),
+        })
+    }
+}
+
+/// 运行一次 Binance BTCUSDT 自动链路。
+///
+/// 中文说明：该函数会读取一次最新公开 spot bookTicker，生成新的策略候选和计划，
+/// 自动生成同一 plan_hash 的受控审批事实，然后进入 dry-run 或显式实盘分发。
+pub fn run_binance_guarded_live_auto_once(
+    options: BinanceGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BinanceGuardedLiveAutoOnceReport> {
+    let source_url = binance_spot_book_ticker_url(BASIS_SYMBOL);
+    let raw_spot_book = fetch_public_json_with_curl(&source_url)?;
+    let ingested_at = current_utc_timestamp()?;
+    run_binance_guarded_live_auto_once_from_spot_json(
+        &raw_spot_book,
+        &source_url,
+        ingested_at,
+        options,
+    )
+}
+
+fn run_binance_guarded_live_auto_once_from_spot_json(
+    raw_spot_book: &str,
+    raw_response_ref: &str,
+    ingested_at: UtcTimestamp,
+    options: BinanceGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BinanceGuardedLiveAutoOnceReport> {
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(BINANCE_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+    let output_dir = Some(output_root.clone());
+    let market_dir = output_root.join("market");
+    let preview_dir = output_root.join("preview");
+    let dry_run_dir = output_root.join("dry-run");
+    let live_dispatch_dir = output_root.join("live-dispatch");
+
+    let quote = write_binance_guarded_live_auto_market_artifacts(
+        raw_spot_book,
+        raw_response_ref,
+        ingested_at,
+        &market_dir,
+    )?;
+    let mut blocking_reasons = Vec::new();
+    if let Some(max_ask) = &options.max_ask {
+        if Decimal::from_str(&quote.best_ask)? > Decimal::from_str(max_ask)? {
+            blocking_reasons.push(format!(
+                "strategy signal blocked: best_ask={} is above max_ask={max_ask}",
+                quote.best_ask
+            ));
+        }
+    } else if options.execute_live {
+        blocking_reasons.push(
+            "live automatic execution requires --max-ask so the strategy has an explicit price guard"
+                .to_owned(),
+        );
+    }
+
+    if !blocking_reasons.is_empty() {
+        let report = BinanceGuardedLiveAutoOnceReport {
+            symbol: BASIS_SYMBOL.to_owned(),
+            strategy_id: BINANCE_GUARDED_LIVE_STRATEGY_ID.to_owned(),
+            source_event_id: Some(quote.event_id),
+            best_ask: Some(quote.best_ask),
+            max_ask: options.max_ask,
+            signal_allowed: false,
+            plan_hash: None,
+            approval_event_id: None,
+            manual_gate_released: false,
+            dispatch_attempted: false,
+            dispatch_allowed: false,
+            submitted_receipt_count: 0,
+            private_confirmation_count: 0,
+            execution_report_status: None,
+            blocking_reasons,
+            output_dir,
+        };
+        write_binance_guarded_live_auto_once_artifacts(&output_root, &report)?;
+        return Ok(report);
+    }
+
+    let preview = run_binance_guarded_live_preview(&market_dir, Some(preview_dir.clone()), None)?;
+    let approval_event_id = format!(
+        "event:approval:auto-live:binance-btcusdt:{}",
+        ingested_at.unix_seconds()
+    );
+    let decided_at = ingested_at.to_string();
+    let expires_at =
+        UtcTimestamp::from_unix_parts(ingested_at.unix_seconds() + 300, 0)?.to_string();
+    let approved_preview = run_binance_guarded_live_preview(
+        &market_dir,
+        Some(preview_dir.clone()),
+        Some(BinanceManualApprovalDecisionRequest {
+            decision: ManualApprovalDecision::Approve,
+            expected_plan_hash: preview.plan_hash.clone(),
+            approval_event_id: approval_event_id.clone(),
+            reviewer_id: "system:guarded-live-auto-strategy".to_owned(),
+            decided_at,
+            expires_at,
+            reason: "Automatic guarded-live strategy signal approved for the same fresh plan hash."
+                .to_owned(),
+        }),
+    )?;
+    let release = run_binance_manual_gate_release_preview(&preview_dir, Some(preview_dir.clone()))?;
+
+    let (
+        dispatch_attempted,
+        dispatch_allowed,
+        submitted_receipt_count,
+        private_confirmation_count,
+        execution_report_status,
+        mut dispatch_reasons,
+    ) = if options.execute_live {
+        if !options.acknowledge_auto_live_orders {
+            return Err(RuntimeError::UnsafeConfig {
+                message: "缺少 --i-understand-auto-live-orders，拒绝进入自动真实下单链路"
+                    .to_owned(),
+            });
+        }
+        let dispatch = run_binance_guarded_live_dispatch(BinanceGuardedLiveDispatchOptions {
+            preview_dir: preview_dir.clone(),
+            config_path: options.config_path.clone(),
+            output_dir: Some(live_dispatch_dir),
+            acknowledge_live_orders: true,
+        })?;
+        (
+            true,
+            dispatch.dispatch_allowed,
+            dispatch.submitted_receipt_count,
+            dispatch.private_confirmation_count,
+            dispatch.execution_report_status,
+            dispatch.blocking_reasons,
+        )
+    } else {
+        let dry_run = run_binance_pre_dispatch_dry_run(
+            &preview_dir,
+            &options.config_path,
+            Some(dry_run_dir),
+        )?;
+        let mut reasons = dry_run.blocking_reasons;
+        reasons.push(
+                "automatic chain ran in dry-run mode; pass --execute-live and --i-understand-auto-live-orders to submit a real order"
+                    .to_owned(),
+            );
+        (false, false, 0, 0, None, reasons)
+    };
+
+    let mut report_reasons = Vec::new();
+    report_reasons.append(&mut dispatch_reasons);
+    let report = BinanceGuardedLiveAutoOnceReport {
+        symbol: BASIS_SYMBOL.to_owned(),
+        strategy_id: BINANCE_GUARDED_LIVE_STRATEGY_ID.to_owned(),
+        source_event_id: Some(quote.event_id),
+        best_ask: Some(quote.best_ask),
+        max_ask: options.max_ask,
+        signal_allowed: true,
+        plan_hash: Some(approved_preview.plan_hash),
+        approval_event_id: Some(release.approval_event_id),
+        manual_gate_released: release.released_manual_gate,
+        dispatch_attempted,
+        dispatch_allowed,
+        submitted_receipt_count,
+        private_confirmation_count,
+        execution_report_status,
+        blocking_reasons: report_reasons,
+        output_dir,
+    };
+    write_binance_guarded_live_auto_once_artifacts(&output_root, &report)?;
+    Ok(report)
+}
+
+/// 运行一次 Binance spot-perp basis 双腿自动套利链路。
+pub fn run_binance_basis_guarded_live_auto_once(
+    options: BinanceBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_binance_basis_guarded_live_auto_once_live(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message:
+                "当前 arb-runtime 未使用 live-exec feature 构建，拒绝 Binance basis 实盘自动链路"
+                    .to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn run_binance_basis_guarded_live_auto_once_live(
+    options: BinanceBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceReport> {
+    let spot_url = binance_spot_book_ticker_url(BASIS_SYMBOL);
+    let perp_url = binance_usdm_book_ticker_url(BASIS_SYMBOL);
+    let premium_url = binance_usdm_premium_index_url(BASIS_SYMBOL);
+    let wss_monitor_urls = match (
+        options.spot_wss_monitor_url.as_deref(),
+        options.perp_wss_monitor_url.as_deref(),
+    ) {
+        (Some(spot_monitor), Some(perp_monitor)) => Some((spot_monitor, perp_monitor)),
+        (None, None) if !options.execute_live => None,
+        (None, None) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "真实 basis 自动下单必须提供 --spot-wss-monitor-url 和 --perp-wss-monitor-url"
+                        .to_owned(),
+            });
+        }
+        _ => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "basis 自动链路必须同时提供 --spot-wss-monitor-url 和 --perp-wss-monitor-url"
+                        .to_owned(),
+            });
+        }
+    };
+    let (raw_spot, spot_ref, raw_perp, perp_ref) =
+        if let Some((spot_monitor, perp_monitor)) = wss_monitor_urls {
+            let spot_snapshot = fetch_binance_basis_wss_monitor_book_ticker_json(
+                spot_monitor,
+                BinancePublicMarket::Spot,
+                BASIS_SPOT_VENUE_ID,
+                BASIS_SPOT_INSTRUMENT_ID,
+            )?;
+            let perp_snapshot = fetch_binance_basis_wss_monitor_book_ticker_json(
+                perp_monitor,
+                BinancePublicMarket::UsdmPerpetual,
+                BASIS_PERP_VENUE_ID,
+                BASIS_PERP_INSTRUMENT_ID,
+            )?;
+            (
+                spot_snapshot.raw_book_ticker_json,
+                spot_snapshot.source_ref,
+                perp_snapshot.raw_book_ticker_json,
+                perp_snapshot.source_ref,
+            )
+        } else {
+            (
+                fetch_public_json_with_curl(&spot_url)?,
+                spot_url.clone(),
+                fetch_public_json_with_curl(&perp_url)?,
+                perp_url.clone(),
+            )
+        };
+    let raw_premium = fetch_public_json_with_curl(&premium_url)?;
+    let ingested_at = current_utc_timestamp()?;
+    run_binance_basis_guarded_live_auto_once_from_json(
+        &raw_spot,
+        &spot_ref,
+        &raw_perp,
+        &perp_ref,
+        &raw_premium,
+        &premium_url,
+        ingested_at,
+        options,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BinanceBasisWssMonitorBookTicker {
+    raw_book_ticker_json: String,
+    source_ref: String,
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_binance_basis_wss_monitor_book_ticker_json(
+    monitor_url: &str,
+    market: BinancePublicMarket,
+    expected_venue_id: &str,
+    expected_instrument_id: &str,
+) -> RuntimeResult<BinanceBasisWssMonitorBookTicker> {
+    let endpoint = normalize_binance_wss_monitor_status_url(monitor_url);
+    let raw_monitor_snapshot = fetch_public_json_with_curl(&endpoint)?;
+    let fetched_at = current_utc_timestamp()?;
+    let quote = parse_binance_wss_monitor_quote_for_basis(
+        &raw_monitor_snapshot,
+        &endpoint,
+        BASIS_SYMBOL,
+        market,
+        expected_venue_id,
+        expected_instrument_id,
+        fetched_at,
+    )?;
+    let source_event_id = quote
+        .source_event_id
+        .as_deref()
+        .unwrap_or("missing-source-event-id");
+    Ok(BinanceBasisWssMonitorBookTicker {
+        raw_book_ticker_json: binance_wss_monitor_quote_to_book_ticker_json(&quote)?,
+        source_ref: format!("wss-monitor:{endpoint}#{source_event_id}"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn normalize_binance_wss_monitor_status_url(input: &str) -> String {
+    let mut url = input.trim().trim_end_matches('/').to_owned();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("http://{url}");
+    }
+    if url.ends_with("/api/binance-wss-book-ticker") {
+        format!("{url}/status")
+    } else if url.contains("/api/binance-wss-book-ticker/") || url.ends_with("/health") {
+        url
+    } else {
+        format!("{url}/api/binance-wss-book-ticker/status")
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[allow(clippy::too_many_arguments)]
+fn parse_binance_wss_monitor_quote_for_basis(
+    raw_json: &str,
+    monitor_ref: &str,
+    symbol: &str,
+    expected_market: BinancePublicMarket,
+    expected_venue_id: &str,
+    expected_instrument_id: &str,
+    fetched_at: UtcTimestamp,
+) -> RuntimeResult<BinanceWssBookTickerQuoteSnapshot> {
+    let fields = parse_json_object_value_slices(raw_json)?;
+    let status = required_json_value_string(&fields, "status", "Binance WSS monitor")?;
+    if status != "streaming" {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` status is `{status}`, not streaming"
+            ),
+        });
+    }
+    if optional_json_bool(&fields, "fail_closed", "Binance WSS monitor")?.unwrap_or(true) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` is fail-closed or lacks fail_closed state"
+            ),
+        });
+    }
+    if let Some(error) = optional_json_value_string(&fields, "last_error", "Binance WSS monitor")? {
+        if !error.trim().is_empty() {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!(
+                    "Binance WSS monitor `{monitor_ref}` reports last_error `{error}`"
+                ),
+            });
+        }
+    }
+    if let Some(market) = optional_json_value_string(&fields, "market", "Binance WSS monitor")? {
+        if market != expected_market.as_str() {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!(
+                    "Binance WSS monitor `{monitor_ref}` market `{market}` does not match expected `{}`",
+                    expected_market.as_str()
+                ),
+            });
+        }
+    }
+    if let Some(wss_updates) =
+        optional_json_value_u64(&fields, "wss_update_count", "Binance WSS monitor")?
+    {
+        if wss_updates == 0 {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("Binance WSS monitor `{monitor_ref}` has no WSS updates yet"),
+            });
+        }
+    }
+
+    let quote = find_binance_wss_monitor_quote(&fields, symbol, monitor_ref)?;
+    ensure_binance_wss_monitor_quote_usable(
+        &quote,
+        monitor_ref,
+        symbol,
+        expected_venue_id,
+        expected_instrument_id,
+        fetched_at,
+    )?;
+    Ok(quote)
+}
+
+#[cfg(feature = "live-exec")]
+fn optional_json_value_u64(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<Option<u64>> {
+    let Some(value) = optional_json_value_string(fields, field, source)? else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("{source} field `{field}` is not an unsigned integer: {error}"),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn find_binance_wss_monitor_quote(
+    fields: &BTreeMap<String, &str>,
+    symbol: &str,
+    monitor_ref: &str,
+) -> RuntimeResult<BinanceWssBookTickerQuoteSnapshot> {
+    if let Some(rows_value) = fields.get("rows") {
+        for row in json_array_value_slices(rows_value)? {
+            let quote = parse_binance_wss_monitor_quote_snapshot(row)?;
+            if quote.symbol == symbol {
+                return Ok(quote);
+            }
+        }
+    }
+    if let Some(value) = fields.get("latest_quote") {
+        if value.trim() != "null" {
+            let quote = parse_binance_wss_monitor_quote_snapshot(value)?;
+            if quote.symbol == symbol {
+                return Ok(quote);
+            }
+        }
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("Binance WSS monitor `{monitor_ref}` lacks quote row for `{symbol}`"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_binance_wss_monitor_quote_snapshot(
+    value: &str,
+) -> RuntimeResult<BinanceWssBookTickerQuoteSnapshot> {
+    let fields = parse_json_object_value_slices(value)?;
+    Ok(BinanceWssBookTickerQuoteSnapshot {
+        symbol: required_json_value_string(&fields, "symbol", "Binance WSS monitor quote")?,
+        venue_id: required_json_value_string(&fields, "venue_id", "Binance WSS monitor quote")?,
+        instrument_id: required_json_value_string(
+            &fields,
+            "instrument_id",
+            "Binance WSS monitor quote",
+        )?,
+        best_bid: optional_json_value_string(&fields, "best_bid", "Binance WSS monitor quote")?,
+        best_ask: optional_json_value_string(&fields, "best_ask", "Binance WSS monitor quote")?,
+        bid_size: optional_json_value_string(&fields, "bid_size", "Binance WSS monitor quote")?,
+        ask_size: optional_json_value_string(&fields, "ask_size", "Binance WSS monitor quote")?,
+        source_sequence: optional_json_value_string(
+            &fields,
+            "source_sequence",
+            "Binance WSS monitor quote",
+        )?,
+        source_event_id: optional_json_value_string(
+            &fields,
+            "source_event_id",
+            "Binance WSS monitor quote",
+        )?,
+        observed_at: required_json_value_string(
+            &fields,
+            "observed_at",
+            "Binance WSS monitor quote",
+        )?,
+        ingested_at: required_json_value_string(
+            &fields,
+            "ingested_at",
+            "Binance WSS monitor quote",
+        )?,
+        freshness_status: required_json_value_string(
+            &fields,
+            "freshness_status",
+            "Binance WSS monitor quote",
+        )?,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn ensure_binance_wss_monitor_quote_usable(
+    quote: &BinanceWssBookTickerQuoteSnapshot,
+    monitor_ref: &str,
+    symbol: &str,
+    expected_venue_id: &str,
+    expected_instrument_id: &str,
+    fetched_at: UtcTimestamp,
+) -> RuntimeResult<()> {
+    if quote.symbol != symbol {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` quote symbol `{}` does not match `{symbol}`",
+                quote.symbol
+            ),
+        });
+    }
+    if quote.venue_id != expected_venue_id || quote.instrument_id != expected_instrument_id {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` quote identity `{}` `{}` does not match `{expected_venue_id}` `{expected_instrument_id}`",
+                quote.venue_id, quote.instrument_id
+            ),
+        });
+    }
+    if quote.freshness_status != "Fresh" {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` quote freshness is `{}`",
+                quote.freshness_status
+            ),
+        });
+    }
+    let source_sequence = quote
+        .source_sequence
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("Binance WSS monitor `{monitor_ref}` quote lacks source_sequence"),
+        })?;
+    source_sequence
+        .parse::<u64>()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` source_sequence `{source_sequence}` is not numeric: {error}"
+            ),
+        })?;
+    let source_event_id = quote
+        .source_event_id
+        .as_deref()
+        .filter(|value| value.contains(":wss-book-ticker:"))
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` latest `{symbol}` quote is not from WSS bookTicker"
+            ),
+        })?;
+    if !source_event_id.contains(symbol) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` source event `{source_event_id}` does not include `{symbol}`"
+            ),
+        });
+    }
+    let observed_at = UtcTimestamp::from_str(&quote.observed_at)?;
+    let ingested_at = UtcTimestamp::from_str(&quote.ingested_at)?;
+    ensure_timestamp_within_max_age(observed_at, fetched_at, monitor_ref, "observed_at")?;
+    ensure_timestamp_within_max_age(ingested_at, fetched_at, monitor_ref, "ingested_at")?;
+    let _ = Price::from_str(required_quote_field(
+        &quote.best_bid,
+        monitor_ref,
+        "best_bid",
+    )?)?;
+    let _ = Price::from_str(required_quote_field(
+        &quote.best_ask,
+        monitor_ref,
+        "best_ask",
+    )?)?;
+    let _ = Quantity::from_str(required_quote_field(
+        &quote.bid_size,
+        monitor_ref,
+        "bid_size",
+    )?)?;
+    let _ = Quantity::from_str(required_quote_field(
+        &quote.ask_size,
+        monitor_ref,
+        "ask_size",
+    )?)?;
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn required_quote_field<'a>(
+    value: &'a Option<String>,
+    monitor_ref: &str,
+    field: &str,
+) -> RuntimeResult<&'a str> {
+    value
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("Binance WSS monitor `{monitor_ref}` quote lacks `{field}`"),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn ensure_timestamp_within_max_age(
+    observed: UtcTimestamp,
+    fetched_at: UtcTimestamp,
+    monitor_ref: &str,
+    field: &str,
+) -> RuntimeResult<()> {
+    let observed_ms = runtime_timestamp_millis(observed)?;
+    let fetched_ms = runtime_timestamp_millis(fetched_at)?;
+    if observed_ms > fetched_ms + 1_000 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` quote `{field}` is in the future"
+            ),
+        });
+    }
+    let age_ms = fetched_ms.saturating_sub(observed_ms);
+    if age_ms > i128::from(MARKET_DATA_MAX_AGE_MS) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance WSS monitor `{monitor_ref}` quote `{field}` age {age_ms}ms exceeds {MARKET_DATA_MAX_AGE_MS}ms"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn runtime_timestamp_millis(timestamp: UtcTimestamp) -> RuntimeResult<i128> {
+    let seconds = i128::from(timestamp.unix_seconds())
+        .checked_mul(1_000)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "timestamp seconds overflowed while computing milliseconds".to_owned(),
+        })?;
+    Ok(seconds + i128::from(timestamp.nanoseconds() / 1_000_000))
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_wss_monitor_quote_to_book_ticker_json(
+    quote: &BinanceWssBookTickerQuoteSnapshot,
+) -> RuntimeResult<String> {
+    let observed_at = UtcTimestamp::from_str(&quote.observed_at)?;
+    Ok(format!(
+        "{{\"askPrice\":{},\"askQty\":{},\"bidPrice\":{},\"bidQty\":{},\"symbol\":{},\"time\":{}}}",
+        json_string(required_quote_field(
+            &quote.best_ask,
+            "Binance WSS monitor quote",
+            "best_ask"
+        )?),
+        json_string(required_quote_field(
+            &quote.ask_size,
+            "Binance WSS monitor quote",
+            "ask_size"
+        )?),
+        json_string(required_quote_field(
+            &quote.best_bid,
+            "Binance WSS monitor quote",
+            "best_bid"
+        )?),
+        json_string(required_quote_field(
+            &quote.bid_size,
+            "Binance WSS monitor quote",
+            "bid_size"
+        )?),
+        json_string(&quote.symbol),
+        runtime_timestamp_millis(observed_at)?
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+#[allow(clippy::too_many_arguments)]
+fn run_binance_basis_guarded_live_auto_once_from_json(
+    raw_spot: &str,
+    spot_ref: &str,
+    raw_perp: &str,
+    perp_ref: &str,
+    raw_premium: &str,
+    premium_ref: &str,
+    ingested_at: UtcTimestamp,
+    options: BinanceBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceReport> {
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(BINANCE_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+    let market_dir = output_root.join("market");
+    let preview_dir = output_root.join("preview");
+    let live_dir = output_root.join("live-dispatch");
+    let output_dir = Some(output_root.clone());
+    let context = write_binance_basis_guarded_live_auto_market_artifacts(
+        BinanceBasisRawInputs {
+            symbol: BASIS_SYMBOL,
+            raw_spot_book: raw_spot,
+            spot_book_ref: spot_ref,
+            raw_perp_book: raw_perp,
+            perp_book_ref: perp_ref,
+            raw_premium_index: raw_premium,
+            premium_index_ref: premium_ref,
+        },
+        ingested_at,
+        options.min_net_bps,
+        &market_dir,
+    )?;
+    let mut blocking_reasons = Vec::new();
+    if !context.signal.is_candidate {
+        blocking_reasons.push(
+            context
+                .signal
+                .reason
+                .clone()
+                .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
+        );
+    }
+    if let Some(max_spot_ask) = &options.max_spot_ask {
+        if Decimal::from_str(&context.spot_ask)? > Decimal::from_str(max_spot_ask)? {
+            blocking_reasons.push(format!(
+                "spot leg blocked: spot_ask={} is above max_spot_ask={max_spot_ask}",
+                context.spot_ask
+            ));
+        }
+    } else if options.execute_live {
+        blocking_reasons.push("live basis execution requires --max-spot-ask".to_owned());
+    }
+    if let Some(min_perp_bid) = &options.min_perp_bid {
+        if Decimal::from_str(&context.perp_bid)? < Decimal::from_str(min_perp_bid)? {
+            blocking_reasons.push(format!(
+                "perp leg blocked: perp_bid={} is below min_perp_bid={min_perp_bid}",
+                context.perp_bid
+            ));
+        }
+    } else if options.execute_live {
+        blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
+    }
+    if !blocking_reasons.is_empty() {
+        let report = BinanceBasisGuardedLiveAutoOnceReport {
+            symbol: BASIS_SYMBOL.to_owned(),
+            strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
+            spot_event_id: Some(context.spot_event_id),
+            perp_event_id: Some(context.perp_event_id),
+            premium_event_id: Some(context.premium_event_id),
+            spot_ask: Some(context.spot_ask),
+            perp_bid: Some(context.perp_bid),
+            net_bps: Some(context.signal.net_bps),
+            signal_allowed: false,
+            plan_hash: None,
+            approval_event_id: None,
+            manual_gate_released: false,
+            dispatch_attempted: false,
+            dispatch_allowed: false,
+            planned_order_count: 0,
+            submitted_receipt_count: 0,
+            private_confirmation_count: 0,
+            protection_attempted: false,
+            protection_actions: Vec::new(),
+            protection_receipt_count: 0,
+            residual_risk: None,
+            execution_report_status: None,
+            blocking_reasons,
+            output_dir,
+        };
+        write_binance_basis_guarded_live_auto_once_artifacts(
+            &output_root,
+            &report,
+            &[],
+            &[],
+            None,
+        )?;
+        return Ok(report);
+    }
+
+    let generated_at = ingested_at.to_string();
+    let candidate = binance_basis_guarded_live_candidate(
+        &context,
+        &generated_at,
+        &ingested_at.unix_seconds().to_string(),
+    )?;
+    let risk_decision = binance_basis_guarded_live_manual_risk_decision(
+        &context,
+        &generated_at,
+        options.min_net_bps,
+    )?;
+    let pending = match build_execution_plan_preview(ExecutionPlanBuildInput::new(
+        &risk_decision,
+        &candidate,
+        ContractExecutionMode::GuardedLive,
+        &generated_at,
+    ))? {
+        PlanBuildOutcome::PendingManualApproval(pending) => pending,
+        PlanBuildOutcome::Schedulable(_) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message: "basis guarded live auto unexpectedly produced dispatchable plan before approval"
+                    .to_owned(),
+            });
+        }
+    };
+    fs::create_dir_all(&preview_dir).map_err(|error| RuntimeError::Io {
+        path: preview_dir.clone(),
+        message: error.to_string(),
+    })?;
+    write_binance_guarded_live_preview_artifacts(
+        &preview_dir,
+        BinanceGuardedLivePreviewArtifacts {
+            candidate: &candidate,
+            risk_decision: &risk_decision,
+            plan_preview: &pending.plan_preview,
+            plan_hash: &execution_plan_hash(&pending.plan_preview),
+            manual_material_md: "",
+            approval_records_jsonl: "",
+            confirmation_template_md: "",
+        },
+    )?;
+    let plan_hash = execution_plan_hash(&pending.plan_preview);
+    let approved_record = review_manual_approval(
+        ManualApprovalReviewInput::new(
+            &pending,
+            &format!(
+                "event:approval:auto-live:binance-basis:{}",
+                ingested_at.unix_seconds()
+            ),
+            "system:basis-guarded-live-auto-strategy",
+            &generated_at,
+            &UtcTimestamp::from_unix_parts(ingested_at.unix_seconds() + 300, 0)?.to_string(),
+            ManualApprovalDecision::Approve,
+        )
+        .with_reason("Automatic basis strategy approved both spot and perp legs for the same fresh plan hash."),
+    )?;
+    write_utf8(
+        preview_dir.join("approval_records.jsonl"),
+        &manual_approval_records_jsonl(std::slice::from_ref(&approved_record)),
+    )?;
+    let release = release_manual_approval_gate(&pending, &approved_record)?;
+    write_binance_manual_gate_release_artifacts(&preview_dir, &release, false, &generated_at)?;
+
+    let config = arb_config::ArbConfig::from_path(&options.config_path)?;
+    let service = start_runtime_with_config(&config)?;
+    let health = service.health();
+    let mut dispatch_blocking = live_dispatch_blocking_reasons(
+        &config,
+        &pending.plan_preview,
+        &release,
+        &plan_hash,
+        &health,
+    );
+    let dispatch_plan = if dispatch_blocking.is_empty() {
+        let dispatch_policy = live_dispatch_policy_from_config(&config)?;
+        let dispatch_plan =
+            build_execution_dispatch_plan(&pending.plan_preview, &dispatch_policy, ingested_at)?;
+        if dispatch_plan.requests.len() != 2 {
+            dispatch_blocking.push(format!(
+                "basis arbitrage requires exactly two order legs, got {}",
+                dispatch_plan.requests.len()
+            ));
+        }
+        Some(dispatch_plan)
+    } else {
+        None
+    };
+
+    let mut receipts = Vec::new();
+    let mut confirmations = Vec::new();
+    let mut execution_report = None;
+    let mut dispatch_attempted = false;
+    let mut primary_submit_receipt_count = 0usize;
+    let mut protection = BinanceBasisLiveProtection::default();
+    if options.execute_live && dispatch_blocking.is_empty() {
+        if !options.acknowledge_basis_live_orders {
+            return Err(RuntimeError::UnsafeConfig {
+                message: "缺少 --i-understand-basis-live-orders，拒绝进入双腿真实套利下单链路"
+                    .to_owned(),
+            });
+        }
+        let dispatch_plan = dispatch_plan
+            .as_ref()
+            .ok_or_else(|| RuntimeError::UnsafeConfig {
+                message: "双腿套利分发计划缺失，拒绝进入真实下单链路".to_owned(),
+            })?;
+        let signing_policy = signing_policy_from_config(&config)?;
+        let spot_account = fetch_binance_private_account_snapshot(
+            &signing_policy,
+            &ingested_at,
+            "basis-pre-spot",
+            BinancePrivateAccountMarket::Spot,
+            BASIS_SPOT_VENUE_ID,
+            "https://api.binance.com",
+            "/api/v3/account",
+        )?;
+        ensure_asset_balance_covers_amount(
+            "Binance Spot",
+            &spot_account.balances,
+            BASIS_QUOTE_ASSET_ID,
+            BINANCE_GUARDED_LIVE_NOTIONAL_USDT,
+        )?;
+        let usdm_account = fetch_binance_private_account_snapshot(
+            &signing_policy,
+            &ingested_at,
+            "basis-pre-usdm",
+            BinancePrivateAccountMarket::UsdmFutures,
+            BASIS_PERP_VENUE_ID,
+            BINANCE_USDM_FUTURES_BASE_URL,
+            "/fapi/v3/account",
+        )?;
+        ensure_asset_balance_covers_amount(
+            "Binance USD-M",
+            &usdm_account.balances,
+            BASIS_QUOTE_ASSET_ID,
+            BINANCE_GUARDED_LIVE_NOTIONAL_USDT,
+        )?;
+        let private_order_events = options
+            .private_order_events_dir
+            .as_ref()
+            .map(|path| BinancePrivateOrderEventStore::from_dir(path))
+            .transpose()?;
+        dispatch_attempted = true;
+        let mut spot_adapter = build_binance_spot_live_adapter(&signing_policy)?;
+        let mut usdm_adapter = build_binance_usdm_live_adapter(&signing_policy)?;
+        let protection_suffix = ingested_at.unix_seconds().to_string();
+        let outcome = execute_binance_basis_live_dispatch(
+            dispatch_plan,
+            &mut spot_adapter,
+            &mut usdm_adapter,
+            BinanceBasisLiveDispatchContext {
+                plan: Some(&pending.plan_preview),
+                generated_at: &generated_at,
+                spot_unwind_limit_price: Price::from_str(&context.spot_bid)?,
+                protection_suffix: &protection_suffix,
+                private_order_events: private_order_events.as_ref(),
+            },
+        )?;
+        receipts = outcome.receipts;
+        confirmations = outcome.confirmations;
+        execution_report = outcome.execution_report;
+        primary_submit_receipt_count = outcome.primary_submit_receipt_count;
+        protection = outcome.protection;
+        dispatch_blocking.extend(outcome.blocking_reasons);
+        if execution_report.is_none() && dispatch_blocking.is_empty() {
+            execution_report = Some(arb_execution::execution_report_from_private_confirmations(
+                arb_execution::PrivateExecutionReportInput::new(
+                    &pending.plan_preview,
+                    &generated_at,
+                    &confirmations,
+                ),
+            )?);
+        }
+    } else if !options.execute_live {
+        dispatch_blocking.push(
+            "basis chain ran in dry-run mode; pass --execute-live and --i-understand-basis-live-orders to submit both real legs"
+                .to_owned(),
+        );
+    }
+
+    if execution_report.is_none() && dispatch_blocking.is_empty() && options.execute_live {
+        execution_report = Some(arb_execution::execution_report_from_private_confirmations(
+            arb_execution::PrivateExecutionReportInput::new(
+                &pending.plan_preview,
+                &generated_at,
+                &confirmations,
+            ),
+        )?);
+    }
+
+    let report = BinanceBasisGuardedLiveAutoOnceReport {
+        symbol: BASIS_SYMBOL.to_owned(),
+        strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
+        spot_event_id: Some(context.spot_event_id),
+        perp_event_id: Some(context.perp_event_id),
+        premium_event_id: Some(context.premium_event_id),
+        spot_ask: Some(context.spot_ask),
+        perp_bid: Some(context.perp_bid),
+        net_bps: Some(context.signal.net_bps),
+        signal_allowed: true,
+        plan_hash: Some(plan_hash),
+        approval_event_id: Some(release.approval_event_id),
+        manual_gate_released: true,
+        dispatch_attempted,
+        dispatch_allowed: dispatch_blocking.is_empty(),
+        planned_order_count: dispatch_plan
+            .as_ref()
+            .map(|plan| plan.requests.len())
+            .unwrap_or(0),
+        submitted_receipt_count: primary_submit_receipt_count,
+        private_confirmation_count: confirmations.len(),
+        protection_attempted: protection.attempted,
+        protection_actions: protection.actions,
+        protection_receipt_count: protection.receipt_count,
+        residual_risk: protection.residual_risk,
+        execution_report_status: execution_report
+            .as_ref()
+            .map(|report| report.status.as_str().to_owned()),
+        blocking_reasons: dispatch_blocking,
+        output_dir,
+    };
+    write_binance_basis_guarded_live_auto_once_artifacts(
+        &live_dir,
+        &report,
+        &receipts,
+        &confirmations,
+        execution_report.as_ref(),
+    )?;
+    write_binance_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BinanceBasisLiveProtection {
+    attempted: bool,
+    actions: Vec<String>,
+    receipt_count: usize,
+    residual_risk: Option<String>,
+}
+
+#[cfg(feature = "live-exec")]
+impl BinanceBasisLiveProtection {
+    fn record_action(&mut self, action: impl Into<String>) {
+        self.attempted = true;
+        self.actions.push(action.into());
+    }
+
+    fn record_receipt(&mut self) {
+        self.receipt_count += 1;
+    }
+
+    fn record_residual_risk(&mut self, detail: impl Into<String>) {
+        self.residual_risk = Some(detail.into());
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Default)]
+struct BinanceBasisLiveExecutionOutcome {
+    receipts: Vec<MutableActionReceipt>,
+    confirmations: Vec<arb_execution::PrivateOrderConfirmation>,
+    execution_report: Option<ExecutionReport>,
+    primary_submit_receipt_count: usize,
+    protection: BinanceBasisLiveProtection,
+    blocking_reasons: Vec<String>,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy)]
+struct BinanceBasisLiveDispatchContext<'a> {
+    plan: Option<&'a ExecutionPlan>,
+    generated_at: &'a str,
+    spot_unwind_limit_price: Price,
+    protection_suffix: &'a str,
+    private_order_events: Option<&'a BinancePrivateOrderEventStore>,
+}
+
+#[cfg(feature = "live-exec")]
+impl<'a> BinanceBasisLiveDispatchContext<'a> {
+    fn order_context(
+        self,
+        market: BinancePrivateOrderMarket,
+    ) -> BinanceBasisOrderConfirmContext<'a> {
+        BinanceBasisOrderConfirmContext {
+            protection_suffix: self.protection_suffix,
+            private_order_events: self.private_order_events,
+            market,
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy)]
+struct BinanceBasisOrderConfirmContext<'a> {
+    protection_suffix: &'a str,
+    private_order_events: Option<&'a BinancePrivateOrderEventStore>,
+    market: BinancePrivateOrderMarket,
+}
+
+#[cfg(feature = "live-exec")]
+fn execute_binance_basis_live_dispatch<S, U>(
+    dispatch_plan: &ExecutionDispatchPlan,
+    spot_adapter: &mut S,
+    usdm_adapter: &mut U,
+    context: BinanceBasisLiveDispatchContext<'_>,
+) -> RuntimeResult<BinanceBasisLiveExecutionOutcome>
+where
+    S: SubmitOrder + CancelOrder + ConfirmOrderStatus,
+    U: SubmitOrder + CancelOrder + ConfirmOrderStatus,
+{
+    let (spot, perp) = binance_basis_planned_legs(dispatch_plan)?;
+    let spot_context = context.order_context(BinancePrivateOrderMarket::Spot);
+    let perp_context = context.order_context(BinancePrivateOrderMarket::UsdmFutures);
+    let mut outcome = BinanceBasisLiveExecutionOutcome::default();
+
+    let spot_receipt = match spot_adapter.submit_order(spot.request.clone()) {
+        Ok(receipt) => {
+            if receipt.kind == MutableActionKind::SubmitOrder
+                && receipt.status == MutableActionStatus::Accepted
+            {
+                outcome.primary_submit_receipt_count += 1;
+            }
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "spot leg submit failed before perp leg; no hedge leg was sent: {error}"
+            ));
+            return Ok(outcome);
+        }
+    };
+
+    let spot_update = match confirm_planned_receipt_with_private_stream_or_order_query(
+        spot_adapter,
+        spot,
+        &spot_receipt,
+        "spot-after-submit",
+        spot_context.private_order_events,
+        spot_context.market,
+    ) {
+        Ok(update) => {
+            outcome
+                .confirmations
+                .push(private_confirmation_from_update(&spot.plan_leg_id, &update));
+            update
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "spot leg was accepted but private confirmation failed; perp leg skipped: {error}"
+            ));
+            let _ = attempt_cancel_live_order(
+                spot_adapter,
+                spot,
+                &spot_receipt,
+                "spot-confirmation-failed",
+                spot_context,
+                &mut outcome,
+            )?;
+            outcome.protection.record_residual_risk(
+                "spot order state is unknown after accepted REST receipt; manual reconciliation is required",
+            );
+            return Ok(outcome);
+        }
+    };
+
+    match spot_update.status {
+        OrderConfirmationStatus::Filled => {}
+        OrderConfirmationStatus::PartiallyFilled => {
+            let filled = spot_update.cumulative_filled_quantity;
+            outcome.blocking_reasons.push(
+                "spot leg partially filled before hedge; perp leg skipped and protection path engaged"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                spot_adapter,
+                spot,
+                &spot_receipt,
+                "spot-partial-fill",
+                spot_context,
+                &mut outcome,
+            )?;
+            if let Some(quantity) = filled.filter(|value| quantity_is_positive(*value)) {
+                attempt_spot_unwind(
+                    spot_adapter,
+                    spot,
+                    quantity,
+                    context.spot_unwind_limit_price,
+                    "spot-partial-fill",
+                    spot_context,
+                    &mut outcome,
+                )?;
+            }
+            return Ok(outcome);
+        }
+        OrderConfirmationStatus::Acknowledged => {
+            outcome.blocking_reasons.push(
+                "spot leg was only acknowledged and not filled; perp leg skipped and spot cancel requested"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                spot_adapter,
+                spot,
+                &spot_receipt,
+                "spot-not-filled",
+                spot_context,
+                &mut outcome,
+            )?;
+            return Ok(outcome);
+        }
+        OrderConfirmationStatus::Cancelled
+        | OrderConfirmationStatus::Rejected
+        | OrderConfirmationStatus::Expired => {
+            outcome.blocking_reasons.push(format!(
+                "spot leg reached terminal non-filled status `{}`; perp leg skipped",
+                spot_update.status.as_str()
+            ));
+            return Ok(outcome);
+        }
+        OrderConfirmationStatus::Unknown => {
+            outcome.blocking_reasons.push(
+                "spot leg status is unknown after accepted REST receipt; perp leg skipped"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                spot_adapter,
+                spot,
+                &spot_receipt,
+                "spot-unknown",
+                spot_context,
+                &mut outcome,
+            )?;
+            outcome.protection.record_residual_risk(
+                "spot order state is unknown; do not assume either leg is flat until private reconciliation completes",
+            );
+            return Ok(outcome);
+        }
+    }
+
+    let spot_filled_quantity = spot_update
+        .cumulative_filled_quantity
+        .unwrap_or(spot.request.quantity);
+    let perp_submit_result = usdm_adapter.submit_order(perp.request.clone());
+    let perp_receipt = match perp_submit_result {
+        Ok(receipt) => {
+            if receipt.kind == MutableActionKind::SubmitOrder
+                && receipt.status == MutableActionStatus::Accepted
+            {
+                outcome.primary_submit_receipt_count += 1;
+            }
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome
+                .blocking_reasons
+                .push(format!("perp hedge submit failed after spot fill: {error}"));
+            if binance_error_is_unknown_external_state(&error) {
+                outcome.protection.record_residual_risk(
+                    "perp submit result is unknown after spot fill; automatic unwind is suppressed to avoid flipping exposure",
+                );
+            } else {
+                attempt_spot_unwind(
+                    spot_adapter,
+                    spot,
+                    spot_filled_quantity,
+                    context.spot_unwind_limit_price,
+                    "perp-submit-failed",
+                    spot_context,
+                    &mut outcome,
+                )?;
+            }
+            return Ok(outcome);
+        }
+    };
+
+    let perp_update = match confirm_planned_receipt_with_private_stream_or_order_query(
+        usdm_adapter,
+        perp,
+        &perp_receipt,
+        "perp-after-submit",
+        perp_context.private_order_events,
+        perp_context.market,
+    ) {
+        Ok(update) => {
+            outcome
+                .confirmations
+                .push(private_confirmation_from_update(&perp.plan_leg_id, &update));
+            update
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "perp hedge was accepted but private confirmation failed: {error}"
+            ));
+            outcome.protection.record_residual_risk(
+                "perp hedge state is unknown after accepted REST receipt; manual reconciliation is required before unwind",
+            );
+            return Ok(outcome);
+        }
+    };
+
+    match perp_update.status {
+        OrderConfirmationStatus::Filled => {
+            if let Some(plan) = context.plan {
+                outcome.execution_report =
+                    Some(arb_execution::execution_report_from_private_confirmations(
+                        arb_execution::PrivateExecutionReportInput::new(
+                            plan,
+                            context.generated_at,
+                            &outcome.confirmations,
+                        ),
+                    )?);
+            }
+        }
+        OrderConfirmationStatus::PartiallyFilled => {
+            outcome.blocking_reasons.push(
+                "perp hedge partially filled after spot fill; cancelling hedge remainder and unwinding unmatched spot quantity"
+                    .to_owned(),
+            );
+            let cancel_update = attempt_cancel_live_order(
+                usdm_adapter,
+                perp,
+                &perp_receipt,
+                "perp-partial-fill",
+                perp_context,
+                &mut outcome,
+            )?;
+            if cancel_update.is_some() {
+                let perp_filled = cancel_update
+                    .and_then(|update| update.cumulative_filled_quantity)
+                    .or(perp_update.cumulative_filled_quantity);
+                if let Some(unmatched) = unmatched_spot_quantity(spot_filled_quantity, perp_filled)
+                    .filter(|quantity| quantity_is_positive(*quantity))
+                {
+                    attempt_spot_unwind(
+                        spot_adapter,
+                        spot,
+                        unmatched,
+                        context.spot_unwind_limit_price,
+                        "perp-partial-fill",
+                        spot_context,
+                        &mut outcome,
+                    )?;
+                }
+            } else {
+                outcome.protection.record_residual_risk(
+                    "perp partial hedge remainder was not confirmed cancelled; automatic spot unwind is suppressed to avoid flipping exposure",
+                );
+            }
+        }
+        OrderConfirmationStatus::Acknowledged => {
+            outcome.blocking_reasons.push(
+                "perp hedge was only acknowledged and not filled; cancelling hedge and unwinding spot"
+                    .to_owned(),
+            );
+            let cancel_update = attempt_cancel_live_order(
+                usdm_adapter,
+                perp,
+                &perp_receipt,
+                "perp-not-filled",
+                perp_context,
+                &mut outcome,
+            )?;
+            match cancel_update.as_ref().map(|update| update.status) {
+                Some(OrderConfirmationStatus::Filled) => {}
+                Some(OrderConfirmationStatus::PartiallyFilled) => {
+                    if let Some(unmatched) = unmatched_spot_quantity(
+                        spot_filled_quantity,
+                        cancel_update.and_then(|update| update.cumulative_filled_quantity),
+                    )
+                    .filter(|quantity| quantity_is_positive(*quantity))
+                    {
+                        attempt_spot_unwind(
+                            spot_adapter,
+                            spot,
+                            unmatched,
+                            context.spot_unwind_limit_price,
+                            "perp-not-filled",
+                            spot_context,
+                            &mut outcome,
+                        )?;
+                    }
+                }
+                Some(
+                    OrderConfirmationStatus::Cancelled
+                    | OrderConfirmationStatus::Rejected
+                    | OrderConfirmationStatus::Expired,
+                ) => {
+                    attempt_spot_unwind(
+                        spot_adapter,
+                        spot,
+                        spot_filled_quantity,
+                        context.spot_unwind_limit_price,
+                        "perp-not-filled",
+                        spot_context,
+                        &mut outcome,
+                    )?;
+                }
+                Some(OrderConfirmationStatus::Acknowledged | OrderConfirmationStatus::Unknown)
+                | None => {
+                    outcome.protection.record_residual_risk(
+                        "perp hedge was not confirmed terminal after cancel attempt; automatic spot unwind is suppressed",
+                    );
+                }
+            }
+        }
+        OrderConfirmationStatus::Cancelled
+        | OrderConfirmationStatus::Rejected
+        | OrderConfirmationStatus::Expired => {
+            outcome.blocking_reasons.push(format!(
+                "perp hedge reached terminal non-filled status `{}` after spot fill; unwinding spot",
+                perp_update.status.as_str()
+            ));
+            attempt_spot_unwind(
+                spot_adapter,
+                spot,
+                spot_filled_quantity,
+                context.spot_unwind_limit_price,
+                "perp-terminal-unfilled",
+                spot_context,
+                &mut outcome,
+            )?;
+        }
+        OrderConfirmationStatus::Unknown => {
+            outcome.blocking_reasons.push(
+                "perp hedge status is unknown after spot fill; no automatic unwind submitted"
+                    .to_owned(),
+            );
+            outcome.protection.record_residual_risk(
+                "perp hedge state is unknown; automatic spot unwind is suppressed to avoid flipping exposure",
+            );
+        }
+    }
+
+    Ok(outcome)
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_planned_legs(
+    dispatch_plan: &ExecutionDispatchPlan,
+) -> RuntimeResult<(&PlannedSubmitOrder, &PlannedSubmitOrder)> {
+    let spot = dispatch_plan
+        .requests
+        .iter()
+        .find(|planned| {
+            planned.basis_leg_role.as_deref() == Some("spot_buy")
+                || planned.request.venue_id.as_str() == BASIS_SPOT_VENUE_ID
+        })
+        .ok_or_else(|| RuntimeError::UnsafeConfig {
+            message: "双腿套利分发计划缺少 spot buy 腿".to_owned(),
+        })?;
+    let perp = dispatch_plan
+        .requests
+        .iter()
+        .find(|planned| {
+            planned.basis_leg_role.as_deref() == Some("perp_short")
+                || planned.request.venue_id.as_str() == BASIS_PERP_VENUE_ID
+        })
+        .ok_or_else(|| RuntimeError::UnsafeConfig {
+            message: "双腿套利分发计划缺少 USD-M perp short 腿".to_owned(),
+        })?;
+    Ok((spot, perp))
+}
+
+#[cfg(feature = "live-exec")]
+fn confirm_planned_receipt_with_private_stream_or_order_query<A>(
+    adapter: &mut A,
+    planned: &PlannedSubmitOrder,
+    receipt: &MutableActionReceipt,
+    scope: &str,
+    private_order_events: Option<&BinancePrivateOrderEventStore>,
+    market: BinancePrivateOrderMarket,
+) -> RuntimeResult<PrivateOrderUpdate>
+where
+    A: ConfirmOrderStatus,
+{
+    if receipt.kind != MutableActionKind::SubmitOrder {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "只允许确认 SubmitOrder 回执".to_owned(),
+        });
+    }
+    let order_ref = order_ref_from_receipt_or_client(planned, receipt)?;
+    confirm_planned_order_ref_with_private_stream_or_order_query(
+        adapter,
+        planned,
+        order_ref,
+        scope,
+        private_order_events,
+        market,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn confirm_planned_order_ref_with_private_stream_or_order_query<A>(
+    adapter: &mut A,
+    planned: &PlannedSubmitOrder,
+    order_ref: OrderReference,
+    scope: &str,
+    private_order_events: Option<&BinancePrivateOrderEventStore>,
+    market: BinancePrivateOrderMarket,
+) -> RuntimeResult<PrivateOrderUpdate>
+where
+    A: ConfirmOrderStatus,
+{
+    if let Some(store) = private_order_events {
+        if let Some(update) = store.latest_update_for_planned(planned, market)? {
+            return Ok(update);
+        }
+    }
+    confirm_planned_order_ref_with_order_query(adapter, planned, order_ref, scope)
+}
+
+#[cfg(feature = "live-exec")]
+fn confirm_planned_order_ref_with_order_query<A>(
+    adapter: &mut A,
+    planned: &PlannedSubmitOrder,
+    order_ref: OrderReference,
+    scope: &str,
+) -> RuntimeResult<PrivateOrderUpdate>
+where
+    A: ConfirmOrderStatus,
+{
+    adapter
+        .confirm_order_status(ConfirmOrderStatusRequest::new(
+            planned.request.venue_id.clone(),
+            planned.request.account_id.clone(),
+            planned.request.instrument_id.clone(),
+            order_ref,
+            format!(
+                "event:binance:basis-order-query:{}:{}",
+                scope, planned.plan_leg_id
+            ),
+        ))
+        .map_err(RuntimeError::from)
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Default)]
+struct BinancePrivateOrderEventStore {
+    spot_events: Vec<String>,
+    usdm_events: Vec<String>,
+}
+
+#[cfg(feature = "live-exec")]
+impl BinancePrivateOrderEventStore {
+    fn from_dir(path: &Path) -> RuntimeResult<Self> {
+        Ok(Self {
+            spot_events: read_optional_jsonl_lines(&path.join("spot_user_data.jsonl"))?,
+            usdm_events: read_optional_jsonl_lines(&path.join("usdm_user_data.jsonl"))?,
+        })
+    }
+
+    fn latest_update_for_planned(
+        &self,
+        planned: &PlannedSubmitOrder,
+        market: BinancePrivateOrderMarket,
+    ) -> RuntimeResult<Option<PrivateOrderUpdate>> {
+        let events = match market {
+            BinancePrivateOrderMarket::Spot => &self.spot_events,
+            BinancePrivateOrderMarket::UsdmFutures => &self.usdm_events,
+        };
+        let Some(expected_client_order_id) = planned.request.client_order_id.as_ref() else {
+            return Ok(None);
+        };
+        for (index, line) in events.iter().enumerate().rev() {
+            let event_type = json_string_field(line, "e")?;
+            if !binance_private_order_event_type_matches(market, &event_type) {
+                continue;
+            }
+            let update = parse_binance_private_order_event_line(
+                line,
+                market,
+                planned,
+                format!(
+                    "event:binance:user-data-stream:{}:{}",
+                    binance_private_order_market_token(market),
+                    index
+                ),
+            )?;
+            if update.instrument_id != planned.request.instrument_id
+                || update.venue_id != planned.request.venue_id
+                || update.account_id != planned.request.account_id
+            {
+                continue;
+            }
+            if update
+                .client_order_id
+                .as_ref()
+                .is_some_and(|client_order_id| client_order_id == expected_client_order_id)
+            {
+                return Ok(Some(update));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn read_optional_jsonl_lines(path: &Path) -> RuntimeResult<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let input = read_utf8(path)?;
+    Ok(input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_private_order_event_type_matches(
+    market: BinancePrivateOrderMarket,
+    event_type: &str,
+) -> bool {
+    match market {
+        BinancePrivateOrderMarket::Spot => event_type == "executionReport",
+        BinancePrivateOrderMarket::UsdmFutures => event_type == "ORDER_TRADE_UPDATE",
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_binance_private_order_event_line(
+    line: &str,
+    market: BinancePrivateOrderMarket,
+    planned: &PlannedSubmitOrder,
+    source_event_id: String,
+) -> RuntimeResult<PrivateOrderUpdate> {
+    match market {
+        BinancePrivateOrderMarket::Spot => parse_binance_spot_execution_report_update(
+            planned.request.venue_id.clone(),
+            planned.request.account_id.clone(),
+            source_event_id,
+            line,
+        ),
+        BinancePrivateOrderMarket::UsdmFutures => parse_binance_usdm_order_trade_update(
+            planned.request.venue_id.clone(),
+            planned.request.account_id.clone(),
+            source_event_id,
+            line,
+        ),
+    }
+    .map_err(RuntimeError::from)
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_private_order_market_token(market: BinancePrivateOrderMarket) -> &'static str {
+    match market {
+        BinancePrivateOrderMarket::Spot => "spot",
+        BinancePrivateOrderMarket::UsdmFutures => "usdm",
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn order_ref_from_receipt_or_client(
+    planned: &PlannedSubmitOrder,
+    receipt: &MutableActionReceipt,
+) -> RuntimeResult<OrderReference> {
+    match &receipt.external_ref {
+        Some(ExternalActionRef::Order(order_id)) => {
+            Ok(OrderReference::VenueOrderId(order_id.clone()))
+        }
+        _ => planned
+            .request
+            .client_order_id
+            .clone()
+            .map(OrderReference::ClientOrderId)
+            .ok_or_else(|| RuntimeError::UnsafeConfig {
+                message: "下单回执缺少外部订单号和 client_order_id，无法执行私有查单确认"
+                    .to_owned(),
+            }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn attempt_cancel_live_order<A>(
+    adapter: &mut A,
+    planned: &PlannedSubmitOrder,
+    receipt: &MutableActionReceipt,
+    reason: &str,
+    context: BinanceBasisOrderConfirmContext<'_>,
+    outcome: &mut BinanceBasisLiveExecutionOutcome,
+) -> RuntimeResult<Option<PrivateOrderUpdate>>
+where
+    A: CancelOrder + ConfirmOrderStatus,
+{
+    let order_ref = order_ref_from_receipt_or_client(planned, receipt)?;
+    outcome.protection.record_action(format!(
+        "cancel_open_order:{reason}:{}",
+        planned.plan_leg_id
+    ));
+    let cancel_receipt = match adapter.cancel_order(CancelOrderRequest::new(
+        planned.request.venue_id.clone(),
+        planned.request.account_id.clone(),
+        order_ref.clone(),
+        ExecIdempotencyKey::new(format!(
+            "{}:cancel:{reason}:{}",
+            planned.request.idempotency_key.as_str(),
+            context.protection_suffix
+        ))?,
+    )) {
+        Ok(receipt) => {
+            outcome.protection.record_receipt();
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "protection cancel failed for `{}`: {error}",
+                planned.plan_leg_id
+            ));
+            outcome.protection.record_residual_risk(format!(
+                "cancel protection failed for `{}`; manual reconciliation is required",
+                planned.plan_leg_id
+            ));
+            return Ok(None);
+        }
+    };
+    if cancel_receipt.status != MutableActionStatus::Accepted {
+        outcome.blocking_reasons.push(format!(
+            "protection cancel for `{}` returned `{}`",
+            planned.plan_leg_id, cancel_receipt.status
+        ));
+        outcome.protection.record_residual_risk(format!(
+            "cancel protection for `{}` was not accepted",
+            planned.plan_leg_id
+        ));
+        return Ok(None);
+    }
+    match confirm_planned_order_ref_with_private_stream_or_order_query(
+        adapter,
+        planned,
+        order_ref,
+        &format!("cancel:{reason}"),
+        context.private_order_events,
+        context.market,
+    ) {
+        Ok(update) => {
+            outcome.confirmations.push(private_confirmation_from_update(
+                &planned.plan_leg_id,
+                &update,
+            ));
+            if !matches!(
+                update.status,
+                OrderConfirmationStatus::Cancelled
+                    | OrderConfirmationStatus::Rejected
+                    | OrderConfirmationStatus::Expired
+                    | OrderConfirmationStatus::Filled
+                    | OrderConfirmationStatus::PartiallyFilled
+            ) {
+                outcome.protection.record_residual_risk(format!(
+                    "cancel protection for `{}` confirmed status `{}`",
+                    planned.plan_leg_id,
+                    update.status.as_str()
+                ));
+            }
+            Ok(Some(update))
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "protection cancel confirmation failed for `{}`: {error}",
+                planned.plan_leg_id
+            ));
+            outcome.protection.record_residual_risk(format!(
+                "cancel protection for `{}` has no private confirmation",
+                planned.plan_leg_id
+            ));
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn attempt_spot_unwind<S>(
+    spot_adapter: &mut S,
+    spot: &PlannedSubmitOrder,
+    quantity: Quantity,
+    limit_price: Price,
+    reason: &str,
+    context: BinanceBasisOrderConfirmContext<'_>,
+    outcome: &mut BinanceBasisLiveExecutionOutcome,
+) -> RuntimeResult<()>
+where
+    S: SubmitOrder + ConfirmOrderStatus,
+{
+    outcome
+        .protection
+        .record_action(format!("spot_unwind_sell:{reason}:{}", spot.plan_leg_id));
+    let unwind_request = SubmitOrderRequest::new(
+        spot.request.venue_id.clone(),
+        spot.request.account_id.clone(),
+        spot.request.instrument_id.clone(),
+        OrderSide::Sell,
+        MutableOrderType::Limit,
+        quantity,
+        Some(limit_price),
+        Some(OrderId::new(format!("rvbU{}", context.protection_suffix))?),
+        ExecIdempotencyKey::new(format!(
+            "{}:unwind:{reason}:{}",
+            spot.request.idempotency_key.as_str(),
+            context.protection_suffix
+        ))?,
+    );
+    let unwind_plan = PlannedSubmitOrder {
+        plan_leg_id: format!("{}:protection-unwind", spot.plan_leg_id),
+        venue_symbol: spot.venue_symbol.clone(),
+        basis_leg_role: Some("spot_unwind".to_owned()),
+        notional_usd: spot.notional_usd,
+        request: unwind_request,
+    };
+    let receipt = match spot_adapter.submit_order(unwind_plan.request.clone()) {
+        Ok(receipt) => {
+            outcome.protection.record_receipt();
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "spot unwind protection submit failed after `{reason}`: {error}"
+            ));
+            outcome.protection.record_residual_risk(format!(
+                "spot unwind protection failed after `{reason}`; manual hedge or unwind is required"
+            ));
+            return Ok(());
+        }
+    };
+    match confirm_planned_receipt_with_private_stream_or_order_query(
+        spot_adapter,
+        &unwind_plan,
+        &receipt,
+        &format!("spot-unwind:{reason}"),
+        context.private_order_events,
+        BinancePrivateOrderMarket::Spot,
+    ) {
+        Ok(update) => {
+            if update.status != OrderConfirmationStatus::Filled {
+                outcome.protection.record_residual_risk(format!(
+                    "spot unwind protection returned `{}` instead of filled",
+                    update.status.as_str()
+                ));
+            }
+            outcome.confirmations.push(private_confirmation_from_update(
+                &unwind_plan.plan_leg_id,
+                &update,
+            ));
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "spot unwind protection confirmation failed after `{reason}`: {error}"
+            ));
+            outcome.protection.record_residual_risk(
+                "spot unwind protection has no private confirmation; manual reconciliation is required",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn quantity_is_positive(value: Quantity) -> bool {
+    !value.as_decimal().is_zero()
+}
+
+#[cfg(feature = "live-exec")]
+fn unmatched_spot_quantity(
+    spot_filled: Quantity,
+    perp_filled: Option<Quantity>,
+) -> Option<Quantity> {
+    let perp_filled = perp_filled?;
+    if spot_filled <= perp_filled {
+        return None;
+    }
+    let delta = spot_filled
+        .as_decimal()
+        .checked_sub(perp_filled.as_decimal())
+        .ok()?;
+    Quantity::new(delta).ok()
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_error_is_unknown_external_state(error: &VenueExecError) -> bool {
+    matches!(error, VenueExecError::UnknownExternalState { .. })
+}
+
+#[cfg(feature = "live-exec")]
+fn run_binance_guarded_live_dispatch_live(
+    options: BinanceGuardedLiveDispatchOptions,
+) -> RuntimeResult<BinanceGuardedLiveDispatchReport> {
+    if !options.acknowledge_live_orders {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "缺少 --i-understand-live-orders，拒绝读取凭证或提交真实订单".to_owned(),
+        });
+    }
+
+    let (pending, approved_record) = load_binance_manual_gate_release_inputs(&options.preview_dir)?;
+    let release = release_manual_approval_gate(&pending, &approved_record)?;
+    let plan = &pending.plan_preview;
+    let plan_hash = execution_plan_hash(plan);
+    let config = arb_config::ArbConfig::from_path(&options.config_path)?;
+    let service = start_runtime_with_config(&config)?;
+    let health = service.health();
+    let generated_at = current_utc_timestamp()?;
+    let generated_at_text = generated_at.to_string();
+    let output_dir = Some(
+        options
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| options.preview_dir.clone()),
+    );
+
+    let mut blocking_reasons =
+        live_dispatch_blocking_reasons(&config, plan, &release, &plan_hash, &health);
+    let mut receipts = Vec::new();
+    let mut confirmations = Vec::new();
+    let mut execution_report = None;
+    let mut pre_account_event = None;
+    let mut post_account_event = None;
+
+    if blocking_reasons.is_empty() {
+        let signing_policy = signing_policy_from_config(&config)?;
+        let pre_account = fetch_binance_spot_private_account_snapshot(
+            &signing_policy,
+            &generated_at,
+            "pre-dispatch",
+        )?;
+        ensure_private_balance_covers_plan(plan, &pre_account.balances)?;
+        pre_account_event = Some(pre_account.balance_event_json);
+
+        let mut adapter = build_binance_spot_live_adapter(&signing_policy)?;
+        let dispatch_plan = build_execution_dispatch_plan(
+            plan,
+            &live_dispatch_policy_from_config(&config)?,
+            generated_at,
+        )?;
+        if dispatch_plan.requests.len() != 1 {
+            blocking_reasons.push(format!(
+                "当前 GuardedLive 实盘入口只允许单腿 BTCUSDT spot 计划，收到 {} 腿",
+                dispatch_plan.requests.len()
+            ));
+        } else {
+            let planned = &dispatch_plan.requests[0];
+            if planned.request.venue_id.as_str() != BASIS_SPOT_VENUE_ID {
+                blocking_reasons.push(format!(
+                    "当前 GuardedLive 实盘入口只允许 venue `{}`，收到 `{}`",
+                    BASIS_SPOT_VENUE_ID, planned.request.venue_id
+                ));
+            } else {
+                let receipt = adapter.submit_order(planned.request.clone())?;
+                receipts.push(receipt.clone());
+                let update =
+                    confirm_live_receipt_with_order_query(&mut adapter, planned, &receipt)?;
+                confirmations.push(private_confirmation_from_update(
+                    &planned.plan_leg_id,
+                    &update,
+                ));
+                execution_report =
+                    Some(arb_execution::execution_report_from_private_confirmations(
+                        arb_execution::PrivateExecutionReportInput::new(
+                            plan,
+                            &generated_at_text,
+                            &confirmations,
+                        ),
+                    )?);
+            }
+        }
+
+        let post_account = fetch_binance_spot_private_account_snapshot(
+            &signing_policy,
+            &generated_at,
+            "post-dispatch",
+        )?;
+        post_account_event = Some(post_account.balance_event_json);
+    }
+
+    let report = BinanceGuardedLiveDispatchReport {
+        plan_id: plan.plan_id.as_str().to_owned(),
+        plan_hash,
+        approval_event_id: release.approval_event_id,
+        dispatch_allowed: blocking_reasons.is_empty(),
+        submitted_receipt_count: receipts.len(),
+        private_confirmation_count: confirmations.len(),
+        pre_account_balance_event_id: pre_account_event
+            .as_ref()
+            .and_then(|event| json_string_field(event, "event_id").ok()),
+        post_account_balance_event_id: post_account_event
+            .as_ref()
+            .and_then(|event| json_string_field(event, "event_id").ok()),
+        execution_report_status: execution_report
+            .as_ref()
+            .map(|report| report.status.as_str().to_owned()),
+        blocking_reasons,
+        output_dir,
+    };
+
+    if let Some(dir) = &report.output_dir {
+        write_binance_guarded_live_dispatch_artifacts(
+            dir,
+            &report,
+            &receipts,
+            &confirmations,
+            execution_report.as_ref(),
+            pre_account_event.as_deref(),
+            post_account_event.as_deref(),
+        )?;
+    }
+    Ok(report)
 }
 
 fn bootstrap_binance_wss_book_ticker_client(
@@ -5121,6 +7263,7 @@ fn ingest_binance_public_ticker_json(
     Ok(vec![batch.raw_event, batch.normalized_event])
 }
 
+#[derive(Clone, Copy)]
 struct BinanceBasisRawInputs<'a> {
     symbol: &'a str,
     raw_spot_book: &'a str,
@@ -5131,14 +7274,124 @@ struct BinanceBasisRawInputs<'a> {
     premium_index_ref: &'a str,
 }
 
+/// basis 管线实例输入。
+///
+/// 中文说明：运行时只依赖这里注入的策略配置和场所能力，不再在策略执行入口
+/// 隐式选择具体交易所。调用方可以用 fixture 读取出的 capability JSONL 组装该
+/// 规格，也可以使用内置的 Binance/Bybit 兼容默认值做 smoke test。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasisPipelineSpec {
+    pub strategy_config: SpotPerpBasisStrategyConfig,
+    pub venue_capabilities: Vec<VenueCapabilityDescriptor>,
+    pub portfolio_state_id: String,
+    pub portfolio_state_hash: String,
+}
+
+impl BasisPipelineSpec {
+    /// 使用显式策略配置和场所能力创建 basis 管线实例。
+    pub fn new(
+        strategy_config: SpotPerpBasisStrategyConfig,
+        venue_capabilities: Vec<VenueCapabilityDescriptor>,
+        portfolio_state_id: impl Into<String>,
+        portfolio_state_hash: impl Into<String>,
+    ) -> RuntimeResult<Self> {
+        if venue_capabilities.is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: "basis pipeline spec requires at least one venue capability".to_owned(),
+            });
+        }
+
+        let missing_venues = [
+            strategy_config.symbol.spot.venue_id.as_str(),
+            strategy_config.symbol.perp.venue_id.as_str(),
+        ]
+        .into_iter()
+        .filter(|required_venue| {
+            !venue_capabilities
+                .iter()
+                .any(|capability| capability.venue_id.as_str() == *required_venue)
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if !missing_venues.is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!(
+                    "basis pipeline spec is missing venue capabilities for {}",
+                    missing_venues.join(", ")
+                ),
+            });
+        }
+
+        let portfolio_state_id = portfolio_state_id.into();
+        if portfolio_state_id.trim().is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: "basis pipeline spec requires a portfolio_state_id".to_owned(),
+            });
+        }
+        let portfolio_state_hash = portfolio_state_hash.into();
+        if portfolio_state_hash.trim().is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: "basis pipeline spec requires a portfolio_state_hash".to_owned(),
+            });
+        }
+
+        SpotPerpBasisStrategy::with_config(strategy_config.clone())?;
+        Ok(Self {
+            strategy_config,
+            venue_capabilities,
+            portfolio_state_id,
+            portfolio_state_hash,
+        })
+    }
+
+    /// Binance BTCUSDT 兼容默认实例。
+    pub fn binance_btcusdt() -> RuntimeResult<Self> {
+        Self::new(
+            SpotPerpBasisStrategyConfig::binance_btcusdt(),
+            load_binance_basis_capabilities()?,
+            "state:binance-basis-public-readonly-01",
+            "hash:binance-basis-public-readonly-01",
+        )
+    }
+
+    /// Bybit BTCUSDT 兼容默认实例。
+    pub fn bybit_btcusdt() -> RuntimeResult<Self> {
+        Self::new(
+            SpotPerpBasisStrategyConfig::bybit_btcusdt(),
+            load_bybit_basis_capabilities()?,
+            "state:bybit-basis-public-readonly-01",
+            "hash:bybit-basis-public-readonly-01",
+        )
+    }
+}
+
 fn assemble_binance_basis_pipeline_from_raw_json(
     replay: &ReplayInput,
     inputs: BinanceBasisRawInputs<'_>,
     ingested_at: UtcTimestamp,
 ) -> RuntimeResult<EndToEndArtifacts> {
+    let events = ingest_binance_basis_public_json(inputs, ingested_at)?;
+    let spec = BasisPipelineSpec::binance_btcusdt()?;
+    assemble_public_basis_pipeline_from_normalized_events(replay, &spec, events, ingested_at)
+}
+
+/// 使用已标准化的 basis 公共行情事件进入策略、风控和后续模拟管线。
+///
+/// 中文说明：该入口不关心事件来自 Binance、Bybit 或其他 adapter，只要求调用方
+/// 提供和策略配置一致的标准化行情事件与场所能力。缺私有余额等外部状态仍按
+/// 风险状态处理，不能被当作通过。
+pub fn assemble_public_basis_pipeline_from_normalized_events(
+    replay: &ReplayInput,
+    spec: &BasisPipelineSpec,
+    events: Vec<NormalizedEvent>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<EndToEndArtifacts> {
     let _temp_dir = RuntimeTempDir::new()?;
     let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
-    let events = ingest_binance_basis_public_json(inputs, ingested_at)?;
     for event in &events {
         event_store.append(event)?;
     }
@@ -5149,16 +7402,16 @@ fn assemble_binance_basis_pipeline_from_raw_json(
         .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
         .map(|event| event.event_id.as_str().to_owned())
         .collect::<Vec<_>>();
-    let portfolio_state = build_binance_basis_portfolio_state(&source_event_refs, ingested_at)?;
+    let portfolio_state =
+        build_public_basis_portfolio_state(spec, &source_event_refs, ingested_at)?;
     ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
-    let venue_capabilities = load_binance_basis_capabilities()?;
     let fixed_time = ingested_at.to_string();
     let evaluation = run_spot_perp_basis_strategy(
         replay.config(),
         &stored_events,
         &portfolio_state,
-        &venue_capabilities,
         &fixed_time,
+        spec,
     )?;
     let Some(candidate) = evaluation.candidate().cloned() else {
         let operations_report =
@@ -5181,7 +7434,7 @@ fn assemble_binance_basis_pipeline_from_raw_json(
         &candidate,
         &portfolio_state,
         replay.config(),
-        &venue_capabilities,
+        &spec.venue_capabilities,
         ingested_at,
     )?;
 
@@ -5311,14 +7564,15 @@ fn binance_basis_instrument(
     .with_lot_size(Quantity::from_str("0.000001")?))
 }
 
-fn build_binance_basis_portfolio_state(
+fn build_public_basis_portfolio_state(
+    spec: &BasisPipelineSpec,
     source_event_refs: &[String],
     as_of: UtcTimestamp,
 ) -> RuntimeResult<PortfolioState> {
     let portfolio_json = format!(
         r#"{{
   "schema_version": "1.0.0",
-  "portfolio_state_id": "state:binance-basis-public-readonly-01",
+  "portfolio_state_id": {},
   "as_of": {},
   "source_event_refs": {},
   "balances": [],
@@ -5330,10 +7584,12 @@ fn build_binance_basis_portfolio_state(
   "missing_data_flags": [
     "PRIVATE_BALANCE_UNAVAILABLE"
   ],
-  "state_hash": "hash:binance-basis-public-readonly-01"
+  "state_hash": {}
 }}"#,
+        json_string(&spec.portfolio_state_id),
         json_string(&as_of.to_string()),
         json_string_array(source_event_refs),
+        json_string(&spec.portfolio_state_hash),
     );
     Ok(from_json_strict::<PortfolioState>(&portfolio_json)?)
 }
@@ -5346,6 +7602,28 @@ struct BinanceGuardedLiveQuote {
     best_ask: String,
     bid_size: String,
     ask_size: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "live-exec")]
+struct BinanceBasisGuardedLiveSignalContext {
+    spot_event_id: String,
+    perp_event_id: String,
+    premium_event_id: String,
+    observed_at: String,
+    spot_bid: String,
+    spot_ask: String,
+    spot_bid_size: String,
+    spot_ask_size: String,
+    perp_bid: String,
+    perp_ask: String,
+    perp_bid_size: String,
+    perp_ask_size: String,
+    last_funding_rate: String,
+    mark_price: String,
+    index_price: String,
+    next_funding_time_ms: String,
+    signal: SpotPerpBasisSignal,
 }
 
 fn load_binance_guarded_live_spot_quote(
@@ -5396,6 +7674,170 @@ fn load_binance_guarded_live_spot_quote(
     Err(RuntimeError::MissingFixture { path })
 }
 
+fn write_binance_guarded_live_auto_market_artifacts(
+    raw_spot_book: &str,
+    raw_response_ref: &str,
+    ingested_at: UtcTimestamp,
+    output_dir: &Path,
+) -> RuntimeResult<BinanceGuardedLiveQuote> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut adapter = BinancePublicBookTickerAdapter::new(
+        VenueId::new(BASIS_SPOT_VENUE_ID)?,
+        binance_basis_instrument(BASIS_SYMBOL, BASIS_SPOT_INSTRUMENT_ID)?,
+        BinancePublicMarket::Spot,
+        ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let batch = adapter.ingest_book_ticker_json(raw_spot_book, raw_response_ref, ingested_at)?;
+    let quote = BinanceGuardedLiveQuote {
+        event_id: batch.normalized_event.event_id.as_str().to_owned(),
+        observed_at: batch.normalized_event.timestamp_event.as_str().to_owned(),
+        best_bid: payload_string(&batch.normalized_event, "best_bid")?.to_owned(),
+        best_ask: payload_string(&batch.normalized_event, "best_ask")?.to_owned(),
+        bid_size: payload_string(&batch.normalized_event, "bid_size")?.to_owned(),
+        ask_size: payload_string(&batch.normalized_event, "ask_size")?.to_owned(),
+    };
+    write_utf8(
+        output_dir.join("stored_events.jsonl"),
+        &jsonl_from_lines(vec![
+            to_canonical_json(&batch.raw_event),
+            to_canonical_json(&batch.normalized_event),
+        ]),
+    )?;
+    write_utf8(
+        output_dir.join("spot_book_ticker.raw.json"),
+        &format!("{raw_spot_book}\n"),
+    )?;
+    Ok(quote)
+}
+
+#[cfg(feature = "live-exec")]
+fn write_binance_basis_guarded_live_auto_market_artifacts(
+    inputs: BinanceBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+    min_net_bps: i128,
+    output_dir: &Path,
+) -> RuntimeResult<BinanceBasisGuardedLiveSignalContext> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let events = ingest_binance_basis_public_json(inputs, ingested_at)?;
+    write_utf8(
+        output_dir.join("stored_events.jsonl"),
+        &canonical_jsonl(&events),
+    )?;
+    write_utf8(
+        output_dir.join("spot_book_ticker.raw.json"),
+        &format!("{}\n", inputs.raw_spot_book),
+    )?;
+    write_utf8(
+        output_dir.join("perp_book_ticker.raw.json"),
+        &format!("{}\n", inputs.raw_perp_book),
+    )?;
+    write_utf8(
+        output_dir.join("premium_index.raw.json"),
+        &format!("{}\n", inputs.raw_premium_index),
+    )?;
+
+    let spot =
+        find_binance_basis_book_event(&events, BASIS_SPOT_VENUE_ID, BASIS_SPOT_INSTRUMENT_ID)?;
+    let perp =
+        find_binance_basis_book_event(&events, BASIS_PERP_VENUE_ID, BASIS_PERP_INSTRUMENT_ID)?;
+    let premium = find_binance_basis_premium_event(&events)?;
+    let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+        symbol: BASIS_SYMBOL.to_owned(),
+        spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
+        spot_best_ask: payload_string(spot, "best_ask")?.to_owned(),
+        perp_best_bid: payload_string(perp, "best_bid")?.to_owned(),
+        perp_best_ask: payload_string(perp, "best_ask")?.to_owned(),
+        notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
+        spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
+        perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+        min_net_bps,
+    })
+    .map_err(|message| RuntimeError::Module {
+        module: "arb-strategies",
+        message,
+    })?;
+
+    Ok(BinanceBasisGuardedLiveSignalContext {
+        spot_event_id: spot.event_id.as_str().to_owned(),
+        perp_event_id: perp.event_id.as_str().to_owned(),
+        premium_event_id: premium.event_id.as_str().to_owned(),
+        observed_at: ingested_at.to_string(),
+        spot_bid: payload_string(spot, "best_bid")?.to_owned(),
+        spot_ask: payload_string(spot, "best_ask")?.to_owned(),
+        spot_bid_size: payload_string(spot, "bid_size")?.to_owned(),
+        spot_ask_size: payload_string(spot, "ask_size")?.to_owned(),
+        perp_bid: payload_string(perp, "best_bid")?.to_owned(),
+        perp_ask: payload_string(perp, "best_ask")?.to_owned(),
+        perp_bid_size: payload_string(perp, "bid_size")?.to_owned(),
+        perp_ask_size: payload_string(perp, "ask_size")?.to_owned(),
+        last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
+        mark_price: payload_string(premium, "mark_price")?.to_owned(),
+        index_price: payload_string(premium, "index_price")?.to_owned(),
+        next_funding_time_ms: payload_scalar_text(premium, "next_funding_time_ms")?,
+        signal,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn find_binance_basis_book_event<'a>(
+    events: &'a [NormalizedEvent],
+    venue_id: &str,
+    instrument_id: &str,
+) -> RuntimeResult<&'a NormalizedEvent> {
+    events
+        .iter()
+        .find(|event| {
+            event.event_type == NormalizedEventType::NormalizedMarketDataEvent
+                && event
+                    .venue_id
+                    .as_ref()
+                    .and_then(|value| value.as_ref())
+                    .is_some_and(|value| value.as_str() == venue_id)
+                && event
+                    .instrument_id
+                    .as_ref()
+                    .and_then(|value| value.as_ref())
+                    .is_some_and(|value| value.as_str() == instrument_id)
+                && payload_string(event, "kind").is_ok_and(|kind| kind == "BookTicker")
+        })
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("missing Binance basis book event for {venue_id} {instrument_id}"),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn find_binance_basis_premium_event(events: &[NormalizedEvent]) -> RuntimeResult<&NormalizedEvent> {
+    events
+        .iter()
+        .find(|event| {
+            event.event_type == NormalizedEventType::NormalizedMarketDataEvent
+                && event
+                    .venue_id
+                    .as_ref()
+                    .and_then(|value| value.as_ref())
+                    .is_some_and(|value| value.as_str() == BASIS_PERP_VENUE_ID)
+                && event
+                    .instrument_id
+                    .as_ref()
+                    .and_then(|value| value.as_ref())
+                    .is_some_and(|value| value.as_str() == BASIS_PERP_INSTRUMENT_ID)
+                && payload_string(event, "kind").is_ok_and(|kind| kind == "PerpPremiumIndex")
+        })
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: "missing Binance basis premium index event".to_owned(),
+        })
+}
+
 fn payload_string<'a>(event: &'a NormalizedEvent, field: &'static str) -> RuntimeResult<&'a str> {
     match event.payload.get(field) {
         Some(JsonValue::String(value)) => Ok(value.as_str()),
@@ -5403,6 +7845,28 @@ fn payload_string<'a>(event: &'a NormalizedEvent, field: &'static str) -> Runtim
             module: "arb-runtime",
             message: format!(
                 "normalized event `{}` payload field `{field}` is not a string",
+                event.event_id.as_str()
+            ),
+        }),
+        None => Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "normalized event `{}` is missing payload field `{field}`",
+                event.event_id.as_str()
+            ),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn payload_scalar_text(event: &NormalizedEvent, field: &'static str) -> RuntimeResult<String> {
+    match event.payload.get(field) {
+        Some(JsonValue::String(value)) => Ok(value.to_owned()),
+        Some(JsonValue::Number(value)) => Ok(value.as_str().to_owned()),
+        Some(_) => Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "normalized event `{}` payload field `{field}` is not a string or number",
                 event.event_id.as_str()
             ),
         }),
@@ -5603,6 +8067,251 @@ fn binance_guarded_live_manual_risk_decision(
         notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
         daily_loss_limit = json_string(BINANCE_GUARDED_LIVE_DAILY_LOSS_LIMIT_USDT),
         capital_limit = json_string(BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT),
+    );
+    Ok(from_json_strict::<RiskDecision>(&risk_json)?)
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_guarded_live_candidate(
+    context: &BinanceBasisGuardedLiveSignalContext,
+    created_at: &str,
+    client_order_suffix: &str,
+) -> RuntimeResult<CandidatePortfolioTransition> {
+    let short_quantity = format!("-{}", context.signal.quantity);
+    let spot_client_order_id = format!("rvbS{client_order_suffix}");
+    let perp_client_order_id = format!("rvbP{client_order_suffix}");
+    let candidate_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "transition_id": {transition_id},
+  "strategy_id": {strategy_id},
+  "strategy_version": "1.0.0",
+  "code_version": "code:binance-basis-guarded-live-auto-1",
+  "config_version": "arb-config-v1",
+  "created_at": {created_at},
+  "input_event_refs": [{spot_event},{perp_event},{premium_event}],
+  "current_portfolio_state_ref": "state:binance-basis-guarded-live-private-redacted",
+  "holding_period": {{"kind": "UntilBasisConvergence"}},
+  "legs": [
+    {{
+      "leg_id": "candleg:binance-basis-live-buy-spot-btcusdt",
+      "leg_type": "Trade",
+      "venue_id": {spot_venue},
+      "instrument_id": {spot_instrument},
+      "account_id": {account_id},
+      "side": "Buy",
+      "asset_flows": [
+        {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}},
+        {{"account_id": {account_id}, "asset_id": {base_asset}, "amount": {quantity}, "direction": "In"}}
+      ],
+      "constraints": {{
+        "basis_leg_role": "spot_buy",
+        "client_order_id": {spot_client_order_id},
+        "gross_basis_bps": {gross_bps},
+        "max_slippage_bps": "5",
+        "net_basis_bps": {net_bps},
+        "notional_usdt": {notional},
+        "post_only": false,
+        "reference_best_ask": {spot_ask},
+        "reference_best_bid": {spot_bid},
+        "reference_bid_size": {spot_bid_size},
+        "reference_ask_size": {spot_ask_size},
+        "reference_market_event_id": {spot_event}
+      }},
+      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+    }},
+    {{
+      "leg_id": "candleg:binance-basis-live-short-usdm-btcusdt",
+      "leg_type": "Trade",
+      "venue_id": {perp_venue},
+      "instrument_id": {perp_instrument},
+      "account_id": {account_id},
+      "side": "Short",
+      "asset_flows": [],
+      "constraints": {{
+        "basis_leg_role": "perp_short",
+        "client_order_id": {perp_client_order_id},
+        "gross_basis_bps": {gross_bps},
+        "last_funding_rate": {last_funding_rate},
+        "max_slippage_bps": "5",
+        "net_basis_bps": {net_bps},
+        "notional_usdt": {notional},
+        "post_only": false,
+        "reference_best_ask": {perp_ask},
+        "reference_best_bid": {perp_bid},
+        "reference_bid_size": {perp_bid_size},
+        "reference_ask_size": {perp_ask_size},
+        "reference_market_event_id": {perp_event},
+        "reference_premium_event_id": {premium_event}
+      }},
+      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+    }}
+  ],
+  "expected_post_state_delta": {{
+    "asset_flows": [
+      {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}},
+      {{"account_id": {account_id}, "asset_id": {base_asset}, "amount": {quantity}, "direction": "In"}}
+    ],
+    "position_deltas": [
+      {{"account_id": {account_id}, "instrument_id": {spot_instrument}, "quantity_delta": {quantity}}},
+      {{"account_id": {account_id}, "instrument_id": {perp_instrument}, "quantity_delta": {short_quantity}}}
+    ]
+  }},
+  "expected_economics": {{
+    "expected_profit_usd": {expected_profit_usd},
+    "expected_profit_bps": {net_bps},
+    "fee_estimate_usd": {fee_estimate_usd},
+    "slippage_estimate_usd": {slippage_estimate_usd},
+    "confidence": 0.60
+  }},
+  "required_capital": {{
+    "asset_requirements": [
+      {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}}
+    ],
+    "recovery_buffer_usd": "1.00"
+  }},
+  "funding_impact": {{
+    "summary": {funding_summary},
+    "impact_usd": "0",
+    "confidence": 0.50
+  }},
+  "failure_modes": ["PartialFill", "ManualInterventionRequired", "UnknownState"],
+  "risk_flags": ["FundingRateUnstable", "BasisWidening", "OneLegExecutionRisk"],
+  "assumptions": [
+    {{
+      "assumption_id": "asm:binance-basis-live-public-signal",
+      "statement": "Automatic live basis signal uses public spot/perp bookTicker and premiumIndex; private balances and both execution venues must be checked before dispatch.",
+      "confidence": 0.50,
+      "source_event_refs": [{spot_event},{perp_event},{premium_event}]
+    }}
+  ]
+}}"#,
+        transition_id = json_string(BINANCE_BASIS_LIVE_TRANSITION_ID),
+        strategy_id = json_string(BINANCE_BASIS_LIVE_STRATEGY_ID),
+        created_at = json_string(created_at),
+        spot_event = json_string(&context.spot_event_id),
+        perp_event = json_string(&context.perp_event_id),
+        premium_event = json_string(&context.premium_event_id),
+        spot_venue = json_string(BASIS_SPOT_VENUE_ID),
+        perp_venue = json_string(BASIS_PERP_VENUE_ID),
+        spot_instrument = json_string(BASIS_SPOT_INSTRUMENT_ID),
+        perp_instrument = json_string(BASIS_PERP_INSTRUMENT_ID),
+        account_id = json_string(BINANCE_GUARDED_LIVE_ACCOUNT_REF),
+        quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
+        base_asset = json_string(BASIS_BASE_ASSET_ID),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+        quantity = json_string(&context.signal.quantity),
+        short_quantity = json_string(&short_quantity),
+        spot_client_order_id = json_string(&spot_client_order_id),
+        perp_client_order_id = json_string(&perp_client_order_id),
+        gross_bps = json_string(&context.signal.gross_bps.to_string()),
+        net_bps = json_string(&context.signal.net_bps.to_string()),
+        spot_ask = json_string(&context.spot_ask),
+        spot_bid = json_string(&context.spot_bid),
+        spot_bid_size = json_string(&context.spot_bid_size),
+        spot_ask_size = json_string(&context.spot_ask_size),
+        perp_ask = json_string(&context.perp_ask),
+        perp_bid = json_string(&context.perp_bid),
+        perp_bid_size = json_string(&context.perp_bid_size),
+        perp_ask_size = json_string(&context.perp_ask_size),
+        last_funding_rate = json_string(&context.last_funding_rate),
+        expected_profit_usd = json_string(&context.signal.expected_profit_usd),
+        fee_estimate_usd = json_string(&context.signal.fee_estimate_usd),
+        slippage_estimate_usd = json_string(&context.signal.slippage_estimate_usd),
+        funding_summary = json_string(&format!(
+            "lastFundingRate={}, mark_price={}, index_price={}, nextFundingTimeMs={}",
+            context.last_funding_rate,
+            context.mark_price,
+            context.index_price,
+            context.next_funding_time_ms
+        )),
+    );
+    Ok(from_json_strict::<CandidatePortfolioTransition>(
+        &candidate_json,
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_guarded_live_manual_risk_decision(
+    context: &BinanceBasisGuardedLiveSignalContext,
+    evaluated_at: &str,
+    min_net_bps: i128,
+) -> RuntimeResult<RiskDecision> {
+    let risk_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "decision_id": "risk:trans:binance-basis-guarded-live-auto-001",
+  "transition_id": {transition_id},
+  "evaluated_at": {evaluated_at},
+  "decision": "RequiresManualApproval",
+  "policy_version": "risk-policy:binance-basis-guarded-live-auto-v1",
+  "policy_hash": "hash:binance-basis-guarded-live-auto-v1",
+  "policy_signature_ref": "sigref:risk-policy-unsigned",
+  "input_state_ref": "state:binance-basis-guarded-live-private-redacted",
+  "checks": [
+    {{
+      "check_id": "check:binance-basis-live:public-data-freshness",
+      "check_type": "DataFreshness",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": "5000", "unit": "ms"}},
+      "observed": {{"string_value": {observed_at}, "unit": "timestamp"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Binance spot/perp public bookTicker and premiumIndex are present for this fresh automatic basis signal."
+    }},
+    {{
+      "check_id": "check:binance-basis-live:net-basis",
+      "check_type": "StrategyExposureLimit",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": {min_net_bps}, "unit": "bps"}},
+      "observed": {{"decimal_value": {net_bps}, "unit": "bps"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Public basis signal net_bps passed the automatic strategy threshold before private checks."
+    }},
+    {{
+      "check_id": "check:binance-basis-live:manual-gate",
+      "check_type": "OneLegExecutionRisk",
+      "status": "Warning",
+      "severity": "Warn",
+      "observed": {{"string_value": "two-leg basis live order path requires guarded approval fact", "unit": "manual_gate"}},
+      "reason_code": "REQUIRES_MANUAL_APPROVAL",
+      "detail": "Spot buy and USD-M perp short must share the same plan_hash and still pass private balance, kill switch and execution gates."
+    }},
+    {{
+      "check_id": "check:binance-basis-live:notional-cap",
+      "check_type": "StrategyExposureLimit",
+      "status": "Pass",
+      "severity": "Info",
+      "threshold": {{"decimal_value": {notional}, "unit": "USDT"}},
+      "observed": {{"decimal_value": {notional}, "unit": "USDT"}},
+      "reason_code": "CHECK_PASSED",
+      "detail": "Each leg uses the configured small notional cap."
+    }}
+  ],
+  "constraints": [
+    {{
+      "constraint_id": "constraint:binance-basis-live:max-notional",
+      "constraint_type": "MaxNotional",
+      "field_path": "$.required_capital.asset_requirements",
+      "limit": {{"decimal_value": {notional}, "unit": "USDT"}}
+    }},
+    {{
+      "constraint_id": "constraint:binance-basis-live:manual-approval",
+      "constraint_type": "RequiresManualApproval",
+      "field_path": "$.decision",
+      "limit": {{"string_value": "automatic guarded approval must reference the same plan_hash", "unit": "approval_requirement"}}
+    }}
+  ],
+  "reason_codes": ["REQUIRES_MANUAL_APPROVAL"],
+  "detail": "Automatic basis signal is a two-leg arbitrage candidate, but dispatch remains gated by same-plan approval, private balances, kill switch, permissions, confirmation and reconciliation."
+}}"#,
+        transition_id = json_string(BINANCE_BASIS_LIVE_TRANSITION_ID),
+        evaluated_at = json_string(evaluated_at),
+        observed_at = json_string(&context.observed_at),
+        min_net_bps = json_string(&min_net_bps.to_string()),
+        net_bps = json_string(&context.signal.net_bps.to_string()),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
     );
     Ok(from_json_strict::<RiskDecision>(&risk_json)?)
 }
@@ -5824,10 +8533,29 @@ fn load_venue_capabilities(fixture_root: &Path) -> RuntimeResult<Vec<VenueCapabi
 fn load_binance_basis_capabilities() -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
     let spot = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesSpotMarkets","ProvidesOrderBookMarkets"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":1200,"source":"binance-public-rest","unit":"Request","window_ms":60000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BINANCE-SPOT","venue_name":"Binance Spot Public REST"}"#;
     let perp = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders","FundingHistory"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesPerpetuals","ProvidesOrderBookMarkets","ProvidesFundingRates"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":2400,"source":"binance-public-futures-rest","unit":"Request","window_ms":60000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BINANCE-USDM","venue_name":"Binance USD-M Public REST"}"#;
-    Ok(vec![
-        from_json_strict::<VenueCapabilityDescriptor>(spot)?,
-        from_json_strict::<VenueCapabilityDescriptor>(perp)?,
-    ])
+    basis_capabilities_from_json_lines(&[spot, perp])
+}
+
+fn load_bybit_basis_capabilities() -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
+    let spot = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesSpotMarkets","ProvidesOrderBookMarkets"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":600,"source":"bybit-public-spot-rest","unit":"Request","window_ms":5000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BYBIT-SPOT","venue_name":"Bybit Spot Public REST"}"#;
+    let perp = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders","FundingHistory"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesPerpetuals","ProvidesOrderBookMarkets","ProvidesFundingRates"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":600,"source":"bybit-public-linear-rest","unit":"Request","window_ms":5000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BYBIT-LINEAR","venue_name":"Bybit Linear Public REST"}"#;
+    basis_capabilities_from_json_lines(&[spot, perp])
+}
+
+fn basis_capabilities_from_json_lines(
+    lines: &[&str],
+) -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
+    if lines.is_empty() {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: "basis capability input is empty".to_owned(),
+        });
+    }
+    let mut capabilities = Vec::with_capacity(lines.len());
+    for line in lines {
+        capabilities.push(from_json_strict::<VenueCapabilityDescriptor>(line)?);
+    }
+    Ok(capabilities)
 }
 
 fn run_strategy(
@@ -5865,19 +8593,19 @@ fn run_spot_perp_basis_strategy(
     config: &arb_config::ArbConfig,
     stored_events: &[arb_eventstore::StoredEvent],
     portfolio_state: &PortfolioState,
-    venue_capabilities: &[VenueCapabilityDescriptor],
     fixed_time: &str,
+    spec: &BasisPipelineSpec,
 ) -> RuntimeResult<StrategyEvaluation> {
     let market_events = stored_events
         .iter()
         .map(|record| record.event.clone())
         .collect::<Vec<_>>();
     let snapshot = ReadOnlySnapshot::new(portfolio_state.clone(), market_events);
-    let capabilities = VenueCapabilitySnapshot::new(venue_capabilities.to_vec())?;
+    let capabilities = VenueCapabilitySnapshot::new(spec.venue_capabilities.clone())?;
     let config = StrategyConfigSnapshot::from_config(config)?;
     let time = StrategyFixedTimeSource::from_rfc3339_z(fixed_time)?;
     let input = StrategyInput::new(snapshot, capabilities, config, time);
-    let strategy = spot_perp_basis_strategy()?;
+    let strategy = SpotPerpBasisStrategy::with_config(spec.strategy_config.clone())?;
     Ok(strategy.evaluate(&input)?)
 }
 
@@ -6640,6 +9368,972 @@ fn pre_dispatch_dry_run_markdown(
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+#[cfg(feature = "live-exec")]
+struct BinancePrivateAccountSnapshot {
+    balance_event_json: String,
+    balances: Vec<VenueBalance>,
+}
+
+#[cfg(feature = "live-exec")]
+fn live_dispatch_blocking_reasons(
+    config: &arb_config::ArbConfig,
+    plan: &ExecutionPlan,
+    release: &ManualApprovalGateRelease,
+    plan_hash: &str,
+    health: &RuntimeHealthSnapshot,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if plan.execution_mode != ContractExecutionMode::ManualApproval {
+        reasons.push(format!(
+            "受控分发只消费 ManualApproval 计划预览，收到 `{}`",
+            plan.execution_mode.as_str()
+        ));
+    }
+    if release.plan_hash != plan_hash {
+        reasons.push("人工门禁释放哈希与当前计划哈希不一致".to_owned());
+    }
+    if config.execution().mode() != ConfigExecutionMode::GuardedLive {
+        reasons.push(format!(
+            "配置执行模式必须是 GuardedLive，当前为 `{}`",
+            config.execution().mode()
+        ));
+    }
+    if !config.execution().live_execution_enabled() {
+        reasons.push("execution.live_execution_enabled 必须为 true".to_owned());
+    }
+    if config.execution().auto_live_enabled() {
+        reasons.push("GuardedLive 受控入口不允许 auto_live_enabled=true".to_owned());
+    }
+    if !config.signing().real_signing_enabled() {
+        reasons.push("signing.real_signing_enabled 必须为 true".to_owned());
+    }
+    if config.kill_switch().is_triggered() {
+        reasons.push("任意熔断范围仍处于打开状态，拒绝实盘分发".to_owned());
+    }
+    if !health.mutable_execution_started {
+        reasons.push("运行时健康快照显示可变执行任务未启动".to_owned());
+    }
+    if !release.gate_transition.to_state.as_str().eq("Ready") {
+        reasons.push("人工审批门禁未释放到 Ready 状态".to_owned());
+    }
+    reasons
+}
+
+#[cfg(feature = "live-exec")]
+fn live_dispatch_policy_from_config(
+    config: &arb_config::ArbConfig,
+) -> RuntimeResult<ExecutionDispatchPolicy> {
+    let cap = Amount::new(Decimal::from_str(BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT)?)?;
+    let mut kill_switch = if config
+        .kill_switch()
+        .blocks_execution_mode(ConfigExecutionMode::GuardedLive)
+    {
+        DispatchKillSwitch::global()
+    } else {
+        DispatchKillSwitch::default()
+    };
+    for venue in config.kill_switch().venues() {
+        kill_switch = kill_switch.with_venue(VenueId::new(venue)?);
+    }
+    for account in config.kill_switch().accounts() {
+        kill_switch = kill_switch.with_account(AccountId::new(account)?);
+    }
+    for instrument in config.kill_switch().instruments() {
+        kill_switch = kill_switch.with_instrument(InstrumentId::new(instrument)?);
+    }
+    Ok(ExecutionDispatchPolicy::new(cap)
+        .allow_symbol(BASIS_SYMBOL)?
+        .with_manual_gate_released(true)
+        .with_kill_switch(kill_switch))
+}
+
+#[cfg(feature = "live-exec")]
+fn signing_policy_from_config(config: &arb_config::ArbConfig) -> RuntimeResult<SigningPolicy> {
+    Ok(SigningPolicy::real_signing_enabled(SigningPolicyRef::new(
+        config.signing().policy_ref().as_str(),
+    )?))
+}
+
+#[cfg(feature = "live-exec")]
+fn build_binance_spot_live_adapter(
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<
+    live::BinanceSpotExecAdapter<RealSigningProviderFromEnv, live::BinanceCurlExecTransport>,
+> {
+    Ok(live::BinanceSpotExecAdapter::new(
+        live::BinanceExecConfig::spot(
+            VenueId::new(BASIS_SPOT_VENUE_ID)?,
+            AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
+            "https://api.binance.com",
+            signing_policy.clone(),
+        )?,
+        RealSigningProviderFromEnv::from_default_env()?,
+        live::BinanceCurlExecTransport::default(),
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn build_binance_usdm_live_adapter(
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<
+    live::BinanceUsdmExecAdapter<RealSigningProviderFromEnv, live::BinanceCurlExecTransport>,
+> {
+    Ok(live::BinanceUsdmExecAdapter::new(
+        live::BinanceExecConfig::usdm_futures(
+            VenueId::new(BASIS_PERP_VENUE_ID)?,
+            AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
+            BINANCE_USDM_FUTURES_BASE_URL,
+            signing_policy.clone(),
+        )?,
+        RealSigningProviderFromEnv::from_default_env()?,
+        live::BinanceCurlExecTransport::default(),
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+#[allow(clippy::too_many_arguments)]
+fn fetch_binance_private_account_snapshot(
+    signing_policy: &SigningPolicy,
+    ingested_at: &UtcTimestamp,
+    scope: &str,
+    market: BinancePrivateAccountMarket,
+    venue_id: &str,
+    base_url: &str,
+    endpoint: &str,
+) -> RuntimeResult<BinancePrivateAccountSnapshot> {
+    let signer = RealSigningProviderFromEnv::from_default_env()?;
+    let signed = signer.sign_binance_hmac(
+        BinanceHmacSigningInput::new(
+            SigningRequestId::new(format!("signing-request/binance-live/account/{scope}"))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
+            vec![BinanceRequestParam::new(
+                "recvWindow",
+                live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+            )?],
+        )?,
+        signing_policy,
+    )?;
+    let raw_json = fetch_signed_binance_get_with_curl(
+        base_url,
+        endpoint,
+        signed.api_key_header_name(),
+        signed.api_key_header_value(),
+        signed.signed_query_for_transport(),
+    )?;
+    let mut adapter = BinancePrivateAccountAdapter::new(
+        VenueId::new(venue_id)?,
+        AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
+        market,
+        *ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let raw_ref = format!("binance-private-account:{scope}:{endpoint}");
+    let batch = match market {
+        BinancePrivateAccountMarket::Spot => {
+            adapter.ingest_spot_account_json(&raw_json, raw_ref, *ingested_at)?
+        }
+        BinancePrivateAccountMarket::UsdmFutures => {
+            adapter.ingest_usdm_account_json(&raw_json, raw_ref, *ingested_at)?
+        }
+    };
+    let balances = adapter.balances(
+        &BalanceQuery::new(VenueId::new(venue_id)?)
+            .for_account(AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?)
+            .for_asset(AssetId::new(BASIS_QUOTE_ASSET_ID)?),
+    )?;
+    Ok(BinancePrivateAccountSnapshot {
+        balance_event_json: to_canonical_json(&batch.balance_event),
+        balances,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_binance_spot_private_account_snapshot(
+    signing_policy: &SigningPolicy,
+    ingested_at: &UtcTimestamp,
+    scope: &str,
+) -> RuntimeResult<BinancePrivateAccountSnapshot> {
+    fetch_binance_private_account_snapshot(
+        signing_policy,
+        ingested_at,
+        scope,
+        BinancePrivateAccountMarket::Spot,
+        BASIS_SPOT_VENUE_ID,
+        "https://api.binance.com",
+        "/api/v3/account",
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn ensure_private_balance_covers_plan(
+    plan: &ExecutionPlan,
+    balances: &[VenueBalance],
+) -> RuntimeResult<()> {
+    let required_text = plan
+        .legs
+        .iter()
+        .find(|leg| {
+            leg.venue_id
+                .as_ref()
+                .is_some_and(|venue| venue.as_str() == BASIS_SPOT_VENUE_ID)
+        })
+        .and_then(|leg| leg.notional_usd.as_ref())
+        .map(|value| value.as_str())
+        .unwrap_or(BINANCE_GUARDED_LIVE_NOTIONAL_USDT);
+    ensure_asset_balance_covers_amount(
+        "Binance 私有账户",
+        balances,
+        BASIS_QUOTE_ASSET_ID,
+        required_text,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn ensure_asset_balance_covers_amount(
+    scope: &str,
+    balances: &[VenueBalance],
+    asset_id: &str,
+    required_text: &str,
+) -> RuntimeResult<()> {
+    let required = Amount::new(Decimal::from_str(required_text)?)?;
+    let Some(balance) = balances
+        .iter()
+        .find(|balance| balance.asset_id.as_str() == asset_id)
+    else {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("{scope} 未返回 {asset_id} 可用余额"),
+        });
+    };
+    if balance.free < required {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "{scope} {asset_id} 可用余额不足：free={} required={}",
+                balance.free, required
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn confirm_live_receipt_with_order_query(
+    adapter: &mut live::BinanceSpotExecAdapter<
+        RealSigningProviderFromEnv,
+        live::BinanceCurlExecTransport,
+    >,
+    planned: &arb_venue_exec::PlannedSubmitOrder,
+    receipt: &MutableActionReceipt,
+) -> RuntimeResult<PrivateOrderUpdate> {
+    if receipt.kind != MutableActionKind::SubmitOrder {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "只允许确认 SubmitOrder 回执".to_owned(),
+        });
+    }
+    let order_ref = match &receipt.external_ref {
+        Some(ExternalActionRef::Order(order_id)) => OrderReference::VenueOrderId(order_id.clone()),
+        _ => planned
+            .request
+            .client_order_id
+            .clone()
+            .map(OrderReference::ClientOrderId)
+            .ok_or_else(|| RuntimeError::UnsafeConfig {
+                message: "下单回执缺少外部订单号和 client_order_id，无法执行私有查单确认"
+                    .to_owned(),
+            })?,
+    };
+    adapter
+        .confirm_order_status(ConfirmOrderStatusRequest::new(
+            planned.request.venue_id.clone(),
+            planned.request.account_id.clone(),
+            planned.request.instrument_id.clone(),
+            order_ref,
+            format!("event:binance:order-query:{}", planned.plan_leg_id),
+        ))
+        .map_err(RuntimeError::from)
+}
+
+#[cfg(feature = "live-exec")]
+fn private_confirmation_from_update(
+    plan_leg_id: &str,
+    update: &PrivateOrderUpdate,
+) -> arb_execution::PrivateOrderConfirmation {
+    let mut confirmation = arb_execution::PrivateOrderConfirmation::new(
+        plan_leg_id,
+        private_confirmation_status(update.status),
+        private_confirmation_source(update.source),
+        update.source_event_id.clone(),
+    );
+    if let Some(order_id) = &update.venue_order_id {
+        confirmation = confirmation.with_venue_order_id(order_id.as_str());
+    }
+    if let Some(client_order_id) = &update.client_order_id {
+        confirmation = confirmation.with_client_order_id(client_order_id.as_str());
+    }
+    if let Some(fill) = update
+        .last_fill
+        .as_ref()
+        .and_then(|fill| private_execution_fill_from_update(update, fill))
+    {
+        confirmation = confirmation.with_fill(fill);
+    } else if matches!(
+        update.status,
+        OrderConfirmationStatus::Filled | OrderConfirmationStatus::PartiallyFilled
+    ) {
+        confirmation = confirmation.with_detail(
+            "私有查单返回成交状态但缺少手续费明细；执行报告保持失败闭合，等待 user data stream 或更完整成交明细。",
+        );
+    }
+    confirmation
+}
+
+#[cfg(feature = "live-exec")]
+fn private_confirmation_status(
+    status: OrderConfirmationStatus,
+) -> arb_execution::PrivateOrderConfirmationStatus {
+    match status {
+        OrderConfirmationStatus::Acknowledged => {
+            arb_execution::PrivateOrderConfirmationStatus::Acknowledged
+        }
+        OrderConfirmationStatus::Filled => arb_execution::PrivateOrderConfirmationStatus::Filled,
+        OrderConfirmationStatus::PartiallyFilled => {
+            arb_execution::PrivateOrderConfirmationStatus::PartiallyFilled
+        }
+        OrderConfirmationStatus::Cancelled => {
+            arb_execution::PrivateOrderConfirmationStatus::Cancelled
+        }
+        OrderConfirmationStatus::Rejected => {
+            arb_execution::PrivateOrderConfirmationStatus::Rejected
+        }
+        OrderConfirmationStatus::Expired => arb_execution::PrivateOrderConfirmationStatus::Expired,
+        OrderConfirmationStatus::Unknown => arb_execution::PrivateOrderConfirmationStatus::Unknown,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn private_confirmation_source(
+    source: OrderConfirmationSource,
+) -> arb_execution::PrivateOrderConfirmationSource {
+    match source {
+        OrderConfirmationSource::PrivateStream => {
+            arb_execution::PrivateOrderConfirmationSource::PrivateStream
+        }
+        OrderConfirmationSource::OrderQuery => {
+            arb_execution::PrivateOrderConfirmationSource::OrderQuery
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn private_execution_fill_from_update(
+    update: &PrivateOrderUpdate,
+    fill: &PrivateOrderFillUpdate,
+) -> Option<arb_execution::PrivateExecutionFill> {
+    let side = match update.side? {
+        arb_venue_exec::OrderSide::Buy => arb_contracts::FillSide::Buy,
+        arb_venue_exec::OrderSide::Sell => arb_contracts::FillSide::Sell,
+    };
+    let fee_asset_id = fill.fee_asset_id.as_ref()?.as_str().to_owned();
+    let fee_amount = fill.fee_amount.as_ref()?.to_string();
+    let mut execution_fill = arb_execution::PrivateExecutionFill::new(
+        side,
+        fill.price.clone(),
+        fill.quantity.clone(),
+        fee_asset_id,
+        fee_amount,
+        fill.source_event_id.clone(),
+    )
+    .with_timestamp(fill.timestamp.clone());
+    if let Some(order_id) = &update.venue_order_id {
+        execution_fill = execution_fill.with_venue_order_id(order_id.as_str());
+    }
+    if let Some(client_order_id) = &update.client_order_id {
+        execution_fill = execution_fill.with_client_order_id(client_order_id.as_str());
+    }
+    Some(execution_fill)
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_signed_binance_get_with_curl(
+    base_url: &str,
+    endpoint: &str,
+    header_name: &str,
+    header_value: &str,
+    signed_query: &str,
+) -> RuntimeResult<String> {
+    let url = format!("{base_url}{endpoint}?{signed_query}");
+    let header = format!("{header_name}: {header_value}");
+    let config = format!(
+        "url = \"{}\"\nheader = \"{}\"\n",
+        curl_config_quote_runtime(&url)?,
+        curl_config_quote_runtime(&header)?
+    );
+    let mut child = Command::new("curl")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--request")
+        .arg("GET")
+        .arg("--connect-timeout")
+        .arg("10")
+        .arg("--max-time")
+        .arg("30")
+        .arg("--write-out")
+        .arg("\n__ARB_BINANCE_HTTP_STATUS__:%{http_code}")
+        .arg("--config")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot start curl for Binance private signed GET: {error}"),
+        })?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "curl stdin unavailable for Binance private signed GET".to_owned(),
+        })?
+        .write_all(config.as_bytes())
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot write curl config for Binance private signed GET: {error}"),
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("curl failed for Binance private signed GET: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(RuntimeError::LiveMarketData {
+            message: "curl failed before a reliable Binance private HTTP response was available"
+                .to_owned(),
+        });
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let Some((body, status)) = rendered.rsplit_once("\n__ARB_BINANCE_HTTP_STATUS__:") else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Binance private signed GET lacked HTTP status marker".to_owned(),
+        });
+    };
+    let status_code = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: "Binance private signed GET returned malformed HTTP status".to_owned(),
+        })?;
+    if !(200..=299).contains(&status_code) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Binance private signed GET returned HTTP {status_code}: {}",
+                response_snippet(body)
+            ),
+        });
+    }
+    Ok(body.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn curl_config_quote_runtime(value: &str) -> RuntimeResult<String> {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'\\' => escaped.push_str("\\\\"),
+            b'"' => escaped.push_str("\\\""),
+            0 | b'\n' | b'\r' => {
+                return Err(RuntimeError::UnsafeConfig {
+                    message: "curl config value contains unsupported control bytes".to_owned(),
+                });
+            }
+            byte if byte.is_ascii_control() => {
+                return Err(RuntimeError::UnsafeConfig {
+                    message: "curl config value contains unsupported control bytes".to_owned(),
+                });
+            }
+            _ => escaped.push(byte as char),
+        }
+    }
+    Ok(escaped)
+}
+
+#[cfg(feature = "live-exec")]
+fn response_snippet(body: &str) -> String {
+    const MAX_LEN: usize = 256;
+    if body.len() <= MAX_LEN {
+        body.to_owned()
+    } else {
+        format!("{}...", &body[..MAX_LEN])
+    }
+}
+
+fn write_binance_guarded_live_auto_once_artifacts(
+    output_dir: &Path,
+    report: &BinanceGuardedLiveAutoOnceReport,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("auto_once_report.json"),
+        &format!("{}\n", auto_once_report_json(report)),
+    )?;
+    write_utf8(
+        output_dir.join("auto_once_report.md"),
+        &auto_once_report_markdown(report),
+    )
+}
+
+fn auto_once_report_json(report: &BinanceGuardedLiveAutoOnceReport) -> String {
+    format!(
+        "{{\"approval_event_id\":{},\"best_ask\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"max_ask\":{},\"plan_hash\":{},\"private_confirmation_count\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"source_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        optional_json_string_universal(report.approval_event_id.as_deref()),
+        optional_json_string_universal(report.best_ask.as_deref()),
+        report
+            .blocking_reasons
+            .iter()
+            .map(|reason| json_string(reason))
+            .collect::<Vec<_>>()
+            .join(","),
+        report.dispatch_allowed,
+        report.dispatch_attempted,
+        optional_json_string_universal(report.execution_report_status.as_deref()),
+        report.manual_gate_released,
+        optional_json_string_universal(report.max_ask.as_deref()),
+        optional_json_string_universal(report.plan_hash.as_deref()),
+        report.private_confirmation_count,
+        report.signal_allowed,
+        optional_json_string_universal(report.source_event_id.as_deref()),
+        json_string(&report.strategy_id),
+        report.submitted_receipt_count,
+        json_string(&report.symbol),
+    )
+}
+
+fn auto_once_report_markdown(report: &BinanceGuardedLiveAutoOnceReport) -> String {
+    let reasons = if report.blocking_reasons.is_empty() {
+        "- none".to_owned()
+    } else {
+        report
+            .blocking_reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"# Binance BTCUSDT Auto Once
+
+中文说明：本文件记录从最新公开行情到策略信号、审批事实和执行门禁的一次自动链路结果。密钥、签名 query 和原始私有账户响应不会写入本文件。
+
+- Symbol: {symbol}
+- Strategy: {strategy_id}
+- Source event: {source_event}
+- Best ask: {best_ask}
+- Max ask: {max_ask}
+- Signal allowed: {signal_allowed}
+- Plan hash: {plan_hash}
+- Approval event: {approval_event}
+- Manual gate released: {manual_gate_released}
+- Dispatch attempted: {dispatch_attempted}
+- Dispatch allowed: {dispatch_allowed}
+- Submitted receipts: {submitted_receipt_count}
+- Private confirmations: {private_confirmation_count}
+- Execution report status: {execution_report_status}
+
+## Blocking Reasons
+
+{reasons}
+"#,
+        symbol = report.symbol,
+        strategy_id = report.strategy_id,
+        source_event = report.source_event_id.as_deref().unwrap_or("none"),
+        best_ask = report.best_ask.as_deref().unwrap_or("none"),
+        max_ask = report.max_ask.as_deref().unwrap_or("none"),
+        signal_allowed = report.signal_allowed,
+        plan_hash = report.plan_hash.as_deref().unwrap_or("none"),
+        approval_event = report.approval_event_id.as_deref().unwrap_or("none"),
+        manual_gate_released = report.manual_gate_released,
+        dispatch_attempted = report.dispatch_attempted,
+        dispatch_allowed = report.dispatch_allowed,
+        submitted_receipt_count = report.submitted_receipt_count,
+        private_confirmation_count = report.private_confirmation_count,
+        execution_report_status = report.execution_report_status.as_deref().unwrap_or("none"),
+        reasons = reasons,
+    )
+}
+
+fn optional_json_string_universal(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn write_binance_basis_guarded_live_auto_once_artifacts(
+    output_dir: &Path,
+    report: &BinanceBasisGuardedLiveAutoOnceReport,
+    receipts: &[MutableActionReceipt],
+    confirmations: &[arb_execution::PrivateOrderConfirmation],
+    execution_report: Option<&ExecutionReport>,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("basis_auto_once_report.json"),
+        &format!("{}\n", basis_auto_once_report_json(report)),
+    )?;
+    write_utf8(
+        output_dir.join("basis_auto_once_report.md"),
+        &basis_auto_once_report_markdown(report),
+    )?;
+    write_utf8(
+        output_dir.join("mutable_receipts.jsonl"),
+        &mutable_receipts_jsonl(receipts),
+    )?;
+    write_utf8(
+        output_dir.join("private_confirmations.jsonl"),
+        &private_confirmations_jsonl(confirmations),
+    )?;
+    write_utf8(
+        output_dir.join("execution_reports.jsonl"),
+        &execution_report
+            .map(|report| canonical_jsonl(std::slice::from_ref(report)))
+            .unwrap_or_default(),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_auto_once_report_json(report: &BinanceBasisGuardedLiveAutoOnceReport) -> String {
+    format!(
+        "{{\"approval_event_id\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"net_bps\":{},\"perp_bid\":{},\"perp_event_id\":{},\"planned_order_count\":{},\"plan_hash\":{},\"premium_event_id\":{},\"private_confirmation_count\":{},\"protection_actions\":[{}],\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"spot_ask\":{},\"spot_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        optional_json_string_universal(report.approval_event_id.as_deref()),
+        report
+            .blocking_reasons
+            .iter()
+            .map(|reason| json_string(reason))
+            .collect::<Vec<_>>()
+            .join(","),
+        report.dispatch_allowed,
+        report.dispatch_attempted,
+        optional_json_string_universal(report.execution_report_status.as_deref()),
+        report.manual_gate_released,
+        report
+            .net_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        optional_json_string_universal(report.perp_bid.as_deref()),
+        optional_json_string_universal(report.perp_event_id.as_deref()),
+        report.planned_order_count,
+        optional_json_string_universal(report.plan_hash.as_deref()),
+        optional_json_string_universal(report.premium_event_id.as_deref()),
+        report.private_confirmation_count,
+        report
+            .protection_actions
+            .iter()
+            .map(|action| json_string(action))
+            .collect::<Vec<_>>()
+            .join(","),
+        report.protection_attempted,
+        report.protection_receipt_count,
+        optional_json_string_universal(report.residual_risk.as_deref()),
+        report.signal_allowed,
+        optional_json_string_universal(report.spot_ask.as_deref()),
+        optional_json_string_universal(report.spot_event_id.as_deref()),
+        json_string(&report.strategy_id),
+        report.submitted_receipt_count,
+        json_string(&report.symbol),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_auto_once_report_markdown(report: &BinanceBasisGuardedLiveAutoOnceReport) -> String {
+    let reasons = if report.blocking_reasons.is_empty() {
+        "- none".to_owned()
+    } else {
+        report
+            .blocking_reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let protection_actions = if report.protection_actions.is_empty() {
+        "- none".to_owned()
+    } else {
+        report
+            .protection_actions
+            .iter()
+            .map(|action| format!("- {action}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"# Binance Basis GuardedLive Auto Once
+
+中文说明：本文件记录 Binance spot-perp basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 USD-M perp short，两腿下单需要显式实盘确认。
+
+- Symbol: {symbol}
+- Strategy: {strategy_id}
+- Spot ask: {spot_ask}
+- Perp bid: {perp_bid}
+- Net bps: {net_bps}
+- Signal allowed: {signal_allowed}
+- Plan hash: {plan_hash}
+- Approval event: {approval_event}
+- Manual gate released: {manual_gate_released}
+- Planned orders: {planned_order_count}
+- Dispatch attempted: {dispatch_attempted}
+- Dispatch allowed: {dispatch_allowed}
+- Submitted receipts: {submitted_receipt_count}
+- Private confirmations: {private_confirmation_count}
+- Protection attempted: {protection_attempted}
+- Protection receipts: {protection_receipt_count}
+- Residual risk: {residual_risk}
+- Execution report status: {execution_report_status}
+
+## Protection Actions
+
+{protection_actions}
+
+## Blocking Reasons
+
+{reasons}
+"#,
+        symbol = report.symbol,
+        strategy_id = report.strategy_id,
+        spot_ask = report.spot_ask.as_deref().unwrap_or("none"),
+        perp_bid = report.perp_bid.as_deref().unwrap_or("none"),
+        net_bps = report
+            .net_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        signal_allowed = report.signal_allowed,
+        plan_hash = report.plan_hash.as_deref().unwrap_or("none"),
+        approval_event = report.approval_event_id.as_deref().unwrap_or("none"),
+        manual_gate_released = report.manual_gate_released,
+        planned_order_count = report.planned_order_count,
+        dispatch_attempted = report.dispatch_attempted,
+        dispatch_allowed = report.dispatch_allowed,
+        submitted_receipt_count = report.submitted_receipt_count,
+        private_confirmation_count = report.private_confirmation_count,
+        protection_attempted = report.protection_attempted,
+        protection_receipt_count = report.protection_receipt_count,
+        residual_risk = report.residual_risk.as_deref().unwrap_or("none"),
+        execution_report_status = report.execution_report_status.as_deref().unwrap_or("none"),
+        protection_actions = protection_actions,
+        reasons = reasons,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn write_binance_guarded_live_dispatch_artifacts(
+    output_dir: &Path,
+    report: &BinanceGuardedLiveDispatchReport,
+    receipts: &[MutableActionReceipt],
+    confirmations: &[arb_execution::PrivateOrderConfirmation],
+    execution_report: Option<&ExecutionReport>,
+    pre_account_event: Option<&str>,
+    post_account_event: Option<&str>,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("live_dispatch_report.json"),
+        &format!("{}\n", live_dispatch_report_json(report)),
+    )?;
+    write_utf8(
+        output_dir.join("live_dispatch_report.md"),
+        &live_dispatch_report_markdown(report),
+    )?;
+    write_utf8(
+        output_dir.join("mutable_receipts.jsonl"),
+        &mutable_receipts_jsonl(receipts),
+    )?;
+    write_utf8(
+        output_dir.join("private_confirmations.jsonl"),
+        &private_confirmations_jsonl(confirmations),
+    )?;
+    write_utf8(
+        output_dir.join("execution_reports.jsonl"),
+        &execution_report
+            .map(|report| canonical_jsonl(std::slice::from_ref(report)))
+            .unwrap_or_default(),
+    )?;
+    write_utf8(
+        output_dir.join("private_account_events.jsonl"),
+        &private_account_events_jsonl(pre_account_event, post_account_event),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn live_dispatch_report_json(report: &BinanceGuardedLiveDispatchReport) -> String {
+    format!(
+        "{{\"approval_event_id\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"execution_report_status\":{},\"plan_hash\":{},\"plan_id\":{},\"post_account_balance_event_id\":{},\"pre_account_balance_event_id\":{},\"private_confirmation_count\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{}}}",
+        json_string(&report.approval_event_id),
+        report
+            .blocking_reasons
+            .iter()
+            .map(|reason| json_string(reason))
+            .collect::<Vec<_>>()
+            .join(","),
+        report.dispatch_allowed,
+        optional_json_string(report.execution_report_status.as_deref()),
+        json_string(&report.plan_hash),
+        json_string(&report.plan_id),
+        optional_json_string(report.post_account_balance_event_id.as_deref()),
+        optional_json_string(report.pre_account_balance_event_id.as_deref()),
+        report.private_confirmation_count,
+        report.submitted_receipt_count,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn live_dispatch_report_markdown(report: &BinanceGuardedLiveDispatchReport) -> String {
+    format!(
+        r#"# Binance BTCUSDT GuardedLive Dispatch
+
+中文说明：本文件记录受控实盘分发结果。API key、secret、签名 query 和原始私有账户响应不会写入本文件。
+
+- Plan: {plan_id}
+- Plan hash: {plan_hash}
+- Approval event: {approval_event_id}
+- Dispatch allowed: {dispatch_allowed}
+- Submitted receipts: {submitted_receipt_count}
+- Private confirmations: {private_confirmation_count}
+- Execution report status: {execution_report_status}
+- Pre account balance event: {pre_event}
+- Post account balance event: {post_event}
+
+## Blocking Reasons
+
+{blocking_reasons}
+"#,
+        plan_id = report.plan_id,
+        plan_hash = report.plan_hash,
+        approval_event_id = report.approval_event_id,
+        dispatch_allowed = report.dispatch_allowed,
+        submitted_receipt_count = report.submitted_receipt_count,
+        private_confirmation_count = report.private_confirmation_count,
+        execution_report_status = report.execution_report_status.as_deref().unwrap_or("none"),
+        pre_event = report
+            .pre_account_balance_event_id
+            .as_deref()
+            .unwrap_or("none"),
+        post_event = report
+            .post_account_balance_event_id
+            .as_deref()
+            .unwrap_or("none"),
+        blocking_reasons = if report.blocking_reasons.is_empty() {
+            "- none".to_owned()
+        } else {
+            report
+                .blocking_reasons
+                .iter()
+                .map(|reason| format!("- {reason}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn mutable_receipts_jsonl(receipts: &[MutableActionReceipt]) -> String {
+    receipts
+        .iter()
+        .map(mutable_receipt_json)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(feature = "live-exec")]
+fn mutable_receipt_json(receipt: &MutableActionReceipt) -> String {
+    format!(
+        "{{\"action_id\":{},\"duplicate\":{},\"external_ref\":{},\"idempotency_key\":{},\"kind\":{},\"simulated\":{},\"status\":{},\"venue_id\":{}}}",
+        json_string(receipt.action_id.as_str()),
+        receipt.duplicate,
+        receipt
+            .external_ref
+            .as_ref()
+            .map(external_action_ref_json)
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(receipt.idempotency_key.as_str()),
+        json_string(receipt.kind.as_str()),
+        receipt.simulated,
+        json_string(receipt.status.as_str()),
+        json_string(receipt.venue_id.as_str()),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn external_action_ref_json(ref_value: &ExternalActionRef) -> String {
+    match ref_value {
+        ExternalActionRef::Order(order_id) => {
+            format!(
+                "{{\"kind\":\"order\",\"value\":{}}}",
+                json_string(order_id.as_str())
+            )
+        }
+        ExternalActionRef::Cancel(action_id) => format!(
+            "{{\"kind\":\"cancel\",\"value\":{}}}",
+            json_string(action_id.as_str())
+        ),
+        ExternalActionRef::Transfer(transfer_id) => format!(
+            "{{\"kind\":\"transfer\",\"value\":{}}}",
+            json_string(transfer_id.as_str())
+        ),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn private_confirmations_jsonl(
+    confirmations: &[arb_execution::PrivateOrderConfirmation],
+) -> String {
+    confirmations
+        .iter()
+        .map(private_confirmation_json)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(feature = "live-exec")]
+fn private_confirmation_json(confirmation: &arb_execution::PrivateOrderConfirmation) -> String {
+    format!(
+        "{{\"client_order_id\":{},\"detail\":{},\"fill_count\":{},\"plan_leg_id\":{},\"source\":{},\"source_event_refs\":[{}],\"status\":{},\"venue_order_id\":{}}}",
+        optional_json_string(confirmation.client_order_id.as_deref()),
+        optional_json_string(confirmation.detail.as_deref()),
+        confirmation.fills.len(),
+        json_string(&confirmation.plan_leg_id),
+        json_string(confirmation.source.as_str()),
+        confirmation
+            .source_event_refs
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(","),
+        json_string(confirmation.status.as_str()),
+        optional_json_string(confirmation.venue_order_id.as_deref()),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn private_account_events_jsonl(pre: Option<&str>, post: Option<&str>) -> String {
+    [pre, post]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(feature = "live-exec")]
+fn optional_json_string(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_owned())
 }
 
 fn json_string_field(input: &str, field: &str) -> RuntimeResult<String> {
@@ -9258,6 +12952,83 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "binance-guarded-live-dispatch" {
+        let options = parse_binance_guarded_live_dispatch_args(&args[1..])?;
+        let report = run_binance_guarded_live_dispatch(options)?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: Binance BTCUSDT GuardedLive dispatch completed; plan_hash={}; approval_event_id={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; execution_report_status={}; blocking_reasons={}{}",
+            report.plan_hash,
+            report.approval_event_id,
+            report.dispatch_allowed,
+            report.submitted_receipt_count,
+            report.private_confirmation_count,
+            report
+                .execution_report_status
+                .as_deref()
+                .unwrap_or("none"),
+            report.blocking_reasons.len(),
+            output_note
+        ));
+    }
+    if args[0] == "binance-guarded-live-auto-once" {
+        let options = parse_binance_guarded_live_auto_once_args(&args[1..])?;
+        let report = run_binance_guarded_live_auto_once(options)?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: Binance BTCUSDT auto-once completed; signal_allowed={}; plan_hash={}; manual_gate_released={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; blocking_reasons={}{}",
+            report.signal_allowed,
+            report.plan_hash.as_deref().unwrap_or("none"),
+            report.manual_gate_released,
+            report.dispatch_attempted,
+            report.dispatch_allowed,
+            report.submitted_receipt_count,
+            report.private_confirmation_count,
+            report.blocking_reasons.len(),
+            output_note
+        ));
+    }
+    if args[0] == "binance-basis-guarded-live-auto-once" {
+        let options = parse_binance_basis_guarded_live_auto_once_args(&args[1..])?;
+        let report = run_binance_basis_guarded_live_auto_once(options)?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: Binance basis auto-once completed; signal_allowed={}; net_bps={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
+            report.signal_allowed,
+            report
+                .net_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            report.planned_order_count,
+            report.dispatch_attempted,
+            report.dispatch_allowed,
+            report.submitted_receipt_count,
+            report.private_confirmation_count,
+            report.protection_attempted,
+            report.protection_receipt_count,
+            report.residual_risk.as_deref().unwrap_or("none"),
+            report.blocking_reasons.len(),
+            output_note
+        ));
+    }
     if args[0] == "binance-wss-book-ticker" {
         let options = parse_binance_wss_book_ticker_args(&args[1..])?;
         let once = options.once;
@@ -9422,7 +13193,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
                 args[0]
             ),
         });
@@ -9450,7 +13221,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
 fn help_text() -> String {
     [
         "arb-runtime",
-        "中文说明：只运行离线、模拟、可回放的运行时装配。",
+        "中文说明：默认只运行离线、模拟、可回放的运行时装配；实盘分发命令需要 live-exec 构建和显式确认。",
         "中文说明：fixture_root 可使用仓库根目录相对路径，例如 fixtures/replay/full_pipeline_simulated。",
         "",
         "Commands:",
@@ -9469,6 +13240,12 @@ fn help_text() -> String {
         "                                    Consume Approved manual record and generate a non-dispatching manual gate release fact preview",
         "  binance-guarded-live-pre-dispatch-dry-run [--preview-dir dir] [--config path] [--out dir]",
         "                                    Run fail-closed pre-dispatch dry run after manual gate release preview",
+        "  binance-guarded-live-dispatch [--preview-dir dir] [--config path] [--out dir] --i-understand-live-orders",
+        "                                    live-exec only: submit the approved GuardedLive BTCUSDT order and query private confirmation",
+        "  binance-guarded-live-auto-once [--config path] [--out dir] [--max-ask price] [--execute-live --i-understand-auto-live-orders]",
+        "                                    Single-leg smoke path: fetch fresh Binance BTCUSDT spot quote, then dry-run or explicitly submit live",
+        "  binance-basis-guarded-live-auto-once [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Two-leg basis path: buy Binance Spot and short Binance USD-M perp after guarded live gates; live mode requires WSS monitor quotes",
         "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
         "  binance-basis-monitor [--bind 127.0.0.1:8796] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
@@ -9511,6 +13288,9 @@ struct BinancePreDispatchDryRunCliOptions {
     config_path: PathBuf,
     output_dir: Option<PathBuf>,
 }
+type BinanceGuardedLiveDispatchCliOptions = BinanceGuardedLiveDispatchOptions;
+type BinanceGuardedLiveAutoOnceCliOptions = BinanceGuardedLiveAutoOnceOptions;
+type BinanceBasisGuardedLiveAutoOnceCliOptions = BinanceBasisGuardedLiveAutoOnceOptions;
 type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
 type BinanceWssBookTickerCliOptions = BinanceWssBookTickerMonitorOptions;
 type BybitBasisMonitorCliOptions = BybitBasisMonitorOptions;
@@ -9887,6 +13667,245 @@ fn parse_binance_pre_dispatch_dry_run_args(
         preview_dir,
         config_path,
         output_dir,
+    })
+}
+
+fn parse_binance_guarded_live_dispatch_args(
+    args: &[String],
+) -> RuntimeResult<BinanceGuardedLiveDispatchCliOptions> {
+    let mut preview_dir = PathBuf::from(BINANCE_GUARDED_LIVE_PREVIEW_DEFAULT_OUT);
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut acknowledge_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--preview-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--preview-dir requires a directory"));
+                };
+                preview_dir = PathBuf::from(value);
+            }
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--i-understand-live-orders" => {
+                acknowledge_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-guarded-live-dispatch option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-guarded-live-dispatch positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceGuardedLiveDispatchOptions {
+        preview_dir,
+        config_path,
+        output_dir,
+        acknowledge_live_orders,
+    })
+}
+
+fn parse_binance_guarded_live_auto_once_args(
+    args: &[String],
+) -> RuntimeResult<BinanceGuardedLiveAutoOnceCliOptions> {
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut max_ask = None;
+    let mut execute_live = false;
+    let mut acknowledge_auto_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--max-ask" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-ask requires a price"));
+                };
+                Decimal::from_str(value)?;
+                max_ask = Some(value.clone());
+            }
+            "--execute-live" => {
+                execute_live = true;
+            }
+            "--dry-run" => {
+                execute_live = false;
+            }
+            "--i-understand-auto-live-orders" => {
+                acknowledge_auto_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-guarded-live-auto-once option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-guarded-live-auto-once positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceGuardedLiveAutoOnceOptions {
+        config_path,
+        output_dir,
+        max_ask,
+        execute_live,
+        acknowledge_auto_live_orders,
+    })
+}
+
+fn parse_binance_basis_guarded_live_auto_once_args(
+    args: &[String],
+) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceCliOptions> {
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut max_spot_ask = None;
+    let mut min_perp_bid = None;
+    let mut spot_wss_monitor_url = None;
+    let mut perp_wss_monitor_url = None;
+    let mut private_order_events_dir = None;
+    let mut execute_live = false;
+    let mut acknowledge_basis_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-bps requires an integer"));
+                };
+                min_net_bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!("--min-net-bps must be an integer: {error}"))
+                })?;
+            }
+            "--max-spot-ask" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-spot-ask requires a price"));
+                };
+                Decimal::from_str(value)?;
+                max_spot_ask = Some(value.clone());
+            }
+            "--min-perp-bid" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-perp-bid requires a price"));
+                };
+                Decimal::from_str(value)?;
+                min_perp_bid = Some(value.clone());
+            }
+            "--spot-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--spot-wss-monitor-url requires a URL"));
+                };
+                spot_wss_monitor_url = Some(value.clone());
+            }
+            "--perp-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--perp-wss-monitor-url requires a URL"));
+                };
+                perp_wss_monitor_url = Some(value.clone());
+            }
+            "--private-order-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-order-events-dir requires a directory",
+                    ));
+                };
+                private_order_events_dir = Some(PathBuf::from(value));
+            }
+            "--execute-live" => {
+                execute_live = true;
+            }
+            "--dry-run" => {
+                execute_live = false;
+            }
+            "--i-understand-basis-live-orders" => {
+                acknowledge_basis_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-basis-guarded-live-auto-once option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-basis-guarded-live-auto-once positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(BinanceBasisGuardedLiveAutoOnceOptions {
+        config_path,
+        output_dir,
+        min_net_bps,
+        max_spot_ask,
+        min_perp_bid,
+        spot_wss_monitor_url,
+        perp_wss_monitor_url,
+        private_order_events_dir,
+        execute_live,
+        acknowledge_basis_live_orders,
     })
 }
 
@@ -10703,6 +14722,88 @@ mod tests {
         assert!(status.contains("\"last_error\":\"forced fail closed for test\""));
     }
 
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_live_wss_monitor_quote_becomes_book_ticker_input() {
+        let raw = r#"{
+          "status":"streaming",
+          "market":"Spot",
+          "fail_closed":false,
+          "wss_update_count":3,
+          "last_error":null,
+          "rows":[{
+            "symbol":"BTCUSDT",
+            "venue_id":"venue:BINANCE-SPOT",
+            "instrument_id":"inst:BINANCE:BTCUSDT:SPOT",
+            "best_bid":"100.01",
+            "best_ask":"100.02",
+            "bid_size":"1.2",
+            "ask_size":"1.3",
+            "source_sequence":"2",
+            "source_event_id":"event:venue-data:binance-public:wss-book-ticker:spot:BTCUSDT:2:u400900301",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          }]
+        }"#;
+
+        let quote = parse_binance_wss_monitor_quote_for_basis(
+            raw,
+            "http://127.0.0.1:8801/api/binance-wss-book-ticker/status",
+            BASIS_SYMBOL,
+            BinancePublicMarket::Spot,
+            BASIS_SPOT_VENUE_ID,
+            BASIS_SPOT_INSTRUMENT_ID,
+            UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at"),
+        )
+        .expect("monitor quote");
+        let book = binance_wss_monitor_quote_to_book_ticker_json(&quote).expect("book ticker json");
+
+        assert!(book.contains("\"symbol\":\"BTCUSDT\""));
+        assert!(book.contains("\"bidPrice\":\"100.01\""));
+        assert!(book.contains("\"askPrice\":\"100.02\""));
+        assert!(book.contains("\"time\":1778630401000"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_live_wss_monitor_rejects_rest_bootstrap_quote() {
+        let raw = r#"{
+          "status":"streaming",
+          "market":"Spot",
+          "fail_closed":false,
+          "wss_update_count":1,
+          "last_error":null,
+          "latest_quote":{
+            "symbol":"BTCUSDT",
+            "venue_id":"venue:BINANCE-SPOT",
+            "instrument_id":"inst:BINANCE:BTCUSDT:SPOT",
+            "best_bid":"100.01",
+            "best_ask":"100.02",
+            "bid_size":"1.2",
+            "ask_size":"1.3",
+            "source_sequence":"1",
+            "source_event_id":"event:venue-data:binance-public:book-ticker:spot:BTCUSDT:1:raw",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          }
+        }"#;
+
+        let error = parse_binance_wss_monitor_quote_for_basis(
+            raw,
+            "http://127.0.0.1:8801/api/binance-wss-book-ticker/status",
+            BASIS_SYMBOL,
+            BinancePublicMarket::Spot,
+            BASIS_SPOT_VENUE_ID,
+            BASIS_SPOT_INSTRUMENT_ID,
+            UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at"),
+        )
+        .expect_err("REST bootstrap quote must be rejected for live execution");
+
+        assert!(error.to_string().contains("not from WSS bookTicker"));
+    }
+
     #[test]
     fn binance_wss_book_ticker_dashboard_requests_realtime_api_paths() {
         let html = binance_wss_book_ticker_dashboard_html();
@@ -10845,6 +14946,66 @@ mod tests {
     }
 
     #[test]
+    fn bybit_basis_pipeline_promotes_normalized_events_to_risk_fact() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let events = vec![
+            from_json_strict::<NormalizedEvent>(
+                r#"{"checksum":"sha256:test-bybit-basis-spot-book","correlation_id":"corr:bybit-basis-001","event_id":"event:test:bybit-basis:spot-book:001","event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":"inst:BYBIT:BTCUSDT:SPOT","payload":{"adapter":"bybit-public-rest","ask_size":"2.0","basis_role":"Spot","best_ask":"100.00","best_bid":"99.90","bid_size":"1.0","freshness":"Fresh","kind":"BookTicker","market":"Spot","risk_reason_code":"OK","venue_symbol":"BTCUSDT"},"schema_version":"1.0.0","source":"bybit-public-rest","source_sequence":"spot-book-001","timestamp_event":"2026-05-13T00:00:00Z","timestamp_ingested":"2026-05-13T00:00:00Z","venue_id":"venue:BYBIT-SPOT"}"#,
+            )
+            .expect("spot event"),
+            from_json_strict::<NormalizedEvent>(
+                r#"{"checksum":"sha256:test-bybit-basis-perp-book","correlation_id":"corr:bybit-basis-001","event_id":"event:test:bybit-basis:perp-book:001","event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":"inst:BYBIT:BTCUSDT:LINEAR-PERP","payload":{"adapter":"bybit-public-rest","ask_size":"2.5","basis_role":"Perp","best_ask":"101.10","best_bid":"101.00","bid_size":"1.5","freshness":"Fresh","kind":"BookTicker","market":"LinearPerp","risk_reason_code":"OK","venue_symbol":"BTCUSDT"},"schema_version":"1.0.0","source":"bybit-public-rest","source_sequence":"perp-book-001","timestamp_event":"2026-05-13T00:00:00Z","timestamp_ingested":"2026-05-13T00:00:00Z","venue_id":"venue:BYBIT-LINEAR"}"#,
+            )
+            .expect("perp event"),
+            from_json_strict::<NormalizedEvent>(
+                r#"{"checksum":"sha256:test-bybit-basis-premium","correlation_id":"corr:bybit-basis-001","event_id":"event:test:bybit-basis:premium:001","event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":"inst:BYBIT:BTCUSDT:LINEAR-PERP","payload":{"adapter":"bybit-public-rest","basis_role":"Perp","funding_interval_hours":"8","index_price":"100.00","kind":"PerpPremiumIndex","last_funding_rate":"0.00010000","mark_price":"101.00","next_funding_time_ms":1778659200000,"risk_reason_code":"OK","venue_symbol":"BTCUSDT"},"schema_version":"1.0.0","source":"bybit-public-rest","source_sequence":"premium-001","timestamp_event":"2026-05-13T00:00:00Z","timestamp_ingested":"2026-05-13T00:00:00Z","venue_id":"venue:BYBIT-LINEAR"}"#,
+            )
+            .expect("premium event"),
+        ];
+        let spec = BasisPipelineSpec::bybit_btcusdt().expect("basis spec");
+
+        let artifacts = assemble_public_basis_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("basis pipeline artifacts");
+
+        assert!(artifacts.stored_events_jsonl.contains("venue:BYBIT-SPOT"));
+        assert!(artifacts.stored_events_jsonl.contains("venue:BYBIT-LINEAR"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:bybit-basis-btcusdt-001"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("strat:bybit-spot-perp-basis"));
+        assert!(!artifacts.risk_decisions_jsonl.is_empty());
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+        assert!(artifacts.execution_plans_jsonl.is_empty());
+    }
+
+    #[test]
+    fn basis_pipeline_spec_rejects_missing_strategy_venue_capability() {
+        let capabilities = load_bybit_basis_capabilities()
+            .expect("capabilities")
+            .into_iter()
+            .filter(|capability| capability.venue_id.as_str() != "venue:BYBIT-LINEAR")
+            .collect::<Vec<_>>();
+
+        let error = BasisPipelineSpec::new(
+            SpotPerpBasisStrategyConfig::bybit_btcusdt(),
+            capabilities,
+            "state:test:missing-bybit-linear-capability",
+            "hash:test:missing-bybit-linear-capability",
+        )
+        .expect_err("missing perp venue capability must fail closed");
+
+        assert!(error.to_string().contains("venue:BYBIT-LINEAR"));
+    }
+
+    #[test]
     fn binance_guarded_live_preview_writes_pending_manual_confirmation_artifacts() {
         let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
         let perp = r#"{"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778630400000}"#;
@@ -10954,6 +15115,552 @@ mod tests {
         assert!(read_utf8(&preview_dir.join("pre_dispatch_dry_run.json"))
             .expect("dry run")
             .contains("\"dispatch_allowed\":false"));
+    }
+
+    #[test]
+    fn binance_guarded_live_auto_once_runs_fresh_signal_to_dry_run_gate() {
+        let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_blocked_by_kill_switch_yaml()).expect("write config");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_binance_guarded_live_auto_once_from_spot_json(
+            spot,
+            "test:binance-spot-book",
+            ingested_at,
+            BinanceGuardedLiveAutoOnceOptions {
+                config_path,
+                output_dir: Some(root.path().join("auto")),
+                max_ask: Some("101.00".to_owned()),
+                execute_live: false,
+                acknowledge_auto_live_orders: false,
+            },
+        )
+        .expect("auto once dry run");
+
+        assert!(report.signal_allowed);
+        assert!(report
+            .plan_hash
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("hash:sha256:")));
+        assert!(report.manual_gate_released);
+        assert!(!report.dispatch_attempted);
+        assert!(!report.dispatch_allowed);
+        assert!(report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("dry-run mode")));
+        let output_dir = report.output_dir.as_ref().expect("output dir");
+        assert!(read_utf8(&output_dir.join("market/stored_events.jsonl"))
+            .expect("market events")
+            .contains("venue:BINANCE-SPOT"));
+        assert!(
+            read_utf8(&output_dir.join("preview/approval_records.jsonl"))
+                .expect("approval")
+                .contains("system:guarded-live-auto-strategy")
+        );
+        assert!(read_utf8(&output_dir.join("auto_once_report.json"))
+            .expect("auto report")
+            .contains("\"signal_allowed\":true"));
+    }
+
+    #[test]
+    fn binance_guarded_live_auto_once_blocks_live_without_price_guard() {
+        let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_binance_guarded_live_auto_once_from_spot_json(
+            spot,
+            "test:binance-spot-book",
+            ingested_at,
+            BinanceGuardedLiveAutoOnceOptions {
+                config_path: root.path().join("unused.yaml"),
+                output_dir: Some(root.path().join("auto")),
+                max_ask: None,
+                execute_live: true,
+                acknowledge_auto_live_orders: true,
+            },
+        )
+        .expect("blocked before live dispatch");
+
+        assert!(!report.signal_allowed);
+        assert!(!report.dispatch_attempted);
+        assert!(report.plan_hash.is_none());
+        assert!(report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("--max-ask")));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_guarded_live_auto_once_builds_two_leg_dry_run() {
+        let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
+        let perp = r#"{"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778630400000}"#;
+        let premium = r#"{"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_binance_basis_guarded_live_auto_once_from_json(
+            spot,
+            "test:binance-spot-book",
+            perp,
+            "test:binance-usdm-book",
+            premium,
+            "test:binance-usdm-premium",
+            ingested_at,
+            BinanceBasisGuardedLiveAutoOnceOptions {
+                config_path,
+                output_dir: Some(root.path().join("basis-auto")),
+                min_net_bps: 5,
+                max_spot_ask: Some("101.00".to_owned()),
+                min_perp_bid: Some("100.50".to_owned()),
+                spot_wss_monitor_url: None,
+                perp_wss_monitor_url: None,
+                private_order_events_dir: None,
+                execute_live: false,
+                acknowledge_basis_live_orders: false,
+            },
+        )
+        .expect("basis auto once dry run");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.planned_order_count, 2);
+        assert!(report.manual_gate_released);
+        assert!(!report.dispatch_attempted);
+        assert!(!report.dispatch_allowed);
+        assert!(report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("dry-run mode")));
+        let output_dir = report.output_dir.as_ref().expect("output dir");
+        let plan_preview =
+            read_utf8(&output_dir.join("preview/plan_preview.json")).expect("plan preview");
+        assert!(plan_preview.contains("\"basis_leg_role\":\"spot_buy\""));
+        assert!(plan_preview.contains("\"basis_leg_role\":\"perp_short\""));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvbS"));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvbP"));
+        let report_json =
+            read_utf8(&output_dir.join("basis_auto_once_report.json")).expect("auto report");
+        assert!(report_json.contains("\"planned_order_count\":2"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_live_dispatch_unwinds_spot_when_perp_rejected_after_spot_fill() {
+        let spot = test_basis_planned_order(
+            "spot_buy",
+            BASIS_SPOT_VENUE_ID,
+            BASIS_SPOT_INSTRUMENT_ID,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvbS1778630400",
+            "idem:test:basis:spot",
+        );
+        let perp = test_basis_planned_order(
+            "perp_short",
+            BASIS_PERP_VENUE_ID,
+            BASIS_PERP_INSTRUMENT_ID,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvbP1778630400",
+            "idem:test:basis:perp",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:binance-basis-protection".to_owned(),
+            requests: vec![spot, perp],
+        };
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BASIS_SPOT_VENUE_ID,
+                    "spot-submit",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BASIS_SPOT_VENUE_ID,
+                    "spot-unwind",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::BinancePrivateOrderMarket::Spot,
+                    BASIS_SPOT_VENUE_ID,
+                    BASIS_SPOT_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("0.100"),
+                    Some(OrderSide::Buy),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::BinancePrivateOrderMarket::Spot,
+                    BASIS_SPOT_VENUE_ID,
+                    BASIS_SPOT_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("0.100"),
+                    Some(OrderSide::Sell),
+                )),
+            ],
+        );
+        let mut usdm_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Err(VenueExecError::ExternalRejected {
+                venue_id: VenueId::new(BASIS_PERP_VENUE_ID).expect("venue"),
+                endpoint: "/fapi/v1/order".to_owned(),
+                status_code: 400,
+                reason: "fixture perp reject".to_owned(),
+            })],
+            vec![],
+            vec![],
+        );
+
+        let outcome = execute_binance_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut usdm_adapter,
+            BinanceBasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630400",
+                private_order_events: None,
+            },
+        )
+        .expect("protected dispatch outcome");
+
+        assert_eq!(outcome.primary_submit_receipt_count, 1);
+        assert!(outcome.protection.attempted);
+        assert_eq!(outcome.protection.receipt_count, 1);
+        assert!(outcome.protection.residual_risk.is_none());
+        assert!(outcome
+            .protection
+            .actions
+            .iter()
+            .any(|action| action.contains("spot_unwind_sell:perp-submit-failed")));
+        assert_eq!(spot_adapter.submitted.len(), 2);
+        assert_eq!(spot_adapter.submitted[1].side, OrderSide::Sell);
+        assert_eq!(spot_adapter.submitted[1].quantity.to_string(), "0.100");
+        assert_eq!(
+            spot_adapter.submitted[1]
+                .limit_price
+                .expect("unwind limit")
+                .to_string(),
+            "99.90"
+        );
+        assert_eq!(usdm_adapter.submitted.len(), 1);
+        assert!(outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("perp hedge submit failed")));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_live_dispatch_prefers_private_stream_confirmations() {
+        let spot = test_basis_planned_order(
+            "spot_buy",
+            BASIS_SPOT_VENUE_ID,
+            BASIS_SPOT_INSTRUMENT_ID,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvbS1778630400",
+            "idem:test:basis:spot",
+        );
+        let perp = test_basis_planned_order(
+            "perp_short",
+            BASIS_PERP_VENUE_ID,
+            BASIS_PERP_INSTRUMENT_ID,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvbP1778630400",
+            "idem:test:basis:perp",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:binance-basis-private-stream".to_owned(),
+            requests: vec![spot, perp],
+        };
+        let temp = RuntimeTempDir::new().expect("private events dir");
+        write_utf8(
+            temp.path().join("spot_user_data.jsonl"),
+            r#"{"e":"executionReport","E":1778630400000,"s":"BTCUSDT","c":"rvbS1778630400","S":"BUY","x":"TRADE","X":"FILLED","i":101,"l":"0.100","z":"0.100","L":"100.00","n":"0.01","N":"USDT","T":1778630400000}"#,
+        )
+        .expect("write spot private stream");
+        write_utf8(
+            temp.path().join("usdm_user_data.jsonl"),
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1778630400000,"o":{"s":"BTCUSDT","c":"rvbP1778630400","S":"SELL","x":"TRADE","X":"FILLED","i":202,"l":"0.100","z":"0.100","L":"101.00","n":"0.01","N":"USDT","T":1778630400000}}"#,
+        )
+        .expect("write usdm private stream");
+        let private_events =
+            BinancePrivateOrderEventStore::from_dir(temp.path()).expect("private events");
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BASIS_SPOT_VENUE_ID,
+                "spot-submit",
+            ))],
+            vec![],
+            vec![],
+        );
+        let mut usdm_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BASIS_PERP_VENUE_ID,
+                "perp-submit",
+            ))],
+            vec![],
+            vec![],
+        );
+
+        let outcome = execute_binance_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut usdm_adapter,
+            BinanceBasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630400",
+                private_order_events: Some(&private_events),
+            },
+        )
+        .expect("private stream dispatch outcome");
+
+        assert_eq!(outcome.primary_submit_receipt_count, 2);
+        assert!(outcome.blocking_reasons.is_empty());
+        assert_eq!(outcome.confirmations.len(), 2);
+        assert!(outcome
+            .confirmations
+            .iter()
+            .all(|confirmation| confirmation.source
+                == arb_execution::PrivateOrderConfirmationSource::PrivateStream));
+    }
+
+    #[cfg(feature = "live-exec")]
+    struct ScriptedBasisLiveAdapter {
+        submit_results: std::collections::VecDeque<
+            Result<MutableActionReceipt, arb_venue_exec::VenueExecError>,
+        >,
+        cancel_results: std::collections::VecDeque<
+            Result<MutableActionReceipt, arb_venue_exec::VenueExecError>,
+        >,
+        confirm_results:
+            std::collections::VecDeque<Result<PrivateOrderUpdate, arb_venue_exec::VenueExecError>>,
+        submitted: Vec<SubmitOrderRequest>,
+        cancelled: Vec<CancelOrderRequest>,
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl ScriptedBasisLiveAdapter {
+        fn new(
+            submit_results: Vec<Result<MutableActionReceipt, arb_venue_exec::VenueExecError>>,
+            cancel_results: Vec<Result<MutableActionReceipt, arb_venue_exec::VenueExecError>>,
+            confirm_results: Vec<Result<PrivateOrderUpdate, arb_venue_exec::VenueExecError>>,
+        ) -> Self {
+            Self {
+                submit_results: submit_results.into(),
+                cancel_results: cancel_results.into(),
+                confirm_results: confirm_results.into(),
+                submitted: Vec::new(),
+                cancelled: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl SubmitOrder for ScriptedBasisLiveAdapter {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> arb_venue_exec::VenueExecResult<MutableActionReceipt> {
+            self.submitted.push(request);
+            self.submit_results
+                .pop_front()
+                .expect("scripted submit result")
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl CancelOrder for ScriptedBasisLiveAdapter {
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> arb_venue_exec::VenueExecResult<MutableActionReceipt> {
+            self.cancelled.push(request);
+            self.cancel_results
+                .pop_front()
+                .expect("scripted cancel result")
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl ConfirmOrderStatus for ScriptedBasisLiveAdapter {
+        fn confirm_order_status(
+            &mut self,
+            _request: ConfirmOrderStatusRequest,
+        ) -> arb_venue_exec::VenueExecResult<PrivateOrderUpdate> {
+            self.confirm_results
+                .pop_front()
+                .expect("scripted confirmation result")
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[allow(clippy::too_many_arguments)]
+    fn test_basis_planned_order(
+        basis_leg_role: &str,
+        venue_id: &str,
+        instrument_id: &str,
+        side: OrderSide,
+        quantity: &str,
+        limit_price: &str,
+        client_order_id: &str,
+        idempotency_key: &str,
+    ) -> PlannedSubmitOrder {
+        PlannedSubmitOrder {
+            plan_leg_id: format!("pleg:test:{basis_leg_role}"),
+            venue_symbol: BASIS_SYMBOL.to_owned(),
+            basis_leg_role: Some(basis_leg_role.to_owned()),
+            notional_usd: Amount::from_str("10.00").expect("notional"),
+            request: SubmitOrderRequest::new(
+                VenueId::new(venue_id).expect("venue"),
+                AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF).expect("account"),
+                InstrumentId::new(instrument_id).expect("instrument"),
+                side,
+                MutableOrderType::Limit,
+                Quantity::from_str(quantity).expect("quantity"),
+                Some(Price::from_str(limit_price).expect("limit")),
+                Some(OrderId::new(client_order_id).expect("client order id")),
+                ExecIdempotencyKey::new(idempotency_key).expect("idempotency"),
+            ),
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn test_mutable_receipt(
+        kind: MutableActionKind,
+        venue_id: &str,
+        suffix: &str,
+    ) -> MutableActionReceipt {
+        let action_id = arb_venue_exec::MutableActionId::new(format!("action:test:{suffix}"))
+            .expect("action id");
+        let external_ref = match kind {
+            MutableActionKind::SubmitOrder => Some(ExternalActionRef::Order(
+                arb_venue_exec::ExternalOrderId::new(format!("binance:fixture:order:{suffix}"))
+                    .expect("order id"),
+            )),
+            MutableActionKind::CancelOrder => Some(ExternalActionRef::Cancel(action_id.clone())),
+            MutableActionKind::TransferRequest => None,
+        };
+        MutableActionReceipt {
+            action_id,
+            kind,
+            status: MutableActionStatus::Accepted,
+            idempotency_key: ExecIdempotencyKey::new(format!("idem:test:{suffix}"))
+                .expect("idempotency"),
+            venue_id: VenueId::new(venue_id).expect("venue"),
+            external_ref,
+            duplicate: false,
+            simulated: false,
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn test_private_order_update(
+        market: arb_venue_exec::BinancePrivateOrderMarket,
+        venue_id: &str,
+        instrument_id: &str,
+        status: OrderConfirmationStatus,
+        filled_quantity: Option<&str>,
+        side: Option<OrderSide>,
+    ) -> PrivateOrderUpdate {
+        let quantity = filled_quantity.map(|value| Quantity::from_str(value).expect("quantity"));
+        let market_token = match market {
+            arb_venue_exec::BinancePrivateOrderMarket::Spot => "spot",
+            arb_venue_exec::BinancePrivateOrderMarket::UsdmFutures => "usdm",
+        };
+        PrivateOrderUpdate {
+            source: OrderConfirmationSource::OrderQuery,
+            market,
+            venue_id: VenueId::new(venue_id).expect("venue"),
+            account_id: AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF).expect("account"),
+            instrument_id: InstrumentId::new(instrument_id).expect("instrument"),
+            symbol: BASIS_SYMBOL.to_owned(),
+            source_event_id: format!("event:test:order-update:{}", status.as_str()),
+            event_time: "2026-05-13T00:00:00Z".to_owned(),
+            status,
+            execution_type: Some("TRADE".to_owned()),
+            side,
+            venue_order_id: Some(
+                arb_venue_exec::ExternalOrderId::new(format!("binance:{market_token}:order:1"))
+                    .expect("venue order id"),
+            ),
+            exchange_order_id: Some("1".to_owned()),
+            client_order_id: None,
+            cumulative_filled_quantity: quantity,
+            last_fill: quantity.map(|quantity| PrivateOrderFillUpdate {
+                source_event_id: format!("event:test:fill:{}", status.as_str()),
+                timestamp: "2026-05-13T00:00:00Z".to_owned(),
+                price: "100.00".to_owned(),
+                quantity: quantity.to_string(),
+                fee_asset_id: None,
+                fee_amount: None,
+                trade_id: Some("1".to_owned()),
+            }),
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_guarded_live_auto_once_blocks_live_without_two_price_guards() {
+        let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
+        let perp = r#"{"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778630400000}"#;
+        let premium = r#"{"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_binance_basis_guarded_live_auto_once_from_json(
+            spot,
+            "test:binance-spot-book",
+            perp,
+            "test:binance-usdm-book",
+            premium,
+            "test:binance-usdm-premium",
+            ingested_at,
+            BinanceBasisGuardedLiveAutoOnceOptions {
+                config_path: root.path().join("unused.yaml"),
+                output_dir: Some(root.path().join("basis-auto")),
+                min_net_bps: 5,
+                max_spot_ask: None,
+                min_perp_bid: None,
+                spot_wss_monitor_url: None,
+                perp_wss_monitor_url: None,
+                private_order_events_dir: None,
+                execute_live: true,
+                acknowledge_basis_live_orders: true,
+            },
+        )
+        .expect("blocked before live dispatch");
+
+        assert!(!report.signal_allowed);
+        assert_eq!(report.planned_order_count, 0);
+        assert!(!report.dispatch_attempted);
+        assert!(report.plan_hash.is_none());
+        assert!(report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("--max-spot-ask")));
+        assert!(report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("--min-perp-bid")));
     }
 
     #[test]
@@ -11413,6 +16120,29 @@ signing:
 "#
     }
 
+    #[cfg(feature = "live-exec")]
+    fn guarded_live_open_real_signing_yaml() -> &'static str {
+        r#"config_version: "arb-config-v1"
+execution:
+  mode: "GuardedLive"
+  live_execution_enabled: true
+  auto_live_enabled: false
+kill_switch:
+  global: false
+  execution: false
+  strategies: []
+  venues: []
+  accounts: []
+  instruments: []
+  assets: []
+  chains: []
+  execution_modes: []
+signing:
+  policy_ref: "signing-policy/binance-env-v1"
+  real_signing_enabled: true
+"#
+    }
+
     #[test]
     fn full_pipeline_fixture_matches_golden_outputs() {
         let report = run_full_pipeline_fixture(full_pipeline_fixture_root())
@@ -11559,7 +16289,10 @@ kill_switch:
             .expect_err("live execution without kill switch must fail closed");
         let message = error.to_string();
         assert!(message.contains("runtime startup rejected"));
-        assert!(message.contains("阶段 9 运行时不能启动可变执行"));
+        assert!(
+            message.contains("阶段 9 运行时不能启动可变执行")
+                || message.contains("real_signing_enabled 未开启")
+        );
     }
 
     #[test]

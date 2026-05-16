@@ -5,7 +5,9 @@ edition.workspace = true
 
 [features]
 default = []
-live-exec = []
+live-exec = ["dep:arb-signing", "arb-signing/real-signing"]
 
 [dependencies]
+arb-contracts = { path = "../arb-contracts" }
 arb-domain = { path = "../arb-domain" }
+arb-signing = { path = "../arb-signing", default-features = false, optional = true }
