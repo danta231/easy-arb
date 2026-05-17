@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 中文说明：启动 Binance、Bybit、OKX basis 实时机会观察链路。
+# 中文说明：启动 Binance、Bybit、OKX、Bitget basis 实时机会观察链路。
 # 该脚本只启动公开行情监控和 dry-run 预下单验证，不传 --execute-live，
 # 不提交订单、不撤单、不转账，不要求或记录任何密钥。
 
@@ -11,12 +11,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 usage() {
   cat <<'USAGE'
 用法:
-  scripts/start-basis-opportunity-observer.sh [binance] [bybit] [okx]
+  scripts/start-basis-opportunity-observer.sh [binance] [bybit] [okx] [bitget]
 
-默认启动 binance、bybit、okx 三条链路。
+默认启动 binance、bybit、okx、bitget 四条链路。
 
 核心行为:
-  1. 启动三条只读 basis monitor，持续刷新公开行情。
+  1. 启动四条只读 basis monitor，持续刷新公开行情。
   2. 轮询 /opportunities，实时记录 candidate_count > 0 的可盈利机会。
   3. 对 /opportunities 返回的每个候选 symbol 触发 guarded-live-auto-once --dry-run，
      生成候选、风险决策、人工门禁释放预览、分发计划等下单前 artifacts。
@@ -43,6 +43,7 @@ usage() {
   BINANCE_BASIS_BIND=127.0.0.1:8796
   BYBIT_BASIS_BIND=127.0.0.1:8797
   OKX_BASIS_BIND=127.0.0.1:8798
+  BITGET_BASIS_BIND=127.0.0.1:8803
 
 可选 WSS monitor URL:
   BINANCE_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8786/api/binance-wss-book-ticker/status
@@ -51,6 +52,8 @@ usage() {
   BYBIT_PERP_WSS_MONITOR_URL=http://127.0.0.1:8789/api/bybit-wss-book-ticker/status
   OKX_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8790/api/okx-wss-book-ticker/status
   OKX_PERP_WSS_MONITOR_URL=http://127.0.0.1:8791/api/okx-wss-book-ticker/status
+  BITGET_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8792/api/bitget-wss-book-ticker/status
+  BITGET_PERP_WSS_MONITOR_URL=http://127.0.0.1:8793/api/bitget-wss-book-ticker/status
 
 输出:
   target/basis-opportunity-observer/logs/realtime-feedback.log
@@ -79,6 +82,7 @@ opportunities_url() {
     binance) printf 'http://%s/api/basis/opportunities' "${BINANCE_BIND}" ;;
     bybit) printf 'http://%s/api/bybit-basis/opportunities' "${BYBIT_BIND}" ;;
     okx) printf 'http://%s/api/okx-basis/opportunities' "${OKX_BIND}" ;;
+    bitget) printf 'http://%s/api/bitget-basis/opportunities' "${BITGET_BIND}" ;;
     *) return 1 ;;
   esac
 }
@@ -88,6 +92,7 @@ auto_once_command() {
     binance) printf 'binance-basis-guarded-live-auto-once' ;;
     bybit) printf 'bybit-basis-guarded-live-auto-once' ;;
     okx) printf 'okx-basis-guarded-live-auto-once' ;;
+    bitget) printf 'bitget-basis-guarded-live-auto-once' ;;
     *) return 1 ;;
   esac
 }
@@ -108,6 +113,10 @@ wss_args_for_venue() {
     okx)
       spot_var="${OKX_SPOT_WSS_MONITOR_URL:-}"
       perp_var="${OKX_PERP_WSS_MONITOR_URL:-}"
+      ;;
+    bitget)
+      spot_var="${BITGET_SPOT_WSS_MONITOR_URL:-}"
+      perp_var="${BITGET_PERP_WSS_MONITOR_URL:-}"
       ;;
     *) return 1 ;;
   esac
@@ -233,6 +242,8 @@ wait_for_monitor_opportunities() {
   local url
   local deadline
   local body
+  local last_body=""
+  local snapshot_status="unknown"
 
   pid="$(pid_for_name "${process_name}")"
   log_file="$(log_for_name "${process_name}")"
@@ -249,7 +260,9 @@ wait_for_monitor_opportunities() {
     fi
 
     if body="$(curl -fsS --max-time "${CURL_TIMEOUT_SECS}" "${url}" 2>> "${LOG_DIR}/curl-errors.log")"; then
-      if printf '%s\n' "${body}" | jq -e 'has("status") and has("candidate_count") and ((.rows // []) | type == "array")' >/dev/null 2>> "${LOG_DIR}/jq-errors.log"; then
+      last_body="${body}"
+      snapshot_status="$(printf '%s\n' "${body}" | jq -r '.status // "unknown"' 2>> "${LOG_DIR}/jq-errors.log" || printf 'unknown')"
+      if printf '%s\n' "${body}" | jq -e 'has("status") and .status == "healthy" and has("candidate_count") and ((.rows // []) | type == "array")' >/dev/null 2>> "${LOG_DIR}/jq-errors.log"; then
         echo "startup_check_ok venue=${venue} endpoint=${url}"
         return 0
       fi
@@ -258,7 +271,10 @@ wait_for_monitor_opportunities() {
     sleep 1
   done
 
-  echo "error: ${venue} monitor did not provide a valid /opportunities response within ${STARTUP_WAIT_SECS}s: ${url}" >&2
+  echo "error: ${venue} monitor did not provide a healthy /opportunities response within ${STARTUP_WAIT_SECS}s: ${url}; last_status=${snapshot_status}" >&2
+  if [[ -n "${last_body}" ]]; then
+    printf '%s\n' "${last_body}" | jq -c '{status:(.status // "unknown"),candidate_count:(.candidate_count // 0),updated_at:(.updated_at // "unknown"),rows:((.rows // []) | length)}' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+  fi
   if [[ -n "${log_file}" && -f "${log_file}" ]]; then
     tail -n 40 "${log_file}" >&2 || true
   fi
@@ -313,8 +329,10 @@ run_validation_job() {
     finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
     if [[ -s "${report_file}" ]]; then
-      validation_result_class="$(jq -r '
-        if .dispatch_plan_built == true and (.dispatch_request_count // 0) == 2 then
+      validation_result_class="$(jq -r --argjson exit_status "${status}" '
+        if $exit_status != 0 and any(.blocking_reasons[]?; startswith("input_parse_failed")) then
+          "input_parse_failed"
+        elif .dispatch_plan_built == true and (.dispatch_request_count // 0) == 2 then
           "pre_trade_flow_complete"
         elif .manual_gate_released == true then
           "manual_gate_released_dispatch_plan_missing"
@@ -544,10 +562,11 @@ if [[ "${1:-}" == "--recorder" ]]; then
   CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
   CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
   CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
-  EFFECTIVE_MONITORS="${BASIS_OBSERVER_EFFECTIVE_MONITORS:-binance bybit okx}"
+  EFFECTIVE_MONITORS="${BASIS_OBSERVER_EFFECTIVE_MONITORS:-binance bybit okx bitget}"
   BINANCE_BIND="${BINANCE_BASIS_BIND:-127.0.0.1:8796}"
   BYBIT_BIND="${BYBIT_BASIS_BIND:-127.0.0.1:8797}"
   OKX_BIND="${OKX_BASIS_BIND:-127.0.0.1:8798}"
+  BITGET_BIND="${BITGET_BASIS_BIND:-127.0.0.1:8803}"
   run_recorder
   exit 0
 fi
@@ -580,6 +599,7 @@ SLIPPAGE_BPS="${BASIS_OBSERVER_SLIPPAGE_BPS:-5}"
 BINANCE_BIND="${BINANCE_BASIS_BIND:-127.0.0.1:8796}"
 BYBIT_BIND="${BYBIT_BASIS_BIND:-127.0.0.1:8797}"
 OKX_BIND="${OKX_BASIS_BIND:-127.0.0.1:8798}"
+BITGET_BIND="${BITGET_BASIS_BIND:-127.0.0.1:8803}"
 VALIDATE_AUTO_ONCE="${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}"
 AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
 CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
@@ -593,7 +613,7 @@ if [[ "$#" -eq 0 ]]; then
   if [[ -n "${BASIS_OBSERVER_MONITORS:-}" ]]; then
     IFS=' ' read -r -a MONITORS <<< "${BASIS_OBSERVER_MONITORS}"
   else
-    MONITORS=(binance bybit okx)
+    MONITORS=(binance bybit okx bitget)
   fi
 else
   MONITORS=("$@")
@@ -601,7 +621,7 @@ fi
 
 for monitor in "${MONITORS[@]}"; do
   case "${monitor}" in
-    binance|bybit|okx) ;;
+    binance|bybit|okx|bitget) ;;
     *) die "unknown monitor: ${monitor}" ;;
   esac
 done
@@ -655,6 +675,7 @@ for monitor in "${MONITORS[@]}"; do
     binance) start_monitor binance binance-basis-monitor "${BINANCE_BIND}" ;;
     bybit) start_monitor bybit bybit-basis-monitor "${BYBIT_BIND}" ;;
     okx) start_monitor okx okx-basis-monitor "${OKX_BIND}" ;;
+    bitget) start_monitor bitget bitget-basis-monitor "${BITGET_BIND}" ;;
   esac
 done
 
@@ -685,6 +706,7 @@ nohup env \
   BINANCE_BASIS_BIND="${BINANCE_BIND}" \
   BYBIT_BASIS_BIND="${BYBIT_BIND}" \
   OKX_BASIS_BIND="${OKX_BIND}" \
+  BITGET_BASIS_BIND="${BITGET_BIND}" \
   "${SCRIPT_DIR}/start-basis-opportunity-observer.sh" --recorder >> "${RECORDER_LOG}" 2>&1 &
 RECORDER_PID="$!"
 printf '%s\t%s\t%s\n' "${RECORDER_PID}" "opportunity-recorder" "${RECORDER_LOG}" >> "${PID_FILE}"
@@ -698,6 +720,7 @@ dashboards:
   Binance: http://${BINANCE_BIND}/dashboard
   Bybit:   http://${BYBIT_BIND}/dashboard
   OKX:     http://${OKX_BIND}/dashboard
+  Bitget:  http://${BITGET_BIND}/dashboard
 
 real-time feedback:
   tail -f ${LOG_DIR}/realtime-feedback.log
@@ -707,6 +730,7 @@ opportunity logs:
   ${OPPORTUNITY_DIR}/binance-opportunities.jsonl
   ${OPPORTUNITY_DIR}/bybit-opportunities.jsonl
   ${OPPORTUNITY_DIR}/okx-opportunities.jsonl
+  ${OPPORTUNITY_DIR}/bitget-opportunities.jsonl
 
 dry-run validation reports:
   ${DRY_RUN_DIR}/dry-run-reports.jsonl

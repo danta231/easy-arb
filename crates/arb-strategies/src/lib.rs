@@ -32,6 +32,7 @@ const DEFAULT_BASIS_SPOT_TAKER_FEE_BPS: i128 = 10;
 const DEFAULT_BASIS_PERP_TAKER_FEE_BPS: i128 = 5;
 const DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const DEFAULT_BASIS_MIN_NET_BPS: i128 = 5;
+const DEFAULT_BASIS_EXIT_POLICY_REF: &str = "exit-policy:spot-perp-basis-composite-v1";
 const BYBIT_BASIS_STRATEGY_ID: &str = "strat:bybit-spot-perp-basis";
 const BYBIT_BASIS_CODE_VERSION: &str = "code:bybit-spot-perp-basis-1";
 const BYBIT_BASIS_SPOT_VENUE_ID: &str = "venue:BYBIT-SPOT";
@@ -358,6 +359,7 @@ impl SpotPerpBasisStrategyConfig {
             },
             output: BasisOutputConfig {
                 transition_id: BINANCE_BASIS_TRANSITION_ID.to_owned(),
+                exit_policy_ref: DEFAULT_BASIS_EXIT_POLICY_REF.to_owned(),
                 assumption_id: "asm:binance-basis-public-data-readonly".to_owned(),
                 premium_index_label: "premiumIndex".to_owned(),
                 expected_economics_confidence: "0.72".to_owned(),
@@ -412,6 +414,7 @@ impl SpotPerpBasisStrategyConfig {
             },
             output: BasisOutputConfig {
                 transition_id: BYBIT_BASIS_TRANSITION_ID.to_owned(),
+                exit_policy_ref: DEFAULT_BASIS_EXIT_POLICY_REF.to_owned(),
                 assumption_id: "asm:bybit-basis-public-data-readonly".to_owned(),
                 premium_index_label: "premiumIndex".to_owned(),
                 expected_economics_confidence: "0.72".to_owned(),
@@ -466,6 +469,7 @@ impl SpotPerpBasisStrategyConfig {
             },
             output: BasisOutputConfig {
                 transition_id: OKX_BASIS_TRANSITION_ID.to_owned(),
+                exit_policy_ref: DEFAULT_BASIS_EXIT_POLICY_REF.to_owned(),
                 assumption_id: "asm:okx-basis-public-data-readonly".to_owned(),
                 premium_index_label: "fundingRate".to_owned(),
                 expected_economics_confidence: "0.72".to_owned(),
@@ -524,6 +528,7 @@ pub struct BasisEconomicsConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BasisOutputConfig {
     pub transition_id: String,
+    pub exit_policy_ref: String,
     pub assumption_id: String,
     pub premium_index_label: String,
     pub expected_economics_confidence: String,
@@ -561,6 +566,7 @@ fn validate_spot_perp_basis_config(config: &SpotPerpBasisStrategyConfig) -> Stra
         "output.recovery_buffer_usd",
         &config.output.recovery_buffer_usd,
     )?;
+    ensure_non_empty_basis_config("output.exit_policy_ref", &config.output.exit_policy_ref)?;
     validate_basis_confidence(
         "output.expected_economics_confidence",
         &config.output.expected_economics_confidence,
@@ -813,7 +819,8 @@ impl SpotPerpBasisStrategy {
   "input_event_refs": {},
   "current_portfolio_state_ref": {},
   "holding_period": {{
-    "kind": "UntilBasisConvergence"
+    "kind": "UntilBasisConvergence",
+    "exit_policy_ref": {}
   }},
   "legs": [
     {{
@@ -962,6 +969,7 @@ impl SpotPerpBasisStrategy {
             json_string(&context.time().now_rfc3339_z()),
             input_event_refs_json,
             json_string(context.snapshot().portfolio_state_id()),
+            json_string(&config.output.exit_policy_ref),
             json_string(&spot_leg.leg_id),
             json_string(&spot_leg.venue_id),
             json_string(&spot_leg.instrument_id),
@@ -1352,11 +1360,300 @@ pub fn evaluate_spot_perp_basis_signal(
     })
 }
 
+/// spot-perp basis 持仓后的 ADL 状态。
+///
+/// 中文说明：ADL 是交易所自动减仓风险信号。`Warning` 表示进入自动减仓队列或
+/// 预警区间，应主动退出；`Deleveraging` 表示交易所已发生自动减仓或外部仓位
+/// 状态可能被改变，后续必须先对账。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpotPerpBasisAdlState {
+    None,
+    Warning,
+    Deleveraging,
+}
+
+impl SpotPerpBasisAdlState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Warning => "adl_warning",
+            Self::Deleveraging => "adl_deleveraging",
+        }
+    }
+}
+
+/// spot-perp basis 平仓决策。
+///
+/// 中文说明：`EmergencyReconcileAndDeRisk` 不是等待人工；它表示不能按原始
+/// 仓位假设直接普通平仓，运行时应先取消挂单、重拉私有状态、对账真实敞口，
+/// 再用 reduce-only 或等价受限动作自动降风险；只有状态仍未知时才升级人工。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpotPerpBasisExitDecision {
+    Hold,
+    Close,
+    EmergencyReconcileAndDeRisk,
+}
+
+impl SpotPerpBasisExitDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Close => "close",
+            Self::EmergencyReconcileAndDeRisk => "emergency_reconcile_and_de_risk",
+        }
+    }
+}
+
+/// spot-perp basis 平仓触发原因。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpotPerpBasisExitReason {
+    TakeProfit,
+    BasisConverged,
+    FundingNoLongerPays,
+    BasisWidened,
+    StopLoss,
+    LiquidationBufferTooThin,
+    LiquidationBufferMissing,
+    PositionImbalance,
+    DataStale,
+    UnknownExternalState,
+    AdlWarning,
+    AdlDeleveraging,
+}
+
+impl SpotPerpBasisExitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TakeProfit => "TAKE_PROFIT",
+            Self::BasisConverged => "BASIS_CONVERGED",
+            Self::FundingNoLongerPays => "FUNDING_NO_LONGER_PAYS",
+            Self::BasisWidened => "BASIS_WIDENED",
+            Self::StopLoss => "STOP_LOSS",
+            Self::LiquidationBufferTooThin => "LIQUIDATION_BUFFER_TOO_THIN",
+            Self::LiquidationBufferMissing => "LIQUIDATION_BUFFER_MISSING",
+            Self::PositionImbalance => "POSITION_IMBALANCE",
+            Self::DataStale => "DATA_STALE",
+            Self::UnknownExternalState => "UNKNOWN_EXTERNAL_STATE",
+            Self::AdlWarning => "ADL_WARNING",
+            Self::AdlDeleveraging => "ADL_DELEVERAGING",
+        }
+    }
+}
+
+/// spot-perp basis 平仓信号输入。
+///
+/// 中文说明：`entry_gross_basis_bps` 是开仓时的毛基差；`entry_total_cost_bps`
+/// 是开仓成本；当前平仓基差用现货 bid 和永续 ask 的可成交价格保守计算。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpotPerpBasisExitSignalInput {
+    pub symbol: String,
+    pub spot_best_bid: String,
+    pub perp_best_ask: String,
+    pub notional_usd: String,
+    pub entry_gross_basis_bps: i128,
+    pub entry_total_cost_bps: i128,
+    pub accumulated_funding_bps: i128,
+    pub expected_next_funding_bps: i128,
+    pub exit_spot_taker_fee_bps: i128,
+    pub exit_perp_taker_fee_bps: i128,
+    pub exit_slippage_buffer_bps: i128,
+    pub target_profit_bps: i128,
+    pub convergence_buffer_bps: i128,
+    pub min_next_funding_bps: i128,
+    pub max_basis_widen_bps: i128,
+    pub max_loss_bps: i128,
+    pub liquidation_buffer_bps: Option<i128>,
+    pub min_liquidation_buffer_bps: i128,
+    pub position_imbalance_bps: i128,
+    pub max_position_imbalance_bps: i128,
+    pub data_is_stale: bool,
+    pub external_state_unknown: bool,
+    pub adl_state: SpotPerpBasisAdlState,
+}
+
+/// spot-perp basis 平仓信号输出。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpotPerpBasisExitSignal {
+    pub symbol: String,
+    pub decision: SpotPerpBasisExitDecision,
+    pub current_close_basis_bps: i128,
+    pub basis_widen_bps: i128,
+    pub exit_total_cost_bps: i128,
+    pub estimated_exit_profit_bps: i128,
+    pub estimated_exit_profit_usd: String,
+    pub remaining_basis_edge_bps: i128,
+    pub reason_codes: Vec<SpotPerpBasisExitReason>,
+    pub detail: String,
+}
+
+/// 计算 spot-perp basis 持仓是否应平仓。
+pub fn evaluate_spot_perp_basis_exit_signal(
+    input: &SpotPerpBasisExitSignalInput,
+) -> Result<SpotPerpBasisExitSignal, String> {
+    ensure_non_negative_signal_bps("entry_total_cost_bps", input.entry_total_cost_bps)?;
+    ensure_non_negative_signal_bps("exit_spot_taker_fee_bps", input.exit_spot_taker_fee_bps)?;
+    ensure_non_negative_signal_bps("exit_perp_taker_fee_bps", input.exit_perp_taker_fee_bps)?;
+    ensure_non_negative_signal_bps("exit_slippage_buffer_bps", input.exit_slippage_buffer_bps)?;
+    ensure_non_negative_signal_bps("target_profit_bps", input.target_profit_bps)?;
+    ensure_non_negative_signal_bps("convergence_buffer_bps", input.convergence_buffer_bps)?;
+    ensure_non_negative_signal_bps("max_basis_widen_bps", input.max_basis_widen_bps)?;
+    ensure_non_negative_signal_bps("max_loss_bps", input.max_loss_bps)?;
+    ensure_non_negative_signal_bps(
+        "min_liquidation_buffer_bps",
+        input.min_liquidation_buffer_bps,
+    )?;
+    ensure_non_negative_signal_bps(
+        "max_position_imbalance_bps",
+        input.max_position_imbalance_bps,
+    )?;
+
+    let spot_bid = FixedDecimal::parse_non_negative("spot_best_bid", &input.spot_best_bid)?;
+    let perp_ask = FixedDecimal::parse_non_negative("perp_best_ask", &input.perp_best_ask)?;
+    let notional = FixedDecimal::parse_non_negative("notional_usd", &input.notional_usd)?;
+    if notional.is_zero() {
+        return Err("notional_usd must be greater than zero".to_owned());
+    }
+    if spot_bid.raw <= 0 {
+        return Err("spot bid price must be greater than zero".to_owned());
+    }
+    if perp_ask.raw <= 0 {
+        return Err("perp ask price must be greater than zero".to_owned());
+    }
+
+    let current_close_basis_bps = tradable_close_basis_bps(perp_ask, spot_bid)?;
+    let exit_total_cost_bps = input
+        .exit_spot_taker_fee_bps
+        .checked_add(input.exit_perp_taker_fee_bps)
+        .and_then(|value| value.checked_add(input.exit_slippage_buffer_bps))
+        .ok_or_else(|| "exit cost bps calculation overflowed".to_owned())?;
+    let entry_after_open_cost_bps = input
+        .entry_gross_basis_bps
+        .checked_sub(input.entry_total_cost_bps)
+        .ok_or_else(|| "entry net basis bps calculation overflowed".to_owned())?;
+    let estimated_exit_profit_bps = entry_after_open_cost_bps
+        .checked_sub(current_close_basis_bps)
+        .and_then(|value| value.checked_sub(exit_total_cost_bps))
+        .and_then(|value| value.checked_add(input.accumulated_funding_bps))
+        .ok_or_else(|| "exit profit bps calculation overflowed".to_owned())?;
+    let estimated_exit_profit_usd =
+        FixedDecimal::usd_from_bps(notional, estimated_exit_profit_bps)?.format_trimmed();
+    let basis_widen_bps = current_close_basis_bps
+        .checked_sub(input.entry_gross_basis_bps)
+        .ok_or_else(|| "basis widening calculation overflowed".to_owned())?;
+    let remaining_basis_edge_bps = current_close_basis_bps
+        .checked_sub(exit_total_cost_bps)
+        .ok_or_else(|| "remaining basis edge calculation overflowed".to_owned())?;
+    let convergence_threshold_bps = exit_total_cost_bps
+        .checked_add(input.convergence_buffer_bps)
+        .ok_or_else(|| "convergence threshold bps calculation overflowed".to_owned())?;
+    let stop_loss_threshold_bps = input
+        .max_loss_bps
+        .checked_neg()
+        .ok_or_else(|| "stop loss bps calculation overflowed".to_owned())?;
+
+    let mut reason_codes = Vec::new();
+    if input.data_is_stale {
+        reason_codes.push(SpotPerpBasisExitReason::DataStale);
+    }
+    if input.external_state_unknown {
+        reason_codes.push(SpotPerpBasisExitReason::UnknownExternalState);
+    }
+    match input.adl_state {
+        SpotPerpBasisAdlState::None => {}
+        SpotPerpBasisAdlState::Warning => reason_codes.push(SpotPerpBasisExitReason::AdlWarning),
+        SpotPerpBasisAdlState::Deleveraging => {
+            reason_codes.push(SpotPerpBasisExitReason::AdlDeleveraging)
+        }
+    }
+    match input.liquidation_buffer_bps {
+        Some(buffer) if buffer <= input.min_liquidation_buffer_bps => {
+            reason_codes.push(SpotPerpBasisExitReason::LiquidationBufferTooThin);
+        }
+        Some(_) => {}
+        None => reason_codes.push(SpotPerpBasisExitReason::LiquidationBufferMissing),
+    }
+    if estimated_exit_profit_bps >= input.target_profit_bps {
+        reason_codes.push(SpotPerpBasisExitReason::TakeProfit);
+    }
+    if current_close_basis_bps <= convergence_threshold_bps {
+        reason_codes.push(SpotPerpBasisExitReason::BasisConverged);
+    }
+    if input.expected_next_funding_bps <= input.min_next_funding_bps {
+        reason_codes.push(SpotPerpBasisExitReason::FundingNoLongerPays);
+    }
+    if basis_widen_bps >= input.max_basis_widen_bps {
+        reason_codes.push(SpotPerpBasisExitReason::BasisWidened);
+    }
+    if estimated_exit_profit_bps <= stop_loss_threshold_bps {
+        reason_codes.push(SpotPerpBasisExitReason::StopLoss);
+    }
+    if signed_bps_abs(input.position_imbalance_bps)? > input.max_position_imbalance_bps {
+        reason_codes.push(SpotPerpBasisExitReason::PositionImbalance);
+    }
+
+    let requires_emergency_derisk = reason_codes.iter().any(|reason| {
+        matches!(
+            reason,
+            SpotPerpBasisExitReason::DataStale
+                | SpotPerpBasisExitReason::UnknownExternalState
+                | SpotPerpBasisExitReason::LiquidationBufferMissing
+                | SpotPerpBasisExitReason::AdlDeleveraging
+        )
+    });
+    let decision = if requires_emergency_derisk {
+        SpotPerpBasisExitDecision::EmergencyReconcileAndDeRisk
+    } else if reason_codes.is_empty() {
+        SpotPerpBasisExitDecision::Hold
+    } else {
+        SpotPerpBasisExitDecision::Close
+    };
+    let detail = if reason_codes.is_empty() {
+        format!(
+            "hold: close_basis_bps={current_close_basis_bps}, estimated_exit_profit_bps={estimated_exit_profit_bps}, expected_next_funding_bps={}",
+            input.expected_next_funding_bps
+        )
+    } else {
+        let reasons = reason_codes
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{}: {reasons}; close_basis_bps={current_close_basis_bps}, estimated_exit_profit_bps={estimated_exit_profit_bps}, adl_state={}",
+            decision.as_str(),
+            input.adl_state.as_str()
+        )
+    };
+
+    Ok(SpotPerpBasisExitSignal {
+        symbol: input.symbol.clone(),
+        decision,
+        current_close_basis_bps,
+        basis_widen_bps,
+        exit_total_cost_bps,
+        estimated_exit_profit_bps,
+        estimated_exit_profit_usd,
+        remaining_basis_edge_bps,
+        reason_codes,
+        detail,
+    })
+}
+
 fn ensure_non_negative_signal_bps(field: &'static str, value: i128) -> Result<(), String> {
     if value < 0 {
         return Err(format!("`{field}` cannot be negative"));
     }
     Ok(())
+}
+
+fn signed_bps_abs(value: i128) -> Result<i128, String> {
+    if value < 0 {
+        value
+            .checked_neg()
+            .ok_or_else(|| "signed bps absolute value overflowed".to_owned())
+    } else {
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1688,6 +1985,21 @@ fn gross_basis_bps(perp_bid: FixedDecimal, spot_ask: FixedDecimal) -> Result<i12
         .ok_or_else(|| "basis bps calculation overflowed".to_owned())
 }
 
+fn tradable_close_basis_bps(
+    perp_ask: FixedDecimal,
+    spot_bid: FixedDecimal,
+) -> Result<i128, String> {
+    if spot_bid.raw <= 0 {
+        return Err("spot bid price must be greater than zero".to_owned());
+    }
+    perp_ask
+        .raw
+        .checked_sub(spot_bid.raw)
+        .and_then(|value| value.checked_mul(10_000))
+        .and_then(|value| value.checked_div(spot_bid.raw))
+        .ok_or_else(|| "close basis bps calculation overflowed".to_owned())
+}
+
 fn nullable_identifier_matches(value: &Option<Option<Identifier>>, expected: &str) -> bool {
     matches!(value, Some(Some(identifier)) if identifier.as_str() == expected)
 }
@@ -2006,6 +2318,15 @@ mod tests {
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
             "81"
+        );
+        assert_eq!(
+            candidate
+                .holding_period
+                .exit_policy_ref
+                .as_ref()
+                .expect("exit policy ref")
+                .as_str(),
+            DEFAULT_BASIS_EXIT_POLICY_REF
         );
         assert_eq!(
             candidate.expected_economics.expected_profit_usd.as_str(),
@@ -2479,6 +2800,108 @@ mod tests {
     }
 
     #[test]
+    fn spot_perp_basis_exit_signal_closes_on_profit_or_convergence() {
+        let signal = evaluate_spot_perp_basis_exit_signal(&basis_exit_input("100.90", "101.00"))
+            .expect("exit signal");
+
+        assert_eq!(signal.decision, SpotPerpBasisExitDecision::Close);
+        assert_eq!(signal.current_close_basis_bps, 9);
+        assert_eq!(signal.exit_total_cost_bps, 20);
+        assert_eq!(signal.estimated_exit_profit_bps, 55);
+        assert_eq!(signal.estimated_exit_profit_usd, "0.55");
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::TakeProfit));
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::BasisConverged));
+    }
+
+    #[test]
+    fn spot_perp_basis_exit_signal_closes_when_funding_turns_or_basis_widens() {
+        let mut input = basis_exit_input("99.00", "101.50");
+        input.expected_next_funding_bps = -1;
+
+        let signal = evaluate_spot_perp_basis_exit_signal(&input).expect("exit signal");
+
+        assert_eq!(signal.decision, SpotPerpBasisExitDecision::Close);
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::FundingNoLongerPays));
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::BasisWidened));
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::StopLoss));
+    }
+
+    #[test]
+    fn spot_perp_basis_exit_signal_handles_adl_warning_and_event() {
+        let mut warning = basis_exit_input("100.20", "101.00");
+        warning.adl_state = SpotPerpBasisAdlState::Warning;
+
+        let warning_signal =
+            evaluate_spot_perp_basis_exit_signal(&warning).expect("ADL warning signal");
+
+        assert_eq!(warning_signal.decision, SpotPerpBasisExitDecision::Close);
+        assert!(warning_signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::AdlWarning));
+
+        let mut deleveraging = basis_exit_input("100.20", "101.00");
+        deleveraging.adl_state = SpotPerpBasisAdlState::Deleveraging;
+
+        let deleveraging_signal =
+            evaluate_spot_perp_basis_exit_signal(&deleveraging).expect("ADL event signal");
+
+        assert_eq!(
+            deleveraging_signal.decision,
+            SpotPerpBasisExitDecision::EmergencyReconcileAndDeRisk
+        );
+        assert!(deleveraging_signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::AdlDeleveraging));
+    }
+
+    #[test]
+    fn spot_perp_basis_exit_signal_closes_on_liquidation_or_imbalance_risk() {
+        let mut input = basis_exit_input("100.20", "101.00");
+        input.liquidation_buffer_bps = Some(120);
+        input.position_imbalance_bps = 6;
+
+        let signal = evaluate_spot_perp_basis_exit_signal(&input).expect("exit signal");
+
+        assert_eq!(signal.decision, SpotPerpBasisExitDecision::Close);
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::LiquidationBufferTooThin));
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::PositionImbalance));
+    }
+
+    #[test]
+    fn spot_perp_basis_exit_signal_requires_emergency_derisk_on_unknown_state() {
+        let mut input = basis_exit_input("100.20", "101.00");
+        input.external_state_unknown = true;
+        input.liquidation_buffer_bps = None;
+
+        let signal = evaluate_spot_perp_basis_exit_signal(&input).expect("exit signal");
+
+        assert_eq!(
+            signal.decision,
+            SpotPerpBasisExitDecision::EmergencyReconcileAndDeRisk
+        );
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::UnknownExternalState));
+        assert!(signal
+            .reason_codes
+            .contains(&SpotPerpBasisExitReason::LiquidationBufferMissing));
+    }
+
+    #[test]
     fn spot_perp_basis_strategy_rejects_invalid_economics_config() {
         let mut config = SpotPerpBasisStrategyConfig::binance_btcusdt();
         config.economics.notional_usd = "0".to_owned();
@@ -2915,6 +3338,34 @@ mod tests {
             json_string(risk_reason_code),
         ))
         .expect("basis premium event")
+    }
+
+    fn basis_exit_input(spot_best_bid: &str, perp_best_ask: &str) -> SpotPerpBasisExitSignalInput {
+        SpotPerpBasisExitSignalInput {
+            symbol: "BTCUSDT".to_owned(),
+            spot_best_bid: spot_best_bid.to_owned(),
+            perp_best_ask: perp_best_ask.to_owned(),
+            notional_usd: "100.00".to_owned(),
+            entry_gross_basis_bps: 100,
+            entry_total_cost_bps: 20,
+            accumulated_funding_bps: 4,
+            expected_next_funding_bps: 1,
+            exit_spot_taker_fee_bps: 10,
+            exit_perp_taker_fee_bps: 5,
+            exit_slippage_buffer_bps: 5,
+            target_profit_bps: 40,
+            convergence_buffer_bps: 2,
+            min_next_funding_bps: 0,
+            max_basis_widen_bps: 50,
+            max_loss_bps: 50,
+            liquidation_buffer_bps: Some(500),
+            min_liquidation_buffer_bps: 150,
+            position_imbalance_bps: 0,
+            max_position_imbalance_bps: 5,
+            data_is_stale: false,
+            external_state_unknown: false,
+            adl_state: SpotPerpBasisAdlState::None,
+        }
     }
 
     fn strategy_replay_context() -> StrategyInput {

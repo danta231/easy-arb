@@ -1016,6 +1016,14 @@ pub mod real {
     pub const OKX_TIMESTAMP_HEADER: &str = "OK-ACCESS-TIMESTAMP";
     /// OKX REST passphrase 认证头名称。
     pub const OKX_PASSPHRASE_HEADER: &str = "OK-ACCESS-PASSPHRASE";
+    /// Bitget REST API key 认证头名称。
+    pub const BITGET_API_KEY_HEADER: &str = "ACCESS-KEY";
+    /// Bitget REST signature 认证头名称。
+    pub const BITGET_SIGNATURE_HEADER: &str = "ACCESS-SIGN";
+    /// Bitget REST timestamp 认证头名称。
+    pub const BITGET_TIMESTAMP_HEADER: &str = "ACCESS-TIMESTAMP";
+    /// Bitget REST passphrase 认证头名称。
+    pub const BITGET_PASSPHRASE_HEADER: &str = "ACCESS-PASSPHRASE";
 
     /// 真实签名提供方接口。
     ///
@@ -1055,6 +1063,20 @@ pub mod real {
         ) -> SigningResult<OkxSignedEndpoint>;
     }
 
+    /// Bitget 真实签名提供方接口。
+    ///
+    /// 中文说明：Bitget REST V2 签名串是
+    /// `timestamp + method + requestPath + body`，GET 请求的 `requestPath`
+    /// 必须包含 query string。Provider 负责补充毫秒时间戳、读取
+    /// API key/secret/passphrase 并输出 Base64 HMAC。
+    pub trait BitgetRealSigningProvider {
+        fn sign_bitget_hmac(
+            &self,
+            input: BitgetHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<BitgetSignedEndpoint>;
+    }
+
     /// Binance 凭证提供方。
     ///
     /// 中文说明：外部 secret provider 通过实现该 trait 接入。trait 不提供日志
@@ -1088,6 +1110,17 @@ pub mod real {
         ) -> SigningResult<OkxApiCredentials>;
     }
 
+    /// Bitget 凭证提供方。
+    ///
+    /// 中文说明：Bitget 凭证包含 API key、secret key 和 passphrase，必须与
+    /// 其他交易所 provider 分开，避免环境变量错配导致真实下单请求误签。
+    pub trait BitgetCredentialProvider {
+        fn load_bitget_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<BitgetApiCredentials>;
+    }
+
     /// Binance 时间戳提供方。
     ///
     /// 中文说明：Binance signed endpoint 要求 `timestamp` 参数。默认实现使用
@@ -1109,6 +1142,14 @@ pub mod real {
     /// `2026-05-17T12:34:56.789Z`。测试或外部运行时可注入受控时间源。
     pub trait OkxTimestampProvider {
         fn timestamp_rfc3339(&self, audit_ref: &SigningAuditRef) -> SigningResult<String>;
+    }
+
+    /// Bitget 时间戳提供方。
+    ///
+    /// 中文说明：Bitget REST 认证头使用 UTC 毫秒时间戳。测试或外部运行时可注入
+    /// 受控时间源。
+    pub trait BitgetTimestampProvider {
+        fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
     }
 
     /// 使用环境变量读取 Binance 凭证的 provider。
@@ -1273,6 +1314,70 @@ pub mod real {
         }
     }
 
+    /// 使用环境变量读取 Bitget 凭证的 provider。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct EnvBitgetCredentialProvider {
+        api_key_env: EnvSecretName,
+        secret_key_env: EnvSecretName,
+        passphrase_env: EnvSecretName,
+    }
+
+    impl EnvBitgetCredentialProvider {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Self::from_env_names(
+                "BITGET_API_KEY",
+                "BITGET_API_SECRET",
+                "BITGET_API_PASSPHRASE",
+            )
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+            passphrase_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key_env: EnvSecretName::new(api_key_env)?,
+                secret_key_env: EnvSecretName::new(secret_key_env)?,
+                passphrase_env: EnvSecretName::new(passphrase_env)?,
+            })
+        }
+
+        pub fn api_key_env(&self) -> &EnvSecretName {
+            &self.api_key_env
+        }
+
+        pub fn secret_key_env(&self) -> &EnvSecretName {
+            &self.secret_key_env
+        }
+
+        pub fn passphrase_env(&self) -> &EnvSecretName {
+            &self.passphrase_env
+        }
+    }
+
+    impl fmt::Debug for EnvBitgetCredentialProvider {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("EnvBitgetCredentialProvider")
+                .field("api_key_env", &self.api_key_env)
+                .field("secret_key_env", &self.secret_key_env)
+                .field("passphrase_env", &self.passphrase_env)
+                .finish()
+        }
+    }
+
+    impl BitgetCredentialProvider for EnvBitgetCredentialProvider {
+        fn load_bitget_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<BitgetApiCredentials> {
+            let api_key = read_env_secret(&self.api_key_env, audit_ref)?;
+            let secret_key = read_env_secret(&self.secret_key_env, audit_ref)?;
+            let passphrase = read_env_secret(&self.passphrase_env, audit_ref)?;
+            BitgetApiCredentials::new(api_key, secret_key, passphrase)
+        }
+    }
+
     fn read_env_secret(name: &EnvSecretName, audit_ref: &SigningAuditRef) -> SigningResult<String> {
         env::var(name.as_str()).map_err(|error| {
             let reason = match error {
@@ -1367,6 +1472,23 @@ pub mod real {
         }
     }
 
+    /// Bitget 系统时间戳提供方。
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct SystemBitgetTimestampProvider;
+
+    impl BitgetTimestampProvider for SystemBitgetTimestampProvider {
+        fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+                SigningError::ClockUnavailable {
+                    audit_ref: audit_ref.clone(),
+                }
+            })?;
+            u64::try_from(duration.as_millis()).map_err(|_| SigningError::ClockUnavailable {
+                audit_ref: audit_ref.clone(),
+            })
+        }
+    }
+
     /// Binance HMAC-SHA256 签名提供方。
     pub struct BinanceHmacSha256SigningProvider<C, T> {
         credentials: C,
@@ -1385,6 +1507,12 @@ pub mod real {
         timestamp: T,
     }
 
+    /// Bitget HMAC-SHA256 签名提供方。
+    pub struct BitgetHmacSha256SigningProvider<C, T> {
+        credentials: C,
+        timestamp: T,
+    }
+
     /// 默认真实签名 provider 类型。
     pub type RealSigningProviderFromEnv = BinanceHmacSha256SigningProvider<
         EnvBinanceCredentialProvider,
@@ -1398,6 +1526,10 @@ pub mod real {
     /// 默认 OKX 真实签名 provider 类型。
     pub type OkxRealSigningProviderFromEnv =
         OkxHmacSha256SigningProvider<EnvOkxCredentialProvider, SystemOkxTimestampProvider>;
+
+    /// 默认 Bitget 真实签名 provider 类型。
+    pub type BitgetRealSigningProviderFromEnv =
+        BitgetHmacSha256SigningProvider<EnvBitgetCredentialProvider, SystemBitgetTimestampProvider>;
 
     impl<C, T> BinanceHmacSha256SigningProvider<C, T> {
         pub fn new(credentials: C, timestamp: T) -> Self {
@@ -1434,6 +1566,23 @@ pub mod real {
     }
 
     impl<C, T> OkxHmacSha256SigningProvider<C, T> {
+        pub fn new(credentials: C, timestamp: T) -> Self {
+            Self {
+                credentials,
+                timestamp,
+            }
+        }
+
+        pub fn credentials(&self) -> &C {
+            &self.credentials
+        }
+
+        pub fn timestamp_provider(&self) -> &T {
+            &self.timestamp
+        }
+    }
+
+    impl<C, T> BitgetHmacSha256SigningProvider<C, T> {
         pub fn new(credentials: C, timestamp: T) -> Self {
             Self {
                 credentials,
@@ -1512,6 +1661,30 @@ pub mod real {
         }
     }
 
+    impl BitgetRealSigningProviderFromEnv {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvBitgetCredentialProvider::from_default_env()?,
+                SystemBitgetTimestampProvider,
+            ))
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+            passphrase_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvBitgetCredentialProvider::from_env_names(
+                    api_key_env,
+                    secret_key_env,
+                    passphrase_env,
+                )?,
+                SystemBitgetTimestampProvider,
+            ))
+        }
+    }
+
     impl<C, T> fmt::Debug for BinanceHmacSha256SigningProvider<C, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("BinanceHmacSha256SigningProvider")
@@ -1533,6 +1706,15 @@ pub mod real {
     impl<C, T> fmt::Debug for OkxHmacSha256SigningProvider<C, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("OkxHmacSha256SigningProvider")
+                .field("credentials", &"<redacted>")
+                .field("timestamp", &"<configured>")
+                .finish()
+        }
+    }
+
+    impl<C, T> fmt::Debug for BitgetHmacSha256SigningProvider<C, T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BitgetHmacSha256SigningProvider")
                 .field("credentials", &"<redacted>")
                 .field("timestamp", &"<configured>")
                 .finish()
@@ -1697,6 +1879,64 @@ pub mod real {
                     Some(SecretString::new("okx_body", input.body)?)
                 },
                 signature: OkxHmacSignature(SecretString::new("signature", signature)?),
+                request,
+                success,
+            })
+        }
+    }
+
+    impl<C, T> BitgetRealSigningProvider for BitgetHmacSha256SigningProvider<C, T>
+    where
+        C: BitgetCredentialProvider,
+        T: BitgetTimestampProvider,
+    {
+        fn sign_bitget_hmac(
+            &self,
+            input: BitgetHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<BitgetSignedEndpoint> {
+            let pending_audit_ref = input.pending_audit_ref()?;
+            let timestamp_millis = self.timestamp.timestamp_millis(&pending_audit_ref)?;
+            let public_payload = input.public_payload(timestamp_millis);
+            let payload_digest = SigningPayloadDigest::new(format!(
+                "sha256:{}",
+                sha256_hex(public_payload.as_bytes())
+            ))?;
+            let request = input.clone().into_signing_request(payload_digest);
+            policy.validate_request(&request)?;
+
+            if policy.mode() != SigningPolicyMode::RealSigningEnabled {
+                return Err(SigningError::RealSigningPolicyNotEnabled {
+                    audit_ref: request.audit_ref(),
+                });
+            }
+
+            let credentials = self
+                .credentials
+                .load_bitget_credentials(&request.audit_ref())?;
+            let canonical_payload = input.canonical_payload(timestamp_millis);
+            let signature = hmac_sha256_base64(
+                credentials.secret_key.expose_bytes(),
+                canonical_payload.as_bytes(),
+            );
+            let signature_ref = SignatureRef::new(format!(
+                "signature-ref/bitget-hmac/{}",
+                ascii_suffix(request.payload_digest().as_str(), 24)
+            ))?;
+            let success = SigningSuccess::new(request.audit_ref(), signature_ref);
+
+            Ok(BitgetSignedEndpoint {
+                api_key: credentials.api_key,
+                passphrase: credentials.passphrase,
+                timestamp_millis,
+                method: input.method,
+                request_path: SecretString::new("bitget_request_path", input.request_path)?,
+                body: if input.body.is_empty() {
+                    None
+                } else {
+                    Some(SecretString::new("bitget_body", input.body)?)
+                },
+                signature: BitgetHmacSignature(SecretString::new("signature", signature)?),
                 request,
                 success,
             })
@@ -1970,6 +2210,22 @@ pub mod real {
         }
     }
 
+    /// Bitget REST 签名方法。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BitgetRestMethod {
+        Get,
+        Post,
+    }
+
+    impl BitgetRestMethod {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Get => "GET",
+                Self::Post => "POST",
+            }
+        }
+    }
+
     /// OKX HMAC 签名输入。
     ///
     /// 中文说明：`request_path` 对 GET 请求应包含 query string，例如
@@ -2085,6 +2341,143 @@ pub mod real {
     impl fmt::Debug for OkxHmacSigningInput {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("OkxHmacSigningInput")
+                .field("request_id", &self.request_id)
+                .field("policy_ref", &self.policy_ref.redacted())
+                .field("purpose", &self.purpose)
+                .field(
+                    "venue_id",
+                    &RedactedValue::from_reference(self.venue_id.as_str()),
+                )
+                .field(
+                    "account_id",
+                    &RedactedValue::from_reference(self.account_id.as_str()),
+                )
+                .field("method", &self.method)
+                .field(
+                    "request_path",
+                    &RedactedValue::from_reference(&self.request_path),
+                )
+                .field("body", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Bitget HMAC 签名输入。
+    ///
+    /// 中文说明：`request_path` 对 GET 请求应包含 query string，例如
+    /// `/api/v2/mix/order/detail?symbol=BTCUSDT&productType=USDT-FUTURES`；
+    /// POST 请求的 JSON body 由调用方按实际要发送的原文传入，签名和传输必须
+    /// 使用同一份 body。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct BitgetHmacSigningInput {
+        request_id: SigningRequestId,
+        policy_ref: SigningPolicyRef,
+        purpose: SigningPurpose,
+        venue_id: VenueId,
+        account_id: AccountId,
+        audit_context: SigningAuditContext,
+        method: BitgetRestMethod,
+        request_path: String,
+        body: String,
+    }
+
+    impl BitgetHmacSigningInput {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            request_id: SigningRequestId,
+            policy_ref: SigningPolicyRef,
+            purpose: SigningPurpose,
+            venue_id: VenueId,
+            account_id: AccountId,
+            method: BitgetRestMethod,
+            request_path: impl Into<String>,
+            body: impl Into<String>,
+        ) -> SigningResult<Self> {
+            let request_path = request_path.into();
+            let body = body.into();
+            validate_bitget_request_path(&request_path)?;
+            validate_bitget_body(&body)?;
+            if method == BitgetRestMethod::Get && !body.is_empty() {
+                return Err(SigningError::InvalidRequest {
+                    field: "bitget_body",
+                    reason: "GET requests must not carry a signed body",
+                });
+            }
+            Ok(Self {
+                request_id,
+                policy_ref,
+                purpose,
+                venue_id,
+                account_id,
+                audit_context: SigningAuditContext::default(),
+                method,
+                request_path,
+                body,
+            })
+        }
+
+        pub fn with_audit_context(mut self, audit_context: SigningAuditContext) -> Self {
+            self.audit_context = audit_context;
+            self
+        }
+
+        pub fn request_id(&self) -> &SigningRequestId {
+            &self.request_id
+        }
+
+        pub fn policy_ref(&self) -> &SigningPolicyRef {
+            &self.policy_ref
+        }
+
+        pub fn method(&self) -> BitgetRestMethod {
+            self.method
+        }
+
+        pub fn request_path(&self) -> &str {
+            &self.request_path
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
+            SigningAuditRef::new(format!(
+                "signing-audit/{}/pending",
+                self.request_id.as_str()
+            ))
+        }
+
+        fn public_payload(&self, timestamp_millis: u64) -> String {
+            self.canonical_payload(timestamp_millis)
+        }
+
+        fn canonical_payload(&self, timestamp_millis: u64) -> String {
+            format!(
+                "{}{}{}{}",
+                timestamp_millis,
+                self.method.as_str(),
+                self.request_path,
+                self.body
+            )
+        }
+
+        fn into_signing_request(self, payload_digest: SigningPayloadDigest) -> SigningRequest {
+            SigningRequest::new(
+                self.request_id,
+                self.policy_ref,
+                self.purpose,
+                self.venue_id,
+                self.account_id,
+                payload_digest,
+            )
+            .with_audit_context(self.audit_context)
+        }
+    }
+
+    impl fmt::Debug for BitgetHmacSigningInput {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BitgetHmacSigningInput")
                 .field("request_id", &self.request_id)
                 .field("policy_ref", &self.policy_ref.redacted())
                 .field("purpose", &self.purpose)
@@ -2266,6 +2659,52 @@ pub mod real {
         }
     }
 
+    /// Bitget API 凭证。
+    ///
+    /// 中文说明：Bitget 真实请求同时需要 API key、secret key 和 passphrase。
+    /// `Debug` 不输出原文；secret key 和 passphrase 随对象 drop 清零。
+    pub struct BitgetApiCredentials {
+        api_key: BitgetApiKey,
+        secret_key: BitgetSecretKey,
+        passphrase: BitgetPassphrase,
+    }
+
+    impl BitgetApiCredentials {
+        pub fn new(
+            api_key: impl Into<String>,
+            secret_key: impl Into<String>,
+            passphrase: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key: BitgetApiKey::new(api_key)?,
+                secret_key: BitgetSecretKey::new(secret_key)?,
+                passphrase: BitgetPassphrase::new(passphrase)?,
+            })
+        }
+
+        pub fn from_parts(
+            api_key: BitgetApiKey,
+            secret_key: BitgetSecretKey,
+            passphrase: BitgetPassphrase,
+        ) -> Self {
+            Self {
+                api_key,
+                secret_key,
+                passphrase,
+            }
+        }
+    }
+
+    impl fmt::Debug for BitgetApiCredentials {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BitgetApiCredentials")
+                .field("api_key", &"<redacted>")
+                .field("secret_key", &"<redacted>")
+                .field("passphrase", &"<redacted>")
+                .finish()
+        }
+    }
+
     /// Binance API key。
     pub struct BinanceApiKey(SecretString);
 
@@ -2320,6 +2759,25 @@ pub mod real {
     impl fmt::Debug for OkxApiKey {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("OkxApiKey(<redacted>)")
+        }
+    }
+
+    /// Bitget API key。
+    pub struct BitgetApiKey(SecretString);
+
+    impl BitgetApiKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self(SecretString::new("api_key", value.into())?))
+        }
+
+        pub fn expose_for_transport(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for BitgetApiKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BitgetApiKey(<redacted>)")
         }
     }
 
@@ -2392,6 +2850,29 @@ pub mod real {
         }
     }
 
+    /// Bitget API secret。
+    pub struct BitgetSecretKey(SecretBytes);
+
+    impl BitgetSecretKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Self::from_bytes(value.into().into_bytes())
+        }
+
+        pub fn from_bytes(value: Vec<u8>) -> SigningResult<Self> {
+            Ok(Self(SecretBytes::new("secret_key", value)?))
+        }
+
+        fn expose_bytes(&self) -> &[u8] {
+            self.0.expose_bytes()
+        }
+    }
+
+    impl fmt::Debug for BitgetSecretKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BitgetSecretKey(<redacted>)")
+        }
+    }
+
     /// OKX API passphrase。
     pub struct OkxPassphrase(SecretString);
 
@@ -2408,6 +2889,25 @@ pub mod real {
     impl fmt::Debug for OkxPassphrase {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("OkxPassphrase(<redacted>)")
+        }
+    }
+
+    /// Bitget API passphrase。
+    pub struct BitgetPassphrase(SecretString);
+
+    impl BitgetPassphrase {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self(SecretString::new("passphrase", value.into())?))
+        }
+
+        pub fn expose_for_transport(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for BitgetPassphrase {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BitgetPassphrase(<redacted>)")
         }
     }
 
@@ -2453,6 +2953,21 @@ pub mod real {
     impl fmt::Debug for OkxHmacSignature {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("OkxHmacSignature(<redacted>)")
+        }
+    }
+
+    /// Bitget HMAC signature（哈希消息认证码签名）。
+    pub struct BitgetHmacSignature(SecretString);
+
+    impl BitgetHmacSignature {
+        pub fn as_str(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for BitgetHmacSignature {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BitgetHmacSignature(<redacted>)")
         }
     }
 
@@ -2698,6 +3213,110 @@ pub mod real {
                 .field("timestamp_header_name", &OKX_TIMESTAMP_HEADER)
                 .field("passphrase_header_name", &OKX_PASSPHRASE_HEADER)
                 .field("timestamp_rfc3339", &self.timestamp_rfc3339)
+                .field("method", &self.method)
+                .field("request_path", &"<redacted>")
+                .field("body", &"<redacted>")
+                .field("signature", &"<redacted>")
+                .field("signing_request", &self.signing_request())
+                .field("signing_success", &self.signing_success())
+                .finish()
+        }
+    }
+
+    /// 已签名 Bitget endpoint 传输材料。
+    ///
+    /// 中文说明：该对象包含 HTTP 发送所需的 Bitget 认证头、request path 和
+    /// body。它不能被直接显示；`Debug` 会脱敏。
+    pub struct BitgetSignedEndpoint {
+        api_key: BitgetApiKey,
+        passphrase: BitgetPassphrase,
+        timestamp_millis: u64,
+        method: BitgetRestMethod,
+        request_path: SecretString,
+        body: Option<SecretString>,
+        signature: BitgetHmacSignature,
+        request: SigningRequest,
+        success: SigningSuccess,
+    }
+
+    impl BitgetSignedEndpoint {
+        pub fn api_key_header_name(&self) -> &'static str {
+            BITGET_API_KEY_HEADER
+        }
+
+        pub fn api_key_header_value(&self) -> &str {
+            self.api_key.expose_for_transport()
+        }
+
+        pub fn signature_header_name(&self) -> &'static str {
+            BITGET_SIGNATURE_HEADER
+        }
+
+        pub fn signature_header_value(&self) -> &str {
+            self.signature.as_str()
+        }
+
+        pub fn timestamp_header_name(&self) -> &'static str {
+            BITGET_TIMESTAMP_HEADER
+        }
+
+        pub fn timestamp_header_value(&self) -> String {
+            self.timestamp_millis.to_string()
+        }
+
+        pub fn timestamp_millis(&self) -> u64 {
+            self.timestamp_millis
+        }
+
+        pub fn passphrase_header_name(&self) -> &'static str {
+            BITGET_PASSPHRASE_HEADER
+        }
+
+        pub fn passphrase_header_value(&self) -> &str {
+            self.passphrase.expose_for_transport()
+        }
+
+        pub fn method(&self) -> BitgetRestMethod {
+            self.method
+        }
+
+        pub fn request_path_for_transport(&self) -> &str {
+            self.request_path.expose_str()
+        }
+
+        pub fn body_for_transport(&self) -> &str {
+            self.body
+                .as_ref()
+                .map(SecretString::expose_str)
+                .unwrap_or("")
+        }
+
+        pub fn signature(&self) -> &BitgetHmacSignature {
+            &self.signature
+        }
+
+        pub fn signing_request(&self) -> &SigningRequest {
+            &self.request
+        }
+
+        pub fn signing_success(&self) -> &SigningSuccess {
+            &self.success
+        }
+
+        pub fn redacted_log_entry(&self) -> RedactedSigningLogEntry {
+            RedactedSigningLogEntry::from_success(&self.request, &self.success)
+        }
+    }
+
+    impl fmt::Debug for BitgetSignedEndpoint {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BitgetSignedEndpoint")
+                .field("api_key_header_name", &BITGET_API_KEY_HEADER)
+                .field("api_key_header_value", &"<redacted>")
+                .field("signature_header_name", &BITGET_SIGNATURE_HEADER)
+                .field("timestamp_header_name", &BITGET_TIMESTAMP_HEADER)
+                .field("passphrase_header_name", &BITGET_PASSPHRASE_HEADER)
+                .field("timestamp_millis", &self.timestamp_millis)
                 .field("method", &self.method)
                 .field("request_path", &"<redacted>")
                 .field("body", &"<redacted>")
@@ -2975,6 +3594,56 @@ pub mod real {
         {
             return Err(SigningError::InvalidRequest {
                 field: "okx_body",
+                reason: "body contains a control byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bitget_request_path(value: &str) -> SigningResult<()> {
+        if value.is_empty() {
+            return Err(SigningError::InvalidRequest {
+                field: "bitget_request_path",
+                reason: "request path cannot be empty",
+            });
+        }
+        if value.len() > 4096 {
+            return Err(SigningError::InvalidRequest {
+                field: "bitget_request_path",
+                reason: "request path is too long",
+            });
+        }
+        if !value.starts_with('/') {
+            return Err(SigningError::InvalidRequest {
+                field: "bitget_request_path",
+                reason: "request path must start with slash",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "bitget_request_path",
+                reason: "request path contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bitget_body(value: &str) -> SigningResult<()> {
+        if value.len() > 8192 {
+            return Err(SigningError::InvalidRequest {
+                field: "bitget_body",
+                reason: "body is too long",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "bitget_body",
                 reason: "body contains a control byte",
             });
         }
@@ -3654,6 +4323,83 @@ mod tests {
 
     #[cfg(feature = "real-signing")]
     #[test]
+    fn real_signing_build_exposes_bitget_hmac_provider() {
+        use crate::real::{
+            BitgetHmacSha256SigningProvider, BitgetRealSigningProvider, BitgetRestMethod,
+            BitgetTimestampProvider, BITGET_API_KEY_HEADER, BITGET_PASSPHRASE_HEADER,
+            BITGET_SIGNATURE_HEADER, BITGET_TIMESTAMP_HEADER,
+        };
+
+        let policy_ref = SigningPolicyRef::new("kms-policy/bitget-hmac-unit").expect("policy ref");
+        let policy = SigningPolicy::real_signing_enabled(policy_ref.clone());
+        let input = crate::real::BitgetHmacSigningInput::new(
+            SigningRequestId::new("signing-request/bitget-hmac-unit").expect("request id"),
+            policy_ref,
+            SigningPurpose::SubmitOrder,
+            VenueId::new("venue:BITGET-USDT-FUTURES").expect("venue id"),
+            AccountId::new("account/paper-bitget").expect("account id"),
+            BitgetRestMethod::Post,
+            "/api/v2/mix/order/place-order",
+            r#"{"symbol":"BTCUSDT","productType":"USDT-FUTURES","marginMode":"crossed","marginCoin":"USDT","side":"sell","orderType":"limit","force":"post_only","size":"0.001","price":"43100.50","clientOid":"bitgetUnit1"}"#,
+        )
+        .expect("bitget input");
+        let signer = BitgetHmacSha256SigningProvider::new(
+            GeneratedCredentialProvider { seed: 17 },
+            FixedTimestamp(1_700_000_000_123),
+        );
+
+        let signed = signer
+            .sign_bitget_hmac(input, &policy)
+            .expect("real-signing feature should sign Bitget payload");
+
+        assert_eq!(signed.api_key_header_name(), BITGET_API_KEY_HEADER);
+        assert_eq!(signed.signature_header_name(), BITGET_SIGNATURE_HEADER);
+        assert_eq!(signed.timestamp_header_name(), BITGET_TIMESTAMP_HEADER);
+        assert_eq!(signed.passphrase_header_name(), BITGET_PASSPHRASE_HEADER);
+        assert_eq!(signed.timestamp_header_value(), "1700000000123");
+        assert_eq!(signed.method(), BitgetRestMethod::Post);
+        assert_eq!(
+            signed.request_path_for_transport(),
+            "/api/v2/mix/order/place-order"
+        );
+        assert!(signed
+            .body_for_transport()
+            .contains(r#""productType":"USDT-FUTURES""#));
+        assert_eq!(signed.signature().as_str().len(), 44);
+        assert!(signed
+            .signature()
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')));
+
+        let raw_api_key = signed.api_key_header_value().to_owned();
+        let raw_passphrase = signed.passphrase_header_value().to_owned();
+        let raw_signature = signed.signature().as_str().to_owned();
+        let raw_body = signed.body_for_transport().to_owned();
+        let rendered_debug = format!("{signed:?}");
+        let rendered_log = signed.redacted_log_entry().to_string();
+
+        assert!(!rendered_debug.contains(&raw_api_key));
+        assert!(!rendered_debug.contains(&raw_passphrase));
+        assert!(!rendered_debug.contains(&raw_signature));
+        assert!(!rendered_debug.contains(&raw_body));
+        assert!(!rendered_log.contains(&raw_api_key));
+        assert!(!rendered_log.contains(&raw_passphrase));
+        assert!(!rendered_log.contains(&raw_signature));
+        assert!(!rendered_log.contains(&raw_body));
+        assert_eq!(
+            signed.redacted_log_entry().status(),
+            SigningAttemptStatus::Signed
+        );
+
+        fn _assert_timestamp_provider<T: BitgetTimestampProvider>(provider: T) -> T {
+            provider
+        }
+        let _ = _assert_timestamp_provider(FixedTimestamp(1));
+    }
+
+    #[cfg(feature = "real-signing")]
+    #[test]
     fn binance_params_reserve_signature_and_timestamp_for_boundary() {
         use crate::real::BinanceRequestParam;
 
@@ -3716,6 +4462,13 @@ mod tests {
     }
 
     #[cfg(feature = "real-signing")]
+    impl crate::real::BitgetTimestampProvider for FixedTimestamp {
+        fn timestamp_millis(&self, _audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
     #[derive(Clone, Copy, Debug)]
     struct GeneratedCredentialProvider {
         seed: u8,
@@ -3757,6 +4510,20 @@ mod tests {
                 generated_ascii(48, self.seed),
                 generated_ascii(64, self.seed.wrapping_add(29)),
                 generated_ascii(32, self.seed.wrapping_add(31)),
+            )
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
+    impl crate::real::BitgetCredentialProvider for GeneratedCredentialProvider {
+        fn load_bitget_credentials(
+            &self,
+            _audit_ref: &SigningAuditRef,
+        ) -> SigningResult<crate::real::BitgetApiCredentials> {
+            crate::real::BitgetApiCredentials::new(
+                generated_ascii(48, self.seed),
+                generated_ascii(64, self.seed.wrapping_add(37)),
+                generated_ascii(32, self.seed.wrapping_add(41)),
             )
         }
     }

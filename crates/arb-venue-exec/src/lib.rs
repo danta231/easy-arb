@@ -287,6 +287,8 @@ pub enum PrivateOrderMarket {
     BybitLinear,
     OkxSpot,
     OkxSwap,
+    BitgetSpot,
+    BitgetUsdtFutures,
 }
 
 impl PrivateOrderMarket {
@@ -298,6 +300,8 @@ impl PrivateOrderMarket {
             Self::BybitLinear => "BybitLinear",
             Self::OkxSpot => "OkxSpot",
             Self::OkxSwap => "OkxSwap",
+            Self::BitgetSpot => "BitgetSpot",
+            Self::BitgetUsdtFutures => "BitgetUsdtFutures",
         }
     }
 
@@ -309,6 +313,8 @@ impl PrivateOrderMarket {
             Self::BybitLinear => "bybit-linear",
             Self::OkxSpot => "okx-spot",
             Self::OkxSwap => "okx-swap",
+            Self::BitgetSpot => "bitget-spot",
+            Self::BitgetUsdtFutures => "bitget-usdt-futures",
         }
     }
 
@@ -320,6 +326,8 @@ impl PrivateOrderMarket {
             Self::BybitLinear => "LINEAR-PERP",
             Self::OkxSpot => "SPOT",
             Self::OkxSwap => "SWAP",
+            Self::BitgetSpot => "SPOT",
+            Self::BitgetUsdtFutures => "USDT-FUTURES",
         }
     }
 
@@ -328,6 +336,7 @@ impl PrivateOrderMarket {
             Self::Spot | Self::UsdmFutures => "BINANCE",
             Self::BybitSpot | Self::BybitLinear => "BYBIT",
             Self::OkxSpot | Self::OkxSwap => "OKX",
+            Self::BitgetSpot | Self::BitgetUsdtFutures => "BITGET",
         }
     }
 }
@@ -1521,6 +1530,8 @@ pub fn parse_binance_order_query_confirmation(
             | PrivateOrderMarket::BybitLinear
             | PrivateOrderMarket::OkxSpot
             | PrivateOrderMarket::OkxSwap
+            | PrivateOrderMarket::BitgetSpot
+            | PrivateOrderMarket::BitgetUsdtFutures
     ) {
         return Err(VenueExecError::InvalidRequest {
             field: "market",
@@ -1703,6 +1714,95 @@ pub fn parse_okx_private_order_stream_update(
     })?;
     let fallback_time = json_field_value(body, "ts");
     parse_okx_private_order_fields(
+        market,
+        OrderConfirmationSource::PrivateStream,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        order,
+        fallback_time.as_deref(),
+    )
+}
+
+/// 解析 Bitget REST 查单响应。
+///
+/// 中文说明：Bitget 下单 REST 回执只代表交易所接收请求；该函数只接受
+/// `/api/v2/spot/trade/orderInfo` 或 `/api/v2/mix/order/detail` 查单返回的明确
+/// 订单状态，用于真实下单后的二次确认。
+pub fn parse_bitget_order_query_confirmation(
+    market: PrivateOrderMarket,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_bitget_private_market(market)?;
+    let code = required_json_field(body, "code")?;
+    if code != "00000" {
+        return Err(VenueExecError::UnknownExternalState {
+            venue_id,
+            detail: format!(
+                "Bitget order query returned code={code}: {}",
+                json_field_value(body, "msg")
+                    .or_else(|| json_field_value(body, "message"))
+                    .unwrap_or_else(|| "missing msg".to_owned())
+            ),
+        });
+    }
+    let data_object = json_object_field(body, "data").or_else(|| {
+        json_array_field(body, "data").and_then(|array| first_json_object_in_array(array))
+    });
+    let order = data_object.ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "Bitget order query response lacks order data",
+    })?;
+    let fallback_time = json_field_value(body, "requestTime");
+    parse_bitget_private_order_fields(
+        market,
+        OrderConfirmationSource::OrderQuery,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        order,
+        fallback_time.as_deref(),
+    )
+}
+
+/// 解析 Bitget private `orders` channel 的订单更新。
+///
+/// 中文说明：Bitget 私有订单流只作为确认来源；调用方仍必须先通过执行门禁和
+/// 真实签名边界下单，不能把 stream 事件当成下单授权。
+pub fn parse_bitget_private_order_stream_update(
+    market: PrivateOrderMarket,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_bitget_private_market(market)?;
+    let arg = json_object_field(body, "arg").ok_or(VenueExecError::InvalidRequest {
+        field: "arg",
+        reason: "Bitget private order stream update lacks arg object",
+    })?;
+    let channel = required_json_field(arg, "channel")?;
+    if channel != "orders" {
+        return Err(VenueExecError::InvalidRequest {
+            field: "channel",
+            reason: "Bitget private order stream update must use orders channel",
+        });
+    }
+    let inst_type = required_json_field(arg, "instType")?;
+    validate_bitget_order_inst_type(market, &inst_type)?;
+    let data = json_array_field(body, "data").ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "Bitget private order stream update lacks data array",
+    })?;
+    let order = first_json_object_in_array(data).ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "Bitget private order stream data contains no order object",
+    })?;
+    let fallback_time = json_field_value(body, "ts");
+    parse_bitget_private_order_fields(
         market,
         OrderConfirmationSource::PrivateStream,
         venue_id,
@@ -1922,6 +2022,86 @@ fn parse_okx_private_order_fields(
     })
 }
 
+fn parse_bitget_private_order_fields(
+    market: PrivateOrderMarket,
+    source: OrderConfirmationSource,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: String,
+    body: &str,
+    fallback_time_ms: Option<&str>,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_token("source_event_id", &source_event_id)?;
+    validate_bitget_private_market(market)?;
+    let symbol = json_field_value(body, "symbol")
+        .or_else(|| json_field_value(body, "instId"))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "symbol",
+            reason: "Bitget private order update lacks symbol or instId",
+        })?;
+    let symbol = bitget_symbol_upper(&symbol)?;
+    let status_text = json_field_value(body, "status")
+        .or_else(|| json_field_value(body, "state"))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "status",
+            reason: "Bitget private order update lacks status or state",
+        })?;
+    let status = bitget_order_confirmation_status(&status_text);
+    let event_time = bitget_event_time(body, fallback_time_ms)?;
+    let exchange_order_id = json_field_value(body, "orderId").filter(|value| !value.is_empty());
+    let venue_order_id = exchange_order_id
+        .as_ref()
+        .map(|order_id| ExternalOrderId::new(format!("{}:order:{order_id}", market.token())))
+        .transpose()?;
+    let client_order_id = json_field_value(body, "clientOid")
+        .filter(|value| !value.is_empty())
+        .map(OrderId::new)
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let side = json_field_value(body, "side")
+        .map(|side| bitget_private_side(&side))
+        .transpose()?;
+    let cumulative_filled_quantity = json_field_value(body, "accBaseVolume")
+        .or_else(|| json_field_value(body, "baseVolume"))
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_quantity("cumulative_filled_quantity", &value))
+        .transpose()?;
+    let instrument_id = InstrumentId::new(format!(
+        "inst:{}:{}:{}",
+        market.venue_family(),
+        symbol,
+        market.instrument_suffix()
+    ))
+    .map_err(domain_invalid_request)?;
+    let last_fill = parse_bitget_private_fill(
+        source,
+        &source_event_id,
+        &event_time,
+        body,
+        cumulative_filled_quantity,
+    )?;
+
+    Ok(PrivateOrderUpdate {
+        source,
+        market,
+        venue_id,
+        account_id,
+        instrument_id,
+        symbol,
+        source_event_id,
+        event_time,
+        status,
+        execution_type: json_field_value(body, "enterPointSource")
+            .or_else(|| json_field_value(body, "orderSource")),
+        side,
+        venue_order_id,
+        exchange_order_id,
+        client_order_id,
+        cumulative_filled_quantity,
+        last_fill,
+    })
+}
+
 fn parse_bybit_private_fill(
     source: OrderConfirmationSource,
     source_event_id: &str,
@@ -2083,6 +2263,65 @@ fn parse_okx_private_fill(
         .or_else(|| json_field_value(body, "feeCcy"))
         .filter(|value| !value.is_empty())
         .map(|value| AssetId::new(format!("asset:{value}")))
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let quantity = parse_quantity("last_fill_quantity", &quantity_text)?;
+    if let Some(cumulative) = cumulative_filled_quantity {
+        if quantity > cumulative {
+            return Err(VenueExecError::InvalidRequest {
+                field: "last_fill_quantity",
+                reason: "last fill quantity exceeds cumulative filled quantity",
+            });
+        }
+    }
+    Ok(Some(PrivateOrderFillUpdate {
+        source_event_id: source_event_id.to_owned(),
+        timestamp: event_time.to_owned(),
+        price,
+        quantity: quantity_text,
+        fee_asset_id,
+        fee_amount,
+        trade_id: json_field_value(body, "tradeId"),
+    }))
+}
+
+fn parse_bitget_private_fill(
+    source: OrderConfirmationSource,
+    source_event_id: &str,
+    event_time: &str,
+    body: &str,
+    cumulative_filled_quantity: Option<Quantity>,
+) -> VenueExecResult<Option<PrivateOrderFillUpdate>> {
+    let quantity_text = json_field_value(body, "baseVolume").or_else(|| {
+        if source == OrderConfirmationSource::OrderQuery {
+            json_field_value(body, "accBaseVolume")
+        } else {
+            None
+        }
+    });
+    let Some(quantity_text) = quantity_text else {
+        return Ok(None);
+    };
+    if !decimal_text_is_positive(&quantity_text) {
+        return Ok(None);
+    }
+    let price = json_field_value(body, "fillPrice")
+        .or_else(|| {
+            if source == OrderConfirmationSource::OrderQuery {
+                json_field_value(body, "priceAvg").or_else(|| json_field_value(body, "price"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "0".to_owned());
+    let fee_amount = json_field_value(body, "fillFee")
+        .or_else(|| json_field_value(body, "fee"))
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_bitget_fee_amount(&value))
+        .transpose()?;
+    let fee_asset_id = json_field_value(body, "fillFeeCoin")
+        .filter(|value| !value.is_empty())
+        .map(|value| AssetId::new(format!("asset:{}", value.to_ascii_uppercase())))
         .transpose()
         .map_err(domain_invalid_request)?;
     let quantity = parse_quantity("last_fill_quantity", &quantity_text)?;
@@ -2272,6 +2511,18 @@ fn okx_event_time(body: &str, fallback_time_ms: Option<&str>) -> VenueExecResult
     okx_millis_to_utc(&millis)
 }
 
+fn bitget_event_time(body: &str, fallback_time_ms: Option<&str>) -> VenueExecResult<String> {
+    let millis = json_field_value(body, "uTime")
+        .or_else(|| json_field_value(body, "fillTime"))
+        .or_else(|| json_field_value(body, "cTime"))
+        .or_else(|| fallback_time_ms.map(str::to_owned))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "event_time",
+            reason: "Bitget private order update lacks event time",
+        })?;
+    bitget_millis_to_utc(&millis)
+}
+
 fn binance_millis_to_utc(value: &str) -> VenueExecResult<String> {
     let millis = value
         .parse::<u64>()
@@ -2299,6 +2550,23 @@ fn okx_millis_to_utc(value: &str) -> VenueExecResult<String> {
     let seconds = i64::try_from(millis / 1_000).map_err(|_| VenueExecError::InvalidRequest {
         field: "event_time",
         reason: "OKX event time is outside supported UTC range",
+    })?;
+    let nanos = u32::try_from((millis % 1_000) * 1_000_000).expect("millisecond nanos fit u32");
+    Ok(UtcTimestamp::from_unix_parts(seconds, nanos)
+        .map_err(domain_invalid_request)?
+        .to_string())
+}
+
+fn bitget_millis_to_utc(value: &str) -> VenueExecResult<String> {
+    let millis = value
+        .parse::<u64>()
+        .map_err(|_| VenueExecError::InvalidRequest {
+            field: "event_time",
+            reason: "Bitget event time must be Unix milliseconds",
+        })?;
+    let seconds = i64::try_from(millis / 1_000).map_err(|_| VenueExecError::InvalidRequest {
+        field: "event_time",
+        reason: "Bitget event time is outside supported UTC range",
     })?;
     let nanos = u32::try_from((millis % 1_000) * 1_000_000).expect("millisecond nanos fit u32");
     Ok(UtcTimestamp::from_unix_parts(seconds, nanos)
@@ -2341,6 +2609,18 @@ fn okx_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
     }
 }
 
+fn bitget_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
+    match value {
+        "live" | "new" | "init" => OrderConfirmationStatus::Acknowledged,
+        "partially_filled" | "partial-fill" => OrderConfirmationStatus::PartiallyFilled,
+        "filled" | "full-fill" => OrderConfirmationStatus::Filled,
+        "canceled" | "cancelled" => OrderConfirmationStatus::Cancelled,
+        "rejected" | "fail" | "order_failed" => OrderConfirmationStatus::Rejected,
+        "expired" => OrderConfirmationStatus::Expired,
+        _ => OrderConfirmationStatus::Unknown,
+    }
+}
+
 fn bybit_private_side(value: &str) -> VenueExecResult<OrderSide> {
     match value {
         "Buy" => Ok(OrderSide::Buy),
@@ -2348,6 +2628,17 @@ fn bybit_private_side(value: &str) -> VenueExecResult<OrderSide> {
         _ => Err(VenueExecError::InvalidRequest {
             field: "side",
             reason: "Bybit order side must be Buy or Sell",
+        }),
+    }
+}
+
+fn bitget_private_side(value: &str) -> VenueExecResult<OrderSide> {
+    match value {
+        "buy" | "Buy" | "BUY" => Ok(OrderSide::Buy),
+        "sell" | "Sell" | "SELL" => Ok(OrderSide::Sell),
+        _ => Err(VenueExecError::InvalidRequest {
+            field: "side",
+            reason: "Bitget order side must be buy or sell",
         }),
     }
 }
@@ -2382,6 +2673,57 @@ fn validate_okx_private_market(market: PrivateOrderMarket) -> VenueExecResult<()
             reason: "OKX order confirmation requires an OKX private order market",
         }),
     }
+}
+
+fn validate_bitget_private_market(market: PrivateOrderMarket) -> VenueExecResult<()> {
+    match market {
+        PrivateOrderMarket::BitgetSpot | PrivateOrderMarket::BitgetUsdtFutures => Ok(()),
+        _ => Err(VenueExecError::InvalidRequest {
+            field: "market",
+            reason: "Bitget order confirmation requires a Bitget private order market",
+        }),
+    }
+}
+
+fn validate_bitget_order_inst_type(
+    market: PrivateOrderMarket,
+    inst_type: &str,
+) -> VenueExecResult<()> {
+    match (market, inst_type) {
+        (PrivateOrderMarket::BitgetSpot, "SPOT")
+        | (PrivateOrderMarket::BitgetUsdtFutures, "USDT-FUTURES") => Ok(()),
+        (PrivateOrderMarket::BitgetSpot | PrivateOrderMarket::BitgetUsdtFutures, _) => {
+            Err(VenueExecError::InvalidRequest {
+                field: "instType",
+                reason: "Bitget instType does not match configured private order market",
+            })
+        }
+        _ => validate_bitget_private_market(market),
+    }
+}
+
+fn bitget_symbol_upper(value: &str) -> VenueExecResult<String> {
+    if value.is_empty() || value.len() > 32 {
+        return Err(VenueExecError::InvalidRequest {
+            field: "symbol",
+            reason: "Bitget symbol must be 1 to 32 bytes",
+        });
+    }
+    if value
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphabetic() || byte.is_ascii_digit()))
+    {
+        return Err(VenueExecError::InvalidRequest {
+            field: "symbol",
+            reason: "Bitget symbol must use ASCII letters and digits",
+        });
+    }
+    Ok(value.to_ascii_uppercase())
+}
+
+fn parse_bitget_fee_amount(value: &str) -> VenueExecResult<Amount> {
+    let normalized = value.strip_prefix('-').unwrap_or(value);
+    parse_amount("fee_amount", normalized)
 }
 
 fn validate_okx_private_inst_id(market: PrivateOrderMarket, inst_id: &str) -> VenueExecResult<()> {
@@ -2452,7 +2794,9 @@ fn validate_bybit_order_category(
             PrivateOrderMarket::Spot
             | PrivateOrderMarket::UsdmFutures
             | PrivateOrderMarket::OkxSpot
-            | PrivateOrderMarket::OkxSwap,
+            | PrivateOrderMarket::OkxSwap
+            | PrivateOrderMarket::BitgetSpot
+            | PrivateOrderMarket::BitgetUsdtFutures,
             _,
         ) => Err(VenueExecError::InvalidRequest {
             field: "market",
@@ -2701,22 +3045,24 @@ pub mod live {
 
     use arb_domain::{AccountId, InstrumentId, OrderId, VenueId};
     use arb_signing::real::{
-        BinanceHmacSigningInput, BinanceRequestParam, BinanceSignedEndpoint, BybitHmacSigningInput,
-        BybitRealSigningProvider, BybitSignedEndpoint, BybitSigningPayloadKind,
-        OkxHmacSigningInput, OkxRealSigningProvider, OkxRestMethod, OkxSignedEndpoint,
-        RealSigningProvider,
+        BinanceHmacSigningInput, BinanceRequestParam, BinanceSignedEndpoint,
+        BitgetHmacSigningInput, BitgetRealSigningProvider, BitgetRestMethod, BitgetSignedEndpoint,
+        BybitHmacSigningInput, BybitRealSigningProvider, BybitSignedEndpoint,
+        BybitSigningPayloadKind, OkxHmacSigningInput, OkxRealSigningProvider, OkxRestMethod,
+        OkxSignedEndpoint, RealSigningProvider,
     };
     use arb_signing::{SigningPolicy, SigningPurpose, SigningRequestId};
 
     use super::{
-        parse_binance_order_query_confirmation, parse_bybit_order_query_confirmation,
-        parse_okx_order_query_confirmation, unknown_status_report, CancelOrder, CancelOrderRequest,
-        ConfirmOrderStatus, ConfirmOrderStatusRequest, ExternalActionRef, ExternalOrderId,
-        IdempotencyKey, MutableActionId, MutableActionKind, MutableActionReceipt,
-        MutableActionStatus, MutableActionStatusReport, MutableOrderType, OrderReference,
-        OrderSide, PrivateOrderMarket, PrivateOrderUpdate, QueryActionStatus,
-        QueryActionStatusRequest, RequestFingerprint, RequestTransfer, SubmitOrder,
-        SubmitOrderRequest, TransferRequest, VenueExecError, VenueExecResult,
+        parse_binance_order_query_confirmation, parse_bitget_order_query_confirmation,
+        parse_bybit_order_query_confirmation, parse_okx_order_query_confirmation,
+        unknown_status_report, CancelOrder, CancelOrderRequest, ConfirmOrderStatus,
+        ConfirmOrderStatusRequest, ExternalActionRef, ExternalOrderId, IdempotencyKey,
+        MutableActionId, MutableActionKind, MutableActionReceipt, MutableActionStatus,
+        MutableActionStatusReport, MutableOrderType, OrderReference, OrderSide, PrivateOrderMarket,
+        PrivateOrderUpdate, QueryActionStatus, QueryActionStatusRequest, RequestFingerprint,
+        RequestTransfer, SubmitOrder, SubmitOrderRequest, TransferRequest, VenueExecError,
+        VenueExecResult,
     };
 
     /// Binance Spot 下单、撤单和查单 endpoint。
@@ -6989,6 +7335,1414 @@ pub mod live {
         };
         VenueId::new(value).expect("static OKX transport venue ID")
     }
+
+    /// Bitget Spot 下单 endpoint。
+    pub const BITGET_SPOT_PLACE_ORDER_ENDPOINT: &str = "/api/v2/spot/trade/place-order";
+    /// Bitget Spot 撤单 endpoint。
+    pub const BITGET_SPOT_CANCEL_ORDER_ENDPOINT: &str = "/api/v2/spot/trade/cancel-order";
+    /// Bitget Spot 查单 endpoint。
+    pub const BITGET_SPOT_ORDER_INFO_ENDPOINT: &str = "/api/v2/spot/trade/orderInfo";
+    /// Bitget USDT-FUTURES 下单 endpoint。
+    pub const BITGET_MIX_PLACE_ORDER_ENDPOINT: &str = "/api/v2/mix/order/place-order";
+    /// Bitget USDT-FUTURES 撤单 endpoint。
+    pub const BITGET_MIX_CANCEL_ORDER_ENDPOINT: &str = "/api/v2/mix/order/cancel-order";
+    /// Bitget USDT-FUTURES 查单 endpoint。
+    pub const BITGET_MIX_ORDER_DETAIL_ENDPOINT: &str = "/api/v2/mix/order/detail";
+    const CURL_BITGET_STATUS_MARKER: &str = "\n__ARB_BITGET_HTTP_STATUS__:";
+
+    /// Bitget 可变执行市场。
+    ///
+    /// 中文说明：该枚举用于强制把 Bitget 现货和 USDT-FUTURES 执行路径分开，
+    /// 避免把现货 instrument 错发到合约 endpoint，或反向误发。
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub enum BitgetExecMarket {
+        Spot,
+        UsdtFutures,
+    }
+
+    impl BitgetExecMarket {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Spot => "Spot",
+                Self::UsdtFutures => "UsdtFutures",
+            }
+        }
+
+        fn token(self) -> &'static str {
+            match self {
+                Self::Spot => "bitget-spot",
+                Self::UsdtFutures => "bitget-usdt-futures",
+            }
+        }
+
+        fn product_type(self) -> Option<&'static str> {
+            match self {
+                Self::Spot => None,
+                Self::UsdtFutures => Some("USDT-FUTURES"),
+            }
+        }
+
+        fn expected_instrument_suffix(self) -> &'static str {
+            match self {
+                Self::Spot => "SPOT",
+                Self::UsdtFutures => "USDT-FUTURES",
+            }
+        }
+
+        fn place_order_endpoint(self) -> &'static str {
+            match self {
+                Self::Spot => BITGET_SPOT_PLACE_ORDER_ENDPOINT,
+                Self::UsdtFutures => BITGET_MIX_PLACE_ORDER_ENDPOINT,
+            }
+        }
+
+        fn cancel_order_endpoint(self) -> &'static str {
+            match self {
+                Self::Spot => BITGET_SPOT_CANCEL_ORDER_ENDPOINT,
+                Self::UsdtFutures => BITGET_MIX_CANCEL_ORDER_ENDPOINT,
+            }
+        }
+
+        fn order_query_endpoint(self) -> &'static str {
+            match self {
+                Self::Spot => BITGET_SPOT_ORDER_INFO_ENDPOINT,
+                Self::UsdtFutures => BITGET_MIX_ORDER_DETAIL_ENDPOINT,
+            }
+        }
+    }
+
+    impl fmt::Display for BitgetExecMarket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    /// Bitget 执行适配器配置。
+    ///
+    /// 中文说明：配置只保存 endpoint、账户引用、签名策略、合约保证金参数和
+    /// 可选 tradeSide，不保存 API key、secret、passphrase、签名或任何凭证原文。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct BitgetExecConfig {
+        market: BitgetExecMarket,
+        venue_id: VenueId,
+        account_id: AccountId,
+        base_url: String,
+        margin_mode: String,
+        margin_coin: String,
+        trade_side: Option<String>,
+        signing_policy: SigningPolicy,
+    }
+
+    impl BitgetExecConfig {
+        pub fn spot(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            Self::new(
+                BitgetExecMarket::Spot,
+                venue_id,
+                account_id,
+                base_url,
+                "crossed",
+                "USDT",
+                signing_policy,
+            )
+        }
+
+        pub fn usdt_futures(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            Self::new(
+                BitgetExecMarket::UsdtFutures,
+                venue_id,
+                account_id,
+                base_url,
+                "crossed",
+                "USDT",
+                signing_policy,
+            )
+        }
+
+        pub fn new(
+            market: BitgetExecMarket,
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            margin_mode: impl Into<String>,
+            margin_coin: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            let margin_mode = margin_mode.into();
+            let margin_coin = margin_coin.into();
+            validate_bitget_margin_mode(market, &margin_mode)?;
+            validate_bitget_margin_coin(market, &margin_coin)?;
+            Ok(Self {
+                market,
+                venue_id,
+                account_id,
+                base_url: normalize_bitget_base_url(base_url.into())?,
+                margin_mode,
+                margin_coin,
+                trade_side: None,
+                signing_policy,
+            })
+        }
+
+        pub fn with_trade_side(mut self, trade_side: impl Into<String>) -> VenueExecResult<Self> {
+            let trade_side = trade_side.into();
+            validate_bitget_trade_side(&trade_side)?;
+            self.trade_side = Some(trade_side);
+            Ok(self)
+        }
+
+        pub fn market(&self) -> BitgetExecMarket {
+            self.market
+        }
+
+        pub fn venue_id(&self) -> &VenueId {
+            &self.venue_id
+        }
+
+        pub fn account_id(&self) -> &AccountId {
+            &self.account_id
+        }
+
+        pub fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        pub fn margin_mode(&self) -> &str {
+            &self.margin_mode
+        }
+
+        pub fn margin_coin(&self) -> &str {
+            &self.margin_coin
+        }
+
+        pub fn trade_side(&self) -> Option<&str> {
+            self.trade_side.as_deref()
+        }
+
+        pub fn signing_policy(&self) -> &SigningPolicy {
+            &self.signing_policy
+        }
+    }
+
+    /// 已签名 Bitget HTTP 请求。
+    pub struct BitgetSignedRequest<'a> {
+        market: BitgetExecMarket,
+        base_url: &'a str,
+        signed_endpoint: &'a BitgetSignedEndpoint,
+    }
+
+    impl BitgetSignedRequest<'_> {
+        pub fn market(&self) -> BitgetExecMarket {
+            self.market
+        }
+
+        pub fn method(&self) -> BitgetRestMethod {
+            self.signed_endpoint.method()
+        }
+
+        pub fn base_url(&self) -> &str {
+            self.base_url
+        }
+
+        pub fn request_path(&self) -> &str {
+            self.signed_endpoint.request_path_for_transport()
+        }
+
+        pub fn body_for_transport(&self) -> &str {
+            self.signed_endpoint.body_for_transport()
+        }
+
+        pub fn api_key_header_name(&self) -> &'static str {
+            self.signed_endpoint.api_key_header_name()
+        }
+
+        pub fn api_key_header_value(&self) -> &str {
+            self.signed_endpoint.api_key_header_value()
+        }
+
+        pub fn signature_header_name(&self) -> &'static str {
+            self.signed_endpoint.signature_header_name()
+        }
+
+        pub fn signature_header_value(&self) -> &str {
+            self.signed_endpoint.signature_header_value()
+        }
+
+        pub fn timestamp_header_name(&self) -> &'static str {
+            self.signed_endpoint.timestamp_header_name()
+        }
+
+        pub fn timestamp_header_value(&self) -> String {
+            self.signed_endpoint.timestamp_header_value()
+        }
+
+        pub fn passphrase_header_name(&self) -> &'static str {
+            self.signed_endpoint.passphrase_header_name()
+        }
+
+        pub fn passphrase_header_value(&self) -> &str {
+            self.signed_endpoint.passphrase_header_value()
+        }
+    }
+
+    impl fmt::Debug for BitgetSignedRequest<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BitgetSignedRequest")
+                .field("market", &self.market)
+                .field("method", &self.method())
+                .field("base_url", &self.base_url)
+                .field("request_path", &"<redacted>")
+                .field("api_key_header_name", &self.api_key_header_name())
+                .field("api_key_header_value", &"<redacted>")
+                .field("signature_header_name", &self.signature_header_name())
+                .field("timestamp_header_name", &self.timestamp_header_name())
+                .field("passphrase_header_name", &self.passphrase_header_name())
+                .field("body", &"<redacted>")
+                .field("signature", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Bitget transport 返回。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct BitgetExecHttpResponse {
+        status_code: u16,
+        body: String,
+    }
+
+    impl BitgetExecHttpResponse {
+        pub fn new(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+            }
+        }
+
+        pub fn status_code(&self) -> u16 {
+            self.status_code
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        pub fn is_success(&self) -> bool {
+            (200..=299).contains(&self.status_code)
+        }
+    }
+
+    /// Bitget 可变执行 transport。
+    ///
+    /// 中文说明：transport 遇到网络断连、TLS 失败或无 HTTP 状态码时必须返回
+    /// `UnknownExternalState`，不能把外部未知状态当成下单失败或成功。
+    pub trait BitgetExecTransport {
+        fn send_signed(
+            &mut self,
+            request: BitgetSignedRequest<'_>,
+        ) -> VenueExecResult<BitgetExecHttpResponse>;
+    }
+
+    /// 使用系统 `curl` 发送 Bitget signed REST 请求的真实 transport。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct BitgetCurlExecTransport {
+        connect_timeout_secs: u64,
+        max_time_secs: u64,
+    }
+
+    impl BitgetCurlExecTransport {
+        pub fn new(connect_timeout_secs: u64, max_time_secs: u64) -> VenueExecResult<Self> {
+            if connect_timeout_secs == 0 || max_time_secs == 0 {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "curl_timeout",
+                    reason: "curl timeouts must be greater than zero",
+                });
+            }
+            Ok(Self {
+                connect_timeout_secs,
+                max_time_secs,
+            })
+        }
+    }
+
+    impl Default for BitgetCurlExecTransport {
+        fn default() -> Self {
+            Self {
+                connect_timeout_secs: 10,
+                max_time_secs: 30,
+            }
+        }
+    }
+
+    impl BitgetExecTransport for BitgetCurlExecTransport {
+        fn send_signed(
+            &mut self,
+            request: BitgetSignedRequest<'_>,
+        ) -> VenueExecResult<BitgetExecHttpResponse> {
+            let venue_id = bitget_transport_venue_id(request.market());
+            let url = bitget_signed_request_url(&request)?;
+            let config = bitget_curl_config(&request, &url)?;
+            let mut child = Command::new("curl")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--request")
+                .arg(request.method().as_str())
+                .arg("--connect-timeout")
+                .arg(self.connect_timeout_secs.to_string())
+                .arg("--max-time")
+                .arg(self.max_time_secs.to_string())
+                .arg("--write-out")
+                .arg(format!("{CURL_BITGET_STATUS_MARKER}%{{http_code}}"))
+                .arg("--config")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "failed to start curl for Bitget signed REST request".to_owned(),
+                })?;
+
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "curl stdin is unavailable for Bitget signed REST request".to_owned(),
+                })?
+                .write_all(config.as_bytes())
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "failed to write curl config for Bitget signed REST request".to_owned(),
+                })?;
+
+            let output =
+                child
+                    .wait_with_output()
+                    .map_err(|_| VenueExecError::UnknownExternalState {
+                        venue_id: venue_id.clone(),
+                        detail: "curl transport did not return a Bitget signed REST response"
+                            .to_owned(),
+                    })?;
+            if !output.status.success() {
+                return Err(VenueExecError::UnknownExternalState {
+                    venue_id,
+                    detail: "curl transport failed before a reliable HTTP response was available"
+                        .to_owned(),
+                });
+            }
+
+            parse_bitget_curl_http_response(&output.stdout, request.market())
+        }
+    }
+
+    /// Bitget Spot 可变执行适配器。
+    pub struct BitgetSpotExecAdapter<S, T> {
+        inner: BitgetExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> BitgetSpotExecAdapter<S, T> {
+        pub fn new(config: BitgetExecConfig, signer: S, transport: T) -> VenueExecResult<Self> {
+            ensure_bitget_config_market(&config, BitgetExecMarket::Spot)?;
+            Ok(Self {
+                inner: BitgetExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &BitgetExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for BitgetSpotExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BitgetSpotExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    /// Bitget USDT-FUTURES 可变执行适配器。
+    pub struct BitgetUsdtFuturesExecAdapter<S, T> {
+        inner: BitgetExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> BitgetUsdtFuturesExecAdapter<S, T> {
+        pub fn new(config: BitgetExecConfig, signer: S, transport: T) -> VenueExecResult<Self> {
+            ensure_bitget_config_market(&config, BitgetExecMarket::UsdtFutures)?;
+            Ok(Self {
+                inner: BitgetExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &BitgetExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for BitgetUsdtFuturesExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BitgetUsdtFuturesExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    macro_rules! impl_bitget_adapter_traits {
+        ($adapter:ty) => {
+            impl<S, T> SubmitOrder for $adapter
+            where
+                S: BitgetRealSigningProvider,
+                T: BitgetExecTransport,
+            {
+                fn submit_order(
+                    &mut self,
+                    request: SubmitOrderRequest,
+                ) -> VenueExecResult<MutableActionReceipt> {
+                    self.inner.submit_order(request)
+                }
+            }
+
+            impl<S, T> CancelOrder for $adapter
+            where
+                S: BitgetRealSigningProvider,
+                T: BitgetExecTransport,
+            {
+                fn cancel_order(
+                    &mut self,
+                    request: CancelOrderRequest,
+                ) -> VenueExecResult<MutableActionReceipt> {
+                    self.inner.cancel_order(request)
+                }
+            }
+
+            impl<S, T> QueryActionStatus for $adapter
+            where
+                S: BitgetRealSigningProvider,
+                T: BitgetExecTransport,
+            {
+                fn query_action_status(
+                    &self,
+                    request: QueryActionStatusRequest,
+                ) -> VenueExecResult<MutableActionStatusReport> {
+                    self.inner.query_action_status(request)
+                }
+            }
+
+            impl<S, T> ConfirmOrderStatus for $adapter
+            where
+                S: BitgetRealSigningProvider,
+                T: BitgetExecTransport,
+            {
+                fn confirm_order_status(
+                    &mut self,
+                    request: ConfirmOrderStatusRequest,
+                ) -> VenueExecResult<PrivateOrderUpdate> {
+                    self.inner.confirm_order_status(request)
+                }
+            }
+
+            impl<S, T> RequestTransfer for $adapter
+            where
+                S: BitgetRealSigningProvider,
+                T: BitgetExecTransport,
+            {
+                fn request_transfer(
+                    &mut self,
+                    request: TransferRequest,
+                ) -> VenueExecResult<MutableActionReceipt> {
+                    self.inner.request_transfer(request)
+                }
+            }
+        };
+    }
+
+    impl_bitget_adapter_traits!(BitgetSpotExecAdapter<S, T>);
+    impl_bitget_adapter_traits!(BitgetUsdtFuturesExecAdapter<S, T>);
+
+    #[derive(Debug)]
+    struct BitgetExecAdapterCore<S, T> {
+        config: BitgetExecConfig,
+        signer: S,
+        transport: T,
+        records_by_key: BTreeMap<IdempotencyKey, LiveActionRecord>,
+        key_by_action_id: BTreeMap<MutableActionId, IdempotencyKey>,
+        orders_by_client_id: BTreeMap<OrderId, BitgetKnownOrder>,
+        orders_by_external_id: BTreeMap<ExternalOrderId, BitgetKnownOrder>,
+        next_sequence: u64,
+    }
+
+    impl<S, T> BitgetExecAdapterCore<S, T> {
+        fn new(config: BitgetExecConfig, signer: S, transport: T) -> Self {
+            Self {
+                config,
+                signer,
+                transport,
+                records_by_key: BTreeMap::new(),
+                key_by_action_id: BTreeMap::new(),
+                orders_by_client_id: BTreeMap::new(),
+                orders_by_external_id: BTreeMap::new(),
+                next_sequence: 0,
+            }
+        }
+
+        fn config(&self) -> &BitgetExecConfig {
+            &self.config
+        }
+
+        fn transport(&self) -> &T {
+            &self.transport
+        }
+
+        fn transport_mut(&mut self) -> &mut T {
+            &mut self.transport
+        }
+
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            Ok(match request {
+                QueryActionStatusRequest::ByActionId(action_id) => {
+                    if let Some(key) = self.key_by_action_id.get(&action_id) {
+                        self.report_for_key(key)
+                    } else {
+                        unknown_status_report(Some(action_id), None)
+                    }
+                }
+                QueryActionStatusRequest::ByIdempotencyKey(key) => self.report_for_key(&key),
+            })
+        }
+
+        fn report_for_key(&self, key: &IdempotencyKey) -> MutableActionStatusReport {
+            self.records_by_key.get(key).map_or_else(
+                || unknown_status_report(None, Some(key.clone())),
+                |record| super::status_report_from_receipt(&record.receipt),
+            )
+        }
+
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.from_account_id)?;
+            Err(VenueExecError::InvalidRequest {
+                field: "transfer",
+                reason: "Bitget live transfer is not implemented by this execution adapter",
+            })
+        }
+
+        fn ensure_request_scope(
+            &self,
+            venue_id: &VenueId,
+            account_id: &AccountId,
+        ) -> VenueExecResult<()> {
+            if venue_id != &self.config.venue_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "venue_id",
+                    reason: "request venue does not match Bitget execution adapter config",
+                });
+            }
+            if account_id != &self.config.account_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "account_id",
+                    reason: "request account does not match Bitget execution adapter config",
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl<S, T> BitgetExecAdapterCore<S, T>
+    where
+        S: BitgetRealSigningProvider,
+        T: BitgetExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            request.validate()?;
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+
+            let symbol = bitget_symbol_from_instrument(self.config.market, &request.instrument_id)?;
+            let body = bitget_order_create_body(&self.config, &symbol, &request)?;
+            let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
+            let endpoint = self.config.market.place_order_endpoint();
+            let signed = self.sign(
+                SigningPurpose::SubmitOrder,
+                &action_id,
+                BitgetRestMethod::Post,
+                endpoint.to_owned(),
+                body,
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_business_success(endpoint, &response)?;
+
+            let known_order = bitget_known_order_from_response(
+                self.config.market,
+                &symbol,
+                request.client_order_id.clone(),
+                response.body(),
+                &action_id,
+            )?;
+            let external_ref = known_order
+                .external_order_id
+                .clone()
+                .map(ExternalActionRef::Order);
+            let receipt = MutableActionReceipt {
+                action_id,
+                kind: MutableActionKind::SubmitOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref,
+                duplicate: false,
+                simulated: false,
+            };
+
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            self.record_known_order(known_order);
+            Ok(receipt)
+        }
+
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+
+            let known_order = self.lookup_known_order(&request.order_ref).ok_or(
+                VenueExecError::InvalidRequest {
+                    field: "order_ref",
+                    reason: "Bitget cancel requires an order previously submitted through this adapter so its symbol is known",
+                },
+            )?;
+            let body = bitget_cancel_order_body(&self.config, &request, known_order)?;
+            let action_id = self.next_action_id(MutableActionKind::CancelOrder)?;
+            let endpoint = self.config.market.cancel_order_endpoint();
+            let signed = self.sign(
+                SigningPurpose::CancelOrder,
+                &action_id,
+                BitgetRestMethod::Post,
+                endpoint.to_owned(),
+                body,
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_business_success(endpoint, &response)?;
+
+            let receipt = MutableActionReceipt {
+                action_id: action_id.clone(),
+                kind: MutableActionKind::CancelOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref: Some(ExternalActionRef::Cancel(action_id)),
+                duplicate: false,
+                simulated: false,
+            };
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            Ok(receipt)
+        }
+
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let symbol = bitget_symbol_from_instrument(self.config.market, &request.instrument_id)?;
+            let request_path =
+                bitget_query_order_request_path(&self.config, &symbol, &request.order_ref)?;
+            let signing_request_id = SigningRequestId::new(format!(
+                "signing-request/bitget-exec/query-order/{}",
+                request.source_event_id
+            ))
+            .map_err(signing_error)?;
+            let signed = self.sign_with_request_id(
+                SigningPurpose::QueryOrder,
+                signing_request_id,
+                BitgetRestMethod::Get,
+                request_path,
+                String::new(),
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_http_success(self.config.market.order_query_endpoint(), &response)?;
+            parse_bitget_order_query_confirmation(
+                private_market_from_bitget_exec_market(self.config.market),
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                request.source_event_id,
+                response.body(),
+            )
+        }
+
+        fn duplicate_receipt(
+            &self,
+            idempotency_key: &IdempotencyKey,
+            fingerprint: &RequestFingerprint,
+        ) -> VenueExecResult<Option<MutableActionReceipt>> {
+            let Some(existing) = self.records_by_key.get(idempotency_key) else {
+                return Ok(None);
+            };
+            if existing.fingerprint != *fingerprint {
+                return Err(VenueExecError::IdempotencyConflict {
+                    idempotency_key: idempotency_key.clone(),
+                    existing_fingerprint: existing.fingerprint.0.clone(),
+                    incoming_fingerprint: fingerprint.0.clone(),
+                });
+            }
+
+            let mut receipt = existing.receipt.clone();
+            receipt.duplicate = true;
+            Ok(Some(receipt))
+        }
+
+        fn next_action_id(&mut self, kind: MutableActionKind) -> VenueExecResult<MutableActionId> {
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("Bitget mutable action sequence overflowed");
+            MutableActionId::new(format!(
+                "{}:{}:{}",
+                self.config.market.token(),
+                kind.as_str(),
+                self.next_sequence
+            ))
+        }
+
+        fn sign(
+            &self,
+            purpose: SigningPurpose,
+            action_id: &MutableActionId,
+            method: BitgetRestMethod,
+            request_path: String,
+            body: String,
+        ) -> VenueExecResult<BitgetSignedEndpoint> {
+            self.sign_with_request_id(
+                purpose,
+                SigningRequestId::new(format!(
+                    "signing-request/bitget-exec/{}",
+                    action_id.as_str()
+                ))
+                .map_err(signing_error)?,
+                method,
+                request_path,
+                body,
+            )
+        }
+
+        fn sign_with_request_id(
+            &self,
+            purpose: SigningPurpose,
+            signing_request_id: SigningRequestId,
+            method: BitgetRestMethod,
+            request_path: String,
+            body: String,
+        ) -> VenueExecResult<BitgetSignedEndpoint> {
+            let input = BitgetHmacSigningInput::new(
+                signing_request_id,
+                self.config.signing_policy.policy_ref().clone(),
+                purpose,
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                method,
+                request_path,
+                body,
+            )
+            .map_err(signing_error)?;
+            self.signer
+                .sign_bitget_hmac(input, &self.config.signing_policy)
+                .map_err(signing_error)
+        }
+
+        fn dispatch_signed(
+            &mut self,
+            signed_endpoint: &BitgetSignedEndpoint,
+        ) -> VenueExecResult<BitgetExecHttpResponse> {
+            let request = BitgetSignedRequest {
+                market: self.config.market,
+                base_url: &self.config.base_url,
+                signed_endpoint,
+            };
+            self.transport.send_signed(request)
+        }
+
+        fn ensure_http_success(
+            &self,
+            endpoint: &'static str,
+            response: &BitgetExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            if response.is_success() {
+                return Ok(());
+            }
+            Err(VenueExecError::ExternalRejected {
+                venue_id: self.config.venue_id.clone(),
+                endpoint: endpoint.to_owned(),
+                status_code: response.status_code(),
+                reason: response_body_snippet(response.body()),
+            })
+        }
+
+        fn ensure_business_success(
+            &self,
+            endpoint: &'static str,
+            response: &BitgetExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            self.ensure_http_success(endpoint, response)?;
+            match json_field_value(response.body(), "code").as_deref() {
+                Some("00000") => Ok(()),
+                Some(code) => Err(VenueExecError::ExternalRejected {
+                    venue_id: self.config.venue_id.clone(),
+                    endpoint: endpoint.to_owned(),
+                    status_code: response.status_code(),
+                    reason: format!(
+                        "Bitget code={code}: {}",
+                        json_field_value(response.body(), "msg")
+                            .or_else(|| json_field_value(response.body(), "message"))
+                            .unwrap_or_else(|| "missing msg".to_owned())
+                    ),
+                }),
+                None => Err(VenueExecError::UnknownExternalState {
+                    venue_id: self.config.venue_id.clone(),
+                    detail: format!("Bitget response from {endpoint} lacks code"),
+                }),
+            }
+        }
+
+        fn record_action(
+            &mut self,
+            idempotency_key: IdempotencyKey,
+            fingerprint: RequestFingerprint,
+            receipt: MutableActionReceipt,
+        ) {
+            self.key_by_action_id
+                .insert(receipt.action_id.clone(), idempotency_key.clone());
+            self.records_by_key.insert(
+                idempotency_key,
+                LiveActionRecord {
+                    fingerprint,
+                    receipt,
+                },
+            );
+        }
+
+        fn record_known_order(&mut self, known_order: BitgetKnownOrder) {
+            if let Some(client_order_id) = known_order.client_order_id.clone() {
+                self.orders_by_client_id
+                    .insert(client_order_id, known_order.clone());
+            }
+            if let Some(external_order_id) = known_order.external_order_id.clone() {
+                self.orders_by_external_id
+                    .insert(external_order_id, known_order);
+            }
+        }
+
+        fn lookup_known_order(&self, order_ref: &OrderReference) -> Option<&BitgetKnownOrder> {
+            match order_ref {
+                OrderReference::ClientOrderId(order_id) => self.orders_by_client_id.get(order_id),
+                OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct BitgetKnownOrder {
+        symbol: String,
+        order_id_param: Option<String>,
+        client_order_id: Option<OrderId>,
+        external_order_id: Option<ExternalOrderId>,
+    }
+
+    fn ensure_bitget_config_market(
+        config: &BitgetExecConfig,
+        expected: BitgetExecMarket,
+    ) -> VenueExecResult<()> {
+        if config.market == expected {
+            Ok(())
+        } else {
+            Err(VenueExecError::InvalidRequest {
+                field: "market",
+                reason: "Bitget execution adapter received config for a different market",
+            })
+        }
+    }
+
+    fn validate_bitget_margin_mode(
+        market: BitgetExecMarket,
+        margin_mode: &str,
+    ) -> VenueExecResult<()> {
+        match (market, margin_mode) {
+            (BitgetExecMarket::Spot, _) => Ok(()),
+            (BitgetExecMarket::UsdtFutures, "crossed" | "isolated") => Ok(()),
+            _ => Err(VenueExecError::InvalidRequest {
+                field: "margin_mode",
+                reason: "Bitget futures marginMode must be crossed or isolated",
+            }),
+        }
+    }
+
+    fn validate_bitget_margin_coin(
+        market: BitgetExecMarket,
+        margin_coin: &str,
+    ) -> VenueExecResult<()> {
+        match market {
+            BitgetExecMarket::Spot => Ok(()),
+            BitgetExecMarket::UsdtFutures if margin_coin == "USDT" => Ok(()),
+            BitgetExecMarket::UsdtFutures => Err(VenueExecError::InvalidRequest {
+                field: "margin_coin",
+                reason: "Bitget USDT-FUTURES marginCoin must be USDT",
+            }),
+        }
+    }
+
+    fn validate_bitget_trade_side(value: &str) -> VenueExecResult<()> {
+        match value {
+            "open" | "close" => Ok(()),
+            _ => Err(VenueExecError::InvalidRequest {
+                field: "trade_side",
+                reason: "Bitget tradeSide must be open or close",
+            }),
+        }
+    }
+
+    fn normalize_bitget_base_url(value: String) -> VenueExecResult<String> {
+        let trimmed = value.trim().trim_end_matches('/').to_owned();
+        if trimmed.is_empty() {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Bitget base URL cannot be empty",
+            });
+        }
+        if trimmed
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Bitget base URL contains a control byte",
+            });
+        }
+        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://127.0.0.1")) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Bitget base URL must use https or an explicit localhost test URL",
+            });
+        }
+        Ok(trimmed)
+    }
+
+    fn bitget_order_create_body(
+        config: &BitgetExecConfig,
+        symbol: &str,
+        request: &SubmitOrderRequest,
+    ) -> VenueExecResult<String> {
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "symbol", symbol)?;
+        if let Some(product_type) = config.market.product_type() {
+            push_json_string_field(&mut body, &mut first, "productType", product_type)?;
+            push_json_string_field(&mut body, &mut first, "marginMode", config.margin_mode())?;
+            push_json_string_field(&mut body, &mut first, "marginCoin", config.margin_coin())?;
+        }
+        push_json_string_field(&mut body, &mut first, "side", bitget_side(request.side))?;
+        if let Some(trade_side) = config.trade_side() {
+            push_json_string_field(&mut body, &mut first, "tradeSide", trade_side)?;
+        }
+        match request.order_type {
+            MutableOrderType::Market => {
+                push_json_string_field(&mut body, &mut first, "orderType", "market")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "size",
+                    &request.quantity.to_string(),
+                )?;
+            }
+            MutableOrderType::Limit => {
+                push_json_string_field(&mut body, &mut first, "orderType", "limit")?;
+                push_json_string_field(&mut body, &mut first, "force", "gtc")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "size",
+                    &request.quantity.to_string(),
+                )?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "price",
+                    &request
+                        .limit_price
+                        .expect("validated limit order price")
+                        .to_string(),
+                )?;
+            }
+            MutableOrderType::PostOnly => {
+                push_json_string_field(&mut body, &mut first, "orderType", "limit")?;
+                push_json_string_field(&mut body, &mut first, "force", "post_only")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "size",
+                    &request.quantity.to_string(),
+                )?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "price",
+                    &request
+                        .limit_price
+                        .expect("validated post-only order price")
+                        .to_string(),
+                )?;
+            }
+        }
+        if let Some(client_order_id) = &request.client_order_id {
+            validate_bitget_client_order_id(client_order_id.as_str())?;
+            push_json_string_field(&mut body, &mut first, "clientOid", client_order_id.as_str())?;
+        }
+        body.push('}');
+        Ok(body)
+    }
+
+    fn bitget_cancel_order_body(
+        config: &BitgetExecConfig,
+        request: &CancelOrderRequest,
+        known_order: &BitgetKnownOrder,
+    ) -> VenueExecResult<String> {
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "symbol", known_order.symbol.as_str())?;
+        if let Some(product_type) = config.market.product_type() {
+            push_json_string_field(&mut body, &mut first, "productType", product_type)?;
+            push_json_string_field(&mut body, &mut first, "marginCoin", config.margin_coin())?;
+        }
+        match &request.order_ref {
+            OrderReference::VenueOrderId(_) => {
+                if let Some(order_id) = &known_order.order_id_param {
+                    push_json_string_field(&mut body, &mut first, "orderId", order_id)?;
+                } else if let Some(client_order_id) = &known_order.client_order_id {
+                    push_json_string_field(
+                        &mut body,
+                        &mut first,
+                        "clientOid",
+                        client_order_id.as_str(),
+                    )?;
+                } else {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "known Bitget venue order lacks orderId and clientOid",
+                    });
+                }
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_bitget_client_order_id(client_order_id.as_str())?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "clientOid",
+                    client_order_id.as_str(),
+                )?;
+            }
+        }
+        body.push('}');
+        Ok(body)
+    }
+
+    fn bitget_query_order_request_path(
+        config: &BitgetExecConfig,
+        symbol: &str,
+        order_ref: &OrderReference,
+    ) -> VenueExecResult<String> {
+        let mut params = if let Some(product_type) = config.market.product_type() {
+            vec![
+                ("symbol".to_owned(), symbol.to_owned()),
+                ("productType".to_owned(), product_type.to_owned()),
+            ]
+        } else {
+            Vec::new()
+        };
+        match order_ref {
+            OrderReference::VenueOrderId(order_id) => {
+                let raw_order_id = bitget_order_id_param_from_external(order_id)?;
+                params.push(("orderId".to_owned(), raw_order_id.to_owned()));
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_bitget_client_order_id(client_order_id.as_str())?;
+                params.push(("clientOid".to_owned(), client_order_id.as_str().to_owned()));
+            }
+        }
+        Ok(format!(
+            "{}?{}",
+            config.market.order_query_endpoint(),
+            query_string_from_pairs(&params)
+        ))
+    }
+
+    fn bitget_order_id_param_from_external(order_id: &ExternalOrderId) -> VenueExecResult<&str> {
+        let value = order_id.as_str();
+        let raw_order_id = value
+            .strip_prefix("bitget-spot:order:")
+            .or_else(|| value.strip_prefix("bitget-usdt-futures:order:"))
+            .ok_or(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Bitget venue order ref must come from a Bitget adapter",
+            })?;
+        validate_bitget_order_id(raw_order_id)?;
+        Ok(raw_order_id)
+    }
+
+    fn private_market_from_bitget_exec_market(market: BitgetExecMarket) -> PrivateOrderMarket {
+        match market {
+            BitgetExecMarket::Spot => PrivateOrderMarket::BitgetSpot,
+            BitgetExecMarket::UsdtFutures => PrivateOrderMarket::BitgetUsdtFutures,
+        }
+    }
+
+    fn bitget_symbol_from_instrument(
+        market: BitgetExecMarket,
+        instrument_id: &InstrumentId,
+    ) -> VenueExecResult<String> {
+        let value = instrument_id.as_str();
+        let mut parts = value.split(':');
+        let prefix = parts.next();
+        let venue = parts.next();
+        let symbol = parts.next();
+        let suffix = parts.next();
+        if parts.next().is_some()
+            || prefix != Some("inst")
+            || venue != Some("BITGET")
+            || suffix != Some(market.expected_instrument_suffix())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "instrument_id",
+                reason: "Bitget execution requires instrument IDs shaped as inst:BITGET:<SYMBOL>:SPOT or inst:BITGET:<SYMBOL>:USDT-FUTURES",
+            });
+        }
+        let symbol = symbol.expect("symbol checked above");
+        validate_bitget_symbol(symbol)?;
+        Ok(symbol.to_owned())
+    }
+
+    fn validate_bitget_symbol(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 32 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "symbol",
+                reason: "Bitget symbol must be 1 to 32 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "symbol",
+                reason: "Bitget symbol must use uppercase ASCII letters and digits",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bitget_client_order_id(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 64 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "Bitget clientOid must be 1 to 64 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "Bitget clientOid must use ASCII letters, digits, dash or underscore",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bitget_order_id(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 96 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Bitget orderId must be 1 to 96 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Bitget orderId contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn bitget_known_order_from_response(
+        market: BitgetExecMarket,
+        symbol: &str,
+        client_order_id: Option<OrderId>,
+        body: &str,
+        action_id: &MutableActionId,
+    ) -> VenueExecResult<BitgetKnownOrder> {
+        let order_id_param = json_field_value(body, "orderId").filter(|value| !value.is_empty());
+        let response_client_order_id = json_field_value(body, "clientOid")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| OrderId::new(value).ok());
+        let client_order_id = client_order_id.or(response_client_order_id);
+        let external_order_id = if let Some(order_id) = &order_id_param {
+            Some(ExternalOrderId::new(format!(
+                "{}:order:{order_id}",
+                market.token()
+            ))?)
+        } else if let Some(client_order_id) = &client_order_id {
+            Some(ExternalOrderId::new(format!(
+                "{}:client:{}",
+                market.token(),
+                client_order_id.as_str()
+            ))?)
+        } else {
+            Some(ExternalOrderId::new(format!(
+                "{}:action:{}",
+                market.token(),
+                action_id.as_str()
+            ))?)
+        };
+        Ok(BitgetKnownOrder {
+            symbol: symbol.to_owned(),
+            order_id_param,
+            client_order_id,
+            external_order_id,
+        })
+    }
+
+    fn bitget_side(side: OrderSide) -> &'static str {
+        match side {
+            OrderSide::Buy => "buy",
+            OrderSide::Sell => "sell",
+        }
+    }
+
+    fn bitget_signed_request_url(request: &BitgetSignedRequest<'_>) -> VenueExecResult<String> {
+        let request_path = request.request_path();
+        if request_path.is_empty() || !request_path.starts_with('/') {
+            return Err(VenueExecError::InvalidRequest {
+                field: "request_path",
+                reason: "Bitget signed REST request path must be an absolute path",
+            });
+        }
+        Ok(format!("{}{}", request.base_url(), request_path))
+    }
+
+    fn bitget_curl_config(request: &BitgetSignedRequest<'_>, url: &str) -> VenueExecResult<String> {
+        let mut config = format!("url = \"{}\"\n", curl_config_quote(url)?);
+        push_curl_header(
+            &mut config,
+            request.api_key_header_name(),
+            request.api_key_header_value(),
+        )?;
+        push_curl_header(
+            &mut config,
+            request.signature_header_name(),
+            request.signature_header_value(),
+        )?;
+        let timestamp = request.timestamp_header_value();
+        push_curl_header(&mut config, request.timestamp_header_name(), &timestamp)?;
+        push_curl_header(
+            &mut config,
+            request.passphrase_header_name(),
+            request.passphrase_header_value(),
+        )?;
+        push_curl_header(&mut config, "locale", "en-US")?;
+        if !request.body_for_transport().is_empty() {
+            push_curl_header(&mut config, "Content-Type", "application/json")?;
+            config.push_str("data = \"");
+            config.push_str(&curl_config_quote(request.body_for_transport())?);
+            config.push_str("\"\n");
+        }
+        Ok(config)
+    }
+
+    fn parse_bitget_curl_http_response(
+        stdout: &[u8],
+        market: BitgetExecMarket,
+    ) -> VenueExecResult<BitgetExecHttpResponse> {
+        let output = String::from_utf8_lossy(stdout);
+        let Some((body, status)) = output.rsplit_once(CURL_BITGET_STATUS_MARKER) else {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: bitget_transport_venue_id(market),
+                detail: "curl transport response lacked an HTTP status marker".to_owned(),
+            });
+        };
+        let status_code =
+            status
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: bitget_transport_venue_id(market),
+                    detail: "curl transport returned a malformed HTTP status".to_owned(),
+                })?;
+        if status_code == 0 {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: bitget_transport_venue_id(market),
+                detail: "curl transport did not receive an HTTP response from Bitget".to_owned(),
+            });
+        }
+        Ok(BitgetExecHttpResponse::new(status_code, body.to_owned()))
+    }
+
+    fn bitget_transport_venue_id(market: BitgetExecMarket) -> VenueId {
+        let value = match market {
+            BitgetExecMarket::Spot => "venue:BITGET-SPOT",
+            BitgetExecMarket::UsdtFutures => "venue:BITGET-USDT-FUTURES",
+        };
+        VenueId::new(value).expect("static Bitget transport venue ID")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7458,6 +9212,104 @@ mod tests {
             err,
             VenueExecError::InvalidRequest {
                 field: "instId",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bitget_order_query_confirms_filled_usdt_futures_order() {
+        let update = parse_bitget_order_query_confirmation(
+            PrivateOrderMarket::BitgetUsdtFutures,
+            venue("venue:BITGET-USDT-FUTURES"),
+            account("account:bitget-unit"),
+            "event:bitget:usdt-futures:query:filled",
+            r#"{"code":"00000","msg":"success","requestTime":1700000002000,"data":{"symbol":"BTCUSDT","orderId":"1234567890","clientOid":"bitgetUnit1","side":"sell","status":"filled","priceAvg":"43100.50","baseVolume":"0.001","fee":"-0.0100","uTime":"1700000001500","tradeId":"901","orderSource":"normal"}}"#,
+        )
+        .expect("bitget order query confirmation");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.market, PrivateOrderMarket::BitgetUsdtFutures);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.side, Some(OrderSide::Sell));
+        assert_eq!(
+            update.instrument_id.as_str(),
+            "inst:BITGET:BTCUSDT:USDT-FUTURES"
+        );
+        assert_eq!(
+            update
+                .venue_order_id
+                .as_ref()
+                .expect("venue order id")
+                .as_str(),
+            "bitget-usdt-futures:order:1234567890"
+        );
+        assert_eq!(
+            update.client_order_id.as_ref().expect("client id").as_str(),
+            "bitgetUnit1"
+        );
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.001"
+        );
+        let fill = update.last_fill.expect("filled query carries fill summary");
+        assert_eq!(fill.timestamp, "2023-11-14T22:13:21.5Z");
+        assert_eq!(fill.price, "43100.50");
+        assert_eq!(fill.quantity, "0.001");
+        assert_eq!(fill.fee_amount.expect("fee amount").to_string(), "0.0100");
+        assert_eq!(fill.trade_id.as_deref(), Some("901"));
+    }
+
+    #[test]
+    fn bitget_private_order_stream_confirms_filled_spot_order() {
+        let update = parse_bitget_private_order_stream_update(
+            PrivateOrderMarket::BitgetSpot,
+            venue("venue:BITGET-SPOT"),
+            account("account:bitget-unit"),
+            "event:bitget:private-order-stream:spot:1",
+            r#"{"arg":{"channel":"orders","instType":"SPOT"},"ts":"1700000002500","data":[{"symbol":"btcusdt","orderId":"22334455","clientOid":"bitgetSpot1","side":"buy","status":"filled","baseVolume":"0.002","fillPrice":"43100.50","fillFee":"-0.0200","fillFeeCoin":"USDT","fillTime":"1700000002500","tradeId":"902"}]}"#,
+        )
+        .expect("bitget private stream update");
+
+        assert_eq!(update.source, OrderConfirmationSource::PrivateStream);
+        assert_eq!(update.market, PrivateOrderMarket::BitgetSpot);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.side, Some(OrderSide::Buy));
+        assert_eq!(update.instrument_id.as_str(), "inst:BITGET:BTCUSDT:SPOT");
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.002"
+        );
+        let fill = update.last_fill.expect("stream trade carries last fill");
+        assert_eq!(
+            fill.fee_asset_id.as_ref().expect("fee asset").as_str(),
+            "asset:USDT"
+        );
+        assert_eq!(fill.fee_amount.expect("fee amount").to_string(), "0.0200");
+        assert_eq!(fill.trade_id.as_deref(), Some("902"));
+    }
+
+    #[test]
+    fn bitget_private_order_stream_rejects_market_mismatch() {
+        let err = parse_bitget_private_order_stream_update(
+            PrivateOrderMarket::BitgetSpot,
+            venue("venue:BITGET-SPOT"),
+            account("account:bitget-unit"),
+            "event:bitget:private-order-stream:mismatch",
+            r#"{"arg":{"channel":"orders","instType":"USDT-FUTURES"},"ts":"1700000002500","data":[{"symbol":"BTCUSDT","orderId":"22334455","side":"sell","status":"live","uTime":"1700000002500"}]}"#,
+        )
+        .expect_err("Bitget spot parser must reject futures instType");
+
+        assert!(matches!(
+            err,
+            VenueExecError::InvalidRequest {
+                field: "instType",
                 ..
             }
         ));
@@ -8148,6 +10000,194 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bitget_usdt_futures_adapter_signs_submits_and_cancels_known_order() {
+        let mut adapter = live::BitgetUsdtFuturesExecAdapter::new(
+            live::BitgetExecConfig::usdt_futures(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-usdt-futures-submit-unit"),
+            )
+            .unwrap()
+            .with_trade_side("open")
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000000124,"data":{"orderId":"1234567890","clientOid":"bitgetUnit1"}}"#,
+            ),
+        )
+        .unwrap();
+
+        let receipt = adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                instrument("inst:BITGET:BTCUSDT:USDT-FUTURES"),
+                OrderSide::Sell,
+                MutableOrderType::PostOnly,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("bitgetUnit1").unwrap()),
+                IdempotencyKey::new("idem:bitget:usdt-futures:submit:1").unwrap(),
+            ))
+            .expect("signed Bitget futures order dispatches");
+
+        assert_eq!(receipt.status, MutableActionStatus::Accepted);
+        assert!(!receipt.simulated);
+        assert_eq!(
+            receipt.external_ref,
+            Some(ExternalActionRef::Order(
+                ExternalOrderId::new("bitget-usdt-futures:order:1234567890").unwrap()
+            ))
+        );
+        assert_eq!(adapter.transport().calls.len(), 1);
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.market, live::BitgetExecMarket::UsdtFutures);
+        assert_eq!(call.method, arb_signing::real::BitgetRestMethod::Post);
+        assert_eq!(call.request_path, live::BITGET_MIX_PLACE_ORDER_ENDPOINT);
+        assert_eq!(call.api_key_header_name, "ACCESS-KEY");
+        assert_eq!(call.signature_header_name, "ACCESS-SIGN");
+        assert_eq!(call.timestamp_header_value, "1700000000123");
+        assert_eq!(call.passphrase_header_name, "ACCESS-PASSPHRASE");
+        assert!(call.body.contains(r#""symbol":"BTCUSDT""#));
+        assert!(call.body.contains(r#""productType":"USDT-FUTURES""#));
+        assert!(call.body.contains(r#""marginMode":"crossed""#));
+        assert!(call.body.contains(r#""marginCoin":"USDT""#));
+        assert!(call.body.contains(r#""side":"sell""#));
+        assert!(call.body.contains(r#""tradeSide":"open""#));
+        assert!(call.body.contains(r#""orderType":"limit""#));
+        assert!(call.body.contains(r#""force":"post_only""#));
+        assert!(call.body.contains(r#""clientOid":"bitgetUnit1""#));
+        assert!(!call.signature_header_value.is_empty());
+        assert!(!call.debug.contains(&call.api_key_header_value));
+        assert!(!call.debug.contains(&call.passphrase_header_value));
+        assert!(!call.debug.contains(&call.signature_header_value));
+        assert!(!call.debug.contains(&call.body));
+
+        adapter.transport_mut().body =
+            r#"{"code":"00000","msg":"success","requestTime":1700000001124,"data":{"orderId":"1234567890","clientOid":"bitgetUnit1"}}"#
+                .to_owned();
+        let order_ref = match receipt.external_ref.expect("order ref") {
+            ExternalActionRef::Order(order_id) => OrderReference::VenueOrderId(order_id),
+            _ => panic!("submit should return order ref"),
+        };
+        let cancel = adapter
+            .cancel_order(CancelOrderRequest::new(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                order_ref,
+                IdempotencyKey::new("idem:bitget:usdt-futures:cancel:1").unwrap(),
+            ))
+            .expect("Bitget cancel dispatches");
+
+        assert_eq!(cancel.kind, MutableActionKind::CancelOrder);
+        assert_eq!(adapter.transport().calls.len(), 2);
+        let cancel_call = &adapter.transport().calls[1];
+        assert_eq!(
+            cancel_call.method,
+            arb_signing::real::BitgetRestMethod::Post
+        );
+        assert_eq!(
+            cancel_call.request_path,
+            live::BITGET_MIX_CANCEL_ORDER_ENDPOINT
+        );
+        assert!(cancel_call.body.contains(r#""symbol":"BTCUSDT""#));
+        assert!(cancel_call.body.contains(r#""productType":"USDT-FUTURES""#));
+        assert!(cancel_call.body.contains(r#""marginCoin":"USDT""#));
+        assert!(cancel_call.body.contains(r#""orderId":"1234567890""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bitget_spot_market_order_uses_real_submit_body_without_price() {
+        let mut adapter = live::BitgetSpotExecAdapter::new(
+            live::BitgetExecConfig::spot(
+                venue("venue:BITGET-SPOT"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-spot-submit-unit"),
+            )
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000000124,"data":{"orderId":"22334455","clientOid":"bitgetSpot1"}}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BITGET-SPOT"),
+                account("account:bitget-unit"),
+                instrument("inst:BITGET:BTCUSDT:SPOT"),
+                OrderSide::Buy,
+                MutableOrderType::Market,
+                quantity("0.001").unwrap(),
+                None,
+                Some(OrderId::new("bitgetSpot1").unwrap()),
+                IdempotencyKey::new("idem:bitget:spot:market:1").unwrap(),
+            ))
+            .expect("Bitget spot market order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.market, live::BitgetExecMarket::Spot);
+        assert_eq!(call.request_path, live::BITGET_SPOT_PLACE_ORDER_ENDPOINT);
+        assert!(call.body.contains(r#""symbol":"BTCUSDT""#));
+        assert!(call.body.contains(r#""side":"buy""#));
+        assert!(call.body.contains(r#""orderType":"market""#));
+        assert!(call.body.contains(r#""size":"0.001""#));
+        assert!(!call.body.contains(r#""price":"#));
+        assert!(!call.body.contains(r#""productType":"#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bitget_order_query_uses_signed_get_confirmation_path() {
+        let mut adapter = live::BitgetUsdtFuturesExecAdapter::new(
+            live::BitgetExecConfig::usdt_futures(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-usdt-futures-query-unit"),
+            )
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000002000,"data":{"symbol":"BTCUSDT","orderId":"1234567890","clientOid":"bitgetUnit1","side":"sell","status":"filled","priceAvg":"43100.50","baseVolume":"0.001","uTime":"1700000001500"}}"#,
+            ),
+        )
+        .unwrap();
+
+        let update = adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                instrument("inst:BITGET:BTCUSDT:USDT-FUTURES"),
+                OrderReference::VenueOrderId(
+                    ExternalOrderId::new("bitget-usdt-futures:order:1234567890").unwrap(),
+                ),
+                "event:bitget:usdt-futures:query:filled",
+            ))
+            .expect("signed Bitget query confirms order");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.market, PrivateOrderMarket::BitgetUsdtFutures);
+        assert_eq!(adapter.transport().calls.len(), 1);
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.method, arb_signing::real::BitgetRestMethod::Get);
+        assert_eq!(
+            call.request_path,
+            "/api/v2/mix/order/detail?symbol=BTCUSDT&productType=USDT-FUTURES&orderId=1234567890"
+        );
+        assert!(call.body.is_empty());
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_adapter_rejects_wrong_market_instrument_before_transport() {
         let mut adapter = live::BinanceSpotExecAdapter::new(
             live::BinanceExecConfig::spot(
@@ -8438,6 +10478,26 @@ mod tests {
     }
 
     #[cfg(feature = "live-exec")]
+    fn bitget_signing_policy(value: &str) -> arb_signing::SigningPolicy {
+        arb_signing::SigningPolicy::real_signing_enabled(
+            arb_signing::SigningPolicyRef::new(value).expect("policy ref"),
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn bitget_test_signer(
+        timestamp_millis: u64,
+    ) -> arb_signing::real::BitgetHmacSha256SigningProvider<
+        GeneratedBinanceCredentialProvider,
+        FixedBinanceTimestamp,
+    > {
+        arb_signing::real::BitgetHmacSha256SigningProvider::new(
+            GeneratedBinanceCredentialProvider,
+            FixedBinanceTimestamp(timestamp_millis),
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
     #[derive(Clone, Copy, Debug)]
     struct FixedBinanceTimestamp(u64);
 
@@ -8457,6 +10517,16 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     impl arb_signing::real::BybitTimestampProvider for FixedBinanceTimestamp {
+        fn timestamp_millis(
+            &self,
+            _audit_ref: &arb_signing::SigningAuditRef,
+        ) -> arb_signing::SigningResult<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl arb_signing::real::BitgetTimestampProvider for FixedBinanceTimestamp {
         fn timestamp_millis(
             &self,
             _audit_ref: &arb_signing::SigningAuditRef,
@@ -8515,6 +10585,20 @@ mod tests {
                 "test-api-key-okx-exec-unit",
                 "test-api-secret-okx-exec-unit",
                 "test-passphrase-okx-exec-unit",
+            )
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl arb_signing::real::BitgetCredentialProvider for GeneratedBinanceCredentialProvider {
+        fn load_bitget_credentials(
+            &self,
+            _audit_ref: &arb_signing::SigningAuditRef,
+        ) -> arb_signing::SigningResult<arb_signing::real::BitgetApiCredentials> {
+            arb_signing::real::BitgetApiCredentials::new(
+                "test-api-key-bitget-exec-unit",
+                "test-api-secret-bitget-exec-unit",
+                "test-passphrase-bitget-exec-unit",
             )
         }
     }
@@ -8690,6 +10774,71 @@ mod tests {
                 debug: format!("{request:?}"),
             });
             Ok(live::OkxExecHttpResponse::new(
+                self.status_code,
+                self.body.clone(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedBitgetCall {
+        market: live::BitgetExecMarket,
+        method: arb_signing::real::BitgetRestMethod,
+        request_path: String,
+        api_key_header_name: String,
+        api_key_header_value: String,
+        signature_header_name: String,
+        signature_header_value: String,
+        timestamp_header_name: String,
+        timestamp_header_value: String,
+        passphrase_header_name: String,
+        passphrase_header_value: String,
+        body: String,
+        debug: String,
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordingBitgetTransport {
+        status_code: u16,
+        body: String,
+        calls: Vec<RecordedBitgetCall>,
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl RecordingBitgetTransport {
+        fn ok(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl live::BitgetExecTransport for RecordingBitgetTransport {
+        fn send_signed(
+            &mut self,
+            request: live::BitgetSignedRequest<'_>,
+        ) -> VenueExecResult<live::BitgetExecHttpResponse> {
+            self.calls.push(RecordedBitgetCall {
+                market: request.market(),
+                method: request.method(),
+                request_path: request.request_path().to_owned(),
+                api_key_header_name: request.api_key_header_name().to_owned(),
+                api_key_header_value: request.api_key_header_value().to_owned(),
+                signature_header_name: request.signature_header_name().to_owned(),
+                signature_header_value: request.signature_header_value().to_owned(),
+                timestamp_header_name: request.timestamp_header_name().to_owned(),
+                timestamp_header_value: request.timestamp_header_value(),
+                passphrase_header_name: request.passphrase_header_name().to_owned(),
+                passphrase_header_value: request.passphrase_header_value().to_owned(),
+                body: request.body_for_transport().to_owned(),
+                debug: format!("{request:?}"),
+            });
+            Ok(live::BitgetExecHttpResponse::new(
                 self.status_code,
                 self.body.clone(),
             ))

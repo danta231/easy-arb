@@ -20,6 +20,7 @@ BYBIT_BIND="${BYBIT_BASIS_BIND:-127.0.0.1:8797}"
 OKX_BIND="${OKX_BASIS_BIND:-127.0.0.1:8798}"
 HYPERLIQUID_BIND="${HYPERLIQUID_BASIS_BIND:-127.0.0.1:8799}"
 ASTER_BIND="${ASTER_BASIS_BIND:-127.0.0.1:8800}"
+BITGET_BIND="${BITGET_BASIS_BIND:-127.0.0.1:8803}"
 DETACH="${BASIS_MONITOR_DETACH:-0}"
 
 PIDS=()
@@ -28,14 +29,15 @@ NAMES=()
 usage() {
   cat <<'USAGE'
 用法:
-  scripts/start-basis-monitors.sh [binance] [bybit] [okx] [hyperliquid] [aster]
+  scripts/start-basis-monitors.sh [binance] [bybit] [okx] [bitget] [hyperliquid] [aster]
 
-默认不传参数时同时启动 binance、bybit、okx、hyperliquid 和 aster。
+默认不传参数时同时启动 binance、bybit、okx、bitget、hyperliquid 和 aster。
 
 常用环境变量:
   BINANCE_BASIS_BIND=127.0.0.1:8796
   BYBIT_BASIS_BIND=127.0.0.1:8797
   OKX_BASIS_BIND=127.0.0.1:8798
+  BITGET_BASIS_BIND=127.0.0.1:8803
   HYPERLIQUID_BASIS_BIND=127.0.0.1:8799
   ASTER_BASIS_BIND=127.0.0.1:8800
   BASIS_MONITOR_INTERVAL_SECS=5
@@ -49,6 +51,7 @@ usage() {
   scripts/start-basis-monitors.sh
   scripts/start-basis-monitors.sh bybit
   scripts/start-basis-monitors.sh okx
+  scripts/start-basis-monitors.sh bitget
   scripts/start-basis-monitors.sh hyperliquid
   scripts/start-basis-monitors.sh aster
   BASIS_MONITOR_DETACH=1 scripts/start-basis-monitors.sh
@@ -77,14 +80,14 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 if [[ "$#" -eq 0 ]]; then
-  MONITORS=("binance" "bybit" "okx" "hyperliquid" "aster")
+  MONITORS=("binance" "bybit" "okx" "bitget" "hyperliquid" "aster")
 else
   MONITORS=("$@")
 fi
 
 for monitor in "${MONITORS[@]}"; do
   case "${monitor}" in
-    binance|bybit|okx|hyperliquid|aster) ;;
+    binance|bybit|okx|bitget|hyperliquid|aster) ;;
     *)
       echo "unknown monitor: ${monitor}" >&2
       usage >&2
@@ -134,6 +137,9 @@ for monitor in "${MONITORS[@]}"; do
       ;;
     okx)
       start_monitor "okx-basis-monitor" "okx-basis-monitor" "${OKX_BIND}"
+      ;;
+    bitget)
+      start_monitor "bitget-basis-monitor" "bitget-basis-monitor" "${BITGET_BIND}"
       ;;
     hyperliquid)
       start_monitor "hyperliquid-basis-monitor" "hyperliquid-basis-monitor" "${HYPERLIQUID_BIND}"
