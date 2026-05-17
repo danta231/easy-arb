@@ -285,6 +285,8 @@ pub enum PrivateOrderMarket {
     UsdmFutures,
     BybitSpot,
     BybitLinear,
+    OkxSpot,
+    OkxSwap,
 }
 
 impl PrivateOrderMarket {
@@ -294,6 +296,8 @@ impl PrivateOrderMarket {
             Self::UsdmFutures => "UsdmFutures",
             Self::BybitSpot => "BybitSpot",
             Self::BybitLinear => "BybitLinear",
+            Self::OkxSpot => "OkxSpot",
+            Self::OkxSwap => "OkxSwap",
         }
     }
 
@@ -303,6 +307,8 @@ impl PrivateOrderMarket {
             Self::UsdmFutures => "usdm",
             Self::BybitSpot => "bybit-spot",
             Self::BybitLinear => "bybit-linear",
+            Self::OkxSpot => "okx-spot",
+            Self::OkxSwap => "okx-swap",
         }
     }
 
@@ -312,6 +318,8 @@ impl PrivateOrderMarket {
             Self::UsdmFutures => "USDM-PERP",
             Self::BybitSpot => "SPOT",
             Self::BybitLinear => "LINEAR-PERP",
+            Self::OkxSpot => "SPOT",
+            Self::OkxSwap => "SWAP",
         }
     }
 
@@ -319,6 +327,7 @@ impl PrivateOrderMarket {
         match self {
             Self::Spot | Self::UsdmFutures => "BINANCE",
             Self::BybitSpot | Self::BybitLinear => "BYBIT",
+            Self::OkxSpot | Self::OkxSwap => "OKX",
         }
     }
 }
@@ -1318,6 +1327,9 @@ fn symbol_from_instrument(instrument_id: &str) -> Option<String> {
         (Some("inst"), Some("BINANCE"), Some(symbol), Some(_)) if parts.next().is_none() => {
             Some(symbol.to_owned())
         }
+        (Some("inst"), Some("OKX"), Some(symbol), Some(_)) if parts.next().is_none() => {
+            Some(symbol.to_owned())
+        }
         (Some("inst"), Some(symbol), None, None) => Some(symbol.to_owned()),
         _ => None,
     }
@@ -1505,7 +1517,10 @@ pub fn parse_binance_order_query_confirmation(
 ) -> VenueExecResult<PrivateOrderUpdate> {
     if matches!(
         market,
-        PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear
+        PrivateOrderMarket::BybitSpot
+            | PrivateOrderMarket::BybitLinear
+            | PrivateOrderMarket::OkxSpot
+            | PrivateOrderMarket::OkxSwap
     ) {
         return Err(VenueExecError::InvalidRequest {
             field: "market",
@@ -1605,6 +1620,89 @@ pub fn parse_bybit_private_order_stream_update(
     let fallback_time =
         json_field_value(body, "creationTime").or_else(|| json_field_value(body, "ts"));
     parse_bybit_private_order_fields(
+        market,
+        OrderConfirmationSource::PrivateStream,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        order,
+        fallback_time.as_deref(),
+    )
+}
+
+/// 解析 OKX V5 REST 查单响应。
+///
+/// 中文说明：OKX 下单 REST 回执只代表交易所接收请求；该函数只接受
+/// `/api/v5/trade/order` 查单返回的明确订单状态，用于真实下单后的二次确认。
+pub fn parse_okx_order_query_confirmation(
+    market: PrivateOrderMarket,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_okx_private_market(market)?;
+    let code = required_json_field(body, "code")?;
+    if code != "0" {
+        return Err(VenueExecError::UnknownExternalState {
+            venue_id,
+            detail: format!(
+                "OKX order query returned code={code}: {}",
+                json_field_value(body, "msg").unwrap_or_else(|| "missing msg".to_owned())
+            ),
+        });
+    }
+    let data = json_array_field(body, "data").ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "OKX order query response lacks data array",
+    })?;
+    let order = first_json_object_in_array(data).ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "OKX order query data contains no order object",
+    })?;
+    parse_okx_private_order_fields(
+        market,
+        OrderConfirmationSource::OrderQuery,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        order,
+        None,
+    )
+}
+
+/// 解析 OKX V5 private `orders` channel 的订单更新。
+///
+/// 中文说明：OKX 私有订单流只作为确认来源；调用方仍必须先通过执行门禁和真实
+/// 签名边界下单，不能把 stream 事件当成下单授权。
+pub fn parse_okx_private_order_stream_update(
+    market: PrivateOrderMarket,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_okx_private_market(market)?;
+    let channel = json_field_value(body, "channel").ok_or(VenueExecError::InvalidRequest {
+        field: "channel",
+        reason: "OKX private order stream update lacks channel",
+    })?;
+    if channel != "orders" {
+        return Err(VenueExecError::InvalidRequest {
+            field: "channel",
+            reason: "OKX private order stream update must use orders channel",
+        });
+    }
+    let data = json_array_field(body, "data").ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "OKX private order stream update lacks data array",
+    })?;
+    let order = first_json_object_in_array(data).ok_or(VenueExecError::InvalidRequest {
+        field: "data",
+        reason: "OKX private order stream data contains no order object",
+    })?;
+    let fallback_time = json_field_value(body, "ts");
+    parse_okx_private_order_fields(
         market,
         OrderConfirmationSource::PrivateStream,
         venue_id,
@@ -1755,6 +1853,75 @@ fn parse_bybit_private_order_fields(
     })
 }
 
+fn parse_okx_private_order_fields(
+    market: PrivateOrderMarket,
+    source: OrderConfirmationSource,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: String,
+    body: &str,
+    fallback_time_ms: Option<&str>,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_token("source_event_id", &source_event_id)?;
+    validate_okx_private_market(market)?;
+    let inst_id = required_json_field(body, "instId")?;
+    validate_okx_private_inst_id(market, &inst_id)?;
+    let status_text = required_json_field(body, "state")?;
+    let status = okx_order_confirmation_status(&status_text);
+    let event_time = okx_event_time(body, fallback_time_ms)?;
+    let exchange_order_id = json_field_value(body, "ordId").filter(|value| !value.is_empty());
+    let venue_order_id = exchange_order_id
+        .as_ref()
+        .map(|order_id| ExternalOrderId::new(format!("{}:order:{order_id}", market.token())))
+        .transpose()?;
+    let client_order_id = json_field_value(body, "clOrdId")
+        .filter(|value| !value.is_empty())
+        .map(OrderId::new)
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let side = json_field_value(body, "side")
+        .map(|side| okx_private_side(&side))
+        .transpose()?;
+    let cumulative_filled_quantity = json_field_value(body, "accFillSz")
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_quantity("cumulative_filled_quantity", &value))
+        .transpose()?;
+    let symbol = okx_symbol_from_inst_id(market, &inst_id)?;
+    let instrument_id = InstrumentId::new(format!(
+        "inst:{}:{}:{}",
+        market.venue_family(),
+        inst_id,
+        market.instrument_suffix()
+    ))
+    .map_err(domain_invalid_request)?;
+    let last_fill = parse_okx_private_fill(
+        source,
+        &source_event_id,
+        &event_time,
+        body,
+        cumulative_filled_quantity,
+    )?;
+
+    Ok(PrivateOrderUpdate {
+        source,
+        market,
+        venue_id,
+        account_id,
+        instrument_id,
+        symbol,
+        source_event_id,
+        event_time,
+        status,
+        execution_type: json_field_value(body, "execType"),
+        side,
+        venue_order_id,
+        exchange_order_id,
+        client_order_id,
+        cumulative_filled_quantity,
+        last_fill,
+    })
+}
+
 fn parse_bybit_private_fill(
     source: OrderConfirmationSource,
     source_event_id: &str,
@@ -1875,6 +2042,66 @@ fn parse_binance_private_fill(
         fee_asset_id,
         fee_amount,
         trade_id: json_field_value(body, "t").or_else(|| json_field_value(body, "tradeId")),
+    }))
+}
+
+fn parse_okx_private_fill(
+    source: OrderConfirmationSource,
+    source_event_id: &str,
+    event_time: &str,
+    body: &str,
+    cumulative_filled_quantity: Option<Quantity>,
+) -> VenueExecResult<Option<PrivateOrderFillUpdate>> {
+    let quantity_text = json_field_value(body, "fillSz").or_else(|| {
+        if source == OrderConfirmationSource::OrderQuery {
+            json_field_value(body, "accFillSz")
+        } else {
+            None
+        }
+    });
+    let Some(quantity_text) = quantity_text else {
+        return Ok(None);
+    };
+    if !decimal_text_is_positive(&quantity_text) {
+        return Ok(None);
+    }
+    let price = json_field_value(body, "fillPx")
+        .or_else(|| {
+            if source == OrderConfirmationSource::OrderQuery {
+                json_field_value(body, "avgPx").or_else(|| json_field_value(body, "px"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "0".to_owned());
+    let fee_amount = json_field_value(body, "fillFee")
+        .or_else(|| json_field_value(body, "fee"))
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_okx_fee_amount(&value))
+        .transpose()?;
+    let fee_asset_id = json_field_value(body, "fillFeeCcy")
+        .or_else(|| json_field_value(body, "feeCcy"))
+        .filter(|value| !value.is_empty())
+        .map(|value| AssetId::new(format!("asset:{value}")))
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let quantity = parse_quantity("last_fill_quantity", &quantity_text)?;
+    if let Some(cumulative) = cumulative_filled_quantity {
+        if quantity > cumulative {
+            return Err(VenueExecError::InvalidRequest {
+                field: "last_fill_quantity",
+                reason: "last fill quantity exceeds cumulative filled quantity",
+            });
+        }
+    }
+    Ok(Some(PrivateOrderFillUpdate {
+        source_event_id: source_event_id.to_owned(),
+        timestamp: event_time.to_owned(),
+        price,
+        quantity: quantity_text,
+        fee_asset_id,
+        fee_amount,
+        trade_id: json_field_value(body, "tradeId"),
     }))
 }
 
@@ -2034,6 +2261,17 @@ fn bybit_event_time(body: &str, fallback_time_ms: Option<&str>) -> VenueExecResu
     binance_millis_to_utc(&millis)
 }
 
+fn okx_event_time(body: &str, fallback_time_ms: Option<&str>) -> VenueExecResult<String> {
+    let millis = json_field_value(body, "uTime")
+        .or_else(|| json_field_value(body, "cTime"))
+        .or_else(|| fallback_time_ms.map(str::to_owned))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "event_time",
+            reason: "OKX private order update lacks event time",
+        })?;
+    okx_millis_to_utc(&millis)
+}
+
 fn binance_millis_to_utc(value: &str) -> VenueExecResult<String> {
     let millis = value
         .parse::<u64>()
@@ -2044,6 +2282,23 @@ fn binance_millis_to_utc(value: &str) -> VenueExecResult<String> {
     let seconds = i64::try_from(millis / 1_000).map_err(|_| VenueExecError::InvalidRequest {
         field: "event_time",
         reason: "Binance event time is outside supported UTC range",
+    })?;
+    let nanos = u32::try_from((millis % 1_000) * 1_000_000).expect("millisecond nanos fit u32");
+    Ok(UtcTimestamp::from_unix_parts(seconds, nanos)
+        .map_err(domain_invalid_request)?
+        .to_string())
+}
+
+fn okx_millis_to_utc(value: &str) -> VenueExecResult<String> {
+    let millis = value
+        .parse::<u64>()
+        .map_err(|_| VenueExecError::InvalidRequest {
+            field: "event_time",
+            reason: "OKX event time must be Unix milliseconds",
+        })?;
+    let seconds = i64::try_from(millis / 1_000).map_err(|_| VenueExecError::InvalidRequest {
+        field: "event_time",
+        reason: "OKX event time is outside supported UTC range",
     })?;
     let nanos = u32::try_from((millis % 1_000) * 1_000_000).expect("millisecond nanos fit u32");
     Ok(UtcTimestamp::from_unix_parts(seconds, nanos)
@@ -2075,6 +2330,17 @@ fn binance_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
     }
 }
 
+fn okx_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
+    match value {
+        "live" | "effective" => OrderConfirmationStatus::Acknowledged,
+        "partially_filled" => OrderConfirmationStatus::PartiallyFilled,
+        "filled" => OrderConfirmationStatus::Filled,
+        "canceled" | "cancelled" | "mmp_canceled" => OrderConfirmationStatus::Cancelled,
+        "order_failed" | "failed" => OrderConfirmationStatus::Rejected,
+        _ => OrderConfirmationStatus::Unknown,
+    }
+}
+
 fn bybit_private_side(value: &str) -> VenueExecResult<OrderSide> {
     match value {
         "Buy" => Ok(OrderSide::Buy),
@@ -2082,6 +2348,17 @@ fn bybit_private_side(value: &str) -> VenueExecResult<OrderSide> {
         _ => Err(VenueExecError::InvalidRequest {
             field: "side",
             reason: "Bybit order side must be Buy or Sell",
+        }),
+    }
+}
+
+fn okx_private_side(value: &str) -> VenueExecResult<OrderSide> {
+    match value {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        _ => Err(VenueExecError::InvalidRequest {
+            field: "side",
+            reason: "OKX order side must be buy or sell",
         }),
     }
 }
@@ -2097,6 +2374,72 @@ fn binance_private_side(value: &str) -> VenueExecResult<OrderSide> {
     }
 }
 
+fn validate_okx_private_market(market: PrivateOrderMarket) -> VenueExecResult<()> {
+    match market {
+        PrivateOrderMarket::OkxSpot | PrivateOrderMarket::OkxSwap => Ok(()),
+        _ => Err(VenueExecError::InvalidRequest {
+            field: "market",
+            reason: "OKX order confirmation requires an OKX private order market",
+        }),
+    }
+}
+
+fn validate_okx_private_inst_id(market: PrivateOrderMarket, inst_id: &str) -> VenueExecResult<()> {
+    validate_okx_inst_id_text(inst_id)?;
+    match market {
+        PrivateOrderMarket::OkxSpot if !inst_id.ends_with("-SWAP") => Ok(()),
+        PrivateOrderMarket::OkxSwap if inst_id.ends_with("-SWAP") => Ok(()),
+        PrivateOrderMarket::OkxSpot | PrivateOrderMarket::OkxSwap => {
+            Err(VenueExecError::InvalidRequest {
+                field: "instId",
+                reason: "OKX instId does not match configured private order market",
+            })
+        }
+        _ => validate_okx_private_market(market),
+    }
+}
+
+fn validate_okx_inst_id_text(value: &str) -> VenueExecResult<()> {
+    if value.is_empty() || value.len() > 64 {
+        return Err(VenueExecError::InvalidRequest {
+            field: "instId",
+            reason: "OKX instId must be 1 to 64 bytes",
+        });
+    }
+    if value
+        .bytes()
+        .any(|byte| !(byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-'))
+    {
+        return Err(VenueExecError::InvalidRequest {
+            field: "instId",
+            reason: "OKX instId must use uppercase ASCII letters, digits or dash",
+        });
+    }
+    Ok(())
+}
+
+fn okx_symbol_from_inst_id(market: PrivateOrderMarket, inst_id: &str) -> VenueExecResult<String> {
+    validate_okx_private_inst_id(market, inst_id)?;
+    Ok(match market {
+        PrivateOrderMarket::OkxSwap => inst_id
+            .strip_suffix("-SWAP")
+            .expect("swap instId suffix validated")
+            .to_owned(),
+        PrivateOrderMarket::OkxSpot => inst_id.to_owned(),
+        _ => {
+            return Err(VenueExecError::InvalidRequest {
+                field: "market",
+                reason: "OKX symbol derivation requires an OKX private order market",
+            })
+        }
+    })
+}
+
+fn parse_okx_fee_amount(value: &str) -> VenueExecResult<Amount> {
+    let normalized = value.strip_prefix('-').unwrap_or(value);
+    parse_amount("fee_amount", normalized)
+}
+
 fn validate_bybit_order_category(
     market: PrivateOrderMarket,
     category: &str,
@@ -2105,12 +2448,16 @@ fn validate_bybit_order_category(
         (PrivateOrderMarket::BybitSpot, "spot") | (PrivateOrderMarket::BybitLinear, "linear") => {
             Ok(())
         }
-        (PrivateOrderMarket::Spot | PrivateOrderMarket::UsdmFutures, _) => {
-            Err(VenueExecError::InvalidRequest {
-                field: "market",
-                reason: "Bybit order confirmation requires a Bybit private order market",
-            })
-        }
+        (
+            PrivateOrderMarket::Spot
+            | PrivateOrderMarket::UsdmFutures
+            | PrivateOrderMarket::OkxSpot
+            | PrivateOrderMarket::OkxSwap,
+            _,
+        ) => Err(VenueExecError::InvalidRequest {
+            field: "market",
+            reason: "Bybit order confirmation requires a Bybit private order market",
+        }),
         _ => Err(VenueExecError::InvalidRequest {
             field: "category",
             reason: "Bybit order query category does not match configured market",
@@ -2356,19 +2703,20 @@ pub mod live {
     use arb_signing::real::{
         BinanceHmacSigningInput, BinanceRequestParam, BinanceSignedEndpoint, BybitHmacSigningInput,
         BybitRealSigningProvider, BybitSignedEndpoint, BybitSigningPayloadKind,
+        OkxHmacSigningInput, OkxRealSigningProvider, OkxRestMethod, OkxSignedEndpoint,
         RealSigningProvider,
     };
     use arb_signing::{SigningPolicy, SigningPurpose, SigningRequestId};
 
     use super::{
         parse_binance_order_query_confirmation, parse_bybit_order_query_confirmation,
-        unknown_status_report, CancelOrder, CancelOrderRequest, ConfirmOrderStatus,
-        ConfirmOrderStatusRequest, ExternalActionRef, ExternalOrderId, IdempotencyKey,
-        MutableActionId, MutableActionKind, MutableActionReceipt, MutableActionStatus,
-        MutableActionStatusReport, MutableOrderType, OrderReference, OrderSide, PrivateOrderMarket,
-        PrivateOrderUpdate, QueryActionStatus, QueryActionStatusRequest, RequestFingerprint,
-        RequestTransfer, SubmitOrder, SubmitOrderRequest, TransferRequest, VenueExecError,
-        VenueExecResult,
+        parse_okx_order_query_confirmation, unknown_status_report, CancelOrder, CancelOrderRequest,
+        ConfirmOrderStatus, ConfirmOrderStatusRequest, ExternalActionRef, ExternalOrderId,
+        IdempotencyKey, MutableActionId, MutableActionKind, MutableActionReceipt,
+        MutableActionStatus, MutableActionStatusReport, MutableOrderType, OrderReference,
+        OrderSide, PrivateOrderMarket, PrivateOrderUpdate, QueryActionStatus,
+        QueryActionStatusRequest, RequestFingerprint, RequestTransfer, SubmitOrder,
+        SubmitOrderRequest, TransferRequest, VenueExecError, VenueExecResult,
     };
 
     /// Binance Spot 下单、撤单和查单 endpoint。
@@ -5301,6 +5649,1346 @@ pub mod live {
         };
         VenueId::new(value).expect("static Bybit transport venue ID")
     }
+
+    /// OKX V5 下单和查单 endpoint。
+    pub const OKX_ORDER_ENDPOINT: &str = "/api/v5/trade/order";
+    /// OKX V5 撤单 endpoint。
+    pub const OKX_CANCEL_ORDER_ENDPOINT: &str = "/api/v5/trade/cancel-order";
+    const CURL_OKX_STATUS_MARKER: &str = "\n__ARB_OKX_HTTP_STATUS__:";
+
+    /// OKX 可变执行市场。
+    ///
+    /// 中文说明：OKX 现货使用 `tdMode=cash`；USDT 永续 swap 默认使用
+    /// `tdMode=cross` 和净持仓模式。若账户启用 long/short mode，可通过
+    /// `with_pos_side` 显式设置 `posSide`，否则让 OKX 拒绝并失败关闭。
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub enum OkxExecMarket {
+        Spot,
+        Swap,
+    }
+
+    impl OkxExecMarket {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Spot => "Spot",
+                Self::Swap => "Swap",
+            }
+        }
+
+        fn token(self) -> &'static str {
+            match self {
+                Self::Spot => "okx-spot",
+                Self::Swap => "okx-swap",
+            }
+        }
+
+        fn default_td_mode(self) -> &'static str {
+            match self {
+                Self::Spot => "cash",
+                Self::Swap => "cross",
+            }
+        }
+
+        fn expected_instrument_suffix(self) -> &'static str {
+            match self {
+                Self::Spot => "SPOT",
+                Self::Swap => "SWAP",
+            }
+        }
+    }
+
+    impl fmt::Display for OkxExecMarket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    /// OKX 执行适配器配置。
+    ///
+    /// 中文说明：配置只保存 endpoint、账户引用、签名策略、tdMode 和可选
+    /// posSide，不保存 API key、secret、passphrase、签名或任何凭证原文。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct OkxExecConfig {
+        market: OkxExecMarket,
+        venue_id: VenueId,
+        account_id: AccountId,
+        base_url: String,
+        td_mode: String,
+        pos_side: Option<String>,
+        signing_policy: SigningPolicy,
+    }
+
+    impl OkxExecConfig {
+        pub fn spot(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            Self::new(
+                OkxExecMarket::Spot,
+                venue_id,
+                account_id,
+                base_url,
+                OkxExecMarket::Spot.default_td_mode(),
+                signing_policy,
+            )
+        }
+
+        pub fn swap(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            Self::new(
+                OkxExecMarket::Swap,
+                venue_id,
+                account_id,
+                base_url,
+                OkxExecMarket::Swap.default_td_mode(),
+                signing_policy,
+            )
+        }
+
+        pub fn new(
+            market: OkxExecMarket,
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            td_mode: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            let td_mode = td_mode.into();
+            validate_okx_td_mode(market, &td_mode)?;
+            Ok(Self {
+                market,
+                venue_id,
+                account_id,
+                base_url: normalize_okx_base_url(base_url.into())?,
+                td_mode,
+                pos_side: None,
+                signing_policy,
+            })
+        }
+
+        pub fn with_pos_side(mut self, pos_side: impl Into<String>) -> VenueExecResult<Self> {
+            let pos_side = pos_side.into();
+            validate_okx_pos_side(&pos_side)?;
+            self.pos_side = Some(pos_side);
+            Ok(self)
+        }
+
+        pub fn market(&self) -> OkxExecMarket {
+            self.market
+        }
+
+        pub fn venue_id(&self) -> &VenueId {
+            &self.venue_id
+        }
+
+        pub fn account_id(&self) -> &AccountId {
+            &self.account_id
+        }
+
+        pub fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        pub fn td_mode(&self) -> &str {
+            &self.td_mode
+        }
+
+        pub fn pos_side(&self) -> Option<&str> {
+            self.pos_side.as_deref()
+        }
+
+        pub fn signing_policy(&self) -> &SigningPolicy {
+            &self.signing_policy
+        }
+    }
+
+    /// 已签名 OKX HTTP 请求。
+    pub struct OkxSignedRequest<'a> {
+        market: OkxExecMarket,
+        base_url: &'a str,
+        signed_endpoint: &'a OkxSignedEndpoint,
+    }
+
+    impl OkxSignedRequest<'_> {
+        pub fn market(&self) -> OkxExecMarket {
+            self.market
+        }
+
+        pub fn method(&self) -> OkxRestMethod {
+            self.signed_endpoint.method()
+        }
+
+        pub fn base_url(&self) -> &str {
+            self.base_url
+        }
+
+        pub fn request_path(&self) -> &str {
+            self.signed_endpoint.request_path_for_transport()
+        }
+
+        pub fn body_for_transport(&self) -> &str {
+            self.signed_endpoint.body_for_transport()
+        }
+
+        pub fn api_key_header_name(&self) -> &'static str {
+            self.signed_endpoint.api_key_header_name()
+        }
+
+        pub fn api_key_header_value(&self) -> &str {
+            self.signed_endpoint.api_key_header_value()
+        }
+
+        pub fn signature_header_name(&self) -> &'static str {
+            self.signed_endpoint.signature_header_name()
+        }
+
+        pub fn signature_header_value(&self) -> &str {
+            self.signed_endpoint.signature_header_value()
+        }
+
+        pub fn timestamp_header_name(&self) -> &'static str {
+            self.signed_endpoint.timestamp_header_name()
+        }
+
+        pub fn timestamp_header_value(&self) -> &str {
+            self.signed_endpoint.timestamp_header_value()
+        }
+
+        pub fn passphrase_header_name(&self) -> &'static str {
+            self.signed_endpoint.passphrase_header_name()
+        }
+
+        pub fn passphrase_header_value(&self) -> &str {
+            self.signed_endpoint.passphrase_header_value()
+        }
+    }
+
+    impl fmt::Debug for OkxSignedRequest<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OkxSignedRequest")
+                .field("market", &self.market)
+                .field("method", &self.method())
+                .field("base_url", &self.base_url)
+                .field("request_path", &"<redacted>")
+                .field("api_key_header_name", &self.api_key_header_name())
+                .field("api_key_header_value", &"<redacted>")
+                .field("signature_header_name", &self.signature_header_name())
+                .field("timestamp_header_name", &self.timestamp_header_name())
+                .field("passphrase_header_name", &self.passphrase_header_name())
+                .field("body", &"<redacted>")
+                .field("signature", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// OKX transport 返回。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct OkxExecHttpResponse {
+        status_code: u16,
+        body: String,
+    }
+
+    impl OkxExecHttpResponse {
+        pub fn new(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+            }
+        }
+
+        pub fn status_code(&self) -> u16 {
+            self.status_code
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        pub fn is_success(&self) -> bool {
+            (200..=299).contains(&self.status_code)
+        }
+    }
+
+    /// OKX 可变执行 transport。
+    ///
+    /// 中文说明：transport 遇到网络断连、TLS 失败或无 HTTP 状态码时必须返回
+    /// `UnknownExternalState`，不能把外部未知状态当成下单失败或成功。
+    pub trait OkxExecTransport {
+        fn send_signed(
+            &mut self,
+            request: OkxSignedRequest<'_>,
+        ) -> VenueExecResult<OkxExecHttpResponse>;
+    }
+
+    /// 使用系统 `curl` 发送 OKX signed REST 请求的真实 transport。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct OkxCurlExecTransport {
+        connect_timeout_secs: u64,
+        max_time_secs: u64,
+    }
+
+    impl OkxCurlExecTransport {
+        pub fn new(connect_timeout_secs: u64, max_time_secs: u64) -> VenueExecResult<Self> {
+            if connect_timeout_secs == 0 || max_time_secs == 0 {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "curl_timeout",
+                    reason: "curl timeouts must be greater than zero",
+                });
+            }
+            Ok(Self {
+                connect_timeout_secs,
+                max_time_secs,
+            })
+        }
+    }
+
+    impl Default for OkxCurlExecTransport {
+        fn default() -> Self {
+            Self {
+                connect_timeout_secs: 10,
+                max_time_secs: 30,
+            }
+        }
+    }
+
+    impl OkxExecTransport for OkxCurlExecTransport {
+        fn send_signed(
+            &mut self,
+            request: OkxSignedRequest<'_>,
+        ) -> VenueExecResult<OkxExecHttpResponse> {
+            let venue_id = okx_transport_venue_id(request.market());
+            let url = okx_signed_request_url(&request)?;
+            let config = okx_curl_config(&request, &url)?;
+            let mut child = Command::new("curl")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--request")
+                .arg(request.method().as_str())
+                .arg("--connect-timeout")
+                .arg(self.connect_timeout_secs.to_string())
+                .arg("--max-time")
+                .arg(self.max_time_secs.to_string())
+                .arg("--write-out")
+                .arg(format!("{CURL_OKX_STATUS_MARKER}%{{http_code}}"))
+                .arg("--config")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "failed to start curl for OKX signed REST request".to_owned(),
+                })?;
+
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "curl stdin is unavailable for OKX signed REST request".to_owned(),
+                })?
+                .write_all(config.as_bytes())
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: venue_id.clone(),
+                    detail: "failed to write curl config for OKX signed REST request".to_owned(),
+                })?;
+
+            let output =
+                child
+                    .wait_with_output()
+                    .map_err(|_| VenueExecError::UnknownExternalState {
+                        venue_id: venue_id.clone(),
+                        detail: "curl transport did not return an OKX signed REST response"
+                            .to_owned(),
+                    })?;
+            if !output.status.success() {
+                return Err(VenueExecError::UnknownExternalState {
+                    venue_id,
+                    detail: "curl transport failed before a reliable HTTP response was available"
+                        .to_owned(),
+                });
+            }
+
+            parse_okx_curl_http_response(&output.stdout, request.market())
+        }
+    }
+
+    /// OKX Spot 可变执行适配器。
+    pub struct OkxSpotExecAdapter<S, T> {
+        inner: OkxExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> OkxSpotExecAdapter<S, T> {
+        pub fn new(config: OkxExecConfig, signer: S, transport: T) -> VenueExecResult<Self> {
+            ensure_okx_config_market(&config, OkxExecMarket::Spot)?;
+            Ok(Self {
+                inner: OkxExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &OkxExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for OkxSpotExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OkxSpotExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    /// OKX Swap 可变执行适配器。
+    pub struct OkxSwapExecAdapter<S, T> {
+        inner: OkxExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> OkxSwapExecAdapter<S, T> {
+        pub fn new(config: OkxExecConfig, signer: S, transport: T) -> VenueExecResult<Self> {
+            ensure_okx_config_market(&config, OkxExecMarket::Swap)?;
+            Ok(Self {
+                inner: OkxExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &OkxExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for OkxSwapExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OkxSwapExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    macro_rules! impl_okx_adapter_traits {
+        ($adapter:ty) => {
+            impl<S, T> SubmitOrder for $adapter
+            where
+                S: OkxRealSigningProvider,
+                T: OkxExecTransport,
+            {
+                fn submit_order(
+                    &mut self,
+                    request: SubmitOrderRequest,
+                ) -> VenueExecResult<MutableActionReceipt> {
+                    self.inner.submit_order(request)
+                }
+            }
+
+            impl<S, T> CancelOrder for $adapter
+            where
+                S: OkxRealSigningProvider,
+                T: OkxExecTransport,
+            {
+                fn cancel_order(
+                    &mut self,
+                    request: CancelOrderRequest,
+                ) -> VenueExecResult<MutableActionReceipt> {
+                    self.inner.cancel_order(request)
+                }
+            }
+
+            impl<S, T> QueryActionStatus for $adapter
+            where
+                S: OkxRealSigningProvider,
+                T: OkxExecTransport,
+            {
+                fn query_action_status(
+                    &self,
+                    request: QueryActionStatusRequest,
+                ) -> VenueExecResult<MutableActionStatusReport> {
+                    self.inner.query_action_status(request)
+                }
+            }
+
+            impl<S, T> ConfirmOrderStatus for $adapter
+            where
+                S: OkxRealSigningProvider,
+                T: OkxExecTransport,
+            {
+                fn confirm_order_status(
+                    &mut self,
+                    request: ConfirmOrderStatusRequest,
+                ) -> VenueExecResult<PrivateOrderUpdate> {
+                    self.inner.confirm_order_status(request)
+                }
+            }
+
+            impl<S, T> RequestTransfer for $adapter
+            where
+                S: OkxRealSigningProvider,
+                T: OkxExecTransport,
+            {
+                fn request_transfer(
+                    &mut self,
+                    request: TransferRequest,
+                ) -> VenueExecResult<MutableActionReceipt> {
+                    self.inner.request_transfer(request)
+                }
+            }
+        };
+    }
+
+    impl_okx_adapter_traits!(OkxSpotExecAdapter<S, T>);
+    impl_okx_adapter_traits!(OkxSwapExecAdapter<S, T>);
+
+    #[derive(Debug)]
+    struct OkxExecAdapterCore<S, T> {
+        config: OkxExecConfig,
+        signer: S,
+        transport: T,
+        records_by_key: BTreeMap<IdempotencyKey, LiveActionRecord>,
+        key_by_action_id: BTreeMap<MutableActionId, IdempotencyKey>,
+        orders_by_client_id: BTreeMap<OrderId, OkxKnownOrder>,
+        orders_by_external_id: BTreeMap<ExternalOrderId, OkxKnownOrder>,
+        next_sequence: u64,
+    }
+
+    impl<S, T> OkxExecAdapterCore<S, T> {
+        fn new(config: OkxExecConfig, signer: S, transport: T) -> Self {
+            Self {
+                config,
+                signer,
+                transport,
+                records_by_key: BTreeMap::new(),
+                key_by_action_id: BTreeMap::new(),
+                orders_by_client_id: BTreeMap::new(),
+                orders_by_external_id: BTreeMap::new(),
+                next_sequence: 0,
+            }
+        }
+
+        fn config(&self) -> &OkxExecConfig {
+            &self.config
+        }
+
+        fn transport(&self) -> &T {
+            &self.transport
+        }
+
+        fn transport_mut(&mut self) -> &mut T {
+            &mut self.transport
+        }
+
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            Ok(match request {
+                QueryActionStatusRequest::ByActionId(action_id) => {
+                    if let Some(key) = self.key_by_action_id.get(&action_id) {
+                        self.report_for_key(key)
+                    } else {
+                        unknown_status_report(Some(action_id), None)
+                    }
+                }
+                QueryActionStatusRequest::ByIdempotencyKey(key) => self.report_for_key(&key),
+            })
+        }
+
+        fn report_for_key(&self, key: &IdempotencyKey) -> MutableActionStatusReport {
+            self.records_by_key.get(key).map_or_else(
+                || unknown_status_report(None, Some(key.clone())),
+                |record| super::status_report_from_receipt(&record.receipt),
+            )
+        }
+
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.from_account_id)?;
+            Err(VenueExecError::InvalidRequest {
+                field: "transfer",
+                reason: "OKX live transfer is not implemented by this execution adapter",
+            })
+        }
+
+        fn ensure_request_scope(
+            &self,
+            venue_id: &VenueId,
+            account_id: &AccountId,
+        ) -> VenueExecResult<()> {
+            if venue_id != &self.config.venue_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "venue_id",
+                    reason: "request venue does not match OKX execution adapter config",
+                });
+            }
+            if account_id != &self.config.account_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "account_id",
+                    reason: "request account does not match OKX execution adapter config",
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl<S, T> OkxExecAdapterCore<S, T>
+    where
+        S: OkxRealSigningProvider,
+        T: OkxExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            request.validate()?;
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+
+            let inst_id = okx_inst_id_from_instrument(self.config.market, &request.instrument_id)?;
+            let body = okx_order_create_body(&self.config, &inst_id, &request)?;
+            let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
+            let signed = self.sign(
+                SigningPurpose::SubmitOrder,
+                &action_id,
+                OkxRestMethod::Post,
+                OKX_ORDER_ENDPOINT.to_owned(),
+                body,
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_business_success(OKX_ORDER_ENDPOINT, &response)?;
+
+            let known_order = okx_known_order_from_response(
+                self.config.market,
+                &inst_id,
+                request.client_order_id.clone(),
+                response.body(),
+                &action_id,
+            )?;
+            let external_ref = known_order
+                .external_order_id
+                .clone()
+                .map(ExternalActionRef::Order);
+            let receipt = MutableActionReceipt {
+                action_id,
+                kind: MutableActionKind::SubmitOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref,
+                duplicate: false,
+                simulated: false,
+            };
+
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            self.record_known_order(known_order);
+            Ok(receipt)
+        }
+
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+
+            let known_order = self.lookup_known_order(&request.order_ref).ok_or(
+                VenueExecError::InvalidRequest {
+                    field: "order_ref",
+                    reason: "OKX cancel requires an order previously submitted through this adapter so its instId is known",
+                },
+            )?;
+            let body = okx_cancel_order_body(&request, known_order)?;
+            let action_id = self.next_action_id(MutableActionKind::CancelOrder)?;
+            let signed = self.sign(
+                SigningPurpose::CancelOrder,
+                &action_id,
+                OkxRestMethod::Post,
+                OKX_CANCEL_ORDER_ENDPOINT.to_owned(),
+                body,
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_business_success(OKX_CANCEL_ORDER_ENDPOINT, &response)?;
+
+            let receipt = MutableActionReceipt {
+                action_id: action_id.clone(),
+                kind: MutableActionKind::CancelOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref: Some(ExternalActionRef::Cancel(action_id)),
+                duplicate: false,
+                simulated: false,
+            };
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            Ok(receipt)
+        }
+
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let inst_id = okx_inst_id_from_instrument(self.config.market, &request.instrument_id)?;
+            let request_path = okx_query_order_request_path(&inst_id, &request.order_ref)?;
+            let signing_request_id = SigningRequestId::new(format!(
+                "signing-request/okx-exec/query-order/{}",
+                request.source_event_id
+            ))
+            .map_err(signing_error)?;
+            let signed = self.sign_with_request_id(
+                SigningPurpose::QueryOrder,
+                signing_request_id,
+                OkxRestMethod::Get,
+                request_path,
+                String::new(),
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_http_success(OKX_ORDER_ENDPOINT, &response)?;
+            parse_okx_order_query_confirmation(
+                private_market_from_okx_exec_market(self.config.market),
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                request.source_event_id,
+                response.body(),
+            )
+        }
+
+        fn duplicate_receipt(
+            &self,
+            idempotency_key: &IdempotencyKey,
+            fingerprint: &RequestFingerprint,
+        ) -> VenueExecResult<Option<MutableActionReceipt>> {
+            let Some(existing) = self.records_by_key.get(idempotency_key) else {
+                return Ok(None);
+            };
+            if existing.fingerprint != *fingerprint {
+                return Err(VenueExecError::IdempotencyConflict {
+                    idempotency_key: idempotency_key.clone(),
+                    existing_fingerprint: existing.fingerprint.0.clone(),
+                    incoming_fingerprint: fingerprint.0.clone(),
+                });
+            }
+
+            let mut receipt = existing.receipt.clone();
+            receipt.duplicate = true;
+            Ok(Some(receipt))
+        }
+
+        fn next_action_id(&mut self, kind: MutableActionKind) -> VenueExecResult<MutableActionId> {
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("OKX mutable action sequence overflowed");
+            MutableActionId::new(format!(
+                "{}:{}:{}",
+                self.config.market.token(),
+                kind.as_str(),
+                self.next_sequence
+            ))
+        }
+
+        fn sign(
+            &self,
+            purpose: SigningPurpose,
+            action_id: &MutableActionId,
+            method: OkxRestMethod,
+            request_path: String,
+            body: String,
+        ) -> VenueExecResult<OkxSignedEndpoint> {
+            self.sign_with_request_id(
+                purpose,
+                SigningRequestId::new(format!("signing-request/okx-exec/{}", action_id.as_str()))
+                    .map_err(signing_error)?,
+                method,
+                request_path,
+                body,
+            )
+        }
+
+        fn sign_with_request_id(
+            &self,
+            purpose: SigningPurpose,
+            signing_request_id: SigningRequestId,
+            method: OkxRestMethod,
+            request_path: String,
+            body: String,
+        ) -> VenueExecResult<OkxSignedEndpoint> {
+            let input = OkxHmacSigningInput::new(
+                signing_request_id,
+                self.config.signing_policy.policy_ref().clone(),
+                purpose,
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                method,
+                request_path,
+                body,
+            )
+            .map_err(signing_error)?;
+            self.signer
+                .sign_okx_hmac(input, &self.config.signing_policy)
+                .map_err(signing_error)
+        }
+
+        fn dispatch_signed(
+            &mut self,
+            signed_endpoint: &OkxSignedEndpoint,
+        ) -> VenueExecResult<OkxExecHttpResponse> {
+            let request = OkxSignedRequest {
+                market: self.config.market,
+                base_url: &self.config.base_url,
+                signed_endpoint,
+            };
+            self.transport.send_signed(request)
+        }
+
+        fn ensure_http_success(
+            &self,
+            endpoint: &'static str,
+            response: &OkxExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            if response.is_success() {
+                return Ok(());
+            }
+            Err(VenueExecError::ExternalRejected {
+                venue_id: self.config.venue_id.clone(),
+                endpoint: endpoint.to_owned(),
+                status_code: response.status_code(),
+                reason: response_body_snippet(response.body()),
+            })
+        }
+
+        fn ensure_business_success(
+            &self,
+            endpoint: &'static str,
+            response: &OkxExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            self.ensure_http_success(endpoint, response)?;
+            match json_field_value(response.body(), "code").as_deref() {
+                Some("0") => {}
+                Some(code) => {
+                    return Err(VenueExecError::ExternalRejected {
+                        venue_id: self.config.venue_id.clone(),
+                        endpoint: endpoint.to_owned(),
+                        status_code: response.status_code(),
+                        reason: format!(
+                            "OKX code={code}: {}",
+                            json_field_value(response.body(), "msg")
+                                .unwrap_or_else(|| "missing msg".to_owned())
+                        ),
+                    });
+                }
+                None => {
+                    return Err(VenueExecError::UnknownExternalState {
+                        venue_id: self.config.venue_id.clone(),
+                        detail: format!("OKX response from {endpoint} lacks code"),
+                    });
+                }
+            }
+            match json_field_value(response.body(), "sCode").as_deref() {
+                Some("0") | None => Ok(()),
+                Some(s_code) => Err(VenueExecError::ExternalRejected {
+                    venue_id: self.config.venue_id.clone(),
+                    endpoint: endpoint.to_owned(),
+                    status_code: response.status_code(),
+                    reason: format!(
+                        "OKX sCode={s_code}: {}",
+                        json_field_value(response.body(), "sMsg")
+                            .unwrap_or_else(|| "missing sMsg".to_owned())
+                    ),
+                }),
+            }
+        }
+
+        fn record_action(
+            &mut self,
+            idempotency_key: IdempotencyKey,
+            fingerprint: RequestFingerprint,
+            receipt: MutableActionReceipt,
+        ) {
+            self.key_by_action_id
+                .insert(receipt.action_id.clone(), idempotency_key.clone());
+            self.records_by_key.insert(
+                idempotency_key,
+                LiveActionRecord {
+                    fingerprint,
+                    receipt,
+                },
+            );
+        }
+
+        fn record_known_order(&mut self, known_order: OkxKnownOrder) {
+            if let Some(client_order_id) = known_order.client_order_id.clone() {
+                self.orders_by_client_id
+                    .insert(client_order_id, known_order.clone());
+            }
+            if let Some(external_order_id) = known_order.external_order_id.clone() {
+                self.orders_by_external_id
+                    .insert(external_order_id, known_order);
+            }
+        }
+
+        fn lookup_known_order(&self, order_ref: &OrderReference) -> Option<&OkxKnownOrder> {
+            match order_ref {
+                OrderReference::ClientOrderId(order_id) => self.orders_by_client_id.get(order_id),
+                OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct OkxKnownOrder {
+        inst_id: String,
+        order_id_param: Option<String>,
+        client_order_id: Option<OrderId>,
+        external_order_id: Option<ExternalOrderId>,
+    }
+
+    fn ensure_okx_config_market(
+        config: &OkxExecConfig,
+        expected: OkxExecMarket,
+    ) -> VenueExecResult<()> {
+        if config.market == expected {
+            Ok(())
+        } else {
+            Err(VenueExecError::InvalidRequest {
+                field: "market",
+                reason: "OKX execution adapter received config for a different market",
+            })
+        }
+    }
+
+    fn validate_okx_td_mode(market: OkxExecMarket, td_mode: &str) -> VenueExecResult<()> {
+        match (market, td_mode) {
+            (OkxExecMarket::Spot, "cash")
+            | (OkxExecMarket::Spot, "cross")
+            | (OkxExecMarket::Spot, "isolated")
+            | (OkxExecMarket::Swap, "cross")
+            | (OkxExecMarket::Swap, "isolated") => Ok(()),
+            _ => Err(VenueExecError::InvalidRequest {
+                field: "td_mode",
+                reason:
+                    "OKX tdMode must be cash/cross/isolated for spot and cross/isolated for swap",
+            }),
+        }
+    }
+
+    fn validate_okx_pos_side(value: &str) -> VenueExecResult<()> {
+        match value {
+            "long" | "short" | "net" => Ok(()),
+            _ => Err(VenueExecError::InvalidRequest {
+                field: "pos_side",
+                reason: "OKX posSide must be long, short or net",
+            }),
+        }
+    }
+
+    fn normalize_okx_base_url(value: String) -> VenueExecResult<String> {
+        let trimmed = value.trim().trim_end_matches('/').to_owned();
+        if trimmed.is_empty() {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "OKX base URL cannot be empty",
+            });
+        }
+        if trimmed
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "OKX base URL contains a control byte",
+            });
+        }
+        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://127.0.0.1")) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "OKX base URL must use https or an explicit localhost test URL",
+            });
+        }
+        Ok(trimmed)
+    }
+
+    fn okx_order_create_body(
+        config: &OkxExecConfig,
+        inst_id: &str,
+        request: &SubmitOrderRequest,
+    ) -> VenueExecResult<String> {
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "instId", inst_id)?;
+        push_json_string_field(&mut body, &mut first, "tdMode", config.td_mode())?;
+        if let Some(pos_side) = config.pos_side() {
+            push_json_string_field(&mut body, &mut first, "posSide", pos_side)?;
+        }
+        push_json_string_field(&mut body, &mut first, "side", okx_side(request.side))?;
+        match request.order_type {
+            MutableOrderType::Market => {
+                push_json_string_field(&mut body, &mut first, "ordType", "market")?;
+                push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
+            }
+            MutableOrderType::Limit => {
+                push_json_string_field(&mut body, &mut first, "ordType", "limit")?;
+                push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "px",
+                    &request
+                        .limit_price
+                        .expect("validated limit order price")
+                        .to_string(),
+                )?;
+            }
+            MutableOrderType::PostOnly => {
+                push_json_string_field(&mut body, &mut first, "ordType", "post_only")?;
+                push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "px",
+                    &request
+                        .limit_price
+                        .expect("validated post-only order price")
+                        .to_string(),
+                )?;
+            }
+        }
+        if let Some(client_order_id) = &request.client_order_id {
+            validate_okx_client_order_id(client_order_id.as_str())?;
+            push_json_string_field(&mut body, &mut first, "clOrdId", client_order_id.as_str())?;
+        }
+        body.push('}');
+        Ok(body)
+    }
+
+    fn okx_cancel_order_body(
+        request: &CancelOrderRequest,
+        known_order: &OkxKnownOrder,
+    ) -> VenueExecResult<String> {
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(
+            &mut body,
+            &mut first,
+            "instId",
+            known_order.inst_id.as_str(),
+        )?;
+        match &request.order_ref {
+            OrderReference::VenueOrderId(_) => {
+                if let Some(order_id) = &known_order.order_id_param {
+                    push_json_string_field(&mut body, &mut first, "ordId", order_id)?;
+                } else if let Some(client_order_id) = &known_order.client_order_id {
+                    push_json_string_field(
+                        &mut body,
+                        &mut first,
+                        "clOrdId",
+                        client_order_id.as_str(),
+                    )?;
+                } else {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "known OKX venue order lacks ordId and clOrdId",
+                    });
+                }
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_okx_client_order_id(client_order_id.as_str())?;
+                push_json_string_field(&mut body, &mut first, "clOrdId", client_order_id.as_str())?;
+            }
+        }
+        body.push('}');
+        Ok(body)
+    }
+
+    fn okx_query_order_request_path(
+        inst_id: &str,
+        order_ref: &OrderReference,
+    ) -> VenueExecResult<String> {
+        let mut params = vec![("instId".to_owned(), inst_id.to_owned())];
+        match order_ref {
+            OrderReference::VenueOrderId(order_id) => {
+                let raw_order_id = okx_order_id_param_from_external(order_id)?;
+                params.push(("ordId".to_owned(), raw_order_id.to_owned()));
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_okx_client_order_id(client_order_id.as_str())?;
+                params.push(("clOrdId".to_owned(), client_order_id.as_str().to_owned()));
+            }
+        }
+        Ok(format!(
+            "{OKX_ORDER_ENDPOINT}?{}",
+            query_string_from_pairs(&params)
+        ))
+    }
+
+    fn okx_order_id_param_from_external(order_id: &ExternalOrderId) -> VenueExecResult<&str> {
+        let value = order_id.as_str();
+        let raw_order_id = value
+            .strip_prefix("okx-spot:order:")
+            .or_else(|| value.strip_prefix("okx-swap:order:"))
+            .ok_or(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "OKX venue order ref must come from an OKX adapter",
+            })?;
+        validate_okx_order_id(raw_order_id)?;
+        Ok(raw_order_id)
+    }
+
+    fn private_market_from_okx_exec_market(market: OkxExecMarket) -> PrivateOrderMarket {
+        match market {
+            OkxExecMarket::Spot => PrivateOrderMarket::OkxSpot,
+            OkxExecMarket::Swap => PrivateOrderMarket::OkxSwap,
+        }
+    }
+
+    fn okx_inst_id_from_instrument(
+        market: OkxExecMarket,
+        instrument_id: &InstrumentId,
+    ) -> VenueExecResult<String> {
+        let value = instrument_id.as_str();
+        let mut parts = value.split(':');
+        let prefix = parts.next();
+        let venue = parts.next();
+        let inst_id = parts.next();
+        let suffix = parts.next();
+        if parts.next().is_some()
+            || prefix != Some("inst")
+            || venue != Some("OKX")
+            || suffix != Some(market.expected_instrument_suffix())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "instrument_id",
+                reason: "OKX execution requires instrument IDs shaped as inst:OKX:<INST-ID>:SPOT or inst:OKX:<INST-ID>:SWAP",
+            });
+        }
+        let inst_id = inst_id.expect("instId checked above");
+        validate_okx_exec_inst_id(market, inst_id)?;
+        Ok(inst_id.to_owned())
+    }
+
+    fn validate_okx_exec_inst_id(market: OkxExecMarket, value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 64 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "inst_id",
+                reason: "OKX instId must be 1 to 64 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-'))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "inst_id",
+                reason: "OKX instId must use uppercase ASCII letters, digits or dash",
+            });
+        }
+        match market {
+            OkxExecMarket::Spot if !value.ends_with("-SWAP") => Ok(()),
+            OkxExecMarket::Swap if value.ends_with("-SWAP") => Ok(()),
+            _ => Err(VenueExecError::InvalidRequest {
+                field: "inst_id",
+                reason: "OKX instId does not match configured execution market",
+            }),
+        }
+    }
+
+    fn validate_okx_client_order_id(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 32 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "OKX clOrdId must be 1 to 32 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "OKX clOrdId must use ASCII letters, digits, dash or underscore",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_okx_order_id(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 96 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "OKX ordId must be 1 to 96 bytes",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "OKX ordId contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn okx_known_order_from_response(
+        market: OkxExecMarket,
+        inst_id: &str,
+        client_order_id: Option<OrderId>,
+        body: &str,
+        action_id: &MutableActionId,
+    ) -> VenueExecResult<OkxKnownOrder> {
+        let order_id_param = json_field_value(body, "ordId").filter(|value| !value.is_empty());
+        let response_client_order_id = json_field_value(body, "clOrdId")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| OrderId::new(value).ok());
+        let client_order_id = client_order_id.or(response_client_order_id);
+        let external_order_id = if let Some(order_id) = &order_id_param {
+            Some(ExternalOrderId::new(format!(
+                "{}:order:{order_id}",
+                market.token()
+            ))?)
+        } else if let Some(client_order_id) = &client_order_id {
+            Some(ExternalOrderId::new(format!(
+                "{}:client:{}",
+                market.token(),
+                client_order_id.as_str()
+            ))?)
+        } else {
+            Some(ExternalOrderId::new(format!(
+                "{}:action:{}",
+                market.token(),
+                action_id.as_str()
+            ))?)
+        };
+        Ok(OkxKnownOrder {
+            inst_id: inst_id.to_owned(),
+            order_id_param,
+            client_order_id,
+            external_order_id,
+        })
+    }
+
+    fn okx_side(side: OrderSide) -> &'static str {
+        match side {
+            OrderSide::Buy => "buy",
+            OrderSide::Sell => "sell",
+        }
+    }
+
+    fn okx_signed_request_url(request: &OkxSignedRequest<'_>) -> VenueExecResult<String> {
+        let request_path = request.request_path();
+        if request_path.is_empty() || !request_path.starts_with('/') {
+            return Err(VenueExecError::InvalidRequest {
+                field: "request_path",
+                reason: "OKX signed REST request path must be an absolute path",
+            });
+        }
+        Ok(format!("{}{}", request.base_url(), request_path))
+    }
+
+    fn okx_curl_config(request: &OkxSignedRequest<'_>, url: &str) -> VenueExecResult<String> {
+        let mut config = format!("url = \"{}\"\n", curl_config_quote(url)?);
+        push_curl_header(
+            &mut config,
+            request.api_key_header_name(),
+            request.api_key_header_value(),
+        )?;
+        push_curl_header(
+            &mut config,
+            request.signature_header_name(),
+            request.signature_header_value(),
+        )?;
+        push_curl_header(
+            &mut config,
+            request.timestamp_header_name(),
+            request.timestamp_header_value(),
+        )?;
+        push_curl_header(
+            &mut config,
+            request.passphrase_header_name(),
+            request.passphrase_header_value(),
+        )?;
+        if !request.body_for_transport().is_empty() {
+            push_curl_header(&mut config, "Content-Type", "application/json")?;
+            config.push_str("data = \"");
+            config.push_str(&curl_config_quote(request.body_for_transport())?);
+            config.push_str("\"\n");
+        }
+        Ok(config)
+    }
+
+    fn parse_okx_curl_http_response(
+        stdout: &[u8],
+        market: OkxExecMarket,
+    ) -> VenueExecResult<OkxExecHttpResponse> {
+        let output = String::from_utf8_lossy(stdout);
+        let Some((body, status)) = output.rsplit_once(CURL_OKX_STATUS_MARKER) else {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: okx_transport_venue_id(market),
+                detail: "curl transport response lacked an HTTP status marker".to_owned(),
+            });
+        };
+        let status_code =
+            status
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: okx_transport_venue_id(market),
+                    detail: "curl transport returned a malformed HTTP status".to_owned(),
+                })?;
+        if status_code == 0 {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: okx_transport_venue_id(market),
+                detail: "curl transport did not receive an HTTP response from OKX".to_owned(),
+            });
+        }
+        Ok(OkxExecHttpResponse::new(status_code, body.to_owned()))
+    }
+
+    fn okx_transport_venue_id(market: OkxExecMarket) -> VenueId {
+        let value = match market {
+            OkxExecMarket::Spot => "venue:OKX-SPOT",
+            OkxExecMarket::Swap => "venue:OKX-SWAP",
+        };
+        VenueId::new(value).expect("static OKX transport venue ID")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5673,6 +7361,103 @@ mod tests {
             err,
             VenueExecError::InvalidRequest {
                 field: "category",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn okx_order_query_confirms_filled_swap_order() {
+        let update = parse_okx_order_query_confirmation(
+            PrivateOrderMarket::OkxSwap,
+            venue("venue:OKX-SWAP"),
+            account("account:okx-unit"),
+            "event:okx:swap:query:filled",
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","ordId":"312269865356374016","clOrdId":"rvoP1778630400","side":"sell","state":"filled","accFillSz":"0.001","avgPx":"43100.50","fillFee":"-0.0100","fillFeeCcy":"USDT","uTime":"1700000001500","tradeId":"901"}]}"#,
+        )
+        .expect("okx order query confirmation");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.market, PrivateOrderMarket::OkxSwap);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.side, Some(OrderSide::Sell));
+        assert_eq!(update.instrument_id.as_str(), "inst:OKX:BTC-USDT-SWAP:SWAP");
+        assert_eq!(update.symbol, "BTC-USDT");
+        assert_eq!(
+            update
+                .venue_order_id
+                .as_ref()
+                .expect("venue order id")
+                .as_str(),
+            "okx-swap:order:312269865356374016"
+        );
+        assert_eq!(
+            update.client_order_id.as_ref().expect("client id").as_str(),
+            "rvoP1778630400"
+        );
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.001"
+        );
+        let fill = update.last_fill.expect("filled query carries fill summary");
+        assert_eq!(fill.timestamp, "2023-11-14T22:13:21.5Z");
+        assert_eq!(fill.price, "43100.50");
+        assert_eq!(fill.quantity, "0.001");
+        assert_eq!(
+            fill.fee_asset_id.as_ref().expect("fee asset").as_str(),
+            "asset:USDT"
+        );
+        assert_eq!(fill.fee_amount.expect("fee amount").to_string(), "0.0100");
+        assert_eq!(fill.trade_id.as_deref(), Some("901"));
+    }
+
+    #[test]
+    fn okx_private_order_stream_confirms_filled_spot_order() {
+        let update = parse_okx_private_order_stream_update(
+            PrivateOrderMarket::OkxSpot,
+            venue("venue:OKX-SPOT"),
+            account("account:okx-unit"),
+            "event:okx:private-order-stream:spot:1",
+            r#"{"arg":{"channel":"orders","instType":"SPOT"},"ts":"1700000002500","data":[{"instId":"BTC-USDT","ordId":"512269865356374016","clOrdId":"rvoS1778630400","side":"buy","state":"filled","accFillSz":"0.001","fillSz":"0.001","fillPx":"43100.50","fillFee":"-0.0100","fillFeeCcy":"USDT","uTime":"1700000002500","tradeId":"902"}]}"#,
+        )
+        .expect("okx private stream update");
+
+        assert_eq!(update.source, OrderConfirmationSource::PrivateStream);
+        assert_eq!(update.market, PrivateOrderMarket::OkxSpot);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.side, Some(OrderSide::Buy));
+        assert_eq!(update.instrument_id.as_str(), "inst:OKX:BTC-USDT:SPOT");
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.001"
+        );
+        assert_eq!(
+            update.last_fill.as_ref().expect("fill").trade_id.as_deref(),
+            Some("902")
+        );
+    }
+
+    #[test]
+    fn okx_private_order_stream_rejects_market_mismatch() {
+        let err = parse_okx_private_order_stream_update(
+            PrivateOrderMarket::OkxSpot,
+            venue("venue:OKX-SPOT"),
+            account("account:okx-unit"),
+            "event:okx:private-order-stream:spot:mismatch",
+            r#"{"arg":{"channel":"orders","instType":"SWAP"},"data":[{"instId":"BTC-USDT-SWAP","ordId":"312","side":"sell","state":"live","uTime":"1700000002500"}]}"#,
+        )
+        .expect_err("OKX spot parser must reject swap instId");
+
+        assert!(matches!(
+            err,
+            VenueExecError::InvalidRequest {
+                field: "instId",
                 ..
             }
         ));
@@ -6233,6 +8018,136 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn okx_spot_adapter_signs_submits_and_cancels_known_order() {
+        let mut adapter = live::OkxSpotExecAdapter::new(
+            live::OkxExecConfig::spot(
+                venue("venue:OKX-SPOT"),
+                account("account:okx-unit"),
+                "https://www.okx.com",
+                okx_signing_policy("kms-policy/okx-spot-submit-unit"),
+            )
+            .unwrap(),
+            okx_test_signer("2026-05-17T12:34:56.789Z"),
+            RecordingOkxTransport::ok(
+                200,
+                r#"{"code":"0","msg":"","data":[{"ordId":"512269865356374016","clOrdId":"rvoS1","sCode":"0","sMsg":""}]}"#,
+            ),
+        )
+        .unwrap();
+
+        let receipt = adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:OKX-SPOT"),
+                account("account:okx-unit"),
+                instrument("inst:OKX:BTC-USDT:SPOT"),
+                OrderSide::Buy,
+                MutableOrderType::Limit,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("rvoS1").unwrap()),
+                IdempotencyKey::new("idem:okx:spot:submit:1").unwrap(),
+            ))
+            .expect("signed OKX spot order dispatches");
+
+        assert_eq!(receipt.status, MutableActionStatus::Accepted);
+        assert!(!receipt.simulated);
+        assert_eq!(
+            receipt.external_ref,
+            Some(ExternalActionRef::Order(
+                ExternalOrderId::new("okx-spot:order:512269865356374016").unwrap()
+            ))
+        );
+        assert_eq!(adapter.transport().calls.len(), 1);
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.market, live::OkxExecMarket::Spot);
+        assert_eq!(call.method, arb_signing::real::OkxRestMethod::Post);
+        assert_eq!(call.request_path, live::OKX_ORDER_ENDPOINT);
+        assert_eq!(call.api_key_header_name, "OK-ACCESS-KEY");
+        assert_eq!(call.signature_header_name, "OK-ACCESS-SIGN");
+        assert_eq!(call.timestamp_header_value, "2026-05-17T12:34:56.789Z");
+        assert_eq!(call.passphrase_header_name, "OK-ACCESS-PASSPHRASE");
+        assert!(call.body.contains(r#""instId":"BTC-USDT""#));
+        assert!(call.body.contains(r#""tdMode":"cash""#));
+        assert!(call.body.contains(r#""side":"buy""#));
+        assert!(call.body.contains(r#""ordType":"limit""#));
+        assert!(call.body.contains(r#""clOrdId":"rvoS1""#));
+        assert!(!call.signature_header_value.is_empty());
+        assert!(!call.debug.contains(&call.api_key_header_value));
+        assert!(!call.debug.contains(&call.passphrase_header_value));
+        assert!(!call.debug.contains(&call.signature_header_value));
+        assert!(!call.debug.contains(&call.body));
+
+        adapter.transport_mut().body =
+            r#"{"code":"0","msg":"","data":[{"ordId":"512269865356374016","clOrdId":"rvoS1","sCode":"0","sMsg":""}]}"#
+                .to_owned();
+        let order_ref = match receipt.external_ref.expect("order ref") {
+            ExternalActionRef::Order(order_id) => OrderReference::VenueOrderId(order_id),
+            _ => panic!("submit should return order ref"),
+        };
+        let cancel = adapter
+            .cancel_order(CancelOrderRequest::new(
+                venue("venue:OKX-SPOT"),
+                account("account:okx-unit"),
+                order_ref,
+                IdempotencyKey::new("idem:okx:spot:cancel:1").unwrap(),
+            ))
+            .expect("OKX cancel dispatches");
+
+        assert_eq!(cancel.kind, MutableActionKind::CancelOrder);
+        assert_eq!(adapter.transport().calls.len(), 2);
+        let cancel_call = &adapter.transport().calls[1];
+        assert_eq!(cancel_call.method, arb_signing::real::OkxRestMethod::Post);
+        assert_eq!(cancel_call.request_path, live::OKX_CANCEL_ORDER_ENDPOINT);
+        assert!(cancel_call.body.contains(r#""instId":"BTC-USDT""#));
+        assert!(cancel_call.body.contains(r#""ordId":"512269865356374016""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn okx_swap_order_query_uses_signed_get_confirmation_path() {
+        let mut adapter = live::OkxSwapExecAdapter::new(
+            live::OkxExecConfig::swap(
+                venue("venue:OKX-SWAP"),
+                account("account:okx-unit"),
+                "https://www.okx.com",
+                okx_signing_policy("kms-policy/okx-swap-query-unit"),
+            )
+            .unwrap(),
+            okx_test_signer("2026-05-17T12:34:56.789Z"),
+            RecordingOkxTransport::ok(
+                200,
+                r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","ordId":"312269865356374016","clOrdId":"rvoP1","side":"sell","state":"filled","accFillSz":"0.001","avgPx":"43100.50","uTime":"1700000001500"}]}"#,
+            ),
+        )
+        .unwrap();
+
+        let update = adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:OKX-SWAP"),
+                account("account:okx-unit"),
+                instrument("inst:OKX:BTC-USDT-SWAP:SWAP"),
+                OrderReference::VenueOrderId(
+                    ExternalOrderId::new("okx-swap:order:312269865356374016").unwrap(),
+                ),
+                "event:okx:swap:query:filled",
+            ))
+            .expect("signed OKX query confirms order");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.market, PrivateOrderMarket::OkxSwap);
+        assert_eq!(adapter.transport().calls.len(), 1);
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.method, arb_signing::real::OkxRestMethod::Get);
+        assert_eq!(
+            call.request_path,
+            "/api/v5/trade/order?instId=BTC-USDT-SWAP&ordId=312269865356374016"
+        );
+        assert!(call.body.is_empty());
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_adapter_rejects_wrong_market_instrument_before_transport() {
         let mut adapter = live::BinanceSpotExecAdapter::new(
             live::BinanceExecConfig::spot(
@@ -6503,8 +8418,32 @@ mod tests {
     }
 
     #[cfg(feature = "live-exec")]
+    fn okx_signing_policy(value: &str) -> arb_signing::SigningPolicy {
+        arb_signing::SigningPolicy::real_signing_enabled(
+            arb_signing::SigningPolicyRef::new(value).expect("policy ref"),
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn okx_test_signer(
+        timestamp_rfc3339: &'static str,
+    ) -> arb_signing::real::OkxHmacSha256SigningProvider<
+        GeneratedBinanceCredentialProvider,
+        FixedOkxTimestamp,
+    > {
+        arb_signing::real::OkxHmacSha256SigningProvider::new(
+            GeneratedBinanceCredentialProvider,
+            FixedOkxTimestamp(timestamp_rfc3339),
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
     #[derive(Clone, Copy, Debug)]
     struct FixedBinanceTimestamp(u64);
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Copy, Debug)]
+    struct FixedOkxTimestamp(&'static str);
 
     #[cfg(feature = "live-exec")]
     impl arb_signing::real::BinanceTimestampProvider for FixedBinanceTimestamp {
@@ -6523,6 +8462,16 @@ mod tests {
             _audit_ref: &arb_signing::SigningAuditRef,
         ) -> arb_signing::SigningResult<u64> {
             Ok(self.0)
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl arb_signing::real::OkxTimestampProvider for FixedOkxTimestamp {
+        fn timestamp_rfc3339(
+            &self,
+            _audit_ref: &arb_signing::SigningAuditRef,
+        ) -> arb_signing::SigningResult<String> {
+            Ok(self.0.to_owned())
         }
     }
 
@@ -6552,6 +8501,20 @@ mod tests {
             arb_signing::real::BybitApiCredentials::new(
                 "test-api-key-bybit-exec-unit",
                 "test-api-secret-bybit-exec-unit",
+            )
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl arb_signing::real::OkxCredentialProvider for GeneratedBinanceCredentialProvider {
+        fn load_okx_credentials(
+            &self,
+            _audit_ref: &arb_signing::SigningAuditRef,
+        ) -> arb_signing::SigningResult<arb_signing::real::OkxApiCredentials> {
+            arb_signing::real::OkxApiCredentials::new(
+                "test-api-key-okx-exec-unit",
+                "test-api-secret-okx-exec-unit",
+                "test-passphrase-okx-exec-unit",
             )
         }
     }
@@ -6662,6 +8625,71 @@ mod tests {
                 debug: format!("{request:?}"),
             });
             Ok(live::BybitExecHttpResponse::new(
+                self.status_code,
+                self.body.clone(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedOkxCall {
+        market: live::OkxExecMarket,
+        method: arb_signing::real::OkxRestMethod,
+        request_path: String,
+        api_key_header_name: String,
+        api_key_header_value: String,
+        signature_header_name: String,
+        signature_header_value: String,
+        timestamp_header_name: String,
+        timestamp_header_value: String,
+        passphrase_header_name: String,
+        passphrase_header_value: String,
+        body: String,
+        debug: String,
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordingOkxTransport {
+        status_code: u16,
+        body: String,
+        calls: Vec<RecordedOkxCall>,
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl RecordingOkxTransport {
+        fn ok(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl live::OkxExecTransport for RecordingOkxTransport {
+        fn send_signed(
+            &mut self,
+            request: live::OkxSignedRequest<'_>,
+        ) -> VenueExecResult<live::OkxExecHttpResponse> {
+            self.calls.push(RecordedOkxCall {
+                market: request.market(),
+                method: request.method(),
+                request_path: request.request_path().to_owned(),
+                api_key_header_name: request.api_key_header_name().to_owned(),
+                api_key_header_value: request.api_key_header_value().to_owned(),
+                signature_header_name: request.signature_header_name().to_owned(),
+                signature_header_value: request.signature_header_value().to_owned(),
+                timestamp_header_name: request.timestamp_header_name().to_owned(),
+                timestamp_header_value: request.timestamp_header_value().to_owned(),
+                passphrase_header_name: request.passphrase_header_name().to_owned(),
+                passphrase_header_value: request.passphrase_header_value().to_owned(),
+                body: request.body_for_transport().to_owned(),
+                debug: format!("{request:?}"),
+            });
+            Ok(live::OkxExecHttpResponse::new(
                 self.status_code,
                 self.body.clone(),
             ))

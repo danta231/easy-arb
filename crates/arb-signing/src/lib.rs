@@ -1008,6 +1008,14 @@ pub mod real {
     pub const BYBIT_SIGNATURE_HEADER: &str = "X-BAPI-SIGN";
     /// Bybit REST recvWindow 认证头名称。
     pub const BYBIT_RECV_WINDOW_HEADER: &str = "X-BAPI-RECV-WINDOW";
+    /// OKX REST API key 认证头名称。
+    pub const OKX_API_KEY_HEADER: &str = "OK-ACCESS-KEY";
+    /// OKX REST signature 认证头名称。
+    pub const OKX_SIGNATURE_HEADER: &str = "OK-ACCESS-SIGN";
+    /// OKX REST timestamp 认证头名称。
+    pub const OKX_TIMESTAMP_HEADER: &str = "OK-ACCESS-TIMESTAMP";
+    /// OKX REST passphrase 认证头名称。
+    pub const OKX_PASSPHRASE_HEADER: &str = "OK-ACCESS-PASSPHRASE";
 
     /// 真实签名提供方接口。
     ///
@@ -1034,6 +1042,19 @@ pub mod real {
         ) -> SigningResult<BybitSignedEndpoint>;
     }
 
+    /// OKX 真实签名提供方接口。
+    ///
+    /// 中文说明：OKX V5 签名串是 `timestamp + method + requestPath + body`，
+    /// `requestPath` 对 GET 请求必须包含 query string。provider 负责补充
+    /// RFC3339 UTC timestamp、读取 API key/secret/passphrase 并输出 Base64 HMAC。
+    pub trait OkxRealSigningProvider {
+        fn sign_okx_hmac(
+            &self,
+            input: OkxHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<OkxSignedEndpoint>;
+    }
+
     /// Binance 凭证提供方。
     ///
     /// 中文说明：外部 secret provider 通过实现该 trait 接入。trait 不提供日志
@@ -1056,6 +1077,17 @@ pub mod real {
         ) -> SigningResult<BybitApiCredentials>;
     }
 
+    /// OKX 凭证提供方。
+    ///
+    /// 中文说明：OKX 凭证包含 API key、secret key 和 passphrase，不能与
+    /// Binance/Bybit provider 共用，避免环境变量错配导致真实下单请求误签。
+    pub trait OkxCredentialProvider {
+        fn load_okx_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<OkxApiCredentials>;
+    }
+
     /// Binance 时间戳提供方。
     ///
     /// 中文说明：Binance signed endpoint 要求 `timestamp` 参数。默认实现使用
@@ -1069,6 +1101,14 @@ pub mod real {
     /// 中文说明：Bybit signed endpoint 要求 `X-BAPI-TIMESTAMP` 使用 UTC 毫秒时间戳。
     pub trait BybitTimestampProvider {
         fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
+    }
+
+    /// OKX 时间戳提供方。
+    ///
+    /// 中文说明：OKX REST 认证头使用 UTC RFC3339 timestamp，例如
+    /// `2026-05-17T12:34:56.789Z`。测试或外部运行时可注入受控时间源。
+    pub trait OkxTimestampProvider {
+        fn timestamp_rfc3339(&self, audit_ref: &SigningAuditRef) -> SigningResult<String>;
     }
 
     /// 使用环境变量读取 Binance 凭证的 provider。
@@ -1173,6 +1213,66 @@ pub mod real {
         }
     }
 
+    /// 使用环境变量读取 OKX 凭证的 provider。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct EnvOkxCredentialProvider {
+        api_key_env: EnvSecretName,
+        secret_key_env: EnvSecretName,
+        passphrase_env: EnvSecretName,
+    }
+
+    impl EnvOkxCredentialProvider {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Self::from_env_names("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE")
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+            passphrase_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key_env: EnvSecretName::new(api_key_env)?,
+                secret_key_env: EnvSecretName::new(secret_key_env)?,
+                passphrase_env: EnvSecretName::new(passphrase_env)?,
+            })
+        }
+
+        pub fn api_key_env(&self) -> &EnvSecretName {
+            &self.api_key_env
+        }
+
+        pub fn secret_key_env(&self) -> &EnvSecretName {
+            &self.secret_key_env
+        }
+
+        pub fn passphrase_env(&self) -> &EnvSecretName {
+            &self.passphrase_env
+        }
+    }
+
+    impl fmt::Debug for EnvOkxCredentialProvider {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("EnvOkxCredentialProvider")
+                .field("api_key_env", &self.api_key_env)
+                .field("secret_key_env", &self.secret_key_env)
+                .field("passphrase_env", &self.passphrase_env)
+                .finish()
+        }
+    }
+
+    impl OkxCredentialProvider for EnvOkxCredentialProvider {
+        fn load_okx_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<OkxApiCredentials> {
+            let api_key = read_env_secret(&self.api_key_env, audit_ref)?;
+            let secret_key = read_env_secret(&self.secret_key_env, audit_ref)?;
+            let passphrase = read_env_secret(&self.passphrase_env, audit_ref)?;
+            OkxApiCredentials::new(api_key, secret_key, passphrase)
+        }
+    }
+
     fn read_env_secret(name: &EnvSecretName, audit_ref: &SigningAuditRef) -> SigningResult<String> {
         env::var(name.as_str()).map_err(|error| {
             let reason = match error {
@@ -1247,6 +1347,26 @@ pub mod real {
         }
     }
 
+    /// OKX 系统时间戳提供方。
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct SystemOkxTimestampProvider;
+
+    impl OkxTimestampProvider for SystemOkxTimestampProvider {
+        fn timestamp_rfc3339(&self, audit_ref: &SigningAuditRef) -> SigningResult<String> {
+            let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+                SigningError::ClockUnavailable {
+                    audit_ref: audit_ref.clone(),
+                }
+            })?;
+            let millis = u64::try_from(duration.as_millis()).map_err(|_| {
+                SigningError::ClockUnavailable {
+                    audit_ref: audit_ref.clone(),
+                }
+            })?;
+            rfc3339_millis_from_unix_millis(millis, audit_ref)
+        }
+    }
+
     /// Binance HMAC-SHA256 签名提供方。
     pub struct BinanceHmacSha256SigningProvider<C, T> {
         credentials: C,
@@ -1255,6 +1375,12 @@ pub mod real {
 
     /// Bybit HMAC-SHA256 签名提供方。
     pub struct BybitHmacSha256SigningProvider<C, T> {
+        credentials: C,
+        timestamp: T,
+    }
+
+    /// OKX HMAC-SHA256 签名提供方。
+    pub struct OkxHmacSha256SigningProvider<C, T> {
         credentials: C,
         timestamp: T,
     }
@@ -1268,6 +1394,10 @@ pub mod real {
     /// 默认 Bybit 真实签名 provider 类型。
     pub type BybitRealSigningProviderFromEnv =
         BybitHmacSha256SigningProvider<EnvBybitCredentialProvider, SystemBybitTimestampProvider>;
+
+    /// 默认 OKX 真实签名 provider 类型。
+    pub type OkxRealSigningProviderFromEnv =
+        OkxHmacSha256SigningProvider<EnvOkxCredentialProvider, SystemOkxTimestampProvider>;
 
     impl<C, T> BinanceHmacSha256SigningProvider<C, T> {
         pub fn new(credentials: C, timestamp: T) -> Self {
@@ -1287,6 +1417,23 @@ pub mod real {
     }
 
     impl<C, T> BybitHmacSha256SigningProvider<C, T> {
+        pub fn new(credentials: C, timestamp: T) -> Self {
+            Self {
+                credentials,
+                timestamp,
+            }
+        }
+
+        pub fn credentials(&self) -> &C {
+            &self.credentials
+        }
+
+        pub fn timestamp_provider(&self) -> &T {
+            &self.timestamp
+        }
+    }
+
+    impl<C, T> OkxHmacSha256SigningProvider<C, T> {
         pub fn new(credentials: C, timestamp: T) -> Self {
             Self {
                 credentials,
@@ -1341,6 +1488,30 @@ pub mod real {
         }
     }
 
+    impl OkxRealSigningProviderFromEnv {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvOkxCredentialProvider::from_default_env()?,
+                SystemOkxTimestampProvider,
+            ))
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+            passphrase_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvOkxCredentialProvider::from_env_names(
+                    api_key_env,
+                    secret_key_env,
+                    passphrase_env,
+                )?,
+                SystemOkxTimestampProvider,
+            ))
+        }
+    }
+
     impl<C, T> fmt::Debug for BinanceHmacSha256SigningProvider<C, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("BinanceHmacSha256SigningProvider")
@@ -1353,6 +1524,15 @@ pub mod real {
     impl<C, T> fmt::Debug for BybitHmacSha256SigningProvider<C, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("BybitHmacSha256SigningProvider")
+                .field("credentials", &"<redacted>")
+                .field("timestamp", &"<configured>")
+                .finish()
+        }
+    }
+
+    impl<C, T> fmt::Debug for OkxHmacSha256SigningProvider<C, T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OkxHmacSha256SigningProvider")
                 .field("credentials", &"<redacted>")
                 .field("timestamp", &"<configured>")
                 .finish()
@@ -1458,6 +1638,65 @@ pub mod real {
                 payload_kind: input.payload_kind,
                 payload: SecretString::new("bybit_payload", input.payload)?,
                 signature: BybitHmacSignature(SecretString::new("signature", signature)?),
+                request,
+                success,
+            })
+        }
+    }
+
+    impl<C, T> OkxRealSigningProvider for OkxHmacSha256SigningProvider<C, T>
+    where
+        C: OkxCredentialProvider,
+        T: OkxTimestampProvider,
+    {
+        fn sign_okx_hmac(
+            &self,
+            input: OkxHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<OkxSignedEndpoint> {
+            let pending_audit_ref = input.pending_audit_ref()?;
+            let timestamp_rfc3339 = self.timestamp.timestamp_rfc3339(&pending_audit_ref)?;
+            validate_okx_timestamp(&timestamp_rfc3339)?;
+            let public_payload = input.public_payload(&timestamp_rfc3339);
+            let payload_digest = SigningPayloadDigest::new(format!(
+                "sha256:{}",
+                sha256_hex(public_payload.as_bytes())
+            ))?;
+            let request = input.clone().into_signing_request(payload_digest);
+            policy.validate_request(&request)?;
+
+            if policy.mode() != SigningPolicyMode::RealSigningEnabled {
+                return Err(SigningError::RealSigningPolicyNotEnabled {
+                    audit_ref: request.audit_ref(),
+                });
+            }
+
+            let credentials = self
+                .credentials
+                .load_okx_credentials(&request.audit_ref())?;
+            let canonical_payload = input.canonical_payload(&timestamp_rfc3339);
+            let signature = hmac_sha256_base64(
+                credentials.secret_key.expose_bytes(),
+                canonical_payload.as_bytes(),
+            );
+            let signature_ref = SignatureRef::new(format!(
+                "signature-ref/okx-hmac/{}",
+                ascii_suffix(request.payload_digest().as_str(), 24)
+            ))?;
+            let success = SigningSuccess::new(request.audit_ref(), signature_ref);
+
+            Ok(OkxSignedEndpoint {
+                api_key: credentials.api_key,
+                passphrase: credentials.passphrase,
+                timestamp_rfc3339,
+                method: input.method,
+                request_path: SecretString::new("okx_request_path", input.request_path)?,
+                body: if input.body.is_empty() {
+                    None
+                } else {
+                    Some(SecretString::new("okx_body", input.body)?)
+                },
+                signature: OkxHmacSignature(SecretString::new("signature", signature)?),
                 request,
                 success,
             })
@@ -1715,6 +1954,158 @@ pub mod real {
         }
     }
 
+    /// OKX REST 签名方法。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum OkxRestMethod {
+        Get,
+        Post,
+    }
+
+    impl OkxRestMethod {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Get => "GET",
+                Self::Post => "POST",
+            }
+        }
+    }
+
+    /// OKX HMAC 签名输入。
+    ///
+    /// 中文说明：`request_path` 对 GET 请求应包含 query string，例如
+    /// `/api/v5/trade/order?instId=BTC-USDT&ordId=...`；POST 请求的 JSON body
+    /// 由调用方按实际要发送的原文传入，签名和传输必须使用同一份 body。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct OkxHmacSigningInput {
+        request_id: SigningRequestId,
+        policy_ref: SigningPolicyRef,
+        purpose: SigningPurpose,
+        venue_id: VenueId,
+        account_id: AccountId,
+        audit_context: SigningAuditContext,
+        method: OkxRestMethod,
+        request_path: String,
+        body: String,
+    }
+
+    impl OkxHmacSigningInput {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            request_id: SigningRequestId,
+            policy_ref: SigningPolicyRef,
+            purpose: SigningPurpose,
+            venue_id: VenueId,
+            account_id: AccountId,
+            method: OkxRestMethod,
+            request_path: impl Into<String>,
+            body: impl Into<String>,
+        ) -> SigningResult<Self> {
+            let request_path = request_path.into();
+            let body = body.into();
+            validate_okx_request_path(&request_path)?;
+            validate_okx_body(&body)?;
+            if method == OkxRestMethod::Get && !body.is_empty() {
+                return Err(SigningError::InvalidRequest {
+                    field: "okx_body",
+                    reason: "GET requests must not carry a signed body",
+                });
+            }
+            Ok(Self {
+                request_id,
+                policy_ref,
+                purpose,
+                venue_id,
+                account_id,
+                audit_context: SigningAuditContext::default(),
+                method,
+                request_path,
+                body,
+            })
+        }
+
+        pub fn with_audit_context(mut self, audit_context: SigningAuditContext) -> Self {
+            self.audit_context = audit_context;
+            self
+        }
+
+        pub fn request_id(&self) -> &SigningRequestId {
+            &self.request_id
+        }
+
+        pub fn policy_ref(&self) -> &SigningPolicyRef {
+            &self.policy_ref
+        }
+
+        pub fn method(&self) -> OkxRestMethod {
+            self.method
+        }
+
+        pub fn request_path(&self) -> &str {
+            &self.request_path
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
+            SigningAuditRef::new(format!(
+                "signing-audit/{}/pending",
+                self.request_id.as_str()
+            ))
+        }
+
+        fn public_payload(&self, timestamp_rfc3339: &str) -> String {
+            self.canonical_payload(timestamp_rfc3339)
+        }
+
+        fn canonical_payload(&self, timestamp_rfc3339: &str) -> String {
+            format!(
+                "{}{}{}{}",
+                timestamp_rfc3339,
+                self.method.as_str(),
+                self.request_path,
+                self.body
+            )
+        }
+
+        fn into_signing_request(self, payload_digest: SigningPayloadDigest) -> SigningRequest {
+            SigningRequest::new(
+                self.request_id,
+                self.policy_ref,
+                self.purpose,
+                self.venue_id,
+                self.account_id,
+                payload_digest,
+            )
+            .with_audit_context(self.audit_context)
+        }
+    }
+
+    impl fmt::Debug for OkxHmacSigningInput {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OkxHmacSigningInput")
+                .field("request_id", &self.request_id)
+                .field("policy_ref", &self.policy_ref.redacted())
+                .field("purpose", &self.purpose)
+                .field(
+                    "venue_id",
+                    &RedactedValue::from_reference(self.venue_id.as_str()),
+                )
+                .field(
+                    "account_id",
+                    &RedactedValue::from_reference(self.account_id.as_str()),
+                )
+                .field("method", &self.method)
+                .field(
+                    "request_path",
+                    &RedactedValue::from_reference(&self.request_path),
+                )
+                .field("body", &"<redacted>")
+                .finish()
+        }
+    }
+
     /// Binance query/body 参数。
     #[derive(Clone, Eq, PartialEq)]
     pub struct BinanceRequestParam {
@@ -1829,6 +2220,52 @@ pub mod real {
         }
     }
 
+    /// OKX API 凭证。
+    ///
+    /// 中文说明：OKX 真实请求同时需要 API key、secret key 和 passphrase。
+    /// `Debug` 不输出原文；secret key 和 passphrase 随对象 drop 清零。
+    pub struct OkxApiCredentials {
+        api_key: OkxApiKey,
+        secret_key: OkxSecretKey,
+        passphrase: OkxPassphrase,
+    }
+
+    impl OkxApiCredentials {
+        pub fn new(
+            api_key: impl Into<String>,
+            secret_key: impl Into<String>,
+            passphrase: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key: OkxApiKey::new(api_key)?,
+                secret_key: OkxSecretKey::new(secret_key)?,
+                passphrase: OkxPassphrase::new(passphrase)?,
+            })
+        }
+
+        pub fn from_parts(
+            api_key: OkxApiKey,
+            secret_key: OkxSecretKey,
+            passphrase: OkxPassphrase,
+        ) -> Self {
+            Self {
+                api_key,
+                secret_key,
+                passphrase,
+            }
+        }
+    }
+
+    impl fmt::Debug for OkxApiCredentials {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OkxApiCredentials")
+                .field("api_key", &"<redacted>")
+                .field("secret_key", &"<redacted>")
+                .field("passphrase", &"<redacted>")
+                .finish()
+        }
+    }
+
     /// Binance API key。
     pub struct BinanceApiKey(SecretString);
 
@@ -1864,6 +2301,25 @@ pub mod real {
     impl fmt::Debug for BybitApiKey {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("BybitApiKey(<redacted>)")
+        }
+    }
+
+    /// OKX API key。
+    pub struct OkxApiKey(SecretString);
+
+    impl OkxApiKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self(SecretString::new("api_key", value.into())?))
+        }
+
+        pub fn expose_for_transport(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for OkxApiKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("OkxApiKey(<redacted>)")
         }
     }
 
@@ -1913,6 +2369,48 @@ pub mod real {
         }
     }
 
+    /// OKX API secret。
+    pub struct OkxSecretKey(SecretBytes);
+
+    impl OkxSecretKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Self::from_bytes(value.into().into_bytes())
+        }
+
+        pub fn from_bytes(value: Vec<u8>) -> SigningResult<Self> {
+            Ok(Self(SecretBytes::new("secret_key", value)?))
+        }
+
+        fn expose_bytes(&self) -> &[u8] {
+            self.0.expose_bytes()
+        }
+    }
+
+    impl fmt::Debug for OkxSecretKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("OkxSecretKey(<redacted>)")
+        }
+    }
+
+    /// OKX API passphrase。
+    pub struct OkxPassphrase(SecretString);
+
+    impl OkxPassphrase {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self(SecretString::new("passphrase", value.into())?))
+        }
+
+        pub fn expose_for_transport(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for OkxPassphrase {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("OkxPassphrase(<redacted>)")
+        }
+    }
+
     /// HMAC signature（哈希消息认证码签名）。
     pub struct BinanceHmacSignature(SecretString);
 
@@ -1940,6 +2438,21 @@ pub mod real {
     impl fmt::Debug for BybitHmacSignature {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("BybitHmacSignature(<redacted>)")
+        }
+    }
+
+    /// OKX HMAC signature（哈希消息认证码签名）。
+    pub struct OkxHmacSignature(SecretString);
+
+    impl OkxHmacSignature {
+        pub fn as_str(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for OkxHmacSignature {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("OkxHmacSignature(<redacted>)")
         }
     }
 
@@ -2088,6 +2601,106 @@ pub mod real {
                 .field("recv_window_ms", &self.recv_window_ms)
                 .field("payload_kind", &self.payload_kind)
                 .field("payload", &"<redacted>")
+                .field("signature", &"<redacted>")
+                .field("signing_request", &self.signing_request())
+                .field("signing_success", &self.signing_success())
+                .finish()
+        }
+    }
+
+    /// 已签名 OKX endpoint 传输材料。
+    ///
+    /// 中文说明：该对象包含 HTTP 发送所需的 OKX 认证头、request path 和
+    /// body。它不能被直接显示；`Debug` 会脱敏。
+    pub struct OkxSignedEndpoint {
+        api_key: OkxApiKey,
+        passphrase: OkxPassphrase,
+        timestamp_rfc3339: String,
+        method: OkxRestMethod,
+        request_path: SecretString,
+        body: Option<SecretString>,
+        signature: OkxHmacSignature,
+        request: SigningRequest,
+        success: SigningSuccess,
+    }
+
+    impl OkxSignedEndpoint {
+        pub fn api_key_header_name(&self) -> &'static str {
+            OKX_API_KEY_HEADER
+        }
+
+        pub fn api_key_header_value(&self) -> &str {
+            self.api_key.expose_for_transport()
+        }
+
+        pub fn signature_header_name(&self) -> &'static str {
+            OKX_SIGNATURE_HEADER
+        }
+
+        pub fn signature_header_value(&self) -> &str {
+            self.signature.as_str()
+        }
+
+        pub fn timestamp_header_name(&self) -> &'static str {
+            OKX_TIMESTAMP_HEADER
+        }
+
+        pub fn timestamp_header_value(&self) -> &str {
+            &self.timestamp_rfc3339
+        }
+
+        pub fn passphrase_header_name(&self) -> &'static str {
+            OKX_PASSPHRASE_HEADER
+        }
+
+        pub fn passphrase_header_value(&self) -> &str {
+            self.passphrase.expose_for_transport()
+        }
+
+        pub fn method(&self) -> OkxRestMethod {
+            self.method
+        }
+
+        pub fn request_path_for_transport(&self) -> &str {
+            self.request_path.expose_str()
+        }
+
+        pub fn body_for_transport(&self) -> &str {
+            self.body
+                .as_ref()
+                .map(SecretString::expose_str)
+                .unwrap_or("")
+        }
+
+        pub fn signature(&self) -> &OkxHmacSignature {
+            &self.signature
+        }
+
+        pub fn signing_request(&self) -> &SigningRequest {
+            &self.request
+        }
+
+        pub fn signing_success(&self) -> &SigningSuccess {
+            &self.success
+        }
+
+        pub fn redacted_log_entry(&self) -> RedactedSigningLogEntry {
+            RedactedSigningLogEntry::from_success(&self.request, &self.success)
+        }
+    }
+
+    impl fmt::Debug for OkxSignedEndpoint {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("OkxSignedEndpoint")
+                .field("api_key_header_name", &OKX_API_KEY_HEADER)
+                .field("api_key_header_value", &"<redacted>")
+                .field("signature_header_name", &OKX_SIGNATURE_HEADER)
+                .field("timestamp_header_name", &OKX_TIMESTAMP_HEADER)
+                .field("passphrase_header_name", &OKX_PASSPHRASE_HEADER)
+                .field("timestamp_rfc3339", &self.timestamp_rfc3339)
+                .field("method", &self.method)
+                .field("request_path", &"<redacted>")
+                .field("body", &"<redacted>")
                 .field("signature", &"<redacted>")
                 .field("signing_request", &self.signing_request())
                 .field("signing_success", &self.signing_success())
@@ -2318,6 +2931,121 @@ pub mod real {
         Ok(())
     }
 
+    fn validate_okx_request_path(value: &str) -> SigningResult<()> {
+        if value.is_empty() {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_request_path",
+                reason: "request path cannot be empty",
+            });
+        }
+        if value.len() > 4096 {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_request_path",
+                reason: "request path is too long",
+            });
+        }
+        if !value.starts_with('/') {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_request_path",
+                reason: "request path must start with slash",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_request_path",
+                reason: "request path contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_okx_body(value: &str) -> SigningResult<()> {
+        if value.len() > 8192 {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_body",
+                reason: "body is too long",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_body",
+                reason: "body contains a control byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_okx_timestamp(value: &str) -> SigningResult<()> {
+        if value.len() != "2026-05-17T12:34:56.789Z".len() {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_timestamp",
+                reason: "timestamp must use UTC RFC3339 milliseconds",
+            });
+        }
+        let bytes = value.as_bytes();
+        let fixed = [
+            (4, b'-'),
+            (7, b'-'),
+            (10, b'T'),
+            (13, b':'),
+            (16, b':'),
+            (19, b'.'),
+            (23, b'Z'),
+        ];
+        if fixed
+            .iter()
+            .any(|(index, expected)| bytes[*index] != *expected)
+            || bytes.iter().enumerate().any(|(index, byte)| {
+                fixed.iter().all(|(fixed_index, _)| *fixed_index != index) && !byte.is_ascii_digit()
+            })
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "okx_timestamp",
+                reason: "timestamp must use UTC RFC3339 milliseconds",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rfc3339_millis_from_unix_millis(
+        millis: u64,
+        audit_ref: &SigningAuditRef,
+    ) -> SigningResult<String> {
+        let seconds = millis / 1_000;
+        let millis_part = millis % 1_000;
+        let days = i64::try_from(seconds / 86_400).map_err(|_| SigningError::ClockUnavailable {
+            audit_ref: audit_ref.clone(),
+        })?;
+        let seconds_of_day = seconds % 86_400;
+        let hour = seconds_of_day / 3_600;
+        let minute = (seconds_of_day % 3_600) / 60;
+        let second = seconds_of_day % 60;
+        let (year, month, day) = civil_from_days(days);
+        Ok(format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis_part:03}Z"
+        ))
+    }
+
+    fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+        let z = days_since_unix_epoch + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = mp + if mp < 10 { 3 } else { -9 };
+        let year = y + if month <= 2 { 1 } else { 0 };
+        (year as i32, month as u32, day as u32)
+    }
+
     fn percent_encode_component(value: &str) -> String {
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         let mut encoded = String::with_capacity(value.len());
@@ -2338,6 +3066,14 @@ pub mod real {
     }
 
     fn hmac_sha256_hex(secret_key: &[u8], payload: &[u8]) -> String {
+        hex_lower(&hmac_sha256(secret_key, payload))
+    }
+
+    fn hmac_sha256_base64(secret_key: &[u8], payload: &[u8]) -> String {
+        base64_standard(&hmac_sha256(secret_key, payload))
+    }
+
+    fn hmac_sha256(secret_key: &[u8], payload: &[u8]) -> [u8; 32] {
         let mut key_block = [0_u8; 64];
         if secret_key.len() > key_block.len() {
             let digest = sha256(secret_key);
@@ -2370,11 +3106,38 @@ pub mod real {
         wipe_bytes(&mut inner_digest);
         wipe_bytes(&mut outer_input);
 
-        hex_lower(&digest)
+        digest
     }
 
     fn sha256_hex(input: &[u8]) -> String {
         hex_lower(&sha256(input))
+    }
+
+    fn base64_standard(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+        for chunk in input.chunks(3) {
+            let first = chunk[0];
+            let second = *chunk.get(1).unwrap_or(&0);
+            let third = *chunk.get(2).unwrap_or(&0);
+
+            output.push(ALPHABET[(first >> 2) as usize] as char);
+            output.push(ALPHABET[(((first & 0b0000_0011) << 4) | (second >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                output.push(
+                    ALPHABET[(((second & 0b0000_1111) << 2) | (third >> 6)) as usize] as char,
+                );
+            } else {
+                output.push('=');
+            }
+            if chunk.len() > 2 {
+                output.push(ALPHABET[(third & 0b0011_1111) as usize] as char);
+            } else {
+                output.push('=');
+            }
+        }
+        output
     }
 
     fn hex_lower(input: &[u8]) -> String {
@@ -2817,6 +3580,80 @@ mod tests {
 
     #[cfg(feature = "real-signing")]
     #[test]
+    fn real_signing_build_exposes_okx_hmac_provider() {
+        use crate::real::{
+            OkxHmacSha256SigningProvider, OkxRealSigningProvider, OkxRestMethod,
+            OkxTimestampProvider, OKX_API_KEY_HEADER, OKX_PASSPHRASE_HEADER, OKX_SIGNATURE_HEADER,
+            OKX_TIMESTAMP_HEADER,
+        };
+
+        let policy_ref = SigningPolicyRef::new("kms-policy/okx-hmac-unit").expect("policy ref");
+        let policy = SigningPolicy::real_signing_enabled(policy_ref.clone());
+        let input = crate::real::OkxHmacSigningInput::new(
+            SigningRequestId::new("signing-request/okx-hmac-unit").expect("request id"),
+            policy_ref,
+            SigningPurpose::SubmitOrder,
+            VenueId::new("venue:OKX-SPOT").expect("venue id"),
+            AccountId::new("account/paper-okx").expect("account id"),
+            OkxRestMethod::Post,
+            "/api/v5/trade/order",
+            r#"{"instId":"BTC-USDT","tdMode":"cash","side":"buy","ordType":"limit","sz":"1","px":"0.1","clOrdId":"okx-test-1"}"#,
+        )
+        .expect("okx input");
+        let signer = OkxHmacSha256SigningProvider::new(
+            GeneratedCredentialProvider { seed: 13 },
+            FixedTimestamp(1_700_000_000_123),
+        );
+
+        let signed = signer
+            .sign_okx_hmac(input, &policy)
+            .expect("real-signing feature should sign OKX payload");
+
+        assert_eq!(signed.api_key_header_name(), OKX_API_KEY_HEADER);
+        assert_eq!(signed.signature_header_name(), OKX_SIGNATURE_HEADER);
+        assert_eq!(signed.timestamp_header_name(), OKX_TIMESTAMP_HEADER);
+        assert_eq!(signed.passphrase_header_name(), OKX_PASSPHRASE_HEADER);
+        assert_eq!(signed.timestamp_header_value(), "2023-11-14T22:13:20.123Z");
+        assert_eq!(signed.method(), OkxRestMethod::Post);
+        assert_eq!(signed.request_path_for_transport(), "/api/v5/trade/order");
+        assert!(signed
+            .body_for_transport()
+            .contains("\"instId\":\"BTC-USDT\""));
+        assert_eq!(signed.signature().as_str().len(), 44);
+        assert!(signed
+            .signature()
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')));
+
+        let raw_api_key = signed.api_key_header_value().to_owned();
+        let raw_passphrase = signed.passphrase_header_value().to_owned();
+        let raw_signature = signed.signature().as_str().to_owned();
+        let raw_body = signed.body_for_transport().to_owned();
+        let rendered_debug = format!("{signed:?}");
+        let rendered_log = signed.redacted_log_entry().to_string();
+
+        assert!(!rendered_debug.contains(&raw_api_key));
+        assert!(!rendered_debug.contains(&raw_passphrase));
+        assert!(!rendered_debug.contains(&raw_signature));
+        assert!(!rendered_debug.contains(&raw_body));
+        assert!(!rendered_log.contains(&raw_api_key));
+        assert!(!rendered_log.contains(&raw_passphrase));
+        assert!(!rendered_log.contains(&raw_signature));
+        assert!(!rendered_log.contains(&raw_body));
+        assert_eq!(
+            signed.redacted_log_entry().status(),
+            SigningAttemptStatus::Signed
+        );
+
+        fn _assert_timestamp_provider<T: OkxTimestampProvider>(provider: T) -> T {
+            provider
+        }
+        let _ = _assert_timestamp_provider(FixedTimestamp(1));
+    }
+
+    #[cfg(feature = "real-signing")]
+    #[test]
     fn binance_params_reserve_signature_and_timestamp_for_boundary() {
         use crate::real::BinanceRequestParam;
 
@@ -2872,6 +3709,13 @@ mod tests {
     }
 
     #[cfg(feature = "real-signing")]
+    impl crate::real::OkxTimestampProvider for FixedTimestamp {
+        fn timestamp_rfc3339(&self, audit_ref: &SigningAuditRef) -> SigningResult<String> {
+            crate::real::rfc3339_millis_from_unix_millis(self.0, audit_ref)
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
     #[derive(Clone, Copy, Debug)]
     struct GeneratedCredentialProvider {
         seed: u8,
@@ -2899,6 +3743,20 @@ mod tests {
             crate::real::BybitApiCredentials::new(
                 generated_ascii(48, self.seed),
                 generated_ascii(64, self.seed.wrapping_add(23)),
+            )
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
+    impl crate::real::OkxCredentialProvider for GeneratedCredentialProvider {
+        fn load_okx_credentials(
+            &self,
+            _audit_ref: &SigningAuditRef,
+        ) -> SigningResult<crate::real::OkxApiCredentials> {
+            crate::real::OkxApiCredentials::new(
+                generated_ascii(48, self.seed),
+                generated_ascii(64, self.seed.wrapping_add(29)),
+                generated_ascii(32, self.seed.wrapping_add(31)),
             )
         }
     }

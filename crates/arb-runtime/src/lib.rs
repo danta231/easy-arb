@@ -84,7 +84,8 @@ use arb_venue_data::{
 #[cfg(feature = "live-exec")]
 use arb_signing::real::{
     BinanceHmacSigningInput, BinanceRequestParam, BybitHmacSigningInput, BybitRealSigningProvider,
-    BybitRealSigningProviderFromEnv, BybitSigningPayloadKind, RealSigningProvider,
+    BybitRealSigningProviderFromEnv, BybitSigningPayloadKind, OkxHmacSigningInput,
+    OkxRealSigningProvider, OkxRealSigningProviderFromEnv, OkxRestMethod, RealSigningProvider,
     RealSigningProviderFromEnv,
 };
 #[cfg(feature = "live-exec")]
@@ -92,18 +93,19 @@ use arb_signing::{SigningPolicy, SigningPolicyRef, SigningPurpose, SigningReques
 #[cfg(feature = "live-exec")]
 use arb_venue_data::{
     BalanceQuery, BalanceReader, BinancePrivateAccountAdapter, BinancePrivateAccountMarket,
-    BybitPrivateAccountAdapter, BybitPrivateAccountMarket, VenueBalance,
+    BybitPrivateAccountAdapter, BybitPrivateAccountMarket, OkxPrivateAccountAdapter,
+    OkxPrivateAccountMarket, VenueBalance,
 };
 #[cfg(feature = "live-exec")]
 use arb_venue_exec::{
     build_execution_dispatch_plan, live, parse_binance_spot_execution_report_update,
-    parse_binance_usdm_order_trade_update, parse_bybit_private_order_stream_update, CancelOrder,
-    CancelOrderRequest, ConfirmOrderStatus, ConfirmOrderStatusRequest, DispatchKillSwitch,
-    ExecutionDispatchPlan, ExecutionDispatchPolicy, ExternalActionRef,
-    IdempotencyKey as ExecIdempotencyKey, MutableActionKind, MutableActionReceipt,
-    MutableActionStatus, MutableOrderType, OrderConfirmationSource, OrderConfirmationStatus,
-    OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate, PrivateOrderMarket,
-    PrivateOrderUpdate, SubmitOrder, SubmitOrderRequest, VenueExecError,
+    parse_binance_usdm_order_trade_update, parse_bybit_private_order_stream_update,
+    parse_okx_private_order_stream_update, CancelOrder, CancelOrderRequest, ConfirmOrderStatus,
+    ConfirmOrderStatusRequest, DispatchKillSwitch, ExecutionDispatchPlan, ExecutionDispatchPolicy,
+    ExternalActionRef, IdempotencyKey as ExecIdempotencyKey, MutableActionKind,
+    MutableActionReceipt, MutableActionStatus, MutableOrderType, OrderConfirmationSource,
+    OrderConfirmationStatus, OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate,
+    PrivateOrderMarket, PrivateOrderUpdate, SubmitOrder, SubmitOrderRequest, VenueExecError,
 };
 
 const DEFAULT_FULL_PIPELINE_FIXTURE: &str = "fixtures/replay/full_pipeline_simulated";
@@ -134,6 +136,15 @@ const BYBIT_BASIS_SPOT_VENUE_ID: &str = "venue:BYBIT-SPOT";
 const BYBIT_BASIS_PERP_VENUE_ID: &str = "venue:BYBIT-LINEAR";
 const BYBIT_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:SPOT";
 const BYBIT_BASIS_PERP_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:LINEAR-PERP";
+const OKX_BASIS_SYMBOL: &str = "BTC-USDT";
+#[cfg(feature = "live-exec")]
+const OKX_BASIS_SPOT_VENUE_ID: &str = "venue:OKX-SPOT";
+#[cfg(feature = "live-exec")]
+const OKX_BASIS_PERP_VENUE_ID: &str = "venue:OKX-SWAP";
+#[cfg(feature = "live-exec")]
+const OKX_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:OKX:BTC-USDT:SPOT";
+#[cfg(feature = "live-exec")]
+const OKX_BASIS_PERP_INSTRUMENT_ID: &str = "inst:OKX:BTC-USDT-SWAP:SWAP";
 const BASIS_BASE_ASSET_ID: &str = "asset:BTC";
 const BASIS_QUOTE_ASSET_ID: &str = "asset:USDT";
 const BASIS_SETTLEMENT_ASSET_ID: &str = "asset:USDT";
@@ -146,11 +157,16 @@ const BINANCE_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
 #[cfg(feature = "live-exec")]
 const BYBIT_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
     "target/bybit-basis-guarded-live-auto-once";
+#[cfg(feature = "live-exec")]
+const OKX_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
+    "target/okx-basis-guarded-live-auto-once";
 const BINANCE_GUARDED_LIVE_ACCOUNT_REF: &str =
     "account:binance-isolated-personal-cex-subaccount-redacted";
 #[cfg(feature = "live-exec")]
 const BYBIT_GUARDED_LIVE_ACCOUNT_REF: &str =
     "account:bybit-unified-personal-cex-subaccount-redacted";
+#[cfg(feature = "live-exec")]
+const OKX_GUARDED_LIVE_ACCOUNT_REF: &str = "account:okx-trading-personal-cex-subaccount-redacted";
 const BINANCE_GUARDED_LIVE_STRATEGY_ID: &str = "strategy:sample-spot-v1";
 const BINANCE_GUARDED_LIVE_TRANSITION_ID: &str = "trans:binance-btcusdt-guarded-live-preview-001";
 #[cfg(feature = "live-exec")]
@@ -161,6 +177,10 @@ const BINANCE_BASIS_LIVE_TRANSITION_ID: &str = "trans:binance-basis-guarded-live
 const BYBIT_BASIS_LIVE_STRATEGY_ID: &str = "strat:bybit-spot-linear-basis";
 #[cfg(feature = "live-exec")]
 const BYBIT_BASIS_LIVE_TRANSITION_ID: &str = "trans:bybit-basis-guarded-live-auto-001";
+#[cfg(feature = "live-exec")]
+const OKX_BASIS_LIVE_STRATEGY_ID: &str = "strat:okx-spot-swap-basis";
+#[cfg(feature = "live-exec")]
+const OKX_BASIS_LIVE_TRANSITION_ID: &str = "trans:okx-basis-guarded-live-auto-001";
 const BINANCE_GUARDED_LIVE_NOTIONAL_USDT: &str = "10.00";
 const BINANCE_GUARDED_LIVE_DAILY_LOSS_LIMIT_USDT: &str = "20.00";
 const BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT: &str = "100.00";
@@ -776,6 +796,7 @@ pub struct BinanceGuardedLiveAutoOnceReport {
 /// `execute_live` 和确认标志。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BasisGuardedLiveAutoOnceOptions {
+    pub symbol: String,
     pub config_path: PathBuf,
     pub output_dir: Option<PathBuf>,
     pub min_net_bps: i128,
@@ -831,6 +852,15 @@ pub type BybitBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
 
 /// Bybit spot-linear basis 双腿单周期自动链路结果。
 pub type BybitBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
+
+/// OKX spot-swap basis 双腿单周期自动链路选项。
+///
+/// 中文说明：字段语义与 Binance/Bybit basis 自动链路一致；交易场所替换为
+/// OKX Spot 和 OKX Swap，真实下单仍必须显式设置 `execute_live` 和确认标志。
+pub type OkxBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
+
+/// OKX spot-swap basis 双腿单周期自动链路结果。
+pub type OkxBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
 
 /// Binance BTCUSDT 人工确认请求。
 ///
@@ -2566,13 +2596,41 @@ pub fn run_bybit_basis_guarded_live_auto_once(
     }
 }
 
+/// 运行一次 OKX spot-swap basis 双腿自动套利链路。
+pub fn run_okx_basis_guarded_live_auto_once(
+    options: OkxBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_okx_basis_guarded_live_auto_once_live(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "当前 arb-runtime 未使用 live-exec feature 构建，拒绝 OKX basis 实盘自动链路"
+                .to_owned(),
+        })
+    }
+}
+
 #[cfg(feature = "live-exec")]
 fn run_binance_basis_guarded_live_auto_once_live(
     options: BasisGuardedLiveAutoOnceOptions,
 ) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
-    let spot_url = binance_spot_book_ticker_url(BASIS_SYMBOL);
-    let perp_url = binance_usdm_book_ticker_url(BASIS_SYMBOL);
-    let premium_url = binance_usdm_premium_index_url(BASIS_SYMBOL);
+    let symbol = normalize_cex_usdt_basis_symbol(&options.symbol, "Binance")?;
+    if options.execute_live && symbol != BASIS_SYMBOL {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "真实 Binance basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
+            ),
+        });
+    }
+    let spot_instrument_id = binance_basis_spot_instrument_id(&symbol)?;
+    let perp_instrument_id = binance_basis_perp_instrument_id(&symbol)?;
+    let spot_url = binance_spot_book_ticker_url(&symbol);
+    let perp_url = binance_usdm_book_ticker_url(&symbol);
+    let premium_url = binance_usdm_premium_index_url(&symbol);
     let wss_monitor_urls = match (
         options.spot_wss_monitor_url.as_deref(),
         options.perp_wss_monitor_url.as_deref(),
@@ -2598,15 +2656,17 @@ fn run_binance_basis_guarded_live_auto_once_live(
         if let Some((spot_monitor, perp_monitor)) = wss_monitor_urls {
             let spot_snapshot = fetch_binance_basis_wss_monitor_book_ticker_json(
                 spot_monitor,
+                &symbol,
                 BinancePublicMarket::Spot,
                 BINANCE_BASIS_SPOT_VENUE_ID,
-                BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+                &spot_instrument_id,
             )?;
             let perp_snapshot = fetch_binance_basis_wss_monitor_book_ticker_json(
                 perp_monitor,
+                &symbol,
                 BinancePublicMarket::UsdmPerpetual,
                 BINANCE_BASIS_PERP_VENUE_ID,
-                BINANCE_BASIS_PERP_INSTRUMENT_ID,
+                &perp_instrument_id,
             )?;
             (
                 spot_snapshot.raw_ticker_json,
@@ -2625,6 +2685,7 @@ fn run_binance_basis_guarded_live_auto_once_live(
     let raw_premium = fetch_public_json_with_curl(&premium_url)?;
     let ingested_at = current_utc_timestamp()?;
     run_binance_basis_guarded_live_auto_once_from_json(
+        &symbol,
         &raw_spot,
         &spot_ref,
         &raw_perp,
@@ -2640,6 +2701,16 @@ fn run_binance_basis_guarded_live_auto_once_live(
 fn run_bybit_basis_guarded_live_auto_once_live(
     options: BybitBasisGuardedLiveAutoOnceOptions,
 ) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+    let symbol = normalize_cex_usdt_basis_symbol(&options.symbol, "Bybit")?;
+    if options.execute_live && symbol != BASIS_SYMBOL {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "真实 Bybit basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
+            ),
+        });
+    }
+    let spot_instrument_id = bybit_basis_spot_instrument_id(&symbol)?;
+    let perp_instrument_id = bybit_basis_perp_instrument_id(&symbol)?;
     let spot_url = bybit_spot_tickers_url();
     let linear_url = bybit_linear_tickers_url();
     let wss_monitor_urls = match (
@@ -2668,16 +2739,18 @@ fn run_bybit_basis_guarded_live_auto_once_live(
             let raw_linear_rest = fetch_public_json_with_curl(&linear_url)?;
             let spot_snapshot = fetch_bybit_basis_wss_monitor_ticker_json(
                 spot_monitor,
+                &symbol,
                 BybitPublicMarket::Spot,
                 BYBIT_BASIS_SPOT_VENUE_ID,
-                BYBIT_BASIS_SPOT_INSTRUMENT_ID,
+                &spot_instrument_id,
                 None,
             )?;
             let linear_snapshot = fetch_bybit_basis_wss_monitor_ticker_json(
                 linear_monitor,
+                &symbol,
                 BybitPublicMarket::LinearPerpetual,
                 BYBIT_BASIS_PERP_VENUE_ID,
-                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                &perp_instrument_id,
                 Some(&raw_linear_rest),
             )?;
             (
@@ -2696,10 +2769,104 @@ fn run_bybit_basis_guarded_live_auto_once_live(
         };
     let ingested_at = current_utc_timestamp()?;
     run_bybit_basis_guarded_live_auto_once_from_json(
+        &symbol,
         &raw_spot,
         &spot_ref,
         &raw_linear,
         &linear_ref,
+        ingested_at,
+        options,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn run_okx_basis_guarded_live_auto_once_live(
+    options: OkxBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceReport> {
+    let symbol = normalize_okx_usdt_basis_symbol(&options.symbol)?;
+    if options.execute_live && symbol != OKX_BASIS_SYMBOL {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "真实 OKX basis 自动下单仍只允许 {OKX_BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
+            ),
+        });
+    }
+    let spot_instrument_id = okx_basis_spot_instrument_id(&symbol)?;
+    let perp_instrument_id = okx_basis_perp_instrument_id(&symbol)?;
+    let spot_url = okx_tickers_url("SPOT");
+    let swap_url = okx_tickers_url("SWAP");
+    let mark_url = okx_mark_price_url();
+    let index_url = okx_index_tickers_url();
+    let funding_url = okx_funding_rate_url(&format!("{symbol}-SWAP"));
+    let wss_monitor_urls = match (
+        options.spot_wss_monitor_url.as_deref(),
+        options.perp_wss_monitor_url.as_deref(),
+    ) {
+        (Some(spot_monitor), Some(swap_monitor)) => Some((spot_monitor, swap_monitor)),
+        (None, None) if !options.execute_live => None,
+        (None, None) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "真实 OKX basis 自动下单必须提供 --spot-wss-monitor-url 和 --perp-wss-monitor-url"
+                        .to_owned(),
+            });
+        }
+        _ => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "OKX basis 自动链路必须同时提供 --spot-wss-monitor-url 和 --perp-wss-monitor-url"
+                        .to_owned(),
+            });
+        }
+    };
+    let (raw_spot, spot_ref, raw_swap, swap_ref) =
+        if let Some((spot_monitor, swap_monitor)) = wss_monitor_urls {
+            let spot_snapshot = fetch_okx_basis_wss_monitor_ticker_json(
+                spot_monitor,
+                &symbol,
+                "SPOT",
+                OKX_BASIS_SPOT_VENUE_ID,
+                &spot_instrument_id,
+            )?;
+            let swap_snapshot = fetch_okx_basis_wss_monitor_ticker_json(
+                swap_monitor,
+                &symbol,
+                "SWAP",
+                OKX_BASIS_PERP_VENUE_ID,
+                &perp_instrument_id,
+            )?;
+            (
+                spot_snapshot.raw_ticker_json,
+                spot_snapshot.source_ref,
+                swap_snapshot.raw_ticker_json,
+                swap_snapshot.source_ref,
+            )
+        } else {
+            (
+                fetch_public_json_with_curl(&spot_url)?,
+                spot_url.clone(),
+                fetch_public_json_with_curl(&swap_url)?,
+                swap_url.clone(),
+            )
+        };
+    let raw_mark = fetch_public_json_with_curl(&mark_url)?;
+    let raw_index = fetch_public_json_with_curl(&index_url)?;
+    let raw_funding = fetch_public_json_with_curl(&funding_url)?;
+    let ingested_at = current_utc_timestamp()?;
+    run_okx_basis_guarded_live_auto_once_from_json(
+        OkxBasisRawInputs {
+            symbol: &symbol,
+            raw_spot_ticker: &raw_spot,
+            spot_ticker_ref: &spot_ref,
+            raw_swap_ticker: &raw_swap,
+            swap_ticker_ref: &swap_ref,
+            raw_mark_price: &raw_mark,
+            mark_price_ref: &mark_url,
+            raw_index_ticker: &raw_index,
+            index_ticker_ref: &index_url,
+            raw_funding_rate: &raw_funding,
+            funding_rate_ref: &funding_url,
+        },
         ingested_at,
         options,
     )
@@ -2715,6 +2882,7 @@ struct BasisWssMonitorTickerJson {
 #[cfg(feature = "live-exec")]
 fn fetch_binance_basis_wss_monitor_book_ticker_json(
     monitor_url: &str,
+    symbol: &str,
     market: BinancePublicMarket,
     expected_venue_id: &str,
     expected_instrument_id: &str,
@@ -2725,7 +2893,7 @@ fn fetch_binance_basis_wss_monitor_book_ticker_json(
     let quote = parse_public_wss_monitor_quote_for_basis(
         &raw_monitor_snapshot,
         &endpoint,
-        BASIS_SYMBOL,
+        symbol,
         market.as_str(),
         expected_venue_id,
         expected_instrument_id,
@@ -2744,6 +2912,7 @@ fn fetch_binance_basis_wss_monitor_book_ticker_json(
 #[cfg(feature = "live-exec")]
 fn fetch_bybit_basis_wss_monitor_ticker_json(
     monitor_url: &str,
+    symbol: &str,
     market: BybitPublicMarket,
     expected_venue_id: &str,
     expected_instrument_id: &str,
@@ -2755,7 +2924,7 @@ fn fetch_bybit_basis_wss_monitor_ticker_json(
     let quote = parse_public_wss_monitor_quote_for_basis(
         &raw_monitor_snapshot,
         &endpoint,
-        BASIS_SYMBOL,
+        symbol,
         market.as_str(),
         expected_venue_id,
         expected_instrument_id,
@@ -2776,6 +2945,36 @@ fn fetch_bybit_basis_wss_monitor_ticker_json(
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_okx_basis_wss_monitor_ticker_json(
+    monitor_url: &str,
+    symbol: &str,
+    inst_type: &'static str,
+    expected_venue_id: &str,
+    expected_instrument_id: &str,
+) -> RuntimeResult<BasisWssMonitorTickerJson> {
+    let endpoint = normalize_okx_wss_monitor_status_url(monitor_url);
+    let raw_monitor_snapshot = fetch_public_json_with_curl(&endpoint)?;
+    let fetched_at = current_utc_timestamp()?;
+    let quote = parse_public_wss_monitor_quote_for_basis(
+        &raw_monitor_snapshot,
+        &endpoint,
+        symbol,
+        inst_type,
+        expected_venue_id,
+        expected_instrument_id,
+        fetched_at,
+    )?;
+    let source_event_id = quote
+        .source_event_id
+        .as_deref()
+        .unwrap_or("missing-source-event-id");
+    Ok(BasisWssMonitorTickerJson {
+        raw_ticker_json: public_wss_monitor_quote_to_okx_ticker_json(&quote, inst_type)?,
+        source_ref: format!("wss-monitor:{endpoint}#{source_event_id}"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
 fn normalize_binance_wss_monitor_status_url(input: &str) -> String {
     normalize_public_wss_monitor_status_url(input, "/api/binance-wss-book-ticker")
 }
@@ -2783,6 +2982,11 @@ fn normalize_binance_wss_monitor_status_url(input: &str) -> String {
 #[cfg(feature = "live-exec")]
 fn normalize_bybit_wss_monitor_status_url(input: &str) -> String {
     normalize_public_wss_monitor_status_url(input, "/api/bybit-wss-book-ticker")
+}
+
+#[cfg(feature = "live-exec")]
+fn normalize_okx_wss_monitor_status_url(input: &str) -> String {
+    normalize_public_wss_monitor_status_url(input, "/api/okx-wss-book-ticker")
 }
 
 #[cfg(feature = "live-exec")]
@@ -3180,6 +3384,66 @@ fn public_wss_monitor_quote_to_bybit_ticker_json(
 }
 
 #[cfg(feature = "live-exec")]
+fn public_wss_monitor_quote_to_okx_ticker_json(
+    quote: &PublicTopOfBookQuoteSnapshot,
+    inst_type: &'static str,
+) -> RuntimeResult<String> {
+    if inst_type != "SPOT" && inst_type != "SWAP" {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("OKX WSS monitor conversion does not support instType `{inst_type}`"),
+        });
+    }
+    let observed_at = UtcTimestamp::from_str(&quote.observed_at)?;
+    let inst_id = okx_inst_id_from_public_monitor_instrument(&quote.instrument_id, inst_type)?;
+    Ok(format!(
+        "{{\"code\":\"0\",\"data\":[{{\"askPx\":{},\"askSz\":{},\"bidPx\":{},\"bidSz\":{},\"instId\":{},\"instType\":{},\"ts\":\"{}\"}}],\"msg\":\"\"}}",
+        json_string(required_quote_field(
+            &quote.best_ask,
+            "OKX WSS monitor quote",
+            "best_ask"
+        )?),
+        json_string(required_quote_field(
+            &quote.ask_size,
+            "OKX WSS monitor quote",
+            "ask_size"
+        )?),
+        json_string(required_quote_field(
+            &quote.best_bid,
+            "OKX WSS monitor quote",
+            "best_bid"
+        )?),
+        json_string(required_quote_field(
+            &quote.bid_size,
+            "OKX WSS monitor quote",
+            "bid_size"
+        )?),
+        json_string(&inst_id),
+        json_string(inst_type),
+        runtime_timestamp_millis(observed_at)?
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn okx_inst_id_from_public_monitor_instrument(
+    instrument_id: &str,
+    inst_type: &str,
+) -> RuntimeResult<String> {
+    let mut parts = instrument_id.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("inst"), Some("OKX"), Some(inst_id), Some(suffix))
+            if parts.next().is_none() && suffix == inst_type =>
+        {
+            Ok(inst_id.to_owned())
+        }
+        _ => Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX WSS monitor instrument `{instrument_id}` does not match instType `{inst_type}`"
+            ),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BybitLinearPremiumTickerFields {
     mark_price: String,
@@ -3222,6 +3486,7 @@ fn bybit_linear_premium_fields_from_rest(
 #[cfg(feature = "live-exec")]
 #[allow(clippy::too_many_arguments)]
 fn run_binance_basis_guarded_live_auto_once_from_json(
+    symbol: &str,
     raw_spot: &str,
     spot_ref: &str,
     raw_perp: &str,
@@ -3231,6 +3496,14 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     ingested_at: UtcTimestamp,
     options: BasisGuardedLiveAutoOnceOptions,
 ) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
+    let symbol = normalize_cex_usdt_basis_symbol(symbol, "Binance")?;
+    if options.execute_live && symbol != BASIS_SYMBOL {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "真实 Binance basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
+            ),
+        });
+    }
     let output_root = options
         .output_dir
         .clone()
@@ -3241,7 +3514,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     let output_dir = Some(output_root.clone());
     let context = write_binance_basis_guarded_live_auto_market_artifacts(
         BinanceBasisRawInputs {
-            symbol: BASIS_SYMBOL,
+            symbol: &symbol,
             raw_spot_book: raw_spot,
             spot_book_ref: spot_ref,
             raw_perp_book: raw_perp,
@@ -3285,7 +3558,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     }
     if !blocking_reasons.is_empty() {
         let report = BasisGuardedLiveAutoOnceReport {
-            symbol: BASIS_SYMBOL.to_owned(),
+            symbol: context.symbol.clone(),
             strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
             spot_event_id: Some(context.spot_event_id),
             perp_event_id: Some(context.perp_event_id),
@@ -3388,7 +3661,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         &health,
     );
     let dispatch_plan = if dispatch_blocking.is_empty() {
-        let dispatch_policy = live_dispatch_policy_from_config(&config)?;
+        let dispatch_policy = live_dispatch_policy_from_config(&config, &context.symbol)?;
         let dispatch_plan =
             build_execution_dispatch_plan(&pending.plan_preview, &dispatch_policy, ingested_at)?;
         if dispatch_plan.requests.len() != 2 {
@@ -3508,7 +3781,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     }
 
     let report = BasisGuardedLiveAutoOnceReport {
-        symbol: BASIS_SYMBOL.to_owned(),
+        symbol: context.symbol.clone(),
         strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
         spot_event_id: Some(context.spot_event_id),
         perp_event_id: Some(context.perp_event_id),
@@ -3551,6 +3824,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
 
 #[cfg(feature = "live-exec")]
 fn run_bybit_basis_guarded_live_auto_once_from_json(
+    symbol: &str,
     raw_spot: &str,
     spot_ref: &str,
     raw_linear: &str,
@@ -3558,6 +3832,14 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
     ingested_at: UtcTimestamp,
     options: BybitBasisGuardedLiveAutoOnceOptions,
 ) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+    let symbol = normalize_cex_usdt_basis_symbol(symbol, "Bybit")?;
+    if options.execute_live && symbol != BASIS_SYMBOL {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "真实 Bybit basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
+            ),
+        });
+    }
     let output_root = options
         .output_dir
         .clone()
@@ -3568,7 +3850,7 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
     let output_dir = Some(output_root.clone());
     let context = write_bybit_basis_guarded_live_auto_market_artifacts(
         BybitBasisRawInputs {
-            symbol: BASIS_SYMBOL,
+            symbol: &symbol,
             raw_spot_ticker: raw_spot,
             spot_ticker_ref: spot_ref,
             raw_linear_ticker: raw_linear,
@@ -3610,7 +3892,7 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
     }
     if !blocking_reasons.is_empty() {
         let report = BybitBasisGuardedLiveAutoOnceReport {
-            symbol: BASIS_SYMBOL.to_owned(),
+            symbol: context.symbol.clone(),
             strategy_id: BYBIT_BASIS_LIVE_STRATEGY_ID.to_owned(),
             spot_event_id: Some(context.spot_event_id),
             perp_event_id: Some(context.perp_event_id),
@@ -3714,7 +3996,7 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
         &health,
     );
     let dispatch_plan = if dispatch_blocking.is_empty() {
-        let dispatch_policy = live_dispatch_policy_from_config(&config)?;
+        let dispatch_policy = live_dispatch_policy_from_config(&config, &context.symbol)?;
         let dispatch_plan =
             build_execution_dispatch_plan(&pending.plan_preview, &dispatch_policy, ingested_at)?;
         if dispatch_plan.requests.len() != 2 {
@@ -3816,8 +4098,308 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
     }
 
     let report = BybitBasisGuardedLiveAutoOnceReport {
-        symbol: BASIS_SYMBOL.to_owned(),
+        symbol: context.symbol.clone(),
         strategy_id: BYBIT_BASIS_LIVE_STRATEGY_ID.to_owned(),
+        spot_event_id: Some(context.spot_event_id),
+        perp_event_id: Some(context.perp_event_id),
+        premium_event_id: Some(context.premium_event_id),
+        spot_ask: Some(context.spot_ask),
+        perp_bid: Some(context.perp_bid),
+        net_bps: Some(context.signal.net_bps),
+        signal_allowed: true,
+        plan_hash: Some(plan_hash),
+        approval_event_id: Some(release.approval_event_id),
+        manual_gate_released: true,
+        dispatch_attempted,
+        dispatch_allowed: dispatch_blocking.is_empty(),
+        planned_order_count: dispatch_plan
+            .as_ref()
+            .map(|plan| plan.requests.len())
+            .unwrap_or(0),
+        submitted_receipt_count: primary_submit_receipt_count,
+        private_confirmation_count: confirmations.len(),
+        protection_attempted: protection.attempted,
+        protection_actions: protection.actions,
+        protection_receipt_count: protection.receipt_count,
+        residual_risk: protection.residual_risk,
+        execution_report_status: execution_report
+            .as_ref()
+            .map(|report| report.status.as_str().to_owned()),
+        blocking_reasons: dispatch_blocking,
+        output_dir,
+    };
+    write_basis_guarded_live_auto_once_artifacts(
+        &live_dir,
+        &report,
+        &receipts,
+        &confirmations,
+        execution_report.as_ref(),
+    )?;
+    write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn run_okx_basis_guarded_live_auto_once_from_json(
+    inputs: OkxBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+    options: OkxBasisGuardedLiveAutoOnceOptions,
+) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceReport> {
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(OKX_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+    let market_dir = output_root.join("market");
+    let preview_dir = output_root.join("preview");
+    let live_dir = output_root.join("live-dispatch");
+    let output_dir = Some(output_root.clone());
+    let context = write_okx_basis_guarded_live_auto_market_artifacts(
+        inputs,
+        ingested_at,
+        options.min_net_bps,
+        &market_dir,
+    )?;
+    if options.execute_live && context.symbol != OKX_BASIS_SYMBOL {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "真实 OKX basis 自动下单仍只允许 {OKX_BASIS_SYMBOL}；{} 仅支持 dry-run 预下单验证",
+                context.symbol
+            ),
+        });
+    }
+    let mut blocking_reasons = Vec::new();
+    if !context.signal.is_candidate {
+        blocking_reasons.push(
+            context
+                .signal
+                .reason
+                .clone()
+                .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
+        );
+    }
+    if let Some(max_spot_ask) = &options.max_spot_ask {
+        if Decimal::from_str(&context.spot_ask)? > Decimal::from_str(max_spot_ask)? {
+            blocking_reasons.push(format!(
+                "spot leg blocked: spot_ask={} is above max_spot_ask={max_spot_ask}",
+                context.spot_ask
+            ));
+        }
+    } else if options.execute_live {
+        blocking_reasons.push("live basis execution requires --max-spot-ask".to_owned());
+    }
+    if let Some(min_perp_bid) = &options.min_perp_bid {
+        if Decimal::from_str(&context.perp_bid)? < Decimal::from_str(min_perp_bid)? {
+            blocking_reasons.push(format!(
+                "perp leg blocked: perp_bid={} is below min_perp_bid={min_perp_bid}",
+                context.perp_bid
+            ));
+        }
+    } else if options.execute_live {
+        blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
+    }
+    if !blocking_reasons.is_empty() {
+        let report = OkxBasisGuardedLiveAutoOnceReport {
+            symbol: context.symbol.clone(),
+            strategy_id: OKX_BASIS_LIVE_STRATEGY_ID.to_owned(),
+            spot_event_id: Some(context.spot_event_id),
+            perp_event_id: Some(context.perp_event_id),
+            premium_event_id: Some(context.premium_event_id),
+            spot_ask: Some(context.spot_ask),
+            perp_bid: Some(context.perp_bid),
+            net_bps: Some(context.signal.net_bps),
+            signal_allowed: false,
+            plan_hash: None,
+            approval_event_id: None,
+            manual_gate_released: false,
+            dispatch_attempted: false,
+            dispatch_allowed: false,
+            planned_order_count: 0,
+            submitted_receipt_count: 0,
+            private_confirmation_count: 0,
+            protection_attempted: false,
+            protection_actions: Vec::new(),
+            protection_receipt_count: 0,
+            residual_risk: None,
+            execution_report_status: None,
+            blocking_reasons,
+            output_dir,
+        };
+        write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+        return Ok(report);
+    }
+
+    let generated_at = ingested_at.to_string();
+    let candidate = okx_basis_guarded_live_candidate(
+        &context,
+        &generated_at,
+        &ingested_at.unix_seconds().to_string(),
+    )?;
+    let risk_decision =
+        okx_basis_guarded_live_manual_risk_decision(&context, &generated_at, options.min_net_bps)?;
+    let pending = match build_execution_plan_preview(ExecutionPlanBuildInput::new(
+        &risk_decision,
+        &candidate,
+        ContractExecutionMode::GuardedLive,
+        &generated_at,
+    ))? {
+        PlanBuildOutcome::PendingManualApproval(pending) => pending,
+        PlanBuildOutcome::Schedulable(_) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "OKX basis guarded live auto unexpectedly produced dispatchable plan before approval"
+                        .to_owned(),
+            });
+        }
+    };
+    fs::create_dir_all(&preview_dir).map_err(|error| RuntimeError::Io {
+        path: preview_dir.clone(),
+        message: error.to_string(),
+    })?;
+    write_binance_guarded_live_preview_artifacts(
+        &preview_dir,
+        BinanceGuardedLivePreviewArtifacts {
+            candidate: &candidate,
+            risk_decision: &risk_decision,
+            plan_preview: &pending.plan_preview,
+            plan_hash: &execution_plan_hash(&pending.plan_preview),
+            manual_material_md: "",
+            approval_records_jsonl: "",
+            confirmation_template_md: "",
+        },
+    )?;
+    let plan_hash = execution_plan_hash(&pending.plan_preview);
+    let approved_record = review_manual_approval(
+        ManualApprovalReviewInput::new(
+            &pending,
+            &format!(
+                "event:approval:auto-live:okx-basis:{}",
+                ingested_at.unix_seconds()
+            ),
+            "system:basis-guarded-live-auto-strategy",
+            &generated_at,
+            &UtcTimestamp::from_unix_parts(ingested_at.unix_seconds() + 300, 0)?.to_string(),
+            ManualApprovalDecision::Approve,
+        )
+        .with_reason("Automatic OKX basis strategy approved both spot and swap legs for the same fresh plan hash."),
+    )?;
+    write_utf8(
+        preview_dir.join("approval_records.jsonl"),
+        &manual_approval_records_jsonl(std::slice::from_ref(&approved_record)),
+    )?;
+    let release = release_manual_approval_gate(&pending, &approved_record)?;
+    write_binance_manual_gate_release_artifacts(&preview_dir, &release, false, &generated_at)?;
+
+    let config = arb_config::ArbConfig::from_path(&options.config_path)?;
+    let service = start_runtime_with_config(&config)?;
+    let health = service.health();
+    let mut dispatch_blocking = live_dispatch_blocking_reasons(
+        &config,
+        &pending.plan_preview,
+        &release,
+        &plan_hash,
+        &health,
+    );
+    let dispatch_plan = if dispatch_blocking.is_empty() {
+        let dispatch_policy = live_dispatch_policy_from_config(&config, &context.symbol)?;
+        let dispatch_plan =
+            build_execution_dispatch_plan(&pending.plan_preview, &dispatch_policy, ingested_at)?;
+        if dispatch_plan.requests.len() != 2 {
+            dispatch_blocking.push(format!(
+                "basis arbitrage requires exactly two order legs, got {}",
+                dispatch_plan.requests.len()
+            ));
+        }
+        Some(dispatch_plan)
+    } else {
+        None
+    };
+
+    let mut receipts = Vec::new();
+    let mut confirmations = Vec::new();
+    let mut execution_report = None;
+    let mut dispatch_attempted = false;
+    let mut primary_submit_receipt_count = 0usize;
+    let mut protection = BasisLiveProtection::default();
+    if options.execute_live && dispatch_blocking.is_empty() {
+        if !options.acknowledge_basis_live_orders {
+            return Err(RuntimeError::UnsafeConfig {
+                message: "缺少 --i-understand-basis-live-orders，拒绝进入 OKX 双腿真实套利下单链路"
+                    .to_owned(),
+            });
+        }
+        let dispatch_plan = dispatch_plan
+            .as_ref()
+            .ok_or_else(|| RuntimeError::UnsafeConfig {
+                message: "OKX 双腿套利分发计划缺失，拒绝进入真实下单链路".to_owned(),
+            })?;
+        let signing_policy = signing_policy_from_config(&config)?;
+        let account =
+            fetch_okx_private_account_snapshot(&signing_policy, &ingested_at, "basis-pre-trading")?;
+        ensure_asset_balance_covers_amount(
+            "OKX Trading",
+            &account.balances,
+            BASIS_QUOTE_ASSET_ID,
+            BINANCE_GUARDED_LIVE_NOTIONAL_USDT,
+        )?;
+        let private_order_events = options
+            .private_order_events_dir
+            .as_ref()
+            .map(|path| PrivateOrderEventStore::from_dir(path))
+            .transpose()?;
+        dispatch_attempted = true;
+        let mut spot_adapter = build_okx_spot_live_adapter(&signing_policy)?;
+        let mut swap_adapter = build_okx_swap_live_adapter(&signing_policy)?;
+        let protection_suffix = ingested_at.unix_seconds().to_string();
+        let outcome = execute_basis_live_dispatch(
+            dispatch_plan,
+            &mut spot_adapter,
+            &mut swap_adapter,
+            BasisLiveDispatchContext {
+                plan: Some(&pending.plan_preview),
+                generated_at: &generated_at,
+                spot_unwind_limit_price: Price::from_str(&context.spot_bid)?,
+                protection_suffix: &protection_suffix,
+                private_order_events: private_order_events.as_ref(),
+                spot_market: PrivateOrderMarket::OkxSpot,
+                perp_market: PrivateOrderMarket::OkxSwap,
+                order_query_event_prefix: "event:okx:basis-order-query",
+            },
+        )?;
+        receipts = outcome.receipts;
+        confirmations = outcome.confirmations;
+        execution_report = outcome.execution_report;
+        primary_submit_receipt_count = outcome.primary_submit_receipt_count;
+        protection = outcome.protection;
+        dispatch_blocking.extend(outcome.blocking_reasons);
+        if execution_report.is_none() && dispatch_blocking.is_empty() {
+            execution_report = Some(arb_execution::execution_report_from_private_confirmations(
+                arb_execution::PrivateExecutionReportInput::new(
+                    &pending.plan_preview,
+                    &generated_at,
+                    &confirmations,
+                ),
+            )?);
+        }
+    } else if !options.execute_live {
+        dispatch_blocking.push(
+            "OKX basis chain ran in dry-run mode; pass --execute-live and --i-understand-basis-live-orders to submit both real legs"
+                .to_owned(),
+        );
+    }
+
+    if execution_report.is_none() && dispatch_blocking.is_empty() && options.execute_live {
+        execution_report = Some(arb_execution::execution_report_from_private_confirmations(
+            arb_execution::PrivateExecutionReportInput::new(
+                &pending.plan_preview,
+                &generated_at,
+                &confirmations,
+            ),
+        )?);
+    }
+
+    let report = OkxBasisGuardedLiveAutoOnceReport {
+        symbol: context.symbol.clone(),
+        strategy_id: OKX_BASIS_LIVE_STRATEGY_ID.to_owned(),
         spot_event_id: Some(context.spot_event_id),
         perp_event_id: Some(context.perp_event_id),
         premium_event_id: Some(context.premium_event_id),
@@ -4305,6 +4887,8 @@ fn basis_private_order_market_venue_id(market: PrivateOrderMarket) -> &'static s
         PrivateOrderMarket::UsdmFutures => BINANCE_BASIS_PERP_VENUE_ID,
         PrivateOrderMarket::BybitSpot => BYBIT_BASIS_SPOT_VENUE_ID,
         PrivateOrderMarket::BybitLinear => BYBIT_BASIS_PERP_VENUE_ID,
+        PrivateOrderMarket::OkxSpot => OKX_BASIS_SPOT_VENUE_ID,
+        PrivateOrderMarket::OkxSwap => OKX_BASIS_PERP_VENUE_ID,
     }
 }
 
@@ -4394,6 +4978,8 @@ struct PrivateOrderEventStore {
     usdm_events: Vec<String>,
     bybit_spot_events: Vec<String>,
     bybit_linear_events: Vec<String>,
+    okx_spot_events: Vec<String>,
+    okx_swap_events: Vec<String>,
 }
 
 #[cfg(feature = "live-exec")]
@@ -4418,6 +5004,22 @@ impl PrivateOrderEventStore {
                     "bybit_linear_private_order.jsonl",
                 ],
             )?,
+            okx_spot_events: read_optional_jsonl_files(
+                path,
+                &[
+                    "okx_spot_user_data.jsonl",
+                    "okx_spot_orders.jsonl",
+                    "okx_spot_private_order.jsonl",
+                ],
+            )?,
+            okx_swap_events: read_optional_jsonl_files(
+                path,
+                &[
+                    "okx_swap_user_data.jsonl",
+                    "okx_swap_orders.jsonl",
+                    "okx_swap_private_order.jsonl",
+                ],
+            )?,
         })
     }
 
@@ -4431,6 +5033,8 @@ impl PrivateOrderEventStore {
             PrivateOrderMarket::UsdmFutures => &self.usdm_events,
             PrivateOrderMarket::BybitSpot => &self.bybit_spot_events,
             PrivateOrderMarket::BybitLinear => &self.bybit_linear_events,
+            PrivateOrderMarket::OkxSpot => &self.okx_spot_events,
+            PrivateOrderMarket::OkxSwap => &self.okx_swap_events,
         };
         let Some(expected_client_order_id) = planned.request.client_order_id.as_ref() else {
             return Ok(None);
@@ -4483,6 +5087,11 @@ fn private_order_event_line_may_match(
                 .map(|topic| topic.starts_with("order"))
                 .unwrap_or(true))
         }
+        PrivateOrderMarket::OkxSpot | PrivateOrderMarket::OkxSwap => {
+            Ok(json_optional_string_field(line, "channel")?
+                .map(|channel| channel == "orders")
+                .unwrap_or(true))
+        }
     }
 }
 
@@ -4514,7 +5123,10 @@ fn binance_private_order_event_type_matches(market: PrivateOrderMarket, event_ty
     match market {
         PrivateOrderMarket::Spot => event_type == "executionReport",
         PrivateOrderMarket::UsdmFutures => event_type == "ORDER_TRADE_UPDATE",
-        PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear => false,
+        PrivateOrderMarket::BybitSpot
+        | PrivateOrderMarket::BybitLinear
+        | PrivateOrderMarket::OkxSpot
+        | PrivateOrderMarket::OkxSwap => false,
     }
 }
 
@@ -4572,6 +5184,16 @@ fn parse_private_order_event_line(
             )
             .map_err(RuntimeError::from)
         }
+        PrivateOrderMarket::OkxSpot | PrivateOrderMarket::OkxSwap => {
+            parse_okx_private_order_stream_update(
+                market,
+                planned.request.venue_id.clone(),
+                planned.request.account_id.clone(),
+                source_event_id,
+                line,
+            )
+            .map_err(RuntimeError::from)
+        }
     }
 }
 
@@ -4582,6 +5204,8 @@ fn private_order_market_token(market: PrivateOrderMarket) -> &'static str {
         PrivateOrderMarket::UsdmFutures => "usdm",
         PrivateOrderMarket::BybitSpot => "bybit-spot",
         PrivateOrderMarket::BybitLinear => "bybit-linear",
+        PrivateOrderMarket::OkxSpot => "okx-spot",
+        PrivateOrderMarket::OkxSwap => "okx-swap",
     }
 }
 
@@ -4594,6 +5218,10 @@ fn private_order_stream_source_event_id(market: PrivateOrderMarket, index: usize
         ),
         PrivateOrderMarket::BybitSpot | PrivateOrderMarket::BybitLinear => format!(
             "event:bybit:private-order-stream:{}:{index}",
+            private_order_market_token(market)
+        ),
+        PrivateOrderMarket::OkxSpot | PrivateOrderMarket::OkxSwap => format!(
+            "event:okx:private-order-stream:{}:{index}",
             private_order_market_token(market)
         ),
     }
@@ -4879,7 +5507,7 @@ fn run_binance_guarded_live_dispatch_live(
         let mut adapter = build_binance_spot_live_adapter(&signing_policy)?;
         let dispatch_plan = build_execution_dispatch_plan(
             plan,
-            &live_dispatch_policy_from_config(&config)?,
+            &live_dispatch_policy_from_config(&config, BASIS_SYMBOL)?,
             generated_at,
         )?;
         if dispatch_plan.requests.len() != 1 {
@@ -6460,8 +7088,11 @@ fn build_binance_basis_monitor_snapshot_from_json(
                     symbol: premium.symbol.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
+                    spot_ask_size: Some(spot.ask_qty.clone()),
                     perp_best_bid: perp.bid_price.clone(),
                     perp_best_ask: perp.ask_price.clone(),
+                    perp_bid_size: Some(perp.bid_qty.clone()),
+                    last_funding_rate: premium.last_funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
                     perp_taker_fee_bps: options.perp_taker_fee_bps,
@@ -6613,8 +7244,11 @@ fn build_aster_basis_monitor_snapshot_from_json(
                     symbol: premium.symbol.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
+                    spot_ask_size: Some(spot.ask_qty.clone()),
                     perp_best_bid: perp.bid_price.clone(),
                     perp_best_ask: perp.ask_price.clone(),
+                    perp_bid_size: Some(perp.bid_qty.clone()),
+                    last_funding_rate: premium.last_funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
                     perp_taker_fee_bps: options.perp_taker_fee_bps,
@@ -6792,8 +7426,11 @@ fn build_bybit_basis_monitor_snapshot_from_json(
                     symbol: symbol.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
+                    spot_ask_size: Some(spot.ask_qty.clone()),
                     perp_best_bid: linear.bid_price.clone(),
                     perp_best_ask: linear.ask_price.clone(),
+                    perp_bid_size: Some(linear.bid_qty.clone()),
+                    last_funding_rate: linear.last_funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
                     perp_taker_fee_bps: options.perp_taker_fee_bps,
@@ -6988,13 +7625,16 @@ fn build_okx_basis_monitor_snapshot_from_json(
 
         let mut signal_error = None;
         let signal = match (spot, funding) {
-            (Some(spot), Some(_)) => {
+            (Some(spot), Some(funding)) => {
                 match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
                     symbol: spot_inst_id.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
+                    spot_ask_size: Some(spot.ask_qty.clone()),
                     perp_best_bid: swap.bid_price.clone(),
                     perp_best_ask: swap.ask_price.clone(),
+                    perp_bid_size: Some(swap.bid_qty.clone()),
+                    last_funding_rate: funding.funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
                     perp_taker_fee_bps: options.perp_taker_fee_bps,
@@ -7138,8 +7778,11 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
                     symbol: perp.coin.clone(),
                     spot_best_bid: spot.price.clone(),
                     spot_best_ask: spot.price.clone(),
+                    spot_ask_size: None,
                     perp_best_bid: perp.price.clone(),
                     perp_best_ask: perp.price.clone(),
+                    perp_bid_size: None,
+                    last_funding_rate: perp.funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
                     perp_taker_fee_bps: options.perp_taker_fee_bps,
@@ -8866,6 +9509,22 @@ struct BybitBasisRawInputs<'a> {
     linear_ticker_ref: &'a str,
 }
 
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy)]
+struct OkxBasisRawInputs<'a> {
+    symbol: &'a str,
+    raw_spot_ticker: &'a str,
+    spot_ticker_ref: &'a str,
+    raw_swap_ticker: &'a str,
+    swap_ticker_ref: &'a str,
+    raw_mark_price: &'a str,
+    mark_price_ref: &'a str,
+    raw_index_ticker: &'a str,
+    index_ticker_ref: &'a str,
+    raw_funding_rate: &'a str,
+    funding_rate_ref: &'a str,
+}
+
 /// basis 管线实例输入。
 ///
 /// 中文说明：运行时只依赖这里注入的策略配置和场所能力，不再在策略执行入口
@@ -9351,21 +10010,30 @@ fn ingest_binance_basis_public_json(
 ) -> RuntimeResult<Vec<NormalizedEvent>> {
     let mut spot_adapter = BinancePublicBookTickerAdapter::new(
         VenueId::new(BINANCE_BASIS_SPOT_VENUE_ID)?,
-        binance_basis_instrument(inputs.symbol, BINANCE_BASIS_SPOT_INSTRUMENT_ID)?,
+        binance_basis_instrument(
+            inputs.symbol,
+            &binance_basis_spot_instrument_id(inputs.symbol)?,
+        )?,
         BinancePublicMarket::Spot,
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let mut perp_adapter = BinancePublicBookTickerAdapter::new(
         VenueId::new(BINANCE_BASIS_PERP_VENUE_ID)?,
-        binance_basis_instrument(inputs.symbol, BINANCE_BASIS_PERP_INSTRUMENT_ID)?,
+        binance_basis_instrument(
+            inputs.symbol,
+            &binance_basis_perp_instrument_id(inputs.symbol)?,
+        )?,
         BinancePublicMarket::UsdmPerpetual,
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let premium_adapter = BinanceUsdmPremiumIndexAdapter::new(
         VenueId::new(BINANCE_BASIS_PERP_VENUE_ID)?,
-        binance_basis_instrument(inputs.symbol, BINANCE_BASIS_PERP_INSTRUMENT_ID)?,
+        binance_basis_instrument(
+            inputs.symbol,
+            &binance_basis_perp_instrument_id(inputs.symbol)?,
+        )?,
         MARKET_DATA_MAX_AGE_MS,
     )?;
 
@@ -9401,21 +10069,30 @@ fn ingest_bybit_basis_public_json(
 ) -> RuntimeResult<Vec<NormalizedEvent>> {
     let mut spot_adapter = BybitPublicTickerAdapter::new(
         VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?,
-        bybit_basis_instrument(inputs.symbol, BYBIT_BASIS_SPOT_INSTRUMENT_ID)?,
+        bybit_basis_instrument(
+            inputs.symbol,
+            &bybit_basis_spot_instrument_id(inputs.symbol)?,
+        )?,
         BybitPublicMarket::Spot,
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let mut linear_adapter = BybitPublicTickerAdapter::new(
         VenueId::new(BYBIT_BASIS_PERP_VENUE_ID)?,
-        bybit_basis_instrument(inputs.symbol, BYBIT_BASIS_PERP_INSTRUMENT_ID)?,
+        bybit_basis_instrument(
+            inputs.symbol,
+            &bybit_basis_perp_instrument_id(inputs.symbol)?,
+        )?,
         BybitPublicMarket::LinearPerpetual,
         ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let premium_adapter = BybitLinearPremiumIndexAdapter::new(
         VenueId::new(BYBIT_BASIS_PERP_VENUE_ID)?,
-        bybit_basis_instrument(inputs.symbol, BYBIT_BASIS_PERP_INSTRUMENT_ID)?,
+        bybit_basis_instrument(
+            inputs.symbol,
+            &bybit_basis_perp_instrument_id(inputs.symbol)?,
+        )?,
         MARKET_DATA_MAX_AGE_MS,
     )?;
 
@@ -9452,7 +10129,7 @@ fn binance_basis_instrument(
     Ok(BinancePublicInstrument::new(
         symbol,
         InstrumentId::new(instrument_id)?,
-        AssetId::new(BASIS_BASE_ASSET_ID)?,
+        AssetId::new(&basis_base_asset_id_from_cex_symbol(symbol)?)?,
         AssetId::new(BASIS_QUOTE_ASSET_ID)?,
         AssetId::new(BASIS_SETTLEMENT_ASSET_ID)?,
     )?
@@ -9467,12 +10144,156 @@ fn bybit_basis_instrument(
     Ok(BybitPublicInstrument::new(
         symbol,
         InstrumentId::new(instrument_id)?,
-        AssetId::new(BASIS_BASE_ASSET_ID)?,
+        AssetId::new(&basis_base_asset_id_from_cex_symbol(symbol)?)?,
         AssetId::new(BASIS_QUOTE_ASSET_ID)?,
         AssetId::new(BASIS_SETTLEMENT_ASSET_ID)?,
     )?
     .with_tick_size(Price::from_str("0.01")?)
     .with_lot_size(Quantity::from_str("0.000001")?))
+}
+
+fn normalize_cex_usdt_basis_symbol(symbol: &str, venue: &'static str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if symbol.len() <= 4 || !symbol.ends_with("USDT") {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{venue} basis symbol must be an uppercase USDT pair like ETHUSDT"),
+        });
+    }
+    if !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{venue} basis symbol must use only ASCII letters and digits"),
+        });
+    }
+    Ok(symbol)
+}
+
+#[cfg(feature = "live-exec")]
+fn normalize_okx_usdt_basis_symbol(symbol: &str) -> RuntimeResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    let normalized = if symbol.contains('-') {
+        symbol
+    } else if symbol.len() > 4 && symbol.ends_with("USDT") {
+        format!("{}-USDT", &symbol[..symbol.len() - 4])
+    } else {
+        symbol
+    };
+    let Some((base, quote)) = normalized.split_once('-') else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "OKX basis symbol must be an uppercase USDT pair like ETH-USDT".to_owned(),
+        });
+    };
+    if base.is_empty() || quote != "USDT" || !base.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(RuntimeError::LiveMarketData {
+            message: "OKX basis symbol must be an uppercase USDT pair like ETH-USDT".to_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn basis_base_asset_id_from_cex_symbol(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_cex_usdt_basis_symbol(symbol, "CEX")?;
+    if symbol == BASIS_SYMBOL {
+        return Ok(BASIS_BASE_ASSET_ID.to_owned());
+    }
+    Ok(format!("asset:{}", &symbol[..symbol.len() - 4]))
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_base_asset_id_from_okx_symbol(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_okx_usdt_basis_symbol(symbol)?;
+    let base = symbol
+        .split_once('-')
+        .map(|(base, _)| base)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("OKX basis symbol `{symbol}` lacks base asset"),
+        })?;
+    Ok(format!("asset:{base}"))
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_symbol_slug(symbol: &str) -> String {
+    symbol
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn binance_basis_spot_instrument_id(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_cex_usdt_basis_symbol(symbol, "Binance")?;
+    if symbol == BASIS_SYMBOL {
+        return Ok(BINANCE_BASIS_SPOT_INSTRUMENT_ID.to_owned());
+    }
+    Ok(format!("inst:BINANCE:{symbol}:SPOT"))
+}
+
+fn binance_basis_perp_instrument_id(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_cex_usdt_basis_symbol(symbol, "Binance")?;
+    if symbol == BASIS_SYMBOL {
+        return Ok(BINANCE_BASIS_PERP_INSTRUMENT_ID.to_owned());
+    }
+    Ok(format!("inst:BINANCE:{symbol}:USDM-PERP"))
+}
+
+fn bybit_basis_spot_instrument_id(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_cex_usdt_basis_symbol(symbol, "Bybit")?;
+    if symbol == BASIS_SYMBOL {
+        return Ok(BYBIT_BASIS_SPOT_INSTRUMENT_ID.to_owned());
+    }
+    Ok(format!("inst:BYBIT:{symbol}:SPOT"))
+}
+
+fn bybit_basis_perp_instrument_id(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_cex_usdt_basis_symbol(symbol, "Bybit")?;
+    if symbol == BASIS_SYMBOL {
+        return Ok(BYBIT_BASIS_PERP_INSTRUMENT_ID.to_owned());
+    }
+    Ok(format!("inst:BYBIT:{symbol}:LINEAR-PERP"))
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_live_transition_id(venue: &str, symbol_slug: &str) -> String {
+    match (venue, symbol_slug) {
+        ("binance", "btcusdt") => return BINANCE_BASIS_LIVE_TRANSITION_ID.to_owned(),
+        ("bybit", "btcusdt") => return BYBIT_BASIS_LIVE_TRANSITION_ID.to_owned(),
+        ("okx", "btc-usdt") => return OKX_BASIS_LIVE_TRANSITION_ID.to_owned(),
+        _ => {}
+    }
+    format!("trans:{venue}-basis-guarded-live-auto:{symbol_slug}")
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_live_risk_decision_id(venue: &str, symbol_slug: &str) -> String {
+    format!("risk:trans:{venue}-basis-guarded-live-auto:{symbol_slug}")
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_live_leg_id(venue: &str, role: &str, symbol_slug: &str) -> String {
+    format!("candleg:{venue}-basis-live-{role}:{symbol_slug}")
+}
+
+#[cfg(feature = "live-exec")]
+fn okx_basis_spot_instrument_id(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_okx_usdt_basis_symbol(symbol)?;
+    if symbol == OKX_BASIS_SYMBOL {
+        return Ok(OKX_BASIS_SPOT_INSTRUMENT_ID.to_owned());
+    }
+    Ok(format!("inst:OKX:{symbol}:SPOT"))
+}
+
+#[cfg(feature = "live-exec")]
+fn okx_basis_perp_instrument_id(symbol: &str) -> RuntimeResult<String> {
+    let symbol = normalize_okx_usdt_basis_symbol(symbol)?;
+    if symbol == OKX_BASIS_SYMBOL {
+        return Ok(OKX_BASIS_PERP_INSTRUMENT_ID.to_owned());
+    }
+    Ok(format!("inst:OKX:{symbol}-SWAP:SWAP"))
 }
 
 fn build_public_basis_portfolio_state(
@@ -9518,6 +10339,11 @@ struct BinanceGuardedLiveQuote {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(feature = "live-exec")]
 struct BinanceBasisGuardedLiveSignalContext {
+    symbol: String,
+    symbol_slug: String,
+    spot_instrument_id: String,
+    perp_instrument_id: String,
+    base_asset_id: String,
     spot_event_id: String,
     perp_event_id: String,
     premium_event_id: String,
@@ -9632,6 +10458,10 @@ fn write_binance_basis_guarded_live_auto_market_artifacts(
     min_net_bps: i128,
     output_dir: &Path,
 ) -> RuntimeResult<BinanceBasisGuardedLiveSignalContext> {
+    let symbol = normalize_cex_usdt_basis_symbol(inputs.symbol, "Binance")?;
+    let spot_instrument_id = binance_basis_spot_instrument_id(&symbol)?;
+    let perp_instrument_id = binance_basis_perp_instrument_id(&symbol)?;
+    let base_asset_id = basis_base_asset_id_from_cex_symbol(&symbol)?;
     fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
         path: output_dir.to_path_buf(),
         message: error.to_string(),
@@ -9654,23 +10484,25 @@ fn write_binance_basis_guarded_live_auto_market_artifacts(
         &format!("{}\n", inputs.raw_premium_index),
     )?;
 
-    let spot = find_binance_basis_book_event(
-        &events,
-        BINANCE_BASIS_SPOT_VENUE_ID,
-        BINANCE_BASIS_SPOT_INSTRUMENT_ID,
-    )?;
-    let perp = find_binance_basis_book_event(
+    let spot =
+        find_binance_basis_book_event(&events, BINANCE_BASIS_SPOT_VENUE_ID, &spot_instrument_id)?;
+    let perp =
+        find_binance_basis_book_event(&events, BINANCE_BASIS_PERP_VENUE_ID, &perp_instrument_id)?;
+    let premium = find_basis_premium_event(
         &events,
         BINANCE_BASIS_PERP_VENUE_ID,
-        BINANCE_BASIS_PERP_INSTRUMENT_ID,
+        &perp_instrument_id,
+        "Binance basis premium index",
     )?;
-    let premium = find_binance_basis_premium_event(&events)?;
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
-        symbol: BASIS_SYMBOL.to_owned(),
+        symbol: symbol.clone(),
         spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
         spot_best_ask: payload_string(spot, "best_ask")?.to_owned(),
+        spot_ask_size: Some(payload_string(spot, "ask_size")?.to_owned()),
         perp_best_bid: payload_string(perp, "best_bid")?.to_owned(),
         perp_best_ask: payload_string(perp, "best_ask")?.to_owned(),
+        perp_bid_size: Some(payload_string(perp, "bid_size")?.to_owned()),
+        last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
         spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
         perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
@@ -9683,6 +10515,11 @@ fn write_binance_basis_guarded_live_auto_market_artifacts(
     })?;
 
     Ok(BinanceBasisGuardedLiveSignalContext {
+        symbol: symbol.clone(),
+        symbol_slug: basis_symbol_slug(&symbol),
+        spot_instrument_id,
+        perp_instrument_id,
+        base_asset_id,
         spot_event_id: spot.event_id.as_str().to_owned(),
         perp_event_id: perp.event_id.as_str().to_owned(),
         premium_event_id: premium.event_id.as_str().to_owned(),
@@ -9710,6 +10547,10 @@ fn write_bybit_basis_guarded_live_auto_market_artifacts(
     min_net_bps: i128,
     output_dir: &Path,
 ) -> RuntimeResult<BinanceBasisGuardedLiveSignalContext> {
+    let symbol = normalize_cex_usdt_basis_symbol(inputs.symbol, "Bybit")?;
+    let spot_instrument_id = bybit_basis_spot_instrument_id(&symbol)?;
+    let perp_instrument_id = bybit_basis_perp_instrument_id(&symbol)?;
+    let base_asset_id = basis_base_asset_id_from_cex_symbol(&symbol)?;
     fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
         path: output_dir.to_path_buf(),
         message: error.to_string(),
@@ -9728,28 +10569,25 @@ fn write_bybit_basis_guarded_live_auto_market_artifacts(
         &format!("{}\n", inputs.raw_linear_ticker),
     )?;
 
-    let spot = find_binance_basis_book_event(
-        &events,
-        BYBIT_BASIS_SPOT_VENUE_ID,
-        BYBIT_BASIS_SPOT_INSTRUMENT_ID,
-    )?;
-    let perp = find_binance_basis_book_event(
-        &events,
-        BYBIT_BASIS_PERP_VENUE_ID,
-        BYBIT_BASIS_PERP_INSTRUMENT_ID,
-    )?;
+    let spot =
+        find_binance_basis_book_event(&events, BYBIT_BASIS_SPOT_VENUE_ID, &spot_instrument_id)?;
+    let perp =
+        find_binance_basis_book_event(&events, BYBIT_BASIS_PERP_VENUE_ID, &perp_instrument_id)?;
     let premium = find_basis_premium_event(
         &events,
         BYBIT_BASIS_PERP_VENUE_ID,
-        BYBIT_BASIS_PERP_INSTRUMENT_ID,
+        &perp_instrument_id,
         "Bybit basis premium index",
     )?;
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
-        symbol: BASIS_SYMBOL.to_owned(),
+        symbol: symbol.clone(),
         spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
         spot_best_ask: payload_string(spot, "best_ask")?.to_owned(),
+        spot_ask_size: Some(payload_string(spot, "ask_size")?.to_owned()),
         perp_best_bid: payload_string(perp, "best_bid")?.to_owned(),
         perp_best_ask: payload_string(perp, "best_ask")?.to_owned(),
+        perp_bid_size: Some(payload_string(perp, "bid_size")?.to_owned()),
+        last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
         spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
         perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
@@ -9762,6 +10600,11 @@ fn write_bybit_basis_guarded_live_auto_market_artifacts(
     })?;
 
     Ok(BinanceBasisGuardedLiveSignalContext {
+        symbol: symbol.clone(),
+        symbol_slug: basis_symbol_slug(&symbol),
+        spot_instrument_id,
+        perp_instrument_id,
+        base_asset_id,
         spot_event_id: spot.event_id.as_str().to_owned(),
         perp_event_id: perp.event_id.as_str().to_owned(),
         premium_event_id: premium.event_id.as_str().to_owned(),
@@ -9778,6 +10621,152 @@ fn write_bybit_basis_guarded_live_auto_market_artifacts(
         mark_price: payload_string(premium, "mark_price")?.to_owned(),
         index_price: payload_string(premium, "index_price")?.to_owned(),
         next_funding_time_ms: payload_scalar_text(premium, "next_funding_time_ms")?,
+        signal,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn write_okx_basis_guarded_live_auto_market_artifacts(
+    inputs: OkxBasisRawInputs<'_>,
+    ingested_at: UtcTimestamp,
+    min_net_bps: i128,
+    output_dir: &Path,
+) -> RuntimeResult<BinanceBasisGuardedLiveSignalContext> {
+    let symbol = normalize_okx_usdt_basis_symbol(inputs.symbol)?;
+    let spot_instrument_id = okx_basis_spot_instrument_id(&symbol)?;
+    let perp_instrument_id = okx_basis_perp_instrument_id(&symbol)?;
+    let base_asset_id = basis_base_asset_id_from_okx_symbol(&symbol)?;
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("spot_ticker.raw.json"),
+        &format!("{}\n", inputs.raw_spot_ticker),
+    )?;
+    write_utf8(
+        output_dir.join("swap_ticker.raw.json"),
+        &format!("{}\n", inputs.raw_swap_ticker),
+    )?;
+    write_utf8(
+        output_dir.join("mark_price.raw.json"),
+        &format!("{}\n", inputs.raw_mark_price),
+    )?;
+    write_utf8(
+        output_dir.join("index_ticker.raw.json"),
+        &format!("{}\n", inputs.raw_index_ticker),
+    )?;
+    write_utf8(
+        output_dir.join("funding_rate.raw.json"),
+        &format!("{}\n", inputs.raw_funding_rate),
+    )?;
+
+    let spot = parse_okx_ticker_rows(inputs.raw_spot_ticker, "okx spot tickers")?
+        .into_iter()
+        .find(|row| row.inst_id == symbol)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX spot ticker response `{}` lacks `{}`",
+                inputs.spot_ticker_ref, symbol
+            ),
+        })?;
+    let swap_inst_id = format!("{symbol}-SWAP");
+    let swap = parse_okx_ticker_rows(inputs.raw_swap_ticker, "okx swap tickers")?
+        .into_iter()
+        .find(|row| row.inst_id == swap_inst_id)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX swap ticker response `{}` lacks `{swap_inst_id}`",
+                inputs.swap_ticker_ref
+            ),
+        })?;
+    let mark = parse_okx_mark_price_rows(inputs.raw_mark_price)?
+        .into_iter()
+        .find(|row| row.inst_id == swap_inst_id)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX mark price response `{}` lacks `{swap_inst_id}`",
+                inputs.mark_price_ref
+            ),
+        })?;
+    let index = parse_okx_index_ticker_rows(inputs.raw_index_ticker)?
+        .into_iter()
+        .find(|row| row.inst_id == symbol)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX index ticker response `{}` lacks `{}`",
+                inputs.index_ticker_ref, symbol
+            ),
+        })?;
+    let funding = parse_okx_funding_rate_rows(inputs.raw_funding_rate)?
+        .into_iter()
+        .find(|row| row.inst_id == swap_inst_id)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX funding rate response `{}` lacks `{swap_inst_id}`",
+                inputs.funding_rate_ref
+            ),
+        })?;
+
+    let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+        symbol: symbol.clone(),
+        spot_best_bid: spot.bid_price.clone(),
+        spot_best_ask: spot.ask_price.clone(),
+        spot_ask_size: Some(spot.ask_qty.clone()),
+        perp_best_bid: swap.bid_price.clone(),
+        perp_best_ask: swap.ask_price.clone(),
+        perp_bid_size: Some(swap.bid_qty.clone()),
+        last_funding_rate: funding.funding_rate.clone(),
+        notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
+        spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
+        perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+        min_net_bps,
+    })
+    .map_err(|message| RuntimeError::Module {
+        module: "arb-strategies",
+        message,
+    })?;
+
+    let sequence = ingested_at.unix_seconds();
+    let spot_event_id = format!("event:okx:basis-live:spot:{sequence}");
+    let perp_event_id = format!("event:okx:basis-live:swap:{sequence}");
+    let premium_event_id = format!("event:okx:basis-live:funding:{sequence}");
+    write_utf8(
+        output_dir.join("stored_events.jsonl"),
+        &format!(
+            "{{\"event_id\":{},\"kind\":\"OKXSpotTicker\",\"symbol\":{}}}\n{{\"event_id\":{},\"kind\":\"OKXSwapTicker\",\"symbol\":{}}}\n{{\"event_id\":{},\"kind\":\"OKXFundingRate\",\"symbol\":{}}}\n",
+            json_string(&spot_event_id),
+            json_string(&symbol),
+            json_string(&perp_event_id),
+            json_string(&swap_inst_id),
+            json_string(&premium_event_id),
+            json_string(&swap_inst_id),
+        ),
+    )?;
+
+    Ok(BinanceBasisGuardedLiveSignalContext {
+        symbol: symbol.clone(),
+        symbol_slug: basis_symbol_slug(&symbol),
+        spot_instrument_id,
+        perp_instrument_id,
+        base_asset_id,
+        spot_event_id,
+        perp_event_id,
+        premium_event_id,
+        observed_at: ingested_at.to_string(),
+        spot_bid: spot.bid_price,
+        spot_ask: spot.ask_price,
+        spot_bid_size: spot.bid_qty,
+        spot_ask_size: spot.ask_qty,
+        perp_bid: swap.bid_price,
+        perp_ask: swap.ask_price,
+        perp_bid_size: swap.bid_qty,
+        perp_ask_size: swap.ask_qty,
+        last_funding_rate: funding.funding_rate,
+        mark_price: mark.mark_price,
+        index_price: index.index_price,
+        next_funding_time_ms: funding.next_funding_time_ms,
         signal,
     })
 }
@@ -9811,6 +10800,7 @@ fn find_binance_basis_book_event<'a>(
 }
 
 #[cfg(feature = "live-exec")]
+#[allow(dead_code)]
 fn find_binance_basis_premium_event(events: &[NormalizedEvent]) -> RuntimeResult<&NormalizedEvent> {
     find_basis_premium_event(
         events,
@@ -10089,8 +11079,20 @@ fn binance_basis_guarded_live_candidate(
     client_order_suffix: &str,
 ) -> RuntimeResult<CandidatePortfolioTransition> {
     let short_quantity = format!("-{}", context.signal.quantity);
-    let spot_client_order_id = format!("rvbS{client_order_suffix}");
-    let perp_client_order_id = format!("rvbP{client_order_suffix}");
+    let transition_id = basis_live_transition_id("binance", &context.symbol_slug);
+    let spot_leg_id = basis_live_leg_id("binance", "buy-spot", &context.symbol_slug);
+    let perp_leg_id = basis_live_leg_id("binance", "short-usdm", &context.symbol_slug);
+    let client_symbol = context.symbol_slug.replace('-', "");
+    let spot_client_order_id = if context.symbol == BASIS_SYMBOL {
+        format!("rvbS{client_order_suffix}")
+    } else {
+        format!("rvbS{client_symbol}{client_order_suffix}")
+    };
+    let perp_client_order_id = if context.symbol == BASIS_SYMBOL {
+        format!("rvbP{client_order_suffix}")
+    } else {
+        format!("rvbP{client_symbol}{client_order_suffix}")
+    };
     let candidate_json = format!(
         r#"{{
   "schema_version": "1.0.0",
@@ -10104,8 +11106,8 @@ fn binance_basis_guarded_live_candidate(
   "current_portfolio_state_ref": "state:binance-basis-guarded-live-private-redacted",
   "holding_period": {{"kind": "UntilBasisConvergence"}},
   "legs": [
-    {{
-      "leg_id": "candleg:binance-basis-live-buy-spot-btcusdt",
+	    {{
+	      "leg_id": {spot_leg_id},
       "leg_type": "Trade",
       "venue_id": {spot_venue},
       "instrument_id": {spot_instrument},
@@ -10130,10 +11132,10 @@ fn binance_basis_guarded_live_candidate(
         "reference_ask_size": {spot_ask_size},
         "reference_market_event_id": {spot_event}
       }},
-      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+	      "failure_modes": ["PartialFill", "VenueOutage"]
     }},
-    {{
-      "leg_id": "candleg:binance-basis-live-short-usdm-btcusdt",
+	    {{
+	      "leg_id": {perp_leg_id},
       "leg_type": "Trade",
       "venue_id": {perp_venue},
       "instrument_id": {perp_instrument},
@@ -10157,7 +11159,7 @@ fn binance_basis_guarded_live_candidate(
         "reference_market_event_id": {perp_event},
         "reference_premium_event_id": {premium_event}
       }},
-      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+	      "failure_modes": ["PartialFill", "VenueOutage"]
     }}
   ],
   "expected_post_state_delta": {{
@@ -10172,7 +11174,7 @@ fn binance_basis_guarded_live_candidate(
   }},
   "expected_economics": {{
     "expected_profit_usd": {expected_profit_usd},
-    "expected_profit_bps": {net_bps},
+    "expected_profit_bps": {expected_profit_bps},
     "fee_estimate_usd": {fee_estimate_usd},
     "slippage_estimate_usd": {slippage_estimate_usd},
     "confidence": 0.60
@@ -10185,11 +11187,16 @@ fn binance_basis_guarded_live_candidate(
   }},
   "funding_impact": {{
     "summary": {funding_summary},
-    "impact_usd": "0",
+    "impact_usd": {funding_impact_usd},
     "confidence": 0.50
   }},
-  "failure_modes": ["PartialFill", "ManualInterventionRequired", "UnknownState"],
-  "risk_flags": ["FundingRateUnstable", "BasisWidening", "OneLegExecutionRisk"],
+  "liquidity_impact": {{
+    "summary": {liquidity_summary},
+    "impact_usd": "0",
+    "confidence": 0.90
+  }},
+  "failure_modes": ["PartialFill", "VenueOutage"],
+  "risk_flags": [],
   "assumptions": [
     {{
       "assumption_id": "asm:binance-basis-live-public-signal",
@@ -10199,7 +11206,7 @@ fn binance_basis_guarded_live_candidate(
     }}
   ]
 }}"#,
-        transition_id = json_string(BINANCE_BASIS_LIVE_TRANSITION_ID),
+        transition_id = json_string(&transition_id),
         strategy_id = json_string(BINANCE_BASIS_LIVE_STRATEGY_ID),
         created_at = json_string(created_at),
         spot_event = json_string(&context.spot_event_id),
@@ -10207,19 +11214,22 @@ fn binance_basis_guarded_live_candidate(
         premium_event = json_string(&context.premium_event_id),
         spot_venue = json_string(BINANCE_BASIS_SPOT_VENUE_ID),
         perp_venue = json_string(BINANCE_BASIS_PERP_VENUE_ID),
-        spot_instrument = json_string(BINANCE_BASIS_SPOT_INSTRUMENT_ID),
-        perp_instrument = json_string(BINANCE_BASIS_PERP_INSTRUMENT_ID),
+        spot_instrument = json_string(&context.spot_instrument_id),
+        perp_instrument = json_string(&context.perp_instrument_id),
         account_id = json_string(BINANCE_GUARDED_LIVE_ACCOUNT_REF),
-        venue_symbol = json_string(BASIS_SYMBOL),
+        venue_symbol = json_string(&context.symbol),
         quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
-        base_asset = json_string(BASIS_BASE_ASSET_ID),
+        base_asset = json_string(&context.base_asset_id),
         notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
         quantity = json_string(&context.signal.quantity),
         short_quantity = json_string(&short_quantity),
+        spot_leg_id = json_string(&spot_leg_id),
+        perp_leg_id = json_string(&perp_leg_id),
         spot_client_order_id = json_string(&spot_client_order_id),
         perp_client_order_id = json_string(&perp_client_order_id),
         gross_bps = json_string(&context.signal.gross_bps.to_string()),
         net_bps = json_string(&context.signal.net_bps.to_string()),
+        expected_profit_bps = json_string(&context.signal.expected_profit_bps.to_string()),
         spot_ask = json_string(&context.spot_ask),
         spot_bid = json_string(&context.spot_bid),
         spot_bid_size = json_string(&context.spot_bid_size),
@@ -10230,6 +11240,7 @@ fn binance_basis_guarded_live_candidate(
         perp_ask_size = json_string(&context.perp_ask_size),
         last_funding_rate = json_string(&context.last_funding_rate),
         expected_profit_usd = json_string(&context.signal.expected_profit_usd),
+        funding_impact_usd = json_string(&context.signal.funding_impact_usd),
         fee_estimate_usd = json_string(&context.signal.fee_estimate_usd),
         slippage_estimate_usd = json_string(&context.signal.slippage_estimate_usd),
         funding_summary = json_string(&format!(
@@ -10238,6 +11249,20 @@ fn binance_basis_guarded_live_candidate(
             context.mark_price,
             context.index_price,
             context.next_funding_time_ms
+        )),
+        liquidity_summary = json_string(&format!(
+            "top_of_book_depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            context
+                .signal
+                .spot_ask_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context.signal.liquidity_required_usd
         )),
     );
     Ok(from_json_strict::<CandidatePortfolioTransition>(
@@ -10251,10 +11276,12 @@ fn binance_basis_guarded_live_manual_risk_decision(
     evaluated_at: &str,
     min_net_bps: i128,
 ) -> RuntimeResult<RiskDecision> {
+    let transition_id = basis_live_transition_id("binance", &context.symbol_slug);
+    let decision_id = basis_live_risk_decision_id("binance", &context.symbol_slug);
     let risk_json = format!(
         r#"{{
   "schema_version": "1.0.0",
-  "decision_id": "risk:trans:binance-basis-guarded-live-auto-001",
+  "decision_id": {decision_id},
   "transition_id": {transition_id},
   "evaluated_at": {evaluated_at},
   "decision": "RequiresManualApproval",
@@ -10320,7 +11347,8 @@ fn binance_basis_guarded_live_manual_risk_decision(
   "reason_codes": ["REQUIRES_MANUAL_APPROVAL"],
   "detail": "Automatic basis signal is a two-leg arbitrage candidate, but dispatch remains gated by same-plan approval, private balances, kill switch, permissions, confirmation and reconciliation."
 }}"#,
-        transition_id = json_string(BINANCE_BASIS_LIVE_TRANSITION_ID),
+        decision_id = json_string(&decision_id),
+        transition_id = json_string(&transition_id),
         evaluated_at = json_string(evaluated_at),
         observed_at = json_string(&context.observed_at),
         min_net_bps = json_string(&min_net_bps.to_string()),
@@ -10337,8 +11365,20 @@ fn bybit_basis_guarded_live_candidate(
     client_order_suffix: &str,
 ) -> RuntimeResult<CandidatePortfolioTransition> {
     let short_quantity = format!("-{}", context.signal.quantity);
-    let spot_client_order_id = format!("rvbS{client_order_suffix}");
-    let perp_client_order_id = format!("rvbP{client_order_suffix}");
+    let transition_id = basis_live_transition_id("bybit", &context.symbol_slug);
+    let spot_leg_id = basis_live_leg_id("bybit", "buy-spot", &context.symbol_slug);
+    let perp_leg_id = basis_live_leg_id("bybit", "short-linear", &context.symbol_slug);
+    let client_symbol = context.symbol_slug.replace('-', "");
+    let spot_client_order_id = if context.symbol == BASIS_SYMBOL {
+        format!("rvbS{client_order_suffix}")
+    } else {
+        format!("rvbS{client_symbol}{client_order_suffix}")
+    };
+    let perp_client_order_id = if context.symbol == BASIS_SYMBOL {
+        format!("rvbP{client_order_suffix}")
+    } else {
+        format!("rvbP{client_symbol}{client_order_suffix}")
+    };
     let candidate_json = format!(
         r#"{{
   "schema_version": "1.0.0",
@@ -10352,8 +11392,8 @@ fn bybit_basis_guarded_live_candidate(
   "current_portfolio_state_ref": "state:bybit-basis-guarded-live-private-redacted",
   "holding_period": {{"kind": "UntilBasisConvergence"}},
   "legs": [
-    {{
-      "leg_id": "candleg:bybit-basis-live-buy-spot-btcusdt",
+	    {{
+	      "leg_id": {spot_leg_id},
       "leg_type": "Trade",
       "venue_id": {spot_venue},
       "instrument_id": {spot_instrument},
@@ -10378,10 +11418,10 @@ fn bybit_basis_guarded_live_candidate(
         "reference_ask_size": {spot_ask_size},
         "reference_market_event_id": {spot_event}
       }},
-      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+	      "failure_modes": ["PartialFill", "VenueOutage"]
     }},
-    {{
-      "leg_id": "candleg:bybit-basis-live-short-linear-btcusdt",
+	    {{
+	      "leg_id": {perp_leg_id},
       "leg_type": "Trade",
       "venue_id": {perp_venue},
       "instrument_id": {perp_instrument},
@@ -10405,7 +11445,7 @@ fn bybit_basis_guarded_live_candidate(
         "reference_market_event_id": {perp_event},
         "reference_premium_event_id": {premium_event}
       }},
-      "failure_modes": ["PartialFill", "VenueOutage", "UnknownState"]
+	      "failure_modes": ["PartialFill", "VenueOutage"]
     }}
   ],
   "expected_post_state_delta": {{
@@ -10420,7 +11460,7 @@ fn bybit_basis_guarded_live_candidate(
   }},
   "expected_economics": {{
     "expected_profit_usd": {expected_profit_usd},
-    "expected_profit_bps": {net_bps},
+    "expected_profit_bps": {expected_profit_bps},
     "fee_estimate_usd": {fee_estimate_usd},
     "slippage_estimate_usd": {slippage_estimate_usd},
     "confidence": 0.60
@@ -10433,11 +11473,16 @@ fn bybit_basis_guarded_live_candidate(
   }},
   "funding_impact": {{
     "summary": {funding_summary},
-    "impact_usd": "0",
+    "impact_usd": {funding_impact_usd},
     "confidence": 0.50
   }},
-  "failure_modes": ["PartialFill", "ManualInterventionRequired", "UnknownState"],
-  "risk_flags": ["FundingRateUnstable", "BasisWidening", "OneLegExecutionRisk"],
+  "liquidity_impact": {{
+    "summary": {liquidity_summary},
+    "impact_usd": "0",
+    "confidence": 0.90
+  }},
+  "failure_modes": ["PartialFill", "VenueOutage"],
+  "risk_flags": [],
   "assumptions": [
     {{
       "assumption_id": "asm:bybit-basis-live-public-signal",
@@ -10447,7 +11492,7 @@ fn bybit_basis_guarded_live_candidate(
     }}
   ]
 }}"#,
-        transition_id = json_string(BYBIT_BASIS_LIVE_TRANSITION_ID),
+        transition_id = json_string(&transition_id),
         strategy_id = json_string(BYBIT_BASIS_LIVE_STRATEGY_ID),
         created_at = json_string(created_at),
         spot_event = json_string(&context.spot_event_id),
@@ -10455,19 +11500,22 @@ fn bybit_basis_guarded_live_candidate(
         premium_event = json_string(&context.premium_event_id),
         spot_venue = json_string(BYBIT_BASIS_SPOT_VENUE_ID),
         perp_venue = json_string(BYBIT_BASIS_PERP_VENUE_ID),
-        spot_instrument = json_string(BYBIT_BASIS_SPOT_INSTRUMENT_ID),
-        perp_instrument = json_string(BYBIT_BASIS_PERP_INSTRUMENT_ID),
+        spot_instrument = json_string(&context.spot_instrument_id),
+        perp_instrument = json_string(&context.perp_instrument_id),
         account_id = json_string(BYBIT_GUARDED_LIVE_ACCOUNT_REF),
-        venue_symbol = json_string(BASIS_SYMBOL),
+        venue_symbol = json_string(&context.symbol),
         quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
-        base_asset = json_string(BASIS_BASE_ASSET_ID),
+        base_asset = json_string(&context.base_asset_id),
         notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
         quantity = json_string(&context.signal.quantity),
         short_quantity = json_string(&short_quantity),
+        spot_leg_id = json_string(&spot_leg_id),
+        perp_leg_id = json_string(&perp_leg_id),
         spot_client_order_id = json_string(&spot_client_order_id),
         perp_client_order_id = json_string(&perp_client_order_id),
         gross_bps = json_string(&context.signal.gross_bps.to_string()),
         net_bps = json_string(&context.signal.net_bps.to_string()),
+        expected_profit_bps = json_string(&context.signal.expected_profit_bps.to_string()),
         spot_ask = json_string(&context.spot_ask),
         spot_bid = json_string(&context.spot_bid),
         spot_bid_size = json_string(&context.spot_bid_size),
@@ -10478,6 +11526,7 @@ fn bybit_basis_guarded_live_candidate(
         perp_ask_size = json_string(&context.perp_ask_size),
         last_funding_rate = json_string(&context.last_funding_rate),
         expected_profit_usd = json_string(&context.signal.expected_profit_usd),
+        funding_impact_usd = json_string(&context.signal.funding_impact_usd),
         fee_estimate_usd = json_string(&context.signal.fee_estimate_usd),
         slippage_estimate_usd = json_string(&context.signal.slippage_estimate_usd),
         funding_summary = json_string(&format!(
@@ -10486,6 +11535,20 @@ fn bybit_basis_guarded_live_candidate(
             context.mark_price,
             context.index_price,
             context.next_funding_time_ms
+        )),
+        liquidity_summary = json_string(&format!(
+            "top_of_book_depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            context
+                .signal
+                .spot_ask_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context.signal.liquidity_required_usd
         )),
     );
     Ok(from_json_strict::<CandidatePortfolioTransition>(
@@ -10499,10 +11562,12 @@ fn bybit_basis_guarded_live_manual_risk_decision(
     evaluated_at: &str,
     min_net_bps: i128,
 ) -> RuntimeResult<RiskDecision> {
+    let transition_id = basis_live_transition_id("bybit", &context.symbol_slug);
+    let decision_id = basis_live_risk_decision_id("bybit", &context.symbol_slug);
     let risk_json = format!(
         r#"{{
   "schema_version": "1.0.0",
-  "decision_id": "risk:trans:bybit-basis-guarded-live-auto-001",
+  "decision_id": {decision_id},
   "transition_id": {transition_id},
   "evaluated_at": {evaluated_at},
   "decision": "RequiresManualApproval",
@@ -10568,7 +11633,249 @@ fn bybit_basis_guarded_live_manual_risk_decision(
   "reason_codes": ["REQUIRES_MANUAL_APPROVAL"],
   "detail": "Automatic Bybit basis signal is a two-leg arbitrage candidate, but dispatch remains gated by same-plan approval, private balances, kill switch, permissions, confirmation and reconciliation."
 }}"#,
-        transition_id = json_string(BYBIT_BASIS_LIVE_TRANSITION_ID),
+        decision_id = json_string(&decision_id),
+        transition_id = json_string(&transition_id),
+        evaluated_at = json_string(evaluated_at),
+        observed_at = json_string(&context.observed_at),
+        min_net_bps = json_string(&min_net_bps.to_string()),
+        net_bps = json_string(&context.signal.net_bps.to_string()),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+    );
+    Ok(from_json_strict::<RiskDecision>(&risk_json)?)
+}
+
+#[cfg(feature = "live-exec")]
+fn okx_basis_guarded_live_candidate(
+    context: &BinanceBasisGuardedLiveSignalContext,
+    created_at: &str,
+    client_order_suffix: &str,
+) -> RuntimeResult<CandidatePortfolioTransition> {
+    let short_quantity = format!("-{}", context.signal.quantity);
+    let transition_id = basis_live_transition_id("okx", &context.symbol_slug);
+    let spot_leg_id = basis_live_leg_id("okx", "buy-spot", &context.symbol_slug);
+    let perp_leg_id = basis_live_leg_id("okx", "short-swap", &context.symbol_slug);
+    let client_symbol = context.symbol_slug.replace('-', "");
+    let spot_client_order_id = if context.symbol == OKX_BASIS_SYMBOL {
+        format!("rvoS{client_order_suffix}")
+    } else {
+        format!("rvoS{client_symbol}{client_order_suffix}")
+    };
+    let perp_client_order_id = if context.symbol == OKX_BASIS_SYMBOL {
+        format!("rvoP{client_order_suffix}")
+    } else {
+        format!("rvoP{client_symbol}{client_order_suffix}")
+    };
+    let candidate_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "transition_id": {transition_id},
+  "strategy_id": {strategy_id},
+  "strategy_version": "1.0.0",
+  "code_version": "code:okx-basis-guarded-live-auto-1",
+  "config_version": "arb-config-v1",
+  "created_at": {created_at},
+  "input_event_refs": [{spot_event},{perp_event},{premium_event}],
+  "current_portfolio_state_ref": "state:okx-basis-guarded-live-private-redacted",
+  "holding_period": {{"kind": "UntilBasisConvergence"}},
+  "legs": [
+	    {{
+	      "leg_id": {spot_leg_id},
+      "leg_type": "Trade",
+      "venue_id": {spot_venue},
+      "instrument_id": {spot_instrument},
+      "account_id": {account_id},
+      "side": "Buy",
+      "asset_flows": [
+        {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}},
+        {{"account_id": {account_id}, "asset_id": {base_asset}, "amount": {quantity}, "direction": "In"}}
+      ],
+      "constraints": {{
+        "basis_leg_role": "spot_buy",
+        "client_order_id": {spot_client_order_id},
+        "gross_basis_bps": {gross_bps},
+        "max_slippage_bps": "5",
+        "net_basis_bps": {net_bps},
+        "notional_usdt": {notional},
+        "post_only": false,
+        "venue_symbol": {venue_symbol},
+        "reference_best_ask": {spot_ask},
+        "reference_best_bid": {spot_bid},
+        "reference_bid_size": {spot_bid_size},
+        "reference_ask_size": {spot_ask_size},
+        "reference_market_event_id": {spot_event}
+      }},
+	      "failure_modes": ["PartialFill", "VenueOutage"]
+    }},
+	    {{
+	      "leg_id": {perp_leg_id},
+      "leg_type": "Trade",
+      "venue_id": {perp_venue},
+      "instrument_id": {perp_instrument},
+      "account_id": {account_id},
+      "side": "Short",
+      "asset_flows": [],
+      "constraints": {{
+        "basis_leg_role": "perp_short",
+        "client_order_id": {perp_client_order_id},
+        "gross_basis_bps": {gross_bps},
+        "last_funding_rate": {last_funding_rate},
+        "max_slippage_bps": "5",
+        "net_basis_bps": {net_bps},
+        "notional_usdt": {notional},
+        "post_only": false,
+        "venue_symbol": {venue_symbol},
+        "reference_best_ask": {perp_ask},
+        "reference_best_bid": {perp_bid},
+        "reference_bid_size": {perp_bid_size},
+        "reference_ask_size": {perp_ask_size},
+        "reference_market_event_id": {perp_event},
+        "reference_premium_event_id": {premium_event}
+      }},
+	      "failure_modes": ["PartialFill", "VenueOutage"]
+    }}
+  ],
+  "expected_post_state_delta": {{
+    "asset_flows": [
+      {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}},
+      {{"account_id": {account_id}, "asset_id": {base_asset}, "amount": {quantity}, "direction": "In"}}
+    ],
+    "position_deltas": [
+      {{"account_id": {account_id}, "instrument_id": {spot_instrument}, "quantity_delta": {quantity}}},
+      {{"account_id": {account_id}, "instrument_id": {perp_instrument}, "quantity_delta": {short_quantity}}}
+    ]
+  }},
+  "expected_economics": {{
+    "expected_profit_usd": {expected_profit_usd},
+    "expected_profit_bps": {expected_profit_bps},
+    "fee_estimate_usd": {fee_estimate_usd},
+    "slippage_estimate_usd": {slippage_estimate_usd},
+    "confidence": 0.60
+  }},
+  "required_capital": {{
+    "asset_requirements": [
+      {{"account_id": {account_id}, "asset_id": {quote_asset}, "amount": {notional}, "direction": "Out"}}
+    ],
+    "recovery_buffer_usd": "1.00"
+  }},
+  "funding_impact": {{
+    "summary": {funding_summary},
+    "impact_usd": {funding_impact_usd},
+    "confidence": 0.50
+  }},
+  "liquidity_impact": {{
+    "summary": {liquidity_summary},
+    "impact_usd": "0",
+    "confidence": 0.90
+  }},
+  "failure_modes": ["PartialFill", "VenueOutage"],
+  "risk_flags": [],
+  "assumptions": [
+    {{
+      "assumption_id": "asm:okx-basis-live-public-signal",
+      "statement": "Automatic live basis signal uses OKX public spot/swap ticker, mark, index and funding endpoints; private balances and both execution venues must be checked before dispatch.",
+      "confidence": 0.50,
+      "source_event_refs": [{spot_event},{perp_event},{premium_event}]
+    }}
+  ]
+}}"#,
+        transition_id = json_string(&transition_id),
+        strategy_id = json_string(OKX_BASIS_LIVE_STRATEGY_ID),
+        created_at = json_string(created_at),
+        spot_event = json_string(&context.spot_event_id),
+        perp_event = json_string(&context.perp_event_id),
+        premium_event = json_string(&context.premium_event_id),
+        spot_venue = json_string(OKX_BASIS_SPOT_VENUE_ID),
+        perp_venue = json_string(OKX_BASIS_PERP_VENUE_ID),
+        spot_instrument = json_string(&context.spot_instrument_id),
+        perp_instrument = json_string(&context.perp_instrument_id),
+        account_id = json_string(OKX_GUARDED_LIVE_ACCOUNT_REF),
+        venue_symbol = json_string(&context.symbol),
+        quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
+        base_asset = json_string(&context.base_asset_id),
+        notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
+        quantity = json_string(&context.signal.quantity),
+        short_quantity = json_string(&short_quantity),
+        spot_leg_id = json_string(&spot_leg_id),
+        perp_leg_id = json_string(&perp_leg_id),
+        spot_client_order_id = json_string(&spot_client_order_id),
+        perp_client_order_id = json_string(&perp_client_order_id),
+        gross_bps = json_string(&context.signal.gross_bps.to_string()),
+        net_bps = json_string(&context.signal.net_bps.to_string()),
+        expected_profit_bps = json_string(&context.signal.expected_profit_bps.to_string()),
+        spot_ask = json_string(&context.spot_ask),
+        spot_bid = json_string(&context.spot_bid),
+        spot_bid_size = json_string(&context.spot_bid_size),
+        spot_ask_size = json_string(&context.spot_ask_size),
+        perp_ask = json_string(&context.perp_ask),
+        perp_bid = json_string(&context.perp_bid),
+        perp_bid_size = json_string(&context.perp_bid_size),
+        perp_ask_size = json_string(&context.perp_ask_size),
+        last_funding_rate = json_string(&context.last_funding_rate),
+        expected_profit_usd = json_string(&context.signal.expected_profit_usd),
+        funding_impact_usd = json_string(&context.signal.funding_impact_usd),
+        fee_estimate_usd = json_string(&context.signal.fee_estimate_usd),
+        slippage_estimate_usd = json_string(&context.signal.slippage_estimate_usd),
+        funding_summary = json_string(&format!(
+            "fundingRate={}, mark_price={}, index_price={}, nextFundingTimeMs={}",
+            context.last_funding_rate,
+            context.mark_price,
+            context.index_price,
+            context.next_funding_time_ms
+        )),
+        liquidity_summary = json_string(&format!(
+            "top_of_book_depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            context
+                .signal
+                .spot_ask_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context.signal.liquidity_required_usd
+        )),
+    );
+    Ok(from_json_strict::<CandidatePortfolioTransition>(
+        &candidate_json,
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn okx_basis_guarded_live_manual_risk_decision(
+    context: &BinanceBasisGuardedLiveSignalContext,
+    evaluated_at: &str,
+    min_net_bps: i128,
+) -> RuntimeResult<RiskDecision> {
+    let transition_id = basis_live_transition_id("okx", &context.symbol_slug);
+    let decision_id = basis_live_risk_decision_id("okx", &context.symbol_slug);
+    let risk_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "decision_id": {decision_id},
+  "transition_id": {transition_id},
+  "evaluated_at": {evaluated_at},
+  "decision": "RequiresManualApproval",
+  "policy_version": "risk-policy:okx-basis-guarded-live-auto-v1",
+  "policy_hash": "hash:okx-basis-guarded-live-auto-v1",
+  "policy_signature_ref": "sigref:risk-policy-unsigned",
+  "input_state_ref": "state:okx-basis-guarded-live-private-redacted",
+  "checks": [
+    {{"check_id":"check:okx-basis-live:public-data-freshness","check_type":"DataFreshness","status":"Pass","severity":"Info","threshold":{{"decimal_value":"5000","unit":"ms"}},"observed":{{"string_value":{observed_at},"unit":"timestamp"}},"reason_code":"CHECK_PASSED","detail":"OKX spot/swap public ticker, mark, index and funding data are present for this fresh automatic basis signal."}},
+    {{"check_id":"check:okx-basis-live:net-basis","check_type":"StrategyExposureLimit","status":"Pass","severity":"Info","threshold":{{"decimal_value":{min_net_bps},"unit":"bps"}},"observed":{{"decimal_value":{net_bps},"unit":"bps"}},"reason_code":"CHECK_PASSED","detail":"Public OKX basis signal net_bps passed the automatic strategy threshold before private checks."}},
+    {{"check_id":"check:okx-basis-live:manual-gate","check_type":"OneLegExecutionRisk","status":"Warning","severity":"Warn","observed":{{"string_value":"two-leg basis live order path requires guarded approval fact","unit":"manual_gate"}},"reason_code":"REQUIRES_MANUAL_APPROVAL","detail":"Spot buy and swap short must share the same plan_hash and still pass private balance, kill switch and execution gates."}},
+    {{"check_id":"check:okx-basis-live:notional-cap","check_type":"StrategyExposureLimit","status":"Pass","severity":"Info","threshold":{{"decimal_value":{notional},"unit":"USDT"}},"observed":{{"decimal_value":{notional},"unit":"USDT"}},"reason_code":"CHECK_PASSED","detail":"Each leg uses the configured small notional cap."}}
+  ],
+  "constraints": [
+    {{"constraint_id":"constraint:okx-basis-live:max-notional","constraint_type":"MaxNotional","field_path":"$.required_capital.asset_requirements","limit":{{"decimal_value":{notional},"unit":"USDT"}}}},
+    {{"constraint_id":"constraint:okx-basis-live:manual-approval","constraint_type":"RequiresManualApproval","field_path":"$.decision","limit":{{"string_value":"automatic guarded approval must reference the same plan_hash","unit":"approval_requirement"}}}}
+  ],
+  "reason_codes": ["REQUIRES_MANUAL_APPROVAL"],
+  "detail": "Automatic OKX basis signal is a two-leg arbitrage candidate, but dispatch remains gated by same-plan approval, private balances, kill switch, permissions, confirmation and reconciliation."
+}}"#,
+        decision_id = json_string(&decision_id),
+        transition_id = json_string(&transition_id),
         evaluated_at = json_string(evaluated_at),
         observed_at = json_string(&context.observed_at),
         min_net_bps = json_string(&min_net_bps.to_string()),
@@ -11686,6 +12993,7 @@ fn live_dispatch_blocking_reasons(
 #[cfg(feature = "live-exec")]
 fn live_dispatch_policy_from_config(
     config: &arb_config::ArbConfig,
+    symbol: &str,
 ) -> RuntimeResult<ExecutionDispatchPolicy> {
     let cap = Amount::new(Decimal::from_str(BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT)?)?;
     let mut kill_switch = if config
@@ -11706,7 +13014,7 @@ fn live_dispatch_policy_from_config(
         kill_switch = kill_switch.with_instrument(InstrumentId::new(instrument)?);
     }
     Ok(ExecutionDispatchPolicy::new(cap)
-        .allow_symbol(BASIS_SYMBOL)?
+        .allow_symbol(symbol)?
         .with_manual_gate_released(true)
         .with_kill_switch(kill_switch))
 }
@@ -11787,6 +13095,42 @@ fn build_bybit_linear_live_adapter(
         )?,
         BybitRealSigningProviderFromEnv::from_default_env()?,
         live::BybitCurlExecTransport::default(),
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn build_okx_spot_live_adapter(
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<
+    live::OkxSpotExecAdapter<OkxRealSigningProviderFromEnv, live::OkxCurlExecTransport>,
+> {
+    Ok(live::OkxSpotExecAdapter::new(
+        live::OkxExecConfig::spot(
+            VenueId::new(OKX_BASIS_SPOT_VENUE_ID)?,
+            AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?,
+            OKX_REST_BASE_URL,
+            signing_policy.clone(),
+        )?,
+        OkxRealSigningProviderFromEnv::from_default_env()?,
+        live::OkxCurlExecTransport::default(),
+    )?)
+}
+
+#[cfg(feature = "live-exec")]
+fn build_okx_swap_live_adapter(
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<
+    live::OkxSwapExecAdapter<OkxRealSigningProviderFromEnv, live::OkxCurlExecTransport>,
+> {
+    Ok(live::OkxSwapExecAdapter::new(
+        live::OkxExecConfig::swap(
+            VenueId::new(OKX_BASIS_PERP_VENUE_ID)?,
+            AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?,
+            OKX_REST_BASE_URL,
+            signing_policy.clone(),
+        )?,
+        OkxRealSigningProviderFromEnv::from_default_env()?,
+        live::OkxCurlExecTransport::default(),
     )?)
 }
 
@@ -11901,6 +13245,48 @@ fn fetch_bybit_unified_private_account_snapshot(
     let balances = adapter.balances(
         &BalanceQuery::new(VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?)
             .for_account(AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?)
+            .for_asset(AssetId::new(BASIS_QUOTE_ASSET_ID)?),
+    )?;
+    Ok(BinancePrivateAccountSnapshot {
+        balance_event_json: to_canonical_json(&batch.balance_event),
+        balances,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_okx_private_account_snapshot(
+    signing_policy: &SigningPolicy,
+    ingested_at: &UtcTimestamp,
+    scope: &str,
+) -> RuntimeResult<BinancePrivateAccountSnapshot> {
+    let signer = OkxRealSigningProviderFromEnv::from_default_env()?;
+    let endpoint = "/api/v5/account/balance?ccy=USDT";
+    let signed = signer.sign_okx_hmac(
+        OkxHmacSigningInput::new(
+            SigningRequestId::new(format!("signing-request/okx-live/account/{scope}"))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(OKX_BASIS_SPOT_VENUE_ID)?,
+            AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?,
+            OkxRestMethod::Get,
+            endpoint,
+            "",
+        )?,
+        signing_policy,
+    )?;
+    let raw_json = fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)?;
+    let mut adapter = OkxPrivateAccountAdapter::new(
+        VenueId::new(OKX_BASIS_SPOT_VENUE_ID)?,
+        AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?,
+        OkxPrivateAccountMarket::TradingAccount,
+        *ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let raw_ref = format!("okx-private-account:{scope}:{endpoint}");
+    let batch = adapter.ingest_account_balance_json(&raw_json, raw_ref, *ingested_at)?;
+    let balances = adapter.balances(
+        &BalanceQuery::new(VenueId::new(OKX_BASIS_SPOT_VENUE_ID)?)
+            .for_account(AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?)
             .for_asset(AssetId::new(BASIS_QUOTE_ASSET_ID)?),
     )?;
     Ok(BinancePrivateAccountSnapshot {
@@ -12278,6 +13664,101 @@ fn fetch_signed_bybit_get_with_curl(
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_signed_okx_get_with_curl(
+    base_url: &str,
+    signed: &arb_signing::real::OkxSignedEndpoint,
+) -> RuntimeResult<String> {
+    let url = format!("{base_url}{}", signed.request_path_for_transport());
+    let headers = [
+        (
+            signed.api_key_header_name(),
+            signed.api_key_header_value().to_owned(),
+        ),
+        (
+            signed.signature_header_name(),
+            signed.signature_header_value().to_owned(),
+        ),
+        (
+            signed.timestamp_header_name(),
+            signed.timestamp_header_value().to_owned(),
+        ),
+        (
+            signed.passphrase_header_name(),
+            signed.passphrase_header_value().to_owned(),
+        ),
+    ];
+    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(&url)?);
+    for (name, value) in headers {
+        let header = format!("{name}: {value}");
+        config.push_str("header = \"");
+        config.push_str(&curl_config_quote_runtime(&header)?);
+        config.push_str("\"\n");
+    }
+    let mut child = Command::new("curl")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--request")
+        .arg("GET")
+        .arg("--connect-timeout")
+        .arg("10")
+        .arg("--max-time")
+        .arg("30")
+        .arg("--write-out")
+        .arg("\n__ARB_OKX_HTTP_STATUS__:%{http_code}")
+        .arg("--config")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot start curl for OKX private signed GET: {error}"),
+        })?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "curl stdin unavailable for OKX private signed GET".to_owned(),
+        })?
+        .write_all(config.as_bytes())
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot write curl config for OKX private signed GET: {error}"),
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("curl failed for OKX private signed GET: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(RuntimeError::LiveMarketData {
+            message: "curl failed before a reliable OKX private HTTP response was available"
+                .to_owned(),
+        });
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let Some((body, status)) = rendered.rsplit_once("\n__ARB_OKX_HTTP_STATUS__:") else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "OKX private signed GET lacked HTTP status marker".to_owned(),
+        });
+    };
+    let status_code = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: "OKX private signed GET returned malformed HTTP status".to_owned(),
+        })?;
+    if !(200..=299).contains(&status_code) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX private signed GET returned HTTP {status_code}: {}",
+                response_snippet(body)
+            ),
+        });
+    }
+    Ok(body.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
 fn curl_config_quote_runtime(value: &str) -> RuntimeResult<String> {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -12492,16 +13973,19 @@ fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> Strin
 
 #[cfg(feature = "live-exec")]
 fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> String {
-    let (title, description) = if report.strategy_id == BYBIT_BASIS_LIVE_STRATEGY_ID {
-        (
+    let (title, description) = match report.strategy_id.as_str() {
+        BYBIT_BASIS_LIVE_STRATEGY_ID => (
             "Bybit Basis GuardedLive Auto Once",
             "本文件记录 Bybit spot-linear basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 linear perp short，两腿下单需要显式实盘确认。",
-        )
-    } else {
-        (
+        ),
+        OKX_BASIS_LIVE_STRATEGY_ID => (
+            "OKX Basis GuardedLive Auto Once",
+            "本文件记录 OKX spot-swap basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 swap short，两腿下单需要显式实盘确认。",
+        ),
+        _ => (
             "Binance Basis GuardedLive Auto Once",
             "本文件记录 Binance spot-perp basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 USD-M perp short，两腿下单需要显式实盘确认。",
-        )
+        ),
     };
     let reasons = if report.blocking_reasons.is_empty() {
         "- none".to_owned()
@@ -15673,6 +17157,35 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "okx-basis-guarded-live-auto-once" {
+        let options = parse_okx_basis_guarded_live_auto_once_args(&args[1..])?;
+        let report = run_okx_basis_guarded_live_auto_once(options)?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: OKX basis auto-once completed; signal_allowed={}; net_bps={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
+            report.signal_allowed,
+            report
+                .net_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            report.planned_order_count,
+            report.dispatch_attempted,
+            report.dispatch_allowed,
+            report.submitted_receipt_count,
+            report.private_confirmation_count,
+            report.protection_attempted,
+            report.protection_receipt_count,
+            report.residual_risk.as_deref().unwrap_or("none"),
+            report.blocking_reasons.len(),
+            output_note
+        ));
+    }
     if args[0] == "binance-wss-book-ticker" {
         let options = parse_binance_wss_book_ticker_args(&args[1..])?;
         let once = options.once;
@@ -15865,7 +17378,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
                 args[0]
             ),
         });
@@ -15920,10 +17433,12 @@ fn help_text() -> String {
         "                                    live-exec only: submit the approved GuardedLive BTCUSDT order and query private confirmation",
         "  binance-guarded-live-auto-once [--config path] [--out dir] [--max-ask price] [--execute-live --i-understand-auto-live-orders]",
         "                                    Single-leg smoke path: fetch fresh Binance BTCUSDT spot quote, then dry-run or explicitly submit live",
-        "  binance-basis-guarded-live-auto-once [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "  binance-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Binance Spot and short Binance USD-M perp after guarded live gates; live mode requires WSS monitor quotes",
-        "  bybit-basis-guarded-live-auto-once [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "  bybit-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Bybit Spot and short Bybit Linear perp after guarded live gates; live mode requires WSS monitor quotes",
+        "  okx-basis-guarded-live-auto-once [--symbol BTC-USDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Two-leg basis path: buy OKX Spot and short OKX Swap after guarded live gates; live mode requires WSS monitor quotes",
         "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
         "  bybit-wss-book-ticker [--bind 127.0.0.1:8802] [--symbol ALL_USDT|BTCUSDT] [--market spot|linear-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
@@ -15974,6 +17489,7 @@ type BinanceGuardedLiveDispatchCliOptions = BinanceGuardedLiveDispatchOptions;
 type BinanceGuardedLiveAutoOnceCliOptions = BinanceGuardedLiveAutoOnceOptions;
 type BinanceBasisGuardedLiveAutoOnceCliOptions = BasisGuardedLiveAutoOnceOptions;
 type BybitBasisGuardedLiveAutoOnceCliOptions = BybitBasisGuardedLiveAutoOnceOptions;
+type OkxBasisGuardedLiveAutoOnceCliOptions = OkxBasisGuardedLiveAutoOnceOptions;
 type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
 type BinanceWssBookTickerCliOptions = BinanceWssBookTickerMonitorOptions;
 type BybitWssBookTickerCliOptions = BybitWssBookTickerMonitorOptions;
@@ -16553,9 +18069,12 @@ fn parse_binance_guarded_live_auto_once_args(
     })
 }
 
-fn parse_binance_basis_guarded_live_auto_once_args(
+fn parse_basis_guarded_live_auto_once_args(
     args: &[String],
-) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceCliOptions> {
+    command_name: &'static str,
+    default_symbol: &'static str,
+) -> RuntimeResult<BasisGuardedLiveAutoOnceOptions> {
+    let mut symbol = default_symbol.to_owned();
     let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
     let mut output_dir = None;
     let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
@@ -16570,6 +18089,13 @@ fn parse_binance_basis_guarded_live_auto_once_args(
 
     while index < args.len() {
         match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
             "--config" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -16643,12 +18169,12 @@ fn parse_binance_basis_guarded_live_auto_once_args(
             }
             value if value.starts_with('-') => {
                 return Err(cli_arg_error(format!(
-                    "unknown binance-basis-guarded-live-auto-once option `{value}`"
+                    "unknown {command_name} option `{value}`"
                 )));
             }
             value => {
                 return Err(cli_arg_error(format!(
-                    "unexpected binance-basis-guarded-live-auto-once positional argument `{value}`"
+                    "unexpected {command_name} positional argument `{value}`"
                 )));
             }
         }
@@ -16656,6 +18182,7 @@ fn parse_binance_basis_guarded_live_auto_once_args(
     }
 
     Ok(BasisGuardedLiveAutoOnceOptions {
+        symbol,
         config_path,
         output_dir,
         min_net_bps,
@@ -16669,19 +18196,34 @@ fn parse_binance_basis_guarded_live_auto_once_args(
     })
 }
 
+fn parse_binance_basis_guarded_live_auto_once_args(
+    args: &[String],
+) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceCliOptions> {
+    parse_basis_guarded_live_auto_once_args(
+        args,
+        "binance-basis-guarded-live-auto-once",
+        BASIS_SYMBOL,
+    )
+}
+
 fn parse_bybit_basis_guarded_live_auto_once_args(
     args: &[String],
 ) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceCliOptions> {
-    parse_binance_basis_guarded_live_auto_once_args(args).map_err(|error| match error {
-        RuntimeError::Module { module, message } => RuntimeError::Module {
-            module,
-            message: message.replace(
-                "binance-basis-guarded-live-auto-once",
-                "bybit-basis-guarded-live-auto-once",
-            ),
-        },
-        other => other,
-    })
+    parse_basis_guarded_live_auto_once_args(
+        args,
+        "bybit-basis-guarded-live-auto-once",
+        BASIS_SYMBOL,
+    )
+}
+
+fn parse_okx_basis_guarded_live_auto_once_args(
+    args: &[String],
+) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceCliOptions> {
+    parse_basis_guarded_live_auto_once_args(
+        args,
+        "okx-basis-guarded-live-auto-once",
+        OKX_BASIS_SYMBOL,
+    )
 }
 
 fn parse_binance_wss_book_ticker_args(
@@ -17738,6 +19280,52 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn okx_basis_live_wss_monitor_quote_becomes_ticker_input() {
+        let raw = r#"{
+          "status":"streaming",
+          "market":"SWAP",
+          "fail_closed":false,
+          "wss_update_count":3,
+          "last_error":null,
+          "rows":[{
+            "symbol":"BTC-USDT",
+            "venue_id":"venue:OKX-SWAP",
+            "instrument_id":"inst:OKX:BTC-USDT-SWAP:SWAP",
+            "best_bid":"101.00",
+            "best_ask":"101.10",
+            "bid_size":"1.2",
+            "ask_size":"1.3",
+            "source_sequence":"2",
+            "source_event_id":"event:venue-data:okx-public:wss-book-ticker:swap:BTC-USDT-SWAP:2:u400900301",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          }]
+        }"#;
+
+        let quote = parse_public_wss_monitor_quote_for_basis(
+            raw,
+            "http://127.0.0.1:8803/api/okx-wss-book-ticker/status",
+            OKX_BASIS_SYMBOL,
+            "SWAP",
+            OKX_BASIS_PERP_VENUE_ID,
+            OKX_BASIS_PERP_INSTRUMENT_ID,
+            UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at"),
+        )
+        .expect("OKX monitor quote");
+        let ticker =
+            public_wss_monitor_quote_to_okx_ticker_json(&quote, "SWAP").expect("ticker json");
+
+        assert!(ticker.contains("\"code\":\"0\""));
+        assert!(ticker.contains("\"instType\":\"SWAP\""));
+        assert!(ticker.contains("\"instId\":\"BTC-USDT-SWAP\""));
+        assert!(ticker.contains("\"bidPx\":\"101.00\""));
+        assert!(ticker.contains("\"askPx\":\"101.10\""));
+        assert!(ticker.contains("\"ts\":\"1778630401000\""));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_basis_live_wss_monitor_rejects_rest_bootstrap_quote() {
         let raw = r#"{
           "status":"streaming",
@@ -18368,6 +19956,7 @@ mod tests {
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
         let report = run_binance_basis_guarded_live_auto_once_from_json(
+            BASIS_SYMBOL,
             spot,
             "test:binance-spot-book",
             perp,
@@ -18376,6 +19965,7 @@ mod tests {
             "test:binance-usdm-premium",
             ingested_at,
             BasisGuardedLiveAutoOnceOptions {
+                symbol: BASIS_SYMBOL.to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("basis-auto")),
                 min_net_bps: 5,
@@ -18422,12 +20012,14 @@ mod tests {
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
         let report = run_bybit_basis_guarded_live_auto_once_from_json(
+            BASIS_SYMBOL,
             spot,
             "test:bybit-spot-ticker",
             linear,
             "test:bybit-linear-ticker",
             ingested_at,
             BybitBasisGuardedLiveAutoOnceOptions {
+                symbol: BASIS_SYMBOL.to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("bybit-basis-auto")),
                 min_net_bps: 5,
@@ -18462,6 +20054,161 @@ mod tests {
         let report_md =
             read_utf8(&output_dir.join("basis_auto_once_report.md")).expect("auto report markdown");
         assert!(report_md.contains("Bybit Basis GuardedLive Auto Once"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_guarded_live_auto_once_builds_non_btc_dry_run() {
+        let spot = r#"{"symbol":"ETHUSDT","bidPrice":"49.90","bidQty":"3.0","askPrice":"50.00","askQty":"4.0"}"#;
+        let perp = r#"{"symbol":"ETHUSDT","bidPrice":"51.00","bidQty":"3.5","askPrice":"51.10","askQty":"4.5","time":1778630400000}"#;
+        let premium = r#"{"symbol":"ETHUSDT","markPrice":"51.00","indexPrice":"50.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_binance_basis_guarded_live_auto_once_from_json(
+            "ETHUSDT",
+            spot,
+            "test:binance-spot-book",
+            perp,
+            "test:binance-usdm-book",
+            premium,
+            "test:binance-usdm-premium",
+            ingested_at,
+            BasisGuardedLiveAutoOnceOptions {
+                symbol: "ETHUSDT".to_owned(),
+                config_path,
+                output_dir: Some(root.path().join("binance-eth-basis-auto")),
+                min_net_bps: 5,
+                max_spot_ask: Some("51.00".to_owned()),
+                min_perp_bid: Some("50.50".to_owned()),
+                spot_wss_monitor_url: None,
+                perp_wss_monitor_url: None,
+                private_order_events_dir: None,
+                execute_live: false,
+                acknowledge_basis_live_orders: false,
+            },
+        )
+        .expect("Binance ETH basis auto once dry run");
+
+        assert_eq!(report.symbol, "ETHUSDT");
+        assert!(report.signal_allowed);
+        assert_eq!(report.planned_order_count, 2);
+        let output_dir = report.output_dir.as_ref().expect("output dir");
+        let plan_preview =
+            read_utf8(&output_dir.join("preview/plan_preview.json")).expect("plan preview");
+        assert!(plan_preview.contains("inst:BINANCE:ETHUSDT:SPOT"));
+        assert!(plan_preview.contains("inst:BINANCE:ETHUSDT:USDM-PERP"));
+        assert!(plan_preview.contains("\"venue_symbol\":\"ETHUSDT\""));
+        assert!(plan_preview.contains("\"asset_id\":\"asset:ETH\""));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvbSethusdt"));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvbPethusdt"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_basis_guarded_live_auto_once_builds_non_btc_dry_run() {
+        let spot = r#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"ETHUSDT","bid1Price":"49.90","bid1Size":"3.0","ask1Price":"50.00","ask1Size":"4.0"}]},"retExtInfo":{},"time":1778630400000}"#;
+        let linear = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"ETHUSDT","bid1Price":"51.00","bid1Size":"3.5","ask1Price":"51.10","ask1Size":"4.5","markPrice":"51.00","indexPrice":"50.00","fundingRate":"0.00010000","nextFundingTime":"1778659200000"}]},"retExtInfo":{},"time":1778630400000}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_bybit_basis_guarded_live_auto_once_from_json(
+            "ETHUSDT",
+            spot,
+            "test:bybit-spot-ticker",
+            linear,
+            "test:bybit-linear-ticker",
+            ingested_at,
+            BybitBasisGuardedLiveAutoOnceOptions {
+                symbol: "ETHUSDT".to_owned(),
+                config_path,
+                output_dir: Some(root.path().join("bybit-eth-basis-auto")),
+                min_net_bps: 5,
+                max_spot_ask: Some("51.00".to_owned()),
+                min_perp_bid: Some("50.50".to_owned()),
+                spot_wss_monitor_url: None,
+                perp_wss_monitor_url: None,
+                private_order_events_dir: None,
+                execute_live: false,
+                acknowledge_basis_live_orders: false,
+            },
+        )
+        .expect("Bybit ETH basis auto once dry run");
+
+        assert_eq!(report.symbol, "ETHUSDT");
+        assert!(report.signal_allowed);
+        assert_eq!(report.planned_order_count, 2);
+        let output_dir = report.output_dir.as_ref().expect("output dir");
+        let plan_preview =
+            read_utf8(&output_dir.join("preview/plan_preview.json")).expect("plan preview");
+        assert!(plan_preview.contains("inst:BYBIT:ETHUSDT:SPOT"));
+        assert!(plan_preview.contains("inst:BYBIT:ETHUSDT:LINEAR-PERP"));
+        assert!(plan_preview.contains("\"venue_symbol\":\"ETHUSDT\""));
+        assert!(plan_preview.contains("\"asset_id\":\"asset:ETH\""));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvbSethusdt"));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvbPethusdt"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn okx_basis_guarded_live_auto_once_builds_non_btc_dry_run() {
+        let spot = r#"{"code":"0","data":[{"instType":"SPOT","instId":"ETH-USDT","bidPx":"49.90","bidSz":"3.0","askPx":"50.00","askSz":"4.0","ts":"1778630400000"}],"msg":""}"#;
+        let swap = r#"{"code":"0","data":[{"instType":"SWAP","instId":"ETH-USDT-SWAP","bidPx":"51.00","bidSz":"3.5","askPx":"51.10","askSz":"4.5","ts":"1778630400000"}],"msg":""}"#;
+        let mark = r#"{"code":"0","data":[{"instType":"SWAP","instId":"ETH-USDT-SWAP","markPx":"51.00","ts":"1778630400000"}],"msg":""}"#;
+        let index = r#"{"code":"0","data":[{"instId":"ETH-USDT","idxPx":"50.00","ts":"1778630400000"}],"msg":""}"#;
+        let funding = r#"{"code":"0","data":[{"instType":"SWAP","instId":"ETH-USDT-SWAP","fundingRate":"0.00010000","fundingTime":"1778630400000","nextFundingTime":"1778659200000","ts":"1778630400000"}],"msg":""}"#;
+        let root = RuntimeTempDir::new().expect("output dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_okx_basis_guarded_live_auto_once_from_json(
+            OkxBasisRawInputs {
+                symbol: "ETH-USDT",
+                raw_spot_ticker: spot,
+                spot_ticker_ref: "test:okx-spot-ticker",
+                raw_swap_ticker: swap,
+                swap_ticker_ref: "test:okx-swap-ticker",
+                raw_mark_price: mark,
+                mark_price_ref: "test:okx-mark-price",
+                raw_index_ticker: index,
+                index_ticker_ref: "test:okx-index-ticker",
+                raw_funding_rate: funding,
+                funding_rate_ref: "test:okx-funding-rate",
+            },
+            ingested_at,
+            OkxBasisGuardedLiveAutoOnceOptions {
+                symbol: "ETH-USDT".to_owned(),
+                config_path,
+                output_dir: Some(root.path().join("okx-eth-basis-auto")),
+                min_net_bps: 5,
+                max_spot_ask: Some("51.00".to_owned()),
+                min_perp_bid: Some("50.50".to_owned()),
+                spot_wss_monitor_url: None,
+                perp_wss_monitor_url: None,
+                private_order_events_dir: None,
+                execute_live: false,
+                acknowledge_basis_live_orders: false,
+            },
+        )
+        .expect("OKX ETH basis auto once dry run");
+
+        assert_eq!(report.symbol, "ETH-USDT");
+        assert!(report.signal_allowed);
+        assert_eq!(report.planned_order_count, 2);
+        let output_dir = report.output_dir.as_ref().expect("output dir");
+        let plan_preview =
+            read_utf8(&output_dir.join("preview/plan_preview.json")).expect("plan preview");
+        assert!(plan_preview.contains("inst:OKX:ETH-USDT:SPOT"));
+        assert!(plan_preview.contains("inst:OKX:ETH-USDT-SWAP:SWAP"));
+        assert!(plan_preview.contains("\"venue_symbol\":\"ETH-USDT\""));
+        assert!(plan_preview.contains("\"asset_id\":\"asset:ETH\""));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvoSethusdt"));
+        assert!(plan_preview.contains("\"client_order_id\":\"rvoPethusdt"));
     }
 
     #[cfg(feature = "live-exec")]
@@ -18853,6 +20600,108 @@ mod tests {
     }
 
     #[cfg(feature = "live-exec")]
+    #[test]
+    fn okx_basis_live_dispatch_uses_okx_order_query_markets() {
+        let spot = test_basis_planned_order_with_symbol_for_account(
+            "spot_buy",
+            OKX_BASIS_SPOT_VENUE_ID,
+            OKX_BASIS_SPOT_INSTRUMENT_ID,
+            OKX_GUARDED_LIVE_ACCOUNT_REF,
+            OKX_BASIS_SYMBOL,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvoS1778630400",
+            "idem:test:okx-basis:spot",
+        );
+        let swap = test_basis_planned_order_with_symbol_for_account(
+            "perp_short",
+            OKX_BASIS_PERP_VENUE_ID,
+            OKX_BASIS_PERP_INSTRUMENT_ID,
+            OKX_GUARDED_LIVE_ACCOUNT_REF,
+            OKX_BASIS_SYMBOL,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvoP1778630400",
+            "idem:test:okx-basis:swap",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:okx-basis-dispatch".to_owned(),
+            requests: vec![spot, swap],
+        };
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                OKX_BASIS_SPOT_VENUE_ID,
+                "okx-spot-submit",
+            ))],
+            vec![],
+            vec![Ok(test_private_order_update(
+                arb_venue_exec::PrivateOrderMarket::OkxSpot,
+                OKX_BASIS_SPOT_VENUE_ID,
+                OKX_BASIS_SPOT_INSTRUMENT_ID,
+                OrderConfirmationStatus::Filled,
+                Some("0.100"),
+                Some(OrderSide::Buy),
+            ))],
+        );
+        let mut swap_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                OKX_BASIS_PERP_VENUE_ID,
+                "okx-swap-submit",
+            ))],
+            vec![],
+            vec![Ok(test_private_order_update(
+                arb_venue_exec::PrivateOrderMarket::OkxSwap,
+                OKX_BASIS_PERP_VENUE_ID,
+                OKX_BASIS_PERP_INSTRUMENT_ID,
+                OrderConfirmationStatus::Filled,
+                Some("0.100"),
+                Some(OrderSide::Sell),
+            ))],
+        );
+
+        let outcome = execute_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut swap_adapter,
+            BasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630400",
+                private_order_events: None,
+                spot_market: PrivateOrderMarket::OkxSpot,
+                perp_market: PrivateOrderMarket::OkxSwap,
+                order_query_event_prefix: "event:okx:basis-order-query",
+            },
+        )
+        .expect("OKX dispatch outcome");
+
+        assert_eq!(outcome.primary_submit_receipt_count, 2);
+        assert!(outcome.blocking_reasons.is_empty());
+        assert_eq!(outcome.confirmations.len(), 2);
+        assert_eq!(spot_adapter.confirmed.len(), 1);
+        assert_eq!(swap_adapter.confirmed.len(), 1);
+        assert!(spot_adapter.confirmed[0]
+            .source_event_id
+            .starts_with("event:okx:basis-order-query:spot-after-submit"));
+        assert!(swap_adapter.confirmed[0]
+            .source_event_id
+            .starts_with("event:okx:basis-order-query:perp-after-submit"));
+        assert_eq!(
+            spot_adapter.confirmed[0].account_id.as_str(),
+            OKX_GUARDED_LIVE_ACCOUNT_REF
+        );
+        assert_eq!(
+            swap_adapter.confirmed[0].venue_id.as_str(),
+            OKX_BASIS_PERP_VENUE_ID
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
     struct ScriptedBasisLiveAdapter {
         submit_results: std::collections::VecDeque<
             Result<MutableActionReceipt, arb_venue_exec::VenueExecError>,
@@ -18962,9 +20811,37 @@ mod tests {
         client_order_id: &str,
         idempotency_key: &str,
     ) -> PlannedSubmitOrder {
+        test_basis_planned_order_with_symbol_for_account(
+            basis_leg_role,
+            venue_id,
+            instrument_id,
+            account_id,
+            BASIS_SYMBOL,
+            side,
+            quantity,
+            limit_price,
+            client_order_id,
+            idempotency_key,
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[allow(clippy::too_many_arguments)]
+    fn test_basis_planned_order_with_symbol_for_account(
+        basis_leg_role: &str,
+        venue_id: &str,
+        instrument_id: &str,
+        account_id: &str,
+        venue_symbol: &str,
+        side: OrderSide,
+        quantity: &str,
+        limit_price: &str,
+        client_order_id: &str,
+        idempotency_key: &str,
+    ) -> PlannedSubmitOrder {
         PlannedSubmitOrder {
             plan_leg_id: format!("pleg:test:{basis_leg_role}"),
-            venue_symbol: BASIS_SYMBOL.to_owned(),
+            venue_symbol: venue_symbol.to_owned(),
             basis_leg_role: Some(basis_leg_role.to_owned()),
             notional_usd: Amount::from_str("10.00").expect("notional"),
             request: SubmitOrderRequest::new(
@@ -19025,12 +20902,16 @@ mod tests {
             arb_venue_exec::PrivateOrderMarket::UsdmFutures => "binance:usdm",
             arb_venue_exec::PrivateOrderMarket::BybitSpot => "bybit-spot",
             arb_venue_exec::PrivateOrderMarket::BybitLinear => "bybit-linear",
+            arb_venue_exec::PrivateOrderMarket::OkxSpot => "okx-spot",
+            arb_venue_exec::PrivateOrderMarket::OkxSwap => "okx-swap",
         };
         let account_id = match market {
             arb_venue_exec::PrivateOrderMarket::Spot
             | arb_venue_exec::PrivateOrderMarket::UsdmFutures => BINANCE_GUARDED_LIVE_ACCOUNT_REF,
             arb_venue_exec::PrivateOrderMarket::BybitSpot
             | arb_venue_exec::PrivateOrderMarket::BybitLinear => BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            arb_venue_exec::PrivateOrderMarket::OkxSpot
+            | arb_venue_exec::PrivateOrderMarket::OkxSwap => OKX_GUARDED_LIVE_ACCOUNT_REF,
         };
         PrivateOrderUpdate {
             source: OrderConfirmationSource::OrderQuery,
@@ -19038,7 +20919,15 @@ mod tests {
             venue_id: VenueId::new(venue_id).expect("venue"),
             account_id: AccountId::new(account_id).expect("account"),
             instrument_id: InstrumentId::new(instrument_id).expect("instrument"),
-            symbol: BASIS_SYMBOL.to_owned(),
+            symbol: if matches!(
+                market,
+                arb_venue_exec::PrivateOrderMarket::OkxSpot
+                    | arb_venue_exec::PrivateOrderMarket::OkxSwap
+            ) {
+                OKX_BASIS_SYMBOL.to_owned()
+            } else {
+                BASIS_SYMBOL.to_owned()
+            },
             source_event_id: format!("event:test:order-update:{}", status.as_str()),
             event_time: "2026-05-13T00:00:00Z".to_owned(),
             status,
@@ -19073,6 +20962,7 @@ mod tests {
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
         let report = run_binance_basis_guarded_live_auto_once_from_json(
+            BASIS_SYMBOL,
             spot,
             "test:binance-spot-book",
             perp,
@@ -19081,6 +20971,7 @@ mod tests {
             "test:binance-usdm-premium",
             ingested_at,
             BasisGuardedLiveAutoOnceOptions {
+                symbol: BASIS_SYMBOL.to_owned(),
                 config_path: root.path().join("unused.yaml"),
                 output_dir: Some(root.path().join("basis-auto")),
                 min_net_bps: 5,
@@ -19107,6 +20998,31 @@ mod tests {
             .blocking_reasons
             .iter()
             .any(|reason| reason.contains("--min-perp-bid")));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn okx_basis_guarded_live_auto_once_requires_wss_monitors_for_live_execution() {
+        let root = RuntimeTempDir::new().expect("output dir");
+
+        let err = run_okx_basis_guarded_live_auto_once(BasisGuardedLiveAutoOnceOptions {
+            symbol: OKX_BASIS_SYMBOL.to_owned(),
+            config_path: root.path().join("unused.yaml"),
+            output_dir: Some(root.path().join("okx-basis-auto")),
+            min_net_bps: 5,
+            max_spot_ask: Some("100.00".to_owned()),
+            min_perp_bid: Some("101.00".to_owned()),
+            spot_wss_monitor_url: None,
+            perp_wss_monitor_url: None,
+            private_order_events_dir: None,
+            execute_live: true,
+            acknowledge_basis_live_orders: true,
+        })
+        .expect_err("OKX live auto-once must fail before REST fetch without WSS monitors");
+
+        assert!(matches!(err, RuntimeError::UnsafeConfig { .. }));
+        assert!(err.to_string().contains("--spot-wss-monitor-url"));
+        assert!(err.to_string().contains("--perp-wss-monitor-url"));
     }
 
     #[test]

@@ -3675,6 +3675,41 @@ pub struct BybitPrivatePositionBatch {
     pub positions: Vec<VenuePosition>,
 }
 
+/// OKX 私有账户只读市场类型。
+///
+/// 中文说明：该枚举只描述账户快照来源，不表达交易、撤单、划转或签名能力。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OkxPrivateAccountMarket {
+    TradingAccount,
+}
+
+impl OkxPrivateAccountMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TradingAccount => "TradingAccount",
+        }
+    }
+
+    fn event_scope(self) -> &'static str {
+        match self {
+            Self::TradingAccount => "trading",
+        }
+    }
+
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::TradingAccount => "/api/v5/account/balance",
+        }
+    }
+}
+
+/// OKX 私有账户余额快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxPrivateBalanceBatch {
+    pub balance_event: NormalizedEvent,
+    pub balances: Vec<VenueBalance>,
+}
+
 /// Binance 私有账户只读适配器。
 ///
 /// 中文说明：该适配器只消费调用方已经获取到的私有账户 JSON 响应，负责把
@@ -4976,6 +5011,384 @@ impl VenueHealthReader for BybitPrivateAccountAdapter {
     }
 }
 
+/// OKX 私有账户只读适配器。
+///
+/// 中文说明：该适配器只消费调用方已经获取到的 OKX V5 私有账户 JSON 响应，
+/// 负责把 `/api/v5/account/balance` 映射为余额只读快照。它不持有 API key、
+/// 不生成签名、不主动联网，也不提供下单、撤单、划转或改杠杆等可变动作。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxPrivateAccountAdapter {
+    venue_id: VenueId,
+    account_id: AccountId,
+    market: OkxPrivateAccountMarket,
+    max_age_ms: u64,
+    balances: Vec<VenueBalance>,
+    positions: Vec<VenuePosition>,
+    health: VenueHealthSnapshot,
+}
+
+impl OkxPrivateAccountAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        account_id: AccountId,
+        market: OkxPrivateAccountMarket,
+        started_at: UtcTimestamp,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let freshness = DataFreshness::new(started_at, started_at, max_age_ms)?;
+        Ok(Self {
+            venue_id: venue_id.clone(),
+            account_id,
+            market,
+            max_age_ms,
+            balances: Vec::new(),
+            positions: Vec::new(),
+            health: VenueHealthSnapshot {
+                venue_id,
+                status: VenueHealthStatus::Unknown,
+                connection: VenueConnectionStatus::Unknown,
+                reason_codes: vec!["PRIVATE_ACCOUNT_NOT_INGESTED".to_owned()],
+                rate_limit: None,
+                source_event_id: None,
+                freshness,
+            },
+        })
+    }
+
+    pub fn market(&self) -> OkxPrivateAccountMarket {
+        self.market
+    }
+
+    pub fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// 解析 OKX V5 `/api/v5/account/balance` 响应为交易账户余额快照。
+    pub fn ingest_account_balance_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<OkxPrivateBalanceBatch> {
+        let raw_response_ref = raw_response_ref.into();
+        let object = parse_okx_private_object(raw_json, &self.venue_id, ReadOnlySurface::Balance)?;
+        validate_okx_v5_code(&object, &self.venue_id, ReadOnlySurface::Balance)?;
+        let accounts = required_array(
+            &object,
+            "data",
+            self.venue_id.clone(),
+            ReadOnlySurface::Balance,
+        )?;
+        if accounts.is_empty() {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MissingField,
+                "OKX account balance response contains no data rows",
+            )));
+        }
+
+        let mut max_update_time_ms = 0_u64;
+        let mut account_objects = Vec::with_capacity(accounts.len());
+        for (account_index, value) in accounts.iter().enumerate() {
+            let account = required_object_value(
+                value,
+                "data",
+                account_index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            let update_time_ms = required_u64(
+                account,
+                "uTime",
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            max_update_time_ms = max_update_time_ms.max(update_time_ms);
+            account_objects.push(account);
+        }
+        let observed_at = timestamp_from_unix_millis(max_update_time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = max_update_time_ms.to_string();
+        let balance_event_id =
+            okx_private_event_id("balance", self.market, &self.account_id, &source_sequence);
+
+        let mut balances = Vec::new();
+        for account in account_objects {
+            let details = required_array(
+                account,
+                "details",
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            if details.is_empty() {
+                return Err(VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Balance,
+                    ExternalErrorClass::MissingField,
+                    "OKX account balance response contains an empty details array",
+                )));
+            }
+            for (detail_index, value) in details.iter().enumerate() {
+                let detail = required_object_value(
+                    value,
+                    "details",
+                    detail_index,
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Balance,
+                )?;
+                let asset = required_string(
+                    detail,
+                    "ccy",
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Balance,
+                )?;
+                validate_okx_asset_symbol(&asset)?;
+                balances.push(VenueBalance {
+                    venue_id: self.venue_id.clone(),
+                    account_id: self.account_id.clone(),
+                    asset_id: okx_asset_id(&asset)?,
+                    free: parse_amount_surface_field(
+                        detail,
+                        "availBal",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    locked: parse_optional_amount_surface_field(
+                        detail,
+                        "frozenBal",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    reserved: parse_optional_amount_surface_field(
+                        detail,
+                        "ordFrozen",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    pending: zero_amount(),
+                    borrowed: parse_optional_amount_surface_field(
+                        detail,
+                        "liab",
+                        &self.venue_id,
+                        ReadOnlySurface::Balance,
+                    )?,
+                    lent: zero_amount(),
+                    unsettled: zero_amount(),
+                    source_event_id: Some(balance_event_id.clone()),
+                    freshness,
+                });
+            }
+        }
+
+        let balance_event = self.balance_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &balances,
+        )?;
+        self.balances = balances.clone();
+        self.positions.clear();
+        self.update_health(freshness, balance_event.event_id.as_str());
+
+        Ok(OkxPrivateBalanceBatch {
+            balance_event,
+            balances,
+        })
+    }
+
+    pub fn classify_http_status(
+        &self,
+        surface: ReadOnlySurface,
+        status_code: u16,
+        detail: impl Into<String>,
+    ) -> ClassifiedExternalError {
+        let class = match status_code {
+            408 | 504 => ExternalErrorClass::Timeout,
+            429 => ExternalErrorClass::RateLimited,
+            500..=599 => ExternalErrorClass::Disconnected,
+            _ => ExternalErrorClass::UnknownExternalState,
+        };
+        ClassifiedExternalError::new(self.venue_id.clone(), surface, class, detail)
+    }
+
+    fn balance_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        balances: &[VenueBalance],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let asset_ids = balances
+            .iter()
+            .map(|balance| balance.asset_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"OkxPrivateAccountAdapter\",\"asset_ids\":{},\"balance_count\":{},\"endpoint\":{},\"freshness\":{},\"kind\":\"OkxPrivateBalanceSnapshot\",\"market\":\"{}\",\"raw_response_ref\":{},\"redaction\":\"private_account_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            json_string_array(asset_ids.iter().map(String::as_str)),
+            balances.len(),
+            json_string(self.market.endpoint()),
+            freshness_payload_json(freshness),
+            self.market.as_str(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: okx_private_event_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::BalanceSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:okx-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "okx:private:{}:{}:{source_sequence}:balance",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: okx_private_correlation_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn update_health(&mut self, freshness: DataFreshness, source_event_id: &str) {
+        self.health.status = if freshness.is_stale() {
+            VenueHealthStatus::Degraded
+        } else {
+            VenueHealthStatus::Healthy
+        };
+        self.health.connection = VenueConnectionStatus::Connected;
+        self.health.reason_codes = if freshness.is_stale() {
+            vec!["DATA_STALE".to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.health.source_event_id = Some(source_event_id.to_owned());
+        self.health.freshness = freshness;
+    }
+}
+
+impl VenueReadAdapter for OkxPrivateAccountAdapter {
+    fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+}
+
+impl MarketDataReader for OkxPrivateAccountAdapter {
+    fn latest_quote(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<MarketQuote>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "OKX private account adapter has no market data surface".to_owned(),
+        })
+    }
+
+    fn order_book(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<OrderBookSnapshot>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "OKX private account adapter has no order book surface".to_owned(),
+        })
+    }
+}
+
+impl BalanceReader for OkxPrivateAccountAdapter {
+    fn balances(&self, query: &BalanceQuery) -> VenueDataResult<Vec<VenueBalance>> {
+        Ok(self
+            .balances
+            .iter()
+            .filter(|balance| balance.venue_id == query.venue_id)
+            .filter(|balance| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &balance.account_id)
+            })
+            .filter(|balance| {
+                query
+                    .asset_id
+                    .as_ref()
+                    .is_none_or(|asset_id| asset_id == &balance.asset_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl PositionReader for OkxPrivateAccountAdapter {
+    fn positions(&self, query: &PositionQuery) -> VenueDataResult<Vec<VenuePosition>> {
+        Ok(self
+            .positions
+            .iter()
+            .filter(|position| position.venue_id == query.venue_id)
+            .filter(|position| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &position.account_id)
+            })
+            .filter(|position| {
+                query
+                    .instrument_id
+                    .as_ref()
+                    .is_none_or(|instrument_id| instrument_id == &position.instrument_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl InstrumentInfoReader for OkxPrivateAccountAdapter {
+    fn instruments(&self, _query: &InstrumentInfoQuery) -> VenueDataResult<Vec<InstrumentInfo>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::InstrumentInfo,
+            reason: "OKX private account adapter does not define instrument metadata".to_owned(),
+        })
+    }
+}
+
+impl VenueHealthReader for OkxPrivateAccountAdapter {
+    fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
+        if venue_id == &self.venue_id {
+            Ok(self.health.clone())
+        } else {
+            Err(VenueDataError::DataUnavailable {
+                venue_id: venue_id.clone(),
+                surface: ReadOnlySurface::VenueHealth,
+                reason: "adapter only tracks its configured venue".to_owned(),
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EventEnvelope {
     event_id: String,
@@ -5380,6 +5793,25 @@ fn validate_bybit_asset_symbol(asset: &str) -> VenueDataResult<()> {
     Ok(())
 }
 
+fn validate_okx_asset_symbol(asset: &str) -> VenueDataResult<()> {
+    if asset.is_empty() || asset.len() > 32 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "okx.asset",
+            reason: "asset symbol length must be 1..=32",
+        });
+    }
+    if !asset
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "okx.asset",
+            reason: "asset symbol must contain only uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
+}
+
 fn validate_binance_asset_symbol(asset: &str) -> VenueDataResult<()> {
     if asset.is_empty() || asset.len() > 32 {
         return Err(VenueDataError::InvalidQuery {
@@ -5440,6 +5872,21 @@ fn parse_bybit_private_object(
     })
 }
 
+fn parse_okx_private_object(
+    raw_json: &str,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<BTreeMap<String, FlatJsonValue>> {
+    FlatJsonParser::new(raw_json).parse().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            error.to_string(),
+        ))
+    })
+}
+
 fn validate_bybit_v5_ret_code(
     object: &BTreeMap<String, FlatJsonValue>,
     venue_id: &VenueId,
@@ -5456,6 +5903,25 @@ fn validate_bybit_v5_ret_code(
         surface,
         ExternalErrorClass::UnknownExternalState,
         format!("Bybit V5 private response returned retCode={ret_code}: {ret_msg}"),
+    )))
+}
+
+fn validate_okx_v5_code(
+    object: &BTreeMap<String, FlatJsonValue>,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<()> {
+    let code = required_string(object, "code", venue_id.clone(), surface)?;
+    if code == "0" {
+        return Ok(());
+    }
+    let msg = optional_string(object, "msg", venue_id.clone(), surface)?
+        .unwrap_or_else(|| "missing msg".to_owned());
+    Err(VenueDataError::External(ClassifiedExternalError::new(
+        venue_id.clone(),
+        surface,
+        ExternalErrorClass::UnknownExternalState,
+        format!("OKX V5 private response returned code={code}: {msg}"),
     )))
 }
 
@@ -5992,6 +6458,11 @@ fn bybit_asset_id(asset: &str) -> VenueDataResult<AssetId> {
     AssetId::new(format!("asset:{asset}")).map_err(VenueDataError::from)
 }
 
+fn okx_asset_id(asset: &str) -> VenueDataResult<AssetId> {
+    validate_okx_asset_symbol(asset)?;
+    AssetId::new(format!("asset:{asset}")).map_err(VenueDataError::from)
+}
+
 fn binance_usdm_instrument_id(symbol: &str) -> VenueDataResult<InstrumentId> {
     validate_binance_symbol(symbol)?;
     InstrumentId::new(format!("inst:BINANCE:{symbol}:USDM-PERP")).map_err(VenueDataError::from)
@@ -6233,6 +6704,30 @@ fn bybit_private_correlation_id(
 ) -> String {
     format!(
         "corr:venue-data:bybit-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn okx_private_event_id(
+    kind: &str,
+    market: OkxPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:okx-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn okx_private_correlation_id(
+    kind: &str,
+    market: OkxPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "corr:venue-data:okx-private:{kind}:{}:{account_id}:{source_sequence}",
         market.event_scope()
     )
 }
@@ -6692,6 +7187,68 @@ mod tests {
         let health = adapter.venue_health(&venue_id).expect("health read");
         assert_eq!(health.status, VenueHealthStatus::Healthy);
         assert_eq!(health.connection, VenueConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn okx_private_account_balance_maps_trading_account_details() {
+        let venue_id = VenueId::new("venue:OKX-PRIVATE").expect("venue id");
+        let account_id = AccountId::new("account:okx-trading-unit").expect("account id");
+        let mut adapter = OkxPrivateAccountAdapter::new(
+            venue_id.clone(),
+            account_id.clone(),
+            OkxPrivateAccountMarket::TradingAccount,
+            timestamp("2023-11-14T22:13:20Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_account_balance_json(
+                r#"{"code":"0","msg":"","data":[{"uTime":"1700000000123","details":[{"ccy":"USDT","availBal":"123.45","frozenBal":"1.00","ordFrozen":"2.00","liab":"0.50"},{"ccy":"BTC","availBal":"0.01000000","frozenBal":"0","ordFrozen":"0","liab":"0"}]}]}"#,
+                "test:okx-account-balance",
+                timestamp("2023-11-14T22:13:22Z"),
+            )
+            .expect("OKX account balance");
+
+        assert_eq!(batch.balances.len(), 2);
+        let usdt = batch
+            .balances
+            .iter()
+            .find(|balance| balance.asset_id.as_str() == "asset:USDT")
+            .expect("USDT balance");
+        assert_eq!(usdt.account_id, account_id);
+        assert_eq!(usdt.free, amount("123.45"));
+        assert_eq!(usdt.locked, amount("1.00"));
+        assert_eq!(usdt.reserved, amount("2.00"));
+        assert_eq!(usdt.borrowed, amount("0.50"));
+        assert_eq!(
+            batch.balance_event.event_type,
+            NormalizedEventType::BalanceSnapshotEvent
+        );
+        assert!(payload_string(&batch.balance_event, "redaction")
+            .contains("private_account_amounts_available"));
+
+        let queried = adapter
+            .balances(
+                &BalanceQuery::new(venue_id.clone())
+                    .for_account(AccountId::new("account:okx-trading-unit").expect("account id"))
+                    .for_asset(AssetId::new("asset:USDT").expect("asset id")),
+            )
+            .expect("balance query");
+        assert_eq!(queried.len(), 1);
+        let health = adapter.venue_health(&venue_id).expect("health");
+        assert_eq!(health.status, VenueHealthStatus::Healthy);
+
+        assert!(matches!(
+            adapter.latest_quote(&MarketDataQuery::new(
+                venue_id,
+                InstrumentId::new("inst:OKX:BTC-USDT:SPOT").expect("instrument")
+            )),
+            Err(VenueDataError::DataUnavailable {
+                surface: ReadOnlySurface::MarketData,
+                ..
+            })
+        ));
     }
 
     #[test]

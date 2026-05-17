@@ -9,8 +9,8 @@
 use arb_strategy_api::{
     candidate_from_json_strict, validate_candidate_for_context, CandidatePortfolioTransition,
     DataSurface, Identifier, JsonValue, MarketCapability, NormalizedEvent, NormalizedEventType,
-    Strategy, StrategyApiResult, StrategyDiagnostic, StrategyEvaluation, StrategyMetadata,
-    StrategyReadContext, StrategyRejectReason, StrategyRejection,
+    Strategy, StrategyApiError, StrategyApiResult, StrategyDiagnostic, StrategyEvaluation,
+    StrategyMetadata, StrategyReadContext, StrategyRejectReason, StrategyRejection,
 };
 
 const SAMPLE_STRATEGY_ID: &str = "strat:sample-spot-demo";
@@ -39,6 +39,13 @@ const BYBIT_BASIS_PERP_VENUE_ID: &str = "venue:BYBIT-LINEAR";
 const BYBIT_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:SPOT";
 const BYBIT_BASIS_PERP_INSTRUMENT_ID: &str = "inst:BYBIT:BTCUSDT:LINEAR-PERP";
 const BYBIT_BASIS_TRANSITION_ID: &str = "trans:bybit-basis-btcusdt-001";
+const OKX_BASIS_STRATEGY_ID: &str = "strat:okx-spot-swap-basis";
+const OKX_BASIS_CODE_VERSION: &str = "code:okx-spot-swap-basis-1";
+const OKX_BASIS_SPOT_VENUE_ID: &str = "venue:OKX-SPOT";
+const OKX_BASIS_PERP_VENUE_ID: &str = "venue:OKX-SWAP";
+const OKX_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:OKX:BTC-USDT:SPOT";
+const OKX_BASIS_PERP_INSTRUMENT_ID: &str = "inst:OKX:BTC-USDT-SWAP:SWAP";
+const OKX_BASIS_TRANSITION_ID: &str = "trans:okx-basis-btc-usdt-001";
 const FIXED_SCALE: i128 = 100_000_000;
 const FIXED_SCALE_DIGITS: usize = 8;
 
@@ -414,6 +421,60 @@ impl SpotPerpBasisStrategyConfig {
             },
         }
     }
+
+    /// 返回 OKX BTC-USDT 参数化策略配置。
+    pub fn okx_btc_usdt() -> Self {
+        Self {
+            instance: StrategyInstanceConfig {
+                strategy_id: OKX_BASIS_STRATEGY_ID.to_owned(),
+                strategy_version: SPOT_PERP_BASIS_STRATEGY_VERSION.to_owned(),
+                code_version: OKX_BASIS_CODE_VERSION.to_owned(),
+                strategy_label: "okx spot-swap basis strategy".to_owned(),
+                venue_family_label: "OKX".to_owned(),
+            },
+            symbol: BasisSymbolConfig {
+                symbol: "BTC-USDT".to_owned(),
+                base_asset_id: "asset:BTC".to_owned(),
+                quote_asset_id: "asset:USDT".to_owned(),
+                spot: BasisLegConfig {
+                    venue_id: OKX_BASIS_SPOT_VENUE_ID.to_owned(),
+                    instrument_id: OKX_BASIS_SPOT_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:okx-basis-readonly".to_owned(),
+                    leg_id: "candleg:okx-basis-buy-spot-btc-usdt".to_owned(),
+                    basis_role: "Spot".to_owned(),
+                    basis_leg_role: "spot_buy".to_owned(),
+                    venue_label: "OKX spot".to_owned(),
+                    instrument_label: "spot".to_owned(),
+                },
+                perp: BasisLegConfig {
+                    venue_id: OKX_BASIS_PERP_VENUE_ID.to_owned(),
+                    instrument_id: OKX_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:okx-basis-readonly".to_owned(),
+                    leg_id: "candleg:okx-basis-short-swap-btc-usdt".to_owned(),
+                    basis_role: "Perp".to_owned(),
+                    basis_leg_role: "perp_short".to_owned(),
+                    venue_label: "OKX swap".to_owned(),
+                    instrument_label: "USDT swap".to_owned(),
+                },
+            },
+            economics: BasisEconomicsConfig {
+                notional_usd: DEFAULT_BASIS_NOTIONAL_USD.to_owned(),
+                spot_taker_fee_bps: DEFAULT_BASIS_SPOT_TAKER_FEE_BPS,
+                perp_taker_fee_bps: DEFAULT_BASIS_PERP_TAKER_FEE_BPS,
+                slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
+                min_net_bps: DEFAULT_BASIS_MIN_NET_BPS,
+            },
+            output: BasisOutputConfig {
+                transition_id: OKX_BASIS_TRANSITION_ID.to_owned(),
+                assumption_id: "asm:okx-basis-public-data-readonly".to_owned(),
+                premium_index_label: "fundingRate".to_owned(),
+                expected_economics_confidence: "0.72".to_owned(),
+                funding_impact_confidence: "0.6".to_owned(),
+                assumption_confidence: "0.72".to_owned(),
+                recovery_buffer_usd: "1.00".to_owned(),
+            },
+        }
+    }
 }
 
 /// 策略身份和实例文案。
@@ -471,6 +532,90 @@ pub struct BasisOutputConfig {
     pub recovery_buffer_usd: String,
 }
 
+fn validate_spot_perp_basis_config(config: &SpotPerpBasisStrategyConfig) -> StrategyApiResult<()> {
+    ensure_non_empty_basis_config("symbol.symbol", &config.symbol.symbol)?;
+    let notional = parse_non_negative_basis_config_decimal(
+        "economics.notional_usd",
+        &config.economics.notional_usd,
+    )?;
+    if notional.is_zero() {
+        return Err(invalid_basis_config(
+            "economics.notional_usd",
+            "notional must be greater than zero",
+        ));
+    }
+    ensure_non_negative_basis_bps(
+        "economics.spot_taker_fee_bps",
+        config.economics.spot_taker_fee_bps,
+    )?;
+    ensure_non_negative_basis_bps(
+        "economics.perp_taker_fee_bps",
+        config.economics.perp_taker_fee_bps,
+    )?;
+    ensure_non_negative_basis_bps(
+        "economics.slippage_buffer_bps",
+        config.economics.slippage_buffer_bps,
+    )?;
+    ensure_non_negative_basis_bps("economics.min_net_bps", config.economics.min_net_bps)?;
+    parse_non_negative_basis_config_decimal(
+        "output.recovery_buffer_usd",
+        &config.output.recovery_buffer_usd,
+    )?;
+    validate_basis_confidence(
+        "output.expected_economics_confidence",
+        &config.output.expected_economics_confidence,
+    )?;
+    validate_basis_confidence(
+        "output.funding_impact_confidence",
+        &config.output.funding_impact_confidence,
+    )?;
+    validate_basis_confidence(
+        "output.assumption_confidence",
+        &config.output.assumption_confidence,
+    )?;
+    Ok(())
+}
+
+fn ensure_non_empty_basis_config(field: &'static str, value: &str) -> StrategyApiResult<()> {
+    if value.trim().is_empty() {
+        return Err(invalid_basis_config(field, "value cannot be empty"));
+    }
+    Ok(())
+}
+
+fn ensure_non_negative_basis_bps(field: &'static str, value: i128) -> StrategyApiResult<()> {
+    if value < 0 {
+        return Err(invalid_basis_config(field, "bps value cannot be negative"));
+    }
+    Ok(())
+}
+
+fn parse_non_negative_basis_config_decimal(
+    field: &'static str,
+    value: &str,
+) -> StrategyApiResult<FixedDecimal> {
+    FixedDecimal::parse_non_negative(field, value)
+        .map_err(|message| invalid_basis_config(field, message))
+}
+
+fn validate_basis_confidence(field: &'static str, value: &str) -> StrategyApiResult<()> {
+    let confidence = parse_non_negative_basis_config_decimal(field, value)?;
+    if confidence.raw > FIXED_SCALE {
+        return Err(invalid_basis_config(
+            field,
+            "confidence must be between 0 and 1",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_basis_config(field: &'static str, message: impl Into<String>) -> StrategyApiError {
+    StrategyApiError::InvalidInput {
+        field,
+        message: message.into(),
+    }
+}
+
 /// 参数化现货-永续 basis 只读策略。
 ///
 /// 中文说明：策略只读取已经标准化的公共行情事件，计算买现货、做空永续的
@@ -490,6 +635,7 @@ impl SpotPerpBasisStrategy {
 
     /// 使用显式配置创建 spot-perp basis 只读策略。
     pub fn with_config(config: SpotPerpBasisStrategyConfig) -> StrategyApiResult<Self> {
+        validate_spot_perp_basis_config(&config)?;
         let metadata = StrategyMetadata::new(
             &config.instance.strategy_id,
             &config.instance.strategy_version,
@@ -613,10 +759,13 @@ impl SpotPerpBasisStrategy {
         let config_version = context.config().config_version();
         let quantity = &opportunity.signal.quantity;
         let expected_profit_usd = &opportunity.signal.expected_profit_usd;
+        let expected_profit_bps = opportunity.signal.expected_profit_bps.to_string();
+        let funding_impact_usd = &opportunity.signal.funding_impact_usd;
         let fee_estimate_usd = &opportunity.signal.fee_estimate_usd;
         let slippage_estimate_usd = &opportunity.signal.slippage_estimate_usd;
         let gross_bps = opportunity.signal.gross_bps.to_string();
         let net_bps = opportunity.signal.net_bps.to_string();
+        let funding_bps = opportunity.signal.funding_bps.to_string();
         let total_cost_bps = opportunity.signal.total_cost_bps.to_string();
         let assumption = format!(
             "Read-only {} public data signal: buy {} at {}, short {} at {}, gross_basis_bps={}, total_cost_bps={}, net_basis_bps={}. Static fee/slippage assumptions must be replaced with account-specific checks before any order path.",
@@ -636,6 +785,20 @@ impl SpotPerpBasisStrategy {
             opportunity.premium.mark_price.format_trimmed(),
             opportunity.premium.index_price.format_trimmed(),
             opportunity.premium.next_funding_time_ms
+        );
+        let liquidity_summary = format!(
+            "Top-of-book depth checked before candidate emission: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}.",
+            opportunity
+                .signal
+                .spot_ask_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity
+                .signal
+                .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity.signal.liquidity_required_usd
         );
 
         let candidate_json = format!(
@@ -682,12 +845,13 @@ impl SpotPerpBasisStrategy {
         "notional_usdt": {},
         "reference_best_ask": {},
         "reference_best_bid": {},
+        "reference_bid_size": {},
+        "reference_ask_size": {},
         "reference_market_event_id": {}
       }},
       "failure_modes": [
         "PartialFill",
-        "VenueOutage",
-        "UnknownState"
+        "VenueOutage"
       ]
     }},
     {{
@@ -700,6 +864,7 @@ impl SpotPerpBasisStrategy {
       "asset_flows": [],
       "constraints": {{
         "basis_leg_role": {},
+        "funding_bps": {},
         "gross_basis_bps": {},
         "last_funding_rate": {},
         "max_slippage_bps": {},
@@ -707,13 +872,14 @@ impl SpotPerpBasisStrategy {
         "notional_usdt": {},
         "reference_best_ask": {},
         "reference_best_bid": {},
+        "reference_bid_size": {},
+        "reference_ask_size": {},
         "reference_market_event_id": {},
         "reference_premium_event_id": {}
       }},
       "failure_modes": [
         "PartialFill",
-        "VenueOutage",
-        "UnknownState"
+        "VenueOutage"
       ]
     }}
   ],
@@ -765,18 +931,19 @@ impl SpotPerpBasisStrategy {
   }},
   "funding_impact": {{
     "summary": {},
-    "impact_usd": "0",
+    "impact_usd": {},
     "confidence": {}
+  }},
+  "liquidity_impact": {{
+    "summary": {},
+    "impact_usd": "0",
+    "confidence": 0.90
   }},
   "failure_modes": [
     "PartialFill",
-    "ManualInterventionRequired",
-    "UnknownState"
+    "VenueOutage"
   ],
   "risk_flags": [
-    "FundingRateUnstable",
-    "BasisWidening",
-    "OneLegExecutionRisk"
   ],
   "assumptions": [
     {{
@@ -812,12 +979,15 @@ impl SpotPerpBasisStrategy {
             json_string(&config.economics.notional_usd),
             json_string(&opportunity.spot.best_ask.format_trimmed()),
             json_string(&opportunity.spot.best_bid.format_trimmed()),
+            json_string(&opportunity.spot.bid_size.format_trimmed()),
+            json_string(&opportunity.spot.ask_size.format_trimmed()),
             json_string(&opportunity.spot.event_id),
             json_string(&perp_leg.leg_id),
             json_string(&perp_leg.venue_id),
             json_string(&perp_leg.instrument_id),
             json_string(&perp_leg.account_id),
             json_string(&perp_leg.basis_leg_role),
+            json_string(&funding_bps),
             json_string(&gross_bps),
             json_string(&opportunity.premium.last_funding_rate),
             json_string(&config.economics.slippage_buffer_bps.to_string()),
@@ -825,6 +995,8 @@ impl SpotPerpBasisStrategy {
             json_string(&config.economics.notional_usd),
             json_string(&opportunity.perp.best_ask.format_trimmed()),
             json_string(&opportunity.perp.best_bid.format_trimmed()),
+            json_string(&opportunity.perp.bid_size.format_trimmed()),
+            json_string(&opportunity.perp.ask_size.format_trimmed()),
             json_string(&opportunity.perp.event_id),
             json_string(&opportunity.premium.event_id),
             json_string(&config.symbol.quote_asset_id),
@@ -840,7 +1012,7 @@ impl SpotPerpBasisStrategy {
             json_string(&perp_leg.account_id),
             json_string(&format!("-{quantity}")),
             json_string(expected_profit_usd),
-            json_string(&net_bps),
+            json_string(&expected_profit_bps),
             json_string(fee_estimate_usd),
             json_string(slippage_estimate_usd),
             config.output.expected_economics_confidence.as_str(),
@@ -849,7 +1021,9 @@ impl SpotPerpBasisStrategy {
             json_string(&spot_leg.account_id),
             json_string(&config.output.recovery_buffer_usd),
             json_string(&funding_summary),
+            json_string(funding_impact_usd),
             config.output.funding_impact_confidence.as_str(),
+            json_string(&liquidity_summary),
             json_string(&config.output.assumption_id),
             json_string(&assumption),
             config.output.assumption_confidence.as_str(),
@@ -962,8 +1136,11 @@ impl Strategy for SpotPerpBasisStrategy {
             symbol: self.config.symbol.symbol.clone(),
             spot_best_bid: spot.best_bid.format_trimmed(),
             spot_best_ask: spot.best_ask.format_trimmed(),
+            spot_ask_size: Some(spot.ask_size.format_trimmed()),
             perp_best_bid: perp.best_bid.format_trimmed(),
             perp_best_ask: perp.best_ask.format_trimmed(),
+            perp_bid_size: Some(perp.bid_size.format_trimmed()),
+            last_funding_rate: premium.last_funding_rate.clone(),
             notional_usd: self.config.economics.notional_usd.clone(),
             spot_taker_fee_bps: self.config.economics.spot_taker_fee_bps,
             perp_taker_fee_bps: self.config.economics.perp_taker_fee_bps,
@@ -1019,6 +1196,11 @@ pub fn bybit_spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrate
     SpotPerpBasisStrategy::with_config(SpotPerpBasisStrategyConfig::bybit_btcusdt())
 }
 
+/// 返回 OKX spot-swap basis 参数化只读策略。
+pub fn okx_spot_swap_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
+    SpotPerpBasisStrategy::with_config(SpotPerpBasisStrategyConfig::okx_btc_usdt())
+}
+
 /// 返回默认 spot-perp basis 只读策略；当前默认保持为 Binance。
 pub fn spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
     binance_spot_perp_basis_strategy()
@@ -1033,8 +1215,11 @@ pub struct SpotPerpBasisSignalInput {
     pub symbol: String,
     pub spot_best_bid: String,
     pub spot_best_ask: String,
+    pub spot_ask_size: Option<String>,
     pub perp_best_bid: String,
     pub perp_best_ask: String,
+    pub perp_bid_size: Option<String>,
+    pub last_funding_rate: String,
     pub notional_usd: String,
     pub spot_taker_fee_bps: i128,
     pub perp_taker_fee_bps: i128,
@@ -1051,10 +1236,16 @@ pub struct SpotPerpBasisSignal {
     pub gross_bps: i128,
     pub total_cost_bps: i128,
     pub net_bps: i128,
+    pub funding_bps: i128,
+    pub expected_profit_bps: i128,
     pub quantity: String,
     pub expected_profit_usd: String,
+    pub funding_impact_usd: String,
     pub fee_estimate_usd: String,
     pub slippage_estimate_usd: String,
+    pub liquidity_required_usd: String,
+    pub spot_ask_depth_usd: Option<String>,
+    pub perp_bid_depth_usd: Option<String>,
     pub is_candidate: bool,
     pub reason: Option<String>,
 }
@@ -1063,40 +1254,109 @@ pub struct SpotPerpBasisSignal {
 pub fn evaluate_spot_perp_basis_signal(
     input: &SpotPerpBasisSignalInput,
 ) -> Result<SpotPerpBasisSignal, String> {
+    ensure_non_negative_signal_bps("spot_taker_fee_bps", input.spot_taker_fee_bps)?;
+    ensure_non_negative_signal_bps("perp_taker_fee_bps", input.perp_taker_fee_bps)?;
+    ensure_non_negative_signal_bps("slippage_buffer_bps", input.slippage_buffer_bps)?;
+    ensure_non_negative_signal_bps("min_net_bps", input.min_net_bps)?;
     let spot_ask = FixedDecimal::parse_non_negative("spot_best_ask", &input.spot_best_ask)?;
     let perp_bid = FixedDecimal::parse_non_negative("perp_best_bid", &input.perp_best_bid)?;
     let notional = FixedDecimal::parse_non_negative("notional_usd", &input.notional_usd)?;
+    if notional.is_zero() {
+        return Err("notional_usd must be greater than zero".to_owned());
+    }
+    let funding_rate =
+        FixedDecimal::parse_signed_rate("last_funding_rate", &input.last_funding_rate)?;
     let gross_bps = gross_basis_bps(perp_bid, spot_ask)?;
     let total_cost_bps =
         input.spot_taker_fee_bps + input.perp_taker_fee_bps + input.slippage_buffer_bps;
     let net_bps = gross_bps - total_cost_bps;
+    let funding_bps = FixedDecimal::bps_from_rate(funding_rate)?;
+    let expected_profit_bps = net_bps
+        .checked_add(funding_bps)
+        .ok_or_else(|| "expected profit bps calculation overflowed".to_owned())?;
     let quantity = FixedDecimal::quantity_for_notional(notional, spot_ask)?;
-    let expected_profit_usd = FixedDecimal::usd_from_bps(notional, net_bps)?;
+    let basis_profit_usd = FixedDecimal::usd_from_bps(notional, net_bps)?;
+    let funding_impact_usd = FixedDecimal::usd_from_rate(notional, funding_rate)?;
+    let expected_profit_usd = basis_profit_usd.checked_add(
+        funding_impact_usd,
+        "expected profit USD calculation overflowed",
+    )?;
     let fee_estimate_usd = FixedDecimal::usd_from_bps(
         notional,
         input.spot_taker_fee_bps + input.perp_taker_fee_bps,
     )?;
     let slippage_estimate_usd = FixedDecimal::usd_from_bps(notional, input.slippage_buffer_bps)?;
-    let is_candidate = net_bps >= input.min_net_bps;
-    let reason = (!is_candidate).then(|| {
-        format!(
-            "basis net_bps={net_bps} below minimum {}; gross_bps={gross_bps}, total_cost_bps={total_cost_bps}",
+    let spot_ask_depth_usd = input
+        .spot_ask_size
+        .as_deref()
+        .map(|value| {
+            FixedDecimal::parse_non_negative("spot_ask_size", value).and_then(|size| {
+                spot_ask.checked_mul_decimal(size, "spot ask depth calculation overflowed")
+            })
+        })
+        .transpose()?;
+    let perp_bid_depth_usd = input
+        .perp_bid_size
+        .as_deref()
+        .map(|value| {
+            FixedDecimal::parse_non_negative("perp_bid_size", value).and_then(|size| {
+                perp_bid.checked_mul_decimal(size, "perp bid depth calculation overflowed")
+            })
+        })
+        .transpose()?;
+    let depth_is_sufficient = match (spot_ask_depth_usd, perp_bid_depth_usd) {
+        (Some(spot_depth), Some(perp_depth)) => {
+            spot_depth.raw >= notional.raw && perp_depth.raw >= notional.raw
+        }
+        _ => true,
+    };
+    let threshold_is_satisfied = expected_profit_bps >= input.min_net_bps;
+    let is_candidate = depth_is_sufficient && threshold_is_satisfied;
+    let reason = if !depth_is_sufficient {
+        Some(format!(
+            "insufficient top-of-book depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            spot_ask_depth_usd
+                .map(FixedDecimal::format_trimmed)
+                .unwrap_or_else(|| "missing".to_owned()),
+            perp_bid_depth_usd
+                .map(FixedDecimal::format_trimmed)
+                .unwrap_or_else(|| "missing".to_owned()),
+            notional.format_trimmed()
+        ))
+    } else if !threshold_is_satisfied {
+        Some(format!(
+            "basis expected_profit_bps={expected_profit_bps} below minimum {}; gross_bps={gross_bps}, total_cost_bps={total_cost_bps}, net_basis_bps={net_bps}, funding_bps={funding_bps}",
             input.min_net_bps
-        )
-    });
+        ))
+    } else {
+        None
+    };
 
     Ok(SpotPerpBasisSignal {
         symbol: input.symbol.clone(),
         gross_bps,
         total_cost_bps,
         net_bps,
+        funding_bps,
+        expected_profit_bps,
         quantity: quantity.format_trimmed(),
         expected_profit_usd: expected_profit_usd.format_trimmed(),
+        funding_impact_usd: funding_impact_usd.format_trimmed(),
         fee_estimate_usd: fee_estimate_usd.format_trimmed(),
         slippage_estimate_usd: slippage_estimate_usd.format_trimmed(),
+        liquidity_required_usd: notional.format_trimmed(),
+        spot_ask_depth_usd: spot_ask_depth_usd.map(FixedDecimal::format_trimmed),
+        perp_bid_depth_usd: perp_bid_depth_usd.map(FixedDecimal::format_trimmed),
         is_candidate,
         reason,
     })
+}
+
+fn ensure_non_negative_signal_bps(field: &'static str, value: i128) -> Result<(), String> {
+    if value < 0 {
+        return Err(format!("`{field}` cannot be negative"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1147,6 +1407,24 @@ struct FixedDecimal {
 impl FixedDecimal {
     fn parse_non_negative(field: &'static str, value: &str) -> Result<Self, String> {
         validate_market_decimal(field, value)?;
+        Self::parse_decimal_body(field, value, false, false)
+    }
+
+    fn parse_signed_rate(field: &'static str, value: &str) -> Result<Self, String> {
+        validate_signed_market_decimal(field, value)?;
+        if let Some(unsigned) = value.strip_prefix('-') {
+            Self::parse_decimal_body(field, unsigned, true, true)
+        } else {
+            Self::parse_decimal_body(field, value, false, true)
+        }
+    }
+
+    fn parse_decimal_body(
+        field: &'static str,
+        value: &str,
+        negative: bool,
+        allow_extra_fractional_digits: bool,
+    ) -> Result<Self, String> {
         let mut raw = 0_i128;
         let mut dot_seen = false;
         let mut frac_digits = 0_usize;
@@ -1155,6 +1433,9 @@ impl FixedDecimal {
                 b'0'..=b'9' => {
                     if dot_seen {
                         if frac_digits == FIXED_SCALE_DIGITS {
+                            if allow_extra_fractional_digits {
+                                continue;
+                            }
                             return Err(format!(
                                 "decimal field `{field}` exceeds {FIXED_SCALE_DIGITS} fractional digits"
                             ));
@@ -1168,9 +1449,7 @@ impl FixedDecimal {
                 }
                 b'.' => dot_seen = true,
                 _ => {
-                    return Err(format!(
-                        "decimal field `{field}` must be a non-negative decimal string"
-                    ));
+                    return Err(format!("decimal field `{field}` must be a decimal string"));
                 }
             }
         }
@@ -1179,7 +1458,17 @@ impl FixedDecimal {
                 .checked_mul(10)
                 .ok_or_else(|| format!("decimal field `{field}` overflowed"))?;
         }
+        let raw = if negative {
+            raw.checked_neg()
+                .ok_or_else(|| format!("decimal field `{field}` overflowed"))?
+        } else {
+            raw
+        };
         Ok(Self { raw })
+    }
+
+    fn is_zero(self) -> bool {
+        self.raw == 0
     }
 
     fn quantity_for_notional(notional: Self, price: Self) -> Result<Self, String> {
@@ -1194,6 +1483,23 @@ impl FixedDecimal {
         Ok(Self { raw })
     }
 
+    fn checked_add(self, other: Self, message: &'static str) -> Result<Self, String> {
+        let raw = self
+            .raw
+            .checked_add(other.raw)
+            .ok_or_else(|| message.to_owned())?;
+        Ok(Self { raw })
+    }
+
+    fn checked_mul_decimal(self, other: Self, message: &'static str) -> Result<Self, String> {
+        let raw = self
+            .raw
+            .checked_mul(other.raw)
+            .and_then(|value| value.checked_div(FIXED_SCALE))
+            .ok_or_else(|| message.to_owned())?;
+        Ok(Self { raw })
+    }
+
     fn usd_from_bps(notional: Self, bps: i128) -> Result<Self, String> {
         let raw = notional
             .raw
@@ -1201,6 +1507,17 @@ impl FixedDecimal {
             .and_then(|value| value.checked_div(10_000))
             .ok_or_else(|| "basis USD calculation overflowed".to_owned())?;
         Ok(Self { raw })
+    }
+
+    fn usd_from_rate(notional: Self, rate: Self) -> Result<Self, String> {
+        notional.checked_mul_decimal(rate, "funding USD calculation overflowed")
+    }
+
+    fn bps_from_rate(rate: Self) -> Result<i128, String> {
+        rate.raw
+            .checked_mul(10_000)
+            .and_then(|value| value.checked_div(FIXED_SCALE))
+            .ok_or_else(|| "funding bps calculation overflowed".to_owned())
     }
 
     fn format_trimmed(self) -> String {
@@ -1231,6 +1548,8 @@ struct BasisBookTickerInput {
     event_id: String,
     best_bid: FixedDecimal,
     best_ask: FixedDecimal,
+    bid_size: FixedDecimal,
+    ask_size: FixedDecimal,
     is_stale: bool,
 }
 
@@ -1275,6 +1594,8 @@ fn latest_basis_book_ticker(
         event_id: event.event_id.as_str().to_owned(),
         best_bid: required_payload_fixed_decimal(event, "best_bid")?,
         best_ask: required_payload_fixed_decimal(event, "best_ask")?,
+        bid_size: required_payload_fixed_decimal(event, "bid_size")?,
+        ask_size: required_payload_fixed_decimal(event, "ask_size")?,
         is_stale: payload_string(event, "risk_reason_code") == Some("DATA_STALE"),
     })
 }
@@ -1393,25 +1714,57 @@ fn payload_string<'a>(event: &'a NormalizedEvent, field: &'static str) -> Option
 }
 
 fn validate_market_decimal(field: &'static str, value: &str) -> Result<(), String> {
+    validate_decimal_string(field, value, false)
+}
+
+fn validate_signed_market_decimal(field: &'static str, value: &str) -> Result<(), String> {
+    validate_decimal_string(field, value, true)
+}
+
+fn validate_decimal_string(
+    field: &'static str,
+    value: &str,
+    allow_negative: bool,
+) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("market quote field `{field}` cannot be empty"));
     }
 
+    let bytes = value.as_bytes();
+    let mut start_index = 0_usize;
+    if bytes[0] == b'-' {
+        if !allow_negative {
+            return Err(format!(
+                "market quote field `{field}` must be a non-negative decimal string"
+            ));
+        }
+        start_index = 1;
+        if start_index == bytes.len() {
+            return Err(format!(
+                "market quote field `{field}` must be a signed decimal string"
+            ));
+        }
+    }
+
     let mut dot_seen = false;
     let mut digits_seen = false;
-    for byte in value.bytes() {
-        match byte {
+    for byte in &bytes[start_index..] {
+        match *byte {
             b'0'..=b'9' => digits_seen = true,
             b'.' if !dot_seen => dot_seen = true,
             _ => {
-                return Err(format!(
-                    "market quote field `{field}` must be a non-negative decimal string"
-                ));
+                let expected = if allow_negative {
+                    "signed decimal string"
+                } else {
+                    "non-negative decimal string"
+                };
+                return Err(format!("market quote field `{field}` must be a {expected}"));
             }
         }
     }
 
-    if !digits_seen || value.starts_with('.') || value.ends_with('.') {
+    let unsigned = &value[start_index..];
+    if !digits_seen || unsigned.starts_with('.') || unsigned.ends_with('.') {
         return Err(format!(
             "market quote field `{field}` must include integer and fractional digits when decimal point is present"
         ));
@@ -1652,11 +2005,11 @@ mod tests {
         assert_eq!(candidate.legs.len(), 2);
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
-            "80"
+            "81"
         );
         assert_eq!(
             candidate.expected_economics.expected_profit_usd.as_str(),
-            "0.8"
+            "0.81"
         );
         assert_eq!(
             candidate.expected_economics.fee_estimate_usd.as_str(),
@@ -1667,10 +2020,31 @@ mod tests {
             "0.05"
         );
         assert_eq!(payload_constraint(candidate, "net_basis_bps"), Some("80"));
+        assert_eq!(
+            payload_constraint(candidate, "reference_ask_size"),
+            Some("2")
+        );
+        assert!(candidate.risk_flags.is_empty());
         assert!(candidate
-            .risk_flags
+            .failure_modes
             .iter()
-            .any(|flag| flag.as_str() == "OneLegExecutionRisk"));
+            .all(|mode| mode.as_str() != "UnknownState"));
+        assert_eq!(
+            candidate
+                .funding_impact
+                .as_ref()
+                .and_then(|impact| impact.impact_usd.as_ref())
+                .map(|value| value.as_str()),
+            Some("0.01")
+        );
+        assert_eq!(
+            candidate
+                .liquidity_impact
+                .as_ref()
+                .and_then(|impact| impact.impact_usd.as_ref())
+                .map(|value| value.as_str()),
+            Some("0")
+        );
         assert!(evaluation.rejection().is_none());
         assert_eq!(
             evaluation.diagnostics()[0].code(),
@@ -1866,6 +2240,97 @@ mod tests {
     }
 
     #[test]
+    fn okx_spot_swap_basis_strategy_outputs_configured_candidate() {
+        let strategy = okx_spot_swap_basis_strategy().expect("strategy");
+        let context = okx_basis_test_context("CHECK_PASSED", "101.00", "101.10", "CHECK_PASSED");
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        let candidate = evaluation.candidate().expect("candidate");
+        assert_eq!(candidate.transition_id.as_str(), OKX_BASIS_TRANSITION_ID);
+        assert_eq!(candidate.strategy_id.as_str(), OKX_BASIS_STRATEGY_ID);
+        assert_eq!(candidate.code_version.as_str(), OKX_BASIS_CODE_VERSION);
+        assert_eq!(candidate.legs.len(), 2);
+        assert_eq!(
+            candidate.legs[0].leg_id.as_str(),
+            "candleg:okx-basis-buy-spot-btc-usdt"
+        );
+        assert_eq!(
+            candidate.legs[0]
+                .venue_id
+                .as_ref()
+                .expect("spot venue")
+                .as_str(),
+            OKX_BASIS_SPOT_VENUE_ID
+        );
+        assert_eq!(
+            candidate.legs[0]
+                .instrument_id
+                .as_ref()
+                .expect("spot instrument")
+                .as_str(),
+            OKX_BASIS_SPOT_INSTRUMENT_ID
+        );
+        assert_eq!(
+            candidate.legs[0]
+                .account_id
+                .as_ref()
+                .expect("spot account")
+                .as_str(),
+            "acct:okx-basis-readonly"
+        );
+        assert_eq!(
+            leg_constraint(candidate, 0, "basis_leg_role"),
+            Some("spot_buy")
+        );
+        assert_eq!(
+            candidate.legs[1].leg_id.as_str(),
+            "candleg:okx-basis-short-swap-btc-usdt"
+        );
+        assert_eq!(
+            candidate.legs[1]
+                .venue_id
+                .as_ref()
+                .expect("swap venue")
+                .as_str(),
+            OKX_BASIS_PERP_VENUE_ID
+        );
+        assert_eq!(
+            candidate.legs[1]
+                .instrument_id
+                .as_ref()
+                .expect("swap instrument")
+                .as_str(),
+            OKX_BASIS_PERP_INSTRUMENT_ID
+        );
+        assert_eq!(
+            candidate.legs[1]
+                .account_id
+                .as_ref()
+                .expect("swap account")
+                .as_str(),
+            "acct:okx-basis-readonly"
+        );
+        assert_eq!(
+            leg_constraint(candidate, 1, "basis_leg_role"),
+            Some("perp_short")
+        );
+        assert_eq!(
+            candidate.expected_post_state_delta.position_deltas[0]
+                .instrument_id
+                .as_str(),
+            OKX_BASIS_SPOT_INSTRUMENT_ID
+        );
+        assert_eq!(
+            candidate.expected_post_state_delta.position_deltas[1]
+                .instrument_id
+                .as_str(),
+            OKX_BASIS_PERP_INSTRUMENT_ID
+        );
+        assert!(evaluation.rejection().is_none());
+    }
+
+    #[test]
     fn bybit_spot_perp_basis_strategy_rejects_missing_capability() {
         let strategy = bybit_spot_perp_basis_strategy().expect("strategy");
         let mut context =
@@ -1960,8 +2425,11 @@ mod tests {
             symbol: "BTCUSDT".to_owned(),
             spot_best_bid: "99.90".to_owned(),
             spot_best_ask: "100.00".to_owned(),
+            spot_ask_size: Some("2.0".to_owned()),
             perp_best_bid: "101.00".to_owned(),
             perp_best_ask: "101.10".to_owned(),
+            perp_bid_size: Some("1.5".to_owned()),
+            last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
             spot_taker_fee_bps: 10,
             perp_taker_fee_bps: 5,
@@ -1973,8 +2441,53 @@ mod tests {
         assert!(signal.is_candidate);
         assert_eq!(signal.gross_bps, 100);
         assert_eq!(signal.net_bps, 80);
-        assert_eq!(signal.expected_profit_usd, "0.8");
+        assert_eq!(signal.funding_bps, 1);
+        assert_eq!(signal.expected_profit_bps, 81);
+        assert_eq!(signal.expected_profit_usd, "0.81");
+        assert_eq!(signal.funding_impact_usd, "0.01");
+        assert_eq!(signal.spot_ask_depth_usd.as_deref(), Some("200"));
+        assert_eq!(signal.perp_bid_depth_usd.as_deref(), Some("151.5"));
         assert_eq!(signal.quantity, "1");
+    }
+
+    #[test]
+    fn spot_perp_basis_signal_rejects_insufficient_top_of_book_depth() {
+        let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: "BTCUSDT".to_owned(),
+            spot_best_bid: "99.90".to_owned(),
+            spot_best_ask: "100.00".to_owned(),
+            spot_ask_size: Some("0.5".to_owned()),
+            perp_best_bid: "101.00".to_owned(),
+            perp_best_ask: "101.10".to_owned(),
+            perp_bid_size: Some("1.5".to_owned()),
+            last_funding_rate: "0.00010000".to_owned(),
+            notional_usd: "100.00".to_owned(),
+            spot_taker_fee_bps: 10,
+            perp_taker_fee_bps: 5,
+            slippage_buffer_bps: 5,
+            min_net_bps: 5,
+        })
+        .expect("signal");
+
+        assert!(!signal.is_candidate);
+        assert_eq!(signal.spot_ask_depth_usd.as_deref(), Some("50"));
+        assert!(signal
+            .reason
+            .as_deref()
+            .expect("reason")
+            .contains("insufficient top-of-book depth"));
+    }
+
+    #[test]
+    fn spot_perp_basis_strategy_rejects_invalid_economics_config() {
+        let mut config = SpotPerpBasisStrategyConfig::binance_btcusdt();
+        config.economics.notional_usd = "0".to_owned();
+
+        let error = SpotPerpBasisStrategy::with_config(config).expect_err("invalid config");
+
+        assert!(error
+            .to_string()
+            .contains("notional must be greater than zero"));
     }
 
     #[test]
@@ -2128,17 +2641,23 @@ mod tests {
             match (venue_id, capability) {
                 (SAMPLE_VENUE_ID, MarketCapability::ProvidesSpotMarkets) => self.has_spot,
                 (
-                    BINANCE_BASIS_SPOT_VENUE_ID | BYBIT_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_VENUE_ID
+                    | BYBIT_BASIS_SPOT_VENUE_ID
+                    | OKX_BASIS_SPOT_VENUE_ID,
                     MarketCapability::ProvidesSpotMarkets
                     | MarketCapability::ProvidesOrderBookMarkets,
                 ) => self.has_basis_spot,
                 (
-                    BINANCE_BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
+                    BINANCE_BASIS_PERP_VENUE_ID
+                    | BYBIT_BASIS_PERP_VENUE_ID
+                    | OKX_BASIS_PERP_VENUE_ID,
                     MarketCapability::ProvidesPerpetuals
                     | MarketCapability::ProvidesOrderBookMarkets,
                 ) => self.has_basis_perp,
                 (
-                    BINANCE_BASIS_PERP_VENUE_ID | BYBIT_BASIS_PERP_VENUE_ID,
+                    BINANCE_BASIS_PERP_VENUE_ID
+                    | BYBIT_BASIS_PERP_VENUE_ID
+                    | OKX_BASIS_PERP_VENUE_ID,
                     MarketCapability::ProvidesFundingRates,
                 ) => self.has_basis_funding,
                 _ => false,
@@ -2154,7 +2673,9 @@ mod tests {
                 BINANCE_BASIS_SPOT_VENUE_ID
                 | BINANCE_BASIS_PERP_VENUE_ID
                 | BYBIT_BASIS_SPOT_VENUE_ID
-                | BYBIT_BASIS_PERP_VENUE_ID => self.has_basis_rest,
+                | BYBIT_BASIS_PERP_VENUE_ID
+                | OKX_BASIS_SPOT_VENUE_ID
+                | OKX_BASIS_PERP_VENUE_ID => self.has_basis_rest,
                 _ => false,
             }
         }
@@ -2188,7 +2709,10 @@ mod tests {
         fn strategy_disabled(&self, strategy_id: &str) -> bool {
             matches!(
                 strategy_id,
-                SAMPLE_STRATEGY_ID | BINANCE_BASIS_STRATEGY_ID | BYBIT_BASIS_STRATEGY_ID
+                SAMPLE_STRATEGY_ID
+                    | BINANCE_BASIS_STRATEGY_ID
+                    | BYBIT_BASIS_STRATEGY_ID
+                    | OKX_BASIS_STRATEGY_ID
             ) && self.disabled_strategy
         }
 
@@ -2200,6 +2724,8 @@ mod tests {
                     | BINANCE_BASIS_PERP_VENUE_ID
                     | BYBIT_BASIS_SPOT_VENUE_ID
                     | BYBIT_BASIS_PERP_VENUE_ID
+                    | OKX_BASIS_SPOT_VENUE_ID
+                    | OKX_BASIS_PERP_VENUE_ID
             ) && self.disabled_venue
         }
     }
@@ -2267,6 +2793,40 @@ mod tests {
         ])
     }
 
+    fn okx_basis_test_context(
+        spot_risk_reason_code: &str,
+        perp_best_bid: &str,
+        perp_best_ask: &str,
+        premium_risk_reason_code: &str,
+    ) -> TestContext {
+        basis_test_context(vec![
+            basis_book_event(
+                "okx-spot",
+                OKX_BASIS_SPOT_VENUE_ID,
+                OKX_BASIS_SPOT_INSTRUMENT_ID,
+                "Spot",
+                "99.90",
+                "100.00",
+                spot_risk_reason_code,
+            ),
+            basis_book_event(
+                "okx-swap",
+                OKX_BASIS_PERP_VENUE_ID,
+                OKX_BASIS_PERP_INSTRUMENT_ID,
+                "Perp",
+                perp_best_bid,
+                perp_best_ask,
+                "CHECK_PASSED",
+            ),
+            basis_premium_event_for(
+                OKX_BASIS_PERP_VENUE_ID,
+                OKX_BASIS_PERP_INSTRUMENT_ID,
+                "0.00010000",
+                premium_risk_reason_code,
+            ),
+        ])
+    }
+
     fn basis_book_event(
         tag: &str,
         venue_id: &str,
@@ -2289,13 +2849,15 @@ mod tests {
   "schema_version": "1.0.0",
   "venue_id": {},
   "instrument_id": {},
-  "payload": {{
-    "basis_role": {},
-    "best_ask": {},
-    "best_bid": {},
-    "kind": "BookTicker",
-    "risk_reason_code": {}
-  }},
+	  "payload": {{
+	    "basis_role": {},
+	    "ask_size": "2.0",
+	    "best_ask": {},
+	    "best_bid": {},
+	    "bid_size": "1.0",
+	    "kind": "BookTicker",
+	    "risk_reason_code": {}
+	  }},
   "checksum": "sha256:fixture-basis-book-{tag}"
 }}"#,
             json_string(venue_id),
