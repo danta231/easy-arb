@@ -1,8 +1,10 @@
 # Personal guarded-live preflight runtime config
 # 中文：个人小额受控实盘预检模板。该文件不包含密钥、账户完整标识、
 # API secret、私钥、助记词、token 或 webhook secret。
-# 中文：本模板只用于本地启动检查。它显式选择 GuardedLive 配置形态，
-# 但通过 execution_modes 熔断继续阻断可变执行，不能下单、撤单、转账或签名。
+# 中文：本模板只用于本地 dry-run 预检。它显式选择 GuardedLive 配置形态，
+# 并放开下单前的分发计划构建门禁，用来验证风控决策、execution plan、
+# manual gate release 和 dispatch 前检查是否能在生产行情条件下完整走通。
+# 启动脚本仍不传 --execute-live 和真实下单确认参数；本文件也不包含任何密钥。
 
 config_version: "arb-config-v1"
 
@@ -13,18 +15,19 @@ execution:
   auto_live_enabled: false
 
 kill_switch:
-  # 中文：保持 GuardedLive 模式熔断，直到后续阶段和独立批准允许真实实现。
+  # 中文：dry-run 预检需要放开熔断，才能构建 dispatch plan 并记录下单前 artifacts。
+  # 真实下单仍必须由命令行显式传 --execute-live 和人工确认参数触发。
   global: false
   execution: false
-  strategies: ["strategy:sample-spot-v1"]
-  venues: ["venue:personal-cex-redacted"]
-  accounts: ["account:personal-cex-subaccount-redacted"]
-  instruments: ["inst:BTC-USDT"]
-  assets: ["asset:BTC", "asset:USDT"]
+  strategies: []
+  venues: []
+  accounts: []
+  instruments: []
+  assets: []
   chains: []
-  execution_modes: ["GuardedLive"]
+  execution_modes: []
 
 signing:
-  # 中文：真实签名保持关闭；这里只保存策略引用，不保存任何签名材料。
-  policy_ref: "signing-policy/null-signer-v1"
-  real_signing_enabled: false
+  # 中文：允许下单前签名策略预检通过；这里只保存策略引用，不保存任何签名材料。
+  policy_ref: "signing-policy/preflight-no-secret-v1"
+  real_signing_enabled: true

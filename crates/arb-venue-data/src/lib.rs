@@ -5737,19 +5737,21 @@ impl<'a> FlatJsonParser<'a> {
 }
 
 fn validate_binance_symbol(symbol: &str) -> VenueDataResult<()> {
-    if symbol.len() < 3 || symbol.len() > 32 {
+    if symbol.len() < 3 || symbol.len() > 64 {
         return Err(VenueDataError::InvalidQuery {
             field: "binance.symbol",
-            reason: "symbol length must be 3..=32",
+            reason: "symbol length must be 3..=64",
         });
     }
-    if !symbol
-        .bytes()
-        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-    {
+    if !symbol.chars().all(|ch| {
+        ch.is_ascii_uppercase()
+            || ch.is_ascii_digit()
+            || (!ch.is_ascii() && !ch.is_control() && !ch.is_whitespace())
+    }) {
         return Err(VenueDataError::InvalidQuery {
             field: "binance.symbol",
-            reason: "symbol must contain only uppercase ASCII letters and digits",
+            reason:
+                "symbol must contain uppercase ASCII letters/digits or non-ASCII symbol characters without whitespace",
         });
     }
     Ok(())
@@ -6554,15 +6556,45 @@ fn current_utc_timestamp(venue_id: &VenueId) -> VenueDataResult<UtcTimestamp> {
     UtcTimestamp::from_unix_parts(seconds, duration.subsec_nanos()).map_err(VenueDataError::from)
 }
 
+fn push_ascii_hex_component(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push('u');
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0f) as usize] as char);
+}
+
+fn symbol_identifier_component(symbol: &str) -> String {
+    if symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return symbol.to_owned();
+    }
+
+    let mut component = String::new();
+    for byte in symbol.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            component.push(byte as char);
+        } else {
+            push_ascii_hex_component(&mut component, byte);
+        }
+    }
+    if component.is_empty() {
+        "symbol".to_owned()
+    } else {
+        component
+    }
+}
+
 fn raw_event_id(symbol: &str, source_sequence: u64) -> String {
+    let symbol = symbol_identifier_component(symbol);
     format!("event:venue-data:binance-public:{symbol}:{source_sequence}:raw")
 }
 
 fn normalized_event_id(symbol: &str, source_sequence: u64) -> String {
+    let symbol = symbol_identifier_component(symbol);
     format!("event:venue-data:binance-public:{symbol}:{source_sequence}:normalized")
 }
 
 fn correlation_id(symbol: &str, source_sequence: u64) -> String {
+    let symbol = symbol_identifier_component(symbol);
     format!("corr:venue-data:binance-public:{symbol}:{source_sequence}")
 }
 
@@ -6572,6 +6604,7 @@ fn binance_public_raw_event_id(
     symbol: &str,
     source_sequence: &str,
 ) -> String {
+    let symbol = symbol_identifier_component(symbol);
     format!(
         "event:venue-data:binance-public:{stream}:{}:{symbol}:{source_sequence}:raw",
         market.event_scope()
@@ -6584,6 +6617,7 @@ fn binance_public_normalized_event_id(
     symbol: &str,
     source_sequence: &str,
 ) -> String {
+    let symbol = symbol_identifier_component(symbol);
     format!(
         "event:venue-data:binance-public:{stream}:{}:{symbol}:{source_sequence}:normalized",
         market.event_scope()
@@ -6596,6 +6630,7 @@ fn binance_public_correlation_id(
     symbol: &str,
     source_sequence: &str,
 ) -> String {
+    let symbol = symbol_identifier_component(symbol);
     format!(
         "corr:venue-data:binance-public:{stream}:{}:{symbol}:{source_sequence}",
         market.event_scope()
@@ -6654,6 +6689,7 @@ fn binance_public_wss_source_event_id(
     local_sequence: u64,
     update_id: u64,
 ) -> String {
+    let symbol = symbol_identifier_component(symbol);
     format!(
         "event:venue-data:binance-public:wss-book-ticker:{}:{symbol}:{local_sequence}:u{update_id}",
         market.event_scope()
@@ -7658,6 +7694,49 @@ mod tests {
             instruments[0].margin_asset_id.as_ref().map(AssetId::as_str),
             Some("asset:USDT")
         );
+    }
+
+    #[test]
+    fn binance_public_book_ticker_keeps_non_ascii_symbol_payload_with_encoded_ids() {
+        let symbol = "中文USDT";
+        let component = symbol_identifier_component(symbol);
+        let asset_usdt = AssetId::new("asset:USDT").expect("asset id");
+        let instrument = BinancePublicInstrument::new(
+            symbol,
+            InstrumentId::new(format!("inst:BINANCE:{component}:SPOT")).expect("instrument id"),
+            AssetId::new(format!("asset:{}", symbol_identifier_component("中文")))
+                .expect("asset id"),
+            asset_usdt.clone(),
+            asset_usdt,
+        )
+        .expect("instrument");
+        let mut adapter = BinancePublicBookTickerAdapter::new(
+            VenueId::new("venue:BINANCE-SPOT").expect("venue id"),
+            instrument,
+            BinancePublicMarket::Spot,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_book_ticker_json(
+                r#"{"symbol":"中文USDT","bidPrice":"99.90","bidQty":"1.20000000","askPrice":"100.00","askQty":"0.80000000"}"#,
+                "test:binance-non-ascii-book-ticker",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("non-ASCII book ticker");
+
+        assert_eq!(
+            payload_string(&batch.normalized_event, "venue_symbol"),
+            symbol
+        );
+        assert!(batch.raw_event.event_id.as_str().contains(&component));
+        assert!(batch
+            .normalized_event
+            .correlation_id
+            .as_str()
+            .contains(&component));
     }
 
     #[test]

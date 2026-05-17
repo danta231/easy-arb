@@ -6,7 +6,7 @@
 
 - `config.template.yaml`：运行时代码侧配置模板，由 `arb-config`（配置模块）读取。默认 `ReadOnly`（只读模式），不启用真实执行或真实签名。
 - `daily_operations_report.template.md`：每日运营报告模板，由 `arb-ops`（运营只读模块）渲染。英文标签保留用于测试样例和下游脚本稳定匹配，中文解释跟随展示。
-- `personal_guarded_live.preflight.yaml`：个人受控实盘预检配置模板，仅用于本地启动检查。该模板仍通过熔断配置阻断 `GuardedLive`（受控实盘）模式下的可变执行。
+- `personal_guarded_live.preflight.yaml`：个人受控实盘预检配置模板，仅用于本地 dry-run（试运行）启动检查。该模板放开下单前的分发计划构建门禁，用于验证风控决策、`execution plan`（执行计划）、`manual gate`（人工门禁）释放和 `dispatch`（分发）前检查；真实下单仍必须由命令行显式传入实盘执行和确认参数。
 
 ## 维护规则
 

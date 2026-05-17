@@ -809,6 +809,15 @@ pub struct BasisGuardedLiveAutoOnceOptions {
     pub acknowledge_basis_live_orders: bool,
 }
 
+/// spot-perp basis 双腿单周期自动链路风控摘要。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasisGuardedLiveRiskDecisionSummary {
+    pub decision_id: String,
+    pub decision: String,
+    pub reason_codes: Vec<String>,
+    pub check_count: usize,
+}
+
 /// spot-perp basis 双腿单周期自动链路结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BasisGuardedLiveAutoOnceReport {
@@ -821,11 +830,17 @@ pub struct BasisGuardedLiveAutoOnceReport {
     pub perp_bid: Option<String>,
     pub net_bps: Option<i128>,
     pub signal_allowed: bool,
+    pub risk_decision: Option<BasisGuardedLiveRiskDecisionSummary>,
     pub plan_hash: Option<String>,
     pub approval_event_id: Option<String>,
     pub manual_gate_released: bool,
     pub dispatch_attempted: bool,
     pub dispatch_allowed: bool,
+    pub dispatch_plan_built: bool,
+    pub dispatch_request_count: usize,
+    pub preview_manual_gate_count: usize,
+    pub preview_place_order_count: usize,
+    pub preview_plan_leg_count: usize,
     pub planned_order_count: usize,
     pub submitted_receipt_count: usize,
     pub private_confirmation_count: usize,
@@ -3484,6 +3499,26 @@ fn bybit_linear_premium_fields_from_rest(
 }
 
 #[cfg(feature = "live-exec")]
+fn basis_plan_preview_counts(plan: &ExecutionPlan) -> (usize, usize, usize) {
+    let preview_plan_leg_count = plan.legs.len();
+    let preview_place_order_count = plan
+        .legs
+        .iter()
+        .filter(|leg| leg.action_type == arb_contracts::ExecutionActionType::PlaceOrder)
+        .count();
+    let preview_manual_gate_count = plan
+        .legs
+        .iter()
+        .filter(|leg| leg.action_type == arb_contracts::ExecutionActionType::ManualApprovalGate)
+        .count();
+    (
+        preview_plan_leg_count,
+        preview_place_order_count,
+        preview_manual_gate_count,
+    )
+}
+
+#[cfg(feature = "live-exec")]
 #[allow(clippy::too_many_arguments)]
 fn run_binance_basis_guarded_live_auto_once_from_json(
     symbol: &str,
@@ -3567,11 +3602,17 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
             perp_bid: Some(context.perp_bid),
             net_bps: Some(context.signal.net_bps),
             signal_allowed: false,
+            risk_decision: None,
             plan_hash: None,
             approval_event_id: None,
             manual_gate_released: false,
             dispatch_attempted: false,
             dispatch_allowed: false,
+            dispatch_plan_built: false,
+            dispatch_request_count: 0,
+            preview_manual_gate_count: 0,
+            preview_place_order_count: 0,
+            preview_plan_leg_count: 0,
             planned_order_count: 0,
             submitted_receipt_count: 0,
             private_confirmation_count: 0,
@@ -3674,6 +3715,13 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     } else {
         None
     };
+    let (preview_plan_leg_count, preview_place_order_count, preview_manual_gate_count) =
+        basis_plan_preview_counts(&pending.plan_preview);
+    let dispatch_plan_built = dispatch_plan.is_some();
+    let dispatch_request_count = dispatch_plan
+        .as_ref()
+        .map(|plan| plan.requests.len())
+        .unwrap_or(0);
 
     let mut receipts = Vec::new();
     let mut confirmations = Vec::new();
@@ -3790,15 +3838,18 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         perp_bid: Some(context.perp_bid),
         net_bps: Some(context.signal.net_bps),
         signal_allowed: true,
+        risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
         plan_hash: Some(plan_hash),
         approval_event_id: Some(release.approval_event_id),
         manual_gate_released: true,
         dispatch_attempted,
         dispatch_allowed: dispatch_blocking.is_empty(),
-        planned_order_count: dispatch_plan
-            .as_ref()
-            .map(|plan| plan.requests.len())
-            .unwrap_or(0),
+        dispatch_plan_built,
+        dispatch_request_count,
+        preview_manual_gate_count,
+        preview_place_order_count,
+        preview_plan_leg_count,
+        planned_order_count: dispatch_request_count,
         submitted_receipt_count: primary_submit_receipt_count,
         private_confirmation_count: confirmations.len(),
         protection_attempted: protection.attempted,
@@ -3901,11 +3952,17 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
             perp_bid: Some(context.perp_bid),
             net_bps: Some(context.signal.net_bps),
             signal_allowed: false,
+            risk_decision: None,
             plan_hash: None,
             approval_event_id: None,
             manual_gate_released: false,
             dispatch_attempted: false,
             dispatch_allowed: false,
+            dispatch_plan_built: false,
+            dispatch_request_count: 0,
+            preview_manual_gate_count: 0,
+            preview_place_order_count: 0,
+            preview_plan_leg_count: 0,
             planned_order_count: 0,
             submitted_receipt_count: 0,
             private_confirmation_count: 0,
@@ -4009,6 +4066,13 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
     } else {
         None
     };
+    let (preview_plan_leg_count, preview_place_order_count, preview_manual_gate_count) =
+        basis_plan_preview_counts(&pending.plan_preview);
+    let dispatch_plan_built = dispatch_plan.is_some();
+    let dispatch_request_count = dispatch_plan
+        .as_ref()
+        .map(|plan| plan.requests.len())
+        .unwrap_or(0);
 
     let mut receipts = Vec::new();
     let mut confirmations = Vec::new();
@@ -4107,15 +4171,18 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
         perp_bid: Some(context.perp_bid),
         net_bps: Some(context.signal.net_bps),
         signal_allowed: true,
+        risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
         plan_hash: Some(plan_hash),
         approval_event_id: Some(release.approval_event_id),
         manual_gate_released: true,
         dispatch_attempted,
         dispatch_allowed: dispatch_blocking.is_empty(),
-        planned_order_count: dispatch_plan
-            .as_ref()
-            .map(|plan| plan.requests.len())
-            .unwrap_or(0),
+        dispatch_plan_built,
+        dispatch_request_count,
+        preview_manual_gate_count,
+        preview_place_order_count,
+        preview_plan_leg_count,
+        planned_order_count: dispatch_request_count,
         submitted_receipt_count: primary_submit_receipt_count,
         private_confirmation_count: confirmations.len(),
         protection_attempted: protection.attempted,
@@ -4208,11 +4275,17 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
             perp_bid: Some(context.perp_bid),
             net_bps: Some(context.signal.net_bps),
             signal_allowed: false,
+            risk_decision: None,
             plan_hash: None,
             approval_event_id: None,
             manual_gate_released: false,
             dispatch_attempted: false,
             dispatch_allowed: false,
+            dispatch_plan_built: false,
+            dispatch_request_count: 0,
+            preview_manual_gate_count: 0,
+            preview_place_order_count: 0,
+            preview_plan_leg_count: 0,
             planned_order_count: 0,
             submitted_receipt_count: 0,
             private_confirmation_count: 0,
@@ -4313,6 +4386,13 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
     } else {
         None
     };
+    let (preview_plan_leg_count, preview_place_order_count, preview_manual_gate_count) =
+        basis_plan_preview_counts(&pending.plan_preview);
+    let dispatch_plan_built = dispatch_plan.is_some();
+    let dispatch_request_count = dispatch_plan
+        .as_ref()
+        .map(|plan| plan.requests.len())
+        .unwrap_or(0);
 
     let mut receipts = Vec::new();
     let mut confirmations = Vec::new();
@@ -4407,15 +4487,18 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
         perp_bid: Some(context.perp_bid),
         net_bps: Some(context.signal.net_bps),
         signal_allowed: true,
+        risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
         plan_hash: Some(plan_hash),
         approval_event_id: Some(release.approval_event_id),
         manual_gate_released: true,
         dispatch_attempted,
         dispatch_allowed: dispatch_blocking.is_empty(),
-        planned_order_count: dispatch_plan
-            .as_ref()
-            .map(|plan| plan.requests.len())
-            .unwrap_or(0),
+        dispatch_plan_built,
+        dispatch_request_count,
+        preview_manual_gate_count,
+        preview_place_order_count,
+        preview_plan_leg_count,
+        planned_order_count: dispatch_request_count,
         submitted_receipt_count: primary_submit_receipt_count,
         private_confirmation_count: confirmations.len(),
         protection_attempted: protection.attempted,
@@ -7963,15 +8046,16 @@ fn is_bybit_wss_all_symbols_scope(symbol: &str) -> bool {
 
 fn validate_binance_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {
     let symbol = symbol.trim().to_ascii_uppercase();
-    if symbol.len() < 3 || symbol.len() > 32 {
-        return Err(cli_arg_error("Binance WSS symbol length must be 3..=32"));
+    if symbol.len() < 3 || symbol.len() > 64 {
+        return Err(cli_arg_error("Binance WSS symbol length must be 3..=64"));
     }
-    if !symbol
-        .bytes()
-        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-    {
+    if !symbol.chars().all(|ch| {
+        ch.is_ascii_uppercase()
+            || ch.is_ascii_digit()
+            || (!ch.is_ascii() && !ch.is_control() && !ch.is_whitespace())
+    }) {
         return Err(cli_arg_error(
-            "Binance WSS symbol must contain only uppercase ASCII letters and digits",
+            "Binance WSS symbol must contain uppercase ASCII letters/digits or non-ASCII symbol characters without whitespace",
         ));
     }
     if !symbol.ends_with("USDT") {
@@ -8050,14 +8134,18 @@ fn binance_public_wss_instrument(
         .ok_or_else(|| cli_arg_error("Binance WSS symbol must have a non-empty USDT base asset"))?
         .to_owned();
     let asset_usdt = AssetId::new("asset:USDT")?;
+    let symbol_component = basis_identifier_component(&symbol);
+    let base_component = basis_identifier_component(&base);
     let instrument_id = match market {
-        BinancePublicMarket::Spot => format!("inst:BINANCE:{symbol}:SPOT"),
-        BinancePublicMarket::UsdmPerpetual => format!("inst:BINANCE:{symbol}:USDM-PERP"),
+        BinancePublicMarket::Spot => format!("inst:BINANCE:{symbol_component}:SPOT"),
+        BinancePublicMarket::UsdmPerpetual => {
+            format!("inst:BINANCE:{symbol_component}:USDM-PERP")
+        }
     };
     BinancePublicInstrument::new(
         symbol,
         InstrumentId::new(instrument_id)?,
-        AssetId::new(format!("asset:{base}"))?,
+        AssetId::new(format!("asset:{base_component}"))?,
         asset_usdt.clone(),
         asset_usdt,
     )
@@ -8194,72 +8282,97 @@ fn hyperliquid_info_request_body(request_type: &str) -> String {
     format!("{{\"type\":{}}}", json_string(request_type))
 }
 
-fn fetch_public_json_with_curl(url: &str) -> RuntimeResult<String> {
-    let output = Command::new("curl")
-        .args(["-fsS", "--max-time", "10", url])
-        .output()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot run curl for public market data: {error}"),
-        })?;
+const PUBLIC_MARKET_CURL_ATTEMPTS: usize = 3;
+const PUBLIC_MARKET_CURL_RETRY_SLEEP_MS: u64 = 250;
 
+fn public_market_curl_body(
+    output: std::process::Output,
+    command_label: &str,
+) -> Result<String, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RuntimeError::LiveMarketData {
-            message: format!("curl returned {}; stderr={}", output.status, stderr.trim()),
-        });
+        return Err(format!(
+            "{command_label} returned {}; stderr={}",
+            output.status,
+            stderr.trim()
+        ));
     }
 
-    let body = String::from_utf8(output.stdout).map_err(|error| RuntimeError::LiveMarketData {
-        message: format!("public market data response was not UTF-8: {error}"),
-    })?;
+    let body = String::from_utf8(output.stdout)
+        .map_err(|error| format!("public market data response was not UTF-8: {error}"))?;
     if body.trim().is_empty() {
-        return Err(RuntimeError::LiveMarketData {
-            message: "public market data response was empty".to_owned(),
-        });
+        return Err("public market data response was empty".to_owned());
     }
     Ok(body)
 }
 
+fn fetch_public_json_with_curl(url: &str) -> RuntimeResult<String> {
+    let mut last_error = None;
+    for attempt in 1..=PUBLIC_MARKET_CURL_ATTEMPTS {
+        match Command::new("curl")
+            .args(["-fsS", "--max-time", "10", url])
+            .output()
+        {
+            Ok(output) => match public_market_curl_body(output, "curl") {
+                Ok(body) => return Ok(body),
+                Err(message) => last_error = Some(message),
+            },
+            Err(error) => {
+                last_error = Some(format!("cannot run curl for public market data: {error}"));
+            }
+        }
+        if attempt < PUBLIC_MARKET_CURL_ATTEMPTS {
+            thread::sleep(Duration::from_millis(PUBLIC_MARKET_CURL_RETRY_SLEEP_MS));
+        }
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "public market data GET failed after {} attempts: {}",
+            PUBLIC_MARKET_CURL_ATTEMPTS,
+            last_error.unwrap_or_else(|| "unknown curl error".to_owned())
+        ),
+    })
+}
+
 fn fetch_public_json_post_with_curl(url: &str, body: &str) -> RuntimeResult<String> {
-    let output = Command::new("curl")
-        .args([
-            "-fsS",
-            "--max-time",
-            "10",
-            "-X",
-            "POST",
-            url,
-            "-H",
-            "Content-Type: application/json",
-            "--data",
-            body,
-        ])
-        .output()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot run curl POST for public market data: {error}"),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RuntimeError::LiveMarketData {
-            message: format!(
-                "curl POST returned {}; stderr={}",
-                output.status,
-                stderr.trim()
-            ),
-        });
+    let mut last_error = None;
+    for attempt in 1..=PUBLIC_MARKET_CURL_ATTEMPTS {
+        match Command::new("curl")
+            .args([
+                "-fsS",
+                "--max-time",
+                "10",
+                "-X",
+                "POST",
+                url,
+                "-H",
+                "Content-Type: application/json",
+                "--data",
+                body,
+            ])
+            .output()
+        {
+            Ok(output) => match public_market_curl_body(output, "curl POST") {
+                Ok(response) => return Ok(response),
+                Err(message) => last_error = Some(message),
+            },
+            Err(error) => {
+                last_error = Some(format!(
+                    "cannot run curl POST for public market data: {error}"
+                ));
+            }
+        }
+        if attempt < PUBLIC_MARKET_CURL_ATTEMPTS {
+            thread::sleep(Duration::from_millis(PUBLIC_MARKET_CURL_RETRY_SLEEP_MS));
+        }
     }
-
-    let response =
-        String::from_utf8(output.stdout).map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("public market data response was not UTF-8: {error}"),
-        })?;
-    if response.trim().is_empty() {
-        return Err(RuntimeError::LiveMarketData {
-            message: "public market data response was empty".to_owned(),
-        });
-    }
-    Ok(response)
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "public market data POST failed after {} attempts: {}",
+            PUBLIC_MARKET_CURL_ATTEMPTS,
+            last_error.unwrap_or_else(|| "unknown curl error".to_owned())
+        ),
+    })
 }
 
 fn current_utc_timestamp() -> RuntimeResult<UtcTimestamp> {
@@ -9790,21 +9903,22 @@ pub fn basis_monitor_row_to_normalized_events(
     }
 
     let observed_at = observed_at.to_string();
+    let symbol_component = basis_identifier_component(&row.symbol);
     let event_prefix = format!(
         "event:runtime:basis-monitor:{}:{}",
-        spec.strategy_config.instance.strategy_id, row.symbol
+        spec.strategy_config.instance.strategy_id, symbol_component
     );
     let correlation_id = format!(
         "corr:runtime:basis-monitor:{}:{}",
-        spec.strategy_config.instance.strategy_id, row.symbol
+        spec.strategy_config.instance.strategy_id, symbol_component
     );
     let source_prefix = format!(
         "monitor:{}:{}",
-        spec.strategy_config.instance.strategy_id, row.symbol
+        spec.strategy_config.instance.strategy_id, symbol_component
     );
     let checksum_prefix = format!(
         "hash:basis-monitor:{}:{}",
-        spec.strategy_config.instance.strategy_id, row.symbol
+        spec.strategy_config.instance.strategy_id, symbol_component
     );
 
     let spot_bid = required_monitor_row_field(row, "spot_bid", &row.spot_bid)?;
@@ -10159,12 +10273,52 @@ fn normalize_cex_usdt_basis_symbol(symbol: &str, venue: &'static str) -> Runtime
             message: format!("{venue} basis symbol must be an uppercase USDT pair like ETHUSDT"),
         });
     }
-    if !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+    if !symbol.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || (!ch.is_ascii() && !ch.is_control() && !ch.is_whitespace())
+    }) {
         return Err(RuntimeError::LiveMarketData {
-            message: format!("{venue} basis symbol must use only ASCII letters and digits"),
+            message: format!(
+                "{venue} basis symbol must use ASCII letters/digits or non-ASCII symbol characters without whitespace"
+            ),
         });
     }
     Ok(symbol)
+}
+
+#[cfg(feature = "live-exec")]
+fn push_ascii_hex_component(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push('u');
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0f) as usize] as char);
+}
+
+fn basis_identifier_component(value: &str) -> String {
+    if value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return value.to_owned();
+    }
+
+    format!("sym{:016x}", stable_symbol_hash(value))
+}
+
+#[cfg(feature = "live-exec")]
+fn dispatch_symbol_token(value: &str) -> String {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
+    }) {
+        value.to_owned()
+    } else {
+        basis_identifier_component(value)
+    }
+}
+
+fn stable_symbol_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(feature = "live-exec")]
@@ -10196,7 +10350,10 @@ fn basis_base_asset_id_from_cex_symbol(symbol: &str) -> RuntimeResult<String> {
     if symbol == BASIS_SYMBOL {
         return Ok(BASIS_BASE_ASSET_ID.to_owned());
     }
-    Ok(format!("asset:{}", &symbol[..symbol.len() - 4]))
+    Ok(format!(
+        "asset:{}",
+        basis_identifier_component(&symbol[..symbol.len() - 4])
+    ))
 }
 
 #[cfg(feature = "live-exec")]
@@ -10213,16 +10370,28 @@ fn basis_base_asset_id_from_okx_symbol(symbol: &str) -> RuntimeResult<String> {
 
 #[cfg(feature = "live-exec")]
 fn basis_symbol_slug(symbol: &str) -> String {
-    symbol
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    if !symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return format!("s{:08x}", stable_symbol_hash(symbol) as u32);
+    }
+
+    let mut slug = String::new();
+    for byte in symbol.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            slug.push((byte as char).to_ascii_lowercase());
+        } else if byte == b'-' {
+            slug.push('-');
+        } else {
+            push_ascii_hex_component(&mut slug, byte);
+        }
+    }
+    if slug.is_empty() {
+        "symbol".to_owned()
+    } else {
+        slug
+    }
 }
 
 fn binance_basis_spot_instrument_id(symbol: &str) -> RuntimeResult<String> {
@@ -10230,7 +10399,10 @@ fn binance_basis_spot_instrument_id(symbol: &str) -> RuntimeResult<String> {
     if symbol == BASIS_SYMBOL {
         return Ok(BINANCE_BASIS_SPOT_INSTRUMENT_ID.to_owned());
     }
-    Ok(format!("inst:BINANCE:{symbol}:SPOT"))
+    Ok(format!(
+        "inst:BINANCE:{}:SPOT",
+        basis_identifier_component(&symbol)
+    ))
 }
 
 fn binance_basis_perp_instrument_id(symbol: &str) -> RuntimeResult<String> {
@@ -10238,7 +10410,10 @@ fn binance_basis_perp_instrument_id(symbol: &str) -> RuntimeResult<String> {
     if symbol == BASIS_SYMBOL {
         return Ok(BINANCE_BASIS_PERP_INSTRUMENT_ID.to_owned());
     }
-    Ok(format!("inst:BINANCE:{symbol}:USDM-PERP"))
+    Ok(format!(
+        "inst:BINANCE:{}:USDM-PERP",
+        basis_identifier_component(&symbol)
+    ))
 }
 
 fn bybit_basis_spot_instrument_id(symbol: &str) -> RuntimeResult<String> {
@@ -10246,7 +10421,10 @@ fn bybit_basis_spot_instrument_id(symbol: &str) -> RuntimeResult<String> {
     if symbol == BASIS_SYMBOL {
         return Ok(BYBIT_BASIS_SPOT_INSTRUMENT_ID.to_owned());
     }
-    Ok(format!("inst:BYBIT:{symbol}:SPOT"))
+    Ok(format!(
+        "inst:BYBIT:{}:SPOT",
+        basis_identifier_component(&symbol)
+    ))
 }
 
 fn bybit_basis_perp_instrument_id(symbol: &str) -> RuntimeResult<String> {
@@ -10254,7 +10432,10 @@ fn bybit_basis_perp_instrument_id(symbol: &str) -> RuntimeResult<String> {
     if symbol == BASIS_SYMBOL {
         return Ok(BYBIT_BASIS_PERP_INSTRUMENT_ID.to_owned());
     }
-    Ok(format!("inst:BYBIT:{symbol}:LINEAR-PERP"))
+    Ok(format!(
+        "inst:BYBIT:{}:LINEAR-PERP",
+        basis_identifier_component(&symbol)
+    ))
 }
 
 #[cfg(feature = "live-exec")]
@@ -11083,6 +11264,7 @@ fn binance_basis_guarded_live_candidate(
     let spot_leg_id = basis_live_leg_id("binance", "buy-spot", &context.symbol_slug);
     let perp_leg_id = basis_live_leg_id("binance", "short-usdm", &context.symbol_slug);
     let client_symbol = context.symbol_slug.replace('-', "");
+    let venue_symbol = dispatch_symbol_token(&context.symbol);
     let spot_client_order_id = if context.symbol == BASIS_SYMBOL {
         format!("rvbS{client_order_suffix}")
     } else {
@@ -11217,7 +11399,7 @@ fn binance_basis_guarded_live_candidate(
         spot_instrument = json_string(&context.spot_instrument_id),
         perp_instrument = json_string(&context.perp_instrument_id),
         account_id = json_string(BINANCE_GUARDED_LIVE_ACCOUNT_REF),
-        venue_symbol = json_string(&context.symbol),
+        venue_symbol = json_string(&venue_symbol),
         quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
         base_asset = json_string(&context.base_asset_id),
         notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
@@ -11369,6 +11551,7 @@ fn bybit_basis_guarded_live_candidate(
     let spot_leg_id = basis_live_leg_id("bybit", "buy-spot", &context.symbol_slug);
     let perp_leg_id = basis_live_leg_id("bybit", "short-linear", &context.symbol_slug);
     let client_symbol = context.symbol_slug.replace('-', "");
+    let venue_symbol = dispatch_symbol_token(&context.symbol);
     let spot_client_order_id = if context.symbol == BASIS_SYMBOL {
         format!("rvbS{client_order_suffix}")
     } else {
@@ -11503,7 +11686,7 @@ fn bybit_basis_guarded_live_candidate(
         spot_instrument = json_string(&context.spot_instrument_id),
         perp_instrument = json_string(&context.perp_instrument_id),
         account_id = json_string(BYBIT_GUARDED_LIVE_ACCOUNT_REF),
-        venue_symbol = json_string(&context.symbol),
+        venue_symbol = json_string(&venue_symbol),
         quote_asset = json_string(BASIS_QUOTE_ASSET_ID),
         base_asset = json_string(&context.base_asset_id),
         notional = json_string(BINANCE_GUARDED_LIVE_NOTIONAL_USDT),
@@ -13014,7 +13197,7 @@ fn live_dispatch_policy_from_config(
         kill_switch = kill_switch.with_instrument(InstrumentId::new(instrument)?);
     }
     Ok(ExecutionDispatchPolicy::new(cap)
-        .allow_symbol(symbol)?
+        .allow_symbol(dispatch_symbol_token(symbol))?
         .with_manual_gate_released(true)
         .with_kill_switch(kill_switch))
 }
@@ -13929,9 +14112,41 @@ fn write_basis_guarded_live_auto_once_artifacts(
 }
 
 #[cfg(feature = "live-exec")]
+fn basis_risk_decision_summary(
+    risk_decision: &RiskDecision,
+) -> BasisGuardedLiveRiskDecisionSummary {
+    BasisGuardedLiveRiskDecisionSummary {
+        decision_id: risk_decision.decision_id.as_str().to_owned(),
+        decision: risk_decision.decision.as_str().to_owned(),
+        reason_codes: risk_decision
+            .reason_codes
+            .iter()
+            .map(|reason| reason.as_str().to_owned())
+            .collect(),
+        check_count: risk_decision.checks.len(),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_risk_decision_summary_json(
+    summary: Option<&BasisGuardedLiveRiskDecisionSummary>,
+) -> String {
+    match summary {
+        Some(summary) => format!(
+            "{{\"check_count\":{},\"decision\":{},\"decision_id\":{},\"reason_codes\":{}}}",
+            summary.check_count,
+            json_string(&summary.decision),
+            json_string(&summary.decision_id),
+            json_string_array(&summary.reason_codes),
+        ),
+        None => "null".to_owned(),
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> String {
     format!(
-        "{{\"approval_event_id\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"net_bps\":{},\"perp_bid\":{},\"perp_event_id\":{},\"planned_order_count\":{},\"plan_hash\":{},\"premium_event_id\":{},\"private_confirmation_count\":{},\"protection_actions\":[{}],\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"spot_ask\":{},\"spot_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"approval_event_id\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"net_bps\":{},\"perp_bid\":{},\"perp_event_id\":{},\"planned_order_count\":{},\"plan_hash\":{},\"premium_event_id\":{},\"preview_manual_gate_count\":{},\"preview_place_order_count\":{},\"preview_plan_leg_count\":{},\"private_confirmation_count\":{},\"protection_actions\":[{}],\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"risk_decision\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"spot_ask\":{},\"spot_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
         optional_json_string_universal(report.approval_event_id.as_deref()),
         report
             .blocking_reasons
@@ -13941,6 +14156,8 @@ fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> Strin
             .join(","),
         report.dispatch_allowed,
         report.dispatch_attempted,
+        report.dispatch_plan_built,
+        report.dispatch_request_count,
         optional_json_string_universal(report.execution_report_status.as_deref()),
         report.manual_gate_released,
         report
@@ -13952,6 +14169,9 @@ fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> Strin
         report.planned_order_count,
         optional_json_string_universal(report.plan_hash.as_deref()),
         optional_json_string_universal(report.premium_event_id.as_deref()),
+        report.preview_manual_gate_count,
+        report.preview_place_order_count,
+        report.preview_plan_leg_count,
         report.private_confirmation_count,
         report
             .protection_actions
@@ -13962,6 +14182,7 @@ fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> Strin
         report.protection_attempted,
         report.protection_receipt_count,
         optional_json_string_universal(report.residual_risk.as_deref()),
+        basis_risk_decision_summary_json(report.risk_decision.as_ref()),
         report.signal_allowed,
         optional_json_string_universal(report.spot_ask.as_deref()),
         optional_json_string_universal(report.spot_event_id.as_deref()),
@@ -14007,6 +14228,16 @@ fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> S
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let risk_decision = report
+        .risk_decision
+        .as_ref()
+        .map(|summary| {
+            format!(
+                "{} ({}, checks={})",
+                summary.decision_id, summary.decision, summary.check_count
+            )
+        })
+        .unwrap_or_else(|| "none".to_owned());
     format!(
         r#"# {title}
 
@@ -14018,9 +14249,15 @@ fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> S
 - Perp bid: {perp_bid}
 - Net bps: {net_bps}
 - Signal allowed: {signal_allowed}
+- Risk decision: {risk_decision}
 - Plan hash: {plan_hash}
 - Approval event: {approval_event}
 - Manual gate released: {manual_gate_released}
+- Preview plan legs: {preview_plan_leg_count}
+- Preview place-order legs: {preview_place_order_count}
+- Preview manual gates: {preview_manual_gate_count}
+- Dispatch plan built: {dispatch_plan_built}
+- Dispatch requests: {dispatch_request_count}
 - Planned orders: {planned_order_count}
 - Dispatch attempted: {dispatch_attempted}
 - Dispatch allowed: {dispatch_allowed}
@@ -14048,9 +14285,15 @@ fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> S
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_owned()),
         signal_allowed = report.signal_allowed,
+        risk_decision = risk_decision,
         plan_hash = report.plan_hash.as_deref().unwrap_or("none"),
         approval_event = report.approval_event_id.as_deref().unwrap_or("none"),
         manual_gate_released = report.manual_gate_released,
+        preview_plan_leg_count = report.preview_plan_leg_count,
+        preview_place_order_count = report.preview_place_order_count,
+        preview_manual_gate_count = report.preview_manual_gate_count,
+        dispatch_plan_built = report.dispatch_plan_built,
+        dispatch_request_count = report.dispatch_request_count,
         planned_order_count = report.planned_order_count,
         dispatch_attempted = report.dispatch_attempted,
         dispatch_allowed = report.dispatch_allowed,
@@ -17110,12 +17353,15 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
                 "; no artifacts written, pass --out <dir> to persist them".to_owned()
             });
         return Ok(format!(
-            "ok: Binance basis auto-once completed; signal_allowed={}; net_bps={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
+            "ok: Binance basis auto-once completed; signal_allowed={}; net_bps={}; preview_place_orders={}; dispatch_plan_built={}; dispatch_requests={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
             report.signal_allowed,
             report
                 .net_bps
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
+            report.preview_place_order_count,
+            report.dispatch_plan_built,
+            report.dispatch_request_count,
             report.planned_order_count,
             report.dispatch_attempted,
             report.dispatch_allowed,
@@ -17139,12 +17385,15 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
                 "; no artifacts written, pass --out <dir> to persist them".to_owned()
             });
         return Ok(format!(
-            "ok: Bybit basis auto-once completed; signal_allowed={}; net_bps={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
+            "ok: Bybit basis auto-once completed; signal_allowed={}; net_bps={}; preview_place_orders={}; dispatch_plan_built={}; dispatch_requests={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
             report.signal_allowed,
             report
                 .net_bps
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
+            report.preview_place_order_count,
+            report.dispatch_plan_built,
+            report.dispatch_request_count,
             report.planned_order_count,
             report.dispatch_attempted,
             report.dispatch_allowed,
@@ -17168,12 +17417,15 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
                 "; no artifacts written, pass --out <dir> to persist them".to_owned()
             });
         return Ok(format!(
-            "ok: OKX basis auto-once completed; signal_allowed={}; net_bps={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
+            "ok: OKX basis auto-once completed; signal_allowed={}; net_bps={}; preview_place_orders={}; dispatch_plan_built={}; dispatch_requests={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
             report.signal_allowed,
             report
                 .net_bps
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
+            report.preview_place_order_count,
+            report.dispatch_plan_built,
+            report.dispatch_request_count,
             report.planned_order_count,
             report.dispatch_attempted,
             report.dispatch_allowed,
@@ -19396,6 +19648,34 @@ mod tests {
     }
 
     #[test]
+    fn binance_wss_all_symbol_scope_keeps_non_ascii_usdt_symbol() {
+        let symbol = "中文USDT";
+        let rows = prepare_binance_wss_book_ticker_rest_rows(
+            vec![MonitorBookTickerRow {
+                symbol: symbol.to_owned(),
+                bid_price: "99.90".to_owned(),
+                bid_qty: "1.0".to_owned(),
+                ask_price: "100.00".to_owned(),
+                ask_qty: "2.0".to_owned(),
+            }],
+            true,
+        )
+        .expect("prepared rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, symbol);
+
+        let instrument = binance_public_wss_instrument(symbol, BinancePublicMarket::Spot)
+            .expect("non-ASCII Binance symbol instrument");
+        assert_eq!(instrument.symbol, symbol);
+        assert!(instrument
+            .instrument_id
+            .as_str()
+            .starts_with("inst:BINANCE:sym"));
+        assert!(instrument.base_asset_id.as_str().starts_with("asset:sym"));
+    }
+
+    #[test]
     fn bybit_basis_dashboard_html_requests_bybit_realtime_api_paths() {
         let html = bybit_basis_dashboard_html();
 
@@ -19981,7 +20261,19 @@ mod tests {
         .expect("basis auto once dry run");
 
         assert!(report.signal_allowed);
+        assert_eq!(
+            report
+                .risk_decision
+                .as_ref()
+                .map(|summary| summary.decision.as_str()),
+            Some("RequiresManualApproval")
+        );
         assert_eq!(report.planned_order_count, 2);
+        assert_eq!(report.preview_plan_leg_count, 3);
+        assert_eq!(report.preview_place_order_count, 2);
+        assert_eq!(report.preview_manual_gate_count, 1);
+        assert!(report.dispatch_plan_built);
+        assert_eq!(report.dispatch_request_count, 2);
         assert!(report.manual_gate_released);
         assert!(!report.dispatch_attempted);
         assert!(!report.dispatch_allowed);
@@ -19999,6 +20291,10 @@ mod tests {
         let report_json =
             read_utf8(&output_dir.join("basis_auto_once_report.json")).expect("auto report");
         assert!(report_json.contains("\"planned_order_count\":2"));
+        assert!(report_json.contains("\"dispatch_plan_built\":true"));
+        assert!(report_json.contains("\"preview_place_order_count\":2"));
+        assert!(report_json.contains("\"risk_decision\":{"));
+        assert!(report_json.contains("\"decision\":\"RequiresManualApproval\""));
     }
 
     #[cfg(feature = "live-exec")]
@@ -20035,8 +20331,20 @@ mod tests {
         .expect("Bybit basis auto once dry run");
 
         assert!(report.signal_allowed);
+        assert_eq!(
+            report
+                .risk_decision
+                .as_ref()
+                .map(|summary| summary.decision.as_str()),
+            Some("RequiresManualApproval")
+        );
         assert_eq!(report.strategy_id, BYBIT_BASIS_LIVE_STRATEGY_ID);
         assert_eq!(report.planned_order_count, 2);
+        assert_eq!(report.preview_plan_leg_count, 3);
+        assert_eq!(report.preview_place_order_count, 2);
+        assert_eq!(report.preview_manual_gate_count, 1);
+        assert!(report.dispatch_plan_built);
+        assert_eq!(report.dispatch_request_count, 2);
         assert!(report.manual_gate_released);
         assert!(!report.dispatch_attempted);
         assert!(!report.dispatch_allowed);
@@ -20054,6 +20362,10 @@ mod tests {
         let report_md =
             read_utf8(&output_dir.join("basis_auto_once_report.md")).expect("auto report markdown");
         assert!(report_md.contains("Bybit Basis GuardedLive Auto Once"));
+        let report_json =
+            read_utf8(&output_dir.join("basis_auto_once_report.json")).expect("auto report json");
+        assert!(report_json.contains("\"risk_decision\":{"));
+        assert!(report_json.contains("\"decision\":\"RequiresManualApproval\""));
     }
 
     #[cfg(feature = "live-exec")]
@@ -20094,6 +20406,13 @@ mod tests {
 
         assert_eq!(report.symbol, "ETHUSDT");
         assert!(report.signal_allowed);
+        assert_eq!(
+            report
+                .risk_decision
+                .as_ref()
+                .map(|summary| summary.decision.as_str()),
+            Some("RequiresManualApproval")
+        );
         assert_eq!(report.planned_order_count, 2);
         let output_dir = report.output_dir.as_ref().expect("output dir");
         let plan_preview =
@@ -20104,6 +20423,65 @@ mod tests {
         assert!(plan_preview.contains("\"asset_id\":\"asset:ETH\""));
         assert!(plan_preview.contains("\"client_order_id\":\"rvbSethusdt"));
         assert!(plan_preview.contains("\"client_order_id\":\"rvbPethusdt"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_guarded_live_auto_once_keeps_non_ascii_symbol_dry_run() {
+        let symbol = "中文USDT";
+        let spot = format!(
+            r#"{{"symbol":"{symbol}","bidPrice":"49.90","bidQty":"3.0","askPrice":"50.00","askQty":"4.0"}}"#
+        );
+        let perp = format!(
+            r#"{{"symbol":"{symbol}","bidPrice":"51.00","bidQty":"3.5","askPrice":"51.10","askQty":"4.5","time":1778630400000}}"#
+        );
+        let premium = format!(
+            r#"{{"symbol":"{symbol}","markPrice":"51.00","indexPrice":"50.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}}"#
+        );
+        let root = RuntimeTempDir::new().expect("output dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+
+        let report = run_binance_basis_guarded_live_auto_once_from_json(
+            symbol,
+            &spot,
+            "test:binance-spot-book",
+            &perp,
+            "test:binance-usdm-book",
+            &premium,
+            "test:binance-usdm-premium",
+            ingested_at,
+            BasisGuardedLiveAutoOnceOptions {
+                symbol: symbol.to_owned(),
+                config_path,
+                output_dir: Some(root.path().join("binance-non-ascii-basis-auto")),
+                min_net_bps: 5,
+                max_spot_ask: Some("51.00".to_owned()),
+                min_perp_bid: Some("50.50".to_owned()),
+                spot_wss_monitor_url: None,
+                perp_wss_monitor_url: None,
+                private_order_events_dir: None,
+                execute_live: false,
+                acknowledge_basis_live_orders: false,
+            },
+        )
+        .expect("Binance non-ASCII symbol basis auto once dry run");
+
+        assert_eq!(report.symbol, symbol);
+        assert!(report.signal_allowed);
+        assert_eq!(report.planned_order_count, 2);
+        assert!(report.dispatch_plan_built);
+        assert_eq!(report.dispatch_request_count, 2);
+        let output_dir = report.output_dir.as_ref().expect("output dir");
+        let plan_preview =
+            read_utf8(&output_dir.join("preview/plan_preview.json")).expect("plan preview");
+        let symbol_component = basis_identifier_component(symbol);
+        assert!(plan_preview.contains(&format!("inst:BINANCE:{symbol_component}:SPOT")));
+        assert!(plan_preview.contains(&format!("\"venue_symbol\":\"{symbol_component}\"")));
+        let raw_spot =
+            read_utf8(&output_dir.join("market/spot_book_ticker.raw.json")).expect("raw spot");
+        assert!(raw_spot.contains(symbol));
     }
 
     #[cfg(feature = "live-exec")]
@@ -20200,6 +20578,11 @@ mod tests {
         assert_eq!(report.symbol, "ETH-USDT");
         assert!(report.signal_allowed);
         assert_eq!(report.planned_order_count, 2);
+        assert_eq!(report.preview_plan_leg_count, 3);
+        assert_eq!(report.preview_place_order_count, 2);
+        assert_eq!(report.preview_manual_gate_count, 1);
+        assert!(report.dispatch_plan_built);
+        assert_eq!(report.dispatch_request_count, 2);
         let output_dir = report.output_dir.as_ref().expect("output dir");
         let plan_preview =
             read_utf8(&output_dir.join("preview/plan_preview.json")).expect("plan preview");
@@ -20209,6 +20592,10 @@ mod tests {
         assert!(plan_preview.contains("\"asset_id\":\"asset:ETH\""));
         assert!(plan_preview.contains("\"client_order_id\":\"rvoSethusdt"));
         assert!(plan_preview.contains("\"client_order_id\":\"rvoPethusdt"));
+        let report_json =
+            read_utf8(&output_dir.join("basis_auto_once_report.json")).expect("auto report json");
+        assert!(report_json.contains("\"risk_decision\":{"));
+        assert!(report_json.contains("\"decision\":\"RequiresManualApproval\""));
     }
 
     #[cfg(feature = "live-exec")]
