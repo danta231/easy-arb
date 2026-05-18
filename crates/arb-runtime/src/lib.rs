@@ -4341,6 +4341,23 @@ fn okx_inst_id_from_public_monitor_instrument(
 }
 
 #[cfg(feature = "live-exec")]
+fn bitget_symbol_from_runtime_instrument(instrument_id: &str) -> RuntimeResult<String> {
+    let mut parts = instrument_id.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("inst"), Some("BITGET"), Some(symbol), Some("USDT-FUTURES"))
+            if parts.next().is_none() =>
+        {
+            Ok(symbol.to_owned())
+        }
+        _ => Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Bitget runtime instrument `{instrument_id}` does not match USDT-FUTURES"
+            ),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BybitLinearPremiumTickerFields {
     mark_price: String,
@@ -7756,19 +7773,14 @@ fn reconcile_basis_exit_position(
         BYBIT_BASIS_LIVE_STRATEGY_ID => {
             fetch_bybit_linear_private_position_snapshot(signing_policy, &ingested_at, state)?
         }
-        OKX_BASIS_LIVE_STRATEGY_ID | BITGET_BASIS_LIVE_STRATEGY_ID => {
-            return Ok(BasisExitReconciledPosition {
-                spot_close_quantity,
-                perp_close_quantity: Some(Quantity::from_str(&state.perp_quantity)?),
-                liquidation_buffer_bps: None,
-                position_imbalance_bps: 0,
-                external_state_unknown: true,
-                residual_risk: Some(format!(
-                    "{} exit supervisor does not yet have a private position parser; suppressing automatic live close",
-                    state.venue_family
-                )),
-            });
+        OKX_BASIS_LIVE_STRATEGY_ID => {
+            fetch_okx_swap_private_position_snapshot(signing_policy, &ingested_at, state)?
         }
+        BITGET_BASIS_LIVE_STRATEGY_ID => fetch_bitget_usdt_futures_private_position_snapshot(
+            signing_policy,
+            &ingested_at,
+            state,
+        )?,
         other => {
             return Err(RuntimeError::UnsafeConfig {
                 message: format!("unsupported basis exit strategy_id `{other}`"),
@@ -7982,6 +7994,122 @@ fn fetch_bybit_linear_private_position_snapshot(
     let batch = adapter.ingest_linear_position_list_json(
         &raw_json,
         format!("bybit-private-position:{}", state.symbol),
+        *ingested_at,
+    )?;
+    adapter
+        .positions(
+            &PositionQuery::new(VenueId::new(&state.perp_venue_id)?)
+                .for_account(AccountId::new(&state.perp_account_id)?)
+                .for_instrument(InstrumentId::new(&state.perp_instrument_id)?),
+        )
+        .map(|positions| {
+            if positions.is_empty() {
+                batch
+                    .positions
+                    .into_iter()
+                    .filter(|position| position.instrument_id.as_str() == state.perp_instrument_id)
+                    .collect()
+            } else {
+                positions
+            }
+        })
+        .map_err(RuntimeError::from)
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_okx_swap_private_position_snapshot(
+    signing_policy: &SigningPolicy,
+    ingested_at: &UtcTimestamp,
+    state: &BasisExitSupervisorPositionState,
+) -> RuntimeResult<Vec<VenuePosition>> {
+    let inst_id = okx_inst_id_from_public_monitor_instrument(&state.perp_instrument_id, "SWAP")?;
+    let signer = OkxRealSigningProviderFromEnv::from_default_env()?;
+    let endpoint = format!("/api/v5/account/positions?instType=SWAP&instId={inst_id}");
+    let signed = signer.sign_okx_hmac(
+        OkxHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/okx-live/position/{}",
+                state.symbol
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(&state.perp_venue_id)?,
+            AccountId::new(&state.perp_account_id)?,
+            OkxRestMethod::Get,
+            &endpoint,
+            "",
+        )?,
+        signing_policy,
+    )?;
+    let raw_json = fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)?;
+    let mut adapter = OkxPrivateAccountAdapter::new(
+        VenueId::new(&state.perp_venue_id)?,
+        AccountId::new(&state.perp_account_id)?,
+        OkxPrivateAccountMarket::TradingAccount,
+        *ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let batch = adapter.ingest_account_positions_json(
+        &raw_json,
+        format!("okx-private-position:{inst_id}"),
+        *ingested_at,
+    )?;
+    adapter
+        .positions(
+            &PositionQuery::new(VenueId::new(&state.perp_venue_id)?)
+                .for_account(AccountId::new(&state.perp_account_id)?)
+                .for_instrument(InstrumentId::new(&state.perp_instrument_id)?),
+        )
+        .map(|positions| {
+            if positions.is_empty() {
+                batch
+                    .positions
+                    .into_iter()
+                    .filter(|position| position.instrument_id.as_str() == state.perp_instrument_id)
+                    .collect()
+            } else {
+                positions
+            }
+        })
+        .map_err(RuntimeError::from)
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_bitget_usdt_futures_private_position_snapshot(
+    signing_policy: &SigningPolicy,
+    ingested_at: &UtcTimestamp,
+    state: &BasisExitSupervisorPositionState,
+) -> RuntimeResult<Vec<VenuePosition>> {
+    let symbol = bitget_symbol_from_runtime_instrument(&state.perp_instrument_id)?;
+    let signer = BitgetRealSigningProviderFromEnv::from_default_env()?;
+    let endpoint = "/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT";
+    let signed = signer.sign_bitget_hmac(
+        BitgetHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/bitget-live/position/{}",
+                state.symbol
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(&state.perp_venue_id)?,
+            AccountId::new(&state.perp_account_id)?,
+            BitgetRestMethod::Get,
+            endpoint,
+            "",
+        )?,
+        signing_policy,
+    )?;
+    let raw_json = fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)?;
+    let mut adapter = BitgetPrivateAccountAdapter::new(
+        VenueId::new(&state.perp_venue_id)?,
+        AccountId::new(&state.perp_account_id)?,
+        BitgetPrivateAccountMarket::UsdtFuturesAccount,
+        *ingested_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let batch = adapter.ingest_usdt_futures_positions_json(
+        &raw_json,
+        format!("bitget-private-position:{symbol}"),
         *ingested_at,
     )?;
     adapter

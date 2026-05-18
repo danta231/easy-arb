@@ -3710,6 +3710,13 @@ pub struct OkxPrivateBalanceBatch {
     pub balances: Vec<VenueBalance>,
 }
 
+/// OKX 私有账户仓位快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxPrivatePositionBatch {
+    pub position_event: NormalizedEvent,
+    pub positions: Vec<VenuePosition>,
+}
+
 /// Bitget 私有账户只读市场类型。
 ///
 /// 中文说明：该枚举只描述账户快照来源，不表达交易、撤单、划转或签名能力。
@@ -3747,6 +3754,111 @@ impl BitgetPrivateAccountMarket {
 pub struct BitgetPrivateBalanceBatch {
     pub balance_event: NormalizedEvent,
     pub balances: Vec<VenueBalance>,
+}
+
+/// Bitget 私有账户仓位快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetPrivatePositionBatch {
+    pub position_event: NormalizedEvent,
+    pub positions: Vec<VenuePosition>,
+}
+
+/// Aster 私有账户只读市场类型。
+///
+/// 中文说明：该枚举只描述 Aster Futures V3 账户快照来源，不表达交易、撤单、
+/// 划转、签名或链上授权能力。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsterPrivateAccountMarket {
+    UsdtFuturesAccount,
+}
+
+impl AsterPrivateAccountMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UsdtFuturesAccount => "UsdtFuturesAccount",
+        }
+    }
+
+    fn event_scope(self) -> &'static str {
+        match self {
+            Self::UsdtFuturesAccount => "usdt-futures",
+        }
+    }
+
+    fn balance_endpoint(self) -> &'static str {
+        match self {
+            Self::UsdtFuturesAccount => "/fapi/v3/balance",
+        }
+    }
+
+    fn position_endpoint(self) -> &'static str {
+        match self {
+            Self::UsdtFuturesAccount => "/fapi/v3/positionRisk",
+        }
+    }
+}
+
+/// Aster 私有账户余额快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AsterPrivateBalanceBatch {
+    pub balance_event: NormalizedEvent,
+    pub balances: Vec<VenueBalance>,
+}
+
+/// Aster 私有账户仓位快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AsterPrivatePositionBatch {
+    pub position_event: NormalizedEvent,
+    pub positions: Vec<VenuePosition>,
+}
+
+/// Hyperliquid 私有账户只读市场类型。
+///
+/// 中文说明：该枚举只描述 Hyperliquid perp 账户状态来源，不表达下单、撤单、
+/// 转账、签名或链上授权能力。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HyperliquidPrivateAccountMarket {
+    PerpetualAccount,
+}
+
+impl HyperliquidPrivateAccountMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerpetualAccount => "PerpetualAccount",
+        }
+    }
+
+    fn event_scope(self) -> &'static str {
+        match self {
+            Self::PerpetualAccount => "perp",
+        }
+    }
+
+    fn account_endpoint(self) -> &'static str {
+        match self {
+            Self::PerpetualAccount => "info:clearinghouseState",
+        }
+    }
+
+    fn market_context_endpoint(self) -> &'static str {
+        match self {
+            Self::PerpetualAccount => "info:metaAndAssetCtxs",
+        }
+    }
+}
+
+/// Hyperliquid 私有账户余额快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidPrivateBalanceBatch {
+    pub balance_event: NormalizedEvent,
+    pub balances: Vec<VenueBalance>,
+}
+
+/// Hyperliquid 私有账户仓位快照批次。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidPrivatePositionBatch {
+    pub position_event: NormalizedEvent,
+    pub positions: Vec<VenuePosition>,
 }
 
 /// Binance 私有账户只读适配器。
@@ -5245,6 +5357,131 @@ impl OkxPrivateAccountAdapter {
         })
     }
 
+    /// 解析 OKX V5 `/api/v5/account/positions` 响应为交易账户仓位快照。
+    pub fn ingest_account_positions_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<OkxPrivatePositionBatch> {
+        let raw_response_ref = raw_response_ref.into();
+        let object = parse_okx_private_object(raw_json, &self.venue_id, ReadOnlySurface::Position)?;
+        validate_okx_v5_code(&object, &self.venue_id, ReadOnlySurface::Position)?;
+        let position_values = required_array(
+            &object,
+            "data",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+
+        let mut max_update_time_ms = timestamp_to_unix_millis(ingested_at)?;
+        let mut position_objects = Vec::with_capacity(position_values.len());
+        for (index, value) in position_values.iter().enumerate() {
+            let position = required_object_value(
+                value,
+                "data",
+                index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            if let Some(update_time_ms) = optional_u64(position, "uTime")? {
+                max_update_time_ms = max_update_time_ms.max(update_time_ms);
+            }
+            position_objects.push(position);
+        }
+
+        let observed_at = timestamp_from_unix_millis(max_update_time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = max_update_time_ms.to_string();
+        let position_event_id =
+            okx_private_event_id("position", self.market, &self.account_id, &source_sequence);
+
+        let mut positions = Vec::new();
+        for position_object in position_objects {
+            let quantity = parse_decimal_surface_field(
+                position_object,
+                "pos",
+                &self.venue_id,
+                ReadOnlySurface::Position,
+            )?;
+            if quantity.is_zero() {
+                continue;
+            }
+
+            let inst_id = required_string(
+                position_object,
+                "instId",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            validate_okx_inst_id(&inst_id)?;
+            let pos_side = optional_string(
+                position_object,
+                "posSide",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?
+            .unwrap_or_else(|| "net".to_owned());
+            let quantity = okx_signed_position_quantity(quantity, &pos_side)?;
+            positions.push(VenuePosition {
+                venue_id: self.venue_id.clone(),
+                position_id: Some(okx_swap_position_id(&self.account_id, &inst_id, &pos_side)?),
+                account_id: self.account_id.clone(),
+                instrument_id: okx_swap_instrument_id(&inst_id)?,
+                quantity,
+                entry_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "avgPx",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                mark_price: parse_price_surface_field(
+                    position_object,
+                    "markPx",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                unrealized_pnl: parse_pnl_surface_field_any(
+                    position_object,
+                    &["upl", "uplLastPx"],
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                liquidation_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "liqPx",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                source_event_id: Some(position_event_id.clone()),
+                freshness,
+            });
+        }
+
+        let position_event = self.position_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &positions,
+        )?;
+        self.positions = positions.clone();
+        self.update_health(freshness, position_event.event_id.as_str());
+
+        Ok(OkxPrivatePositionBatch {
+            position_event,
+            positions,
+        })
+    }
+
     pub fn classify_http_status(
         &self,
         surface: ReadOnlySurface,
@@ -5306,6 +5543,62 @@ impl OkxPrivateAccountAdapter {
             )),
             correlation_id: okx_private_correlation_id(
                 "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn position_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        positions: &[VenuePosition],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let instrument_ids = positions
+            .iter()
+            .map(|position| position.instrument_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"OkxPrivateAccountAdapter\",\"endpoint\":\"/api/v5/account/positions\",\"freshness\":{},\"instrument_ids\":{},\"kind\":\"OkxPrivatePositionSnapshot\",\"market\":\"{}\",\"position_count\":{},\"raw_response_ref\":{},\"redaction\":\"private_position_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            freshness_payload_json(freshness),
+            json_string_array(instrument_ids.iter().map(String::as_str)),
+            self.market.as_str(),
+            positions.len(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: okx_private_event_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::PositionSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:okx-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "okx:private:{}:{}:{source_sequence}:position",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: okx_private_correlation_id(
+                "position",
                 self.market,
                 &self.account_id,
                 source_sequence,
@@ -5693,6 +5986,144 @@ impl BitgetPrivateAccountAdapter {
         })
     }
 
+    /// 解析 Bitget USDT-FUTURES `/api/v2/mix/position/all-position` 响应为仓位快照。
+    pub fn ingest_usdt_futures_positions_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BitgetPrivatePositionBatch> {
+        self.ensure_market(
+            BitgetPrivateAccountMarket::UsdtFuturesAccount,
+            "bitget.mix.position.all_position",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let object =
+            parse_bitget_private_object(raw_json, &self.venue_id, ReadOnlySurface::Position)?;
+        validate_bitget_code(&object, &self.venue_id, ReadOnlySurface::Position)?;
+        let request_time_ms = required_u64(
+            &object,
+            "requestTime",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        let position_values = required_array(
+            &object,
+            "data",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+
+        let mut max_update_time_ms = request_time_ms;
+        let mut position_objects = Vec::with_capacity(position_values.len());
+        for (index, value) in position_values.iter().enumerate() {
+            let position = required_object_value(
+                value,
+                "data",
+                index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            if let Some(update_time_ms) = optional_u64(position, "uTime")? {
+                max_update_time_ms = max_update_time_ms.max(update_time_ms);
+            }
+            position_objects.push(position);
+        }
+
+        let observed_at = timestamp_from_unix_millis(max_update_time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = max_update_time_ms.to_string();
+        let position_event_id =
+            bitget_private_event_id("position", self.market, &self.account_id, &source_sequence);
+
+        let mut positions = Vec::new();
+        for position_object in position_objects {
+            let total = parse_decimal_surface_field(
+                position_object,
+                "total",
+                &self.venue_id,
+                ReadOnlySurface::Position,
+            )?;
+            if total.is_zero() {
+                continue;
+            }
+            let hold_side = required_string(
+                position_object,
+                "holdSide",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let quantity = bitget_signed_position_quantity(total, &hold_side)?;
+            let symbol = required_string(
+                position_object,
+                "symbol",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let symbol = bitget_symbol(&symbol)?;
+            positions.push(VenuePosition {
+                venue_id: self.venue_id.clone(),
+                position_id: Some(bitget_usdt_futures_position_id(
+                    &self.account_id,
+                    &symbol,
+                    &hold_side,
+                )?),
+                account_id: self.account_id.clone(),
+                instrument_id: bitget_usdt_futures_instrument_id(&symbol)?,
+                quantity,
+                entry_price: optional_nonzero_price_surface_field_any(
+                    position_object,
+                    &["openPriceAvg", "averageOpenPrice"],
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                mark_price: parse_price_surface_field(
+                    position_object,
+                    "markPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                unrealized_pnl: parse_pnl_surface_field_any(
+                    position_object,
+                    &["unrealizedPL", "unrealizedPnl"],
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                liquidation_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "liquidationPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                source_event_id: Some(position_event_id.clone()),
+                freshness,
+            });
+        }
+
+        let position_event = self.position_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &positions,
+        )?;
+        self.positions = positions.clone();
+        self.update_health(freshness, position_event.event_id.as_str());
+
+        Ok(BitgetPrivatePositionBatch {
+            position_event,
+            positions,
+        })
+    }
+
     pub fn classify_http_status(
         &self,
         surface: ReadOnlySurface,
@@ -5769,6 +6200,62 @@ impl BitgetPrivateAccountAdapter {
             )),
             correlation_id: bitget_private_correlation_id(
                 "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn position_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        positions: &[VenuePosition],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let instrument_ids = positions
+            .iter()
+            .map(|position| position.instrument_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"BitgetPrivateAccountAdapter\",\"endpoint\":\"/api/v2/mix/position/all-position\",\"freshness\":{},\"instrument_ids\":{},\"kind\":\"BitgetPrivatePositionSnapshot\",\"market\":\"{}\",\"position_count\":{},\"raw_response_ref\":{},\"redaction\":\"private_position_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            freshness_payload_json(freshness),
+            json_string_array(instrument_ids.iter().map(String::as_str)),
+            self.market.as_str(),
+            positions.len(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: bitget_private_event_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::PositionSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:bitget-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "bitget:private:{}:{}:{source_sequence}:position",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: bitget_private_correlation_id(
+                "position",
                 self.market,
                 &self.account_id,
                 source_sequence,
@@ -5878,6 +6365,1147 @@ impl InstrumentInfoReader for BitgetPrivateAccountAdapter {
 }
 
 impl VenueHealthReader for BitgetPrivateAccountAdapter {
+    fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
+        if venue_id == &self.venue_id {
+            Ok(self.health.clone())
+        } else {
+            Err(VenueDataError::DataUnavailable {
+                venue_id: venue_id.clone(),
+                surface: ReadOnlySurface::VenueHealth,
+                reason: "adapter only tracks its configured venue".to_owned(),
+            })
+        }
+    }
+}
+
+/// Aster 私有账户只读适配器。
+///
+/// 中文说明：该适配器只消费调用方已经获取到的 Aster Futures V3 `USER_DATA`
+/// JSON 响应，负责把余额和仓位映射为只读快照。它不持有 API key、不生成签名、
+/// 不主动联网，也不提供下单、撤单、划转、改杠杆或链上授权等可变动作。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AsterPrivateAccountAdapter {
+    venue_id: VenueId,
+    account_id: AccountId,
+    market: AsterPrivateAccountMarket,
+    max_age_ms: u64,
+    balances: Vec<VenueBalance>,
+    positions: Vec<VenuePosition>,
+    health: VenueHealthSnapshot,
+}
+
+impl AsterPrivateAccountAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        account_id: AccountId,
+        market: AsterPrivateAccountMarket,
+        started_at: UtcTimestamp,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let freshness = DataFreshness::new(started_at, started_at, max_age_ms)?;
+        Ok(Self {
+            venue_id: venue_id.clone(),
+            account_id,
+            market,
+            max_age_ms,
+            balances: Vec::new(),
+            positions: Vec::new(),
+            health: VenueHealthSnapshot {
+                venue_id,
+                status: VenueHealthStatus::Unknown,
+                connection: VenueConnectionStatus::Unknown,
+                reason_codes: vec!["PRIVATE_ACCOUNT_NOT_INGESTED".to_owned()],
+                rate_limit: None,
+                source_event_id: None,
+                freshness,
+            },
+        })
+    }
+
+    pub fn market(&self) -> AsterPrivateAccountMarket {
+        self.market
+    }
+
+    pub fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// 解析 Aster Futures V3 `/fapi/v3/balance` 响应为余额快照。
+    pub fn ingest_usdt_futures_balance_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<AsterPrivateBalanceBatch> {
+        self.ensure_market(
+            AsterPrivateAccountMarket::UsdtFuturesAccount,
+            "aster.futures.balance",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let value = parse_aster_private_value(raw_json, &self.venue_id, ReadOnlySurface::Balance)?;
+        let FlatJsonValue::Array(balance_values) = value else {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MalformedPayload,
+                "Aster futures balance response must be a JSON array",
+            )));
+        };
+        if balance_values.is_empty() {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MissingField,
+                "Aster futures balance response contains no balances",
+            )));
+        }
+
+        let mut max_update_time_ms = 0_u64;
+        let mut balance_objects = Vec::with_capacity(balance_values.len());
+        for (index, value) in balance_values.iter().enumerate() {
+            let balance_object = required_object_value(
+                value,
+                "balances",
+                index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            let update_time_ms = required_u64(
+                balance_object,
+                "updateTime",
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            max_update_time_ms = max_update_time_ms.max(update_time_ms);
+            balance_objects.push(balance_object);
+        }
+
+        let observed_at = timestamp_from_unix_millis(max_update_time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = max_update_time_ms.to_string();
+        let balance_event_id =
+            aster_private_event_id("balance", self.market, &self.account_id, &source_sequence);
+
+        let mut balances = Vec::with_capacity(balance_objects.len());
+        for balance_object in balance_objects {
+            let asset = required_string(
+                balance_object,
+                "asset",
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+            )?;
+            let asset = aster_asset_symbol(&asset)?;
+            balances.push(VenueBalance {
+                venue_id: self.venue_id.clone(),
+                account_id: self.account_id.clone(),
+                asset_id: aster_asset_id(&asset)?,
+                free: parse_amount_surface_field(
+                    balance_object,
+                    "availableBalance",
+                    &self.venue_id,
+                    ReadOnlySurface::Balance,
+                )?,
+                locked: parse_non_negative_amount_difference_surface_fields(
+                    balance_object,
+                    "balance",
+                    "availableBalance",
+                    &self.venue_id,
+                    ReadOnlySurface::Balance,
+                )?,
+                reserved: zero_amount(),
+                pending: zero_amount(),
+                borrowed: zero_amount(),
+                lent: zero_amount(),
+                unsettled: zero_amount(),
+                source_event_id: Some(balance_event_id.clone()),
+                freshness,
+            });
+        }
+
+        let balance_event = self.balance_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &balances,
+        )?;
+        self.balances = balances.clone();
+        self.positions.clear();
+        self.update_health(freshness, balance_event.event_id.as_str());
+
+        Ok(AsterPrivateBalanceBatch {
+            balance_event,
+            balances,
+        })
+    }
+
+    /// 解析 Aster Futures V3 `/fapi/v3/positionRisk` 响应为仓位快照。
+    ///
+    /// 中文说明：非零仓位必须携带 mark price、entry price、unrealized PnL 等风险
+    /// 字段；缺失时按外部数据不完整处理，调用方应失败关闭。
+    pub fn ingest_usdt_futures_position_risk_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<AsterPrivatePositionBatch> {
+        self.ensure_market(
+            AsterPrivateAccountMarket::UsdtFuturesAccount,
+            "aster.futures.position_risk",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let value = parse_aster_private_value(raw_json, &self.venue_id, ReadOnlySurface::Position)?;
+        let FlatJsonValue::Array(position_values) = value else {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                "Aster futures positionRisk response must be a JSON array",
+            )));
+        };
+
+        let mut max_update_time_ms = 0_u64;
+        let mut has_nonzero_position = false;
+        let mut position_objects = Vec::with_capacity(position_values.len());
+        for (index, value) in position_values.iter().enumerate() {
+            let position_object = required_object_value(
+                value,
+                "positions",
+                index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let quantity = parse_decimal_surface_field(
+                position_object,
+                "positionAmt",
+                &self.venue_id,
+                ReadOnlySurface::Position,
+            )?;
+            has_nonzero_position |= !quantity.is_zero();
+            let update_time_ms = required_u64(
+                position_object,
+                "updateTime",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            max_update_time_ms = max_update_time_ms.max(update_time_ms);
+            position_objects.push(position_object);
+        }
+
+        if !has_nonzero_position && max_update_time_ms == 0 {
+            max_update_time_ms = timestamp_to_unix_millis(ingested_at)?;
+        }
+
+        let observed_at = timestamp_from_unix_millis(max_update_time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = max_update_time_ms.to_string();
+        let position_event_id =
+            aster_private_event_id("position", self.market, &self.account_id, &source_sequence);
+
+        let mut positions = Vec::new();
+        for position_object in position_objects {
+            let quantity = parse_decimal_surface_field(
+                position_object,
+                "positionAmt",
+                &self.venue_id,
+                ReadOnlySurface::Position,
+            )?;
+            if quantity.is_zero() {
+                continue;
+            }
+
+            let symbol = required_string(
+                position_object,
+                "symbol",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let symbol = aster_symbol(&symbol)?;
+            let position_side = optional_string(
+                position_object,
+                "positionSide",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?
+            .unwrap_or_else(|| "BOTH".to_owned());
+            validate_aster_position_side(&position_side)?;
+            positions.push(VenuePosition {
+                venue_id: self.venue_id.clone(),
+                position_id: Some(aster_usdt_futures_position_id(
+                    &self.account_id,
+                    &symbol,
+                    &position_side,
+                )?),
+                account_id: self.account_id.clone(),
+                instrument_id: aster_usdt_futures_instrument_id(&symbol)?,
+                quantity,
+                entry_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "entryPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                mark_price: parse_price_surface_field(
+                    position_object,
+                    "markPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                unrealized_pnl: parse_pnl_surface_field_any(
+                    position_object,
+                    &["unRealizedProfit", "unrealizedProfit"],
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                liquidation_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "liquidationPrice",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                source_event_id: Some(position_event_id.clone()),
+                freshness,
+            });
+        }
+
+        let position_event = self.position_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &positions,
+        )?;
+        self.positions = positions.clone();
+        self.update_health(freshness, position_event.event_id.as_str());
+
+        Ok(AsterPrivatePositionBatch {
+            position_event,
+            positions,
+        })
+    }
+
+    pub fn classify_http_status(
+        &self,
+        surface: ReadOnlySurface,
+        status_code: u16,
+        detail: impl Into<String>,
+    ) -> ClassifiedExternalError {
+        let class = match status_code {
+            408 | 504 => ExternalErrorClass::Timeout,
+            418 | 429 => ExternalErrorClass::RateLimited,
+            500..=599 => ExternalErrorClass::Disconnected,
+            _ => ExternalErrorClass::UnknownExternalState,
+        };
+        ClassifiedExternalError::new(self.venue_id.clone(), surface, class, detail)
+    }
+
+    fn ensure_market(
+        &self,
+        expected: AsterPrivateAccountMarket,
+        field: &'static str,
+    ) -> VenueDataResult<()> {
+        if self.market == expected {
+            Ok(())
+        } else {
+            Err(VenueDataError::InvalidQuery {
+                field,
+                reason: "Aster private account adapter market does not match this ingestion path",
+            })
+        }
+    }
+
+    fn balance_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        balances: &[VenueBalance],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let asset_ids = balances
+            .iter()
+            .map(|balance| balance.asset_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"AsterPrivateAccountAdapter\",\"asset_ids\":{},\"balance_count\":{},\"endpoint\":{},\"freshness\":{},\"kind\":\"AsterPrivateBalanceSnapshot\",\"market\":\"{}\",\"raw_response_ref\":{},\"redaction\":\"private_account_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            json_string_array(asset_ids.iter().map(String::as_str)),
+            balances.len(),
+            json_string(self.market.balance_endpoint()),
+            freshness_payload_json(freshness),
+            self.market.as_str(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: aster_private_event_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::BalanceSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:aster-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "aster:private:{}:{}:{source_sequence}:balance",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: aster_private_correlation_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn position_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        positions: &[VenuePosition],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let instrument_ids = positions
+            .iter()
+            .map(|position| position.instrument_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"AsterPrivateAccountAdapter\",\"endpoint\":{},\"freshness\":{},\"instrument_ids\":{},\"kind\":\"AsterPrivatePositionSnapshot\",\"market\":\"{}\",\"position_count\":{},\"raw_response_ref\":{},\"redaction\":\"private_position_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            json_string(self.market.position_endpoint()),
+            freshness_payload_json(freshness),
+            json_string_array(instrument_ids.iter().map(String::as_str)),
+            self.market.as_str(),
+            positions.len(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: aster_private_event_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::PositionSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:aster-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "aster:private:{}:{}:{source_sequence}:position",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: aster_private_correlation_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn update_health(&mut self, freshness: DataFreshness, source_event_id: &str) {
+        self.health.status = if freshness.is_stale() {
+            VenueHealthStatus::Degraded
+        } else {
+            VenueHealthStatus::Healthy
+        };
+        self.health.connection = VenueConnectionStatus::Connected;
+        self.health.reason_codes = if freshness.is_stale() {
+            vec!["DATA_STALE".to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.health.source_event_id = Some(source_event_id.to_owned());
+        self.health.freshness = freshness;
+    }
+}
+
+impl VenueReadAdapter for AsterPrivateAccountAdapter {
+    fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+}
+
+impl MarketDataReader for AsterPrivateAccountAdapter {
+    fn latest_quote(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<MarketQuote>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Aster private account adapter has no market data surface".to_owned(),
+        })
+    }
+
+    fn order_book(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<OrderBookSnapshot>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Aster private account adapter has no order book surface".to_owned(),
+        })
+    }
+}
+
+impl BalanceReader for AsterPrivateAccountAdapter {
+    fn balances(&self, query: &BalanceQuery) -> VenueDataResult<Vec<VenueBalance>> {
+        Ok(self
+            .balances
+            .iter()
+            .filter(|balance| balance.venue_id == query.venue_id)
+            .filter(|balance| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &balance.account_id)
+            })
+            .filter(|balance| {
+                query
+                    .asset_id
+                    .as_ref()
+                    .is_none_or(|asset_id| asset_id == &balance.asset_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl PositionReader for AsterPrivateAccountAdapter {
+    fn positions(&self, query: &PositionQuery) -> VenueDataResult<Vec<VenuePosition>> {
+        Ok(self
+            .positions
+            .iter()
+            .filter(|position| position.venue_id == query.venue_id)
+            .filter(|position| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &position.account_id)
+            })
+            .filter(|position| {
+                query
+                    .instrument_id
+                    .as_ref()
+                    .is_none_or(|instrument_id| instrument_id == &position.instrument_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl InstrumentInfoReader for AsterPrivateAccountAdapter {
+    fn instruments(&self, _query: &InstrumentInfoQuery) -> VenueDataResult<Vec<InstrumentInfo>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::InstrumentInfo,
+            reason: "Aster private account adapter does not define instrument metadata".to_owned(),
+        })
+    }
+}
+
+impl VenueHealthReader for AsterPrivateAccountAdapter {
+    fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
+        if venue_id == &self.venue_id {
+            Ok(self.health.clone())
+        } else {
+            Err(VenueDataError::DataUnavailable {
+                venue_id: venue_id.clone(),
+                surface: ReadOnlySurface::VenueHealth,
+                reason: "adapter only tracks its configured venue".to_owned(),
+            })
+        }
+    }
+}
+
+/// Hyperliquid 私有账户只读适配器。
+///
+/// 中文说明：该适配器只消费调用方已经获取到的 Hyperliquid `info`
+/// `clearinghouseState` 和 `metaAndAssetCtxs` JSON 响应。`clearinghouseState`
+/// 不直接提供 mark price，因此仓位映射必须同时给出公共资产上下文；缺失时按
+/// 外部数据不完整失败关闭。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidPrivateAccountAdapter {
+    venue_id: VenueId,
+    account_id: AccountId,
+    market: HyperliquidPrivateAccountMarket,
+    max_age_ms: u64,
+    balances: Vec<VenueBalance>,
+    positions: Vec<VenuePosition>,
+    health: VenueHealthSnapshot,
+}
+
+impl HyperliquidPrivateAccountAdapter {
+    pub fn new(
+        venue_id: VenueId,
+        account_id: AccountId,
+        market: HyperliquidPrivateAccountMarket,
+        started_at: UtcTimestamp,
+        max_age_ms: u64,
+    ) -> VenueDataResult<Self> {
+        let freshness = DataFreshness::new(started_at, started_at, max_age_ms)?;
+        Ok(Self {
+            venue_id: venue_id.clone(),
+            account_id,
+            market,
+            max_age_ms,
+            balances: Vec::new(),
+            positions: Vec::new(),
+            health: VenueHealthSnapshot {
+                venue_id,
+                status: VenueHealthStatus::Unknown,
+                connection: VenueConnectionStatus::Unknown,
+                reason_codes: vec!["PRIVATE_ACCOUNT_NOT_INGESTED".to_owned()],
+                rate_limit: None,
+                source_event_id: None,
+                freshness,
+            },
+        })
+    }
+
+    pub fn market(&self) -> HyperliquidPrivateAccountMarket {
+        self.market
+    }
+
+    pub fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// 解析 Hyperliquid `clearinghouseState` 响应为 USDC 保证金余额快照。
+    pub fn ingest_clearinghouse_state_balance_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<HyperliquidPrivateBalanceBatch> {
+        self.ensure_market(
+            HyperliquidPrivateAccountMarket::PerpetualAccount,
+            "hyperliquid.clearinghouse_state.balance",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let object =
+            parse_hyperliquid_private_object(raw_json, &self.venue_id, ReadOnlySurface::Balance)?;
+        let time_ms = required_u64(
+            &object,
+            "time",
+            self.venue_id.clone(),
+            ReadOnlySurface::Balance,
+        )?;
+        let observed_at = timestamp_from_unix_millis(time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = time_ms.to_string();
+        let balance_event_id = hyperliquid_private_event_id(
+            "balance",
+            self.market,
+            &self.account_id,
+            &source_sequence,
+        );
+        let margin_summary = required_object_field(
+            &object,
+            "marginSummary",
+            self.venue_id.clone(),
+            ReadOnlySurface::Balance,
+        )?;
+        let account_value = parse_decimal_surface_field(
+            margin_summary,
+            "accountValue",
+            &self.venue_id,
+            ReadOnlySurface::Balance,
+        )?;
+        let withdrawable = parse_decimal_surface_field(
+            &object,
+            "withdrawable",
+            &self.venue_id,
+            ReadOnlySurface::Balance,
+        )?;
+        let locked = account_value.checked_sub(withdrawable).map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MalformedPayload,
+                format!("Hyperliquid accountValue minus withdrawable is invalid: {error}"),
+            ))
+        })?;
+        let balances = vec![VenueBalance {
+            venue_id: self.venue_id.clone(),
+            account_id: self.account_id.clone(),
+            asset_id: AssetId::new("asset:USDC").map_err(VenueDataError::from)?,
+            free: Amount::new(withdrawable).map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Balance,
+                    ExternalErrorClass::MalformedPayload,
+                    format!("Hyperliquid withdrawable is not a valid amount: {error}"),
+                ))
+            })?,
+            locked: Amount::new(locked).map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Balance,
+                    ExternalErrorClass::MalformedPayload,
+                    format!(
+                        "Hyperliquid accountValue must be greater than or equal to withdrawable: {error}"
+                    ),
+                ))
+            })?,
+            reserved: zero_amount(),
+            pending: zero_amount(),
+            borrowed: zero_amount(),
+            lent: zero_amount(),
+            unsettled: zero_amount(),
+            source_event_id: Some(balance_event_id),
+            freshness,
+        }];
+
+        let balance_event = self.balance_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &balances,
+        )?;
+        self.balances = balances.clone();
+        self.positions.clear();
+        self.update_health(freshness, balance_event.event_id.as_str());
+
+        Ok(HyperliquidPrivateBalanceBatch {
+            balance_event,
+            balances,
+        })
+    }
+
+    /// 解析 Hyperliquid `clearinghouseState` 和 `metaAndAssetCtxs` 为仓位快照。
+    pub fn ingest_clearinghouse_state_positions_json(
+        &mut self,
+        raw_clearinghouse_state_json: &str,
+        raw_asset_contexts_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<HyperliquidPrivatePositionBatch> {
+        self.ensure_market(
+            HyperliquidPrivateAccountMarket::PerpetualAccount,
+            "hyperliquid.clearinghouse_state.positions",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let object = parse_hyperliquid_private_object(
+            raw_clearinghouse_state_json,
+            &self.venue_id,
+            ReadOnlySurface::Position,
+        )?;
+        let mark_prices = parse_hyperliquid_mark_prices(raw_asset_contexts_json, &self.venue_id)?;
+        let time_ms = required_u64(
+            &object,
+            "time",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        let observed_at = timestamp_from_unix_millis(time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = time_ms.to_string();
+        let position_event_id = hyperliquid_private_event_id(
+            "position",
+            self.market,
+            &self.account_id,
+            &source_sequence,
+        );
+        let position_values = required_array(
+            &object,
+            "assetPositions",
+            self.venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+
+        let mut positions = Vec::new();
+        for (index, value) in position_values.iter().enumerate() {
+            let wrapper = required_object_value(
+                value,
+                "assetPositions",
+                index,
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let position_object = required_object_field(
+                wrapper,
+                "position",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let quantity = parse_decimal_surface_field(
+                position_object,
+                "szi",
+                &self.venue_id,
+                ReadOnlySurface::Position,
+            )?;
+            if quantity.is_zero() {
+                continue;
+            }
+            let coin = required_string(
+                position_object,
+                "coin",
+                self.venue_id.clone(),
+                ReadOnlySurface::Position,
+            )?;
+            let coin = hyperliquid_coin(&coin)?;
+            let Some(mark_price) = mark_prices.get(&coin).copied() else {
+                return Err(VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::Position,
+                    ExternalErrorClass::MissingField,
+                    format!("Hyperliquid metaAndAssetCtxs response is missing markPx for `{coin}`"),
+                )));
+            };
+            positions.push(VenuePosition {
+                venue_id: self.venue_id.clone(),
+                position_id: Some(hyperliquid_perp_position_id(
+                    &self.account_id,
+                    &coin,
+                    if quantity.is_negative() {
+                        "short"
+                    } else {
+                        "long"
+                    },
+                )?),
+                account_id: self.account_id.clone(),
+                instrument_id: hyperliquid_perp_instrument_id(&coin)?,
+                quantity,
+                entry_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "entryPx",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                mark_price,
+                unrealized_pnl: parse_pnl_surface_field_any(
+                    position_object,
+                    &["unrealizedPnl"],
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                liquidation_price: optional_nonzero_price_surface_field(
+                    position_object,
+                    "liquidationPx",
+                    &self.venue_id,
+                    ReadOnlySurface::Position,
+                )?,
+                source_event_id: Some(position_event_id.clone()),
+                freshness,
+            });
+        }
+
+        let position_event = self.position_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &positions,
+        )?;
+        self.positions = positions.clone();
+        self.update_health(freshness, position_event.event_id.as_str());
+
+        Ok(HyperliquidPrivatePositionBatch {
+            position_event,
+            positions,
+        })
+    }
+
+    pub fn classify_http_status(
+        &self,
+        surface: ReadOnlySurface,
+        status_code: u16,
+        detail: impl Into<String>,
+    ) -> ClassifiedExternalError {
+        let class = match status_code {
+            408 | 504 => ExternalErrorClass::Timeout,
+            429 => ExternalErrorClass::RateLimited,
+            500..=599 => ExternalErrorClass::Disconnected,
+            _ => ExternalErrorClass::UnknownExternalState,
+        };
+        ClassifiedExternalError::new(self.venue_id.clone(), surface, class, detail)
+    }
+
+    fn ensure_market(
+        &self,
+        expected: HyperliquidPrivateAccountMarket,
+        field: &'static str,
+    ) -> VenueDataResult<()> {
+        if self.market == expected {
+            Ok(())
+        } else {
+            Err(VenueDataError::InvalidQuery {
+                field,
+                reason:
+                    "Hyperliquid private account adapter market does not match this ingestion path",
+            })
+        }
+    }
+
+    fn balance_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        balances: &[VenueBalance],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let asset_ids = balances
+            .iter()
+            .map(|balance| balance.asset_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"HyperliquidPrivateAccountAdapter\",\"asset_ids\":{},\"balance_count\":{},\"endpoint\":{},\"freshness\":{},\"kind\":\"HyperliquidPrivateBalanceSnapshot\",\"market\":\"{}\",\"raw_response_ref\":{},\"redaction\":\"private_account_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            json_string_array(asset_ids.iter().map(String::as_str)),
+            balances.len(),
+            json_string(self.market.account_endpoint()),
+            freshness_payload_json(freshness),
+            self.market.as_str(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: hyperliquid_private_event_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::BalanceSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:hyperliquid-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "hyperliquid:private:{}:{}:{source_sequence}:balance",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: hyperliquid_private_correlation_id(
+                "balance",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn position_snapshot_event(
+        &self,
+        raw_response_ref: &str,
+        source_sequence: &str,
+        observed_at: UtcTimestamp,
+        ingested_at: UtcTimestamp,
+        freshness: DataFreshness,
+        positions: &[VenuePosition],
+    ) -> VenueDataResult<NormalizedEvent> {
+        let instrument_ids = positions
+            .iter()
+            .map(|position| position.instrument_id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let payload = format!(
+            "{{\"account_id\":{},\"adapter\":\"HyperliquidPrivateAccountAdapter\",\"endpoint\":{},\"freshness\":{},\"instrument_ids\":{},\"kind\":\"HyperliquidPrivatePositionSnapshot\",\"market\":\"{}\",\"market_context_endpoint\":{},\"position_count\":{},\"raw_response_ref\":{},\"redaction\":\"private_position_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            json_string(self.account_id.as_str()),
+            json_string(self.market.account_endpoint()),
+            freshness_payload_json(freshness),
+            json_string_array(instrument_ids.iter().map(String::as_str)),
+            self.market.as_str(),
+            json_string(self.market.market_context_endpoint()),
+            positions.len(),
+            json_string(raw_response_ref),
+            json_string(if freshness.is_stale() {
+                "DATA_STALE"
+            } else {
+                "CHECK_PASSED"
+            }),
+        );
+        build_normalized_event(EventEnvelope {
+            event_id: hyperliquid_private_event_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            event_type: NormalizedEventType::PositionSnapshotEvent,
+            timestamp_event: observed_at,
+            timestamp_ingested: ingested_at,
+            source: "adapter:hyperliquid-private-account".to_owned(),
+            source_sequence: Some(format!(
+                "hyperliquid:private:{}:{}:{source_sequence}:position",
+                self.market.event_scope(),
+                self.account_id
+            )),
+            correlation_id: hyperliquid_private_correlation_id(
+                "position",
+                self.market,
+                &self.account_id,
+                source_sequence,
+            ),
+            causation_id: None,
+            venue_id: Some(self.venue_id.as_str().to_owned()),
+            instrument_id: None,
+            payload_json: payload,
+        })
+    }
+
+    fn update_health(&mut self, freshness: DataFreshness, source_event_id: &str) {
+        self.health.status = if freshness.is_stale() {
+            VenueHealthStatus::Degraded
+        } else {
+            VenueHealthStatus::Healthy
+        };
+        self.health.connection = VenueConnectionStatus::Connected;
+        self.health.reason_codes = if freshness.is_stale() {
+            vec!["DATA_STALE".to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.health.source_event_id = Some(source_event_id.to_owned());
+        self.health.freshness = freshness;
+    }
+}
+
+impl VenueReadAdapter for HyperliquidPrivateAccountAdapter {
+    fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+}
+
+impl MarketDataReader for HyperliquidPrivateAccountAdapter {
+    fn latest_quote(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<MarketQuote>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Hyperliquid private account adapter has no market data surface".to_owned(),
+        })
+    }
+
+    fn order_book(&self, _query: &MarketDataQuery) -> VenueDataResult<Option<OrderBookSnapshot>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::MarketData,
+            reason: "Hyperliquid private account adapter has no order book surface".to_owned(),
+        })
+    }
+}
+
+impl BalanceReader for HyperliquidPrivateAccountAdapter {
+    fn balances(&self, query: &BalanceQuery) -> VenueDataResult<Vec<VenueBalance>> {
+        Ok(self
+            .balances
+            .iter()
+            .filter(|balance| balance.venue_id == query.venue_id)
+            .filter(|balance| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &balance.account_id)
+            })
+            .filter(|balance| {
+                query
+                    .asset_id
+                    .as_ref()
+                    .is_none_or(|asset_id| asset_id == &balance.asset_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl PositionReader for HyperliquidPrivateAccountAdapter {
+    fn positions(&self, query: &PositionQuery) -> VenueDataResult<Vec<VenuePosition>> {
+        Ok(self
+            .positions
+            .iter()
+            .filter(|position| position.venue_id == query.venue_id)
+            .filter(|position| {
+                query
+                    .account_id
+                    .as_ref()
+                    .is_none_or(|account_id| account_id == &position.account_id)
+            })
+            .filter(|position| {
+                query
+                    .instrument_id
+                    .as_ref()
+                    .is_none_or(|instrument_id| instrument_id == &position.instrument_id)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+impl InstrumentInfoReader for HyperliquidPrivateAccountAdapter {
+    fn instruments(&self, _query: &InstrumentInfoQuery) -> VenueDataResult<Vec<InstrumentInfo>> {
+        Err(VenueDataError::DataUnavailable {
+            venue_id: self.venue_id.clone(),
+            surface: ReadOnlySurface::InstrumentInfo,
+            reason: "Hyperliquid private account adapter does not define instrument metadata"
+                .to_owned(),
+        })
+    }
+}
+
+impl VenueHealthReader for HyperliquidPrivateAccountAdapter {
     fn venue_health(&self, venue_id: &VenueId) -> VenueDataResult<VenueHealthSnapshot> {
         if venue_id == &self.venue_id {
             Ok(self.health.clone())
@@ -6278,6 +7906,83 @@ fn validate_bybit_symbol(symbol: &str) -> VenueDataResult<()> {
     Ok(())
 }
 
+fn validate_okx_inst_id(inst_id: &str) -> VenueDataResult<()> {
+    if inst_id.len() < 3 || inst_id.len() > 64 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "okx.instId",
+            reason: "instrument ID length must be 3..=64",
+        });
+    }
+    if !inst_id
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "okx.instId",
+            reason: "instrument ID must contain only uppercase ASCII letters, digits and hyphens",
+        });
+    }
+    Ok(())
+}
+
+fn validate_bitget_symbol(symbol: &str) -> VenueDataResult<()> {
+    if symbol.len() < 3 || symbol.len() > 32 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "bitget.symbol",
+            reason: "symbol length must be 3..=32",
+        });
+    }
+    if !symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "bitget.symbol",
+            reason: "symbol must contain only uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
+}
+
+fn validate_aster_symbol(symbol: &str) -> VenueDataResult<()> {
+    if symbol.len() < 3 || symbol.len() > 32 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "aster.symbol",
+            reason: "symbol length must be 3..=32",
+        });
+    }
+    if !symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "aster.symbol",
+            reason: "symbol must contain only uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
+}
+
+fn validate_hyperliquid_coin(coin: &str) -> VenueDataResult<()> {
+    if coin.is_empty() || coin.len() > 64 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "hyperliquid.coin",
+            reason: "coin length must be 1..=64",
+        });
+    }
+    if !coin
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-' | b'.'))
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "hyperliquid.coin",
+            reason:
+                "coin must contain only ASCII letters, digits, colon, underscore, hyphen or dot",
+        });
+    }
+    Ok(())
+}
+
 fn validate_bybit_asset_symbol(asset: &str) -> VenueDataResult<()> {
     if asset.is_empty() || asset.len() > 32 {
         return Err(VenueDataError::InvalidQuery {
@@ -6335,6 +8040,25 @@ fn validate_bitget_asset_symbol(asset: &str) -> VenueDataResult<()> {
     Ok(())
 }
 
+fn validate_aster_asset_symbol(asset: &str) -> VenueDataResult<()> {
+    if asset.is_empty() || asset.len() > 32 {
+        return Err(VenueDataError::InvalidQuery {
+            field: "aster.asset",
+            reason: "asset symbol length must be 1..=32",
+        });
+    }
+    if !asset
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(VenueDataError::InvalidQuery {
+            field: "aster.asset",
+            reason: "asset symbol must contain only uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
+}
+
 fn validate_binance_asset_symbol(asset: &str) -> VenueDataResult<()> {
     if asset.is_empty() || asset.len() > 32 {
         return Err(VenueDataError::InvalidQuery {
@@ -6360,6 +8084,17 @@ fn validate_binance_position_side(position_side: &str) -> VenueDataResult<()> {
     } else {
         Err(VenueDataError::InvalidQuery {
             field: "binance.positionSide",
+            reason: "position side must be BOTH, LONG or SHORT",
+        })
+    }
+}
+
+fn validate_aster_position_side(position_side: &str) -> VenueDataResult<()> {
+    if matches!(position_side, "BOTH" | "LONG" | "SHORT") {
+        Ok(())
+    } else {
+        Err(VenueDataError::InvalidQuery {
+            field: "aster.positionSide",
             reason: "position side must be BOTH, LONG or SHORT",
         })
     }
@@ -6423,6 +8158,134 @@ fn parse_bitget_private_object(
             error.to_string(),
         ))
     })
+}
+
+fn parse_aster_private_value(
+    raw_json: &str,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<FlatJsonValue> {
+    FlatJsonParser::new(raw_json)
+        .parse_value_root()
+        .map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                surface,
+                ExternalErrorClass::MalformedPayload,
+                error.to_string(),
+            ))
+        })
+}
+
+fn parse_hyperliquid_private_object(
+    raw_json: &str,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<BTreeMap<String, FlatJsonValue>> {
+    FlatJsonParser::new(raw_json).parse().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            error.to_string(),
+        ))
+    })
+}
+
+fn parse_hyperliquid_mark_prices(
+    raw_json: &str,
+    venue_id: &VenueId,
+) -> VenueDataResult<BTreeMap<String, Price>> {
+    let value = FlatJsonParser::new(raw_json)
+        .parse_value_root()
+        .map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                error.to_string(),
+            ))
+        })?;
+    let FlatJsonValue::Array(values) = value else {
+        return Err(VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::Position,
+            ExternalErrorClass::MalformedPayload,
+            "Hyperliquid metaAndAssetCtxs response must be a JSON array",
+        )));
+    };
+    if values.len() != 2 {
+        return Err(VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::Position,
+            ExternalErrorClass::MalformedPayload,
+            "Hyperliquid metaAndAssetCtxs response must contain metadata and asset contexts",
+        )));
+    }
+    let meta = match &values[0] {
+        FlatJsonValue::Object(object) => object,
+        _ => {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                "Hyperliquid metaAndAssetCtxs metadata item must be an object",
+            )))
+        }
+    };
+    let universe = required_array(
+        meta,
+        "universe",
+        venue_id.clone(),
+        ReadOnlySurface::Position,
+    )?;
+    let contexts = match &values[1] {
+        FlatJsonValue::Array(values) => values,
+        _ => {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MalformedPayload,
+                "Hyperliquid metaAndAssetCtxs context item must be an array",
+            )))
+        }
+    };
+    let mut prices = BTreeMap::new();
+    for (index, item) in universe.iter().enumerate() {
+        let meta_row = required_object_value(
+            item,
+            "universe",
+            index,
+            venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        let coin = required_string(
+            meta_row,
+            "name",
+            venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        validate_hyperliquid_coin(&coin)?;
+        let Some(context) = contexts.get(index) else {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                ReadOnlySurface::Position,
+                ExternalErrorClass::MissingField,
+                format!("Hyperliquid metaAndAssetCtxs missing context row for `{coin}`"),
+            )));
+        };
+        let context = required_object_value(
+            context,
+            "asset_contexts",
+            index,
+            venue_id.clone(),
+            ReadOnlySurface::Position,
+        )?;
+        let mark_price =
+            parse_price_surface_field(context, "markPx", venue_id, ReadOnlySurface::Position)?;
+        prices.insert(coin, mark_price);
+    }
+    Ok(prices)
 }
 
 fn validate_bybit_v5_ret_code(
@@ -6853,6 +8716,33 @@ fn parse_optional_amount_surface_field(
     })
 }
 
+fn parse_non_negative_amount_difference_surface_fields(
+    object: &BTreeMap<String, FlatJsonValue>,
+    minuend_field: &'static str,
+    subtrahend_field: &'static str,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<Amount> {
+    let minuend = parse_decimal_surface_field(object, minuend_field, venue_id, surface)?;
+    let subtrahend = parse_decimal_surface_field(object, subtrahend_field, venue_id, surface)?;
+    let difference = minuend.checked_sub(subtrahend).map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            format!("field `{minuend_field}` minus `{subtrahend_field}` is invalid: {error}"),
+        ))
+    })?;
+    Amount::new(difference).map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            format!("field `{minuend_field}` must be greater than or equal to `{subtrahend_field}`: {error}"),
+        ))
+    })
+}
+
 fn parse_decimal_surface_field(
     object: &BTreeMap<String, FlatJsonValue>,
     field: &'static str,
@@ -6895,9 +8785,24 @@ fn optional_nonzero_price_surface_field(
     venue_id: &VenueId,
     surface: ReadOnlySurface,
 ) -> VenueDataResult<Option<Price>> {
-    let Some(value) = optional_decimal_text(object, field, venue_id, surface)? else {
+    let Some(raw) = object.get(field) else {
         return Ok(None);
     };
+    let value = match raw {
+        FlatJsonValue::String(value) | FlatJsonValue::Number(value) => value,
+        FlatJsonValue::Null => return Ok(None),
+        _ => {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                surface,
+                ExternalErrorClass::MalformedPayload,
+                format!("field `{field}` must be a decimal string or number when present"),
+            )))
+        }
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
     let price = value.parse::<Price>().map_err(|error| {
         VenueDataError::External(ClassifiedExternalError::new(
             venue_id.clone(),
@@ -6907,6 +8812,20 @@ fn optional_nonzero_price_surface_field(
         ))
     })?;
     Ok((!price.as_decimal().is_zero()).then_some(price))
+}
+
+fn optional_nonzero_price_surface_field_any(
+    object: &BTreeMap<String, FlatJsonValue>,
+    fields: &[&'static str],
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<Option<Price>> {
+    for field in fields {
+        if object.contains_key(*field) {
+            return optional_nonzero_price_surface_field(object, field, venue_id, surface);
+        }
+    }
+    Ok(None)
 }
 
 fn parse_pnl_surface_field_any(
@@ -7026,8 +8945,37 @@ fn bitget_asset_symbol(asset: &str) -> VenueDataResult<String> {
     Ok(asset)
 }
 
+fn bitget_symbol(symbol: &str) -> VenueDataResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    validate_bitget_symbol(&symbol)?;
+    Ok(symbol)
+}
+
+fn aster_asset_symbol(asset: &str) -> VenueDataResult<String> {
+    let asset = asset.trim().to_ascii_uppercase();
+    validate_aster_asset_symbol(&asset)?;
+    Ok(asset)
+}
+
+fn aster_symbol(symbol: &str) -> VenueDataResult<String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    validate_aster_symbol(&symbol)?;
+    Ok(symbol)
+}
+
+fn hyperliquid_coin(coin: &str) -> VenueDataResult<String> {
+    let coin = coin.trim().to_owned();
+    validate_hyperliquid_coin(&coin)?;
+    Ok(coin)
+}
+
 fn bitget_asset_id(asset: &str) -> VenueDataResult<AssetId> {
     validate_bitget_asset_symbol(asset)?;
+    AssetId::new(format!("asset:{asset}")).map_err(VenueDataError::from)
+}
+
+fn aster_asset_id(asset: &str) -> VenueDataResult<AssetId> {
+    validate_aster_asset_symbol(asset)?;
     AssetId::new(format!("asset:{asset}")).map_err(VenueDataError::from)
 }
 
@@ -7041,6 +8989,32 @@ fn bybit_linear_instrument_id(symbol: &str) -> VenueDataResult<InstrumentId> {
     InstrumentId::new(format!("inst:BYBIT:{symbol}:LINEAR-PERP")).map_err(VenueDataError::from)
 }
 
+fn okx_swap_instrument_id(inst_id: &str) -> VenueDataResult<InstrumentId> {
+    validate_okx_inst_id(inst_id)?;
+    if !inst_id.ends_with("-SWAP") {
+        return Err(VenueDataError::InvalidQuery {
+            field: "okx.instId",
+            reason: "only OKX SWAP positions are currently mapped by this adapter",
+        });
+    }
+    InstrumentId::new(format!("inst:OKX:{inst_id}:SWAP")).map_err(VenueDataError::from)
+}
+
+fn bitget_usdt_futures_instrument_id(symbol: &str) -> VenueDataResult<InstrumentId> {
+    validate_bitget_symbol(symbol)?;
+    InstrumentId::new(format!("inst:BITGET:{symbol}:USDT-FUTURES")).map_err(VenueDataError::from)
+}
+
+fn aster_usdt_futures_instrument_id(symbol: &str) -> VenueDataResult<InstrumentId> {
+    validate_aster_symbol(symbol)?;
+    InstrumentId::new(format!("inst:ASTER:{symbol}:USDT-FUTURES")).map_err(VenueDataError::from)
+}
+
+fn hyperliquid_perp_instrument_id(coin: &str) -> VenueDataResult<InstrumentId> {
+    validate_hyperliquid_coin(coin)?;
+    InstrumentId::new(format!("inst:HYPERLIQUID:{coin}:PERP")).map_err(VenueDataError::from)
+}
+
 fn binance_usdm_position_id(
     account_id: &AccountId,
     symbol: &str,
@@ -7052,6 +9026,89 @@ fn binance_usdm_position_id(
         "pos:{}:binance-usdm:{symbol}:{}",
         account_id,
         position_side.to_ascii_lowercase()
+    ))
+    .map_err(VenueDataError::from)
+}
+
+fn okx_swap_position_id(
+    account_id: &AccountId,
+    inst_id: &str,
+    pos_side: &str,
+) -> VenueDataResult<PositionId> {
+    validate_okx_inst_id(inst_id)?;
+    let pos_side = match pos_side {
+        "net" | "long" | "short" => pos_side,
+        _ => {
+            return Err(VenueDataError::InvalidQuery {
+                field: "okx.position.posSide",
+                reason: "position side must be net, long or short",
+            });
+        }
+    };
+    PositionId::new(format!(
+        "pos:{}:okx-swap:{}:{pos_side}",
+        account_id.as_str(),
+        symbol_identifier_component(inst_id)
+    ))
+    .map_err(VenueDataError::from)
+}
+
+fn bitget_usdt_futures_position_id(
+    account_id: &AccountId,
+    symbol: &str,
+    hold_side: &str,
+) -> VenueDataResult<PositionId> {
+    validate_bitget_symbol(symbol)?;
+    let hold_side = match hold_side {
+        "long" | "short" => hold_side,
+        _ => {
+            return Err(VenueDataError::InvalidQuery {
+                field: "bitget.position.holdSide",
+                reason: "position side must be long or short",
+            });
+        }
+    };
+    PositionId::new(format!(
+        "pos:{}:bitget-usdt-futures:{symbol}:{hold_side}",
+        account_id.as_str()
+    ))
+    .map_err(VenueDataError::from)
+}
+
+fn aster_usdt_futures_position_id(
+    account_id: &AccountId,
+    symbol: &str,
+    position_side: &str,
+) -> VenueDataResult<PositionId> {
+    validate_aster_symbol(symbol)?;
+    validate_aster_position_side(position_side)?;
+    PositionId::new(format!(
+        "pos:{}:aster-usdt-futures:{symbol}:{}",
+        account_id.as_str(),
+        position_side.to_ascii_lowercase()
+    ))
+    .map_err(VenueDataError::from)
+}
+
+fn hyperliquid_perp_position_id(
+    account_id: &AccountId,
+    coin: &str,
+    side: &str,
+) -> VenueDataResult<PositionId> {
+    validate_hyperliquid_coin(coin)?;
+    let side = match side {
+        "long" | "short" => side,
+        _ => {
+            return Err(VenueDataError::InvalidQuery {
+                field: "hyperliquid.position.side",
+                reason: "position side must be long or short",
+            });
+        }
+    };
+    PositionId::new(format!(
+        "pos:{}:hyperliquid-perp:{}:{side}",
+        account_id.as_str(),
+        symbol_identifier_component(coin)
     ))
     .map_err(VenueDataError::from)
 }
@@ -7092,12 +9149,70 @@ fn bybit_signed_position_quantity(size: Decimal, side: &str) -> VenueDataResult<
     }
 }
 
+fn okx_signed_position_quantity(quantity: Decimal, pos_side: &str) -> VenueDataResult<Decimal> {
+    match pos_side {
+        "net" => Ok(quantity),
+        "long" => {
+            if quantity.is_negative() {
+                return Err(VenueDataError::InvalidQuery {
+                    field: "okx.position.pos",
+                    reason: "long position quantity must not be negative",
+                });
+            }
+            Ok(quantity)
+        }
+        "short" => {
+            if quantity.is_negative() {
+                Ok(quantity)
+            } else {
+                quantity.checked_neg().map_err(VenueDataError::from)
+            }
+        }
+        _ => Err(VenueDataError::InvalidQuery {
+            field: "okx.position.posSide",
+            reason: "position side must be net, long or short",
+        }),
+    }
+}
+
+fn bitget_signed_position_quantity(quantity: Decimal, hold_side: &str) -> VenueDataResult<Decimal> {
+    if quantity.is_negative() {
+        return Err(VenueDataError::InvalidQuery {
+            field: "bitget.position.total",
+            reason: "position total must not be negative",
+        });
+    }
+    match hold_side {
+        "long" => Ok(quantity),
+        "short" => quantity.checked_neg().map_err(VenueDataError::from),
+        _ => Err(VenueDataError::InvalidQuery {
+            field: "bitget.position.holdSide",
+            reason: "position side must be long or short",
+        }),
+    }
+}
+
 fn timestamp_from_unix_millis(value: u64) -> Result<UtcTimestamp, String> {
     let seconds = i64::try_from(value / 1_000)
         .map_err(|_| "closeTime milliseconds overflow i64 seconds".to_owned())?;
     let nanos = u32::try_from((value % 1_000) * 1_000_000)
         .map_err(|_| "closeTime millisecond remainder overflowed nanoseconds".to_owned())?;
     UtcTimestamp::from_unix_parts(seconds, nanos).map_err(|error| error.to_string())
+}
+
+fn timestamp_to_unix_millis(timestamp: UtcTimestamp) -> VenueDataResult<u64> {
+    let seconds =
+        u64::try_from(timestamp.unix_seconds()).map_err(|_| VenueDataError::InvalidQuery {
+            field: "timestamp",
+            reason: "timestamp must be at or after Unix epoch",
+        })?;
+    seconds
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(u64::from(timestamp.nanoseconds() / 1_000_000)))
+        .ok_or(VenueDataError::InvalidQuery {
+            field: "timestamp",
+            reason: "timestamp milliseconds overflowed",
+        })
 }
 
 fn current_utc_timestamp(venue_id: &VenueId) -> VenueDataResult<UtcTimestamp> {
@@ -7354,6 +9469,54 @@ fn bitget_private_correlation_id(
 ) -> String {
     format!(
         "corr:venue-data:bitget-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn aster_private_event_id(
+    kind: &str,
+    market: AsterPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:aster-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn aster_private_correlation_id(
+    kind: &str,
+    market: AsterPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "corr:venue-data:aster-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn hyperliquid_private_event_id(
+    kind: &str,
+    market: HyperliquidPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "event:venue-data:hyperliquid-private:{kind}:{}:{account_id}:{source_sequence}",
+        market.event_scope()
+    )
+}
+
+fn hyperliquid_private_correlation_id(
+    kind: &str,
+    market: HyperliquidPrivateAccountMarket,
+    account_id: &AccountId,
+    source_sequence: &str,
+) -> String {
+    format!(
+        "corr:venue-data:hyperliquid-private:{kind}:{}:{account_id}:{source_sequence}",
         market.event_scope()
     )
 }
@@ -7878,6 +10041,102 @@ mod tests {
     }
 
     #[test]
+    fn okx_private_trading_account_maps_swap_positions() {
+        let venue_id = VenueId::new("venue:OKX-PRIVATE").expect("venue id");
+        let account_id = AccountId::new("account:okx-trading-unit").expect("account id");
+        let mut adapter = OkxPrivateAccountAdapter::new(
+            venue_id.clone(),
+            account_id.clone(),
+            OkxPrivateAccountMarket::TradingAccount,
+            timestamp("2023-11-14T22:13:20Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_account_positions_json(
+                r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","pos":"2","posSide":"short","avgPx":"43100.00","markPx":"43250.50","upl":"-301.00","liqPx":"45000.00","uTime":"1700000001500"},{"instType":"SWAP","instId":"ETH-USDT-SWAP","pos":"0","posSide":"net","avgPx":"0","markPx":"2500.00","upl":"0","liqPx":"","uTime":"1700000001500"}]}"#,
+                "test:okx-account-positions",
+                timestamp("2023-11-14T22:13:22Z"),
+            )
+            .expect("OKX account positions");
+
+        assert_eq!(
+            batch.position_event.event_type,
+            NormalizedEventType::PositionSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&batch.position_event, "endpoint"),
+            "/api/v5/account/positions"
+        );
+        assert_eq!(batch.positions.len(), 1);
+        let position = &batch.positions[0];
+        assert_eq!(position.account_id, account_id);
+        assert_eq!(
+            position.instrument_id.as_str(),
+            "inst:OKX:BTC-USDT-SWAP:SWAP"
+        );
+        assert_eq!(position.quantity.to_string(), "-2");
+        assert_eq!(position.entry_price.expect("entry").to_string(), "43100.00");
+        assert_eq!(position.mark_price.to_string(), "43250.50");
+        assert_eq!(position.unrealized_pnl.to_string(), "-301.00");
+        assert_eq!(
+            position.liquidation_price.expect("liq").to_string(),
+            "45000.00"
+        );
+        assert_eq!(
+            position.source_event_id.as_deref(),
+            Some(batch.position_event.event_id.as_str())
+        );
+
+        let queried = adapter
+            .positions(
+                &PositionQuery::new(venue_id.clone())
+                    .for_account(AccountId::new("account:okx-trading-unit").expect("account id"))
+                    .for_instrument(
+                        InstrumentId::new("inst:OKX:BTC-USDT-SWAP:SWAP").expect("instrument"),
+                    ),
+            )
+            .expect("position query");
+        assert_eq!(queried, batch.positions);
+        let rendered = to_canonical_json(&batch.position_event);
+        assert!(!rendered.contains("43100.00"));
+        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn okx_private_position_snapshot_accepts_empty_positions() {
+        let venue_id = VenueId::new("venue:OKX-PRIVATE").expect("venue id");
+        let mut adapter = OkxPrivateAccountAdapter::new(
+            venue_id.clone(),
+            AccountId::new("account:okx-trading-unit").expect("account id"),
+            OkxPrivateAccountMarket::TradingAccount,
+            timestamp("2023-11-14T22:13:20Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_account_positions_json(
+                r#"{"code":"0","msg":"","data":[]}"#,
+                "test:okx-account-positions-empty",
+                timestamp("2023-11-14T22:13:22Z"),
+            )
+            .expect("empty OKX account positions");
+
+        assert!(batch.positions.is_empty());
+        assert_eq!(
+            payload_string(&batch.position_event, "risk_reason_code"),
+            "CHECK_PASSED"
+        );
+        let queried = adapter
+            .positions(&PositionQuery::new(venue_id))
+            .expect("position query");
+        assert!(queried.is_empty());
+    }
+
+    #[test]
     fn bitget_private_spot_assets_map_account_balances() {
         let venue_id = VenueId::new("venue:BITGET-SPOT-PRIVATE").expect("venue id");
         let account_id = AccountId::new("account:bitget-spot-unit").expect("account id");
@@ -7966,6 +10225,92 @@ mod tests {
     }
 
     #[test]
+    fn bitget_private_usdt_futures_positions_map_signed_exposure() {
+        let venue_id = VenueId::new("venue:BITGET-USDT-FUTURES-PRIVATE").expect("venue id");
+        let account_id = AccountId::new("account:bitget-futures-unit").expect("account id");
+        let mut adapter = BitgetPrivateAccountAdapter::new(
+            venue_id.clone(),
+            account_id.clone(),
+            BitgetPrivateAccountMarket::UsdtFuturesAccount,
+            timestamp("2023-11-14T22:13:20Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_usdt_futures_positions_json(
+                r#"{"code":"00000","msg":"success","requestTime":1700000000123,"data":[{"symbol":"BTCUSDT","marginCoin":"USDT","holdSide":"short","openDelegateSize":"0","marginSize":"100","available":"1.000","locked":"0.500","total":"1.500","leverage":"5","openPriceAvg":"43100.00","unrealizedPL":"-225.75","liquidationPrice":"45000.00","markPrice":"43250.50","uTime":"1700000001500"},{"symbol":"ETHUSDT","marginCoin":"USDT","holdSide":"long","total":"0","openPriceAvg":"0","unrealizedPL":"0","liquidationPrice":"0","markPrice":"2500.00","uTime":"1700000001500"}]}"#,
+                "test:bitget-futures-positions",
+                timestamp("2023-11-14T22:13:22Z"),
+            )
+            .expect("Bitget futures positions");
+
+        assert_eq!(
+            batch.position_event.event_type,
+            NormalizedEventType::PositionSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&batch.position_event, "endpoint"),
+            "/api/v2/mix/position/all-position"
+        );
+        assert_eq!(batch.positions.len(), 1);
+        let position = &batch.positions[0];
+        assert_eq!(position.account_id, account_id);
+        assert_eq!(
+            position.instrument_id.as_str(),
+            "inst:BITGET:BTCUSDT:USDT-FUTURES"
+        );
+        assert_eq!(position.quantity.to_string(), "-1.500");
+        assert_eq!(position.entry_price.expect("entry").to_string(), "43100.00");
+        assert_eq!(position.mark_price.to_string(), "43250.50");
+        assert_eq!(position.unrealized_pnl.to_string(), "-225.75");
+        assert_eq!(
+            position.liquidation_price.expect("liq").to_string(),
+            "45000.00"
+        );
+
+        let queried = adapter
+            .positions(
+                &PositionQuery::new(venue_id.clone())
+                    .for_account(AccountId::new("account:bitget-futures-unit").expect("account id"))
+                    .for_instrument(
+                        InstrumentId::new("inst:BITGET:BTCUSDT:USDT-FUTURES").expect("instrument"),
+                    ),
+            )
+            .expect("position query");
+        assert_eq!(queried, batch.positions);
+        let rendered = to_canonical_json(&batch.position_event);
+        assert!(!rendered.contains("43100.00"));
+        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn bitget_private_position_requires_mark_price_for_nonzero_position() {
+        let mut adapter = BitgetPrivateAccountAdapter::new(
+            VenueId::new("venue:BITGET-USDT-FUTURES-PRIVATE").expect("venue id"),
+            AccountId::new("account:bitget-futures-unit").expect("account id"),
+            BitgetPrivateAccountMarket::UsdtFuturesAccount,
+            timestamp("2023-11-14T22:13:20Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let error = adapter
+            .ingest_usdt_futures_positions_json(
+                r#"{"code":"00000","msg":"success","requestTime":1700000000123,"data":[{"symbol":"BTCUSDT","holdSide":"long","total":"1.000","openPriceAvg":"43100.00","unrealizedPL":"1.00","liquidationPrice":"0","uTime":"1700000001500"}]}"#,
+                "test:bitget-futures-positions-missing-mark",
+                timestamp("2023-11-14T22:13:22Z"),
+            )
+            .expect_err("nonzero Bitget position without mark price is unsafe");
+
+        let error = expect_external(error);
+        assert_eq!(error.surface, ReadOnlySurface::Position);
+        assert_eq!(error.class, ExternalErrorClass::MissingField);
+        assert!(error.fail_closed);
+    }
+
+    #[test]
     fn bitget_private_balance_fails_closed_on_non_success_code() {
         let mut adapter = BitgetPrivateAccountAdapter::new(
             VenueId::new("venue:BITGET-SPOT-PRIVATE").expect("venue id"),
@@ -7985,6 +10330,276 @@ mod tests {
             .expect_err("Bitget non-success code must fail closed");
 
         assert!(matches!(error, VenueDataError::External(_)));
+    }
+
+    #[test]
+    fn aster_private_usdt_futures_balance_maps_available_amounts_without_credentials() {
+        let venue_id = VenueId::new("venue:ASTER-USDT-FUTURES-PRIVATE").expect("venue id");
+        let account_id = AccountId::new("account:aster-futures-unit").expect("account id");
+        let mut adapter = AsterPrivateAccountAdapter::new(
+            venue_id.clone(),
+            account_id.clone(),
+            AsterPrivateAccountMarket::UsdtFuturesAccount,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_usdt_futures_balance_json(
+                r#"[{"accountAlias":"SgsR","asset":"USDT","balance":"124.45","crossWalletBalance":"124.45","crossUnPnl":"0.00000000","availableBalance":"123.45","maxWithdrawAmount":"123.45","marginAvailable":true,"updateTime":1767225601000},{"accountAlias":"SgsR","asset":"BTC","balance":"0.01000000","crossWalletBalance":"0.01000000","crossUnPnl":"0","availableBalance":"0.01000000","maxWithdrawAmount":"0.01000000","marginAvailable":true,"updateTime":1767225601000}]"#,
+                "test:aster-futures-balance",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("Aster futures balance");
+
+        assert_eq!(
+            batch.balance_event.event_type,
+            NormalizedEventType::BalanceSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&batch.balance_event, "endpoint"),
+            "/fapi/v3/balance"
+        );
+        assert_eq!(
+            payload_string(&batch.balance_event, "risk_reason_code"),
+            "CHECK_PASSED"
+        );
+        assert_eq!(batch.balances.len(), 2);
+        let usdt = batch
+            .balances
+            .iter()
+            .find(|balance| balance.asset_id.as_str() == "asset:USDT")
+            .expect("USDT balance");
+        assert_eq!(usdt.account_id, account_id);
+        assert_eq!(usdt.free, amount("123.45"));
+        assert_eq!(usdt.locked, amount("1.00"));
+        assert_eq!(
+            usdt.source_event_id.as_deref(),
+            Some(batch.balance_event.event_id.as_str())
+        );
+
+        let queried = adapter
+            .balances(
+                &BalanceQuery::new(venue_id.clone())
+                    .for_account(AccountId::new("account:aster-futures-unit").expect("account id"))
+                    .for_asset(AssetId::new("asset:USDT").expect("asset id")),
+            )
+            .expect("balance query");
+        assert_eq!(queried.len(), 1);
+        let health = adapter.venue_health(&venue_id).expect("health");
+        assert_eq!(health.status, VenueHealthStatus::Healthy);
+
+        let rendered = to_canonical_json(&batch.balance_event);
+        assert!(!rendered.contains("123.45"));
+        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn aster_private_usdt_futures_position_risk_maps_signed_positions() {
+        let venue_id = VenueId::new("venue:ASTER-USDT-FUTURES-PRIVATE").expect("venue id");
+        let account_id = AccountId::new("account:aster-futures-unit").expect("account id");
+        let mut adapter = AsterPrivateAccountAdapter::new(
+            venue_id.clone(),
+            account_id.clone(),
+            AsterPrivateAccountMarket::UsdtFuturesAccount,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_usdt_futures_position_risk_json(
+                r#"[{"symbol":"BTCUSDT","positionSide":"SHORT","positionAmt":"-0.500","entryPrice":"43100.00","markPrice":"43250.50","unRealizedProfit":"-75.25","liquidationPrice":"45000.00","updateTime":1767225601500},{"symbol":"ETHUSDT","positionSide":"BOTH","positionAmt":"0","entryPrice":"0","markPrice":"2500.00","unRealizedProfit":"0","liquidationPrice":"0","updateTime":1767225601500}]"#,
+                "test:aster-futures-position-risk",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("Aster futures positions");
+
+        assert_eq!(
+            batch.position_event.event_type,
+            NormalizedEventType::PositionSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&batch.position_event, "endpoint"),
+            "/fapi/v3/positionRisk"
+        );
+        assert_eq!(batch.positions.len(), 1);
+        let position = &batch.positions[0];
+        assert_eq!(position.account_id, account_id);
+        assert_eq!(
+            position.instrument_id.as_str(),
+            "inst:ASTER:BTCUSDT:USDT-FUTURES"
+        );
+        assert_eq!(position.quantity.to_string(), "-0.500");
+        assert_eq!(position.entry_price.expect("entry").to_string(), "43100.00");
+        assert_eq!(position.mark_price.to_string(), "43250.50");
+        assert_eq!(position.unrealized_pnl.to_string(), "-75.25");
+        assert_eq!(
+            position.liquidation_price.expect("liq").to_string(),
+            "45000.00"
+        );
+        assert_eq!(
+            position.source_event_id.as_deref(),
+            Some(batch.position_event.event_id.as_str())
+        );
+
+        let queried = adapter
+            .positions(
+                &PositionQuery::new(venue_id.clone())
+                    .for_account(AccountId::new("account:aster-futures-unit").expect("account id"))
+                    .for_instrument(
+                        InstrumentId::new("inst:ASTER:BTCUSDT:USDT-FUTURES").expect("instrument"),
+                    ),
+            )
+            .expect("position query");
+        assert_eq!(queried, batch.positions);
+
+        let rendered = to_canonical_json(&batch.position_event);
+        assert!(!rendered.contains("43100.00"));
+        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn aster_private_position_requires_mark_price_for_nonzero_position() {
+        let mut adapter = AsterPrivateAccountAdapter::new(
+            VenueId::new("venue:ASTER-USDT-FUTURES-PRIVATE").expect("venue id"),
+            AccountId::new("account:aster-futures-unit").expect("account id"),
+            AsterPrivateAccountMarket::UsdtFuturesAccount,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let error = adapter
+            .ingest_usdt_futures_position_risk_json(
+                r#"[{"symbol":"BTCUSDT","positionSide":"LONG","positionAmt":"1.000","entryPrice":"43100.00","unRealizedProfit":"1.00","liquidationPrice":"0","updateTime":1767225601500}]"#,
+                "test:aster-futures-position-risk-missing-mark",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect_err("nonzero Aster position without mark price is unsafe");
+
+        let error = expect_external(error);
+        assert_eq!(error.surface, ReadOnlySurface::Position);
+        assert_eq!(error.class, ExternalErrorClass::MissingField);
+        assert!(error.fail_closed);
+    }
+
+    #[test]
+    fn hyperliquid_private_clearinghouse_state_maps_balances_and_positions() {
+        let venue_id = VenueId::new("venue:HYPERLIQUID-PERP-PRIVATE").expect("venue id");
+        let account_id = AccountId::new("account:hyperliquid-unit").expect("account id");
+        let mut adapter = HyperliquidPrivateAccountAdapter::new(
+            venue_id.clone(),
+            account_id.clone(),
+            HyperliquidPrivateAccountMarket::PerpetualAccount,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter");
+        let clearinghouse_state = r#"{"marginSummary":{"accountValue":"1000.00","totalNtlPos":"4325.05","totalRawUsd":"1000.00","totalMarginUsed":"200.00"},"crossMarginSummary":{"accountValue":"1000.00","totalNtlPos":"4325.05","totalRawUsd":"1000.00","totalMarginUsed":"200.00"},"crossMaintenanceMarginUsed":"50.00","withdrawable":"800.00","assetPositions":[{"type":"oneWay","position":{"coin":"BTC","szi":"0.100","leverage":{"type":"cross","value":10},"entryPx":"43000.00","positionValue":"4325.05","unrealizedPnl":"25.05","returnOnEquity":"0.01","liquidationPx":"35000.00","marginUsed":"100.00","maxLeverage":50,"cumFunding":{"allTime":"0","sinceOpen":"0","sinceChange":"0"}}},{"type":"oneWay","position":{"coin":"ETH","szi":"0","entryPx":"0","positionValue":"0","unrealizedPnl":"0","liquidationPx":null}}],"time":1767225601500}"#;
+        let asset_contexts = r#"[{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":50},{"name":"ETH","szDecimals":4,"maxLeverage":50}],"marginTables":[]},[{"dayNtlVlm":"1","funding":"0.0001","markPx":"43250.50","midPx":"43250.45","openInterest":"123","oraclePx":"43249.0","premium":"0.0001","prevDayPx":"43000.0"},{"dayNtlVlm":"1","funding":"0.0001","markPx":"2500.00","midPx":"2500.00","openInterest":"123","oraclePx":"2500.0","premium":"0.0001","prevDayPx":"2490.0"}]]"#;
+
+        let balances = adapter
+            .ingest_clearinghouse_state_balance_json(
+                clearinghouse_state,
+                "test:hyperliquid-clearinghouse-state-balance",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("Hyperliquid balance");
+        assert_eq!(
+            balances.balance_event.event_type,
+            NormalizedEventType::BalanceSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&balances.balance_event, "endpoint"),
+            "info:clearinghouseState"
+        );
+        assert_eq!(balances.balances.len(), 1);
+        assert_eq!(balances.balances[0].asset_id.as_str(), "asset:USDC");
+        assert_eq!(balances.balances[0].free, amount("800.00"));
+        assert_eq!(balances.balances[0].locked, amount("200.00"));
+
+        let positions = adapter
+            .ingest_clearinghouse_state_positions_json(
+                clearinghouse_state,
+                asset_contexts,
+                "test:hyperliquid-clearinghouse-state-positions+meta",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("Hyperliquid positions");
+        assert_eq!(
+            positions.position_event.event_type,
+            NormalizedEventType::PositionSnapshotEvent
+        );
+        assert_eq!(
+            payload_string(&positions.position_event, "endpoint"),
+            "info:clearinghouseState"
+        );
+        assert_eq!(
+            payload_string(&positions.position_event, "market_context_endpoint"),
+            "info:metaAndAssetCtxs"
+        );
+        assert_eq!(positions.positions.len(), 1);
+        let position = &positions.positions[0];
+        assert_eq!(position.account_id, account_id);
+        assert_eq!(position.instrument_id.as_str(), "inst:HYPERLIQUID:BTC:PERP");
+        assert_eq!(position.quantity.to_string(), "0.100");
+        assert_eq!(position.entry_price.expect("entry").to_string(), "43000.00");
+        assert_eq!(position.mark_price.to_string(), "43250.50");
+        assert_eq!(position.unrealized_pnl.to_string(), "25.05");
+        assert_eq!(
+            position.liquidation_price.expect("liq").to_string(),
+            "35000.00"
+        );
+
+        let queried = adapter
+            .positions(
+                &PositionQuery::new(venue_id.clone())
+                    .for_account(AccountId::new("account:hyperliquid-unit").expect("account id"))
+                    .for_instrument(
+                        InstrumentId::new("inst:HYPERLIQUID:BTC:PERP").expect("instrument"),
+                    ),
+            )
+            .expect("position query");
+        assert_eq!(queried, positions.positions);
+        let health = adapter.venue_health(&venue_id).expect("health");
+        assert_eq!(health.status, VenueHealthStatus::Healthy);
+
+        let rendered = to_canonical_json(&positions.position_event);
+        assert!(!rendered.contains("43000.00"));
+        assert!(!rendered.contains("private_key"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn hyperliquid_private_position_requires_public_mark_price_context() {
+        let mut adapter = HyperliquidPrivateAccountAdapter::new(
+            VenueId::new("venue:HYPERLIQUID-PERP-PRIVATE").expect("venue id"),
+            AccountId::new("account:hyperliquid-unit").expect("account id"),
+            HyperliquidPrivateAccountMarket::PerpetualAccount,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("adapter");
+        let clearinghouse_state = r#"{"marginSummary":{"accountValue":"1000.00","totalNtlPos":"4325.05","totalRawUsd":"1000.00","totalMarginUsed":"200.00"},"withdrawable":"800.00","assetPositions":[{"type":"oneWay","position":{"coin":"BTC","szi":"0.100","entryPx":"43000.00","positionValue":"4325.05","unrealizedPnl":"25.05","liquidationPx":"35000.00"}}],"time":1767225601500}"#;
+        let asset_contexts_without_btc = r#"[{"universe":[{"name":"ETH","szDecimals":4,"maxLeverage":50}],"marginTables":[]},[{"markPx":"2500.00"}]]"#;
+
+        let error = adapter
+            .ingest_clearinghouse_state_positions_json(
+                clearinghouse_state,
+                asset_contexts_without_btc,
+                "test:hyperliquid-missing-mark",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect_err("Hyperliquid position without mark context is unsafe");
+
+        let error = expect_external(error);
+        assert_eq!(error.surface, ReadOnlySurface::Position);
+        assert_eq!(error.class, ExternalErrorClass::MissingField);
+        assert!(error.fail_closed);
     }
 
     #[test]
