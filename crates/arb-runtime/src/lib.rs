@@ -221,6 +221,7 @@ const BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS: i128 = 10;
 const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
+const BASIS_AUTO_PRICE_GUARD_MAX_BPS: i128 = 100;
 #[cfg(feature = "live-exec")]
 const BASIS_EXIT_DEFAULT_TARGET_PROFIT_BPS: i128 = 40;
 #[cfg(feature = "live-exec")]
@@ -1249,6 +1250,7 @@ pub struct BasisGuardedLiveAutoOnceOptions {
     pub min_net_bps: i128,
     pub max_spot_ask: Option<String>,
     pub min_perp_bid: Option<String>,
+    pub auto_price_guard_bps: Option<i128>,
     pub spot_wss_monitor_url: Option<String>,
     pub perp_wss_monitor_url: Option<String>,
     pub private_order_events_dir: Option<PathBuf>,
@@ -1275,6 +1277,9 @@ pub struct BasisGuardedLiveAutoOnceReport {
     pub premium_event_id: Option<String>,
     pub spot_ask: Option<String>,
     pub perp_bid: Option<String>,
+    pub max_spot_ask: Option<String>,
+    pub min_perp_bid: Option<String>,
+    pub auto_price_guard_bps: Option<i128>,
     pub net_bps: Option<i128>,
     pub signal_allowed: bool,
     pub risk_decision: Option<BasisGuardedLiveRiskDecisionSummary>,
@@ -4368,6 +4373,91 @@ fn basis_plan_preview_counts(plan: &ExecutionPlan) -> (usize, usize, usize) {
 }
 
 #[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BasisResolvedPriceGuards {
+    max_spot_ask: Option<String>,
+    min_perp_bid: Option<String>,
+    auto_price_guard_bps: Option<i128>,
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_basis_price_guards(
+    options: &BasisGuardedLiveAutoOnceOptions,
+    spot_ask: &str,
+    perp_bid: &str,
+) -> RuntimeResult<BasisResolvedPriceGuards> {
+    if let Some(auto_bps) = options.auto_price_guard_bps {
+        validate_basis_auto_price_guard_bps(auto_bps)?;
+        if options.max_spot_ask.is_some() || options.min_perp_bid.is_some() {
+            return Err(RuntimeError::UnsafeConfig {
+                message: "--auto-price-guard-bps cannot be combined with --max-spot-ask or --min-perp-bid"
+                    .to_owned(),
+            });
+        }
+        return Ok(BasisResolvedPriceGuards {
+            max_spot_ask: Some(apply_basis_auto_price_guard(
+                spot_ask,
+                10_000 + auto_bps,
+                "max spot ask auto price guard",
+            )?),
+            min_perp_bid: Some(apply_basis_auto_price_guard(
+                perp_bid,
+                10_000 - auto_bps,
+                "min perp bid auto price guard",
+            )?),
+            auto_price_guard_bps: Some(auto_bps),
+        });
+    }
+
+    Ok(BasisResolvedPriceGuards {
+        max_spot_ask: options.max_spot_ask.clone(),
+        min_perp_bid: options.min_perp_bid.clone(),
+        auto_price_guard_bps: None,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn validate_basis_auto_price_guard_bps(value: i128) -> RuntimeResult<()> {
+    if !(0..=BASIS_AUTO_PRICE_GUARD_MAX_BPS).contains(&value) {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "--auto-price-guard-bps must be between 0 and {BASIS_AUTO_PRICE_GUARD_MAX_BPS}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn apply_basis_auto_price_guard(
+    price: &str,
+    multiplier_bps: i128,
+    context: &'static str,
+) -> RuntimeResult<String> {
+    let price = Decimal::from_str(price)?;
+    if price.is_negative() || price.is_zero() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("{context} requires a positive price"),
+        });
+    }
+    let atoms = price
+        .atoms()
+        .checked_mul(multiplier_bps)
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("{context} overflowed while applying bps multiplier"),
+        })?;
+    let scale = price
+        .scale()
+        .checked_add(4)
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("{context} scale overflowed while applying bps multiplier"),
+        })?;
+    Ok(Decimal::from_scaled_atoms(atoms, scale).to_string())
+}
+
+#[cfg(feature = "live-exec")]
 #[allow(clippy::too_many_arguments)]
 fn run_binance_basis_guarded_live_auto_once_from_json(
     symbol: &str,
@@ -4420,7 +4510,8 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
                 .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
         );
     }
-    if let Some(max_spot_ask) = &options.max_spot_ask {
+    let price_guards = resolve_basis_price_guards(&options, &context.spot_ask, &context.perp_bid)?;
+    if let Some(max_spot_ask) = &price_guards.max_spot_ask {
         if Decimal::from_str(&context.spot_ask)? > Decimal::from_str(max_spot_ask)? {
             blocking_reasons.push(format!(
                 "spot leg blocked: spot_ask={} is above max_spot_ask={max_spot_ask}",
@@ -4430,7 +4521,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     } else if options.execute_live {
         blocking_reasons.push("live basis execution requires --max-spot-ask".to_owned());
     }
-    if let Some(min_perp_bid) = &options.min_perp_bid {
+    if let Some(min_perp_bid) = &price_guards.min_perp_bid {
         if Decimal::from_str(&context.perp_bid)? < Decimal::from_str(min_perp_bid)? {
             blocking_reasons.push(format!(
                 "perp leg blocked: perp_bid={} is below min_perp_bid={min_perp_bid}",
@@ -4449,6 +4540,9 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
             premium_event_id: Some(context.premium_event_id),
             spot_ask: Some(context.spot_ask),
             perp_bid: Some(context.perp_bid),
+            max_spot_ask: price_guards.max_spot_ask.clone(),
+            min_perp_bid: price_guards.min_perp_bid.clone(),
+            auto_price_guard_bps: price_guards.auto_price_guard_bps,
             net_bps: Some(context.signal.net_bps),
             signal_allowed: false,
             risk_decision: None,
@@ -4698,6 +4792,9 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         premium_event_id: Some(context.premium_event_id),
         spot_ask: Some(context.spot_ask),
         perp_bid: Some(context.perp_bid),
+        max_spot_ask: price_guards.max_spot_ask.clone(),
+        min_perp_bid: price_guards.min_perp_bid.clone(),
+        auto_price_guard_bps: price_guards.auto_price_guard_bps,
         net_bps: Some(context.signal.net_bps),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
@@ -4783,7 +4880,8 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
                 .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
         );
     }
-    if let Some(max_spot_ask) = &options.max_spot_ask {
+    let price_guards = resolve_basis_price_guards(&options, &context.spot_ask, &context.perp_bid)?;
+    if let Some(max_spot_ask) = &price_guards.max_spot_ask {
         if Decimal::from_str(&context.spot_ask)? > Decimal::from_str(max_spot_ask)? {
             blocking_reasons.push(format!(
                 "spot leg blocked: spot_ask={} is above max_spot_ask={max_spot_ask}",
@@ -4793,7 +4891,7 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
     } else if options.execute_live {
         blocking_reasons.push("live basis execution requires --max-spot-ask".to_owned());
     }
-    if let Some(min_perp_bid) = &options.min_perp_bid {
+    if let Some(min_perp_bid) = &price_guards.min_perp_bid {
         if Decimal::from_str(&context.perp_bid)? < Decimal::from_str(min_perp_bid)? {
             blocking_reasons.push(format!(
                 "perp leg blocked: perp_bid={} is below min_perp_bid={min_perp_bid}",
@@ -4812,6 +4910,9 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
             premium_event_id: Some(context.premium_event_id),
             spot_ask: Some(context.spot_ask),
             perp_bid: Some(context.perp_bid),
+            max_spot_ask: price_guards.max_spot_ask.clone(),
+            min_perp_bid: price_guards.min_perp_bid.clone(),
+            auto_price_guard_bps: price_guards.auto_price_guard_bps,
             net_bps: Some(context.signal.net_bps),
             signal_allowed: false,
             risk_decision: None,
@@ -5044,6 +5145,9 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
         premium_event_id: Some(context.premium_event_id),
         spot_ask: Some(context.spot_ask),
         perp_bid: Some(context.perp_bid),
+        max_spot_ask: price_guards.max_spot_ask.clone(),
+        min_perp_bid: price_guards.min_perp_bid.clone(),
+        auto_price_guard_bps: price_guards.auto_price_guard_bps,
         net_bps: Some(context.signal.net_bps),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
@@ -5119,7 +5223,8 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
                 .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
         );
     }
-    if let Some(max_spot_ask) = &options.max_spot_ask {
+    let price_guards = resolve_basis_price_guards(&options, &context.spot_ask, &context.perp_bid)?;
+    if let Some(max_spot_ask) = &price_guards.max_spot_ask {
         if Decimal::from_str(&context.spot_ask)? > Decimal::from_str(max_spot_ask)? {
             blocking_reasons.push(format!(
                 "spot leg blocked: spot_ask={} is above max_spot_ask={max_spot_ask}",
@@ -5129,7 +5234,7 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
     } else if options.execute_live {
         blocking_reasons.push("live basis execution requires --max-spot-ask".to_owned());
     }
-    if let Some(min_perp_bid) = &options.min_perp_bid {
+    if let Some(min_perp_bid) = &price_guards.min_perp_bid {
         if Decimal::from_str(&context.perp_bid)? < Decimal::from_str(min_perp_bid)? {
             blocking_reasons.push(format!(
                 "perp leg blocked: perp_bid={} is below min_perp_bid={min_perp_bid}",
@@ -5148,6 +5253,9 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
             premium_event_id: Some(context.premium_event_id),
             spot_ask: Some(context.spot_ask),
             perp_bid: Some(context.perp_bid),
+            max_spot_ask: price_guards.max_spot_ask.clone(),
+            min_perp_bid: price_guards.min_perp_bid.clone(),
+            auto_price_guard_bps: price_guards.auto_price_guard_bps,
             net_bps: Some(context.signal.net_bps),
             signal_allowed: false,
             risk_decision: None,
@@ -5373,6 +5481,9 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
         premium_event_id: Some(context.premium_event_id),
         spot_ask: Some(context.spot_ask),
         perp_bid: Some(context.perp_bid),
+        max_spot_ask: price_guards.max_spot_ask.clone(),
+        min_perp_bid: price_guards.min_perp_bid.clone(),
+        auto_price_guard_bps: price_guards.auto_price_guard_bps,
         net_bps: Some(context.signal.net_bps),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
@@ -5441,6 +5552,9 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
                 premium_event_id: None,
                 spot_ask: None,
                 perp_bid: None,
+                max_spot_ask: None,
+                min_perp_bid: None,
+                auto_price_guard_bps: options.auto_price_guard_bps,
                 net_bps: None,
                 signal_allowed: false,
                 risk_decision: None,
@@ -5487,7 +5601,8 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
                 .unwrap_or_else(|| "basis signal did not pass threshold".to_owned()),
         );
     }
-    if let Some(max_spot_ask) = &options.max_spot_ask {
+    let price_guards = resolve_basis_price_guards(&options, &context.spot_ask, &context.perp_bid)?;
+    if let Some(max_spot_ask) = &price_guards.max_spot_ask {
         if Decimal::from_str(&context.spot_ask)? > Decimal::from_str(max_spot_ask)? {
             blocking_reasons.push(format!(
                 "spot leg blocked: spot_ask={} is above max_spot_ask={max_spot_ask}",
@@ -5497,7 +5612,7 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
     } else if options.execute_live {
         blocking_reasons.push("live basis execution requires --max-spot-ask".to_owned());
     }
-    if let Some(min_perp_bid) = &options.min_perp_bid {
+    if let Some(min_perp_bid) = &price_guards.min_perp_bid {
         if Decimal::from_str(&context.perp_bid)? < Decimal::from_str(min_perp_bid)? {
             blocking_reasons.push(format!(
                 "perp leg blocked: perp_bid={} is below min_perp_bid={min_perp_bid}",
@@ -5516,6 +5631,9 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
             premium_event_id: Some(context.premium_event_id),
             spot_ask: Some(context.spot_ask),
             perp_bid: Some(context.perp_bid),
+            max_spot_ask: price_guards.max_spot_ask.clone(),
+            min_perp_bid: price_guards.min_perp_bid.clone(),
+            auto_price_guard_bps: price_guards.auto_price_guard_bps,
             net_bps: Some(context.signal.net_bps),
             signal_allowed: false,
             risk_decision: None,
@@ -5765,6 +5883,9 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
         premium_event_id: Some(context.premium_event_id),
         spot_ask: Some(context.spot_ask),
         perp_bid: Some(context.perp_bid),
+        max_spot_ask: price_guards.max_spot_ask.clone(),
+        min_perp_bid: price_guards.min_perp_bid.clone(),
+        auto_price_guard_bps: price_guards.auto_price_guard_bps,
         net_bps: Some(context.signal.net_bps),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
@@ -19242,8 +19363,12 @@ fn basis_risk_decision_summary_json(
 #[cfg(feature = "live-exec")]
 fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> String {
     format!(
-        "{{\"approval_event_id\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"net_bps\":{},\"perp_bid\":{},\"perp_event_id\":{},\"planned_order_count\":{},\"plan_hash\":{},\"premium_event_id\":{},\"preview_manual_gate_count\":{},\"preview_place_order_count\":{},\"preview_plan_leg_count\":{},\"private_confirmation_count\":{},\"protection_actions\":[{}],\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"risk_decision\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"spot_ask\":{},\"spot_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"approval_event_id\":{},\"auto_price_guard_bps\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"max_spot_ask\":{},\"min_perp_bid\":{},\"net_bps\":{},\"perp_bid\":{},\"perp_event_id\":{},\"planned_order_count\":{},\"plan_hash\":{},\"premium_event_id\":{},\"preview_manual_gate_count\":{},\"preview_place_order_count\":{},\"preview_plan_leg_count\":{},\"private_confirmation_count\":{},\"protection_actions\":[{}],\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"risk_decision\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"spot_ask\":{},\"spot_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
         optional_json_string_universal(report.approval_event_id.as_deref()),
+        report
+            .auto_price_guard_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
         report
             .blocking_reasons
             .iter()
@@ -19256,6 +19381,8 @@ fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> Strin
         report.dispatch_request_count,
         optional_json_string_universal(report.execution_report_status.as_deref()),
         report.manual_gate_released,
+        optional_json_string_universal(report.max_spot_ask.as_deref()),
+        optional_json_string_universal(report.min_perp_bid.as_deref()),
         report
             .net_bps
             .map(|value| value.to_string())
@@ -19347,6 +19474,9 @@ fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> S
 - Strategy: {strategy_id}
 - Spot ask: {spot_ask}
 - Perp bid: {perp_bid}
+- Max spot ask guard: {max_spot_ask}
+- Min perp bid guard: {min_perp_bid}
+- Auto price guard bps: {auto_price_guard_bps}
 - Net bps: {net_bps}
 - Signal allowed: {signal_allowed}
 - Risk decision: {risk_decision}
@@ -19380,6 +19510,12 @@ fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> S
         strategy_id = report.strategy_id,
         spot_ask = report.spot_ask.as_deref().unwrap_or("none"),
         perp_bid = report.perp_bid.as_deref().unwrap_or("none"),
+        max_spot_ask = report.max_spot_ask.as_deref().unwrap_or("none"),
+        min_perp_bid = report.min_perp_bid.as_deref().unwrap_or("none"),
+        auto_price_guard_bps = report
+            .auto_price_guard_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
         net_bps = report
             .net_bps
             .map(|value| value.to_string())
@@ -23485,13 +23621,13 @@ fn help_text() -> String {
         "                                    live-exec only: submit the approved GuardedLive BTCUSDT order and query private confirmation",
         "  binance-guarded-live-auto-once [--config path] [--out dir] [--max-ask price] [--execute-live --i-understand-auto-live-orders]",
         "                                    Single-leg smoke path: fetch fresh Binance BTCUSDT spot quote, then dry-run or explicitly submit live",
-        "  binance-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "  binance-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Binance Spot and short Binance USD-M perp after guarded live gates; live mode requires WSS monitor quotes",
-        "  bybit-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "  bybit-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Bybit Spot and short Bybit Linear perp after guarded live gates; live mode requires WSS monitor quotes",
-        "  okx-basis-guarded-live-auto-once [--symbol BTC-USDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "  okx-basis-guarded-live-auto-once [--symbol BTC-USDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy OKX Spot and short OKX Swap after guarded live gates; live mode requires WSS monitor quotes",
-        "  bitget-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
+        "  bitget-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Bitget Spot and short Bitget USDT-FUTURES after guarded live gates; live mode requires WSS monitor quotes",
         "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
@@ -24147,6 +24283,7 @@ fn parse_basis_guarded_live_auto_once_args(
     let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
     let mut max_spot_ask = None;
     let mut min_perp_bid = None;
+    let mut auto_price_guard_bps = None;
     let mut spot_wss_monitor_url = None;
     let mut perp_wss_monitor_url = None;
     let mut private_order_events_dir = None;
@@ -24202,6 +24339,23 @@ fn parse_basis_guarded_live_auto_once_args(
                 Decimal::from_str(value)?;
                 min_perp_bid = Some(value.clone());
             }
+            "--auto-price-guard-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--auto-price-guard-bps requires an integer"));
+                };
+                let bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--auto-price-guard-bps must be an integer: {error}"
+                    ))
+                })?;
+                if !(0..=BASIS_AUTO_PRICE_GUARD_MAX_BPS).contains(&bps) {
+                    return Err(cli_arg_error(format!(
+                        "--auto-price-guard-bps must be between 0 and {BASIS_AUTO_PRICE_GUARD_MAX_BPS}"
+                    )));
+                }
+                auto_price_guard_bps = Some(bps);
+            }
             "--spot-wss-monitor-url" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -24247,6 +24401,11 @@ fn parse_basis_guarded_live_auto_once_args(
         }
         index += 1;
     }
+    if auto_price_guard_bps.is_some() && (max_spot_ask.is_some() || min_perp_bid.is_some()) {
+        return Err(cli_arg_error(
+            "--auto-price-guard-bps cannot be combined with --max-spot-ask or --min-perp-bid",
+        ));
+    }
 
     Ok(BasisGuardedLiveAutoOnceOptions {
         symbol,
@@ -24255,6 +24414,7 @@ fn parse_basis_guarded_live_auto_once_args(
         min_net_bps,
         max_spot_ask,
         min_perp_bid,
+        auto_price_guard_bps,
         spot_wss_monitor_url,
         perp_wss_monitor_url,
         private_order_events_dir,
@@ -26827,6 +26987,81 @@ mod tests {
     }
 
     #[test]
+    fn basis_guarded_live_auto_once_args_parse_auto_price_guard() {
+        let args = vec![
+            "--symbol".to_owned(),
+            BASIS_SYMBOL.to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--out".to_owned(),
+            "target/live-canary/binance-btcusdt-once".to_owned(),
+            "--min-net-bps".to_owned(),
+            "5".to_owned(),
+            "--spot-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8801".to_owned(),
+            "--perp-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8801".to_owned(),
+            "--auto-price-guard-bps".to_owned(),
+            "2".to_owned(),
+            "--execute-live".to_owned(),
+            "--i-understand-basis-live-orders".to_owned(),
+        ];
+
+        let options = parse_binance_basis_guarded_live_auto_once_args(&args).expect("options");
+
+        assert_eq!(options.auto_price_guard_bps, Some(2));
+        assert_eq!(options.max_spot_ask, None);
+        assert_eq!(options.min_perp_bid, None);
+        assert!(options.execute_live);
+        assert!(options.acknowledge_basis_live_orders);
+    }
+
+    #[test]
+    fn basis_guarded_live_auto_once_args_reject_mixed_price_guards() {
+        let args = vec![
+            "--max-spot-ask".to_owned(),
+            "101.00".to_owned(),
+            "--min-perp-bid".to_owned(),
+            "100.50".to_owned(),
+            "--auto-price-guard-bps".to_owned(),
+            "2".to_owned(),
+        ];
+
+        let error = parse_binance_basis_guarded_live_auto_once_args(&args)
+            .expect_err("manual and auto price guards must not mix");
+
+        assert!(error
+            .to_string()
+            .contains("cannot be combined with --max-spot-ask"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn basis_auto_price_guard_resolves_from_current_quotes() {
+        let options = BasisGuardedLiveAutoOnceOptions {
+            symbol: BASIS_SYMBOL.to_owned(),
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: None,
+            min_net_bps: 5,
+            max_spot_ask: None,
+            min_perp_bid: None,
+            auto_price_guard_bps: Some(2),
+            spot_wss_monitor_url: Some("http://127.0.0.1:8801".to_owned()),
+            perp_wss_monitor_url: Some("http://127.0.0.1:8801".to_owned()),
+            private_order_events_dir: None,
+            execute_live: true,
+            acknowledge_basis_live_orders: true,
+        };
+
+        let guards =
+            resolve_basis_price_guards(&options, "100.00", "101.00").expect("price guards");
+
+        assert_eq!(guards.max_spot_ask.as_deref(), Some("100.020000"));
+        assert_eq!(guards.min_perp_bid.as_deref(), Some("100.979800"));
+        assert_eq!(guards.auto_price_guard_bps, Some(2));
+    }
+
+    #[test]
     fn funding_arb_pipeline_promotes_normalized_events_to_risk_fact() {
         let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
@@ -27548,6 +27783,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: Some("101.00".to_owned()),
                 min_perp_bid: Some("100.50".to_owned()),
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -27618,6 +27854,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: Some("101.00".to_owned()),
                 min_perp_bid: Some("100.50".to_owned()),
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -27692,6 +27929,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: Some("51.00".to_owned()),
                 min_perp_bid: Some("50.50".to_owned()),
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -27756,6 +27994,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: Some("51.00".to_owned()),
                 min_perp_bid: Some("50.50".to_owned()),
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -27805,6 +28044,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: Some("51.00".to_owned()),
                 min_perp_bid: Some("50.50".to_owned()),
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -27863,6 +28103,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: Some("51.00".to_owned()),
                 min_perp_bid: Some("50.50".to_owned()),
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -27924,6 +28165,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: Some("51.00".to_owned()),
                 min_perp_bid: Some("50.50".to_owned()),
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -28923,6 +29165,7 @@ mod tests {
                 min_net_bps: 5,
                 max_spot_ask: None,
                 min_perp_bid: None,
+                auto_price_guard_bps: None,
                 spot_wss_monitor_url: None,
                 perp_wss_monitor_url: None,
                 private_order_events_dir: None,
@@ -28958,6 +29201,7 @@ mod tests {
             min_net_bps: 5,
             max_spot_ask: Some("100.00".to_owned()),
             min_perp_bid: Some("101.00".to_owned()),
+            auto_price_guard_bps: None,
             spot_wss_monitor_url: None,
             perp_wss_monitor_url: None,
             private_order_events_dir: None,
@@ -28983,6 +29227,7 @@ mod tests {
             min_net_bps: 5,
             max_spot_ask: Some("100.00".to_owned()),
             min_perp_bid: Some("101.00".to_owned()),
+            auto_price_guard_bps: None,
             spot_wss_monitor_url: None,
             perp_wss_monitor_url: None,
             private_order_events_dir: None,
