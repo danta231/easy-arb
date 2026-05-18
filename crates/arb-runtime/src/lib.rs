@@ -126,6 +126,7 @@ const BITGET_REST_BASE_URL: &str = "https://api.bitget.com";
 const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const ASTER_SPOT_REST_BASE_URL: &str = "https://sapi.asterdex.com";
 const ASTER_FUTURES_REST_BASE_URL: &str = "https://fapi.asterdex.com";
+const FUNDING_ARB_MAX_MARK_INDEX_DIVERGENCE_BPS: i128 = 100;
 const RAW_TICKER_FILE: &str = "raw/binance_ticker_24hr.redacted.json";
 const RAW_TICKER_REF: &str = "raw/binance_ticker_24hr.redacted.json";
 const RISK_POLICY_FILE: &str = "risk_policy.yaml";
@@ -385,7 +386,27 @@ pub struct ArbVenueCapabilityProfile {
     pub supports_mark_index_price: bool,
     pub supports_top_of_book_size: bool,
     pub funding_interval_hours: Option<u64>,
+    pub funding_settlement_price_source: FundingSettlementPriceSource,
     pub dry_run_execution_supported: bool,
+}
+
+/// 资金费率结算价格来源。
+///
+/// 中文说明：不同永续交易场所的资金费率并不总是按同一价格口径结算。运行时先把
+/// 该差异显式建模，后续候选和对账必须按场所口径解释预期收益。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FundingSettlementPriceSource {
+    MarkPrice,
+    OraclePrice,
+}
+
+impl FundingSettlementPriceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MarkPrice => "mark_price",
+            Self::OraclePrice => "oracle_price",
+        }
+    }
 }
 
 impl ArbVenueCapabilityProfile {
@@ -447,6 +468,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             supports_mark_index_price: true,
             supports_top_of_book_size: true,
             funding_interval_hours: Some(8),
+            funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
         },
         ArbVenueCapabilityProfile {
@@ -458,6 +480,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             supports_mark_index_price: true,
             supports_top_of_book_size: true,
             funding_interval_hours: Some(8),
+            funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
         },
         ArbVenueCapabilityProfile {
@@ -469,6 +492,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             supports_mark_index_price: true,
             supports_top_of_book_size: true,
             funding_interval_hours: Some(8),
+            funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
         },
         ArbVenueCapabilityProfile {
@@ -480,6 +504,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             supports_mark_index_price: true,
             supports_top_of_book_size: true,
             funding_interval_hours: Some(8),
+            funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
         },
         ArbVenueCapabilityProfile {
@@ -491,6 +516,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             supports_mark_index_price: true,
             supports_top_of_book_size: true,
             funding_interval_hours: Some(8),
+            funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
         },
         ArbVenueCapabilityProfile {
@@ -502,6 +528,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             supports_mark_index_price: true,
             supports_top_of_book_size: true,
             funding_interval_hours: Some(1),
+            funding_settlement_price_source: FundingSettlementPriceSource::OraclePrice,
             dry_run_execution_supported: true,
         },
     ]
@@ -1810,6 +1837,7 @@ pub struct BinanceBasisMarketRow {
     pub mark_price: String,
     pub index_price: String,
     pub last_funding_rate: String,
+    pub funding_interval_hours: String,
     pub next_funding_time_ms: String,
     pub gross_basis_bps: Option<String>,
     pub total_cost_bps: Option<String>,
@@ -10240,6 +10268,8 @@ fn build_binance_basis_monitor_snapshot_from_json(
             .and_then(|signal| signal.reason.clone())
             .or(signal_error)
             .or(reason);
+        let funding_interval_hours =
+            funding_interval_hours_or_default("binance", premium.funding_interval_hours.clone())?;
 
         rows.push(BinanceBasisMarketRow {
             symbol: premium.symbol,
@@ -10254,6 +10284,7 @@ fn build_binance_basis_monitor_snapshot_from_json(
             mark_price: premium.mark_price,
             index_price: premium.index_price,
             last_funding_rate: premium.last_funding_rate,
+            funding_interval_hours,
             next_funding_time_ms: premium.next_funding_time_ms,
             gross_basis_bps: signal.as_ref().map(|signal| signal.gross_bps.to_string()),
             total_cost_bps: signal
@@ -10378,6 +10409,8 @@ fn build_aster_basis_monitor_snapshot_from_json(
             .and_then(|signal| signal.reason.clone())
             .or(signal_error)
             .or(reason);
+        let funding_interval_hours =
+            funding_interval_hours_or_default("aster", premium.funding_interval_hours.clone())?;
 
         rows.push(AsterBasisMarketRow {
             symbol: premium.symbol,
@@ -10392,6 +10425,7 @@ fn build_aster_basis_monitor_snapshot_from_json(
             mark_price: premium.mark_price,
             index_price: premium.index_price,
             last_funding_rate: premium.last_funding_rate,
+            funding_interval_hours,
             next_funding_time_ms: premium.next_funding_time_ms,
             gross_basis_bps: signal.as_ref().map(|signal| signal.gross_bps.to_string()),
             total_cost_bps: signal
@@ -10578,6 +10612,10 @@ fn build_bybit_basis_monitor_snapshot_from_json(
             last_funding_rate: linear
                 .map(|row| row.last_funding_rate.clone())
                 .unwrap_or_default(),
+            funding_interval_hours: funding_interval_hours_or_default(
+                "bybit",
+                linear.and_then(|row| row.funding_interval_hours.clone()),
+            )?,
             next_funding_time_ms: linear
                 .map(|row| row.next_funding_time_ms.clone())
                 .unwrap_or_default(),
@@ -10780,6 +10818,10 @@ fn build_okx_basis_monitor_snapshot_from_json(
             last_funding_rate: funding
                 .map(|row| row.funding_rate.clone())
                 .unwrap_or_default(),
+            funding_interval_hours: funding_interval_hours_or_default(
+                "okx",
+                funding.and_then(|row| row.funding_interval_hours.clone()),
+            )?,
             next_funding_time_ms: funding
                 .map(|row| row.next_funding_time_ms.clone())
                 .unwrap_or_default(),
@@ -10945,6 +10987,10 @@ fn build_bitget_basis_monitor_snapshot_from_json(
             last_funding_rate: funding
                 .map(|row| row.funding_rate.clone())
                 .unwrap_or_default(),
+            funding_interval_hours: funding_interval_hours_or_default(
+                "bitget",
+                funding.and_then(|row| row.funding_interval_hours.clone()),
+            )?,
             next_funding_time_ms: funding
                 .map(|row| row.next_funding_time_ms.clone())
                 .unwrap_or_default(),
@@ -11066,6 +11112,7 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
             mark_price: perp.mark_price,
             index_price: perp.oracle_price,
             last_funding_rate: perp.funding_rate,
+            funding_interval_hours: funding_interval_hours_string_for_venue("hyperliquid")?,
             next_funding_time_ms: String::new(),
             gross_basis_bps: signal.as_ref().map(|signal| signal.gross_bps.to_string()),
             total_cost_bps: signal
@@ -11142,7 +11189,7 @@ fn parse_funding_arb_basis_status_snapshot(
             message: "basis monitor status is missing rows".to_owned(),
         })?;
     let venue_family = normalize_venue_family(&source.venue_family);
-    let interval_hours = funding_interval_hours_for_venue(&venue_family)?.to_string();
+    let default_interval_hours = funding_interval_hours_string_for_venue(&venue_family)?;
     let mut rows = Vec::new();
     for object in json_object_slices(rows_json)? {
         let row_fields = parse_json_object_value_slices(object)?;
@@ -11168,8 +11215,29 @@ fn parse_funding_arb_basis_status_snapshot(
                 "perp_ask_qty",
                 "basis monitor row",
             )?,
+            mark_price: optional_json_value_string(&row_fields, "mark_price", "basis monitor row")?,
+            index_price: optional_json_value_string(
+                &row_fields,
+                "index_price",
+                "basis monitor row",
+            )?,
             funding_rate,
-            funding_interval_hours: interval_hours.clone(),
+            funding_interval_hours: optional_json_value_string(
+                &row_fields,
+                "funding_interval_hours",
+                "basis monitor row",
+            )?
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                parse_positive_u64_runtime("funding_interval_hours", &value)
+                    .map(|interval| interval.to_string())
+            })
+            .unwrap_or_else(|| Ok(default_interval_hours.clone()))?,
+            next_funding_time_ms: optional_json_value_string(
+                &row_fields,
+                "next_funding_time_ms",
+                "basis monitor row",
+            )?,
             source_status: required_json_value_string(
                 &row_fields,
                 "source_status",
@@ -11261,22 +11329,28 @@ fn funding_arb_pair_row(
         venue_a_ask: venue_a.perp_ask.clone().unwrap_or_default(),
         venue_a_bid_qty: venue_a.perp_bid_qty.clone().unwrap_or_default(),
         venue_a_ask_qty: venue_a.perp_ask_qty.clone().unwrap_or_default(),
+        venue_a_mark_price: venue_a.mark_price.clone().unwrap_or_default(),
+        venue_a_index_price: venue_a.index_price.clone().unwrap_or_default(),
         venue_a_funding_rate: normalize_funding_rate_string_to_8h(
             &venue_a.funding_rate,
             &venue_a.funding_interval_hours,
         )
         .unwrap_or_else(|_| venue_a.funding_rate.clone()),
         venue_a_funding_interval_hours: "8".to_owned(),
+        venue_a_next_funding_time_ms: venue_a.next_funding_time_ms.clone().unwrap_or_default(),
         venue_b_bid: venue_b.perp_bid.clone().unwrap_or_default(),
         venue_b_ask: venue_b.perp_ask.clone().unwrap_or_default(),
         venue_b_bid_qty: venue_b.perp_bid_qty.clone().unwrap_or_default(),
         venue_b_ask_qty: venue_b.perp_ask_qty.clone().unwrap_or_default(),
+        venue_b_mark_price: venue_b.mark_price.clone().unwrap_or_default(),
+        venue_b_index_price: venue_b.index_price.clone().unwrap_or_default(),
         venue_b_funding_rate: normalize_funding_rate_string_to_8h(
             &venue_b.funding_rate,
             &venue_b.funding_interval_hours,
         )
         .unwrap_or_else(|_| venue_b.funding_rate.clone()),
         venue_b_funding_interval_hours: "8".to_owned(),
+        venue_b_next_funding_time_ms: venue_b.next_funding_time_ms.clone().unwrap_or_default(),
         funding_interval_hours: "8".to_owned(),
         long_venue_family,
         short_venue_family,
@@ -11320,6 +11394,20 @@ fn funding_arb_pair_row(
                 missing.join(", ")
             )),
             "missing_perp_top_of_book".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    if let Some(reason) = funding_arb_mark_index_rejection(venue_a, venue_b)? {
+        return Ok(base_row(
+            false,
+            Some(reason),
+            "mark_index_divergence".to_owned(),
             None,
             None,
             None,
@@ -11455,8 +11543,32 @@ fn funding_arb_missing_market_fields(
         {
             missing.push(format!("{prefix}.perp_ask_qty"));
         }
+        if venue.mark_price.as_deref().unwrap_or("").trim().is_empty() {
+            missing.push(format!("{prefix}.mark_price"));
+        }
+        if venue.index_price.as_deref().unwrap_or("").trim().is_empty() {
+            missing.push(format!("{prefix}.index_price"));
+        }
     }
     missing
+}
+
+fn funding_arb_mark_index_rejection(
+    venue_a: &FundingArbVenueMarket,
+    venue_b: &FundingArbVenueMarket,
+) -> RuntimeResult<Option<String>> {
+    for (label, venue) in [("venue_a", venue_a), ("venue_b", venue_b)] {
+        let mark_price = venue.mark_price.as_deref().unwrap_or_default();
+        let index_price = venue.index_price.as_deref().unwrap_or_default();
+        let divergence_bps = mark_index_divergence_bps(mark_price, index_price)?;
+        if divergence_bps > FUNDING_ARB_MAX_MARK_INDEX_DIVERGENCE_BPS {
+            return Ok(Some(format!(
+                "{label} {} mark/index divergence {} bps exceeds maximum {} bps",
+                venue.venue_family, divergence_bps, FUNDING_ARB_MAX_MARK_INDEX_DIVERGENCE_BPS
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn normalize_funding_rate_string_to_8h(rate: &str, interval_hours: &str) -> RuntimeResult<String> {
@@ -11487,6 +11599,42 @@ fn funding_interval_hours_for_venue(venue_family: &str) -> RuntimeResult<u64> {
         .and_then(|profile| profile.funding_interval_hours)
         .ok_or_else(|| RuntimeError::LiveMarketData {
             message: format!("venue `{venue_family}` lacks funding_interval_hours profile"),
+        })
+}
+
+fn funding_interval_hours_string_for_venue(venue_family: &str) -> RuntimeResult<String> {
+    Ok(funding_interval_hours_for_venue(venue_family)?.to_string())
+}
+
+fn funding_interval_hours_or_default(
+    venue_family: &str,
+    observed: Option<String>,
+) -> RuntimeResult<String> {
+    if let Some(value) = observed.filter(|value| !value.trim().is_empty()) {
+        return Ok(parse_positive_u64_runtime("funding_interval_hours", &value)?.to_string());
+    }
+    funding_interval_hours_string_for_venue(venue_family)
+}
+
+fn mark_index_divergence_bps(mark_price: &str, index_price: &str) -> RuntimeResult<i128> {
+    let mark = MonitorDecimal::parse("mark_price", mark_price)?;
+    let index = MonitorDecimal::parse("index_price", index_price)?;
+    if mark.raw <= 0 || index.raw <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: "mark_price and index_price must be greater than zero".to_owned(),
+        });
+    }
+    let diff = mark
+        .raw
+        .checked_sub(index.raw)
+        .and_then(|value| value.checked_abs())
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "mark/index divergence calculation overflowed".to_owned(),
+        })?;
+    diff.checked_mul(10_000)
+        .and_then(|value| value.checked_div(index.raw))
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "mark/index divergence calculation overflowed".to_owned(),
         })
 }
 
@@ -12110,6 +12258,7 @@ struct MonitorPremiumIndexRow {
     mark_price: String,
     index_price: String,
     last_funding_rate: String,
+    funding_interval_hours: Option<String>,
     next_funding_time_ms: String,
 }
 
@@ -12123,6 +12272,7 @@ struct BybitLinearTickerRow {
     mark_price: String,
     index_price: String,
     last_funding_rate: String,
+    funding_interval_hours: Option<String>,
     next_funding_time_ms: String,
 }
 
@@ -12141,6 +12291,7 @@ struct BitgetUsdtFuturesTickerRow {
 struct BitgetFundingRateRow {
     symbol: String,
     funding_rate: String,
+    funding_interval_hours: Option<String>,
     next_funding_time_ms: String,
 }
 
@@ -12178,6 +12329,7 @@ struct OkxIndexTickerRow {
 struct OkxFundingRateRow {
     inst_id: String,
     funding_rate: String,
+    funding_interval_hours: Option<String>,
     next_funding_time_ms: String,
 }
 
@@ -12229,6 +12381,9 @@ fn parse_premium_index_rows(input: &str) -> RuntimeResult<Vec<MonitorPremiumInde
                     "lastFundingRate",
                     "premiumIndex",
                 )?,
+                funding_interval_hours: optional_json_scalar(&fields, "fundingRateInterval")
+                    .or_else(|| optional_json_scalar(&fields, "fundingIntervalHour"))
+                    .or_else(|| optional_json_scalar(&fields, "fundingIntervalHours")),
                 next_funding_time_ms: required_json_scalar(
                     &fields,
                     "nextFundingTime",
@@ -12287,6 +12442,11 @@ fn parse_bybit_linear_ticker_rows(input: &str) -> RuntimeResult<Vec<BybitLinearT
                 last_funding_rate: required_json_value_string(
                     &fields,
                     "fundingRate",
+                    "bybit linear tickers",
+                )?,
+                funding_interval_hours: optional_first_json_value_string(
+                    &fields,
+                    &["fundingIntervalHour", "fundingIntervalHours"],
                     "bybit linear tickers",
                 )?,
                 next_funding_time_ms: required_json_value_string(
@@ -12498,6 +12658,15 @@ fn parse_bitget_funding_rate_rows(input: &str) -> RuntimeResult<Vec<BitgetFundin
                     &["fundingRate", "lastFundingRate"],
                     "bitget usdt-futures funding rates",
                 )?,
+                funding_interval_hours: optional_first_json_value_string(
+                    &fields,
+                    &[
+                        "fundingRateInterval",
+                        "fundingIntervalHour",
+                        "fundingIntervalHours",
+                    ],
+                    "bitget usdt-futures funding rates",
+                )?,
                 next_funding_time_ms,
             })
         })
@@ -12592,6 +12761,15 @@ fn parse_okx_funding_rate_rows(input: &str) -> RuntimeResult<Vec<OkxFundingRateR
                 funding_rate: required_json_value_string(
                     &fields,
                     "fundingRate",
+                    "okx funding rate",
+                )?,
+                funding_interval_hours: optional_first_json_value_string(
+                    &fields,
+                    &[
+                        "fundingRateInterval",
+                        "fundingIntervalHour",
+                        "fundingIntervalHours",
+                    ],
                     "okx funding rate",
                 )?,
                 next_funding_time_ms,
@@ -13190,6 +13368,31 @@ fn required_json_scalar(
     }
 }
 
+fn optional_json_scalar(
+    fields: &BTreeMap<String, MonitorJsonScalar>,
+    field: &'static str,
+) -> Option<String> {
+    match fields.get(field) {
+        Some(MonitorJsonScalar::String(value))
+        | Some(MonitorJsonScalar::Number(value))
+        | Some(MonitorJsonScalar::Bool(value)) => Some(value.clone()),
+        Some(MonitorJsonScalar::Null) | None => None,
+    }
+}
+
+fn optional_first_json_value_string(
+    fields: &BTreeMap<String, &str>,
+    field_names: &[&'static str],
+    source: &'static str,
+) -> RuntimeResult<Option<String>> {
+    for field in field_names {
+        if fields.contains_key(*field) {
+            return optional_json_value_string(fields, field, source);
+        }
+    }
+    Ok(None)
+}
+
 fn required_json_value_string(
     fields: &BTreeMap<String, &str>,
     field: &'static str,
@@ -13630,14 +13833,20 @@ pub struct FundingArbMarketRow {
     pub venue_a_ask: String,
     pub venue_a_bid_qty: String,
     pub venue_a_ask_qty: String,
+    pub venue_a_mark_price: String,
+    pub venue_a_index_price: String,
     pub venue_a_funding_rate: String,
     pub venue_a_funding_interval_hours: String,
+    pub venue_a_next_funding_time_ms: String,
     pub venue_b_bid: String,
     pub venue_b_ask: String,
     pub venue_b_bid_qty: String,
     pub venue_b_ask_qty: String,
+    pub venue_b_mark_price: String,
+    pub venue_b_index_price: String,
     pub venue_b_funding_rate: String,
     pub venue_b_funding_interval_hours: String,
+    pub venue_b_next_funding_time_ms: String,
     pub funding_interval_hours: String,
     pub long_venue_family: Option<String>,
     pub short_venue_family: Option<String>,
@@ -13679,8 +13888,11 @@ struct FundingArbVenueMarket {
     perp_ask: Option<String>,
     perp_bid_qty: Option<String>,
     perp_ask_qty: Option<String>,
+    mark_price: Option<String>,
+    index_price: Option<String>,
     funding_rate: String,
     funding_interval_hours: String,
+    next_funding_time_ms: Option<String>,
     source_status: String,
 }
 
@@ -14505,10 +14717,11 @@ fn funding_arb_monitor_row_to_normalized_events(
         &spec.strategy_config.venues.venue_a.venue_id,
         &spec.strategy_config.venues.venue_a.instrument_id,
         &row.symbol,
-        &row.venue_a_ask,
-        &row.venue_a_ask,
+        &row.venue_a_mark_price,
+        &row.venue_a_index_price,
         &row.venue_a_funding_rate,
         &row.venue_a_funding_interval_hours,
+        &row.venue_a_next_funding_time_ms,
     );
     let venue_b_premium = funding_monitor_premium_index_event_json(
         &format!("{event_prefix}:venue-b-premium"),
@@ -14519,10 +14732,11 @@ fn funding_arb_monitor_row_to_normalized_events(
         &spec.strategy_config.venues.venue_b.venue_id,
         &spec.strategy_config.venues.venue_b.instrument_id,
         &row.symbol,
-        &row.venue_b_bid,
-        &row.venue_b_bid,
+        &row.venue_b_mark_price,
+        &row.venue_b_index_price,
         &row.venue_b_funding_rate,
         &row.venue_b_funding_interval_hours,
+        &row.venue_b_next_funding_time_ms,
     );
 
     Ok(vec![
@@ -14651,9 +14865,10 @@ fn funding_monitor_premium_index_event_json(
     index_price: &str,
     last_funding_rate: &str,
     funding_interval_hours: &str,
+    next_funding_time_ms: &str,
 ) -> String {
     format!(
-        r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"funding-arb-monitor","basis_role":"Perp","funding_interval_hours":{},"index_price":{},"kind":"PerpPremiumIndex","last_funding_rate":{},"mark_price":{},"next_funding_time_ms":0,"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"funding-arb-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
+        r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"funding-arb-monitor","basis_role":"Perp","funding_interval_hours":{},"index_price":{},"kind":"PerpPremiumIndex","last_funding_rate":{},"mark_price":{},"next_funding_time_ms":{},"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"funding-arb-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
         json_string(checksum),
         json_string(correlation_id),
         json_string(event_id),
@@ -14662,6 +14877,7 @@ fn funding_monitor_premium_index_event_json(
         json_string(index_price),
         json_string(last_funding_rate),
         json_string(mark_price),
+        json_string(next_funding_time_ms),
         json_string(venue_symbol),
         json_string(source_sequence),
         json_string(observed_at),
@@ -20275,6 +20491,16 @@ fn parse_funding_arb_market_row_json_fields(
             "venue_a_ask_qty",
             "funding arb monitor row",
         )?,
+        venue_a_mark_price: required_json_value_string(
+            fields,
+            "venue_a_mark_price",
+            "funding arb monitor row",
+        )?,
+        venue_a_index_price: required_json_value_string(
+            fields,
+            "venue_a_index_price",
+            "funding arb monitor row",
+        )?,
         venue_a_funding_rate: required_json_value_string(
             fields,
             "venue_a_funding_rate",
@@ -20285,6 +20511,12 @@ fn parse_funding_arb_market_row_json_fields(
             "venue_a_funding_interval_hours",
             "funding arb monitor row",
         )?,
+        venue_a_next_funding_time_ms: optional_json_value_string(
+            fields,
+            "venue_a_next_funding_time_ms",
+            "funding arb monitor row",
+        )?
+        .unwrap_or_default(),
         venue_b_bid: required_json_value_string(fields, "venue_b_bid", "funding arb monitor row")?,
         venue_b_ask: required_json_value_string(fields, "venue_b_ask", "funding arb monitor row")?,
         venue_b_bid_qty: required_json_value_string(
@@ -20297,6 +20529,16 @@ fn parse_funding_arb_market_row_json_fields(
             "venue_b_ask_qty",
             "funding arb monitor row",
         )?,
+        venue_b_mark_price: required_json_value_string(
+            fields,
+            "venue_b_mark_price",
+            "funding arb monitor row",
+        )?,
+        venue_b_index_price: required_json_value_string(
+            fields,
+            "venue_b_index_price",
+            "funding arb monitor row",
+        )?,
         venue_b_funding_rate: required_json_value_string(
             fields,
             "venue_b_funding_rate",
@@ -20307,6 +20549,12 @@ fn parse_funding_arb_market_row_json_fields(
             "venue_b_funding_interval_hours",
             "funding arb monitor row",
         )?,
+        venue_b_next_funding_time_ms: optional_json_value_string(
+            fields,
+            "venue_b_next_funding_time_ms",
+            "funding arb monitor row",
+        )?
+        .unwrap_or_default(),
         funding_interval_hours: required_json_value_string(
             fields,
             "funding_interval_hours",
@@ -20617,8 +20865,9 @@ impl BinanceBasisMonitorSnapshot {
 impl BinanceBasisMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"expected_profit_usd\":{},\"gross_basis_bps\":{},\"index_price\":{},\"is_candidate\":{},\"last_funding_rate\":{},\"mark_price\":{},\"net_basis_bps\":{},\"next_funding_time_ms\":{},\"perp_ask\":{},\"perp_ask_qty\":{},\"perp_bid\":{},\"perp_bid_qty\":{},\"quantity\":{},\"reason\":{},\"source_status\":{},\"spot_ask\":{},\"spot_ask_qty\":{},\"spot_bid\":{},\"spot_bid_qty\":{},\"symbol\":{},\"total_cost_bps\":{}}}",
+            "{{\"expected_profit_usd\":{},\"funding_interval_hours\":{},\"gross_basis_bps\":{},\"index_price\":{},\"is_candidate\":{},\"last_funding_rate\":{},\"mark_price\":{},\"net_basis_bps\":{},\"next_funding_time_ms\":{},\"perp_ask\":{},\"perp_ask_qty\":{},\"perp_bid\":{},\"perp_bid_qty\":{},\"quantity\":{},\"reason\":{},\"source_status\":{},\"spot_ask\":{},\"spot_ask_qty\":{},\"spot_bid\":{},\"spot_bid_qty\":{},\"symbol\":{},\"total_cost_bps\":{}}}",
             json_option_string(&self.expected_profit_usd),
+            json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_basis_bps),
             json_string(&self.index_price),
             self.is_candidate,
@@ -20696,7 +20945,7 @@ impl FundingArbMonitorSnapshot {
 impl FundingArbMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_b_ask\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{}}}",
+            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
             json_option_string(&self.expected_funding_usd),
             json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_funding_spread_bps),
@@ -20716,6 +20965,9 @@ impl FundingArbMarketRow {
             json_string(&self.venue_a_family),
             json_string(&self.venue_a_funding_interval_hours),
             json_string(&self.venue_a_funding_rate),
+            json_string(&self.venue_a_index_price),
+            json_string(&self.venue_a_mark_price),
+            json_string(&self.venue_a_next_funding_time_ms),
             json_string(&self.venue_b_ask),
             json_string(&self.venue_b_ask_qty),
             json_string(&self.venue_b_bid),
@@ -20723,6 +20975,9 @@ impl FundingArbMarketRow {
             json_string(&self.venue_b_family),
             json_string(&self.venue_b_funding_interval_hours),
             json_string(&self.venue_b_funding_rate),
+            json_string(&self.venue_b_index_price),
+            json_string(&self.venue_b_mark_price),
+            json_string(&self.venue_b_next_funding_time_ms),
         )
     }
 }
@@ -25815,14 +26070,20 @@ mod tests {
             venue_a_ask: "100.00".to_owned(),
             venue_a_bid_qty: "2.0".to_owned(),
             venue_a_ask_qty: "2.0".to_owned(),
+            venue_a_mark_price: "100.00".to_owned(),
+            venue_a_index_price: "100.00".to_owned(),
             venue_a_funding_rate: venue_a_funding_rate.to_owned(),
             venue_a_funding_interval_hours: "8".to_owned(),
+            venue_a_next_funding_time_ms: "1778659200000".to_owned(),
             venue_b_bid: "100.05".to_owned(),
             venue_b_ask: "100.10".to_owned(),
             venue_b_bid_qty: "2.0".to_owned(),
             venue_b_ask_qty: "2.0".to_owned(),
+            venue_b_mark_price: "100.05".to_owned(),
+            venue_b_index_price: "100.00".to_owned(),
             venue_b_funding_rate: venue_b_funding_rate.to_owned(),
             venue_b_funding_interval_hours: "8".to_owned(),
+            venue_b_next_funding_time_ms: "1778659200000".to_owned(),
             funding_interval_hours: "8".to_owned(),
             long_venue_family: Some("binance".to_owned()),
             short_venue_family: Some("bybit".to_owned()),
@@ -25867,7 +26128,7 @@ mod tests {
             .map(json_string)
             .unwrap_or_else(|| "null".to_owned());
         format!(
-            r#"{{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{{"symbol":{},"perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":{},"perp_ask_qty":{},"last_funding_rate":{},"source_status":{}}}]}}"#,
+            r#"{{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{{"symbol":{},"perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":{},"perp_ask_qty":{},"mark_price":"100.05","index_price":"100.00","last_funding_rate":{},"next_funding_time_ms":"1778659200000","source_status":{}}}]}}"#,
             json_string(symbol),
             bid_qty_json,
             ask_qty_json,
@@ -25994,6 +26255,7 @@ mod tests {
             "100.00",
             venue_a_funding_rate,
             venue_a_interval_hours,
+            "1778659200000",
         );
         let venue_b_premium = funding_monitor_premium_index_event_json(
             "event:test:funding-arb:venue-b-premium",
@@ -26008,6 +26270,7 @@ mod tests {
             "100.05",
             venue_b_funding_rate,
             venue_b_interval_hours,
+            "1778659200000",
         );
         vec![
             from_json_strict::<NormalizedEvent>(&venue_a_book).expect("venue a book"),
@@ -26919,6 +27182,73 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_monitor_prefers_row_level_funding_interval() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let aster_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00040000","funding_interval_hours":"4","next_funding_time_ms":"1778659200000","source_status":"missing_spot"}]}"#;
+        let aster = funding_arb_test_venue_snapshot("aster", aster_status);
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "binance".to_owned(),
+                    status_url: "http://127.0.0.1/binance/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "aster".to_owned(),
+                    status_url: "http://127.0.0.1/aster/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![binance, aster], vec![], &options)
+                .expect("funding arb snapshot");
+
+        let row = &snapshot.rows[0];
+        assert_eq!(row.venue_b_funding_rate, "0.0008");
+        assert_eq!(row.venue_b_funding_interval_hours, "8");
+    }
+
+    #[test]
+    fn funding_arb_monitor_rejects_mark_index_divergence() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"120.00","index_price":"100.00","last_funding_rate":"0.00300000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
+        let bybit = funding_arb_test_venue_snapshot("bybit", bybit_status);
+
+        let snapshot = build_funding_arb_monitor_snapshot_from_sources(
+            vec![binance, bybit],
+            vec![],
+            &FundingArbMonitorOptions::default(),
+        )
+        .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.candidate_count, 0);
+        assert_eq!(snapshot.rows[0].source_status, "mark_index_divergence");
+        assert!(snapshot.rows[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("mark/index divergence")));
+    }
+
+    #[test]
     fn funding_arb_monitor_fails_closed_when_perp_size_is_missing() {
         let binance = funding_arb_test_venue_snapshot(
             "binance",
@@ -27464,6 +27794,7 @@ mod tests {
             mark_price: "101.00".to_owned(),
             index_price: "100.00".to_owned(),
             last_funding_rate: "0.00010000".to_owned(),
+            funding_interval_hours: "8".to_owned(),
             next_funding_time_ms: "1778659200000".to_owned(),
             gross_basis_bps: Some("100".to_owned()),
             total_cost_bps: Some("20".to_owned()),
@@ -27567,6 +27898,7 @@ mod tests {
                 mark_price: String::new(),
                 index_price: String::new(),
                 last_funding_rate: String::new(),
+                funding_interval_hours: "8".to_owned(),
                 next_funding_time_ms: String::new(),
                 gross_basis_bps: Some("100".to_owned()),
                 total_cost_bps: Some("20".to_owned()),

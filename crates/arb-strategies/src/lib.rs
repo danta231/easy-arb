@@ -52,6 +52,7 @@ const CROSS_EXCHANGE_FUNDING_ARB_STRATEGY_VERSION: &str = "1.0.0";
 const CROSS_EXCHANGE_FUNDING_ARB_CODE_VERSION: &str = "code:cross-exchange-funding-arb-1";
 const CROSS_EXCHANGE_FUNDING_ARB_TRANSITION_ID: &str =
     "trans:cross-exchange-funding-arb-btcusdt-001";
+const CROSS_EXCHANGE_MAX_MARK_INDEX_DIVERGENCE_BPS: i128 = 100;
 const FIXED_SCALE: i128 = 100_000_000;
 const FIXED_SCALE_DIGITS: usize = 8;
 
@@ -1864,6 +1865,25 @@ impl Strategy for CrossExchangeFundingArbStrategy {
                 "funding arbitrage input contains stale public market data",
             );
         }
+        for (label, premium) in [("venue A", &premium_a), ("venue B", &premium_b)] {
+            let divergence_bps =
+                match mark_index_divergence_bps(premium.mark_price, premium.index_price) {
+                    Ok(value) => value,
+                    Err(detail) => {
+                        return self.reject(context, StrategyRejectReason::MissingData, detail)
+                    }
+                };
+            if divergence_bps > CROSS_EXCHANGE_MAX_MARK_INDEX_DIVERGENCE_BPS {
+                return self.reject(
+                    context,
+                    StrategyRejectReason::NoCandidate,
+                    format!(
+                        "{label} mark/index divergence {divergence_bps} bps exceeds maximum {} bps",
+                        CROSS_EXCHANGE_MAX_MARK_INDEX_DIVERGENCE_BPS
+                    ),
+                );
+            }
+        }
 
         let interval_a = match premium_a.funding_interval_hours.as_deref() {
             Some(value) => value,
@@ -3018,6 +3038,13 @@ fn price_divergence_bps(left: FixedDecimal, right: FixedDecimal) -> Result<i128,
         .ok_or_else(|| "entry price divergence calculation overflowed".to_owned())
 }
 
+fn mark_index_divergence_bps(
+    mark_price: FixedDecimal,
+    index_price: FixedDecimal,
+) -> Result<i128, String> {
+    price_divergence_bps(mark_price, index_price)
+}
+
 fn tradable_close_basis_bps(
     perp_ask: FixedDecimal,
     spot_bid: FixedDecimal,
@@ -3494,6 +3521,30 @@ mod tests {
             candidate.expected_economics.expected_profit_bps.as_str(),
             "24"
         );
+    }
+
+    #[test]
+    fn cross_exchange_funding_strategy_rejects_mark_index_divergence() {
+        let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
+        let mut events = cross_exchange_funding_events("0.00010000", "0.00300000", "8", "8");
+        events[2].payload.insert(
+            "mark_price".to_owned(),
+            JsonValue::String("120.00".to_owned()),
+        );
+        let context = basis_test_context(events);
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        assert!(evaluation.candidate().is_none());
+        let rejection = evaluation.rejection().expect("rejection");
+        assert_eq!(
+            rejection.reason().as_str(),
+            StrategyRejectReason::NoCandidate.as_str()
+        );
+        assert!(rejection
+            .detail()
+            .expect("detail")
+            .contains("mark/index divergence"));
     }
 
     #[test]
