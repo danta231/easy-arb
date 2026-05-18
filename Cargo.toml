@@ -13,6 +13,7 @@ members = [
     "crates/arb-venue-data",
     "crates/arb-venue-exec",
     "crates/arb-signing",
+    "crates/arb-wallet-signer",
     "crates/arb-replay",
     "crates/arb-ops",
     "crates/arb-runtime",

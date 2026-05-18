@@ -3,7 +3,8 @@
 //! 中文说明：本 crate 只定义受控签名请求、签名策略、审计引用和默认拒绝的
 //! 空签名器。默认 feature 为空，不连接真实密钥、不保存明文密钥、不输出
 //! 明文签名材料。`real-signing` feature 显式开启后才暴露真实 HMAC 签名边界；
-//! 真实凭证仍只能从环境变量或调用方实现的外部 secret provider 读取。
+//! 真实凭证仍只能从环境变量、调用方实现的外部 secret provider 或外部签名命令
+//! 读取。
 //!
 //! 中文说明：默认 feature 下 `arb_signing::real` 模块不存在；需要显式开启
 //! `real-signing` feature 后才能使用真实签名 provider。
@@ -986,14 +987,18 @@ impl fmt::Display for RedactedSigningReport {
 
 /// 真实签名边界。
 ///
-/// 中文说明：该模块只有在 `real-signing` feature 下编译。它只提供 HMAC-SHA256
-/// 传输签名能力，不保存真实凭证，不实现 fixture 凭证，也不在 `Debug` 或
-/// `Display` 中输出 API key、API secret、待签名 query 或 signature。
+/// 中文说明：该模块只有在 `real-signing` feature 下编译。它提供 HMAC-SHA256
+/// 传输签名能力和 Aster Futures V3 外部 EIP-712 签名边界，不保存真实凭证，
+/// 不实现 fixture 凭证，也不在 `Debug` 或 `Display` 中输出 API key、API secret、
+/// 待签名 query 或 signature。
 #[cfg(feature = "real-signing")]
 pub mod real {
     use std::collections::BTreeSet;
     use std::env;
     use std::fmt;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1077,6 +1082,19 @@ pub mod real {
         ) -> SigningResult<BitgetSignedEndpoint>;
     }
 
+    /// Aster Futures V3 外部 EIP-712 签名 provider。
+    ///
+    /// 中文说明：Aster V3 `USER_DATA`/`TRADE` 请求要求用 API wallet 对
+    /// URL-encoded 参数串执行 EIP-712 签名。本 trait 只负责构造受控参数串、
+    /// 审计签名请求并调用外部签名命令；私钥不进入本进程。
+    pub trait AsterRealSigningProvider {
+        fn sign_aster_eip712_external(
+            &self,
+            input: AsterV3SigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<AsterSignedEndpoint>;
+    }
+
     /// Binance 凭证提供方。
     ///
     /// 中文说明：外部 secret provider 通过实现该 trait 接入。trait 不提供日志
@@ -1121,6 +1139,18 @@ pub mod real {
         ) -> SigningResult<BitgetApiCredentials>;
     }
 
+    /// Aster 外部签名命令 provider。
+    ///
+    /// 中文说明：provider 只返回可执行程序路径。外部程序从 stdin 接收 Aster
+    /// 官方 `typed_data.message.msg` 对应的 URL-encoded 参数串，并向 stdout 输出
+    /// 65-byte ECDSA signature 的十六进制字符串。私钥由外部程序自行管理。
+    pub trait AsterExternalSignerCommandProvider {
+        fn load_aster_external_signer_command(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<AsterExternalSignerCommand>;
+    }
+
     /// Binance 时间戳提供方。
     ///
     /// 中文说明：Binance signed endpoint 要求 `timestamp` 参数。默认实现使用
@@ -1150,6 +1180,13 @@ pub mod real {
     /// 受控时间源。
     pub trait BitgetTimestampProvider {
         fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
+    }
+
+    /// Aster Futures V3 nonce 提供方。
+    ///
+    /// 中文说明：Aster V3 使用当前系统时间的微秒 nonce，并拒绝重复或过旧 nonce。
+    pub trait AsterNonceProvider {
+        fn nonce_micros(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
     }
 
     /// 使用环境变量读取 Binance 凭证的 provider。
@@ -1378,6 +1415,79 @@ pub mod real {
         }
     }
 
+    /// 使用环境变量读取 Aster 外部 EIP-712 签名命令的 provider。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct EnvAsterExternalSignerCommandProvider {
+        command_env: EnvSecretName,
+    }
+
+    impl EnvAsterExternalSignerCommandProvider {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Self::from_env_name("ASTER_EIP712_SIGNER_CMD")
+        }
+
+        pub fn from_env_name(command_env: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self {
+                command_env: EnvSecretName::new(command_env)?,
+            })
+        }
+
+        pub fn command_env(&self) -> &EnvSecretName {
+            &self.command_env
+        }
+    }
+
+    impl fmt::Debug for EnvAsterExternalSignerCommandProvider {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("EnvAsterExternalSignerCommandProvider")
+                .field("command_env", &self.command_env)
+                .finish()
+        }
+    }
+
+    impl AsterExternalSignerCommandProvider for EnvAsterExternalSignerCommandProvider {
+        fn load_aster_external_signer_command(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<AsterExternalSignerCommand> {
+            let command = read_env_secret(&self.command_env, audit_ref)?;
+            AsterExternalSignerCommand::new(command)
+        }
+    }
+
+    /// 使用固定命令路径读取 Aster 外部 EIP-712 签名命令的 provider。
+    ///
+    /// 中文说明：runtime 用它指向同一 target 目录中的 `arb-wallet-signer`。
+    /// 该 provider 只保存可执行文件路径，不保存私钥。
+    pub struct LiteralAsterExternalSignerCommandProvider {
+        command: AsterExternalSignerCommand,
+    }
+
+    impl LiteralAsterExternalSignerCommandProvider {
+        pub fn new(command: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self {
+                command: AsterExternalSignerCommand::new(command)?,
+            })
+        }
+    }
+
+    impl fmt::Debug for LiteralAsterExternalSignerCommandProvider {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LiteralAsterExternalSignerCommandProvider")
+                .field("command", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl AsterExternalSignerCommandProvider for LiteralAsterExternalSignerCommandProvider {
+        fn load_aster_external_signer_command(
+            &self,
+            _audit_ref: &SigningAuditRef,
+        ) -> SigningResult<AsterExternalSignerCommand> {
+            AsterExternalSignerCommand::new(self.command.expose_for_exec().to_owned())
+        }
+    }
+
     fn read_env_secret(name: &EnvSecretName, audit_ref: &SigningAuditRef) -> SigningResult<String> {
         env::var(name.as_str()).map_err(|error| {
             let reason = match error {
@@ -1489,6 +1599,40 @@ pub mod real {
         }
     }
 
+    static ASTER_LAST_NONCE_MICROS: AtomicU64 = AtomicU64::new(0);
+
+    /// Aster V3 系统 nonce 提供方。
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct SystemAsterNonceProvider;
+
+    impl AsterNonceProvider for SystemAsterNonceProvider {
+        fn nonce_micros(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+                SigningError::ClockUnavailable {
+                    audit_ref: audit_ref.clone(),
+                }
+            })?;
+            let now_micros = u64::try_from(duration.as_micros()).map_err(|_| {
+                SigningError::ClockUnavailable {
+                    audit_ref: audit_ref.clone(),
+                }
+            })?;
+            loop {
+                let previous = ASTER_LAST_NONCE_MICROS.load(Ordering::Relaxed);
+                let candidate = now_micros.max(previous.saturating_add(1));
+                match ASTER_LAST_NONCE_MICROS.compare_exchange(
+                    previous,
+                    candidate,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Ok(candidate),
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+
     /// Binance HMAC-SHA256 签名提供方。
     pub struct BinanceHmacSha256SigningProvider<C, T> {
         credentials: C,
@@ -1513,6 +1657,12 @@ pub mod real {
         timestamp: T,
     }
 
+    /// Aster Futures V3 外部 EIP-712 签名提供方。
+    pub struct AsterEip712ExternalSigningProvider<C, N> {
+        signer_command: C,
+        nonce: N,
+    }
+
     /// 默认真实签名 provider 类型。
     pub type RealSigningProviderFromEnv = BinanceHmacSha256SigningProvider<
         EnvBinanceCredentialProvider,
@@ -1530,6 +1680,12 @@ pub mod real {
     /// 默认 Bitget 真实签名 provider 类型。
     pub type BitgetRealSigningProviderFromEnv =
         BitgetHmacSha256SigningProvider<EnvBitgetCredentialProvider, SystemBitgetTimestampProvider>;
+
+    /// 默认 Aster 外部 EIP-712 签名 provider 类型。
+    pub type AsterRealSigningProviderFromEnv = AsterEip712ExternalSigningProvider<
+        EnvAsterExternalSignerCommandProvider,
+        SystemAsterNonceProvider,
+    >;
 
     impl<C, T> BinanceHmacSha256SigningProvider<C, T> {
         pub fn new(credentials: C, timestamp: T) -> Self {
@@ -1596,6 +1752,23 @@ pub mod real {
 
         pub fn timestamp_provider(&self) -> &T {
             &self.timestamp
+        }
+    }
+
+    impl<C, N> AsterEip712ExternalSigningProvider<C, N> {
+        pub fn new(signer_command: C, nonce: N) -> Self {
+            Self {
+                signer_command,
+                nonce,
+            }
+        }
+
+        pub fn signer_command_provider(&self) -> &C {
+            &self.signer_command
+        }
+
+        pub fn nonce_provider(&self) -> &N {
+            &self.nonce
         }
     }
 
@@ -1685,6 +1858,22 @@ pub mod real {
         }
     }
 
+    impl AsterRealSigningProviderFromEnv {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvAsterExternalSignerCommandProvider::from_default_env()?,
+                SystemAsterNonceProvider,
+            ))
+        }
+
+        pub fn from_env_name(command_env: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvAsterExternalSignerCommandProvider::from_env_name(command_env)?,
+                SystemAsterNonceProvider,
+            ))
+        }
+    }
+
     impl<C, T> fmt::Debug for BinanceHmacSha256SigningProvider<C, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("BinanceHmacSha256SigningProvider")
@@ -1717,6 +1906,15 @@ pub mod real {
             f.debug_struct("BitgetHmacSha256SigningProvider")
                 .field("credentials", &"<redacted>")
                 .field("timestamp", &"<configured>")
+                .finish()
+        }
+    }
+
+    impl<C, N> fmt::Debug for AsterEip712ExternalSigningProvider<C, N> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AsterEip712ExternalSigningProvider")
+                .field("signer_command", &"<redacted>")
+                .field("nonce", &"<configured>")
                 .finish()
         }
     }
@@ -1943,6 +2141,56 @@ pub mod real {
         }
     }
 
+    impl<C, N> AsterRealSigningProvider for AsterEip712ExternalSigningProvider<C, N>
+    where
+        C: AsterExternalSignerCommandProvider,
+        N: AsterNonceProvider,
+    {
+        fn sign_aster_eip712_external(
+            &self,
+            input: AsterV3SigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<AsterSignedEndpoint> {
+            let pending_audit_ref = input.pending_audit_ref()?;
+            let nonce_micros = self.nonce.nonce_micros(&pending_audit_ref)?;
+            let canonical_payload = input.canonical_payload(nonce_micros);
+            let payload_digest = SigningPayloadDigest::new(format!(
+                "sha256:{}",
+                sha256_hex(canonical_payload.as_bytes())
+            ))?;
+            let request = input.into_signing_request(payload_digest);
+            policy.validate_request(&request)?;
+
+            if policy.mode() != SigningPolicyMode::RealSigningEnabled {
+                return Err(SigningError::RealSigningPolicyNotEnabled {
+                    audit_ref: request.audit_ref(),
+                });
+            }
+
+            let command = self
+                .signer_command
+                .load_aster_external_signer_command(&request.audit_ref())?;
+            let signature = sign_aster_payload_with_external_command(&command, &canonical_payload)?;
+            let signed_query = format!(
+                "{canonical_payload}&signature={}",
+                percent_encode_component(signature.as_str())
+            );
+            let signature_ref = SignatureRef::new(format!(
+                "signature-ref/aster-eip712-external/{}",
+                ascii_suffix(request.payload_digest().as_str(), 24)
+            ))?;
+            let success = SigningSuccess::new(request.audit_ref(), signature_ref);
+
+            Ok(AsterSignedEndpoint {
+                nonce_micros,
+                signed_query: SecretString::new("aster_signed_query", signed_query)?,
+                signature,
+                request,
+                success,
+            })
+        }
+    }
+
     /// Binance HMAC 签名输入。
     ///
     /// 中文说明：输入只包含非密钥的请求上下文和待发送参数。Provider 会按
@@ -2048,6 +2296,137 @@ pub mod real {
                     "account_id",
                     &RedactedValue::from_reference(self.account_id.as_str()),
                 )
+                .field("params", &self.params)
+                .finish()
+        }
+    }
+
+    /// Aster Futures V3 EIP-712 签名输入。
+    ///
+    /// 中文说明：输入只包含公开地址、非密钥请求参数和审计上下文。Provider 会补充
+    /// 微秒 nonce 和 signer 参数，然后把 URL-encoded 参数串交给外部 signer。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct AsterV3SigningInput {
+        request_id: SigningRequestId,
+        policy_ref: SigningPolicyRef,
+        purpose: SigningPurpose,
+        venue_id: VenueId,
+        account_id: AccountId,
+        audit_context: SigningAuditContext,
+        user: Option<AsterAddress>,
+        signer: AsterAddress,
+        params: Vec<AsterRequestParam>,
+    }
+
+    impl AsterV3SigningInput {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            request_id: SigningRequestId,
+            policy_ref: SigningPolicyRef,
+            purpose: SigningPurpose,
+            venue_id: VenueId,
+            account_id: AccountId,
+            user: Option<String>,
+            signer: String,
+            params: impl IntoIterator<Item = AsterRequestParam>,
+        ) -> SigningResult<Self> {
+            let params = params.into_iter().collect::<Vec<_>>();
+            validate_aster_params(&params)?;
+            Ok(Self {
+                request_id,
+                policy_ref,
+                purpose,
+                venue_id,
+                account_id,
+                audit_context: SigningAuditContext::default(),
+                user: user.map(AsterAddress::new).transpose()?,
+                signer: AsterAddress::new(signer)?,
+                params,
+            })
+        }
+
+        pub fn with_audit_context(mut self, audit_context: SigningAuditContext) -> Self {
+            self.audit_context = audit_context;
+            self
+        }
+
+        pub fn request_id(&self) -> &SigningRequestId {
+            &self.request_id
+        }
+
+        pub fn policy_ref(&self) -> &SigningPolicyRef {
+            &self.policy_ref
+        }
+
+        pub fn user(&self) -> Option<&AsterAddress> {
+            self.user.as_ref()
+        }
+
+        pub fn signer(&self) -> &AsterAddress {
+            &self.signer
+        }
+
+        pub fn params(&self) -> &[AsterRequestParam] {
+            &self.params
+        }
+
+        fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
+            SigningAuditRef::new(format!(
+                "signing-audit/{}/pending",
+                self.request_id.as_str()
+            ))
+        }
+
+        fn canonical_payload(&self, nonce_micros: u64) -> String {
+            let mut pairs = Vec::new();
+            for param in &self.params {
+                let mut rendered = String::new();
+                param.push_encoded_pair(&mut rendered);
+                pairs.push(rendered);
+            }
+            if let Some(user) = &self.user {
+                pairs.push(format!(
+                    "user={}",
+                    percent_encode_component(user.expose_for_transport())
+                ));
+            }
+            pairs.push(format!("nonce={nonce_micros}"));
+            pairs.push(format!(
+                "signer={}",
+                percent_encode_component(self.signer.expose_for_transport())
+            ));
+            pairs.join("&")
+        }
+
+        fn into_signing_request(self, payload_digest: SigningPayloadDigest) -> SigningRequest {
+            SigningRequest::new(
+                self.request_id,
+                self.policy_ref,
+                self.purpose,
+                self.venue_id,
+                self.account_id,
+                payload_digest,
+            )
+            .with_audit_context(self.audit_context)
+        }
+    }
+
+    impl fmt::Debug for AsterV3SigningInput {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AsterV3SigningInput")
+                .field("request_id", &self.request_id)
+                .field("policy_ref", &self.policy_ref.redacted())
+                .field("purpose", &self.purpose)
+                .field(
+                    "venue_id",
+                    &RedactedValue::from_reference(self.venue_id.as_str()),
+                )
+                .field(
+                    "account_id",
+                    &RedactedValue::from_reference(self.account_id.as_str()),
+                )
+                .field("user", &self.user)
+                .field("signer", &self.signer)
                 .field("params", &self.params)
                 .finish()
         }
@@ -2536,6 +2915,130 @@ pub mod real {
                 .field("name", &self.name)
                 .field("value", &RedactedValue::from_reference(&self.value))
                 .finish()
+        }
+    }
+
+    /// Aster Futures V3 query/body 参数。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct AsterRequestParam {
+        name: String,
+        value: String,
+    }
+
+    impl AsterRequestParam {
+        pub fn new(name: impl Into<String>, value: impl Into<String>) -> SigningResult<Self> {
+            let name = name.into();
+            let value = value.into();
+            validate_aster_param_name(&name)?;
+            validate_aster_param_value(&value)?;
+            Ok(Self { name, value })
+        }
+
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        pub fn value_for_transport(&self) -> &str {
+            &self.value
+        }
+
+        fn push_encoded_pair(&self, output: &mut String) {
+            output.push_str(&percent_encode_component(&self.name));
+            output.push('=');
+            output.push_str(&percent_encode_component(&self.value));
+        }
+    }
+
+    impl fmt::Debug for AsterRequestParam {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AsterRequestParam")
+                .field("name", &self.name)
+                .field("value", &RedactedValue::from_reference(&self.value))
+                .finish()
+        }
+    }
+
+    /// Aster 0x 地址。
+    pub struct AsterAddress(SecretString);
+
+    impl AsterAddress {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            let value = value.into();
+            validate_aster_address(&value)?;
+            Ok(Self(SecretString::new("aster_address", value)?))
+        }
+
+        pub fn expose_for_transport(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl Clone for AsterAddress {
+        fn clone(&self) -> Self {
+            Self(
+                SecretString::new("aster_address", self.expose_for_transport().to_owned())
+                    .expect("validated Aster address clone"),
+            )
+        }
+    }
+
+    impl PartialEq for AsterAddress {
+        fn eq(&self, other: &Self) -> bool {
+            self.expose_for_transport() == other.expose_for_transport()
+        }
+    }
+
+    impl Eq for AsterAddress {}
+
+    impl fmt::Debug for AsterAddress {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_tuple("AsterAddress")
+                .field(&RedactedValue::from_reference(self.expose_for_transport()))
+                .finish()
+        }
+    }
+
+    /// Aster 外部 signer 命令。
+    pub struct AsterExternalSignerCommand(SecretString);
+
+    impl AsterExternalSignerCommand {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            let value = value.into();
+            validate_aster_external_signer_command(&value)?;
+            Ok(Self(SecretString::new(
+                "aster_external_signer_command",
+                value,
+            )?))
+        }
+
+        pub fn expose_for_exec(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for AsterExternalSignerCommand {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("AsterExternalSignerCommand(<redacted>)")
+        }
+    }
+
+    /// Aster EIP-712 signature。
+    pub struct AsterEip712Signature(SecretString);
+
+    impl AsterEip712Signature {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            let normalized = normalize_aster_signature(value.into())?;
+            Ok(Self(SecretString::new("signature", normalized)?))
+        }
+
+        pub fn as_str(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for AsterEip712Signature {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("AsterEip712Signature(<redacted>)")
         }
     }
 
@@ -3327,6 +3830,56 @@ pub mod real {
         }
     }
 
+    /// 已签名 Aster Futures V3 endpoint 传输材料。
+    ///
+    /// 中文说明：该对象包含 HTTP 发送所需的带 `nonce`、`signer` 和 `signature`
+    /// 的 query string。它不能被直接显示；`Debug` 会脱敏。
+    pub struct AsterSignedEndpoint {
+        nonce_micros: u64,
+        signed_query: SecretString,
+        signature: AsterEip712Signature,
+        request: SigningRequest,
+        success: SigningSuccess,
+    }
+
+    impl AsterSignedEndpoint {
+        pub fn signed_query_for_transport(&self) -> &str {
+            self.signed_query.expose_str()
+        }
+
+        pub fn nonce_micros(&self) -> u64 {
+            self.nonce_micros
+        }
+
+        pub fn signature(&self) -> &AsterEip712Signature {
+            &self.signature
+        }
+
+        pub fn signing_request(&self) -> &SigningRequest {
+            &self.request
+        }
+
+        pub fn signing_success(&self) -> &SigningSuccess {
+            &self.success
+        }
+
+        pub fn redacted_log_entry(&self) -> RedactedSigningLogEntry {
+            RedactedSigningLogEntry::from_success(&self.request, &self.success)
+        }
+    }
+
+    impl fmt::Debug for AsterSignedEndpoint {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AsterSignedEndpoint")
+                .field("signed_query", &"<redacted>")
+                .field("nonce_micros", &self.nonce_micros)
+                .field("signature", &"<redacted>")
+                .field("signing_request", &self.signing_request())
+                .field("signing_success", &self.signing_success())
+                .finish()
+        }
+    }
+
     struct SecretString {
         bytes: Vec<u8>,
     }
@@ -3518,6 +4071,137 @@ pub mod real {
             });
         }
         Ok(())
+    }
+
+    fn validate_aster_params(params: &[AsterRequestParam]) -> SigningResult<()> {
+        let mut names = BTreeSet::new();
+        for param in params {
+            if !names.insert(param.name.as_str()) {
+                return Err(SigningError::InvalidRequest {
+                    field: "aster_param",
+                    reason: "duplicate parameter name",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_aster_param_name(value: &str) -> SigningResult<()> {
+        if value.is_empty() {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_param_name",
+                reason: "parameter name cannot be empty",
+            });
+        }
+        if value.len() > 64 {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_param_name",
+                reason: "parameter name is too long",
+            });
+        }
+        if matches!(
+            value.to_ascii_lowercase().as_str(),
+            "signature" | "nonce" | "signer" | "user"
+        ) {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_param_name",
+                reason: "signature boundary owns signature, nonce, signer, and user parameters",
+            });
+        }
+        if looks_like_secret_label(value) {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_param_name",
+                reason: "parameter name must not look like key material",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_param_name",
+                reason: "parameter name must be ASCII letters, digits or underscore",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_aster_param_value(value: &str) -> SigningResult<()> {
+        if value.len() > 4096 {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_param_value",
+                reason: "parameter value is too long",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_param_value",
+                reason: "parameter value contains a control byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_aster_address(value: &str) -> SigningResult<()> {
+        if value.len() != 42 || !value.starts_with("0x") {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_address",
+                reason: "address must be a 42-character 0x-prefixed hex string",
+            });
+        }
+        if !value.as_bytes().iter().skip(2).all(u8::is_ascii_hexdigit) {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_address",
+                reason: "address must contain only hexadecimal characters",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_aster_external_signer_command(value: &str) -> SigningResult<()> {
+        if value.trim().is_empty() {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "command path cannot be empty",
+            });
+        }
+        if value.len() > 4096 {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "command path is too long",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "command path contains a control byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn normalize_aster_signature(value: String) -> SigningResult<String> {
+        let trimmed = value.trim();
+        let hex = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+        if hex.len() != 130 {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_signature",
+                reason: "signature must be 65 bytes encoded as 130 hexadecimal characters",
+            });
+        }
+        if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_signature",
+                reason: "signature must be hexadecimal",
+            });
+        }
+        Ok(format!("0x{}", hex.to_ascii_lowercase()))
     }
 
     fn validate_bybit_recv_window(value: u64) -> SigningResult<()> {
@@ -3732,6 +4416,51 @@ pub mod real {
 
     fn is_unreserved_percent_byte(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+    }
+
+    fn sign_aster_payload_with_external_command(
+        command: &AsterExternalSignerCommand,
+        canonical_payload: &str,
+    ) -> SigningResult<AsterEip712Signature> {
+        let mut child = Command::new(command.expose_for_exec())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "cannot start external Aster signer command",
+            })?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or(SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "external Aster signer stdin is unavailable",
+            })?
+            .write_all(canonical_payload.as_bytes())
+            .map_err(|_| SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "cannot write Aster payload to external signer",
+            })?;
+        let output = child
+            .wait_with_output()
+            .map_err(|_| SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "external Aster signer did not return a reliable result",
+            })?;
+        if !output.status.success() {
+            return Err(SigningError::InvalidRequest {
+                field: "aster_external_signer_command",
+                reason: "external Aster signer exited unsuccessfully",
+            });
+        }
+        let rendered =
+            String::from_utf8(output.stdout).map_err(|_| SigningError::InvalidRequest {
+                field: "aster_signature",
+                reason: "external Aster signer output is not valid UTF-8",
+            })?;
+        AsterEip712Signature::new(rendered)
     }
 
     fn hmac_sha256_hex(secret_key: &[u8], payload: &[u8]) -> String {
@@ -4177,6 +4906,62 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "real-signing", unix))]
+    #[test]
+    fn real_signing_build_exposes_aster_external_eip712_provider() {
+        use crate::real::{
+            AsterEip712ExternalSigningProvider, AsterRealSigningProvider, AsterRequestParam,
+            AsterV3SigningInput,
+        };
+
+        let signature = format!("0x{}", "a".repeat(130));
+        let script_path = write_aster_signer_script(&signature);
+        let policy_ref =
+            SigningPolicyRef::new("kms-policy/aster-external-unit").expect("policy ref");
+        let policy = SigningPolicy::real_signing_enabled(policy_ref.clone());
+        let input = AsterV3SigningInput::new(
+            SigningRequestId::new("signing-request/aster-eip712-unit").expect("request id"),
+            policy_ref,
+            SigningPurpose::QueryAccount,
+            VenueId::new("venue:ASTER-USDT-FUTURES").expect("venue id"),
+            AccountId::new("account/aster-readonly").expect("account id"),
+            Some("0x1111111111111111111111111111111111111111".to_owned()),
+            "0x2222222222222222222222222222222222222222".to_owned(),
+            [AsterRequestParam::new("symbol", "BTCUSDT").expect("param")],
+        )
+        .expect("aster input");
+        let signer = AsterEip712ExternalSigningProvider::new(
+            StaticAsterCommandProvider {
+                command: script_path.display().to_string(),
+            },
+            FixedNonce(1_748_310_859_508_867),
+        );
+
+        let signed = signer
+            .sign_aster_eip712_external(input, &policy)
+            .expect("external signer should sign Aster payload");
+
+        assert_eq!(signed.nonce_micros(), 1_748_310_859_508_867);
+        assert!(signed
+            .signed_query_for_transport()
+            .contains("symbol=BTCUSDT&user=0x1111111111111111111111111111111111111111&nonce=1748310859508867&signer=0x2222222222222222222222222222222222222222&signature=0x"));
+        assert_eq!(signed.signature().as_str(), signature);
+
+        let raw_query = signed.signed_query_for_transport().to_owned();
+        let raw_signature = signed.signature().as_str().to_owned();
+        let rendered_debug = format!("{signed:?}");
+        let rendered_log = signed.redacted_log_entry().to_string();
+
+        assert!(!rendered_debug.contains(&raw_query));
+        assert!(!rendered_debug.contains(&raw_signature));
+        assert!(!rendered_log.contains(&raw_query));
+        assert!(!rendered_log.contains(&raw_signature));
+        assert_eq!(
+            signed.redacted_log_entry().status(),
+            SigningAttemptStatus::Signed
+        );
+    }
+
     #[cfg(feature = "real-signing")]
     #[test]
     fn real_signing_build_exposes_bybit_hmac_provider() {
@@ -4470,6 +5255,33 @@ mod tests {
 
     #[cfg(feature = "real-signing")]
     #[derive(Clone, Copy, Debug)]
+    struct FixedNonce(u64);
+
+    #[cfg(feature = "real-signing")]
+    impl crate::real::AsterNonceProvider for FixedNonce {
+        fn nonce_micros(&self, _audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[cfg(all(feature = "real-signing", unix))]
+    #[derive(Clone, Debug)]
+    struct StaticAsterCommandProvider {
+        command: String,
+    }
+
+    #[cfg(all(feature = "real-signing", unix))]
+    impl crate::real::AsterExternalSignerCommandProvider for StaticAsterCommandProvider {
+        fn load_aster_external_signer_command(
+            &self,
+            _audit_ref: &SigningAuditRef,
+        ) -> SigningResult<crate::real::AsterExternalSignerCommand> {
+            crate::real::AsterExternalSignerCommand::new(self.command.clone())
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
+    #[derive(Clone, Copy, Debug)]
     struct GeneratedCredentialProvider {
         seed: u8,
     }
@@ -4551,6 +5363,30 @@ mod tests {
             bytes.push(ALPHABET[alphabet_index]);
         }
         String::from_utf8(bytes).expect("generated ASCII")
+    }
+
+    #[cfg(all(feature = "real-signing", unix))]
+    fn write_aster_signer_script(signature: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "arb-signing-aster-test-{}-{}",
+            std::process::id(),
+            signature.len()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let script_path = dir.join("signer.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\ncat >/dev/null\nprintf '{}'\n", signature),
+        )
+        .expect("write Aster signer script");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod signer script");
+        script_path
     }
 
     fn sample_request() -> SigningRequest {

@@ -1,0 +1,9 @@
+[package]
+name = "arb-wallet-signer"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+libsecp256k1 = "0.6.0"
+serde_json = "1.0"
+sha3 = "0.10.8"

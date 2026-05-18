@@ -289,6 +289,8 @@ pub enum PrivateOrderMarket {
     OkxSwap,
     BitgetSpot,
     BitgetUsdtFutures,
+    AsterPerp,
+    HyperliquidPerp,
 }
 
 impl PrivateOrderMarket {
@@ -302,6 +304,8 @@ impl PrivateOrderMarket {
             Self::OkxSwap => "OkxSwap",
             Self::BitgetSpot => "BitgetSpot",
             Self::BitgetUsdtFutures => "BitgetUsdtFutures",
+            Self::AsterPerp => "AsterPerp",
+            Self::HyperliquidPerp => "HyperliquidPerp",
         }
     }
 
@@ -315,6 +319,8 @@ impl PrivateOrderMarket {
             Self::OkxSwap => "okx-swap",
             Self::BitgetSpot => "bitget-spot",
             Self::BitgetUsdtFutures => "bitget-usdt-futures",
+            Self::AsterPerp => "aster-perp",
+            Self::HyperliquidPerp => "hyperliquid-perp",
         }
     }
 
@@ -328,6 +334,8 @@ impl PrivateOrderMarket {
             Self::OkxSwap => "SWAP",
             Self::BitgetSpot => "SPOT",
             Self::BitgetUsdtFutures => "USDT-FUTURES",
+            Self::AsterPerp => "USDT-FUTURES",
+            Self::HyperliquidPerp => "PERP",
         }
     }
 
@@ -337,6 +345,8 @@ impl PrivateOrderMarket {
             Self::BybitSpot | Self::BybitLinear => "BYBIT",
             Self::OkxSpot | Self::OkxSwap => "OKX",
             Self::BitgetSpot | Self::BitgetUsdtFutures => "BITGET",
+            Self::AsterPerp => "ASTER",
+            Self::HyperliquidPerp => "HYPERLIQUID",
         }
     }
 }
@@ -1679,6 +1689,8 @@ pub fn parse_binance_order_query_confirmation(
             | PrivateOrderMarket::OkxSwap
             | PrivateOrderMarket::BitgetSpot
             | PrivateOrderMarket::BitgetUsdtFutures
+            | PrivateOrderMarket::AsterPerp
+            | PrivateOrderMarket::HyperliquidPerp
     ) {
         return Err(VenueExecError::InvalidRequest {
             field: "market",
@@ -1692,6 +1704,66 @@ pub fn parse_binance_order_query_confirmation(
         account_id,
         source_event_id.into(),
         body,
+    )
+}
+
+/// 解析 Aster Futures V3 REST 查单响应。
+///
+/// 中文说明：Aster V3 的订单字段与 Binance futures 接近，但 venue family 和
+/// signer/endpoint 完全不同，因此单独标准化，避免把 Aster 私有确认误标为
+/// Binance。
+pub fn parse_aster_order_query_confirmation(
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    parse_aster_private_order_fields(
+        OrderConfirmationSource::OrderQuery,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        body,
+    )
+}
+
+/// 解析 Hyperliquid `info` / `orderStatus` 查单响应。
+pub fn parse_hyperliquid_order_query_confirmation(
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: impl Into<String>,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    let root_status = required_json_field(body, "status")?;
+    if root_status == "unknownOid" {
+        return Err(VenueExecError::UnknownExternalState {
+            venue_id,
+            detail: "Hyperliquid orderStatus returned unknownOid".to_owned(),
+        });
+    }
+    if root_status != "order" {
+        return Err(VenueExecError::InvalidRequest {
+            field: "status",
+            reason: "Hyperliquid orderStatus response must have status=order",
+        });
+    }
+    let wrapper = json_object_field(body, "order").ok_or(VenueExecError::InvalidRequest {
+        field: "order",
+        reason: "Hyperliquid orderStatus response lacks order wrapper",
+    })?;
+    let order = json_object_field(wrapper, "order").ok_or(VenueExecError::InvalidRequest {
+        field: "order.order",
+        reason: "Hyperliquid orderStatus response lacks order payload",
+    })?;
+    let status_text = required_json_field(wrapper, "status")?;
+    parse_hyperliquid_private_order_fields(
+        OrderConfirmationSource::OrderQuery,
+        venue_id,
+        account_id,
+        source_event_id.into(),
+        order,
+        &status_text,
+        json_field_value(wrapper, "statusTimestamp").as_deref(),
     )
 }
 
@@ -2031,6 +2103,130 @@ fn parse_binance_private_order_fields(
         cumulative_filled_quantity,
         last_fill,
     })
+}
+
+fn parse_aster_private_order_fields(
+    source: OrderConfirmationSource,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: String,
+    body: &str,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_token("source_event_id", &source_event_id)?;
+    let symbol = required_json_field(body, "symbol")?;
+    validate_binance_private_symbol(&symbol)?;
+    let status_text = required_json_field(body, "status")?;
+    let status = binance_order_confirmation_status(&status_text);
+    let event_time = aster_event_time(body)?;
+    let exchange_order_id = json_field_value(body, "orderId");
+    let venue_order_id = exchange_order_id
+        .as_ref()
+        .map(|order_id| ExternalOrderId::new(format!("aster-perp:order:{order_id}")))
+        .transpose()?;
+    let client_order_id = json_field_value(body, "clientOrderId")
+        .filter(|value| !value.is_empty())
+        .map(OrderId::new)
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let side = json_field_value(body, "side")
+        .map(|side| binance_private_side(&side))
+        .transpose()?;
+    let cumulative_filled_quantity = json_field_value(body, "executedQty")
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_quantity("cumulative_filled_quantity", &value))
+        .transpose()?;
+    let instrument_id = InstrumentId::new(format!("inst:ASTER:{symbol}:USDT-FUTURES"))
+        .map_err(domain_invalid_request)?;
+    let last_fill = parse_binance_private_fill(
+        source,
+        &source_event_id,
+        &event_time,
+        body,
+        cumulative_filled_quantity,
+    )?;
+
+    Ok(PrivateOrderUpdate {
+        source,
+        market: PrivateOrderMarket::AsterPerp,
+        venue_id,
+        account_id,
+        instrument_id,
+        symbol,
+        source_event_id,
+        event_time,
+        status,
+        execution_type: json_field_value(body, "origType")
+            .or_else(|| json_field_value(body, "type")),
+        side,
+        venue_order_id,
+        exchange_order_id,
+        client_order_id,
+        cumulative_filled_quantity,
+        last_fill,
+    })
+}
+
+fn parse_hyperliquid_private_order_fields(
+    source: OrderConfirmationSource,
+    venue_id: VenueId,
+    account_id: AccountId,
+    source_event_id: String,
+    body: &str,
+    status_text: &str,
+    fallback_time_ms: Option<&str>,
+) -> VenueExecResult<PrivateOrderUpdate> {
+    validate_token("source_event_id", &source_event_id)?;
+    let coin = required_json_field(body, "coin")?;
+    validate_hyperliquid_coin(&coin)?;
+    let status = hyperliquid_order_confirmation_status(status_text);
+    let event_time = hyperliquid_event_time(body, fallback_time_ms)?;
+    let exchange_order_id = json_field_value(body, "oid");
+    let venue_order_id = exchange_order_id
+        .as_ref()
+        .map(|order_id| ExternalOrderId::new(format!("hyperliquid-perp:order:{order_id}")))
+        .transpose()?;
+    let client_order_id = json_field_value(body, "cloid")
+        .filter(|value| !value.is_empty() && value != "null")
+        .map(OrderId::new)
+        .transpose()
+        .map_err(domain_invalid_request)?;
+    let side = json_field_value(body, "side")
+        .map(|side| hyperliquid_private_side(&side))
+        .transpose()?;
+    let cumulative_filled_quantity = json_field_value(body, "origSz")
+        .filter(|_| status == OrderConfirmationStatus::Filled)
+        .map(|value| parse_quantity("cumulative_filled_quantity", &value))
+        .transpose()?;
+    let runtime_symbol = hyperliquid_runtime_symbol_from_coin(&coin);
+    let instrument_id = InstrumentId::new(format!("inst:HYPERLIQUID:{runtime_symbol}:PERP"))
+        .map_err(domain_invalid_request)?;
+
+    Ok(PrivateOrderUpdate {
+        source,
+        market: PrivateOrderMarket::HyperliquidPerp,
+        venue_id,
+        account_id,
+        instrument_id,
+        symbol: runtime_symbol,
+        source_event_id,
+        event_time,
+        status,
+        execution_type: json_field_value(body, "orderType"),
+        side,
+        venue_order_id,
+        exchange_order_id,
+        client_order_id,
+        cumulative_filled_quantity,
+        last_fill: None,
+    })
+}
+
+fn hyperliquid_runtime_symbol_from_coin(coin: &str) -> String {
+    if coin.ends_with("USDT") {
+        coin.to_owned()
+    } else {
+        format!("{coin}USDT")
+    }
 }
 
 fn parse_bybit_private_order_fields(
@@ -2499,10 +2695,7 @@ fn required_json_field(body: &str, field: &'static str) -> VenueExecResult<Strin
 }
 
 fn json_field_value(body: &str, field: &str) -> Option<String> {
-    let pattern = format!("\"{field}\"");
-    let mut rest = body.get(body.find(&pattern)? + pattern.len()..)?;
-    rest = rest.trim_start();
-    rest = rest.strip_prefix(':')?.trim_start();
+    let rest = json_field_tail(body, field)?;
     if let Some(after_quote) = rest.strip_prefix('"') {
         let end = after_quote.find('"')?;
         return Some(after_quote[..end].to_owned());
@@ -2518,11 +2711,22 @@ fn json_field_value(body: &str, field: &str) -> Option<String> {
     }
 }
 
-fn json_object_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
+fn json_field_tail<'a>(body: &'a str, field: &str) -> Option<&'a str> {
     let pattern = format!("\"{field}\"");
-    let mut rest = body.get(body.find(&pattern)? + pattern.len()..)?;
-    rest = rest.trim_start();
-    rest = rest.strip_prefix(':')?.trim_start();
+    let mut rest = body;
+    loop {
+        let index = rest.find(&pattern)?;
+        let after_name = rest.get(index + pattern.len()..)?;
+        let after_ws = after_name.trim_start();
+        if let Some(value) = after_ws.strip_prefix(':') {
+            return Some(value.trim_start());
+        }
+        rest = after_name;
+    }
+}
+
+fn json_object_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
+    let rest = json_field_tail(body, field)?;
     let start = rest.find('{')?;
     let bytes = rest.as_bytes();
     let mut depth = 0i32;
@@ -2556,10 +2760,7 @@ fn json_object_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
 }
 
 fn json_array_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
-    let pattern = format!("\"{field}\"");
-    let mut rest = body.get(body.find(&pattern)? + pattern.len()..)?;
-    rest = rest.trim_start();
-    rest = rest.strip_prefix(':')?.trim_start();
+    let rest = json_field_tail(body, field)?;
     let start = rest.find('[')?;
     let bytes = rest.as_bytes();
     let mut depth = 0i32;
@@ -2632,6 +2833,26 @@ fn binance_event_time(body: &str) -> VenueExecResult<String> {
         .ok_or(VenueExecError::InvalidRequest {
             field: "event_time",
             reason: "Binance private order update lacks event time",
+        })?;
+    binance_millis_to_utc(&millis)
+}
+
+fn aster_event_time(body: &str) -> VenueExecResult<String> {
+    let millis = json_field_value(body, "updateTime")
+        .or_else(|| json_field_value(body, "time"))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "event_time",
+            reason: "Aster private order update lacks event time",
+        })?;
+    binance_millis_to_utc(&millis)
+}
+
+fn hyperliquid_event_time(body: &str, fallback_time_ms: Option<&str>) -> VenueExecResult<String> {
+    let millis = json_field_value(body, "timestamp")
+        .or_else(|| fallback_time_ms.map(str::to_owned))
+        .ok_or(VenueExecError::InvalidRequest {
+            field: "event_time",
+            reason: "Hyperliquid private order update lacks event time",
         })?;
     binance_millis_to_utc(&millis)
 }
@@ -2745,6 +2966,40 @@ fn binance_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
     }
 }
 
+fn hyperliquid_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
+    match value {
+        "open" | "triggered" => OrderConfirmationStatus::Acknowledged,
+        "filled" => OrderConfirmationStatus::Filled,
+        "canceled"
+        | "marginCanceled"
+        | "vaultWithdrawalCanceled"
+        | "openInterestCapCanceled"
+        | "selfTradeCanceled"
+        | "reduceOnlyCanceled"
+        | "siblingFilledCanceled"
+        | "delistedCanceled"
+        | "liquidatedCanceled"
+        | "scheduledCancel" => OrderConfirmationStatus::Cancelled,
+        "rejected"
+        | "tickRejected"
+        | "minTradeNtlRejected"
+        | "perpMarginRejected"
+        | "reduceOnlyRejected"
+        | "badAloPxRejected"
+        | "iocCancelRejected"
+        | "badTriggerPxRejected"
+        | "marketOrderNoLiquidityRejected"
+        | "positionIncreaseAtOpenInterestCapRejected"
+        | "positionFlipAtOpenInterestCapRejected"
+        | "tooAggressiveAtOpenInterestCapRejected"
+        | "openInterestIncreaseRejected"
+        | "insufficientSpotBalanceRejected"
+        | "oracleRejected"
+        | "perpMaxPositionRejected" => OrderConfirmationStatus::Rejected,
+        _ => OrderConfirmationStatus::Unknown,
+    }
+}
+
 fn okx_order_confirmation_status(value: &str) -> OrderConfirmationStatus {
     match value {
         "live" | "effective" => OrderConfirmationStatus::Acknowledged,
@@ -2808,6 +3063,17 @@ fn binance_private_side(value: &str) -> VenueExecResult<OrderSide> {
         _ => Err(VenueExecError::InvalidRequest {
             field: "side",
             reason: "Binance order side must be BUY or SELL",
+        }),
+    }
+}
+
+fn hyperliquid_private_side(value: &str) -> VenueExecResult<OrderSide> {
+    match value {
+        "B" | "buy" | "Buy" => Ok(OrderSide::Buy),
+        "A" | "sell" | "Sell" => Ok(OrderSide::Sell),
+        _ => Err(VenueExecError::InvalidRequest {
+            field: "side",
+            reason: "Hyperliquid order side must be B/buy or A/sell",
         }),
     }
 }
@@ -2943,7 +3209,9 @@ fn validate_bybit_order_category(
             | PrivateOrderMarket::OkxSpot
             | PrivateOrderMarket::OkxSwap
             | PrivateOrderMarket::BitgetSpot
-            | PrivateOrderMarket::BitgetUsdtFutures,
+            | PrivateOrderMarket::BitgetUsdtFutures
+            | PrivateOrderMarket::AsterPerp
+            | PrivateOrderMarket::HyperliquidPerp,
             _,
         ) => Err(VenueExecError::InvalidRequest {
             field: "market",
@@ -2980,6 +3248,25 @@ fn validate_bybit_private_symbol(value: &str) -> VenueExecResult<()> {
         return Err(VenueExecError::InvalidRequest {
             field: "symbol",
             reason: "Bybit symbol must use uppercase ASCII letters and digits",
+        });
+    }
+    Ok(())
+}
+
+fn validate_hyperliquid_coin(value: &str) -> VenueExecResult<()> {
+    if value.is_empty() || value.len() > 64 {
+        return Err(VenueExecError::InvalidRequest {
+            field: "coin",
+            reason: "Hyperliquid coin must be 1 to 64 bytes",
+        });
+    }
+    if value
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'/')))
+    {
+        return Err(VenueExecError::InvalidRequest {
+            field: "coin",
+            reason: "Hyperliquid coin contains an unsupported byte",
         });
     }
     Ok(())
@@ -3189,20 +3476,23 @@ pub mod live {
     use std::fmt;
     use std::io::Write;
     use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use arb_domain::{AccountId, InstrumentId, OrderId, VenueId};
     use arb_signing::real::{
+        AsterRealSigningProvider, AsterRequestParam, AsterSignedEndpoint, AsterV3SigningInput,
         BinanceHmacSigningInput, BinanceRequestParam, BinanceSignedEndpoint,
         BitgetHmacSigningInput, BitgetRealSigningProvider, BitgetRestMethod, BitgetSignedEndpoint,
         BybitHmacSigningInput, BybitRealSigningProvider, BybitSignedEndpoint,
         BybitSigningPayloadKind, OkxHmacSigningInput, OkxRealSigningProvider, OkxRestMethod,
         OkxSignedEndpoint, RealSigningProvider,
     };
-    use arb_signing::{SigningPolicy, SigningPurpose, SigningRequestId};
+    use arb_signing::{SigningPolicy, SigningPolicyMode, SigningPurpose, SigningRequestId};
 
     use super::{
-        parse_binance_order_query_confirmation, parse_bitget_order_query_confirmation,
-        parse_bybit_order_query_confirmation, parse_okx_order_query_confirmation,
+        parse_aster_order_query_confirmation, parse_binance_order_query_confirmation,
+        parse_bitget_order_query_confirmation, parse_bybit_order_query_confirmation,
+        parse_hyperliquid_order_query_confirmation, parse_okx_order_query_confirmation,
         unknown_status_report, CancelOrder, CancelOrderRequest, ConfirmOrderStatus,
         ConfirmOrderStatusRequest, ExternalActionRef, ExternalOrderId, IdempotencyKey,
         MutableActionId, MutableActionKind, MutableActionReceipt, MutableActionStatus,
@@ -4644,6 +4934,2143 @@ pub mod live {
             BinanceExecMarket::UsdmFutures => "venue:BINANCE-USDM",
         };
         VenueId::new(value).expect("static Binance transport venue ID")
+    }
+
+    /// Aster Futures V3 下单、撤单和查单 endpoint。
+    pub const ASTER_FUTURES_V3_ORDER_ENDPOINT: &str = "/fapi/v3/order";
+    /// 默认 Aster Futures V3 REST base URL。
+    pub const ASTER_FUTURES_V3_BASE_URL: &str = "https://fapi3.asterdex.com";
+    const CURL_ASTER_STATUS_MARKER: &str = "\n__ARB_ASTER_HTTP_STATUS__:";
+
+    /// Aster signed REST HTTP 方法。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum AsterExecHttpMethod {
+        Get,
+        Post,
+        Delete,
+    }
+
+    impl AsterExecHttpMethod {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Get => "GET",
+                Self::Post => "POST",
+                Self::Delete => "DELETE",
+            }
+        }
+    }
+
+    impl fmt::Display for AsterExecHttpMethod {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    /// Aster Futures V3 执行适配器配置。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct AsterExecConfig {
+        venue_id: VenueId,
+        account_id: AccountId,
+        base_url: String,
+        user: Option<String>,
+        signer: String,
+        signing_policy: SigningPolicy,
+    }
+
+    impl AsterExecConfig {
+        pub fn perp(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            user: Option<String>,
+            signer: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            let signer = signer.into();
+            validate_ethereum_address_text("aster_signer", &signer)?;
+            if let Some(user) = &user {
+                validate_ethereum_address_text("aster_user", user)?;
+            }
+            Ok(Self {
+                venue_id,
+                account_id,
+                base_url: normalize_aster_base_url(base_url.into())?,
+                user,
+                signer,
+                signing_policy,
+            })
+        }
+
+        pub fn venue_id(&self) -> &VenueId {
+            &self.venue_id
+        }
+
+        pub fn account_id(&self) -> &AccountId {
+            &self.account_id
+        }
+
+        pub fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        pub fn user(&self) -> Option<&str> {
+            self.user.as_deref()
+        }
+
+        pub fn signer(&self) -> &str {
+            &self.signer
+        }
+
+        pub fn signing_policy(&self) -> &SigningPolicy {
+            &self.signing_policy
+        }
+    }
+
+    pub struct AsterSignedRequest<'a> {
+        method: AsterExecHttpMethod,
+        base_url: &'a str,
+        endpoint: &'static str,
+        signed_endpoint: &'a AsterSignedEndpoint,
+    }
+
+    impl AsterSignedRequest<'_> {
+        pub fn method(&self) -> AsterExecHttpMethod {
+            self.method
+        }
+
+        pub fn base_url(&self) -> &str {
+            self.base_url
+        }
+
+        pub fn endpoint(&self) -> &'static str {
+            self.endpoint
+        }
+
+        pub fn signed_query_for_transport(&self) -> &str {
+            self.signed_endpoint.signed_query_for_transport()
+        }
+    }
+
+    impl fmt::Debug for AsterSignedRequest<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AsterSignedRequest")
+                .field("method", &self.method)
+                .field("base_url", &self.base_url)
+                .field("endpoint", &self.endpoint)
+                .field("signed_query", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Aster transport 返回。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct AsterExecHttpResponse {
+        status_code: u16,
+        body: String,
+    }
+
+    impl AsterExecHttpResponse {
+        pub fn new(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+            }
+        }
+
+        pub fn status_code(&self) -> u16 {
+            self.status_code
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        pub fn is_success(&self) -> bool {
+            (200..=299).contains(&self.status_code)
+        }
+    }
+
+    pub trait AsterExecTransport {
+        fn send_signed(
+            &mut self,
+            request: AsterSignedRequest<'_>,
+        ) -> VenueExecResult<AsterExecHttpResponse>;
+    }
+
+    /// 使用系统 `curl` 发送 Aster signed REST 请求的真实 transport。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct AsterCurlExecTransport {
+        connect_timeout_secs: u64,
+        max_time_secs: u64,
+    }
+
+    impl AsterCurlExecTransport {
+        pub fn new(connect_timeout_secs: u64, max_time_secs: u64) -> VenueExecResult<Self> {
+            if connect_timeout_secs == 0 || max_time_secs == 0 {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "curl_timeout",
+                    reason: "curl timeouts must be greater than zero",
+                });
+            }
+            Ok(Self {
+                connect_timeout_secs,
+                max_time_secs,
+            })
+        }
+    }
+
+    impl Default for AsterCurlExecTransport {
+        fn default() -> Self {
+            Self {
+                connect_timeout_secs: 10,
+                max_time_secs: 30,
+            }
+        }
+    }
+
+    impl AsterExecTransport for AsterCurlExecTransport {
+        fn send_signed(
+            &mut self,
+            request: AsterSignedRequest<'_>,
+        ) -> VenueExecResult<AsterExecHttpResponse> {
+            let url = aster_signed_request_url(&request)?;
+            let config = format!("url = \"{}\"\n", curl_config_quote(&url)?);
+            let mut child = Command::new("curl")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--request")
+                .arg(request.method().as_str())
+                .arg("--connect-timeout")
+                .arg(self.connect_timeout_secs.to_string())
+                .arg("--max-time")
+                .arg(self.max_time_secs.to_string())
+                .arg("--write-out")
+                .arg(format!("{CURL_ASTER_STATUS_MARKER}%{{http_code}}"))
+                .arg("--config")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: aster_transport_venue_id(),
+                    detail: "failed to start curl for Aster signed REST request".to_owned(),
+                })?;
+
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| VenueExecError::UnknownExternalState {
+                    venue_id: aster_transport_venue_id(),
+                    detail: "curl stdin is unavailable for Aster signed REST request".to_owned(),
+                })?
+                .write_all(config.as_bytes())
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: aster_transport_venue_id(),
+                    detail: "failed to write curl config for Aster signed REST request".to_owned(),
+                })?;
+
+            let output =
+                child
+                    .wait_with_output()
+                    .map_err(|_| VenueExecError::UnknownExternalState {
+                        venue_id: aster_transport_venue_id(),
+                        detail: "curl transport did not return an Aster signed REST response"
+                            .to_owned(),
+                    })?;
+            if !output.status.success() {
+                return Err(VenueExecError::UnknownExternalState {
+                    venue_id: aster_transport_venue_id(),
+                    detail: "curl transport failed before a reliable HTTP response was available"
+                        .to_owned(),
+                });
+            }
+            parse_aster_curl_http_response(&output.stdout)
+        }
+    }
+
+    /// Aster perp 可变执行适配器。
+    pub struct AsterPerpExecAdapter<S, T> {
+        inner: AsterExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> AsterPerpExecAdapter<S, T> {
+        pub fn new(config: AsterExecConfig, signer: S, transport: T) -> VenueExecResult<Self> {
+            Ok(Self {
+                inner: AsterExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &AsterExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for AsterPerpExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AsterPerpExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    impl<S, T> SubmitOrder for AsterPerpExecAdapter<S, T>
+    where
+        S: AsterRealSigningProvider,
+        T: AsterExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.submit_order(request)
+        }
+    }
+
+    impl<S, T> CancelOrder for AsterPerpExecAdapter<S, T>
+    where
+        S: AsterRealSigningProvider,
+        T: AsterExecTransport,
+    {
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.cancel_order(request)
+        }
+    }
+
+    impl<S, T> QueryActionStatus for AsterPerpExecAdapter<S, T>
+    where
+        S: AsterRealSigningProvider,
+        T: AsterExecTransport,
+    {
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            self.inner.query_action_status(request)
+        }
+    }
+
+    impl<S, T> ConfirmOrderStatus for AsterPerpExecAdapter<S, T>
+    where
+        S: AsterRealSigningProvider,
+        T: AsterExecTransport,
+    {
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.inner.confirm_order_status(request)
+        }
+    }
+
+    impl<S, T> RequestTransfer for AsterPerpExecAdapter<S, T>
+    where
+        S: AsterRealSigningProvider,
+        T: AsterExecTransport,
+    {
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.request_transfer(request)
+        }
+    }
+
+    #[derive(Debug)]
+    struct AsterExecAdapterCore<S, T> {
+        config: AsterExecConfig,
+        signer: S,
+        transport: T,
+        records_by_key: BTreeMap<IdempotencyKey, LiveActionRecord>,
+        key_by_action_id: BTreeMap<MutableActionId, IdempotencyKey>,
+        orders_by_client_id: BTreeMap<OrderId, AsterKnownOrder>,
+        orders_by_external_id: BTreeMap<ExternalOrderId, AsterKnownOrder>,
+        next_sequence: u64,
+    }
+
+    impl<S, T> AsterExecAdapterCore<S, T> {
+        fn new(config: AsterExecConfig, signer: S, transport: T) -> Self {
+            Self {
+                config,
+                signer,
+                transport,
+                records_by_key: BTreeMap::new(),
+                key_by_action_id: BTreeMap::new(),
+                orders_by_client_id: BTreeMap::new(),
+                orders_by_external_id: BTreeMap::new(),
+                next_sequence: 0,
+            }
+        }
+
+        fn config(&self) -> &AsterExecConfig {
+            &self.config
+        }
+
+        fn transport(&self) -> &T {
+            &self.transport
+        }
+
+        fn transport_mut(&mut self) -> &mut T {
+            &mut self.transport
+        }
+
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            Ok(match request {
+                QueryActionStatusRequest::ByActionId(action_id) => {
+                    if let Some(key) = self.key_by_action_id.get(&action_id) {
+                        self.report_for_key(key)
+                    } else {
+                        unknown_status_report(Some(action_id), None)
+                    }
+                }
+                QueryActionStatusRequest::ByIdempotencyKey(key) => self.report_for_key(&key),
+            })
+        }
+
+        fn report_for_key(&self, key: &IdempotencyKey) -> MutableActionStatusReport {
+            self.records_by_key.get(key).map_or_else(
+                || unknown_status_report(None, Some(key.clone())),
+                |record| super::status_report_from_receipt(&record.receipt),
+            )
+        }
+
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.from_account_id)?;
+            Err(VenueExecError::InvalidRequest {
+                field: "transfer",
+                reason: "Aster live transfer is not implemented by this execution adapter",
+            })
+        }
+
+        fn ensure_request_scope(
+            &self,
+            venue_id: &VenueId,
+            account_id: &AccountId,
+        ) -> VenueExecResult<()> {
+            if venue_id != &self.config.venue_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "venue_id",
+                    reason: "request venue does not match Aster execution adapter config",
+                });
+            }
+            if account_id != &self.config.account_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "account_id",
+                    reason: "request account does not match Aster execution adapter config",
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl<S, T> AsterExecAdapterCore<S, T>
+    where
+        S: AsterRealSigningProvider,
+        T: AsterExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            request.validate()?;
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+            let symbol = aster_symbol_from_instrument(&request.instrument_id)?;
+            let params = aster_submit_order_params(&symbol, &request)?;
+            let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
+            let signed = self.sign(SigningPurpose::SubmitOrder, &action_id, params)?;
+            let response = self.dispatch_signed(
+                AsterExecHttpMethod::Post,
+                ASTER_FUTURES_V3_ORDER_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_success(ASTER_FUTURES_V3_ORDER_ENDPOINT, &response)?;
+            let known_order = aster_known_order_from_response(
+                &symbol,
+                request.client_order_id.clone(),
+                response.body(),
+                &action_id,
+            )?;
+            let external_ref = known_order
+                .external_order_id
+                .clone()
+                .map(ExternalActionRef::Order);
+            let receipt = MutableActionReceipt {
+                action_id,
+                kind: MutableActionKind::SubmitOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref,
+                duplicate: false,
+                simulated: false,
+            };
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            self.record_known_order(known_order);
+            Ok(receipt)
+        }
+
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+            let known_order =
+                self.lookup_known_order(&request.order_ref)
+                    .ok_or(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "Aster cancel requires an order previously submitted through this adapter so its symbol is known",
+                    })?;
+            let params = aster_cancel_order_params(&request.order_ref, known_order)?;
+            let action_id = self.next_action_id(MutableActionKind::CancelOrder)?;
+            let signed = self.sign(SigningPurpose::CancelOrder, &action_id, params)?;
+            let response = self.dispatch_signed(
+                AsterExecHttpMethod::Delete,
+                ASTER_FUTURES_V3_ORDER_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_success(ASTER_FUTURES_V3_ORDER_ENDPOINT, &response)?;
+            let receipt = MutableActionReceipt {
+                action_id: action_id.clone(),
+                kind: MutableActionKind::CancelOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref: Some(ExternalActionRef::Cancel(action_id)),
+                duplicate: false,
+                simulated: false,
+            };
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            Ok(receipt)
+        }
+
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let symbol = aster_symbol_from_instrument(&request.instrument_id)?;
+            let params = aster_query_order_params(&symbol, &request.order_ref)?;
+            let signing_request_id = SigningRequestId::new(format!(
+                "signing-request/aster-exec/query-order/{}",
+                request.source_event_id
+            ))
+            .map_err(signing_error)?;
+            let signed =
+                self.sign_with_request_id(SigningPurpose::QueryOrder, signing_request_id, params)?;
+            let response = self.dispatch_signed(
+                AsterExecHttpMethod::Get,
+                ASTER_FUTURES_V3_ORDER_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_success(ASTER_FUTURES_V3_ORDER_ENDPOINT, &response)?;
+            parse_aster_order_query_confirmation(
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                request.source_event_id,
+                response.body(),
+            )
+        }
+
+        fn duplicate_receipt(
+            &self,
+            idempotency_key: &IdempotencyKey,
+            fingerprint: &RequestFingerprint,
+        ) -> VenueExecResult<Option<MutableActionReceipt>> {
+            let Some(existing) = self.records_by_key.get(idempotency_key) else {
+                return Ok(None);
+            };
+            if existing.fingerprint != *fingerprint {
+                return Err(VenueExecError::IdempotencyConflict {
+                    idempotency_key: idempotency_key.clone(),
+                    existing_fingerprint: existing.fingerprint.0.clone(),
+                    incoming_fingerprint: fingerprint.0.clone(),
+                });
+            }
+            let mut receipt = existing.receipt.clone();
+            receipt.duplicate = true;
+            Ok(Some(receipt))
+        }
+
+        fn next_action_id(&mut self, kind: MutableActionKind) -> VenueExecResult<MutableActionId> {
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("Aster mutable action sequence overflowed");
+            MutableActionId::new(format!(
+                "aster:perp:{}:{}",
+                kind.as_str(),
+                self.next_sequence
+            ))
+        }
+
+        fn sign(
+            &self,
+            purpose: SigningPurpose,
+            action_id: &MutableActionId,
+            params: Vec<AsterRequestParam>,
+        ) -> VenueExecResult<AsterSignedEndpoint> {
+            self.sign_with_request_id(
+                purpose,
+                SigningRequestId::new(format!("signing-request/aster-exec/{}", action_id.as_str()))
+                    .map_err(signing_error)?,
+                params,
+            )
+        }
+
+        fn sign_with_request_id(
+            &self,
+            purpose: SigningPurpose,
+            signing_request_id: SigningRequestId,
+            params: Vec<AsterRequestParam>,
+        ) -> VenueExecResult<AsterSignedEndpoint> {
+            let input = AsterV3SigningInput::new(
+                signing_request_id,
+                self.config.signing_policy.policy_ref().clone(),
+                purpose,
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                self.config.user.clone(),
+                self.config.signer.clone(),
+                params,
+            )
+            .map_err(signing_error)?;
+            self.signer
+                .sign_aster_eip712_external(input, &self.config.signing_policy)
+                .map_err(signing_error)
+        }
+
+        fn dispatch_signed(
+            &mut self,
+            method: AsterExecHttpMethod,
+            endpoint: &'static str,
+            signed_endpoint: &AsterSignedEndpoint,
+        ) -> VenueExecResult<AsterExecHttpResponse> {
+            self.transport.send_signed(AsterSignedRequest {
+                method,
+                base_url: &self.config.base_url,
+                endpoint,
+                signed_endpoint,
+            })
+        }
+
+        fn ensure_success(
+            &self,
+            endpoint: &'static str,
+            response: &AsterExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            if response.is_success() {
+                return Ok(());
+            }
+            Err(VenueExecError::ExternalRejected {
+                venue_id: self.config.venue_id.clone(),
+                endpoint: endpoint.to_owned(),
+                status_code: response.status_code(),
+                reason: response_body_snippet(response.body()),
+            })
+        }
+
+        fn record_action(
+            &mut self,
+            idempotency_key: IdempotencyKey,
+            fingerprint: RequestFingerprint,
+            receipt: MutableActionReceipt,
+        ) {
+            self.key_by_action_id
+                .insert(receipt.action_id.clone(), idempotency_key.clone());
+            self.records_by_key.insert(
+                idempotency_key,
+                LiveActionRecord {
+                    fingerprint,
+                    receipt,
+                },
+            );
+        }
+
+        fn record_known_order(&mut self, known_order: AsterKnownOrder) {
+            if let Some(client_order_id) = known_order.client_order_id.clone() {
+                self.orders_by_client_id
+                    .insert(client_order_id, known_order.clone());
+            }
+            if let Some(external_order_id) = known_order.external_order_id.clone() {
+                self.orders_by_external_id
+                    .insert(external_order_id, known_order);
+            }
+        }
+
+        fn lookup_known_order(&self, order_ref: &OrderReference) -> Option<&AsterKnownOrder> {
+            match order_ref {
+                OrderReference::ClientOrderId(order_id) => self.orders_by_client_id.get(order_id),
+                OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct AsterKnownOrder {
+        symbol: String,
+        order_id_param: Option<String>,
+        client_order_id: Option<OrderId>,
+        external_order_id: Option<ExternalOrderId>,
+    }
+
+    fn normalize_aster_base_url(value: String) -> VenueExecResult<String> {
+        let trimmed = value.trim().trim_end_matches('/').to_owned();
+        if trimmed.is_empty() {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Aster base URL cannot be empty",
+            });
+        }
+        if trimmed
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Aster base URL contains a control byte",
+            });
+        }
+        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://127.0.0.1")) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Aster base URL must use https or an explicit localhost test URL",
+            });
+        }
+        Ok(trimmed)
+    }
+
+    fn aster_submit_order_params(
+        symbol: &str,
+        request: &SubmitOrderRequest,
+    ) -> VenueExecResult<Vec<AsterRequestParam>> {
+        let mut params = vec![
+            aster_param("symbol", symbol)?,
+            aster_param("side", binance_side(request.side))?,
+        ];
+        match request.order_type {
+            MutableOrderType::Market => {
+                params.push(aster_param("type", "MARKET")?);
+                params.push(aster_param("quantity", request.quantity.to_string())?);
+            }
+            MutableOrderType::Limit => {
+                params.push(aster_param("type", "LIMIT")?);
+                params.push(aster_param(
+                    "timeInForce",
+                    binance_time_in_force(limit_time_in_force(request)),
+                )?);
+                params.push(aster_param("quantity", request.quantity.to_string())?);
+                params.push(aster_param(
+                    "price",
+                    request
+                        .limit_price
+                        .expect("validated limit order price")
+                        .to_string(),
+                )?);
+            }
+            MutableOrderType::PostOnly => {
+                params.push(aster_param("type", "LIMIT")?);
+                params.push(aster_param("timeInForce", "GTX")?);
+                params.push(aster_param("quantity", request.quantity.to_string())?);
+                params.push(aster_param(
+                    "price",
+                    request
+                        .limit_price
+                        .expect("validated post-only order price")
+                        .to_string(),
+                )?);
+            }
+        }
+        if request.reduce_only {
+            params.push(aster_param("reduceOnly", "true")?);
+        }
+        if let Some(client_order_id) = &request.client_order_id {
+            validate_aster_client_order_id(client_order_id.as_str())?;
+            params.push(aster_param("newClientOrderId", client_order_id.as_str())?);
+        }
+        Ok(params)
+    }
+
+    fn aster_cancel_order_params(
+        order_ref: &OrderReference,
+        known_order: &AsterKnownOrder,
+    ) -> VenueExecResult<Vec<AsterRequestParam>> {
+        let mut params = vec![aster_param("symbol", known_order.symbol.as_str())?];
+        match order_ref {
+            OrderReference::VenueOrderId(_) => {
+                if let Some(order_id) = &known_order.order_id_param {
+                    params.push(aster_param("orderId", order_id.as_str())?);
+                } else if let Some(client_order_id) = &known_order.client_order_id {
+                    params.push(aster_param("origClientOrderId", client_order_id.as_str())?);
+                } else {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "known Aster venue order lacks orderId and client order ID",
+                    });
+                }
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                params.push(aster_param("origClientOrderId", client_order_id.as_str())?);
+            }
+        }
+        Ok(params)
+    }
+
+    fn aster_query_order_params(
+        symbol: &str,
+        order_ref: &OrderReference,
+    ) -> VenueExecResult<Vec<AsterRequestParam>> {
+        let mut params = vec![aster_param("symbol", symbol)?];
+        match order_ref {
+            OrderReference::VenueOrderId(order_id) => {
+                params.push(aster_param(
+                    "orderId",
+                    aster_order_id_param_from_external(order_id)?,
+                )?);
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                params.push(aster_param("origClientOrderId", client_order_id.as_str())?);
+            }
+        }
+        Ok(params)
+    }
+
+    fn aster_order_id_param_from_external(order_id: &ExternalOrderId) -> VenueExecResult<&str> {
+        let value = order_id.as_str();
+        let Some(raw_order_id) = value.strip_prefix("aster-perp:order:") else {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Aster venue order ref must come from the Aster perp adapter",
+            });
+        };
+        if raw_order_id.is_empty() || raw_order_id.bytes().any(|byte| !byte.is_ascii_digit()) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_ref",
+                reason: "Aster venue order ref lacks numeric orderId",
+            });
+        }
+        Ok(raw_order_id)
+    }
+
+    fn aster_symbol_from_instrument(instrument_id: &InstrumentId) -> VenueExecResult<String> {
+        let value = instrument_id.as_str();
+        let mut parts = value.split(':');
+        let prefix = parts.next();
+        let venue = parts.next();
+        let symbol = parts.next();
+        let suffix = parts.next();
+        if parts.next().is_some()
+            || prefix != Some("inst")
+            || venue != Some("ASTER")
+            || suffix != Some("USDT-FUTURES")
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "instrument_id",
+                reason: "Aster execution requires instrument IDs shaped as inst:ASTER:<SYMBOL>:USDT-FUTURES",
+            });
+        }
+        let symbol = symbol.expect("symbol checked above");
+        validate_binance_symbol(symbol)?;
+        Ok(symbol.to_owned())
+    }
+
+    fn validate_aster_client_order_id(value: &str) -> VenueExecResult<()> {
+        validate_binance_client_order_id(value)
+    }
+
+    fn aster_known_order_from_response(
+        symbol: &str,
+        client_order_id: Option<OrderId>,
+        body: &str,
+        action_id: &MutableActionId,
+    ) -> VenueExecResult<AsterKnownOrder> {
+        let order_id_param = json_field_value(body, "orderId");
+        let response_client_order_id =
+            json_field_value(body, "clientOrderId").and_then(|value| OrderId::new(value).ok());
+        let client_order_id = client_order_id.or(response_client_order_id);
+        let external_order_id = if let Some(order_id) = &order_id_param {
+            Some(ExternalOrderId::new(format!(
+                "aster-perp:order:{order_id}"
+            ))?)
+        } else if let Some(client_order_id) = &client_order_id {
+            Some(ExternalOrderId::new(format!(
+                "aster-perp:client:{}",
+                client_order_id.as_str()
+            ))?)
+        } else {
+            Some(ExternalOrderId::new(format!(
+                "aster-perp:action:{}",
+                action_id.as_str()
+            ))?)
+        };
+        Ok(AsterKnownOrder {
+            symbol: symbol.to_owned(),
+            order_id_param,
+            client_order_id,
+            external_order_id,
+        })
+    }
+
+    fn aster_param(
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> VenueExecResult<AsterRequestParam> {
+        AsterRequestParam::new(name, value).map_err(signing_error)
+    }
+
+    fn aster_signed_request_url(request: &AsterSignedRequest<'_>) -> VenueExecResult<String> {
+        let endpoint = request.endpoint();
+        if endpoint.is_empty() || !endpoint.starts_with('/') {
+            return Err(VenueExecError::InvalidRequest {
+                field: "endpoint",
+                reason: "Aster signed REST endpoint must be an absolute path",
+            });
+        }
+        Ok(format!(
+            "{}{}?{}",
+            request.base_url(),
+            endpoint,
+            request.signed_query_for_transport()
+        ))
+    }
+
+    fn parse_aster_curl_http_response(stdout: &[u8]) -> VenueExecResult<AsterExecHttpResponse> {
+        let output = String::from_utf8_lossy(stdout);
+        let Some((body, status)) = output.rsplit_once(CURL_ASTER_STATUS_MARKER) else {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: aster_transport_venue_id(),
+                detail: "curl transport response lacked an HTTP status marker".to_owned(),
+            });
+        };
+        let status_code =
+            status
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: aster_transport_venue_id(),
+                    detail: "curl transport returned a malformed HTTP status".to_owned(),
+                })?;
+        if status_code == 0 {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: aster_transport_venue_id(),
+                detail: "curl transport did not receive an HTTP response from Aster".to_owned(),
+            });
+        }
+        Ok(AsterExecHttpResponse::new(status_code, body.to_owned()))
+    }
+
+    fn aster_transport_venue_id() -> VenueId {
+        VenueId::new("venue:ASTER-USDT-FUTURES").expect("static Aster transport venue ID")
+    }
+
+    /// Hyperliquid exchange endpoint。
+    pub const HYPERLIQUID_EXCHANGE_ENDPOINT: &str = "/exchange";
+    /// Hyperliquid info endpoint。
+    pub const HYPERLIQUID_INFO_ENDPOINT: &str = "/info";
+    /// 默认 Hyperliquid API base URL。
+    pub const HYPERLIQUID_API_BASE_URL: &str = "https://api.hyperliquid.xyz";
+    const CURL_HYPERLIQUID_STATUS_MARKER: &str = "\n__ARB_HYPERLIQUID_HTTP_STATUS__:";
+
+    /// Hyperliquid L1 action signer 请求。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct HyperliquidSigningInput {
+        pub source: String,
+        pub nonce: u64,
+        pub vault_address: Option<String>,
+        pub expires_after: Option<u64>,
+        pub action_json: String,
+    }
+
+    pub trait HyperliquidExchangeSigner {
+        fn sign_l1_action(
+            &self,
+            input: HyperliquidSigningInput,
+        ) -> VenueExecResult<HyperliquidSignatureJson>;
+    }
+
+    /// Hyperliquid 签名 JSON。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct HyperliquidSignatureJson {
+        json: String,
+    }
+
+    impl HyperliquidSignatureJson {
+        pub fn new(json: impl Into<String>) -> VenueExecResult<Self> {
+            let json = json.into();
+            validate_hyperliquid_signature_json(&json)?;
+            Ok(Self { json })
+        }
+
+        pub fn as_json(&self) -> &str {
+            &self.json
+        }
+    }
+
+    /// 使用 `arb-wallet-signer hyperliquid-l1-action` 的 Hyperliquid signer。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct HyperliquidExternalSigner {
+        command: String,
+    }
+
+    impl HyperliquidExternalSigner {
+        pub fn new(command: impl Into<String>) -> VenueExecResult<Self> {
+            let command = command.into();
+            validate_command_path("hyperliquid_signer_command", &command)?;
+            Ok(Self { command })
+        }
+    }
+
+    impl HyperliquidExchangeSigner for HyperliquidExternalSigner {
+        fn sign_l1_action(
+            &self,
+            input: HyperliquidSigningInput,
+        ) -> VenueExecResult<HyperliquidSignatureJson> {
+            let mut command = Command::new(&self.command);
+            command
+                .arg("hyperliquid-l1-action")
+                .arg("--source")
+                .arg(&input.source)
+                .arg("--nonce")
+                .arg(input.nonce.to_string());
+            if let Some(vault_address) = &input.vault_address {
+                command.arg("--vault-address").arg(vault_address);
+            }
+            if let Some(expires_after) = input.expires_after {
+                command
+                    .arg("--expires-after")
+                    .arg(expires_after.to_string());
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| VenueExecError::SigningFailed {
+                    reason: "cannot start external Hyperliquid signer command".to_owned(),
+                })?;
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| VenueExecError::SigningFailed {
+                    reason: "external Hyperliquid signer stdin is unavailable".to_owned(),
+                })?
+                .write_all(input.action_json.as_bytes())
+                .map_err(|_| VenueExecError::SigningFailed {
+                    reason: "cannot write Hyperliquid action to external signer".to_owned(),
+                })?;
+            let output = child
+                .wait_with_output()
+                .map_err(|_| VenueExecError::SigningFailed {
+                    reason: "external Hyperliquid signer did not return a reliable result"
+                        .to_owned(),
+                })?;
+            if !output.status.success() {
+                return Err(VenueExecError::SigningFailed {
+                    reason: "external Hyperliquid signer exited unsuccessfully".to_owned(),
+                });
+            }
+            let rendered =
+                String::from_utf8(output.stdout).map_err(|_| VenueExecError::SigningFailed {
+                    reason: "external Hyperliquid signer output is not valid UTF-8".to_owned(),
+                })?;
+            HyperliquidSignatureJson::new(rendered)
+        }
+    }
+
+    pub trait HyperliquidExecTransport {
+        fn post_json(
+            &mut self,
+            base_url: &str,
+            endpoint: &'static str,
+            body: &str,
+        ) -> VenueExecResult<HyperliquidExecHttpResponse>;
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct HyperliquidExecHttpResponse {
+        status_code: u16,
+        body: String,
+    }
+
+    impl HyperliquidExecHttpResponse {
+        pub fn new(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                body: body.into(),
+            }
+        }
+
+        pub fn status_code(&self) -> u16 {
+            self.status_code
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        pub fn is_success(&self) -> bool {
+            (200..=299).contains(&self.status_code)
+        }
+    }
+
+    /// 使用系统 `curl` 发送 Hyperliquid JSON 请求的真实 transport。
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct HyperliquidCurlExecTransport {
+        connect_timeout_secs: u64,
+        max_time_secs: u64,
+    }
+
+    impl HyperliquidCurlExecTransport {
+        pub fn new(connect_timeout_secs: u64, max_time_secs: u64) -> VenueExecResult<Self> {
+            if connect_timeout_secs == 0 || max_time_secs == 0 {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "curl_timeout",
+                    reason: "curl timeouts must be greater than zero",
+                });
+            }
+            Ok(Self {
+                connect_timeout_secs,
+                max_time_secs,
+            })
+        }
+    }
+
+    impl Default for HyperliquidCurlExecTransport {
+        fn default() -> Self {
+            Self {
+                connect_timeout_secs: 10,
+                max_time_secs: 30,
+            }
+        }
+    }
+
+    impl HyperliquidExecTransport for HyperliquidCurlExecTransport {
+        fn post_json(
+            &mut self,
+            base_url: &str,
+            endpoint: &'static str,
+            body: &str,
+        ) -> VenueExecResult<HyperliquidExecHttpResponse> {
+            let url = hyperliquid_request_url(base_url, endpoint)?;
+            let mut config = format!("url = \"{}\"\n", curl_config_quote(&url)?);
+            push_curl_header(&mut config, "Content-Type", "application/json")?;
+            config.push_str("data = \"");
+            config.push_str(&curl_config_quote(body)?);
+            config.push_str("\"\n");
+            let mut child = Command::new("curl")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--request")
+                .arg("POST")
+                .arg("--connect-timeout")
+                .arg(self.connect_timeout_secs.to_string())
+                .arg("--max-time")
+                .arg(self.max_time_secs.to_string())
+                .arg("--write-out")
+                .arg(format!("{CURL_HYPERLIQUID_STATUS_MARKER}%{{http_code}}"))
+                .arg("--config")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: hyperliquid_transport_venue_id(),
+                    detail: "failed to start curl for Hyperliquid REST request".to_owned(),
+                })?;
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| VenueExecError::UnknownExternalState {
+                    venue_id: hyperliquid_transport_venue_id(),
+                    detail: "curl stdin is unavailable for Hyperliquid REST request".to_owned(),
+                })?
+                .write_all(config.as_bytes())
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: hyperliquid_transport_venue_id(),
+                    detail: "failed to write curl config for Hyperliquid REST request".to_owned(),
+                })?;
+            let output =
+                child
+                    .wait_with_output()
+                    .map_err(|_| VenueExecError::UnknownExternalState {
+                        venue_id: hyperliquid_transport_venue_id(),
+                        detail: "curl transport did not return a Hyperliquid REST response"
+                            .to_owned(),
+                    })?;
+            if !output.status.success() {
+                return Err(VenueExecError::UnknownExternalState {
+                    venue_id: hyperliquid_transport_venue_id(),
+                    detail: "curl transport failed before a reliable HTTP response was available"
+                        .to_owned(),
+                });
+            }
+            parse_hyperliquid_curl_http_response(&output.stdout)
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct HyperliquidExecConfig {
+        venue_id: VenueId,
+        account_id: AccountId,
+        base_url: String,
+        user: String,
+        source: String,
+        vault_address: Option<String>,
+        expires_after_ms: Option<u64>,
+        signing_policy: SigningPolicy,
+        asset_ids_by_symbol: BTreeMap<String, u32>,
+    }
+
+    impl HyperliquidExecConfig {
+        pub fn perp(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            user: impl Into<String>,
+            source: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            let user = user.into();
+            validate_ethereum_address_text("hyperliquid_user", &user)?;
+            let source = source.into();
+            validate_hyperliquid_source(&source)?;
+            Ok(Self {
+                venue_id,
+                account_id,
+                base_url: normalize_hyperliquid_base_url(base_url.into())?,
+                user: user.to_ascii_lowercase(),
+                source,
+                vault_address: None,
+                expires_after_ms: None,
+                signing_policy,
+                asset_ids_by_symbol: BTreeMap::new(),
+            })
+        }
+
+        pub fn with_vault_address(
+            mut self,
+            vault_address: impl Into<String>,
+        ) -> VenueExecResult<Self> {
+            let vault_address = vault_address.into();
+            validate_ethereum_address_text("hyperliquid_vault_address", &vault_address)?;
+            self.vault_address = Some(vault_address.to_ascii_lowercase());
+            Ok(self)
+        }
+
+        pub fn with_expires_after_ms(mut self, expires_after_ms: u64) -> Self {
+            self.expires_after_ms = Some(expires_after_ms);
+            self
+        }
+
+        pub fn with_asset_id(
+            mut self,
+            symbol: impl Into<String>,
+            asset_id: u32,
+        ) -> VenueExecResult<Self> {
+            let symbol = symbol.into();
+            validate_hyperliquid_symbol(&symbol)?;
+            self.asset_ids_by_symbol.insert(symbol, asset_id);
+            Ok(self)
+        }
+
+        pub fn venue_id(&self) -> &VenueId {
+            &self.venue_id
+        }
+
+        pub fn account_id(&self) -> &AccountId {
+            &self.account_id
+        }
+    }
+
+    /// Hyperliquid perp 可变执行适配器。
+    pub struct HyperliquidPerpExecAdapter<S, T> {
+        inner: HyperliquidExecAdapterCore<S, T>,
+    }
+
+    impl<S, T> HyperliquidPerpExecAdapter<S, T> {
+        pub fn new(
+            config: HyperliquidExecConfig,
+            signer: S,
+            transport: T,
+        ) -> VenueExecResult<Self> {
+            Ok(Self {
+                inner: HyperliquidExecAdapterCore::new(config, signer, transport),
+            })
+        }
+
+        pub fn config(&self) -> &HyperliquidExecConfig {
+            self.inner.config()
+        }
+
+        pub fn transport(&self) -> &T {
+            self.inner.transport()
+        }
+
+        pub fn transport_mut(&mut self) -> &mut T {
+            self.inner.transport_mut()
+        }
+    }
+
+    impl<S, T> fmt::Debug for HyperliquidPerpExecAdapter<S, T>
+    where
+        S: fmt::Debug,
+        T: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("HyperliquidPerpExecAdapter")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+
+    impl<S, T> SubmitOrder for HyperliquidPerpExecAdapter<S, T>
+    where
+        S: HyperliquidExchangeSigner,
+        T: HyperliquidExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.submit_order(request)
+        }
+    }
+
+    impl<S, T> CancelOrder for HyperliquidPerpExecAdapter<S, T>
+    where
+        S: HyperliquidExchangeSigner,
+        T: HyperliquidExecTransport,
+    {
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.cancel_order(request)
+        }
+    }
+
+    impl<S, T> QueryActionStatus for HyperliquidPerpExecAdapter<S, T>
+    where
+        S: HyperliquidExchangeSigner,
+        T: HyperliquidExecTransport,
+    {
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            self.inner.query_action_status(request)
+        }
+    }
+
+    impl<S, T> ConfirmOrderStatus for HyperliquidPerpExecAdapter<S, T>
+    where
+        S: HyperliquidExchangeSigner,
+        T: HyperliquidExecTransport,
+    {
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.inner.confirm_order_status(request)
+        }
+    }
+
+    impl<S, T> RequestTransfer for HyperliquidPerpExecAdapter<S, T>
+    where
+        S: HyperliquidExchangeSigner,
+        T: HyperliquidExecTransport,
+    {
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.inner.request_transfer(request)
+        }
+    }
+
+    #[derive(Debug)]
+    struct HyperliquidExecAdapterCore<S, T> {
+        config: HyperliquidExecConfig,
+        signer: S,
+        transport: T,
+        records_by_key: BTreeMap<IdempotencyKey, LiveActionRecord>,
+        key_by_action_id: BTreeMap<MutableActionId, IdempotencyKey>,
+        orders_by_client_id: BTreeMap<OrderId, HyperliquidKnownOrder>,
+        orders_by_external_id: BTreeMap<ExternalOrderId, HyperliquidKnownOrder>,
+        next_sequence: u64,
+    }
+
+    impl<S, T> HyperliquidExecAdapterCore<S, T> {
+        fn new(config: HyperliquidExecConfig, signer: S, transport: T) -> Self {
+            Self {
+                config,
+                signer,
+                transport,
+                records_by_key: BTreeMap::new(),
+                key_by_action_id: BTreeMap::new(),
+                orders_by_client_id: BTreeMap::new(),
+                orders_by_external_id: BTreeMap::new(),
+                next_sequence: 0,
+            }
+        }
+
+        fn config(&self) -> &HyperliquidExecConfig {
+            &self.config
+        }
+
+        fn transport(&self) -> &T {
+            &self.transport
+        }
+
+        fn transport_mut(&mut self) -> &mut T {
+            &mut self.transport
+        }
+
+        fn query_action_status(
+            &self,
+            request: QueryActionStatusRequest,
+        ) -> VenueExecResult<MutableActionStatusReport> {
+            Ok(match request {
+                QueryActionStatusRequest::ByActionId(action_id) => {
+                    if let Some(key) = self.key_by_action_id.get(&action_id) {
+                        self.report_for_key(key)
+                    } else {
+                        unknown_status_report(Some(action_id), None)
+                    }
+                }
+                QueryActionStatusRequest::ByIdempotencyKey(key) => self.report_for_key(&key),
+            })
+        }
+
+        fn report_for_key(&self, key: &IdempotencyKey) -> MutableActionStatusReport {
+            self.records_by_key.get(key).map_or_else(
+                || unknown_status_report(None, Some(key.clone())),
+                |record| super::status_report_from_receipt(&record.receipt),
+            )
+        }
+
+        fn request_transfer(
+            &mut self,
+            request: TransferRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.from_account_id)?;
+            Err(VenueExecError::InvalidRequest {
+                field: "transfer",
+                reason: "Hyperliquid live transfer is not implemented by this execution adapter",
+            })
+        }
+
+        fn ensure_request_scope(
+            &self,
+            venue_id: &VenueId,
+            account_id: &AccountId,
+        ) -> VenueExecResult<()> {
+            if venue_id != &self.config.venue_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "venue_id",
+                    reason: "request venue does not match Hyperliquid execution adapter config",
+                });
+            }
+            if account_id != &self.config.account_id {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "account_id",
+                    reason: "request account does not match Hyperliquid execution adapter config",
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl<S, T> HyperliquidExecAdapterCore<S, T>
+    where
+        S: HyperliquidExchangeSigner,
+        T: HyperliquidExecTransport,
+    {
+        fn submit_order(
+            &mut self,
+            request: SubmitOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            request.validate()?;
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+            ensure_hyperliquid_real_signing_policy(&self.config.signing_policy)?;
+            let symbol = hyperliquid_symbol_from_instrument(&request.instrument_id)?;
+            let asset_id = self.hyperliquid_asset_id(&symbol)?;
+            let action_json = hyperliquid_submit_order_action_json(asset_id, &request)?;
+            let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
+            let body = self.sign_exchange_body(action_json)?;
+            let response = self.transport.post_json(
+                &self.config.base_url,
+                HYPERLIQUID_EXCHANGE_ENDPOINT,
+                &body,
+            )?;
+            self.ensure_success(HYPERLIQUID_EXCHANGE_ENDPOINT, &response)?;
+            ensure_hyperliquid_exchange_ok(
+                &self.config.venue_id,
+                HYPERLIQUID_EXCHANGE_ENDPOINT,
+                &response,
+            )?;
+            let known_order = hyperliquid_known_order_from_response(
+                &symbol,
+                asset_id,
+                request.client_order_id.clone(),
+                response.body(),
+                &action_id,
+            )?;
+            let external_ref = known_order
+                .external_order_id
+                .clone()
+                .map(ExternalActionRef::Order);
+            let receipt = MutableActionReceipt {
+                action_id,
+                kind: MutableActionKind::SubmitOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref,
+                duplicate: false,
+                simulated: false,
+            };
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            self.record_known_order(known_order);
+            Ok(receipt)
+        }
+
+        fn cancel_order(
+            &mut self,
+            request: CancelOrderRequest,
+        ) -> VenueExecResult<MutableActionReceipt> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let fingerprint = request.fingerprint();
+            if let Some(receipt) = self.duplicate_receipt(&request.idempotency_key, &fingerprint)? {
+                return Ok(receipt);
+            }
+            ensure_hyperliquid_real_signing_policy(&self.config.signing_policy)?;
+            let known_order =
+                self.lookup_known_order(&request.order_ref)
+                    .ok_or(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "Hyperliquid cancel requires an order previously submitted through this adapter so asset id is known",
+                    })?;
+            let action_json =
+                hyperliquid_cancel_order_action_json(&request.order_ref, known_order)?;
+            let action_id = self.next_action_id(MutableActionKind::CancelOrder)?;
+            let body = self.sign_exchange_body(action_json)?;
+            let response = self.transport.post_json(
+                &self.config.base_url,
+                HYPERLIQUID_EXCHANGE_ENDPOINT,
+                &body,
+            )?;
+            self.ensure_success(HYPERLIQUID_EXCHANGE_ENDPOINT, &response)?;
+            ensure_hyperliquid_exchange_ok(
+                &self.config.venue_id,
+                HYPERLIQUID_EXCHANGE_ENDPOINT,
+                &response,
+            )?;
+            let receipt = MutableActionReceipt {
+                action_id: action_id.clone(),
+                kind: MutableActionKind::CancelOrder,
+                status: MutableActionStatus::Accepted,
+                idempotency_key: request.idempotency_key.clone(),
+                venue_id: request.venue_id,
+                external_ref: Some(ExternalActionRef::Cancel(action_id)),
+                duplicate: false,
+                simulated: false,
+            };
+            self.record_action(request.idempotency_key, fingerprint, receipt.clone());
+            Ok(receipt)
+        }
+
+        fn confirm_order_status(
+            &mut self,
+            request: ConfirmOrderStatusRequest,
+        ) -> VenueExecResult<PrivateOrderUpdate> {
+            self.ensure_request_scope(&request.venue_id, &request.account_id)?;
+            let oid = hyperliquid_order_status_oid(&request.order_ref)?;
+            let body = format!(
+                "{{\"type\":\"orderStatus\",\"user\":{},\"oid\":{}}}",
+                json_string_literal(&self.config.user)?,
+                oid
+            );
+            let response = self.transport.post_json(
+                &self.config.base_url,
+                HYPERLIQUID_INFO_ENDPOINT,
+                &body,
+            )?;
+            self.ensure_success(HYPERLIQUID_INFO_ENDPOINT, &response)?;
+            parse_hyperliquid_order_query_confirmation(
+                self.config.venue_id.clone(),
+                self.config.account_id.clone(),
+                request.source_event_id,
+                response.body(),
+            )
+        }
+
+        fn hyperliquid_asset_id(&self, symbol: &str) -> VenueExecResult<u32> {
+            self.config
+                .asset_ids_by_symbol
+                .get(symbol)
+                .or_else(|| {
+                    symbol
+                        .strip_suffix("USDT")
+                        .and_then(|coin| self.config.asset_ids_by_symbol.get(coin))
+                })
+                .copied()
+                .ok_or(VenueExecError::InvalidRequest {
+                    field: "asset_id",
+                    reason: "Hyperliquid perp asset id mapping is required before live order submission",
+                })
+        }
+
+        fn sign_exchange_body(&self, action_json: String) -> VenueExecResult<String> {
+            let nonce = current_unix_millis()?;
+            let signature = self.signer.sign_l1_action(HyperliquidSigningInput {
+                source: self.config.source.clone(),
+                nonce,
+                vault_address: self.config.vault_address.clone(),
+                expires_after: self.config.expires_after_ms,
+                action_json: action_json.clone(),
+            })?;
+            let mut body = format!(
+                "{{\"action\":{},\"nonce\":{},\"signature\":{}",
+                action_json,
+                nonce,
+                signature.as_json()
+            );
+            if let Some(vault_address) = &self.config.vault_address {
+                body.push_str(",\"vaultAddress\":");
+                body.push_str(&json_string_literal(vault_address)?);
+            }
+            if let Some(expires_after) = self.config.expires_after_ms {
+                body.push_str(",\"expiresAfter\":");
+                body.push_str(&expires_after.to_string());
+            }
+            body.push('}');
+            Ok(body)
+        }
+
+        fn duplicate_receipt(
+            &self,
+            idempotency_key: &IdempotencyKey,
+            fingerprint: &RequestFingerprint,
+        ) -> VenueExecResult<Option<MutableActionReceipt>> {
+            let Some(existing) = self.records_by_key.get(idempotency_key) else {
+                return Ok(None);
+            };
+            if existing.fingerprint != *fingerprint {
+                return Err(VenueExecError::IdempotencyConflict {
+                    idempotency_key: idempotency_key.clone(),
+                    existing_fingerprint: existing.fingerprint.0.clone(),
+                    incoming_fingerprint: fingerprint.0.clone(),
+                });
+            }
+            let mut receipt = existing.receipt.clone();
+            receipt.duplicate = true;
+            Ok(Some(receipt))
+        }
+
+        fn next_action_id(&mut self, kind: MutableActionKind) -> VenueExecResult<MutableActionId> {
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("Hyperliquid mutable action sequence overflowed");
+            MutableActionId::new(format!(
+                "hyperliquid:perp:{}:{}",
+                kind.as_str(),
+                self.next_sequence
+            ))
+        }
+
+        fn ensure_success(
+            &self,
+            endpoint: &'static str,
+            response: &HyperliquidExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            if response.is_success() {
+                return Ok(());
+            }
+            Err(VenueExecError::ExternalRejected {
+                venue_id: self.config.venue_id.clone(),
+                endpoint: endpoint.to_owned(),
+                status_code: response.status_code(),
+                reason: response_body_snippet(response.body()),
+            })
+        }
+
+        fn record_action(
+            &mut self,
+            idempotency_key: IdempotencyKey,
+            fingerprint: RequestFingerprint,
+            receipt: MutableActionReceipt,
+        ) {
+            self.key_by_action_id
+                .insert(receipt.action_id.clone(), idempotency_key.clone());
+            self.records_by_key.insert(
+                idempotency_key,
+                LiveActionRecord {
+                    fingerprint,
+                    receipt,
+                },
+            );
+        }
+
+        fn record_known_order(&mut self, known_order: HyperliquidKnownOrder) {
+            if let Some(client_order_id) = known_order.client_order_id.clone() {
+                self.orders_by_client_id
+                    .insert(client_order_id, known_order.clone());
+            }
+            if let Some(external_order_id) = known_order.external_order_id.clone() {
+                self.orders_by_external_id
+                    .insert(external_order_id, known_order);
+            }
+        }
+
+        fn lookup_known_order(&self, order_ref: &OrderReference) -> Option<&HyperliquidKnownOrder> {
+            match order_ref {
+                OrderReference::ClientOrderId(order_id) => self.orders_by_client_id.get(order_id),
+                OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct HyperliquidKnownOrder {
+        symbol: String,
+        asset_id: u32,
+        raw_order_id: Option<String>,
+        client_order_id: Option<OrderId>,
+        external_order_id: Option<ExternalOrderId>,
+    }
+
+    fn normalize_hyperliquid_base_url(value: String) -> VenueExecResult<String> {
+        let trimmed = value.trim().trim_end_matches('/').to_owned();
+        if trimmed.is_empty() {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Hyperliquid base URL cannot be empty",
+            });
+        }
+        if trimmed
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Hyperliquid base URL contains a control byte",
+            });
+        }
+        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://127.0.0.1")) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "base_url",
+                reason: "Hyperliquid base URL must use https or an explicit localhost test URL",
+            });
+        }
+        Ok(trimmed)
+    }
+
+    fn hyperliquid_submit_order_action_json(
+        asset_id: u32,
+        request: &SubmitOrderRequest,
+    ) -> VenueExecResult<String> {
+        if request.order_type == MutableOrderType::Market {
+            return Err(VenueExecError::InvalidRequest {
+                field: "order_type",
+                reason: "Hyperliquid live market order requires an explicit protective limit price; use limit IOC",
+            });
+        }
+        let tif = match request.order_type {
+            MutableOrderType::PostOnly => "Alo",
+            MutableOrderType::Limit => match limit_time_in_force(request) {
+                MutableTimeInForce::Gtc => "Gtc",
+                MutableTimeInForce::Ioc => "Ioc",
+                MutableTimeInForce::Fok => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "time_in_force",
+                        reason: "Hyperliquid exchange endpoint supports Gtc, Ioc and Alo; FOK is not mapped",
+                    });
+                }
+            },
+            MutableOrderType::Market => unreachable!("market rejected above"),
+        };
+        let mut order = format!(
+            "{{\"a\":{},\"b\":{},\"p\":{},\"s\":{},\"r\":{},\"t\":{{\"limit\":{{\"tif\":{}}}}}",
+            asset_id,
+            request.side == OrderSide::Buy,
+            json_string_literal(
+                &request
+                    .limit_price
+                    .expect("validated Hyperliquid limit price")
+                    .to_string()
+            )?,
+            json_string_literal(&request.quantity.to_string())?,
+            request.reduce_only,
+            json_string_literal(tif)?
+        );
+        if let Some(client_order_id) = &request.client_order_id {
+            validate_hyperliquid_client_order_id(client_order_id.as_str())?;
+            order.push_str(",\"c\":");
+            order.push_str(&json_string_literal(client_order_id.as_str())?);
+        }
+        order.push('}');
+        Ok(format!(
+            "{{\"type\":\"order\",\"orders\":[{}],\"grouping\":\"na\"}}",
+            order
+        ))
+    }
+
+    fn hyperliquid_cancel_order_action_json(
+        order_ref: &OrderReference,
+        known_order: &HyperliquidKnownOrder,
+    ) -> VenueExecResult<String> {
+        match order_ref {
+            OrderReference::VenueOrderId(_) => {
+                let raw_order_id =
+                    known_order
+                        .raw_order_id
+                        .as_ref()
+                        .ok_or(VenueExecError::InvalidRequest {
+                            field: "order_ref",
+                            reason: "known Hyperliquid venue order lacks numeric oid",
+                        })?;
+                Ok(format!(
+                    "{{\"type\":\"cancel\",\"cancels\":[{{\"a\":{},\"o\":{}}}]}}",
+                    known_order.asset_id, raw_order_id
+                ))
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_hyperliquid_client_order_id(client_order_id.as_str())?;
+                Ok(format!(
+                    "{{\"type\":\"cancelByCloid\",\"cancels\":[{{\"asset\":{},\"cloid\":{}}}]}}",
+                    known_order.asset_id,
+                    json_string_literal(client_order_id.as_str())?
+                ))
+            }
+        }
+    }
+
+    fn hyperliquid_order_status_oid(order_ref: &OrderReference) -> VenueExecResult<String> {
+        match order_ref {
+            OrderReference::VenueOrderId(order_id) => {
+                let value = order_id.as_str();
+                let Some(raw_order_id) = value.strip_prefix("hyperliquid-perp:order:") else {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "Hyperliquid venue order ref must come from the Hyperliquid perp adapter",
+                    });
+                };
+                if raw_order_id.is_empty()
+                    || raw_order_id.bytes().any(|byte| !byte.is_ascii_digit())
+                {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "order_ref",
+                        reason: "Hyperliquid venue order ref lacks numeric oid",
+                    });
+                }
+                Ok(raw_order_id.to_owned())
+            }
+            OrderReference::ClientOrderId(client_order_id) => {
+                validate_hyperliquid_client_order_id(client_order_id.as_str())?;
+                Ok(json_string_literal(client_order_id.as_str())?)
+            }
+        }
+    }
+
+    fn hyperliquid_symbol_from_instrument(instrument_id: &InstrumentId) -> VenueExecResult<String> {
+        let value = instrument_id.as_str();
+        let mut parts = value.split(':');
+        let prefix = parts.next();
+        let venue = parts.next();
+        let symbol = parts.next();
+        let suffix = parts.next();
+        if parts.next().is_some()
+            || prefix != Some("inst")
+            || venue != Some("HYPERLIQUID")
+            || suffix != Some("PERP")
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field: "instrument_id",
+                reason: "Hyperliquid execution requires instrument IDs shaped as inst:HYPERLIQUID:<SYMBOL>:PERP",
+            });
+        }
+        let symbol = symbol.expect("symbol checked above");
+        validate_hyperliquid_symbol(symbol)?;
+        Ok(symbol.to_owned())
+    }
+
+    fn hyperliquid_known_order_from_response(
+        symbol: &str,
+        asset_id: u32,
+        client_order_id: Option<OrderId>,
+        body: &str,
+        action_id: &MutableActionId,
+    ) -> VenueExecResult<HyperliquidKnownOrder> {
+        let raw_order_id = json_field_value(body, "oid")
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()));
+        let response_client_order_id = json_field_value(body, "cloid")
+            .filter(|value| !value.is_empty() && value != "null")
+            .and_then(|value| OrderId::new(value).ok());
+        let client_order_id = client_order_id.or(response_client_order_id);
+        let external_order_id = if let Some(order_id) = &raw_order_id {
+            Some(ExternalOrderId::new(format!(
+                "hyperliquid-perp:order:{order_id}"
+            ))?)
+        } else if let Some(client_order_id) = &client_order_id {
+            Some(ExternalOrderId::new(format!(
+                "hyperliquid-perp:client:{}",
+                client_order_id.as_str()
+            ))?)
+        } else {
+            Some(ExternalOrderId::new(format!(
+                "hyperliquid-perp:action:{}",
+                action_id.as_str()
+            ))?)
+        };
+        Ok(HyperliquidKnownOrder {
+            symbol: symbol.to_owned(),
+            asset_id,
+            raw_order_id,
+            client_order_id,
+            external_order_id,
+        })
+    }
+
+    fn ensure_hyperliquid_real_signing_policy(policy: &SigningPolicy) -> VenueExecResult<()> {
+        if policy.mode() == SigningPolicyMode::RealSigningEnabled {
+            Ok(())
+        } else {
+            Err(VenueExecError::SigningFailed {
+                reason: "Hyperliquid live exchange signing requires real signing policy".to_owned(),
+            })
+        }
+    }
+
+    fn ensure_hyperliquid_exchange_ok(
+        venue_id: &VenueId,
+        endpoint: &'static str,
+        response: &HyperliquidExecHttpResponse,
+    ) -> VenueExecResult<()> {
+        if json_field_value(response.body(), "status").as_deref() == Some("ok")
+            && !response.body().contains("\"error\"")
+        {
+            return Ok(());
+        }
+        Err(VenueExecError::ExternalRejected {
+            venue_id: venue_id.clone(),
+            endpoint: endpoint.to_owned(),
+            status_code: response.status_code(),
+            reason: response_body_snippet(response.body()),
+        })
+    }
+
+    fn validate_hyperliquid_signature_json(value: &str) -> VenueExecResult<()> {
+        let trimmed = value.trim();
+        let r = json_field_value(trimmed, "r").ok_or(VenueExecError::SigningFailed {
+            reason: "Hyperliquid signature JSON lacks r".to_owned(),
+        })?;
+        let s = json_field_value(trimmed, "s").ok_or(VenueExecError::SigningFailed {
+            reason: "Hyperliquid signature JSON lacks s".to_owned(),
+        })?;
+        let v = json_field_value(trimmed, "v").ok_or(VenueExecError::SigningFailed {
+            reason: "Hyperliquid signature JSON lacks v".to_owned(),
+        })?;
+        validate_signature_hex_32("hyperliquid_signature_r", &r)?;
+        validate_signature_hex_32("hyperliquid_signature_s", &s)?;
+        if v != "27" && v != "28" {
+            return Err(VenueExecError::SigningFailed {
+                reason: "Hyperliquid signature JSON v must be 27 or 28".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_signature_hex_32(field: &'static str, value: &str) -> VenueExecResult<()> {
+        let hex = value.strip_prefix("0x").unwrap_or(value);
+        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(VenueExecError::InvalidRequest {
+                field,
+                reason: "signature part must be 32 bytes encoded as hex",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_hyperliquid_symbol(value: &str) -> VenueExecResult<()> {
+        if value.is_empty() || value.len() > 64 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "symbol",
+                reason: "Hyperliquid symbol must be 1 to 64 bytes",
+            });
+        }
+        if value.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'/'))
+        }) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "symbol",
+                reason: "Hyperliquid symbol contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_hyperliquid_client_order_id(value: &str) -> VenueExecResult<()> {
+        let hex = value
+            .strip_prefix("0x")
+            .ok_or(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "Hyperliquid cloid must be a 0x-prefixed 16-byte hex string",
+            })?;
+        if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(VenueExecError::InvalidRequest {
+                field: "client_order_id",
+                reason: "Hyperliquid cloid must be a 0x-prefixed 16-byte hex string",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_hyperliquid_source(value: &str) -> VenueExecResult<()> {
+        if matches!(value, "a" | "b") {
+            Ok(())
+        } else {
+            Err(VenueExecError::InvalidRequest {
+                field: "source",
+                reason: "Hyperliquid source must be `a` for mainnet or `b` for testnet",
+            })
+        }
+    }
+
+    fn validate_ethereum_address_text(field: &'static str, value: &str) -> VenueExecResult<()> {
+        if value.len() != 42 || !value.starts_with("0x") {
+            return Err(VenueExecError::InvalidRequest {
+                field,
+                reason: "address must be a 42-character 0x-prefixed hex string",
+            });
+        }
+        if !value.as_bytes().iter().skip(2).all(u8::is_ascii_hexdigit) {
+            return Err(VenueExecError::InvalidRequest {
+                field,
+                reason: "address must contain only hexadecimal characters",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_command_path(field: &'static str, value: &str) -> VenueExecResult<()> {
+        if value.trim().is_empty() {
+            return Err(VenueExecError::InvalidRequest {
+                field,
+                reason: "command path cannot be empty",
+            });
+        }
+        if value.len() > 4096
+            || value
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(VenueExecError::InvalidRequest {
+                field,
+                reason: "command path contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn current_unix_millis() -> VenueExecResult<u64> {
+        let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+            VenueExecError::UnknownExternalState {
+                venue_id: hyperliquid_transport_venue_id(),
+                detail: "system clock is before Unix epoch".to_owned(),
+            }
+        })?;
+        u64::try_from(duration.as_millis()).map_err(|_| VenueExecError::UnknownExternalState {
+            venue_id: hyperliquid_transport_venue_id(),
+            detail: "system clock milliseconds overflow u64".to_owned(),
+        })
+    }
+
+    fn hyperliquid_request_url(base_url: &str, endpoint: &'static str) -> VenueExecResult<String> {
+        if endpoint.is_empty() || !endpoint.starts_with('/') {
+            return Err(VenueExecError::InvalidRequest {
+                field: "endpoint",
+                reason: "Hyperliquid REST endpoint must be an absolute path",
+            });
+        }
+        Ok(format!("{base_url}{endpoint}"))
+    }
+
+    fn parse_hyperliquid_curl_http_response(
+        stdout: &[u8],
+    ) -> VenueExecResult<HyperliquidExecHttpResponse> {
+        let output = String::from_utf8_lossy(stdout);
+        let Some((body, status)) = output.rsplit_once(CURL_HYPERLIQUID_STATUS_MARKER) else {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: hyperliquid_transport_venue_id(),
+                detail: "curl transport response lacked an HTTP status marker".to_owned(),
+            });
+        };
+        let status_code =
+            status
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| VenueExecError::UnknownExternalState {
+                    venue_id: hyperliquid_transport_venue_id(),
+                    detail: "curl transport returned a malformed HTTP status".to_owned(),
+                })?;
+        if status_code == 0 {
+            return Err(VenueExecError::UnknownExternalState {
+                venue_id: hyperliquid_transport_venue_id(),
+                detail: "curl transport did not receive an HTTP response from Hyperliquid"
+                    .to_owned(),
+            });
+        }
+        Ok(HyperliquidExecHttpResponse::new(
+            status_code,
+            body.to_owned(),
+        ))
+    }
+
+    fn hyperliquid_transport_venue_id() -> VenueId {
+        VenueId::new("venue:HYPERLIQUID-PERP").expect("static Hyperliquid transport venue ID")
+    }
+
+    fn json_string_literal(value: &str) -> VenueExecResult<String> {
+        let mut body = String::new();
+        body.push('"');
+        push_json_escaped(&mut body, value)?;
+        body.push('"');
+        Ok(body)
     }
 
     /// Bybit V5 下单 endpoint。
@@ -9254,6 +11681,89 @@ mod tests {
     }
 
     #[test]
+    fn aster_order_query_confirms_filled_perp_order() {
+        let update = parse_aster_order_query_confirmation(
+            venue("venue:ASTER-USDT-FUTURES"),
+            account("account:aster-unit"),
+            "event:aster:perp:query:filled",
+            r#"{"symbol":"BTCUSDT","orderId":22542179,"clientOrderId":"asterUnit1","side":"BUY","status":"FILLED","type":"LIMIT","origType":"LIMIT","executedQty":"0.001","avgPrice":"43100.50","updateTime":1700000001500}"#,
+        )
+        .expect("Aster order query confirmation");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.market, PrivateOrderMarket::AsterPerp);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.side, Some(OrderSide::Buy));
+        assert_eq!(
+            update.instrument_id.as_str(),
+            "inst:ASTER:BTCUSDT:USDT-FUTURES"
+        );
+        assert_eq!(
+            update
+                .venue_order_id
+                .as_ref()
+                .expect("venue order id")
+                .as_str(),
+            "aster-perp:order:22542179"
+        );
+        assert_eq!(
+            update.client_order_id.as_ref().expect("client id").as_str(),
+            "asterUnit1"
+        );
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.001"
+        );
+        let fill = update.last_fill.expect("filled query carries fill summary");
+        assert_eq!(fill.timestamp, "2023-11-14T22:13:21.5Z");
+        assert_eq!(fill.price, "43100.50");
+        assert_eq!(fill.quantity, "0.001");
+    }
+
+    #[test]
+    fn hyperliquid_order_status_confirms_filled_perp_order() {
+        let update = parse_hyperliquid_order_query_confirmation(
+            venue("venue:HYPERLIQUID-PERP"),
+            account("account:hyperliquid-unit"),
+            "event:hyperliquid:perp:query:filled",
+            r#"{"status":"order","order":{"order":{"coin":"BTC","side":"B","limitPx":"43100.50","sz":"0.0","oid":77747314,"timestamp":1700000001000,"reduceOnly":false,"orderType":"Limit","origSz":"0.001","tif":"Ioc","cloid":"0x1234567890abcdef1234567890abcdef"},"status":"filled","statusTimestamp":1700000001500}}"#,
+        )
+        .expect("Hyperliquid orderStatus confirmation");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.market, PrivateOrderMarket::HyperliquidPerp);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(update.side, Some(OrderSide::Buy));
+        assert_eq!(
+            update.instrument_id.as_str(),
+            "inst:HYPERLIQUID:BTCUSDT:PERP"
+        );
+        assert_eq!(
+            update
+                .venue_order_id
+                .as_ref()
+                .expect("venue order id")
+                .as_str(),
+            "hyperliquid-perp:order:77747314"
+        );
+        assert_eq!(
+            update.client_order_id.as_ref().expect("client id").as_str(),
+            "0x1234567890abcdef1234567890abcdef"
+        );
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("cumulative quantity")
+                .to_string(),
+            "0.001"
+        );
+        assert!(update.last_fill.is_none());
+    }
+
+    #[test]
     fn bybit_order_query_confirms_filled_linear_order() {
         let update = parse_bybit_order_query_confirmation(
             PrivateOrderMarket::BybitLinear,
@@ -10073,6 +12583,179 @@ mod tests {
         assert!(call.signed_query.contains("symbol=BTCUSDT"));
         assert!(call.signed_query.contains("orderId=12345"));
         assert!(call.signed_query.contains("&signature="));
+    }
+
+    #[cfg(all(feature = "live-exec", unix))]
+    #[test]
+    fn aster_perp_adapter_signs_submits_cancels_and_queries_order() {
+        let mut adapter = live::AsterPerpExecAdapter::new(
+            live::AsterExecConfig::perp(
+                venue("venue:ASTER-USDT-FUTURES"),
+                account("account:aster-unit"),
+                live::ASTER_FUTURES_V3_BASE_URL,
+                Some("0x1111111111111111111111111111111111111111".to_owned()),
+                "0x2222222222222222222222222222222222222222",
+                aster_signing_policy("kms-policy/aster-perp-exec-unit"),
+            )
+            .unwrap(),
+            aster_test_signer(1_748_310_859_508_867),
+            RecordingAsterTransport::ok([
+                r#"{"symbol":"BTCUSDT","orderId":22542179,"clientOrderId":"asterUnit1","side":"BUY","status":"NEW","executedQty":"0","updateTime":1700000000123}"#,
+                r#"{"symbol":"BTCUSDT","orderId":22542179,"clientOrderId":"asterUnit1","side":"BUY","status":"CANCELED","executedQty":"0","updateTime":1700000001123}"#,
+                r#"{"symbol":"BTCUSDT","orderId":22542179,"clientOrderId":"asterUnit1","side":"BUY","status":"CANCELED","executedQty":"0","updateTime":1700000002123}"#,
+            ]),
+        )
+        .unwrap();
+
+        let receipt = adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:ASTER-USDT-FUTURES"),
+                account("account:aster-unit"),
+                instrument("inst:ASTER:BTCUSDT:USDT-FUTURES"),
+                OrderSide::Buy,
+                MutableOrderType::PostOnly,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("asterUnit1").unwrap()),
+                IdempotencyKey::new("idem:aster:perp:submit:1").unwrap(),
+            ))
+            .expect("signed Aster order dispatches");
+
+        assert_eq!(receipt.status, MutableActionStatus::Accepted);
+        let submit_call = &adapter.transport().calls[0];
+        assert_eq!(submit_call.method, live::AsterExecHttpMethod::Post);
+        assert_eq!(submit_call.endpoint, live::ASTER_FUTURES_V3_ORDER_ENDPOINT);
+        assert!(submit_call.signed_query.contains("symbol=BTCUSDT"));
+        assert!(submit_call.signed_query.contains("side=BUY"));
+        assert!(submit_call.signed_query.contains("type=LIMIT"));
+        assert!(submit_call.signed_query.contains("timeInForce=GTX"));
+        assert!(submit_call.signed_query.contains("quantity=0.001"));
+        assert!(submit_call.signed_query.contains("price=43100.50"));
+        assert!(submit_call
+            .signed_query
+            .contains("newClientOrderId=asterUnit1"));
+        assert!(submit_call
+            .signed_query
+            .contains("signer=0x2222222222222222222222222222222222222222"));
+        assert!(submit_call.signed_query.contains("&signature=0x"));
+        assert!(!submit_call.debug.contains(&submit_call.signed_query));
+
+        let order_ref = match receipt.external_ref.expect("Aster order ref") {
+            ExternalActionRef::Order(order_id) => OrderReference::VenueOrderId(order_id),
+            other => panic!("unexpected Aster ref: {other:?}"),
+        };
+        adapter
+            .cancel_order(CancelOrderRequest::new(
+                venue("venue:ASTER-USDT-FUTURES"),
+                account("account:aster-unit"),
+                order_ref.clone(),
+                IdempotencyKey::new("idem:aster:perp:cancel:1").unwrap(),
+            ))
+            .expect("known Aster order can be canceled");
+        let cancel_call = &adapter.transport().calls[1];
+        assert_eq!(cancel_call.method, live::AsterExecHttpMethod::Delete);
+        assert!(cancel_call.signed_query.contains("symbol=BTCUSDT"));
+        assert!(cancel_call.signed_query.contains("orderId=22542179"));
+
+        let update = adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:ASTER-USDT-FUTURES"),
+                account("account:aster-unit"),
+                instrument("inst:ASTER:BTCUSDT:USDT-FUTURES"),
+                order_ref,
+                "event:aster:perp:query:cancelled",
+            ))
+            .expect("signed Aster query confirms order");
+        assert_eq!(update.status, OrderConfirmationStatus::Cancelled);
+        assert_eq!(
+            adapter.transport().calls[2].method,
+            live::AsterExecHttpMethod::Get
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn hyperliquid_perp_adapter_signs_exchange_actions_and_queries_order_status() {
+        let mut adapter = live::HyperliquidPerpExecAdapter::new(
+            live::HyperliquidExecConfig::perp(
+                venue("venue:HYPERLIQUID-PERP"),
+                account("account:hyperliquid-unit"),
+                live::HYPERLIQUID_API_BASE_URL,
+                "0x3333333333333333333333333333333333333333",
+                "a",
+                hyperliquid_signing_policy("kms-policy/hyperliquid-perp-exec-unit"),
+            )
+            .unwrap()
+            .with_asset_id("BTCUSDT", 0)
+            .unwrap(),
+            StaticHyperliquidSigner,
+            RecordingHyperliquidTransport::ok([
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77747314}}]}}}"#,
+                r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#,
+                r#"{"status":"order","order":{"order":{"coin":"BTC","side":"B","limitPx":"43100.50","sz":"0.0","oid":77747314,"timestamp":1700000001000,"reduceOnly":false,"orderType":"Limit","origSz":"0.001","tif":"Ioc","cloid":"0x1234567890abcdef1234567890abcdef"},"status":"filled","statusTimestamp":1700000001500}}"#,
+            ]),
+        )
+        .unwrap();
+
+        let receipt = adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:HYPERLIQUID-PERP"),
+                    account("account:hyperliquid-unit"),
+                    instrument("inst:HYPERLIQUID:BTCUSDT:PERP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("0x1234567890abcdef1234567890abcdef").unwrap()),
+                    IdempotencyKey::new("idem:hyperliquid:perp:submit:1").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect("signed Hyperliquid order dispatches");
+
+        let submit_call = &adapter.transport().calls[0];
+        assert_eq!(submit_call.endpoint, live::HYPERLIQUID_EXCHANGE_ENDPOINT);
+        assert!(submit_call.body.contains(r#""type":"order""#));
+        assert!(submit_call.body.contains(r#""a":0"#));
+        assert!(submit_call.body.contains(r#""b":true"#));
+        assert!(submit_call.body.contains(r#""tif":"Ioc""#));
+        assert!(submit_call
+            .body
+            .contains(r#""c":"0x1234567890abcdef1234567890abcdef""#));
+        assert!(submit_call.body.contains(r#""signature":{"r":"0x"#));
+
+        let order_ref = match receipt.external_ref.expect("Hyperliquid order ref") {
+            ExternalActionRef::Order(order_id) => OrderReference::VenueOrderId(order_id),
+            other => panic!("unexpected Hyperliquid ref: {other:?}"),
+        };
+        adapter
+            .cancel_order(CancelOrderRequest::new(
+                venue("venue:HYPERLIQUID-PERP"),
+                account("account:hyperliquid-unit"),
+                order_ref.clone(),
+                IdempotencyKey::new("idem:hyperliquid:perp:cancel:1").unwrap(),
+            ))
+            .expect("known Hyperliquid order can be canceled");
+        let cancel_call = &adapter.transport().calls[1];
+        assert_eq!(cancel_call.endpoint, live::HYPERLIQUID_EXCHANGE_ENDPOINT);
+        assert!(cancel_call.body.contains(r#""type":"cancel""#));
+        assert!(cancel_call.body.contains(r#""o":77747314"#));
+
+        let update = adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:HYPERLIQUID-PERP"),
+                account("account:hyperliquid-unit"),
+                instrument("inst:HYPERLIQUID:BTCUSDT:PERP"),
+                order_ref,
+                "event:hyperliquid:perp:query:filled",
+            ))
+            .expect("Hyperliquid orderStatus confirms order");
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        let query_call = &adapter.transport().calls[2];
+        assert_eq!(query_call.endpoint, live::HYPERLIQUID_INFO_ENDPOINT);
+        assert!(query_call.body.contains(r#""type":"orderStatus""#));
+        assert!(query_call.body.contains(r#""oid":77747314"#));
     }
 
     #[cfg(feature = "live-exec")]
@@ -11140,6 +13823,38 @@ mod tests {
         )
     }
 
+    #[cfg(all(feature = "live-exec", unix))]
+    fn aster_signing_policy(value: &str) -> arb_signing::SigningPolicy {
+        arb_signing::SigningPolicy::real_signing_enabled(
+            arb_signing::SigningPolicyRef::new(value).expect("policy ref"),
+        )
+    }
+
+    #[cfg(all(feature = "live-exec", unix))]
+    fn aster_test_signer(
+        nonce_micros: u64,
+    ) -> arb_signing::real::AsterEip712ExternalSigningProvider<
+        arb_signing::real::LiteralAsterExternalSignerCommandProvider,
+        FixedAsterNonce,
+    > {
+        let signature = format!("0x{}", "a".repeat(130));
+        let signer_script = write_aster_signer_script(&signature);
+        arb_signing::real::AsterEip712ExternalSigningProvider::new(
+            arb_signing::real::LiteralAsterExternalSignerCommandProvider::new(
+                signer_script.display().to_string(),
+            )
+            .expect("literal Aster signer command"),
+            FixedAsterNonce(nonce_micros),
+        )
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn hyperliquid_signing_policy(value: &str) -> arb_signing::SigningPolicy {
+        arb_signing::SigningPolicy::real_signing_enabled(
+            arb_signing::SigningPolicyRef::new(value).expect("policy ref"),
+        )
+    }
+
     #[cfg(feature = "live-exec")]
     #[derive(Clone, Copy, Debug)]
     struct FixedBinanceTimestamp(u64);
@@ -11147,6 +13862,10 @@ mod tests {
     #[cfg(feature = "live-exec")]
     #[derive(Clone, Copy, Debug)]
     struct FixedOkxTimestamp(&'static str);
+
+    #[cfg(all(feature = "live-exec", unix))]
+    #[derive(Clone, Copy, Debug)]
+    struct FixedAsterNonce(u64);
 
     #[cfg(feature = "live-exec")]
     impl arb_signing::real::BinanceTimestampProvider for FixedBinanceTimestamp {
@@ -11186,6 +13905,40 @@ mod tests {
         ) -> arb_signing::SigningResult<String> {
             Ok(self.0.to_owned())
         }
+    }
+
+    #[cfg(all(feature = "live-exec", unix))]
+    impl arb_signing::real::AsterNonceProvider for FixedAsterNonce {
+        fn nonce_micros(
+            &self,
+            _audit_ref: &arb_signing::SigningAuditRef,
+        ) -> arb_signing::SigningResult<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[cfg(all(feature = "live-exec", unix))]
+    fn write_aster_signer_script(signature: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "arb-venue-exec-aster-test-{}-{}",
+            std::process::id(),
+            signature.len()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let script_path = dir.join("signer.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\ncat >/dev/null\nprintf '{}'\n", signature),
+        )
+        .expect("write Aster signer script");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod signer script");
+        script_path
     }
 
     #[cfg(feature = "live-exec")]
@@ -11484,6 +14237,127 @@ mod tests {
             Ok(live::BitgetExecHttpResponse::new(
                 self.status_code,
                 self.body.clone(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedAsterCall {
+        method: live::AsterExecHttpMethod,
+        base_url: String,
+        endpoint: &'static str,
+        signed_query: String,
+        debug: String,
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordingAsterTransport {
+        status_code: u16,
+        bodies: Vec<String>,
+        calls: Vec<RecordedAsterCall>,
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl RecordingAsterTransport {
+        fn ok<const N: usize>(bodies: [&'static str; N]) -> Self {
+            Self {
+                status_code: 200,
+                bodies: bodies.into_iter().map(str::to_owned).collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl live::AsterExecTransport for RecordingAsterTransport {
+        fn send_signed(
+            &mut self,
+            request: live::AsterSignedRequest<'_>,
+        ) -> VenueExecResult<live::AsterExecHttpResponse> {
+            self.calls.push(RecordedAsterCall {
+                method: request.method(),
+                base_url: request.base_url().to_owned(),
+                endpoint: request.endpoint(),
+                signed_query: request.signed_query_for_transport().to_owned(),
+                debug: format!("{request:?}"),
+            });
+            let body = self
+                .bodies
+                .get(self.calls.len().saturating_sub(1))
+                .cloned()
+                .unwrap_or_else(|| "{}".to_owned());
+            Ok(live::AsterExecHttpResponse::new(self.status_code, body))
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct StaticHyperliquidSigner;
+
+    #[cfg(feature = "live-exec")]
+    impl live::HyperliquidExchangeSigner for StaticHyperliquidSigner {
+        fn sign_l1_action(
+            &self,
+            _input: live::HyperliquidSigningInput,
+        ) -> VenueExecResult<live::HyperliquidSignatureJson> {
+            live::HyperliquidSignatureJson::new(format!(
+                r#"{{"r":"0x{}","s":"0x{}","v":27}}"#,
+                "1".repeat(64),
+                "2".repeat(64)
+            ))
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedHyperliquidCall {
+        base_url: String,
+        endpoint: &'static str,
+        body: String,
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordingHyperliquidTransport {
+        status_code: u16,
+        bodies: Vec<String>,
+        calls: Vec<RecordedHyperliquidCall>,
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl RecordingHyperliquidTransport {
+        fn ok<const N: usize>(bodies: [&'static str; N]) -> Self {
+            Self {
+                status_code: 200,
+                bodies: bodies.into_iter().map(str::to_owned).collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    impl live::HyperliquidExecTransport for RecordingHyperliquidTransport {
+        fn post_json(
+            &mut self,
+            base_url: &str,
+            endpoint: &'static str,
+            body: &str,
+        ) -> VenueExecResult<live::HyperliquidExecHttpResponse> {
+            self.calls.push(RecordedHyperliquidCall {
+                base_url: base_url.to_owned(),
+                endpoint,
+                body: body.to_owned(),
+            });
+            let body = self
+                .bodies
+                .get(self.calls.len().saturating_sub(1))
+                .cloned()
+                .unwrap_or_else(|| "{}".to_owned());
+            Ok(live::HyperliquidExecHttpResponse::new(
+                self.status_code,
+                body,
             ))
         }
     }

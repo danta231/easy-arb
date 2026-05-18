@@ -15,10 +15,14 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "live-exec")]
+use std::process::{Child, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
+#[cfg(feature = "live-exec")]
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arb_config::ExecutionMode as ConfigExecutionMode;
@@ -89,11 +93,13 @@ use arb_venue_data::{
 
 #[cfg(feature = "live-exec")]
 use arb_signing::real::{
-    BinanceHmacSigningInput, BinanceRequestParam, BitgetHmacSigningInput,
+    AsterEip712ExternalSigningProvider, AsterRealSigningProvider, AsterRequestParam,
+    AsterV3SigningInput, BinanceHmacSigningInput, BinanceRequestParam, BitgetHmacSigningInput,
     BitgetRealSigningProvider, BitgetRealSigningProviderFromEnv, BitgetRestMethod,
     BybitHmacSigningInput, BybitRealSigningProvider, BybitRealSigningProviderFromEnv,
-    BybitSigningPayloadKind, OkxHmacSigningInput, OkxRealSigningProvider,
-    OkxRealSigningProviderFromEnv, OkxRestMethod, RealSigningProvider, RealSigningProviderFromEnv,
+    BybitSigningPayloadKind, LiteralAsterExternalSignerCommandProvider, OkxHmacSigningInput,
+    OkxRealSigningProvider, OkxRealSigningProviderFromEnv, OkxRestMethod, RealSigningProvider,
+    RealSigningProviderFromEnv, SystemAsterNonceProvider,
 };
 #[cfg(feature = "live-exec")]
 use arb_signing::{SigningPolicy, SigningPolicyRef, SigningPurpose, SigningRequestId};
@@ -127,6 +133,11 @@ const BITGET_REST_BASE_URL: &str = "https://api.bitget.com";
 const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const ASTER_SPOT_REST_BASE_URL: &str = "https://sapi.asterdex.com";
 const ASTER_FUTURES_REST_BASE_URL: &str = "https://fapi.asterdex.com";
+#[cfg(feature = "live-exec")]
+const ASTER_FUTURES_V3_REST_BASE_URL: &str = "https://fapi3.asterdex.com";
+const ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT: &str = "ASTER_EIP712_SIGNER_CMD";
+#[cfg(feature = "live-exec")]
+const ARB_WALLET_SIGNER_PATH_ENV_DEFAULT: &str = "ARB_WALLET_SIGNER_PATH";
 const FUNDING_ARB_MAX_MARK_INDEX_DIVERGENCE_BPS: i128 = 100;
 const RAW_TICKER_FILE: &str = "raw/binance_ticker_24hr.redacted.json";
 const RAW_TICKER_REF: &str = "raw/binance_ticker_24hr.redacted.json";
@@ -174,6 +185,14 @@ const BINANCE_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str = "target/binance-guarded
 #[cfg(feature = "live-exec")]
 const BINANCE_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
     "target/binance-basis-guarded-live-auto-once";
+#[cfg(feature = "live-exec")]
+const BINANCE_BASIS_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/binance-basis-resident-live";
+#[cfg(feature = "live-exec")]
+const BINANCE_BASIS_LIVE_STACK_DEFAULT_OUT: &str = "target/binance-basis-live-stack";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_BASIS_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/multi-venue-basis-resident-live";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_BASIS_LIVE_STACK_DEFAULT_OUT: &str = "target/multi-venue-basis-live-stack";
 #[cfg(feature = "live-exec")]
 const BYBIT_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
     "target/bybit-basis-guarded-live-auto-once";
@@ -226,6 +245,9 @@ const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
 const FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD: &str = "0.01";
 const FUNDING_PRIVATE_ACCOUNT_MIN_COLLATERAL_RATIO_BPS: i128 = 1_000;
 const FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS: i128 = 60_000;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_PRIVATE_READONLY_SNAPSHOT_DEFAULT_OUT: &str =
+    "target/funding-arb-private-readonly-snapshot";
 const FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS: i128 = 150;
 const FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS: i128 = 5;
 const BASIS_AUTO_PRICE_GUARD_MAX_BPS: i128 = 100;
@@ -255,6 +277,18 @@ const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 const BYBIT_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8802";
 const BYBIT_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 const BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_BYBIT_SPOT_WSS_BIND_ADDR: &str = "127.0.0.1:8805";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_BYBIT_PERP_WSS_BIND_ADDR: &str = "127.0.0.1:8806";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR: &str = "127.0.0.1:8807";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_OKX_PERP_WSS_BIND_ADDR: &str = "127.0.0.1:8808";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR: &str = "127.0.0.1:8809";
+#[cfg(feature = "live-exec")]
+const MULTI_VENUE_BITGET_PERP_WSS_BIND_ADDR: &str = "127.0.0.1:8810";
 const BYBIT_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 const BYBIT_LINEAR_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const RECONCILIATION_RUN_ID: &str = "recon:full-pipeline-simulated";
@@ -539,8 +573,8 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(8),
             funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
-            runtime_live_execution_supported: false,
-            runtime_private_order_confirmation_supported: false,
+            runtime_live_execution_supported: true,
+            runtime_private_order_confirmation_supported: true,
             runtime_auto_funding_settlement_supported: false,
         },
         ArbVenueCapabilityProfile {
@@ -554,8 +588,8 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(1),
             funding_settlement_price_source: FundingSettlementPriceSource::OraclePrice,
             dry_run_execution_supported: true,
-            runtime_live_execution_supported: false,
-            runtime_private_order_confirmation_supported: false,
+            runtime_live_execution_supported: true,
+            runtime_private_order_confirmation_supported: true,
             runtime_auto_funding_settlement_supported: false,
         },
     ]
@@ -1811,6 +1845,212 @@ pub struct BasisExitSupervisorReport {
     pub output_dir: Option<PathBuf>,
 }
 
+/// Binance basis 常驻实盘状态机选项。
+///
+/// 中文说明：这是单进程 resident runner（常驻运行器）入口。每轮先监督已有仓位，
+/// 再根据硬上限决定是否允许新增开仓。真实下单仍必须显式设置 `execute_live`
+/// 和确认标志。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisResidentLiveOptions {
+    pub symbol: String,
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub min_net_bps: i128,
+    pub auto_price_guard_bps: Option<i128>,
+    pub spot_wss_monitor_url: String,
+    pub perp_wss_monitor_url: String,
+    pub private_order_events_dir: Option<PathBuf>,
+    pub adl_events_dir: Option<PathBuf>,
+    pub position_state_path: Option<PathBuf>,
+    pub poll_interval_secs: u64,
+    pub max_cycles: Option<u64>,
+    pub max_live_entries: u64,
+    pub max_concurrent_positions: usize,
+    pub max_total_notional_usdt: String,
+    pub execute_live: bool,
+    pub acknowledge_basis_live_orders: bool,
+}
+
+/// Binance basis 常驻实盘状态机报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisResidentLiveReport {
+    pub phase: String,
+    pub cycles: u64,
+    pub last_net_bps: Option<i128>,
+    pub entry_dispatch_attempted: bool,
+    pub exit_dispatch_attempted: bool,
+    pub position_state_path: Option<PathBuf>,
+    pub open_position_count: usize,
+    pub total_open_notional_usdt: String,
+    pub live_entry_count: usize,
+    pub halt_reason: Option<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// Binance basis 实盘 stack supervisor 选项。
+///
+/// 中文说明：该入口负责用一个命令编排 Binance 现货/合约 WSS monitor 和
+/// resident runner。默认会拉起两个 monitor 子进程，再启动 resident runner；
+/// 所有子进程日志、事件和 summary 写入同一个输出目录。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisLiveStackOptions {
+    pub symbol: String,
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub min_net_bps: i128,
+    pub auto_price_guard_bps: Option<i128>,
+    pub spot_wss_bind_addr: String,
+    pub perp_wss_bind_addr: String,
+    pub monitor_symbol: Option<String>,
+    pub monitor_reconnect_delay_secs: u64,
+    pub readiness_timeout_secs: u64,
+    pub shutdown_grace_secs: u64,
+    pub private_order_events_dir: Option<PathBuf>,
+    pub adl_events_dir: Option<PathBuf>,
+    pub position_state_path: Option<PathBuf>,
+    pub poll_interval_secs: u64,
+    pub max_cycles: Option<u64>,
+    pub max_live_entries: u64,
+    pub max_concurrent_positions: usize,
+    pub max_total_notional_usdt: String,
+    pub use_existing_monitors: bool,
+    pub execute_live: bool,
+    pub acknowledge_basis_live_orders: bool,
+}
+
+/// Binance basis 实盘 stack supervisor 报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceBasisLiveStackReport {
+    pub phase: String,
+    pub output_dir: PathBuf,
+    pub resident_exit_status: Option<String>,
+    pub spot_monitor_exit_status: Option<String>,
+    pub perp_monitor_exit_status: Option<String>,
+    pub readiness_ok: bool,
+    pub halt_reason: Option<String>,
+}
+
+/// spot-perp basis 常驻实盘支持的中心化交易所。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BasisLiveVenue {
+    Binance,
+    Bybit,
+    Okx,
+    Bitget,
+}
+
+impl BasisLiveVenue {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binance => "binance",
+            Self::Bybit => "bybit",
+            Self::Okx => "okx",
+            Self::Bitget => "bitget",
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Binance => "Binance",
+            Self::Bybit => "Bybit",
+            Self::Okx => "OKX",
+            Self::Bitget => "Bitget",
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn default_symbol(self) -> &'static str {
+        match self {
+            Self::Binance | Self::Bybit => BASIS_SYMBOL,
+            Self::Okx => OKX_BASIS_SYMBOL,
+            Self::Bitget => BITGET_BASIS_SYMBOL,
+        }
+    }
+}
+
+/// 多交易所 basis 常驻实盘状态机选项。
+///
+/// 中文说明：该入口按交易所轮询现有仓位退出监督和新增开仓机会，所有真实下单
+/// 仍走各交易所已有的 guarded live auto-once 链路，并受全局硬上限约束。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiVenueBasisResidentLiveOptions {
+    pub venues: Vec<BasisLiveVenue>,
+    pub symbols: BTreeMap<BasisLiveVenue, String>,
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub min_net_bps: i128,
+    pub auto_price_guard_bps: Option<i128>,
+    pub spot_wss_monitor_urls: BTreeMap<BasisLiveVenue, String>,
+    pub perp_wss_monitor_urls: BTreeMap<BasisLiveVenue, String>,
+    pub private_order_events_dir: Option<PathBuf>,
+    pub adl_events_dir: Option<PathBuf>,
+    pub poll_interval_secs: u64,
+    pub max_cycles: Option<u64>,
+    pub max_live_entries: u64,
+    pub max_concurrent_positions: usize,
+    pub max_total_notional_usdt: String,
+    pub execute_live: bool,
+    pub acknowledge_basis_live_orders: bool,
+}
+
+/// 多交易所 basis 常驻实盘状态机报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiVenueBasisResidentLiveReport {
+    pub phase: String,
+    pub cycles: u64,
+    pub venue_count: usize,
+    pub entry_dispatch_attempted: bool,
+    pub exit_dispatch_attempted: bool,
+    pub open_position_count: usize,
+    pub total_open_notional_usdt: String,
+    pub live_entry_count: usize,
+    pub halt_reason: Option<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+/// 多交易所 basis live stack supervisor 选项。
+///
+/// 中文说明：该入口负责用一个命令编排多交易所行情 monitor 和通用 resident
+/// runner。当前内置可托管 WSS monitor 覆盖 Binance/Bybit；OKX/Bitget 真实
+/// live 模式需要通过 `--use-existing-monitors` 接入外部 WSS monitor URL。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiVenueBasisLiveStackOptions {
+    pub venues: Vec<BasisLiveVenue>,
+    pub symbols: BTreeMap<BasisLiveVenue, String>,
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub min_net_bps: i128,
+    pub auto_price_guard_bps: Option<i128>,
+    pub spot_wss_bind_addrs: BTreeMap<BasisLiveVenue, String>,
+    pub perp_wss_bind_addrs: BTreeMap<BasisLiveVenue, String>,
+    pub monitor_symbol: Option<String>,
+    pub monitor_reconnect_delay_secs: u64,
+    pub readiness_timeout_secs: u64,
+    pub shutdown_grace_secs: u64,
+    pub private_order_events_dir: Option<PathBuf>,
+    pub adl_events_dir: Option<PathBuf>,
+    pub poll_interval_secs: u64,
+    pub max_cycles: Option<u64>,
+    pub max_live_entries: u64,
+    pub max_concurrent_positions: usize,
+    pub max_total_notional_usdt: String,
+    pub use_existing_monitors: bool,
+    pub execute_live: bool,
+    pub acknowledge_basis_live_orders: bool,
+}
+
+/// 多交易所 basis live stack supervisor 报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiVenueBasisLiveStackReport {
+    pub phase: String,
+    pub output_dir: PathBuf,
+    pub resident_exit_status: Option<String>,
+    pub monitor_exit_statuses: BTreeMap<String, String>,
+    pub readiness_ok: bool,
+    pub halt_reason: Option<String>,
+}
+
 /// Binance BTCUSDT 人工确认请求。
 ///
 /// 中文说明：只有调用方显式提供同一个 `expected_plan_hash` 时才会生成审批记录。
@@ -2221,6 +2461,112 @@ pub struct FundingArbGuardedDryRunOnceOptions {
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
+}
+
+/// funding arb guarded live canary 单次闭环选项。
+///
+/// 中文说明：该入口复用 guarded dry-run 的观察者快照、账单、私有账户和仓位
+/// 门禁；默认只生成计划和报告。只有同时传入 `--execute-live` 与
+/// `--i-understand-funding-arb-live-orders` 时才会进入真实下单/撤单/查单路径。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbGuardedLiveCanaryOnceOptions {
+    pub dry_run: FundingArbGuardedDryRunOnceOptions,
+    pub execute_live: bool,
+    pub acknowledge_funding_arb_live_orders: bool,
+    pub private_order_events_dir: Option<PathBuf>,
+    pub hyperliquid_user: Option<String>,
+    pub hyperliquid_source: String,
+    pub hyperliquid_vault_address: Option<String>,
+    pub hyperliquid_expires_after_ms: Option<u64>,
+    pub hyperliquid_asset_ids: BTreeMap<String, u32>,
+    pub aster_user: Option<String>,
+    pub aster_signer: Option<String>,
+    pub aster_signer_cmd_env: String,
+}
+
+/// funding arb guarded live canary 单次闭环报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbGuardedLiveCanaryOnceReport {
+    pub pair_id: String,
+    pub symbol: String,
+    pub dry_run: FundingArbGuardedDryRunReport,
+    pub plan_hash: Option<String>,
+    pub approval_event_id: Option<String>,
+    pub manual_gate_released: bool,
+    pub execute_live: bool,
+    pub dispatch_allowed: bool,
+    pub dispatch_plan_built: bool,
+    pub dispatch_request_count: usize,
+    pub dispatch_attempted: bool,
+    pub submitted_receipt_count: usize,
+    pub private_confirmation_count: usize,
+    pub protection_attempted: bool,
+    pub protection_actions: Vec<String>,
+    pub protection_receipt_count: usize,
+    pub residual_risk: Option<String>,
+    pub execution_report_status: Option<String>,
+    pub blocking_reasons: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+    pub mutable_execution_started: bool,
+}
+
+/// funding arb 私有只读实盘快照选项。
+///
+/// 中文说明：该入口只读取交易所账户和仓位只读接口，并写出 guarded dry-run
+/// 可消费的 raw snapshot；不提交订单、不撤单、不转账。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbPrivateReadonlySnapshotOnceOptions {
+    pub config_path: PathBuf,
+    pub snapshot_path: PathBuf,
+    pub pair_id: String,
+    pub output_dir: Option<PathBuf>,
+    pub hyperliquid_user: Option<String>,
+    pub aster_user: Option<String>,
+    pub aster_signer: Option<String>,
+    pub aster_signer_cmd_env: String,
+}
+
+/// wallet signer 本地预检选项。
+///
+/// 中文说明：该入口只做本地签名和地址匹配验证，不访问交易所、不下单、不撤单、
+/// 不转账。Aster 默认检查，因为 Aster 私有只读接口也需要 EIP-712 签名；
+/// Hyperliquid 只读不需要签名，仅在显式要求或配置 agent 时检查。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletSignerPreflightOptions {
+    pub output_dir: Option<PathBuf>,
+    pub aster_signer: Option<String>,
+    pub aster_signer_cmd_env: String,
+    pub skip_aster: bool,
+    pub check_hyperliquid: bool,
+    pub hyperliquid_agent: Option<String>,
+    pub hyperliquid_source: String,
+}
+
+/// wallet signer 本地预检报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletSignerPreflightReport {
+    pub checked_at: String,
+    pub aster_status: String,
+    pub hyperliquid_status: String,
+    pub blocking_reasons: Vec<String>,
+    pub summary_path: Option<PathBuf>,
+    pub mutable_execution_started: bool,
+}
+
+/// funding arb 私有只读实盘快照报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbPrivateReadonlySnapshotReport {
+    pub pair_id: String,
+    pub symbol: String,
+    pub venue_families: Vec<String>,
+    pub account_statement_count: usize,
+    pub position_statement_count: usize,
+    pub account_raw_snapshot_path: PathBuf,
+    pub position_raw_snapshot_path: PathBuf,
+    pub summary_path: PathBuf,
+    pub updated_at: String,
+    pub mutable_execution_started: bool,
+    pub notes: Vec<String>,
 }
 
 /// 单个 symbol 的实时 basis 行情行。
@@ -3032,6 +3378,939 @@ pub fn run_binance_basis_scan(
     Ok(report)
 }
 
+/// 运行一次 funding arb 私有只读实盘快照采集。
+///
+/// 中文说明：该入口只读取账户/仓位 USER_DATA 或公开用户状态接口并写出本地
+/// raw snapshot；不提交订单、不撤单、不转账，也不启动 mutable execution。
+pub fn run_funding_arb_private_readonly_snapshot_once(
+    options: FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingArbPrivateReadonlySnapshotReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_funding_arb_private_readonly_snapshot_once_live(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "当前 arb-runtime 未使用 live-exec feature 构建，拒绝读取交易所私有账户接口"
+                .to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn run_funding_arb_private_readonly_snapshot_once_live(
+    options: FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingArbPrivateReadonlySnapshotReport> {
+    validate_funding_arb_private_readonly_snapshot_once_options(&options)?;
+    let snapshot_json = read_utf8(&options.snapshot_path)?;
+    let snapshot = parse_funding_arb_monitor_snapshot_json(&snapshot_json)?;
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.pair_id == options.pair_id)
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb snapshot does not contain pair_id `{}`",
+                options.pair_id
+            ),
+        })?;
+    let symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let venue_families = [
+        normalize_venue_family(&row.venue_a_family),
+        normalize_venue_family(&row.venue_b_family),
+    ];
+    let output_dir = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(FUNDING_ARB_PRIVATE_READONLY_SNAPSHOT_DEFAULT_OUT));
+    fs::create_dir_all(&output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.clone(),
+        message: error.to_string(),
+    })?;
+
+    let mut account_statements = Vec::new();
+    let mut position_statements = Vec::new();
+    let mut notes =
+        vec!["只读快照采集未启动 mutable execution，未提交订单、未撤单、未转账。".to_owned()];
+    for family in &venue_families {
+        let leg = funding_arb_leg_config(family, &symbol)?;
+        let fetched = fetch_funding_arb_private_readonly_venue_snapshots(
+            family,
+            &symbol,
+            &leg.account_id,
+            &leg.venue_id,
+            &leg.instrument_id,
+            &options,
+        )?;
+        account_statements.push(FundingPrivateReadonlyRawStatement {
+            venue_family: family.clone(),
+            account_id: leg.account_id.clone(),
+            payload_json: fetched.account_payload_json,
+        });
+        position_statements.push(FundingPrivateReadonlyRawStatement {
+            venue_family: family.clone(),
+            account_id: leg.account_id,
+            payload_json: fetched.position_payload_json,
+        });
+        notes.push(fetched.note);
+    }
+
+    let updated_at = current_utc_timestamp()?.to_string();
+    let account_raw_json =
+        funding_private_readonly_raw_snapshot_json(&updated_at, &account_statements);
+    let position_raw_json =
+        funding_private_readonly_raw_snapshot_json(&updated_at, &position_statements);
+    parse_funding_private_raw_snapshot_json(
+        &account_raw_json,
+        "funding private readonly account raw snapshot",
+    )?;
+    parse_funding_private_raw_snapshot_json(
+        &position_raw_json,
+        "funding private readonly position raw snapshot",
+    )?;
+
+    let account_raw_snapshot_path =
+        output_dir.join("funding_arb_private_account_raw_snapshot.json");
+    let position_raw_snapshot_path =
+        output_dir.join("funding_arb_private_position_raw_snapshot.json");
+    let summary_path = output_dir.join("funding_arb_private_readonly_summary.json");
+    write_utf8(account_raw_snapshot_path.clone(), &account_raw_json)?;
+    write_utf8(position_raw_snapshot_path.clone(), &position_raw_json)?;
+
+    let report = FundingArbPrivateReadonlySnapshotReport {
+        pair_id: options.pair_id,
+        symbol,
+        venue_families: venue_families.to_vec(),
+        account_statement_count: account_statements.len(),
+        position_statement_count: position_statements.len(),
+        account_raw_snapshot_path,
+        position_raw_snapshot_path,
+        summary_path: summary_path.clone(),
+        updated_at,
+        mutable_execution_started: false,
+        notes,
+    };
+    write_utf8(
+        summary_path,
+        &funding_private_readonly_snapshot_summary_json(&report),
+    )?;
+    Ok(report)
+}
+
+fn validate_funding_arb_private_readonly_snapshot_once_options(
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<()> {
+    if options.pair_id.trim().is_empty() {
+        return Err(cli_arg_error(
+            "funding-arb-private-readonly-snapshot-once requires --pair-id",
+        ));
+    }
+    if options.snapshot_path.as_os_str().is_empty() {
+        return Err(cli_arg_error(
+            "funding-arb-private-readonly-snapshot-once requires --snapshot",
+        ));
+    }
+    if options.config_path.as_os_str().is_empty() {
+        return Err(cli_arg_error(
+            "funding-arb-private-readonly-snapshot-once requires --config",
+        ));
+    }
+    if options
+        .output_dir
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-private-readonly-snapshot-once --out cannot be empty",
+        ));
+    }
+    if options.aster_signer_cmd_env.trim().is_empty() {
+        return Err(cli_arg_error(
+            "funding-arb-private-readonly-snapshot-once Aster signer command env name cannot be empty",
+        ));
+    }
+    if let Some(user) = &options.hyperliquid_user {
+        validate_hyperliquid_user_address(user)?;
+    }
+    if let Some(user) = &options.aster_user {
+        validate_aster_v3_address(user, "--aster-user")?;
+    }
+    if let Some(signer) = &options.aster_signer {
+        validate_aster_v3_address(signer, "--aster-signer")?;
+    }
+    Ok(())
+}
+
+/// 运行一次 wallet signer 本地预检。
+///
+/// 中文说明：该入口只调用本地 signer 做离线签名，不访问交易所，不启动 mutable
+/// execution。报告中的 `Blocked` 表示不能继续私有只读或交易签名前置流程。
+pub fn run_wallet_signer_preflight(
+    options: WalletSignerPreflightOptions,
+) -> RuntimeResult<WalletSignerPreflightReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_wallet_signer_preflight_live(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "当前 arb-runtime 未使用 live-exec feature 构建，拒绝读取签名环境".to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn run_wallet_signer_preflight_live(
+    options: WalletSignerPreflightOptions,
+) -> RuntimeResult<WalletSignerPreflightReport> {
+    validate_wallet_signer_preflight_options(&options)?;
+    let mut blocking_reasons = Vec::new();
+
+    let aster_status = if options.skip_aster {
+        "Skipped".to_owned()
+    } else {
+        match run_aster_wallet_signer_preflight(&options) {
+            Ok(()) => "Passed".to_owned(),
+            Err(error) => {
+                blocking_reasons.push(format!("Aster signer preflight blocked: {error}"));
+                "Blocked".to_owned()
+            }
+        }
+    };
+
+    let should_check_hyperliquid = options.check_hyperliquid
+        || options.hyperliquid_agent.is_some()
+        || std::env::var("HYPERLIQUID_AGENT").is_ok();
+    let hyperliquid_status = if !should_check_hyperliquid {
+        "Skipped".to_owned()
+    } else {
+        match run_hyperliquid_wallet_signer_preflight(&options) {
+            Ok(()) => "Passed".to_owned(),
+            Err(error) => {
+                blocking_reasons.push(format!("Hyperliquid signer preflight blocked: {error}"));
+                "Blocked".to_owned()
+            }
+        }
+    };
+
+    let checked_at = current_utc_timestamp()?.to_string();
+    let summary_path = if let Some(output_dir) = &options.output_dir {
+        fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+            path: output_dir.clone(),
+            message: error.to_string(),
+        })?;
+        let path = output_dir.join("wallet_signer_preflight_summary.json");
+        let report = WalletSignerPreflightReport {
+            checked_at: checked_at.clone(),
+            aster_status: aster_status.clone(),
+            hyperliquid_status: hyperliquid_status.clone(),
+            blocking_reasons: blocking_reasons.clone(),
+            summary_path: Some(path.clone()),
+            mutable_execution_started: false,
+        };
+        write_utf8(path.clone(), &wallet_signer_preflight_summary_json(&report))?;
+        Some(path)
+    } else {
+        None
+    };
+
+    Ok(WalletSignerPreflightReport {
+        checked_at,
+        aster_status,
+        hyperliquid_status,
+        blocking_reasons,
+        summary_path,
+        mutable_execution_started: false,
+    })
+}
+
+fn validate_wallet_signer_preflight_options(
+    options: &WalletSignerPreflightOptions,
+) -> RuntimeResult<()> {
+    if options
+        .output_dir
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "wallet-signer-preflight --out cannot be empty",
+        ));
+    }
+    if options.aster_signer_cmd_env.trim().is_empty() {
+        return Err(cli_arg_error(
+            "wallet-signer-preflight Aster signer command env name cannot be empty",
+        ));
+    }
+    if let Some(signer) = &options.aster_signer {
+        validate_aster_v3_address(signer, "--aster-signer")?;
+    }
+    if let Some(agent) = &options.hyperliquid_agent {
+        validate_hyperliquid_user_address(agent)?;
+    }
+    if !matches!(options.hyperliquid_source.as_str(), "a" | "b") {
+        return Err(cli_arg_error(
+            "wallet-signer-preflight --hyperliquid-source must be `a` or `b`",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn run_aster_wallet_signer_preflight(options: &WalletSignerPreflightOptions) -> RuntimeResult<()> {
+    let aster_signer =
+        resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
+    let signer_command = resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
+    let signer = AsterEip712ExternalSigningProvider::new(
+        LiteralAsterExternalSignerCommandProvider::new(signer_command)?,
+        SystemAsterNonceProvider,
+    );
+    let policy_ref = SigningPolicyRef::new("signing-policy/wallet-signer-preflight/aster")?;
+    let signing_policy = SigningPolicy::real_signing_enabled(policy_ref.clone());
+    let signed = signer.sign_aster_eip712_external(
+        AsterV3SigningInput::new(
+            SigningRequestId::new("signing-request/wallet-signer-preflight/aster")?,
+            policy_ref,
+            SigningPurpose::QueryAccount,
+            VenueId::new("venue:ASTER-USDT-FUTURES")?,
+            AccountId::new("account/aster-wallet-signer-preflight")?,
+            None,
+            aster_signer,
+            [AsterRequestParam::new("symbol", "BTCUSDT")?],
+        )?,
+        &signing_policy,
+    )?;
+    if signed.signature().as_str().len() != 132 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Aster wallet signer returned malformed signature length".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn run_hyperliquid_wallet_signer_preflight(
+    options: &WalletSignerPreflightOptions,
+) -> RuntimeResult<()> {
+    let agent = resolve_required_hyperliquid_agent_address(options.hyperliquid_agent.as_deref())?;
+    let signer_command = resolve_wallet_signer_command()?;
+    let output = Command::new(signer_command)
+        .arg("hyperliquid-l1-phantom")
+        .arg("--source")
+        .arg(&options.hyperliquid_source)
+        .arg("--connection-id")
+        .arg("0x0000000000000000000000000000000000000000000000000000000000000000")
+        .arg("--expect-address")
+        .arg(agent)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|error| RuntimeError::UnsafeConfig {
+            message: format!("cannot start arb-wallet-signer for Hyperliquid preflight: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "arb-wallet-signer Hyperliquid preflight exited unsuccessfully".to_owned(),
+        });
+    }
+    let rendered = String::from_utf8(output.stdout).map_err(|_| RuntimeError::UnsafeConfig {
+        message: "arb-wallet-signer Hyperliquid preflight output is not valid UTF-8".to_owned(),
+    })?;
+    validate_hyperliquid_signature_json(rendered.trim())?;
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_required_hyperliquid_agent_address(option_value: Option<&str>) -> RuntimeResult<String> {
+    let value = option_value
+        .map(str::to_owned)
+        .or_else(|| std::env::var("HYPERLIQUID_AGENT").ok())
+        .ok_or_else(|| RuntimeError::UnsafeConfig {
+            message:
+                "Hyperliquid signer preflight requires --hyperliquid-agent or HYPERLIQUID_AGENT"
+                    .to_owned(),
+        })?;
+    validate_hyperliquid_user_address(&value)?;
+    Ok(value.trim().to_ascii_lowercase())
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_required_hyperliquid_user(option_value: Option<&str>) -> RuntimeResult<String> {
+    let value = option_value
+        .map(str::to_owned)
+        .or_else(|| std::env::var("HYPERLIQUID_USER").ok())
+        .ok_or_else(|| RuntimeError::UnsafeConfig {
+            message: "Hyperliquid live canary requires --hyperliquid-user or HYPERLIQUID_USER"
+                .to_owned(),
+        })?;
+    validate_hyperliquid_user_address(&value)?;
+    Ok(value.trim().to_ascii_lowercase())
+}
+
+#[cfg(feature = "live-exec")]
+fn validate_hyperliquid_signature_json(value: &str) -> RuntimeResult<()> {
+    let has_r = value.contains("\"r\":\"0x");
+    let has_s = value.contains("\"s\":\"0x");
+    let has_v = value.contains("\"v\":27") || value.contains("\"v\":28");
+    if has_r && has_s && has_v && !value.contains('\n') {
+        Ok(())
+    } else {
+        Err(RuntimeError::UnsafeConfig {
+            message: "arb-wallet-signer Hyperliquid preflight returned malformed signature JSON"
+                .to_owned(),
+        })
+    }
+}
+
+fn validate_hyperliquid_user_address(user: &str) -> RuntimeResult<()> {
+    let value = user.trim();
+    let valid = value.len() == 42
+        && value.starts_with("0x")
+        && value
+            .as_bytes()
+            .iter()
+            .skip(2)
+            .all(|byte| byte.is_ascii_hexdigit());
+    if valid {
+        Ok(())
+    } else {
+        Err(cli_arg_error(
+            "Hyperliquid --hyperliquid-user must be a 42-character 0x-prefixed hex address",
+        ))
+    }
+}
+
+fn validate_aster_v3_address(value: &str, field: &str) -> RuntimeResult<()> {
+    let trimmed = value.trim();
+    let valid = trimmed.len() == 42
+        && trimmed.starts_with("0x")
+        && trimmed
+            .as_bytes()
+            .iter()
+            .skip(2)
+            .all(|byte| byte.is_ascii_hexdigit());
+    if valid {
+        Ok(())
+    } else {
+        Err(cli_arg_error(format!(
+            "Aster {field} must be a 42-character 0x-prefixed hex address"
+        )))
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateReadonlyRawStatement {
+    venue_family: String,
+    account_id: String,
+    payload_json: String,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateReadonlyFetchedVenue {
+    account_payload_json: String,
+    position_payload_json: String,
+    note: String,
+}
+
+#[cfg(feature = "live-exec")]
+#[allow(clippy::too_many_arguments)]
+fn fetch_funding_arb_private_readonly_venue_snapshots(
+    venue_family: &str,
+    symbol: &str,
+    account_id: &str,
+    venue_id: &str,
+    instrument_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    match normalize_venue_family(venue_family).as_str() {
+        "binance" => {
+            fetch_binance_funding_private_readonly_snapshots(symbol, account_id, venue_id, options)
+        }
+        "bybit" => {
+            fetch_bybit_funding_private_readonly_snapshots(symbol, account_id, venue_id, options)
+        }
+        "okx" => fetch_okx_funding_private_readonly_snapshots(
+            instrument_id,
+            account_id,
+            venue_id,
+            options,
+        ),
+        "bitget" => fetch_bitget_funding_private_readonly_snapshots(
+            account_id,
+            venue_id,
+            instrument_id,
+            options,
+        ),
+        "aster" => {
+            fetch_aster_funding_private_readonly_snapshots(symbol, account_id, venue_id, options)
+        }
+        "hyperliquid" => fetch_hyperliquid_funding_private_readonly_snapshots(account_id, options),
+        other => Err(RuntimeError::UnsafeConfig {
+            message: format!("unsupported funding-arb private readonly venue `{other}`"),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn read_only_signing_policy_from_config(config_path: &Path) -> RuntimeResult<SigningPolicy> {
+    let config = arb_config::ArbConfig::from_path(config_path)?;
+    if !config.signing().real_signing_enabled() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "只读私有账户查询需要 config.signing.real_signing_enabled=true；仍只允许 QueryAccount purpose"
+                .to_owned(),
+        });
+    }
+    Ok(SigningPolicy::real_signing_enabled(SigningPolicyRef::new(
+        config.signing().policy_ref().as_str(),
+    )?))
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_binance_funding_private_readonly_snapshots(
+    symbol: &str,
+    account_id: &str,
+    venue_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = RealSigningProviderFromEnv::from_default_env()?;
+    let account_signed = signer.sign_binance_hmac(
+        BinanceHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/binance/account/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            vec![BinanceRequestParam::new(
+                "recvWindow",
+                live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+            )?],
+        )?,
+        &signing_policy,
+    )?;
+    let account_payload_json = fetch_signed_binance_get_with_curl(
+        BINANCE_USDM_FUTURES_BASE_URL,
+        "/fapi/v3/account",
+        account_signed.api_key_header_name(),
+        account_signed.api_key_header_value(),
+        account_signed.signed_query_for_transport(),
+    )?;
+    let position_signed = signer.sign_binance_hmac(
+        BinanceHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/binance/position/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            vec![
+                BinanceRequestParam::new("symbol", symbol.to_owned())?,
+                BinanceRequestParam::new(
+                    "recvWindow",
+                    live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+                )?,
+            ],
+        )?,
+        &signing_policy,
+    )?;
+    let position_payload_json = fetch_signed_binance_get_with_curl(
+        BINANCE_USDM_FUTURES_BASE_URL,
+        "/fapi/v3/positionRisk",
+        position_signed.api_key_header_name(),
+        position_signed.api_key_header_value(),
+        position_signed.signed_query_for_transport(),
+    )?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json,
+        position_payload_json,
+        note: "binance USER_DATA account and positionRisk fetched read-only".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_bybit_funding_private_readonly_snapshots(
+    symbol: &str,
+    account_id: &str,
+    venue_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
+    let account_signed = signer.sign_bybit_hmac(
+        BybitHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/bybit/account/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            BybitSigningPayloadKind::QueryString,
+            "accountType=UNIFIED",
+        )?,
+        &signing_policy,
+    )?;
+    let account_payload_json = fetch_signed_bybit_get_with_curl(
+        BYBIT_REST_BASE_URL,
+        "/v5/account/wallet-balance",
+        &account_signed,
+    )?;
+    let position_query = format!("category=linear&symbol={symbol}");
+    let position_signed = signer.sign_bybit_hmac(
+        BybitHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/bybit/position/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            BybitSigningPayloadKind::QueryString,
+            &position_query,
+        )?,
+        &signing_policy,
+    )?;
+    let position_payload_json = fetch_signed_bybit_get_with_curl(
+        BYBIT_REST_BASE_URL,
+        "/v5/position/list",
+        &position_signed,
+    )?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json,
+        position_payload_json,
+        note: "bybit V5 wallet-balance and linear position/list fetched read-only".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_okx_funding_private_readonly_snapshots(
+    instrument_id: &str,
+    account_id: &str,
+    venue_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = OkxRealSigningProviderFromEnv::from_default_env()?;
+    let account_path = "/api/v5/account/balance?ccy=USDT";
+    let account_signed = signer.sign_okx_hmac(
+        OkxHmacSigningInput::new(
+            SigningRequestId::new("signing-request/funding-arb-readonly/okx/account")?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            OkxRestMethod::Get,
+            account_path,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let account_payload_json = fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &account_signed)?;
+    let inst_id = okx_inst_id_from_public_monitor_instrument(instrument_id, "SWAP")?;
+    let position_path = format!("/api/v5/account/positions?instType=SWAP&instId={inst_id}");
+    let position_signed = signer.sign_okx_hmac(
+        OkxHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/okx/position/{}",
+                basis_identifier_component(&inst_id)
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            OkxRestMethod::Get,
+            &position_path,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let position_payload_json =
+        fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &position_signed)?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json,
+        position_payload_json,
+        note: "okx account balance and SWAP positions fetched read-only".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_bitget_funding_private_readonly_snapshots(
+    account_id: &str,
+    venue_id: &str,
+    instrument_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = BitgetRealSigningProviderFromEnv::from_default_env()?;
+    let account_path = "/api/v2/mix/account/accounts?productType=USDT-FUTURES";
+    let account_signed = signer.sign_bitget_hmac(
+        BitgetHmacSigningInput::new(
+            SigningRequestId::new("signing-request/funding-arb-readonly/bitget/account")?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            BitgetRestMethod::Get,
+            account_path,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let account_payload_json =
+        fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &account_signed)?;
+    let symbol = bitget_symbol_from_runtime_instrument(instrument_id)?;
+    let position_path =
+        "/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT";
+    let position_signed = signer.sign_bitget_hmac(
+        BitgetHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/bitget/position/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            BitgetRestMethod::Get,
+            position_path,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let position_payload_json =
+        fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &position_signed)?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json,
+        position_payload_json,
+        note: "bitget mix account and all-position fetched read-only".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_aster_funding_private_readonly_snapshots(
+    symbol: &str,
+    account_id: &str,
+    venue_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let aster_user = resolve_optional_aster_v3_address(
+        options.aster_user.as_deref(),
+        "ASTER_USER",
+        "--aster-user",
+    )?;
+    let aster_signer =
+        resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
+    let signer_command = resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
+    let signer = AsterEip712ExternalSigningProvider::new(
+        LiteralAsterExternalSignerCommandProvider::new(signer_command)?,
+        SystemAsterNonceProvider,
+    );
+    let account_signed = signer.sign_aster_eip712_external(
+        AsterV3SigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/aster/account/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            aster_user.clone(),
+            aster_signer.clone(),
+            Vec::<AsterRequestParam>::new(),
+        )?,
+        &signing_policy,
+    )?;
+    let account_payload_json = fetch_signed_aster_get_with_curl(
+        ASTER_FUTURES_V3_REST_BASE_URL,
+        "/fapi/v3/balance",
+        &account_signed,
+    )?;
+    let position_signed = signer.sign_aster_eip712_external(
+        AsterV3SigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/aster/position/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            aster_user,
+            aster_signer,
+            vec![AsterRequestParam::new("symbol", symbol.to_owned())?],
+        )?,
+        &signing_policy,
+    )?;
+    let position_payload_json = fetch_signed_aster_get_with_curl(
+        ASTER_FUTURES_V3_REST_BASE_URL,
+        "/fapi/v3/positionRisk",
+        &position_signed,
+    )?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json,
+        position_payload_json,
+        note: "aster Futures V3 balance and positionRisk fetched read-only via arb-wallet-signer EIP-712 boundary".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_aster_eip712_signer_command(command_env_name: &str) -> RuntimeResult<String> {
+    if let Ok(command) = std::env::var(command_env_name) {
+        let trimmed = command.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_owned());
+        }
+    }
+    resolve_wallet_signer_command()
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_wallet_signer_command() -> RuntimeResult<String> {
+    if let Ok(command) = std::env::var(ARB_WALLET_SIGNER_PATH_ENV_DEFAULT) {
+        let trimmed = command.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_owned());
+        }
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let bundled = parent.join(platform_executable_name("arb-wallet-signer"));
+            if bundled.is_file() {
+                return Ok(bundled.display().to_string());
+            }
+        }
+    }
+    Ok(platform_executable_name("arb-wallet-signer").to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn platform_executable_name(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("{name}.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_owned()
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_required_aster_v3_address(
+    option_value: Option<&str>,
+    env_name: &str,
+) -> RuntimeResult<String> {
+    let field = if env_name == "ASTER_USER" {
+        "--aster-user"
+    } else {
+        "--aster-signer"
+    };
+    let value = option_value
+        .map(str::to_owned)
+        .or_else(|| std::env::var(env_name).ok())
+        .ok_or_else(|| RuntimeError::UnsafeConfig {
+            message: format!("Aster live signer requires {field} or {env_name}"),
+        })?;
+    validate_aster_v3_address(&value, field)?;
+    Ok(value.trim().to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_optional_aster_v3_address(
+    option_value: Option<&str>,
+    env_name: &str,
+    field: &str,
+) -> RuntimeResult<Option<String>> {
+    let value = option_value
+        .map(str::to_owned)
+        .or_else(|| std::env::var(env_name).ok());
+    if let Some(value) = value {
+        validate_aster_v3_address(&value, field)?;
+        Ok(Some(value.trim().to_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_hyperliquid_funding_private_readonly_snapshots(
+    account_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let Some(user) = options.hyperliquid_user.as_ref() else {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Hyperliquid read-only snapshot requires --hyperliquid-user with the master or sub-account address".to_owned(),
+        });
+    };
+    let body = format!(
+        "{{\"type\":\"clearinghouseState\",\"user\":{}}}",
+        json_string(user.trim())
+    );
+    let payload_json = fetch_public_json_post_with_curl(HYPERLIQUID_INFO_URL, &body)?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json: payload_json.clone(),
+        position_payload_json: payload_json,
+        note: format!(
+            "hyperliquid clearinghouseState fetched read-only for account reference {account_id}"
+        ),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_private_readonly_raw_snapshot_json(
+    updated_at: &str,
+    statements: &[FundingPrivateReadonlyRawStatement],
+) -> String {
+    let statements_json = statements
+        .iter()
+        .map(|statement| {
+            format!(
+                "{{\"account_id\":{},\"payload\":{},\"venue_family\":{}}}",
+                json_string(&statement.account_id),
+                json_string(&statement.payload_json),
+                json_string(&statement.venue_family)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"schema_version\":\"1.0.0\",\"status\":\"complete\",\"statements\":[{}],\"updated_at\":{}}}",
+        statements_json,
+        json_string(updated_at)
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_private_readonly_snapshot_summary_json(
+    report: &FundingArbPrivateReadonlySnapshotReport,
+) -> String {
+    format!(
+        "{{\"account_raw_snapshot_path\":{},\"account_statement_count\":{},\"mutable_execution_started\":{},\"notes\":{},\"pair_id\":{},\"position_raw_snapshot_path\":{},\"position_statement_count\":{},\"summary_path\":{},\"symbol\":{},\"updated_at\":{},\"venue_families\":{}}}",
+        json_string(&report.account_raw_snapshot_path.display().to_string()),
+        report.account_statement_count,
+        report.mutable_execution_started,
+        json_string_array(&report.notes),
+        json_string(&report.pair_id),
+        json_string(&report.position_raw_snapshot_path.display().to_string()),
+        report.position_statement_count,
+        json_string(&report.summary_path.display().to_string()),
+        json_string(&report.symbol),
+        json_string(&report.updated_at),
+        json_string_array(&report.venue_families)
+    )
+}
+
 /// 拉取一次 Binance 公开 spot/perp basis 数据并进入正式模拟管线。
 ///
 /// 中文说明：该入口使用公开 REST 数据创建标准化事件和候选转换，然后继续经过
@@ -3693,6 +4972,3167 @@ pub fn run_bitget_basis_guarded_live_auto_once(
                     .to_owned(),
         })
     }
+}
+
+/// 运行 Binance basis 常驻实盘状态机。
+pub fn run_binance_basis_resident_live(
+    options: BinanceBasisResidentLiveOptions,
+) -> RuntimeResult<BinanceBasisResidentLiveReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_binance_basis_resident_live_inner(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "当前 arb-runtime 未使用 live-exec feature 构建，拒绝 Binance basis 常驻实盘"
+                .to_owned(),
+        })
+    }
+}
+
+/// 运行 Binance basis 实盘 stack supervisor。
+pub fn run_binance_basis_live_stack(
+    options: BinanceBasisLiveStackOptions,
+) -> RuntimeResult<BinanceBasisLiveStackReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_binance_basis_live_stack_inner(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message:
+                "当前 arb-runtime 未使用 live-exec feature 构建，拒绝启动 Binance basis 实盘 stack"
+                    .to_owned(),
+        })
+    }
+}
+
+/// 运行多交易所 basis 常驻实盘状态机。
+pub fn run_multi_venue_basis_resident_live(
+    options: MultiVenueBasisResidentLiveOptions,
+) -> RuntimeResult<MultiVenueBasisResidentLiveReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_multi_venue_basis_resident_live_inner(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "当前 arb-runtime 未使用 live-exec feature 构建，拒绝多交易所 basis 常驻实盘"
+                .to_owned(),
+        })
+    }
+}
+
+/// 运行多交易所 basis live stack supervisor。
+pub fn run_multi_venue_basis_live_stack(
+    options: MultiVenueBasisLiveStackOptions,
+) -> RuntimeResult<MultiVenueBasisLiveStackReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_multi_venue_basis_live_stack_inner(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message:
+                "当前 arb-runtime 未使用 live-exec feature 构建，拒绝启动多交易所 basis live stack"
+                    .to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BinanceBasisResidentLiveState {
+    phase: String,
+    position_state_path: Option<PathBuf>,
+    updated_at: String,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Debug)]
+struct BinanceBasisResidentLiveLock {
+    path: PathBuf,
+}
+
+#[cfg(feature = "live-exec")]
+impl Drop for BinanceBasisResidentLiveLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BinanceBasisResidentPosition {
+    position_id: String,
+    position_state_path: PathBuf,
+    notional_usdt: String,
+    status: String,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BinanceBasisResidentPositionRegistry {
+    positions: BTreeMap<String, BinanceBasisResidentPosition>,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResidentEntryCapacity {
+    Allowed,
+    Blocked(String),
+}
+
+#[cfg(feature = "live-exec")]
+fn run_binance_basis_resident_live_inner(
+    options: BinanceBasisResidentLiveOptions,
+) -> RuntimeResult<BinanceBasisResidentLiveReport> {
+    validate_binance_basis_resident_live_options(&options)?;
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(BINANCE_BASIS_RESIDENT_LIVE_DEFAULT_OUT));
+    fs::create_dir_all(&output_root).map_err(|error| RuntimeError::Io {
+        path: output_root.clone(),
+        message: error.to_string(),
+    })?;
+    let _lock = acquire_binance_basis_resident_live_lock(&output_root)?;
+    write_binance_basis_resident_live_config(&output_root, &options)?;
+
+    let mut state = load_binance_basis_resident_live_state(&output_root)?
+        .unwrap_or_else(|| initial_binance_basis_resident_live_state(&options));
+    if let Some(position_state_path) = &options.position_state_path {
+        state.phase = "running".to_owned();
+        state.position_state_path = Some(position_state_path.clone());
+        state.updated_at = current_utc_timestamp()?.to_string();
+        ensure_initial_resident_position_registered(&output_root, position_state_path)?;
+    }
+    write_binance_basis_resident_live_state(&output_root, &state)?;
+
+    let mut cycles = 0_u64;
+    let mut last_net_bps = None;
+    let mut entry_dispatch_attempted = false;
+    let mut exit_dispatch_attempted = false;
+    let mut halt_reason = None;
+    loop {
+        if output_root.join("STOP").exists() {
+            halt_reason =
+                Some("STOP file observed; resident live halted before next cycle".to_owned());
+            state.phase = "halted".to_owned();
+            state.updated_at = current_utc_timestamp()?.to_string();
+            write_binance_basis_resident_live_state(&output_root, &state)?;
+            break;
+        }
+        if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
+            halt_reason = Some("max cycles reached".to_owned());
+            break;
+        }
+        cycles += 1;
+
+        if state.phase == "halted" {
+            halt_reason.get_or_insert_with(|| "resident state is halted".to_owned());
+            break;
+        }
+
+        let latest_registry = load_binance_basis_resident_position_registry(&output_root)?;
+        for position in latest_registry.active_positions() {
+            let cycle_dir = output_root
+                .join("exit")
+                .join(&position.position_id)
+                .join(resident_cycle_dir_name(cycles)?);
+            match run_binance_basis_resident_exit_cycle(
+                &options,
+                &position.position_state_path,
+                &cycle_dir,
+            ) {
+                Ok(report) => {
+                    append_binance_basis_resident_exit_event(
+                        &output_root,
+                        cycles,
+                        &cycle_dir,
+                        &report,
+                    )?;
+                    if options.execute_live && report.dispatch_attempted {
+                        exit_dispatch_attempted = true;
+                        if binance_basis_resident_exit_cleanly_closed(&report) {
+                            append_binance_basis_resident_position_closed(
+                                &output_root,
+                                &position.position_id,
+                                cycles,
+                                &cycle_dir,
+                                &report,
+                            )?;
+                        } else {
+                            append_binance_basis_resident_position_unknown(
+                                &output_root,
+                                &position.position_id,
+                                cycles,
+                                &cycle_dir,
+                                "exit dispatch attempted but close was not cleanly confirmed",
+                            )?;
+                            halt_reason = Some(
+                                "exit dispatch produced unknown or residual state; resident live stopped"
+                                    .to_owned(),
+                            );
+                            state.phase = "halted".to_owned();
+                            state.updated_at = current_utc_timestamp()?.to_string();
+                            write_binance_basis_resident_live_state(&output_root, &state)?;
+                            break;
+                        }
+                    } else if options.execute_live
+                        && report.decision != SpotPerpBasisExitDecision::Hold.as_str()
+                        && !report.blocking_reasons.is_empty()
+                    {
+                        halt_reason = Some(
+                            "exit signal was non-hold but live close was blocked; resident live stopped"
+                                .to_owned(),
+                        );
+                        state.phase = "halted".to_owned();
+                        state.updated_at = current_utc_timestamp()?.to_string();
+                        write_binance_basis_resident_live_state(&output_root, &state)?;
+                        break;
+                    }
+                }
+                Err(error) => {
+                    append_binance_basis_resident_error_event(
+                        &output_root,
+                        cycles,
+                        "exit",
+                        &cycle_dir,
+                        &error.to_string(),
+                    )?;
+                    if options.execute_live {
+                        halt_reason = Some(format!(
+                            "exit cycle failed for {}; resident live stopped: {error}",
+                            position.position_id
+                        ));
+                        state.phase = "halted".to_owned();
+                        state.updated_at = current_utc_timestamp()?.to_string();
+                        write_binance_basis_resident_live_state(&output_root, &state)?;
+                        break;
+                    }
+                }
+            }
+        }
+        if state.phase == "halted" {
+            break;
+        }
+
+        let latest_registry = load_binance_basis_resident_position_registry(&output_root)?;
+        match binance_basis_resident_entry_capacity(&options, &latest_registry)? {
+            ResidentEntryCapacity::Allowed => {
+                let cycle_dir = output_root
+                    .join("entry")
+                    .join(resident_cycle_dir_name(cycles)?);
+                match run_binance_basis_resident_entry_cycle(&options, &cycle_dir) {
+                    Ok(report) => {
+                        last_net_bps = report.net_bps;
+                        append_binance_basis_resident_entry_event(
+                            &output_root,
+                            cycles,
+                            &cycle_dir,
+                            &report,
+                        )?;
+                        if options.execute_live && report.dispatch_attempted {
+                            entry_dispatch_attempted = true;
+                            let position_state =
+                                cycle_dir.join("live-dispatch/basis_exit_supervisor_state.json");
+                            if binance_basis_resident_entry_cleanly_opened(&report, &position_state)
+                            {
+                                let position = append_binance_basis_resident_position_opened(
+                                    &output_root,
+                                    cycles,
+                                    &cycle_dir,
+                                    &position_state,
+                                    &report,
+                                )?;
+                                state.phase = "running".to_owned();
+                                state.position_state_path = Some(position.position_state_path);
+                                state.updated_at = current_utc_timestamp()?.to_string();
+                                write_binance_basis_resident_live_state(&output_root, &state)?;
+                            } else {
+                                halt_reason = Some(
+                                    "entry dispatch was attempted but no clean open-position state was confirmed; resident live stopped"
+                                        .to_owned(),
+                                );
+                                state.phase = "halted".to_owned();
+                                state.updated_at = current_utc_timestamp()?.to_string();
+                                write_binance_basis_resident_live_state(&output_root, &state)?;
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        append_binance_basis_resident_error_event(
+                            &output_root,
+                            cycles,
+                            "entry",
+                            &cycle_dir,
+                            &error.to_string(),
+                        )?;
+                        if options.execute_live {
+                            halt_reason = Some(format!(
+                                "entry cycle failed; resident live stopped: {error}"
+                            ));
+                            state.phase = "halted".to_owned();
+                            state.updated_at = current_utc_timestamp()?.to_string();
+                            write_binance_basis_resident_live_state(&output_root, &state)?;
+                            break;
+                        }
+                    }
+                }
+            }
+            ResidentEntryCapacity::Blocked(reason) => {
+                append_binance_basis_resident_capacity_event(&output_root, cycles, &reason)?;
+                if latest_registry.active_positions().is_empty() {
+                    halt_reason = Some(reason);
+                    break;
+                }
+            }
+        }
+
+        if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
+            halt_reason = Some("max cycles reached".to_owned());
+            break;
+        }
+        thread::sleep(Duration::from_secs(options.poll_interval_secs));
+    }
+
+    let latest_registry = load_binance_basis_resident_position_registry(&output_root)?;
+    Ok(BinanceBasisResidentLiveReport {
+        phase: state.phase,
+        cycles,
+        last_net_bps,
+        entry_dispatch_attempted,
+        exit_dispatch_attempted,
+        position_state_path: state.position_state_path,
+        open_position_count: latest_registry.active_positions().len(),
+        total_open_notional_usdt: latest_registry.total_active_notional()?.to_string(),
+        live_entry_count: latest_registry.live_entry_count(),
+        halt_reason,
+        output_dir: Some(output_root),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn validate_binance_basis_resident_live_options(
+    options: &BinanceBasisResidentLiveOptions,
+) -> RuntimeResult<()> {
+    if options.poll_interval_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance resident live poll interval must be greater than zero".to_owned(),
+        });
+    }
+    if matches!(options.max_cycles, Some(0)) {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance resident live max cycles must be greater than zero".to_owned(),
+        });
+    }
+    if options.spot_wss_monitor_url.trim().is_empty()
+        || options.perp_wss_monitor_url.trim().is_empty()
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance resident live requires spot/perp WSS monitor URLs".to_owned(),
+        });
+    }
+    if options.execute_live && !options.acknowledge_basis_live_orders {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "缺少 --i-understand-basis-live-orders，拒绝启动 Binance 常驻实盘".to_owned(),
+        });
+    }
+    if options.execute_live && options.poll_interval_secs < 10 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance resident live poll interval must be at least 10 seconds in live mode"
+                .to_owned(),
+        });
+    }
+    if options.max_live_entries == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance resident live max live entries must be greater than zero".to_owned(),
+        });
+    }
+    if options.max_concurrent_positions == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance resident live max concurrent positions must be greater than zero"
+                .to_owned(),
+        });
+    }
+    let max_total = Decimal::from_str(&options.max_total_notional_usdt)?;
+    if max_total.is_negative() || max_total.is_zero() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance resident live max total notional must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if let Some(bps) = options.auto_price_guard_bps {
+        validate_basis_auto_price_guard_bps(bps)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn initial_binance_basis_resident_live_state(
+    options: &BinanceBasisResidentLiveOptions,
+) -> BinanceBasisResidentLiveState {
+    BinanceBasisResidentLiveState {
+        phase: "running".to_owned(),
+        position_state_path: options.position_state_path.clone(),
+        updated_at: current_utc_timestamp_string(),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_resident_cycle_allowed(cycles: u64, max_cycles: Option<u64>) -> bool {
+    match max_cycles {
+        Some(max) => cycles < max,
+        None => true,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn resident_cycle_dir_name(cycle: u64) -> RuntimeResult<String> {
+    Ok(format!(
+        "{:06}-{}",
+        cycle,
+        current_utc_timestamp()?.to_string().replace([':', '.'], "")
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn acquire_binance_basis_resident_live_lock(
+    output_root: &Path,
+) -> RuntimeResult<BinanceBasisResidentLiveLock> {
+    let path = output_root.join("resident_live.lock");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                RuntimeError::UnsafeConfig {
+                    message: format!(
+                        "Binance resident live lock already exists at {}; another runner may be active",
+                        path.display()
+                    ),
+                }
+            } else {
+                RuntimeError::Io {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            }
+        })?;
+    file.write_all(format!("created_at={}\n", current_utc_timestamp_string()).as_bytes())
+        .map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    Ok(BinanceBasisResidentLiveLock { path })
+}
+
+#[cfg(feature = "live-exec")]
+impl BinanceBasisResidentPositionRegistry {
+    fn active_positions(&self) -> Vec<BinanceBasisResidentPosition> {
+        self.positions
+            .values()
+            .filter(|position| position.status != "closed")
+            .cloned()
+            .collect()
+    }
+
+    fn live_entry_count(&self) -> usize {
+        self.positions.len()
+    }
+
+    fn has_unknown_position(&self) -> bool {
+        self.positions
+            .values()
+            .any(|position| position.status == "unknown")
+    }
+
+    fn total_active_notional(&self) -> RuntimeResult<Decimal> {
+        let mut total = Decimal::from_scaled_atoms(0, 0);
+        for position in self.active_positions() {
+            total = total.checked_add(Decimal::from_str(&position.notional_usdt)?)?;
+        }
+        Ok(total)
+    }
+
+    fn contains_position_state_path(&self, path: &Path) -> bool {
+        let target = path.display().to_string();
+        self.positions
+            .values()
+            .any(|position| position.position_state_path.display().to_string() == target)
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_resident_entry_capacity(
+    options: &BinanceBasisResidentLiveOptions,
+    registry: &BinanceBasisResidentPositionRegistry,
+) -> RuntimeResult<ResidentEntryCapacity> {
+    if registry.has_unknown_position() {
+        return Ok(ResidentEntryCapacity::Blocked(
+            "unknown resident position exists; new entries are blocked".to_owned(),
+        ));
+    }
+    if registry.live_entry_count() >= options.max_live_entries as usize {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "max live entries reached: {} >= {}",
+            registry.live_entry_count(),
+            options.max_live_entries
+        )));
+    }
+    let active_positions = registry.active_positions();
+    if active_positions.len() >= options.max_concurrent_positions {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "max concurrent positions reached: {} >= {}",
+            active_positions.len(),
+            options.max_concurrent_positions
+        )));
+    }
+    let max_total = Decimal::from_str(&options.max_total_notional_usdt)?;
+    let next_notional = Decimal::from_str(BINANCE_GUARDED_LIVE_NOTIONAL_USDT)?;
+    let after_next = registry
+        .total_active_notional()?
+        .checked_add(next_notional)?;
+    if after_next > max_total {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "max total notional would be exceeded: after_next={} max={}",
+            after_next, max_total
+        )));
+    }
+    Ok(ResidentEntryCapacity::Allowed)
+}
+
+#[cfg(feature = "live-exec")]
+fn run_binance_basis_resident_entry_cycle(
+    options: &BinanceBasisResidentLiveOptions,
+    cycle_dir: &Path,
+) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
+    run_binance_basis_guarded_live_auto_once(BasisGuardedLiveAutoOnceOptions {
+        symbol: options.symbol.clone(),
+        config_path: options.config_path.clone(),
+        output_dir: Some(cycle_dir.to_path_buf()),
+        min_net_bps: options.min_net_bps,
+        max_spot_ask: None,
+        min_perp_bid: None,
+        auto_price_guard_bps: options.auto_price_guard_bps,
+        spot_wss_monitor_url: Some(options.spot_wss_monitor_url.clone()),
+        perp_wss_monitor_url: Some(options.perp_wss_monitor_url.clone()),
+        private_order_events_dir: options.private_order_events_dir.clone(),
+        execute_live: options.execute_live,
+        acknowledge_basis_live_orders: options.acknowledge_basis_live_orders,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn run_binance_basis_resident_exit_cycle(
+    options: &BinanceBasisResidentLiveOptions,
+    position_state_path: &Path,
+    cycle_dir: &Path,
+) -> RuntimeResult<BasisExitSupervisorReport> {
+    run_basis_exit_supervisor(BasisExitSupervisorOptions {
+        position_state_path: position_state_path.to_path_buf(),
+        config_path: options.config_path.clone(),
+        output_dir: Some(cycle_dir.to_path_buf()),
+        spot_wss_monitor_url: Some(options.spot_wss_monitor_url.clone()),
+        perp_wss_monitor_url: Some(options.perp_wss_monitor_url.clone()),
+        adl_events_dir: options.adl_events_dir.clone(),
+        execute_live: options.execute_live,
+        acknowledge_basis_live_orders: options.acknowledge_basis_live_orders,
+        once: true,
+        poll_interval_secs: options.poll_interval_secs,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn load_binance_basis_resident_position_registry(
+    output_root: &Path,
+) -> RuntimeResult<BinanceBasisResidentPositionRegistry> {
+    let path = output_root.join("resident_live_positions.jsonl");
+    if !path.exists() {
+        return Ok(BinanceBasisResidentPositionRegistry::default());
+    }
+    let input = read_utf8(&path)?;
+    let mut registry = BinanceBasisResidentPositionRegistry::default();
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let fields = parse_json_object_value_slices(line)?;
+        let event_type =
+            required_json_value_string(&fields, "event_type", "resident position registry")?;
+        match event_type.as_str() {
+            "position_opened" => {
+                let position_id = required_json_value_string(
+                    &fields,
+                    "position_id",
+                    "resident position registry",
+                )?;
+                let position_state_path = PathBuf::from(required_json_value_string(
+                    &fields,
+                    "position_state_path",
+                    "resident position registry",
+                )?);
+                let notional_usdt = required_json_value_string(
+                    &fields,
+                    "notional_usdt",
+                    "resident position registry",
+                )?;
+                registry.positions.insert(
+                    position_id.clone(),
+                    BinanceBasisResidentPosition {
+                        position_id,
+                        position_state_path,
+                        notional_usdt,
+                        status: "open".to_owned(),
+                    },
+                );
+            }
+            "position_closed" => {
+                let position_id = required_json_value_string(
+                    &fields,
+                    "position_id",
+                    "resident position registry",
+                )?;
+                if let Some(position) = registry.positions.get_mut(&position_id) {
+                    position.status = "closed".to_owned();
+                }
+            }
+            "position_unknown" => {
+                let position_id = required_json_value_string(
+                    &fields,
+                    "position_id",
+                    "resident position registry",
+                )?;
+                if let Some(position) = registry.positions.get_mut(&position_id) {
+                    position.status = "unknown".to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(registry)
+}
+
+#[cfg(feature = "live-exec")]
+fn ensure_initial_resident_position_registered(
+    output_root: &Path,
+    position_state_path: &Path,
+) -> RuntimeResult<()> {
+    let registry = load_binance_basis_resident_position_registry(output_root)?;
+    if registry.contains_position_state_path(position_state_path) {
+        return Ok(());
+    }
+    let state_json = read_utf8(position_state_path)?;
+    let state = parse_basis_exit_supervisor_state_json(&state_json)?;
+    let position_id = format!(
+        "initial-{}",
+        current_utc_timestamp()?.to_string().replace([':', '.'], "")
+    );
+    let line = format!(
+        "{{\"cycle\":0,\"event_type\":\"position_opened\",\"notional_usdt\":{},\"opened_at\":{},\"position_id\":{},\"position_state_path\":{},\"source\":\"initial-position-state\"}}",
+        json_string(&state.notional_usd),
+        json_string(&state.opened_at),
+        json_string(&position_id),
+        json_string(&position_state_path.display().to_string()),
+    );
+    append_binance_basis_resident_position_jsonl(output_root, &line)?;
+    append_binance_basis_resident_jsonl(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_resident_entry_cleanly_opened(
+    report: &BasisGuardedLiveAutoOnceReport,
+    position_state_path: &Path,
+) -> bool {
+    position_state_path.exists()
+        && report.submitted_receipt_count >= 2
+        && report.private_confirmation_count >= 2
+        && report.residual_risk.is_none()
+        && report.blocking_reasons.is_empty()
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_resident_exit_cleanly_closed(report: &BasisExitSupervisorReport) -> bool {
+    report.dispatch_attempted
+        && report.private_confirmation_count > 0
+        && report.residual_risk.is_none()
+        && report.blocking_reasons.is_empty()
+}
+
+#[cfg(feature = "live-exec")]
+fn ascii_suffix_for_identifier(value: &str) -> String {
+    let mut suffix = value
+        .chars()
+        .rev()
+        .take(24)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if suffix.is_empty() {
+        suffix.push_str("id");
+    }
+    suffix
+}
+
+#[cfg(feature = "live-exec")]
+fn write_binance_basis_resident_live_config(
+    output_root: &Path,
+    options: &BinanceBasisResidentLiveOptions,
+) -> RuntimeResult<()> {
+    let contents = format!(
+        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"spot_wss_monitor_url\":{},\"perp_wss_monitor_url\":{},\"position_state_path\":{},\"symbol\":{}}}",
+        optional_json_string(options.adl_events_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
+        options
+            .auto_price_guard_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&options.config_path.display().to_string()),
+        options.execute_live,
+        options.max_concurrent_positions,
+        options
+            .max_cycles
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        options.max_live_entries,
+        json_string(&options.max_total_notional_usdt),
+        options.min_net_bps,
+        optional_json_string(options.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
+        options.poll_interval_secs,
+        optional_json_string(options.private_order_events_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
+        json_string(&options.spot_wss_monitor_url),
+        json_string(&options.perp_wss_monitor_url),
+        optional_json_string(options.position_state_path.as_ref().map(|path| path.display().to_string()).as_deref()),
+        json_string(&options.symbol)
+    );
+    write_utf8(
+        output_root.join("resident_live_config.json"),
+        &(contents + "\n"),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn load_binance_basis_resident_live_state(
+    output_root: &Path,
+) -> RuntimeResult<Option<BinanceBasisResidentLiveState>> {
+    let path = output_root.join("resident_live_state.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = read_utf8(&path)?;
+    let fields = parse_json_object_value_slices(&contents)?;
+    let phase = required_json_value_string(&fields, "phase", "resident live state")?;
+    let updated_at = required_json_value_string(&fields, "updated_at", "resident live state")?;
+    let position_state_path =
+        optional_json_value_string(&fields, "position_state_path", "resident live state")?
+            .map(PathBuf::from);
+    Ok(Some(BinanceBasisResidentLiveState {
+        phase,
+        position_state_path,
+        updated_at,
+    }))
+}
+
+#[cfg(feature = "live-exec")]
+fn write_binance_basis_resident_live_state(
+    output_root: &Path,
+    state: &BinanceBasisResidentLiveState,
+) -> RuntimeResult<()> {
+    let contents = format!(
+        "{{\"phase\":{},\"position_state_path\":{},\"updated_at\":{}}}\n",
+        json_string(&state.phase),
+        optional_json_string(
+            state
+                .position_state_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .as_deref()
+        ),
+        json_string(&state.updated_at)
+    );
+    write_utf8(output_root.join("resident_live_state.json"), &contents)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_entry_event(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    report: &BasisGuardedLiveAutoOnceReport,
+) -> RuntimeResult<()> {
+    append_binance_basis_resident_jsonl(
+        output_root,
+        &format!(
+            "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"event_type\":\"entry_cycle\",\"net_bps\":{},\"private_confirmation_count\":{},\"residual_risk\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+            report.blocking_reasons.len(),
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            report.dispatch_allowed,
+            report.dispatch_attempted,
+            report
+                .net_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_owned()),
+            report.private_confirmation_count,
+            optional_json_string(report.residual_risk.as_deref()),
+            report.submitted_receipt_count,
+            json_string(&report.symbol)
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_exit_event(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    report: &BasisExitSupervisorReport,
+) -> RuntimeResult<()> {
+    append_binance_basis_resident_jsonl(
+        output_root,
+        &format!(
+            "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"private_confirmation_count\":{},\"residual_risk\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+            report.blocking_reasons.len(),
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(&report.decision),
+            report.dispatch_attempted,
+            report.private_confirmation_count,
+            optional_json_string(report.residual_risk.as_deref()),
+            report.submitted_receipt_count,
+            json_string(&report.symbol)
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_position_opened(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    position_state_path: &Path,
+    report: &BasisGuardedLiveAutoOnceReport,
+) -> RuntimeResult<BinanceBasisResidentPosition> {
+    let state_json = read_utf8(position_state_path)?;
+    let state = parse_basis_exit_supervisor_state_json(&state_json)?;
+    let position_id = format!(
+        "pos-{}-{}",
+        cycle,
+        report
+            .plan_hash
+            .as_deref()
+            .map(ascii_suffix_for_identifier)
+            .unwrap_or_else(|| "no-plan-hash".to_owned())
+    );
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_opened\",\"net_bps\":{},\"notional_usdt\":{},\"opened_at\":{},\"plan_hash\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"submitted_receipt_count\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        report
+            .net_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&state.notional_usd),
+        json_string(&state.opened_at),
+        optional_json_string(report.plan_hash.as_deref()),
+        json_string(&position_id),
+        json_string(&position_state_path.display().to_string()),
+        report.private_confirmation_count,
+        report.submitted_receipt_count,
+    );
+    append_binance_basis_resident_position_jsonl(output_root, &line)?;
+    append_binance_basis_resident_jsonl(output_root, &line)?;
+    Ok(BinanceBasisResidentPosition {
+        position_id,
+        position_state_path: position_state_path.to_path_buf(),
+        notional_usdt: state.notional_usd,
+        status: "open".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_position_closed(
+    output_root: &Path,
+    position_id: &str,
+    cycle: u64,
+    cycle_dir: &Path,
+    report: &BasisExitSupervisorReport,
+) -> RuntimeResult<()> {
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"position_id\":{},\"private_confirmation_count\":{},\"submitted_receipt_count\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&report.decision),
+        json_string(position_id),
+        report.private_confirmation_count,
+        report.submitted_receipt_count,
+    );
+    append_binance_basis_resident_position_jsonl(output_root, &line)?;
+    append_binance_basis_resident_jsonl(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_position_unknown(
+    output_root: &Path,
+    position_id: &str,
+    cycle: u64,
+    cycle_dir: &Path,
+    reason: &str,
+) -> RuntimeResult<()> {
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_unknown\",\"position_id\":{},\"reason\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(position_id),
+        json_string(reason),
+    );
+    append_binance_basis_resident_position_jsonl(output_root, &line)?;
+    append_binance_basis_resident_jsonl(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_capacity_event(
+    output_root: &Path,
+    cycle: u64,
+    reason: &str,
+) -> RuntimeResult<()> {
+    append_binance_basis_resident_jsonl(
+        output_root,
+        &format!(
+            "{{\"cycle\":{},\"event_type\":\"entry_capacity_blocked\",\"reason\":{}}}",
+            cycle,
+            json_string(reason),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_error_event(
+    output_root: &Path,
+    cycle: u64,
+    phase: &str,
+    cycle_dir: &Path,
+    error: &str,
+) -> RuntimeResult<()> {
+    append_binance_basis_resident_jsonl(
+        output_root,
+        &format!(
+            "{{\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"event_type\":\"cycle_error\",\"phase\":{}}}",
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(error),
+            json_string(phase)
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_jsonl(output_root: &Path, line: &str) -> RuntimeResult<()> {
+    let path = output_root.join("resident_live_events.jsonl");
+    append_line_to_jsonl(path, line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_resident_position_jsonl(
+    output_root: &Path,
+    line: &str,
+) -> RuntimeResult<()> {
+    let path = output_root.join("resident_live_positions.jsonl");
+    append_line_to_jsonl(path, line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_line_to_jsonl(path: PathBuf, line: &str) -> RuntimeResult<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|error| RuntimeError::Io {
+            path,
+            message: error.to_string(),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Debug)]
+struct MultiVenueBasisResidentLiveLock {
+    path: PathBuf,
+}
+
+#[cfg(feature = "live-exec")]
+impl Drop for MultiVenueBasisResidentLiveLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MultiVenueBasisResidentRegistrySummary {
+    active_position_count: usize,
+    live_entry_count: usize,
+    has_unknown_position: bool,
+    total_active_notional_usdt: Decimal,
+}
+
+#[cfg(feature = "live-exec")]
+fn run_multi_venue_basis_resident_live_inner(
+    options: MultiVenueBasisResidentLiveOptions,
+) -> RuntimeResult<MultiVenueBasisResidentLiveReport> {
+    validate_multi_venue_basis_resident_live_options(&options)?;
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(MULTI_VENUE_BASIS_RESIDENT_LIVE_DEFAULT_OUT));
+    fs::create_dir_all(&output_root).map_err(|error| RuntimeError::Io {
+        path: output_root.clone(),
+        message: error.to_string(),
+    })?;
+    let _lock = acquire_multi_venue_basis_resident_live_lock(&output_root)?;
+    write_multi_venue_basis_resident_live_config(&output_root, &options)?;
+    write_multi_venue_basis_resident_live_state(&output_root, "running", 0, None)?;
+
+    let mut cycles = 0_u64;
+    let mut entry_dispatch_attempted = false;
+    let mut exit_dispatch_attempted = false;
+    let mut halt_reason = None;
+    loop {
+        if output_root.join("STOP").exists() {
+            halt_reason = Some("STOP file observed; multi-venue resident live halted".to_owned());
+            write_multi_venue_basis_resident_live_state(
+                &output_root,
+                "halted",
+                cycles,
+                halt_reason.as_deref(),
+            )?;
+            break;
+        }
+        if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
+            halt_reason = Some("max cycles reached".to_owned());
+            break;
+        }
+        cycles += 1;
+        append_multi_venue_basis_resident_event(
+            &output_root,
+            "cycle_started",
+            &format!("\"cycle\":{}", cycles),
+        )?;
+
+        for venue in &options.venues {
+            let venue_dir = multi_venue_basis_resident_venue_dir(&output_root, *venue);
+            fs::create_dir_all(&venue_dir).map_err(|error| RuntimeError::Io {
+                path: venue_dir.clone(),
+                message: error.to_string(),
+            })?;
+            if venue_dir.join("STOP").exists() {
+                append_multi_venue_basis_resident_event(
+                    &output_root,
+                    "venue_stop_observed",
+                    &format!(
+                        "\"cycle\":{},\"venue\":{}",
+                        cycles,
+                        json_string(venue.as_str())
+                    ),
+                )?;
+                continue;
+            }
+
+            let registry = load_binance_basis_resident_position_registry(&venue_dir)?;
+            for position in registry.active_positions() {
+                let cycle_dir = venue_dir
+                    .join("exit")
+                    .join(&position.position_id)
+                    .join(resident_cycle_dir_name(cycles)?);
+                match run_multi_venue_basis_resident_exit_cycle(
+                    &options,
+                    *venue,
+                    &position.position_state_path,
+                    &cycle_dir,
+                ) {
+                    Ok(report) => {
+                        append_binance_basis_resident_exit_event(
+                            &venue_dir, cycles, &cycle_dir, &report,
+                        )?;
+                        append_multi_venue_basis_resident_event(
+                            &output_root,
+                            "exit_cycle",
+                            &format!(
+                                "\"blocking_reasons\":{},\"cycle\":{},\"decision\":{},\"dispatch_attempted\":{},\"private_confirmation_count\":{},\"residual_risk\":{},\"venue\":{}",
+                                report.blocking_reasons.len(),
+                                cycles,
+                                json_string(&report.decision),
+                                report.dispatch_attempted,
+                                report.private_confirmation_count,
+                                optional_json_string(report.residual_risk.as_deref()),
+                                json_string(venue.as_str())
+                            ),
+                        )?;
+                        if options.execute_live && report.dispatch_attempted {
+                            exit_dispatch_attempted = true;
+                            if binance_basis_resident_exit_cleanly_closed(&report) {
+                                append_binance_basis_resident_position_closed(
+                                    &venue_dir,
+                                    &position.position_id,
+                                    cycles,
+                                    &cycle_dir,
+                                    &report,
+                                )?;
+                            } else {
+                                append_binance_basis_resident_position_unknown(
+                                    &venue_dir,
+                                    &position.position_id,
+                                    cycles,
+                                    &cycle_dir,
+                                    "exit dispatch attempted but close was not cleanly confirmed",
+                                )?;
+                                halt_reason = Some(format!(
+                                    "{} exit dispatch produced unknown or residual state; multi-venue resident live stopped",
+                                    venue.label()
+                                ));
+                                write_multi_venue_basis_resident_live_state(
+                                    &output_root,
+                                    "halted",
+                                    cycles,
+                                    halt_reason.as_deref(),
+                                )?;
+                                break;
+                            }
+                        } else if options.execute_live
+                            && report.decision != SpotPerpBasisExitDecision::Hold.as_str()
+                            && !report.blocking_reasons.is_empty()
+                        {
+                            halt_reason = Some(format!(
+                                "{} exit signal was non-hold but live close was blocked; multi-venue resident live stopped",
+                                venue.label()
+                            ));
+                            write_multi_venue_basis_resident_live_state(
+                                &output_root,
+                                "halted",
+                                cycles,
+                                halt_reason.as_deref(),
+                            )?;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        append_binance_basis_resident_error_event(
+                            &venue_dir,
+                            cycles,
+                            "exit",
+                            &cycle_dir,
+                            &error.to_string(),
+                        )?;
+                        append_multi_venue_basis_resident_error_event(
+                            &output_root,
+                            cycles,
+                            *venue,
+                            "exit",
+                            &cycle_dir,
+                            &error.to_string(),
+                        )?;
+                        if options.execute_live {
+                            halt_reason = Some(format!(
+                                "{} exit cycle failed; multi-venue resident live stopped: {error}",
+                                venue.label()
+                            ));
+                            write_multi_venue_basis_resident_live_state(
+                                &output_root,
+                                "halted",
+                                cycles,
+                                halt_reason.as_deref(),
+                            )?;
+                            break;
+                        }
+                    }
+                }
+            }
+            if halt_reason.is_some() {
+                break;
+            }
+        }
+        if halt_reason.is_some() {
+            break;
+        }
+
+        for venue in &options.venues {
+            let venue_dir = multi_venue_basis_resident_venue_dir(&output_root, *venue);
+            if venue_dir.join("STOP").exists() {
+                continue;
+            }
+            match multi_venue_basis_resident_entry_capacity(&options, &output_root)? {
+                ResidentEntryCapacity::Allowed => {
+                    let cycle_dir = venue_dir
+                        .join("entry")
+                        .join(resident_cycle_dir_name(cycles)?);
+                    match run_multi_venue_basis_resident_entry_cycle(&options, *venue, &cycle_dir) {
+                        Ok(report) => {
+                            append_binance_basis_resident_entry_event(
+                                &venue_dir, cycles, &cycle_dir, &report,
+                            )?;
+                            append_multi_venue_basis_resident_entry_event(
+                                &output_root,
+                                cycles,
+                                *venue,
+                                &cycle_dir,
+                                &report,
+                            )?;
+                            if options.execute_live && report.dispatch_attempted {
+                                entry_dispatch_attempted = true;
+                                let position_state = cycle_dir
+                                    .join("live-dispatch/basis_exit_supervisor_state.json");
+                                if binance_basis_resident_entry_cleanly_opened(
+                                    &report,
+                                    &position_state,
+                                ) {
+                                    append_binance_basis_resident_position_opened(
+                                        &venue_dir,
+                                        cycles,
+                                        &cycle_dir,
+                                        &position_state,
+                                        &report,
+                                    )?;
+                                } else {
+                                    halt_reason = Some(format!(
+                                        "{} entry dispatch was attempted but no clean open-position state was confirmed; multi-venue resident live stopped",
+                                        venue.label()
+                                    ));
+                                    write_multi_venue_basis_resident_live_state(
+                                        &output_root,
+                                        "halted",
+                                        cycles,
+                                        halt_reason.as_deref(),
+                                    )?;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            append_binance_basis_resident_error_event(
+                                &venue_dir,
+                                cycles,
+                                "entry",
+                                &cycle_dir,
+                                &error.to_string(),
+                            )?;
+                            append_multi_venue_basis_resident_error_event(
+                                &output_root,
+                                cycles,
+                                *venue,
+                                "entry",
+                                &cycle_dir,
+                                &error.to_string(),
+                            )?;
+                            if options.execute_live {
+                                halt_reason = Some(format!(
+                                    "{} entry cycle failed; multi-venue resident live stopped: {error}",
+                                    venue.label()
+                                ));
+                                write_multi_venue_basis_resident_live_state(
+                                    &output_root,
+                                    "halted",
+                                    cycles,
+                                    halt_reason.as_deref(),
+                                )?;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ResidentEntryCapacity::Blocked(reason) => {
+                    append_multi_venue_basis_resident_event(
+                        &output_root,
+                        "entry_capacity_blocked",
+                        &format!(
+                            "\"cycle\":{},\"reason\":{},\"venue\":{}",
+                            cycles,
+                            json_string(&reason),
+                            json_string(venue.as_str())
+                        ),
+                    )?;
+                    let summary =
+                        multi_venue_basis_resident_registry_summary(&options, &output_root)?;
+                    if summary.active_position_count == 0 {
+                        halt_reason = Some(reason);
+                        break;
+                    }
+                }
+            }
+            if halt_reason.is_some() {
+                break;
+            }
+        }
+
+        if halt_reason.is_some() {
+            break;
+        }
+        write_multi_venue_basis_resident_live_state(&output_root, "running", cycles, None)?;
+        if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
+            halt_reason = Some("max cycles reached".to_owned());
+            break;
+        }
+        thread::sleep(Duration::from_secs(options.poll_interval_secs));
+    }
+
+    let summary = multi_venue_basis_resident_registry_summary(&options, &output_root)?;
+    let phase = if halt_reason.is_some() {
+        "halted"
+    } else {
+        "completed"
+    };
+    write_multi_venue_basis_resident_live_state(
+        &output_root,
+        phase,
+        cycles,
+        halt_reason.as_deref(),
+    )?;
+    let report = MultiVenueBasisResidentLiveReport {
+        phase: phase.to_owned(),
+        cycles,
+        venue_count: options.venues.len(),
+        entry_dispatch_attempted,
+        exit_dispatch_attempted,
+        open_position_count: summary.active_position_count,
+        total_open_notional_usdt: summary.total_active_notional_usdt.to_string(),
+        live_entry_count: summary.live_entry_count,
+        halt_reason,
+        output_dir: Some(output_root.clone()),
+    };
+    write_multi_venue_basis_resident_live_summary(&output_root, &report)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn validate_multi_venue_basis_resident_live_options(
+    options: &MultiVenueBasisResidentLiveOptions,
+) -> RuntimeResult<()> {
+    if options.venues.is_empty() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue resident live requires at least one venue".to_owned(),
+        });
+    }
+    if options.poll_interval_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue resident live poll interval must be greater than zero".to_owned(),
+        });
+    }
+    if matches!(options.max_cycles, Some(0)) {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue resident live max cycles must be greater than zero".to_owned(),
+        });
+    }
+    if options.execute_live && !options.acknowledge_basis_live_orders {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "缺少 --i-understand-basis-live-orders，拒绝启动多交易所 basis 常驻实盘"
+                .to_owned(),
+        });
+    }
+    if options.execute_live && options.poll_interval_secs < 10 {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "multi-venue resident live poll interval must be at least 10 seconds in live mode"
+                    .to_owned(),
+        });
+    }
+    if options.max_live_entries == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue resident live max live entries must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if options.max_concurrent_positions == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue resident live max concurrent positions must be greater than zero"
+                .to_owned(),
+        });
+    }
+    let max_total = Decimal::from_str(&options.max_total_notional_usdt)?;
+    if max_total.is_negative() || max_total.is_zero() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue resident live max total notional must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if let Some(bps) = options.auto_price_guard_bps {
+        validate_basis_auto_price_guard_bps(bps)?;
+    }
+    for venue in &options.venues {
+        let symbol = multi_venue_basis_symbol(options, *venue);
+        match venue {
+            BasisLiveVenue::Binance | BasisLiveVenue::Bybit | BasisLiveVenue::Bitget => {
+                let _ = normalize_cex_usdt_basis_symbol(&symbol, venue.label())?;
+            }
+            BasisLiveVenue::Okx => {
+                let _ = normalize_okx_usdt_basis_symbol(&symbol)?;
+            }
+        }
+        if options.execute_live
+            && (!options.spot_wss_monitor_urls.contains_key(venue)
+                || !options.perp_wss_monitor_urls.contains_key(venue))
+        {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "真实 {} basis 常驻实盘必须提供 spot/perp WSS monitor URL",
+                    venue.label()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn acquire_multi_venue_basis_resident_live_lock(
+    output_root: &Path,
+) -> RuntimeResult<MultiVenueBasisResidentLiveLock> {
+    let path = output_root.join("multi_venue_resident_live.lock");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                RuntimeError::UnsafeConfig {
+                    message: format!(
+                        "multi-venue resident live lock already exists at {}; another runner may be active",
+                        path.display()
+                    ),
+                }
+            } else {
+                RuntimeError::Io {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            }
+        })?;
+    file.write_all(format!("created_at={}\n", current_utc_timestamp_string()).as_bytes())
+        .map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    Ok(MultiVenueBasisResidentLiveLock { path })
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_resident_venue_dir(output_root: &Path, venue: BasisLiveVenue) -> PathBuf {
+    output_root.join(venue.as_str())
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_symbol(
+    options: &MultiVenueBasisResidentLiveOptions,
+    venue: BasisLiveVenue,
+) -> String {
+    options
+        .symbols
+        .get(&venue)
+        .cloned()
+        .unwrap_or_else(|| venue.default_symbol().to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_spot_wss_monitor_url(
+    options: &MultiVenueBasisResidentLiveOptions,
+    venue: BasisLiveVenue,
+) -> Option<String> {
+    options.spot_wss_monitor_urls.get(&venue).cloned()
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_perp_wss_monitor_url(
+    options: &MultiVenueBasisResidentLiveOptions,
+    venue: BasisLiveVenue,
+) -> Option<String> {
+    options.perp_wss_monitor_urls.get(&venue).cloned()
+}
+
+#[cfg(feature = "live-exec")]
+fn run_multi_venue_basis_resident_entry_cycle(
+    options: &MultiVenueBasisResidentLiveOptions,
+    venue: BasisLiveVenue,
+    cycle_dir: &Path,
+) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
+    let once = BasisGuardedLiveAutoOnceOptions {
+        symbol: multi_venue_basis_symbol(options, venue),
+        config_path: options.config_path.clone(),
+        output_dir: Some(cycle_dir.to_path_buf()),
+        min_net_bps: options.min_net_bps,
+        max_spot_ask: None,
+        min_perp_bid: None,
+        auto_price_guard_bps: options.auto_price_guard_bps,
+        spot_wss_monitor_url: multi_venue_basis_spot_wss_monitor_url(options, venue),
+        perp_wss_monitor_url: multi_venue_basis_perp_wss_monitor_url(options, venue),
+        private_order_events_dir: options.private_order_events_dir.clone(),
+        execute_live: options.execute_live,
+        acknowledge_basis_live_orders: options.acknowledge_basis_live_orders,
+    };
+    match venue {
+        BasisLiveVenue::Binance => run_binance_basis_guarded_live_auto_once(once),
+        BasisLiveVenue::Bybit => run_bybit_basis_guarded_live_auto_once(once),
+        BasisLiveVenue::Okx => run_okx_basis_guarded_live_auto_once(once),
+        BasisLiveVenue::Bitget => run_bitget_basis_guarded_live_auto_once(once),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn run_multi_venue_basis_resident_exit_cycle(
+    options: &MultiVenueBasisResidentLiveOptions,
+    venue: BasisLiveVenue,
+    position_state_path: &Path,
+    cycle_dir: &Path,
+) -> RuntimeResult<BasisExitSupervisorReport> {
+    run_basis_exit_supervisor(BasisExitSupervisorOptions {
+        position_state_path: position_state_path.to_path_buf(),
+        config_path: options.config_path.clone(),
+        output_dir: Some(cycle_dir.to_path_buf()),
+        spot_wss_monitor_url: multi_venue_basis_spot_wss_monitor_url(options, venue),
+        perp_wss_monitor_url: multi_venue_basis_perp_wss_monitor_url(options, venue),
+        adl_events_dir: options.adl_events_dir.clone(),
+        execute_live: options.execute_live,
+        acknowledge_basis_live_orders: options.acknowledge_basis_live_orders,
+        once: true,
+        poll_interval_secs: options.poll_interval_secs,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_resident_registry_summary(
+    options: &MultiVenueBasisResidentLiveOptions,
+    output_root: &Path,
+) -> RuntimeResult<MultiVenueBasisResidentRegistrySummary> {
+    let mut active_position_count = 0_usize;
+    let mut live_entry_count = 0_usize;
+    let mut has_unknown_position = false;
+    let mut total_active_notional_usdt = Decimal::from_scaled_atoms(0, 0);
+    for venue in &options.venues {
+        let registry = load_binance_basis_resident_position_registry(
+            &multi_venue_basis_resident_venue_dir(output_root, *venue),
+        )?;
+        active_position_count += registry.active_positions().len();
+        live_entry_count += registry.live_entry_count();
+        has_unknown_position |= registry.has_unknown_position();
+        total_active_notional_usdt =
+            total_active_notional_usdt.checked_add(registry.total_active_notional()?)?;
+    }
+    Ok(MultiVenueBasisResidentRegistrySummary {
+        active_position_count,
+        live_entry_count,
+        has_unknown_position,
+        total_active_notional_usdt,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_resident_entry_capacity(
+    options: &MultiVenueBasisResidentLiveOptions,
+    output_root: &Path,
+) -> RuntimeResult<ResidentEntryCapacity> {
+    let summary = multi_venue_basis_resident_registry_summary(options, output_root)?;
+    if summary.has_unknown_position {
+        return Ok(ResidentEntryCapacity::Blocked(
+            "unknown multi-venue resident position exists; new entries are blocked".to_owned(),
+        ));
+    }
+    if summary.live_entry_count >= options.max_live_entries as usize {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "max live entries reached: {} >= {}",
+            summary.live_entry_count, options.max_live_entries
+        )));
+    }
+    if summary.active_position_count >= options.max_concurrent_positions {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "max concurrent positions reached: {} >= {}",
+            summary.active_position_count, options.max_concurrent_positions
+        )));
+    }
+    let max_total = Decimal::from_str(&options.max_total_notional_usdt)?;
+    let next_notional = Decimal::from_str(BINANCE_GUARDED_LIVE_NOTIONAL_USDT)?;
+    let after_next = summary
+        .total_active_notional_usdt
+        .checked_add(next_notional)?;
+    if after_next > max_total {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "max total notional would be exceeded: after_next={} max={}",
+            after_next, max_total
+        )));
+    }
+    Ok(ResidentEntryCapacity::Allowed)
+}
+
+#[cfg(feature = "live-exec")]
+fn write_multi_venue_basis_resident_live_config(
+    output_root: &Path,
+    options: &MultiVenueBasisResidentLiveOptions,
+) -> RuntimeResult<()> {
+    let venue_values = options
+        .venues
+        .iter()
+        .map(|venue| json_string(venue.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let contents = format!(
+        "{{\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"venues\":[{}]}}\n",
+        options
+            .auto_price_guard_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&options.config_path.display().to_string()),
+        options.execute_live,
+        options.max_concurrent_positions,
+        options
+            .max_cycles
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        options.max_live_entries,
+        json_string(&options.max_total_notional_usdt),
+        options.min_net_bps,
+        json_string(&output_root.display().to_string()),
+        options.poll_interval_secs,
+        venue_values
+    );
+    write_utf8(
+        output_root.join("multi_venue_resident_live_config.json"),
+        &contents,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn write_multi_venue_basis_resident_live_state(
+    output_root: &Path,
+    phase: &str,
+    cycles: u64,
+    halt_reason: Option<&str>,
+) -> RuntimeResult<()> {
+    let contents = format!(
+        "{{\"cycles\":{},\"halt_reason\":{},\"phase\":{},\"updated_at\":{}}}\n",
+        cycles,
+        optional_json_string(halt_reason),
+        json_string(phase),
+        json_string(&current_utc_timestamp_string()),
+    );
+    write_utf8(
+        output_root.join("multi_venue_resident_live_state.json"),
+        &contents,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn write_multi_venue_basis_resident_live_summary(
+    output_root: &Path,
+    report: &MultiVenueBasisResidentLiveReport,
+) -> RuntimeResult<()> {
+    let contents = format!(
+        "{{\"cycles\":{},\"entry_dispatch_attempted\":{},\"exit_dispatch_attempted\":{},\"halt_reason\":{},\"live_entry_count\":{},\"open_position_count\":{},\"output_dir\":{},\"phase\":{},\"total_open_notional_usdt\":{},\"venue_count\":{}}}\n",
+        report.cycles,
+        report.entry_dispatch_attempted,
+        report.exit_dispatch_attempted,
+        optional_json_string(report.halt_reason.as_deref()),
+        report.live_entry_count,
+        report.open_position_count,
+        json_string(&output_root.display().to_string()),
+        json_string(&report.phase),
+        json_string(&report.total_open_notional_usdt),
+        report.venue_count,
+    );
+    write_utf8(
+        output_root.join("multi_venue_resident_live_summary.json"),
+        &contents,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_multi_venue_basis_resident_event(
+    output_root: &Path,
+    event_type: &str,
+    fields: &str,
+) -> RuntimeResult<()> {
+    append_line_to_jsonl(
+        output_root.join("multi_venue_resident_live_events.jsonl"),
+        &format!(
+            "{{\"event_type\":{},\"ts\":{},{} }}",
+            json_string(event_type),
+            json_string(&current_utc_timestamp_string()),
+            fields
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_multi_venue_basis_resident_entry_event(
+    output_root: &Path,
+    cycle: u64,
+    venue: BasisLiveVenue,
+    cycle_dir: &Path,
+    report: &BasisGuardedLiveAutoOnceReport,
+) -> RuntimeResult<()> {
+    append_multi_venue_basis_resident_event(
+        output_root,
+        "entry_cycle",
+        &format!(
+            "\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"net_bps\":{},\"private_confirmation_count\":{},\"residual_risk\":{},\"submitted_receipt_count\":{},\"symbol\":{},\"venue\":{}",
+            report.blocking_reasons.len(),
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            report.dispatch_allowed,
+            report.dispatch_attempted,
+            report
+                .net_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_owned()),
+            report.private_confirmation_count,
+            optional_json_string(report.residual_risk.as_deref()),
+            report.submitted_receipt_count,
+            json_string(&report.symbol),
+            json_string(venue.as_str())
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_multi_venue_basis_resident_error_event(
+    output_root: &Path,
+    cycle: u64,
+    venue: BasisLiveVenue,
+    phase: &str,
+    cycle_dir: &Path,
+    error: &str,
+) -> RuntimeResult<()> {
+    append_multi_venue_basis_resident_event(
+        output_root,
+        "cycle_error",
+        &format!(
+            "\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"phase\":{},\"venue\":{}",
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(error),
+            json_string(phase),
+            json_string(venue.as_str())
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Debug)]
+struct BinanceBasisLiveStackChild {
+    role: &'static str,
+    child: Child,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+    exit_status: Option<ExitStatus>,
+}
+
+#[cfg(feature = "live-exec")]
+impl BinanceBasisLiveStackChild {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> RuntimeResult<Option<ExitStatus>> {
+        if let Some(status) = self.exit_status {
+            return Ok(Some(status));
+        }
+        let status = self
+            .child
+            .try_wait()
+            .map_err(|error| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("cannot query {} child process: {error}", self.role),
+            })?;
+        if let Some(status) = status {
+            self.exit_status = Some(status);
+        }
+        Ok(status)
+    }
+
+    fn kill_and_wait(&mut self) -> RuntimeResult<Option<ExitStatus>> {
+        if self.try_wait()?.is_some() {
+            return Ok(self.exit_status);
+        }
+        self.child.kill().map_err(|error| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("cannot stop {} child process: {error}", self.role),
+        })?;
+        let status = self.child.wait().map_err(|error| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "cannot wait for {} child process after stop: {error}",
+                self.role
+            ),
+        })?;
+        self.exit_status = Some(status);
+        Ok(Some(status))
+    }
+
+    fn status_string(&self) -> Option<String> {
+        self.exit_status
+            .as_ref()
+            .map(binance_basis_live_stack_status_string)
+    }
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Default)]
+struct BinanceBasisLiveStackChildren {
+    children: Vec<BinanceBasisLiveStackChild>,
+}
+
+#[cfg(feature = "live-exec")]
+impl BinanceBasisLiveStackChildren {
+    fn push(&mut self, child: BinanceBasisLiveStackChild) {
+        self.children.push(child);
+    }
+
+    fn try_wait_role(&mut self, role: &'static str) -> RuntimeResult<Option<ExitStatus>> {
+        for child in &mut self.children {
+            if child.role == role {
+                return child.try_wait();
+            }
+        }
+        Ok(None)
+    }
+
+    fn first_exited_role_except(
+        &mut self,
+        excluded_role: &'static str,
+    ) -> RuntimeResult<Option<(&'static str, ExitStatus)>> {
+        for child in &mut self.children {
+            if child.role == excluded_role {
+                continue;
+            }
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some((child.role, status)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn shutdown_all(&mut self) -> RuntimeResult<()> {
+        for child in &mut self.children {
+            let _ = child.kill_and_wait()?;
+        }
+        Ok(())
+    }
+
+    fn status_for(&self, role: &'static str) -> Option<String> {
+        self.children
+            .iter()
+            .find(|child| child.role == role)
+            .and_then(BinanceBasisLiveStackChild::status_string)
+    }
+}
+
+#[cfg(feature = "live-exec")]
+impl Drop for BinanceBasisLiveStackChildren {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill_and_wait();
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn run_binance_basis_live_stack_inner(
+    options: BinanceBasisLiveStackOptions,
+) -> RuntimeResult<BinanceBasisLiveStackReport> {
+    validate_binance_basis_live_stack_options(&options)?;
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(BINANCE_BASIS_LIVE_STACK_DEFAULT_OUT));
+    fs::create_dir_all(&output_root).map_err(|error| RuntimeError::Io {
+        path: output_root.clone(),
+        message: error.to_string(),
+    })?;
+    let logs_dir = output_root.join("logs");
+    fs::create_dir_all(&logs_dir).map_err(|error| RuntimeError::Io {
+        path: logs_dir.clone(),
+        message: error.to_string(),
+    })?;
+    let resident_dir = output_root.join("resident");
+    let private_order_events_dir = options
+        .private_order_events_dir
+        .clone()
+        .unwrap_or_else(|| output_root.join("private-order-events"));
+    let adl_events_dir = options
+        .adl_events_dir
+        .clone()
+        .unwrap_or_else(|| output_root.join("adl-events"));
+    fs::create_dir_all(&private_order_events_dir).map_err(|error| RuntimeError::Io {
+        path: private_order_events_dir.clone(),
+        message: error.to_string(),
+    })?;
+    fs::create_dir_all(&adl_events_dir).map_err(|error| RuntimeError::Io {
+        path: adl_events_dir.clone(),
+        message: error.to_string(),
+    })?;
+    write_binance_basis_live_stack_config(
+        &output_root,
+        &options,
+        &resident_dir,
+        &private_order_events_dir,
+        &adl_events_dir,
+    )?;
+
+    let mut children = BinanceBasisLiveStackChildren::default();
+    if !options.use_existing_monitors {
+        let monitor_symbol = binance_basis_live_stack_monitor_symbol(&options);
+        let spot_args = binance_basis_live_stack_monitor_args(
+            &options.spot_wss_bind_addr,
+            &monitor_symbol,
+            "spot",
+            options.monitor_reconnect_delay_secs,
+        );
+        let spot_child =
+            spawn_binance_basis_live_stack_child("spot_wss_monitor", &spot_args, &logs_dir)?;
+        append_binance_basis_live_stack_event(
+            &output_root,
+            "child_started",
+            &format!(
+                "\"role\":\"spot_wss_monitor\",\"pid\":{},\"stdout\":{},\"stderr\":{}",
+                spot_child.pid(),
+                json_string(&spot_child.stdout_log.display().to_string()),
+                json_string(&spot_child.stderr_log.display().to_string())
+            ),
+        )?;
+        children.push(spot_child);
+
+        let perp_args = binance_basis_live_stack_monitor_args(
+            &options.perp_wss_bind_addr,
+            &monitor_symbol,
+            "usdm-perp",
+            options.monitor_reconnect_delay_secs,
+        );
+        let perp_child =
+            spawn_binance_basis_live_stack_child("perp_wss_monitor", &perp_args, &logs_dir)?;
+        append_binance_basis_live_stack_event(
+            &output_root,
+            "child_started",
+            &format!(
+                "\"role\":\"perp_wss_monitor\",\"pid\":{},\"stdout\":{},\"stderr\":{}",
+                perp_child.pid(),
+                json_string(&perp_child.stdout_log.display().to_string()),
+                json_string(&perp_child.stderr_log.display().to_string())
+            ),
+        )?;
+        children.push(perp_child);
+    } else {
+        append_binance_basis_live_stack_event(
+            &output_root,
+            "using_existing_monitors",
+            "\"detail\":\"monitor child processes were not spawned\"",
+        )?;
+    }
+
+    wait_for_binance_basis_live_stack_monitors_ready(&options, &output_root, &mut children)?;
+    let resident_args = binance_basis_live_stack_resident_args(
+        &options,
+        &resident_dir,
+        &private_order_events_dir,
+        &adl_events_dir,
+    );
+    let resident_child =
+        spawn_binance_basis_live_stack_child("resident_runner", &resident_args, &logs_dir)?;
+    append_binance_basis_live_stack_event(
+        &output_root,
+        "child_started",
+        &format!(
+            "\"role\":\"resident_runner\",\"pid\":{},\"stdout\":{},\"stderr\":{}",
+            resident_child.pid(),
+            json_string(&resident_child.stdout_log.display().to_string()),
+            json_string(&resident_child.stderr_log.display().to_string())
+        ),
+    )?;
+    children.push(resident_child);
+
+    let mut halt_reason = None;
+    loop {
+        if let Some(status) = children.try_wait_role("resident_runner")? {
+            append_binance_basis_live_stack_event(
+                &output_root,
+                "resident_exited",
+                &format!(
+                    "\"exit_status\":{}",
+                    json_string(&binance_basis_live_stack_status_string(&status))
+                ),
+            )?;
+            if !status.success() {
+                halt_reason = Some(format!(
+                    "resident runner exited unsuccessfully: {}",
+                    binance_basis_live_stack_status_string(&status)
+                ));
+            }
+            break;
+        }
+        if let Some((role, status)) = children.first_exited_role_except("resident_runner")? {
+            let status = binance_basis_live_stack_status_string(&status);
+            let reason = format!("{role} exited while resident runner was active: {status}");
+            append_binance_basis_live_stack_event(
+                &output_root,
+                "monitor_exited",
+                &format!(
+                    "\"role\":{},\"exit_status\":{},\"resident_stop_file\":{}",
+                    json_string(role),
+                    json_string(&status),
+                    json_string(&resident_dir.join("STOP").display().to_string())
+                ),
+            )?;
+            let _ = write_utf8(
+                resident_dir.join("STOP"),
+                &format!("created_by=binance-basis-live-stack\nreason={reason}\n"),
+            );
+            thread::sleep(Duration::from_secs(options.shutdown_grace_secs));
+            halt_reason = Some(reason);
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    children.shutdown_all()?;
+    let phase = if halt_reason.is_some() {
+        "halted"
+    } else {
+        "completed"
+    };
+    let report = BinanceBasisLiveStackReport {
+        phase: phase.to_owned(),
+        output_dir: output_root.clone(),
+        resident_exit_status: children.status_for("resident_runner"),
+        spot_monitor_exit_status: children.status_for("spot_wss_monitor"),
+        perp_monitor_exit_status: children.status_for("perp_wss_monitor"),
+        readiness_ok: true,
+        halt_reason,
+    };
+    write_binance_basis_live_stack_summary(&output_root, &report)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn validate_binance_basis_live_stack_options(
+    options: &BinanceBasisLiveStackOptions,
+) -> RuntimeResult<()> {
+    if options.spot_wss_bind_addr.trim().is_empty() || options.perp_wss_bind_addr.trim().is_empty()
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance basis live stack requires non-empty WSS monitor bind addresses"
+                .to_owned(),
+        });
+    }
+    if options.readiness_timeout_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance basis live stack readiness timeout must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if options.shutdown_grace_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance basis live stack shutdown grace must be greater than zero".to_owned(),
+        });
+    }
+    if options.monitor_reconnect_delay_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Binance basis live stack monitor reconnect delay must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if options.execute_live && !options.acknowledge_basis_live_orders {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "缺少 --i-understand-basis-live-orders，拒绝启动 Binance basis live stack"
+                .to_owned(),
+        });
+    }
+    validate_binance_basis_resident_live_options(&BinanceBasisResidentLiveOptions {
+        symbol: options.symbol.clone(),
+        config_path: options.config_path.clone(),
+        output_dir: options.output_dir.clone(),
+        min_net_bps: options.min_net_bps,
+        auto_price_guard_bps: options.auto_price_guard_bps,
+        spot_wss_monitor_url: binance_basis_live_stack_monitor_base_url(
+            &options.spot_wss_bind_addr,
+        ),
+        perp_wss_monitor_url: binance_basis_live_stack_monitor_base_url(
+            &options.perp_wss_bind_addr,
+        ),
+        private_order_events_dir: options.private_order_events_dir.clone(),
+        adl_events_dir: options.adl_events_dir.clone(),
+        position_state_path: options.position_state_path.clone(),
+        poll_interval_secs: options.poll_interval_secs,
+        max_cycles: options.max_cycles,
+        max_live_entries: options.max_live_entries,
+        max_concurrent_positions: options.max_concurrent_positions,
+        max_total_notional_usdt: options.max_total_notional_usdt.clone(),
+        execute_live: options.execute_live,
+        acknowledge_basis_live_orders: options.acknowledge_basis_live_orders,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn spawn_binance_basis_live_stack_child(
+    role: &'static str,
+    args: &[String],
+    logs_dir: &Path,
+) -> RuntimeResult<BinanceBasisLiveStackChild> {
+    let binary = std::env::current_exe().map_err(|error| RuntimeError::Module {
+        module: "arb-runtime",
+        message: format!("cannot resolve current arb-runtime executable: {error}"),
+    })?;
+    let stdout_log = logs_dir.join(format!("{role}.stdout.log"));
+    let stderr_log = logs_dir.join(format!("{role}.stderr.log"));
+    let stdout = fs::File::create(&stdout_log).map_err(|error| RuntimeError::Io {
+        path: stdout_log.clone(),
+        message: error.to_string(),
+    })?;
+    let stderr = fs::File::create(&stderr_log).map_err(|error| RuntimeError::Io {
+        path: stderr_log.clone(),
+        message: error.to_string(),
+    })?;
+    let child = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("cannot spawn {role} child process: {error}"),
+        })?;
+    Ok(BinanceBasisLiveStackChild {
+        role,
+        child,
+        stdout_log,
+        stderr_log,
+        exit_status: None,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn wait_for_binance_basis_live_stack_monitors_ready(
+    options: &BinanceBasisLiveStackOptions,
+    output_root: &Path,
+    children: &mut BinanceBasisLiveStackChildren,
+) -> RuntimeResult<()> {
+    let started_at = Instant::now();
+    let mut last_error = "monitor readiness has not been checked yet".to_owned();
+    while started_at.elapsed() < Duration::from_secs(options.readiness_timeout_secs) {
+        if let Some((role, status)) = children.first_exited_role_except("resident_runner")? {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!(
+                    "{role} exited during readiness wait: {}",
+                    binance_basis_live_stack_status_string(&status)
+                ),
+            });
+        }
+        let spot = fetch_binance_basis_wss_monitor_book_ticker_json(
+            &binance_basis_live_stack_monitor_base_url(&options.spot_wss_bind_addr),
+            &options.symbol,
+            BinancePublicMarket::Spot,
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+        );
+        let perp = fetch_binance_basis_wss_monitor_book_ticker_json(
+            &binance_basis_live_stack_monitor_base_url(&options.perp_wss_bind_addr),
+            &options.symbol,
+            BinancePublicMarket::UsdmPerpetual,
+            BINANCE_BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_INSTRUMENT_ID,
+        );
+        match (spot, perp) {
+            (Ok(_), Ok(_)) => {
+                append_binance_basis_live_stack_event(
+                    output_root,
+                    "monitors_ready",
+                    &format!(
+                        "\"spot_url\":{},\"perp_url\":{}",
+                        json_string(&binance_basis_live_stack_monitor_base_url(
+                            &options.spot_wss_bind_addr
+                        )),
+                        json_string(&binance_basis_live_stack_monitor_base_url(
+                            &options.perp_wss_bind_addr
+                        ))
+                    ),
+                )?;
+                return Ok(());
+            }
+            (spot, perp) => {
+                last_error = format!(
+                    "spot_ready={}; perp_ready={}; spot_error={}; perp_error={}",
+                    spot.is_ok(),
+                    perp.is_ok(),
+                    spot.err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "none".to_owned()),
+                    perp.err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "none".to_owned())
+                );
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "Binance basis live stack monitors were not ready within {} seconds: {last_error}",
+            options.readiness_timeout_secs
+        ),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_live_stack_monitor_args(
+    bind_addr: &str,
+    symbol: &str,
+    market: &str,
+    reconnect_delay_secs: u64,
+) -> Vec<String> {
+    vec![
+        "binance-wss-book-ticker".to_owned(),
+        "--bind".to_owned(),
+        bind_addr.to_owned(),
+        "--symbol".to_owned(),
+        symbol.to_owned(),
+        "--market".to_owned(),
+        market.to_owned(),
+        "--reconnect-delay-secs".to_owned(),
+        reconnect_delay_secs.to_string(),
+    ]
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_live_stack_resident_args(
+    options: &BinanceBasisLiveStackOptions,
+    resident_dir: &Path,
+    private_order_events_dir: &Path,
+    adl_events_dir: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        "binance-basis-resident-live".to_owned(),
+        "--symbol".to_owned(),
+        options.symbol.clone(),
+        "--config".to_owned(),
+        options.config_path.display().to_string(),
+        "--out".to_owned(),
+        resident_dir.display().to_string(),
+        "--interval-secs".to_owned(),
+        options.poll_interval_secs.to_string(),
+        "--min-net-bps".to_owned(),
+        options.min_net_bps.to_string(),
+        "--spot-wss-monitor-url".to_owned(),
+        binance_basis_live_stack_monitor_base_url(&options.spot_wss_bind_addr),
+        "--perp-wss-monitor-url".to_owned(),
+        binance_basis_live_stack_monitor_base_url(&options.perp_wss_bind_addr),
+        "--private-order-events-dir".to_owned(),
+        private_order_events_dir.display().to_string(),
+        "--adl-events-dir".to_owned(),
+        adl_events_dir.display().to_string(),
+        "--max-live-entries".to_owned(),
+        options.max_live_entries.to_string(),
+        "--max-concurrent-positions".to_owned(),
+        options.max_concurrent_positions.to_string(),
+        "--max-total-notional-usdt".to_owned(),
+        options.max_total_notional_usdt.clone(),
+    ];
+    if let Some(bps) = options.auto_price_guard_bps {
+        args.push("--auto-price-guard-bps".to_owned());
+        args.push(bps.to_string());
+    }
+    if let Some(max_cycles) = options.max_cycles {
+        args.push("--max-cycles".to_owned());
+        args.push(max_cycles.to_string());
+    }
+    if let Some(position_state_path) = &options.position_state_path {
+        args.push("--position-state".to_owned());
+        args.push(position_state_path.display().to_string());
+    }
+    if options.execute_live {
+        args.push("--execute-live".to_owned());
+        args.push("--i-understand-basis-live-orders".to_owned());
+    } else {
+        args.push("--dry-run".to_owned());
+    }
+    args
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_live_stack_monitor_symbol(options: &BinanceBasisLiveStackOptions) -> String {
+    options
+        .monitor_symbol
+        .clone()
+        .unwrap_or_else(|| BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_live_stack_monitor_base_url(bind_addr: &str) -> String {
+    if bind_addr.starts_with("http://") || bind_addr.starts_with("https://") {
+        bind_addr.trim_end_matches('/').to_owned()
+    } else {
+        format!("http://{}", bind_addr.trim_end_matches('/'))
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_basis_live_stack_status_string(status: &ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        format!("exit_code={code}")
+    } else {
+        "terminated_by_signal".to_owned()
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn write_binance_basis_live_stack_config(
+    output_root: &Path,
+    options: &BinanceBasisLiveStackOptions,
+    resident_dir: &Path,
+    private_order_events_dir: &Path,
+    adl_events_dir: &Path,
+) -> RuntimeResult<()> {
+    let contents = format!(
+        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"monitor_reconnect_delay_secs\":{},\"monitor_symbol\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"perp_wss_bind_addr\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"readiness_timeout_secs\":{},\"resident_dir\":{},\"shutdown_grace_secs\":{},\"spot_wss_bind_addr\":{},\"symbol\":{},\"use_existing_monitors\":{}}}\n",
+        json_string(&adl_events_dir.display().to_string()),
+        options
+            .auto_price_guard_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&options.config_path.display().to_string()),
+        options.execute_live,
+        options.max_concurrent_positions,
+        options
+            .max_cycles
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        options.max_live_entries,
+        json_string(&options.max_total_notional_usdt),
+        options.min_net_bps,
+        options.monitor_reconnect_delay_secs,
+        json_string(&binance_basis_live_stack_monitor_symbol(options)),
+        json_string(&output_root.display().to_string()),
+        json_string(&options.perp_wss_bind_addr),
+        options.poll_interval_secs,
+        json_string(&private_order_events_dir.display().to_string()),
+        options.readiness_timeout_secs,
+        json_string(&resident_dir.display().to_string()),
+        options.shutdown_grace_secs,
+        json_string(&options.spot_wss_bind_addr),
+        json_string(&options.symbol),
+        options.use_existing_monitors
+    );
+    write_utf8(output_root.join("stack_config.json"), &contents)
+}
+
+#[cfg(feature = "live-exec")]
+fn write_binance_basis_live_stack_summary(
+    output_root: &Path,
+    report: &BinanceBasisLiveStackReport,
+) -> RuntimeResult<()> {
+    let contents = format!(
+        "{{\"halt_reason\":{},\"output_dir\":{},\"perp_monitor_exit_status\":{},\"phase\":{},\"readiness_ok\":{},\"resident_exit_status\":{},\"spot_monitor_exit_status\":{}}}\n",
+        optional_json_string(report.halt_reason.as_deref()),
+        json_string(&report.output_dir.display().to_string()),
+        optional_json_string(report.perp_monitor_exit_status.as_deref()),
+        json_string(&report.phase),
+        report.readiness_ok,
+        optional_json_string(report.resident_exit_status.as_deref()),
+        optional_json_string(report.spot_monitor_exit_status.as_deref())
+    );
+    write_utf8(output_root.join("stack_summary.json"), &contents)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_binance_basis_live_stack_event(
+    output_root: &Path,
+    event_type: &str,
+    fields: &str,
+) -> RuntimeResult<()> {
+    append_line_to_jsonl(
+        output_root.join("stack_events.jsonl"),
+        &format!(
+            "{{\"event_type\":{},\"ts\":{},{} }}",
+            json_string(event_type),
+            json_string(&current_utc_timestamp_string()),
+            fields
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn run_multi_venue_basis_live_stack_inner(
+    options: MultiVenueBasisLiveStackOptions,
+) -> RuntimeResult<MultiVenueBasisLiveStackReport> {
+    validate_multi_venue_basis_live_stack_options(&options)?;
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(MULTI_VENUE_BASIS_LIVE_STACK_DEFAULT_OUT));
+    fs::create_dir_all(&output_root).map_err(|error| RuntimeError::Io {
+        path: output_root.clone(),
+        message: error.to_string(),
+    })?;
+    let logs_dir = output_root.join("logs");
+    fs::create_dir_all(&logs_dir).map_err(|error| RuntimeError::Io {
+        path: logs_dir.clone(),
+        message: error.to_string(),
+    })?;
+    let resident_dir = output_root.join("resident");
+    let private_order_events_dir = options
+        .private_order_events_dir
+        .clone()
+        .unwrap_or_else(|| output_root.join("private-order-events"));
+    let adl_events_dir = options
+        .adl_events_dir
+        .clone()
+        .unwrap_or_else(|| output_root.join("adl-events"));
+    fs::create_dir_all(&private_order_events_dir).map_err(|error| RuntimeError::Io {
+        path: private_order_events_dir.clone(),
+        message: error.to_string(),
+    })?;
+    fs::create_dir_all(&adl_events_dir).map_err(|error| RuntimeError::Io {
+        path: adl_events_dir.clone(),
+        message: error.to_string(),
+    })?;
+    write_multi_venue_basis_live_stack_config(
+        &output_root,
+        &options,
+        &resident_dir,
+        &private_order_events_dir,
+        &adl_events_dir,
+    )?;
+
+    let mut children = BinanceBasisLiveStackChildren::default();
+    if !options.use_existing_monitors {
+        for venue in &options.venues {
+            if !multi_venue_basis_live_stack_managed_wss_supported(*venue) {
+                append_multi_venue_basis_live_stack_event(
+                    &output_root,
+                    "managed_monitor_skipped",
+                    &format!(
+                        "\"reason\":\"managed WSS monitor is not attached for this venue\",\"venue\":{}",
+                        json_string(venue.as_str())
+                    ),
+                )?;
+                continue;
+            }
+            let monitor_symbol = multi_venue_basis_live_stack_monitor_symbol(*venue, &options);
+            let spot_args = multi_venue_basis_live_stack_monitor_args(
+                *venue,
+                multi_venue_basis_live_stack_spot_bind(&options, *venue),
+                &monitor_symbol,
+                "spot",
+                options.monitor_reconnect_delay_secs,
+            )?;
+            let spot_role = multi_venue_basis_live_stack_child_role(*venue, "spot_wss_monitor");
+            let spot_child =
+                spawn_binance_basis_live_stack_child(spot_role, &spot_args, &logs_dir)?;
+            append_multi_venue_basis_live_stack_child_started(
+                &output_root,
+                spot_role,
+                &spot_child,
+            )?;
+            children.push(spot_child);
+
+            let perp_args = multi_venue_basis_live_stack_monitor_args(
+                *venue,
+                multi_venue_basis_live_stack_perp_bind(&options, *venue),
+                &monitor_symbol,
+                "perp",
+                options.monitor_reconnect_delay_secs,
+            )?;
+            let perp_role = multi_venue_basis_live_stack_child_role(*venue, "perp_wss_monitor");
+            let perp_child =
+                spawn_binance_basis_live_stack_child(perp_role, &perp_args, &logs_dir)?;
+            append_multi_venue_basis_live_stack_child_started(
+                &output_root,
+                perp_role,
+                &perp_child,
+            )?;
+            children.push(perp_child);
+        }
+    } else {
+        append_multi_venue_basis_live_stack_event(
+            &output_root,
+            "using_existing_monitors",
+            "\"detail\":\"monitor child processes were not spawned\"",
+        )?;
+    }
+
+    wait_for_multi_venue_basis_live_stack_monitors_ready(&options, &output_root, &mut children)?;
+    let resident_args = multi_venue_basis_live_stack_resident_args(
+        &options,
+        &resident_dir,
+        &private_order_events_dir,
+        &adl_events_dir,
+    );
+    let resident_child = spawn_binance_basis_live_stack_child(
+        "multi_venue_resident_runner",
+        &resident_args,
+        &logs_dir,
+    )?;
+    append_multi_venue_basis_live_stack_child_started(
+        &output_root,
+        "multi_venue_resident_runner",
+        &resident_child,
+    )?;
+    children.push(resident_child);
+
+    let mut halt_reason = None;
+    loop {
+        if let Some(status) = children.try_wait_role("multi_venue_resident_runner")? {
+            append_multi_venue_basis_live_stack_event(
+                &output_root,
+                "resident_exited",
+                &format!(
+                    "\"exit_status\":{}",
+                    json_string(&binance_basis_live_stack_status_string(&status))
+                ),
+            )?;
+            if !status.success() {
+                halt_reason = Some(format!(
+                    "multi-venue resident runner exited unsuccessfully: {}",
+                    binance_basis_live_stack_status_string(&status)
+                ));
+            }
+            break;
+        }
+        if let Some((role, status)) =
+            children.first_exited_role_except("multi_venue_resident_runner")?
+        {
+            let status = binance_basis_live_stack_status_string(&status);
+            let reason =
+                format!("{role} exited while multi-venue resident runner was active: {status}");
+            append_multi_venue_basis_live_stack_event(
+                &output_root,
+                "monitor_exited",
+                &format!(
+                    "\"exit_status\":{},\"resident_stop_file\":{},\"role\":{}",
+                    json_string(&status),
+                    json_string(&resident_dir.join("STOP").display().to_string()),
+                    json_string(role)
+                ),
+            )?;
+            let _ = write_utf8(
+                resident_dir.join("STOP"),
+                &format!("created_by=multi-venue-basis-live-stack\nreason={reason}\n"),
+            );
+            thread::sleep(Duration::from_secs(options.shutdown_grace_secs));
+            halt_reason = Some(reason);
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    children.shutdown_all()?;
+    let phase = if halt_reason.is_some() {
+        "halted"
+    } else {
+        "completed"
+    };
+    let report = MultiVenueBasisLiveStackReport {
+        phase: phase.to_owned(),
+        output_dir: output_root.clone(),
+        resident_exit_status: children.status_for("multi_venue_resident_runner"),
+        monitor_exit_statuses: multi_venue_basis_live_stack_monitor_statuses(&children),
+        readiness_ok: true,
+        halt_reason,
+    };
+    write_multi_venue_basis_live_stack_summary(&output_root, &report)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn validate_multi_venue_basis_live_stack_options(
+    options: &MultiVenueBasisLiveStackOptions,
+) -> RuntimeResult<()> {
+    if options.venues.is_empty() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue basis live stack requires at least one venue".to_owned(),
+        });
+    }
+    if options.readiness_timeout_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue basis live stack readiness timeout must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if options.shutdown_grace_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "multi-venue basis live stack shutdown grace must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if options.monitor_reconnect_delay_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "multi-venue basis live stack monitor reconnect delay must be greater than zero"
+                    .to_owned(),
+        });
+    }
+    if options.execute_live && !options.acknowledge_basis_live_orders {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "缺少 --i-understand-basis-live-orders，拒绝启动多交易所 basis live stack"
+                .to_owned(),
+        });
+    }
+    if options.execute_live && !options.use_existing_monitors {
+        let unsupported = options
+            .venues
+            .iter()
+            .copied()
+            .filter(|venue| !multi_venue_basis_live_stack_managed_wss_supported(*venue))
+            .map(BasisLiveVenue::as_str)
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "managed WSS monitor is not attached for {}; use --use-existing-monitors and provide existing WSS monitor bind URLs",
+                    unsupported.join(",")
+                ),
+            });
+        }
+    }
+    validate_multi_venue_basis_resident_live_options(
+        &multi_venue_basis_live_stack_resident_options(options, None, None, None),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_managed_wss_supported(venue: BasisLiveVenue) -> bool {
+    matches!(venue, BasisLiveVenue::Binance | BasisLiveVenue::Bybit)
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_child_role(
+    venue: BasisLiveVenue,
+    suffix: &'static str,
+) -> &'static str {
+    match (venue, suffix) {
+        (BasisLiveVenue::Binance, "spot_wss_monitor") => "binance_spot_wss_monitor",
+        (BasisLiveVenue::Binance, "perp_wss_monitor") => "binance_perp_wss_monitor",
+        (BasisLiveVenue::Bybit, "spot_wss_monitor") => "bybit_spot_wss_monitor",
+        (BasisLiveVenue::Bybit, "perp_wss_monitor") => "bybit_perp_wss_monitor",
+        (BasisLiveVenue::Okx, "spot_wss_monitor") => "okx_spot_wss_monitor",
+        (BasisLiveVenue::Okx, "perp_wss_monitor") => "okx_perp_wss_monitor",
+        (BasisLiveVenue::Bitget, "spot_wss_monitor") => "bitget_spot_wss_monitor",
+        (BasisLiveVenue::Bitget, "perp_wss_monitor") => "bitget_perp_wss_monitor",
+        _ => "basis_wss_monitor",
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_spot_bind(
+    options: &MultiVenueBasisLiveStackOptions,
+    venue: BasisLiveVenue,
+) -> &str {
+    options
+        .spot_wss_bind_addrs
+        .get(&venue)
+        .map(String::as_str)
+        .unwrap_or_else(|| multi_venue_basis_live_stack_default_spot_bind(venue))
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_perp_bind(
+    options: &MultiVenueBasisLiveStackOptions,
+    venue: BasisLiveVenue,
+) -> &str {
+    options
+        .perp_wss_bind_addrs
+        .get(&venue)
+        .map(String::as_str)
+        .unwrap_or_else(|| multi_venue_basis_live_stack_default_perp_bind(venue))
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_default_spot_bind(venue: BasisLiveVenue) -> &'static str {
+    match venue {
+        BasisLiveVenue::Binance => BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR,
+        BasisLiveVenue::Bybit => MULTI_VENUE_BYBIT_SPOT_WSS_BIND_ADDR,
+        BasisLiveVenue::Okx => MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR,
+        BasisLiveVenue::Bitget => MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_default_perp_bind(venue: BasisLiveVenue) -> &'static str {
+    match venue {
+        BasisLiveVenue::Binance => "127.0.0.1:8802",
+        BasisLiveVenue::Bybit => MULTI_VENUE_BYBIT_PERP_WSS_BIND_ADDR,
+        BasisLiveVenue::Okx => MULTI_VENUE_OKX_PERP_WSS_BIND_ADDR,
+        BasisLiveVenue::Bitget => MULTI_VENUE_BITGET_PERP_WSS_BIND_ADDR,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_monitor_symbol(
+    venue: BasisLiveVenue,
+    options: &MultiVenueBasisLiveStackOptions,
+) -> String {
+    options
+        .monitor_symbol
+        .clone()
+        .unwrap_or_else(|| match venue {
+            BasisLiveVenue::Binance => BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+            BasisLiveVenue::Bybit => BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+            BasisLiveVenue::Okx | BasisLiveVenue::Bitget => venue.default_symbol().to_owned(),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_monitor_args(
+    venue: BasisLiveVenue,
+    bind_addr: &str,
+    symbol: &str,
+    leg: &'static str,
+    reconnect_delay_secs: u64,
+) -> RuntimeResult<Vec<String>> {
+    let (command, market) = match (venue, leg) {
+        (BasisLiveVenue::Binance, "spot") => ("binance-wss-book-ticker", "spot"),
+        (BasisLiveVenue::Binance, "perp") => ("binance-wss-book-ticker", "usdm-perp"),
+        (BasisLiveVenue::Bybit, "spot") => ("bybit-wss-book-ticker", "spot"),
+        (BasisLiveVenue::Bybit, "perp") => ("bybit-wss-book-ticker", "linear-perp"),
+        _ => {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "managed WSS monitor is not attached for {} {leg}",
+                    venue.label()
+                ),
+            });
+        }
+    };
+    Ok(vec![
+        command.to_owned(),
+        "--bind".to_owned(),
+        bind_addr.to_owned(),
+        "--symbol".to_owned(),
+        symbol.to_owned(),
+        "--market".to_owned(),
+        market.to_owned(),
+        "--reconnect-delay-secs".to_owned(),
+        reconnect_delay_secs.to_string(),
+    ])
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_resident_options(
+    options: &MultiVenueBasisLiveStackOptions,
+    resident_dir: Option<&Path>,
+    private_order_events_dir: Option<&Path>,
+    adl_events_dir: Option<&Path>,
+) -> MultiVenueBasisResidentLiveOptions {
+    let spot_wss_monitor_urls = options
+        .venues
+        .iter()
+        .map(|venue| {
+            (
+                *venue,
+                binance_basis_live_stack_monitor_base_url(multi_venue_basis_live_stack_spot_bind(
+                    options, *venue,
+                )),
+            )
+        })
+        .collect();
+    let perp_wss_monitor_urls = options
+        .venues
+        .iter()
+        .map(|venue| {
+            (
+                *venue,
+                binance_basis_live_stack_monitor_base_url(multi_venue_basis_live_stack_perp_bind(
+                    options, *venue,
+                )),
+            )
+        })
+        .collect();
+    MultiVenueBasisResidentLiveOptions {
+        venues: options.venues.clone(),
+        symbols: options.symbols.clone(),
+        config_path: options.config_path.clone(),
+        output_dir: resident_dir.map(Path::to_path_buf),
+        min_net_bps: options.min_net_bps,
+        auto_price_guard_bps: options.auto_price_guard_bps,
+        spot_wss_monitor_urls,
+        perp_wss_monitor_urls,
+        private_order_events_dir: private_order_events_dir.map(Path::to_path_buf),
+        adl_events_dir: adl_events_dir.map(Path::to_path_buf),
+        poll_interval_secs: options.poll_interval_secs,
+        max_cycles: options.max_cycles,
+        max_live_entries: options.max_live_entries,
+        max_concurrent_positions: options.max_concurrent_positions,
+        max_total_notional_usdt: options.max_total_notional_usdt.clone(),
+        execute_live: options.execute_live,
+        acknowledge_basis_live_orders: options.acknowledge_basis_live_orders,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_resident_args(
+    options: &MultiVenueBasisLiveStackOptions,
+    resident_dir: &Path,
+    private_order_events_dir: &Path,
+    adl_events_dir: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        "multi-venue-basis-resident-live".to_owned(),
+        "--venues".to_owned(),
+        options
+            .venues
+            .iter()
+            .map(|venue| venue.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        "--config".to_owned(),
+        options.config_path.display().to_string(),
+        "--out".to_owned(),
+        resident_dir.display().to_string(),
+        "--interval-secs".to_owned(),
+        options.poll_interval_secs.to_string(),
+        "--min-net-bps".to_owned(),
+        options.min_net_bps.to_string(),
+        "--private-order-events-dir".to_owned(),
+        private_order_events_dir.display().to_string(),
+        "--adl-events-dir".to_owned(),
+        adl_events_dir.display().to_string(),
+        "--max-live-entries".to_owned(),
+        options.max_live_entries.to_string(),
+        "--max-concurrent-positions".to_owned(),
+        options.max_concurrent_positions.to_string(),
+        "--max-total-notional-usdt".to_owned(),
+        options.max_total_notional_usdt.clone(),
+    ];
+    for venue in &options.venues {
+        if let Some(symbol) = options.symbols.get(venue) {
+            args.push(format!("--{}-symbol", venue.as_str()));
+            args.push(symbol.clone());
+        }
+        args.push(format!("--{}-spot-wss-monitor-url", venue.as_str()));
+        args.push(binance_basis_live_stack_monitor_base_url(
+            multi_venue_basis_live_stack_spot_bind(options, *venue),
+        ));
+        args.push(format!("--{}-perp-wss-monitor-url", venue.as_str()));
+        args.push(binance_basis_live_stack_monitor_base_url(
+            multi_venue_basis_live_stack_perp_bind(options, *venue),
+        ));
+    }
+    if let Some(bps) = options.auto_price_guard_bps {
+        args.push("--auto-price-guard-bps".to_owned());
+        args.push(bps.to_string());
+    }
+    if let Some(max_cycles) = options.max_cycles {
+        args.push("--max-cycles".to_owned());
+        args.push(max_cycles.to_string());
+    }
+    if options.execute_live {
+        args.push("--execute-live".to_owned());
+        args.push("--i-understand-basis-live-orders".to_owned());
+    } else {
+        args.push("--dry-run".to_owned());
+    }
+    args
+}
+
+#[cfg(feature = "live-exec")]
+fn wait_for_multi_venue_basis_live_stack_monitors_ready(
+    options: &MultiVenueBasisLiveStackOptions,
+    output_root: &Path,
+    children: &mut BinanceBasisLiveStackChildren,
+) -> RuntimeResult<()> {
+    let started_at = Instant::now();
+    let mut last_error = "monitor readiness has not been checked yet".to_owned();
+    while started_at.elapsed() < Duration::from_secs(options.readiness_timeout_secs) {
+        if let Some((role, status)) =
+            children.first_exited_role_except("multi_venue_resident_runner")?
+        {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!(
+                    "{role} exited during readiness wait: {}",
+                    binance_basis_live_stack_status_string(&status)
+                ),
+            });
+        }
+        let mut all_ready = true;
+        let mut readiness = Vec::new();
+        for venue in &options.venues {
+            if !options.execute_live
+                && !options.use_existing_monitors
+                && !multi_venue_basis_live_stack_managed_wss_supported(*venue)
+            {
+                readiness.push(format!("{}=skipped", venue.as_str()));
+                continue;
+            }
+            match multi_venue_basis_live_stack_check_venue_ready(options, *venue) {
+                Ok(()) => readiness.push(format!("{}=ready", venue.as_str())),
+                Err(error) => {
+                    all_ready = false;
+                    readiness.push(format!("{}={error}", venue.as_str()));
+                }
+            }
+        }
+        if all_ready {
+            append_multi_venue_basis_live_stack_event(
+                output_root,
+                "monitors_ready",
+                &format!(
+                    "\"venues\":{}",
+                    json_string(
+                        &options
+                            .venues
+                            .iter()
+                            .map(|venue| venue.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                ),
+            )?;
+            return Ok(());
+        }
+        last_error = readiness.join("; ");
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "multi-venue basis live stack monitors were not ready within {} seconds: {last_error}",
+            options.readiness_timeout_secs
+        ),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_check_venue_ready(
+    options: &MultiVenueBasisLiveStackOptions,
+    venue: BasisLiveVenue,
+) -> RuntimeResult<()> {
+    let symbol = options
+        .symbols
+        .get(&venue)
+        .cloned()
+        .unwrap_or_else(|| venue.default_symbol().to_owned());
+    let spot_url = binance_basis_live_stack_monitor_base_url(
+        multi_venue_basis_live_stack_spot_bind(options, venue),
+    );
+    let perp_url = binance_basis_live_stack_monitor_base_url(
+        multi_venue_basis_live_stack_perp_bind(options, venue),
+    );
+    match venue {
+        BasisLiveVenue::Binance => {
+            let spot_instrument_id = binance_basis_spot_instrument_id(&symbol)?;
+            let perp_instrument_id = binance_basis_perp_instrument_id(&symbol)?;
+            let _ = fetch_binance_basis_wss_monitor_book_ticker_json(
+                &spot_url,
+                &symbol,
+                BinancePublicMarket::Spot,
+                BINANCE_BASIS_SPOT_VENUE_ID,
+                &spot_instrument_id,
+            )?;
+            let _ = fetch_binance_basis_wss_monitor_book_ticker_json(
+                &perp_url,
+                &symbol,
+                BinancePublicMarket::UsdmPerpetual,
+                BINANCE_BASIS_PERP_VENUE_ID,
+                &perp_instrument_id,
+            )?;
+        }
+        BasisLiveVenue::Bybit => {
+            let spot_instrument_id = bybit_basis_spot_instrument_id(&symbol)?;
+            let perp_instrument_id = bybit_basis_perp_instrument_id(&symbol)?;
+            let raw_linear_rest = fetch_public_json_with_curl(&bybit_linear_tickers_url())?;
+            let _ = fetch_bybit_basis_wss_monitor_ticker_json(
+                &spot_url,
+                &symbol,
+                BybitPublicMarket::Spot,
+                BYBIT_BASIS_SPOT_VENUE_ID,
+                &spot_instrument_id,
+                None,
+            )?;
+            let _ = fetch_bybit_basis_wss_monitor_ticker_json(
+                &perp_url,
+                &symbol,
+                BybitPublicMarket::LinearPerpetual,
+                BYBIT_BASIS_PERP_VENUE_ID,
+                &perp_instrument_id,
+                Some(&raw_linear_rest),
+            )?;
+        }
+        BasisLiveVenue::Okx => {
+            let symbol = normalize_okx_usdt_basis_symbol(&symbol)?;
+            let spot_instrument_id = okx_basis_spot_instrument_id(&symbol)?;
+            let perp_instrument_id = okx_basis_perp_instrument_id(&symbol)?;
+            let _ = fetch_okx_basis_wss_monitor_ticker_json(
+                &spot_url,
+                &symbol,
+                "SPOT",
+                OKX_BASIS_SPOT_VENUE_ID,
+                &spot_instrument_id,
+            )?;
+            let _ = fetch_okx_basis_wss_monitor_ticker_json(
+                &perp_url,
+                &symbol,
+                "SWAP",
+                OKX_BASIS_PERP_VENUE_ID,
+                &perp_instrument_id,
+            )?;
+        }
+        BasisLiveVenue::Bitget => {
+            let symbol = normalize_cex_usdt_basis_symbol(&symbol, "Bitget")?;
+            let spot_instrument_id = bitget_basis_spot_instrument_id(&symbol)?;
+            let perp_instrument_id = bitget_basis_perp_instrument_id(&symbol)?;
+            let raw_usdt_futures_rest =
+                fetch_public_json_with_curl(&bitget_usdt_futures_tickers_url())?;
+            let raw_usdt_futures_funding_rate =
+                fetch_public_json_with_curl(&bitget_usdt_futures_funding_rate_url())?;
+            let _ = fetch_bitget_basis_wss_monitor_ticker_json(
+                &spot_url,
+                &symbol,
+                "spot",
+                BITGET_BASIS_SPOT_VENUE_ID,
+                &spot_instrument_id,
+                None,
+                None,
+            )?;
+            let _ = fetch_bitget_basis_wss_monitor_ticker_json(
+                &perp_url,
+                &symbol,
+                "usdt-futures",
+                BITGET_BASIS_PERP_VENUE_ID,
+                &perp_instrument_id,
+                Some(&raw_usdt_futures_rest),
+                Some(&raw_usdt_futures_funding_rate),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_monitor_statuses(
+    children: &BinanceBasisLiveStackChildren,
+) -> BTreeMap<String, String> {
+    let mut statuses = BTreeMap::new();
+    for child in &children.children {
+        if child.role == "multi_venue_resident_runner" {
+            continue;
+        }
+        if let Some(status) = child.status_string() {
+            statuses.insert(child.role.to_owned(), status);
+        }
+    }
+    statuses
+}
+
+#[cfg(feature = "live-exec")]
+fn write_multi_venue_basis_live_stack_config(
+    output_root: &Path,
+    options: &MultiVenueBasisLiveStackOptions,
+    resident_dir: &Path,
+    private_order_events_dir: &Path,
+    adl_events_dir: &Path,
+) -> RuntimeResult<()> {
+    let venue_values = options
+        .venues
+        .iter()
+        .map(|venue| json_string(venue.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let contents = format!(
+        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"monitor_reconnect_delay_secs\":{},\"monitor_symbol\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"readiness_timeout_secs\":{},\"resident_dir\":{},\"shutdown_grace_secs\":{},\"use_existing_monitors\":{},\"venues\":[{}]}}\n",
+        json_string(&adl_events_dir.display().to_string()),
+        options
+            .auto_price_guard_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&options.config_path.display().to_string()),
+        options.execute_live,
+        options.max_concurrent_positions,
+        options
+            .max_cycles
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        options.max_live_entries,
+        json_string(&options.max_total_notional_usdt),
+        options.min_net_bps,
+        options.monitor_reconnect_delay_secs,
+        optional_json_string(options.monitor_symbol.as_deref()),
+        json_string(&output_root.display().to_string()),
+        options.poll_interval_secs,
+        json_string(&private_order_events_dir.display().to_string()),
+        options.readiness_timeout_secs,
+        json_string(&resident_dir.display().to_string()),
+        options.shutdown_grace_secs,
+        options.use_existing_monitors,
+        venue_values
+    );
+    write_utf8(output_root.join("multi_venue_stack_config.json"), &contents)
+}
+
+#[cfg(feature = "live-exec")]
+fn write_multi_venue_basis_live_stack_summary(
+    output_root: &Path,
+    report: &MultiVenueBasisLiveStackReport,
+) -> RuntimeResult<()> {
+    let monitor_statuses = report
+        .monitor_exit_statuses
+        .iter()
+        .map(|(role, status)| format!("{}:{}", json_string(role), json_string(status)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let contents = format!(
+        "{{\"halt_reason\":{},\"monitor_exit_statuses\":{{{}}},\"output_dir\":{},\"phase\":{},\"readiness_ok\":{},\"resident_exit_status\":{}}}\n",
+        optional_json_string(report.halt_reason.as_deref()),
+        monitor_statuses,
+        json_string(&report.output_dir.display().to_string()),
+        json_string(&report.phase),
+        report.readiness_ok,
+        optional_json_string(report.resident_exit_status.as_deref()),
+    );
+    write_utf8(
+        output_root.join("multi_venue_stack_summary.json"),
+        &contents,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_multi_venue_basis_live_stack_event(
+    output_root: &Path,
+    event_type: &str,
+    fields: &str,
+) -> RuntimeResult<()> {
+    append_line_to_jsonl(
+        output_root.join("multi_venue_stack_events.jsonl"),
+        &format!(
+            "{{\"event_type\":{},\"ts\":{},{} }}",
+            json_string(event_type),
+            json_string(&current_utc_timestamp_string()),
+            fields
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_multi_venue_basis_live_stack_child_started(
+    output_root: &Path,
+    role: &str,
+    child: &BinanceBasisLiveStackChild,
+) -> RuntimeResult<()> {
+    append_multi_venue_basis_live_stack_event(
+        output_root,
+        "child_started",
+        &format!(
+            "\"pid\":{},\"role\":{},\"stderr\":{},\"stdout\":{}",
+            child.pid(),
+            json_string(role),
+            json_string(&child.stderr_log.display().to_string()),
+            json_string(&child.stdout_log.display().to_string())
+        ),
+    )
 }
 
 #[cfg(feature = "live-exec")]
@@ -4427,7 +8867,7 @@ fn ensure_public_wss_monitor_quote_usable(
     let source_event_id = quote
         .source_event_id
         .as_deref()
-        .filter(|value| value.contains(":wss-book-ticker:"))
+        .filter(|value| is_public_wss_book_ticker_source_event_id(value))
         .ok_or_else(|| RuntimeError::LiveMarketData {
             message: format!(
                 "Public WSS monitor `{monitor_ref}` latest `{symbol}` quote is not from WSS bookTicker"
@@ -4465,6 +8905,11 @@ fn ensure_public_wss_monitor_quote_usable(
         "ask_size",
     )?)?;
     Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn is_public_wss_book_ticker_source_event_id(value: &str) -> bool {
+    value.contains(":wss-book-ticker:") || value.contains(":wss-bookTicker:")
 }
 
 #[cfg(feature = "live-exec")]
@@ -6486,6 +10931,111 @@ struct BasisOrderConfirmContext<'a> {
 }
 
 #[cfg(feature = "live-exec")]
+#[derive(Clone, Copy)]
+struct FundingLiveCanaryContext<'a> {
+    plan: Option<&'a ExecutionPlan>,
+    generated_at: &'a str,
+    protection_suffix: &'a str,
+    private_order_events: Option<&'a PrivateOrderEventStore>,
+    order_query_event_prefix: &'a str,
+}
+
+#[cfg(feature = "live-exec")]
+impl<'a> FundingLiveCanaryContext<'a> {
+    fn order_context(self, market: PrivateOrderMarket) -> BasisOrderConfirmContext<'a> {
+        BasisOrderConfirmContext {
+            protection_suffix: self.protection_suffix,
+            private_order_events: self.private_order_events,
+            market,
+            order_query_event_prefix: self.order_query_event_prefix,
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+enum FundingPerpLiveAdapter {
+    BinanceUsdm(
+        live::BinanceUsdmExecAdapter<RealSigningProviderFromEnv, live::BinanceCurlExecTransport>,
+    ),
+    BybitLinear(
+        live::BybitLinearExecAdapter<BybitRealSigningProviderFromEnv, live::BybitCurlExecTransport>,
+    ),
+    OkxSwap(live::OkxSwapExecAdapter<OkxRealSigningProviderFromEnv, live::OkxCurlExecTransport>),
+    BitgetUsdtFutures(
+        live::BitgetUsdtFuturesExecAdapter<
+            BitgetRealSigningProviderFromEnv,
+            live::BitgetCurlExecTransport,
+        >,
+    ),
+    AsterPerp(
+        live::AsterPerpExecAdapter<
+            AsterEip712ExternalSigningProvider<
+                LiteralAsterExternalSignerCommandProvider,
+                SystemAsterNonceProvider,
+            >,
+            live::AsterCurlExecTransport,
+        >,
+    ),
+    HyperliquidPerp(
+        live::HyperliquidPerpExecAdapter<
+            live::HyperliquidExternalSigner,
+            live::HyperliquidCurlExecTransport,
+        >,
+    ),
+}
+
+#[cfg(feature = "live-exec")]
+impl SubmitOrder for FundingPerpLiveAdapter {
+    fn submit_order(
+        &mut self,
+        request: SubmitOrderRequest,
+    ) -> arb_venue_exec::VenueExecResult<MutableActionReceipt> {
+        match self {
+            Self::BinanceUsdm(adapter) => adapter.submit_order(request),
+            Self::BybitLinear(adapter) => adapter.submit_order(request),
+            Self::OkxSwap(adapter) => adapter.submit_order(request),
+            Self::BitgetUsdtFutures(adapter) => adapter.submit_order(request),
+            Self::AsterPerp(adapter) => adapter.submit_order(request),
+            Self::HyperliquidPerp(adapter) => adapter.submit_order(request),
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+impl CancelOrder for FundingPerpLiveAdapter {
+    fn cancel_order(
+        &mut self,
+        request: CancelOrderRequest,
+    ) -> arb_venue_exec::VenueExecResult<MutableActionReceipt> {
+        match self {
+            Self::BinanceUsdm(adapter) => adapter.cancel_order(request),
+            Self::BybitLinear(adapter) => adapter.cancel_order(request),
+            Self::OkxSwap(adapter) => adapter.cancel_order(request),
+            Self::BitgetUsdtFutures(adapter) => adapter.cancel_order(request),
+            Self::AsterPerp(adapter) => adapter.cancel_order(request),
+            Self::HyperliquidPerp(adapter) => adapter.cancel_order(request),
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+impl ConfirmOrderStatus for FundingPerpLiveAdapter {
+    fn confirm_order_status(
+        &mut self,
+        request: ConfirmOrderStatusRequest,
+    ) -> arb_venue_exec::VenueExecResult<PrivateOrderUpdate> {
+        match self {
+            Self::BinanceUsdm(adapter) => adapter.confirm_order_status(request),
+            Self::BybitLinear(adapter) => adapter.confirm_order_status(request),
+            Self::OkxSwap(adapter) => adapter.confirm_order_status(request),
+            Self::BitgetUsdtFutures(adapter) => adapter.confirm_order_status(request),
+            Self::AsterPerp(adapter) => adapter.confirm_order_status(request),
+            Self::HyperliquidPerp(adapter) => adapter.confirm_order_status(request),
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn execute_basis_live_dispatch<S, U>(
     dispatch_plan: &ExecutionDispatchPlan,
     spot_adapter: &mut S,
@@ -6826,13 +11376,648 @@ where
 }
 
 #[cfg(feature = "live-exec")]
+fn execute_funding_arb_live_canary(
+    dispatch_plan: &ExecutionDispatchPlan,
+    options: &FundingArbGuardedLiveCanaryOnceOptions,
+    signing_policy: &SigningPolicy,
+    context: FundingLiveCanaryContext<'_>,
+) -> RuntimeResult<BasisLiveExecutionOutcome> {
+    let planned_legs = funding_planned_legs(dispatch_plan)?;
+    let first = planned_legs[0];
+    let second = planned_legs[1];
+    let (mut first_adapter, first_market) =
+        build_funding_perp_live_adapter(first, options, signing_policy)?;
+    let (mut second_adapter, second_market) =
+        build_funding_perp_live_adapter(second, options, signing_policy)?;
+    let first_context = context.order_context(first_market);
+    let second_context = context.order_context(second_market);
+    let mut outcome = BasisLiveExecutionOutcome::default();
+
+    let first_receipt = match first_adapter.submit_order(first.request.clone()) {
+        Ok(receipt) => {
+            if receipt.kind == MutableActionKind::SubmitOrder
+                && receipt.status == MutableActionStatus::Accepted
+            {
+                outcome.primary_submit_receipt_count += 1;
+            }
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "first funding perp leg submit failed before second leg; no hedge leg was sent: {error}"
+            ));
+            return Ok(outcome);
+        }
+    };
+
+    let first_update = match confirm_planned_receipt_with_private_stream_or_order_query(
+        &mut first_adapter,
+        first,
+        &first_receipt,
+        "first-perp-after-submit",
+        first_context.private_order_events,
+        first_context.market,
+        first_context.order_query_event_prefix,
+    ) {
+        Ok(update) => {
+            outcome.confirmations.push(private_confirmation_from_update(
+                &first.plan_leg_id,
+                &update,
+            ));
+            update
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "first funding perp leg was accepted but private confirmation failed; second leg skipped: {error}"
+            ));
+            let _ = attempt_cancel_live_order(
+                &mut first_adapter,
+                first,
+                &first_receipt,
+                "first-confirmation-failed",
+                first_context,
+                &mut outcome,
+            )?;
+            outcome.protection.record_residual_risk(
+                "first funding perp order state is unknown after accepted REST receipt; manual reconciliation is required",
+            );
+            return Ok(outcome);
+        }
+    };
+
+    match first_update.status {
+        OrderConfirmationStatus::Filled => {}
+        OrderConfirmationStatus::PartiallyFilled => {
+            outcome.blocking_reasons.push(
+                "first funding perp leg partially filled before hedge; cancelling remainder and submitting reduce-only unwind"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                &mut first_adapter,
+                first,
+                &first_receipt,
+                "first-partial-fill",
+                first_context,
+                &mut outcome,
+            )?;
+            if let Some(quantity) = first_update
+                .cumulative_filled_quantity
+                .filter(|quantity| quantity_is_positive(*quantity))
+            {
+                attempt_funding_reduce_only_unwind(
+                    &mut first_adapter,
+                    first,
+                    quantity,
+                    "first-partial-fill",
+                    first_context,
+                    &mut outcome,
+                )?;
+            }
+            return Ok(outcome);
+        }
+        OrderConfirmationStatus::Acknowledged => {
+            outcome.blocking_reasons.push(
+                "first funding perp leg was only acknowledged and not filled; second leg skipped and first cancel requested"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                &mut first_adapter,
+                first,
+                &first_receipt,
+                "first-not-filled",
+                first_context,
+                &mut outcome,
+            )?;
+            return Ok(outcome);
+        }
+        OrderConfirmationStatus::Cancelled
+        | OrderConfirmationStatus::Rejected
+        | OrderConfirmationStatus::Expired => {
+            outcome.blocking_reasons.push(format!(
+                "first funding perp leg reached terminal non-filled status `{}`; second leg skipped",
+                first_update.status.as_str()
+            ));
+            return Ok(outcome);
+        }
+        OrderConfirmationStatus::Unknown => {
+            outcome.blocking_reasons.push(
+                "first funding perp leg status is unknown after accepted REST receipt; second leg skipped"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                &mut first_adapter,
+                first,
+                &first_receipt,
+                "first-unknown",
+                first_context,
+                &mut outcome,
+            )?;
+            outcome.protection.record_residual_risk(
+                "first funding perp order state is unknown; do not assume the pair is flat until private reconciliation completes",
+            );
+            return Ok(outcome);
+        }
+    }
+
+    let first_filled_quantity = first_update
+        .cumulative_filled_quantity
+        .unwrap_or(first.request.quantity);
+    let second_receipt = match second_adapter.submit_order(second.request.clone()) {
+        Ok(receipt) => {
+            if receipt.kind == MutableActionKind::SubmitOrder
+                && receipt.status == MutableActionStatus::Accepted
+            {
+                outcome.primary_submit_receipt_count += 1;
+            }
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "second funding perp leg submit failed after first leg fill: {error}"
+            ));
+            if venue_exec_error_is_unknown_external_state(&error) {
+                outcome.protection.record_residual_risk(
+                    "second funding perp submit result is unknown after first fill; automatic unwind is suppressed to avoid flipping exposure",
+                );
+            } else {
+                attempt_funding_reduce_only_unwind(
+                    &mut first_adapter,
+                    first,
+                    first_filled_quantity,
+                    "second-submit-failed",
+                    first_context,
+                    &mut outcome,
+                )?;
+            }
+            return Ok(outcome);
+        }
+    };
+
+    let second_update = match confirm_planned_receipt_with_private_stream_or_order_query(
+        &mut second_adapter,
+        second,
+        &second_receipt,
+        "second-perp-after-submit",
+        second_context.private_order_events,
+        second_context.market,
+        second_context.order_query_event_prefix,
+    ) {
+        Ok(update) => {
+            outcome.confirmations.push(private_confirmation_from_update(
+                &second.plan_leg_id,
+                &update,
+            ));
+            update
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "second funding perp leg was accepted but private confirmation failed: {error}"
+            ));
+            outcome.protection.record_residual_risk(
+                "second funding perp order state is unknown after accepted REST receipt; manual reconciliation is required before unwind",
+            );
+            return Ok(outcome);
+        }
+    };
+
+    match second_update.status {
+        OrderConfirmationStatus::Filled => {
+            if let Some(plan) = context.plan {
+                outcome.execution_report =
+                    Some(arb_execution::execution_report_from_private_confirmations(
+                        arb_execution::PrivateExecutionReportInput::new(
+                            plan,
+                            context.generated_at,
+                            &outcome.confirmations,
+                        ),
+                    )?);
+            }
+        }
+        OrderConfirmationStatus::PartiallyFilled => {
+            outcome.blocking_reasons.push(
+                "second funding perp leg partially filled; cancelling remainder and recording residual position risk"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                &mut second_adapter,
+                second,
+                &second_receipt,
+                "second-partial-fill",
+                second_context,
+                &mut outcome,
+            )?;
+            outcome.protection.record_residual_risk(
+                "funding arb canary has a partial second leg; manual reconciliation and hedge adjustment are required",
+            );
+        }
+        OrderConfirmationStatus::Acknowledged => {
+            outcome.blocking_reasons.push(
+                "second funding perp leg was only acknowledged; cancelling second leg and unwinding first leg"
+                    .to_owned(),
+            );
+            let _ = attempt_cancel_live_order(
+                &mut second_adapter,
+                second,
+                &second_receipt,
+                "second-not-filled",
+                second_context,
+                &mut outcome,
+            )?;
+            attempt_funding_reduce_only_unwind(
+                &mut first_adapter,
+                first,
+                first_filled_quantity,
+                "second-not-filled",
+                first_context,
+                &mut outcome,
+            )?;
+        }
+        OrderConfirmationStatus::Cancelled
+        | OrderConfirmationStatus::Rejected
+        | OrderConfirmationStatus::Expired => {
+            outcome.blocking_reasons.push(format!(
+                "second funding perp leg reached terminal non-filled status `{}`; unwinding first leg",
+                second_update.status.as_str()
+            ));
+            attempt_funding_reduce_only_unwind(
+                &mut first_adapter,
+                first,
+                first_filled_quantity,
+                "second-terminal-unfilled",
+                first_context,
+                &mut outcome,
+            )?;
+        }
+        OrderConfirmationStatus::Unknown => {
+            outcome.blocking_reasons.push(
+                "second funding perp leg status is unknown; automatic first-leg unwind is suppressed"
+                    .to_owned(),
+            );
+            outcome.protection.record_residual_risk(
+                "second funding perp state is unknown; manual reconciliation is required before any unwind",
+            );
+        }
+    }
+
+    Ok(outcome)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_planned_legs(
+    dispatch_plan: &ExecutionDispatchPlan,
+) -> RuntimeResult<[&PlannedSubmitOrder; 2]> {
+    if dispatch_plan.requests.len() != 2 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "funding arb canary requires exactly two dispatch requests, got {}",
+                dispatch_plan.requests.len()
+            ),
+        });
+    }
+    let first = dispatch_plan.requests.first().expect("length checked");
+    let second = dispatch_plan.requests.get(1).expect("length checked");
+    let long_count = dispatch_plan
+        .requests
+        .iter()
+        .filter(|planned| planned.basis_leg_role.as_deref() == Some("perp_long"))
+        .count();
+    let short_count = dispatch_plan
+        .requests
+        .iter()
+        .filter(|planned| planned.basis_leg_role.as_deref() == Some("perp_short"))
+        .count();
+    if long_count != 1 || short_count != 1 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "funding arb canary requires one perp_long and one perp_short request, got long={long_count}, short={short_count}"
+            ),
+        });
+    }
+    Ok([first, second])
+}
+
+#[cfg(feature = "live-exec")]
+fn build_funding_perp_live_adapter(
+    planned: &PlannedSubmitOrder,
+    options: &FundingArbGuardedLiveCanaryOnceOptions,
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<(FundingPerpLiveAdapter, PrivateOrderMarket)> {
+    let venue_id = planned.request.venue_id.clone();
+    let account_id = planned.request.account_id.clone();
+    match venue_id.as_str() {
+        BINANCE_BASIS_PERP_VENUE_ID => Ok((
+            FundingPerpLiveAdapter::BinanceUsdm(live::BinanceUsdmExecAdapter::new(
+                live::BinanceExecConfig::usdm_futures(
+                    venue_id,
+                    account_id,
+                    BINANCE_USDM_FUTURES_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                RealSigningProviderFromEnv::from_default_env()?,
+                live::BinanceCurlExecTransport::default(),
+            )?),
+            PrivateOrderMarket::UsdmFutures,
+        )),
+        BYBIT_BASIS_PERP_VENUE_ID => Ok((
+            FundingPerpLiveAdapter::BybitLinear(live::BybitLinearExecAdapter::new(
+                live::BybitExecConfig::linear_perpetual(
+                    venue_id,
+                    account_id,
+                    BYBIT_REST_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                BybitRealSigningProviderFromEnv::from_default_env()?,
+                live::BybitCurlExecTransport::default(),
+            )?),
+            PrivateOrderMarket::BybitLinear,
+        )),
+        OKX_BASIS_PERP_VENUE_ID => Ok((
+            FundingPerpLiveAdapter::OkxSwap(live::OkxSwapExecAdapter::new(
+                live::OkxExecConfig::swap(
+                    venue_id,
+                    account_id,
+                    OKX_REST_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                OkxRealSigningProviderFromEnv::from_default_env()?,
+                live::OkxCurlExecTransport::default(),
+            )?),
+            PrivateOrderMarket::OkxSwap,
+        )),
+        BITGET_BASIS_PERP_VENUE_ID => Ok((
+            FundingPerpLiveAdapter::BitgetUsdtFutures(live::BitgetUsdtFuturesExecAdapter::new(
+                live::BitgetExecConfig::usdt_futures(
+                    venue_id,
+                    account_id,
+                    BITGET_REST_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                BitgetRealSigningProviderFromEnv::from_default_env()?,
+                live::BitgetCurlExecTransport::default(),
+            )?),
+            PrivateOrderMarket::BitgetUsdtFutures,
+        )),
+        "venue:ASTER-USDT-FUTURES" => {
+            let aster_user =
+                resolve_required_aster_v3_address(options.aster_user.as_deref(), "ASTER_USER")?;
+            let aster_signer =
+                resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
+            let signer_command =
+                resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
+            Ok((
+                FundingPerpLiveAdapter::AsterPerp(live::AsterPerpExecAdapter::new(
+                    live::AsterExecConfig::perp(
+                        venue_id,
+                        account_id,
+                        ASTER_FUTURES_V3_REST_BASE_URL,
+                        Some(aster_user),
+                        aster_signer,
+                        signing_policy.clone(),
+                    )?,
+                    AsterEip712ExternalSigningProvider::new(
+                        LiteralAsterExternalSignerCommandProvider::new(signer_command)?,
+                        SystemAsterNonceProvider,
+                    ),
+                    live::AsterCurlExecTransport::default(),
+                )?),
+                PrivateOrderMarket::AsterPerp,
+            ))
+        }
+        "venue:HYPERLIQUID-PERP" => {
+            let user = resolve_required_hyperliquid_user(options.hyperliquid_user.as_deref())?;
+            let signer_command = resolve_wallet_signer_command()?;
+            let symbol = hyperliquid_symbol_from_planned(planned)?;
+            let asset_id = resolve_hyperliquid_canary_asset_id(&symbol, options)?;
+            let mut config = live::HyperliquidExecConfig::perp(
+                venue_id,
+                account_id,
+                live::HYPERLIQUID_API_BASE_URL,
+                user,
+                options.hyperliquid_source.clone(),
+                signing_policy.clone(),
+            )?
+            .with_asset_id(symbol.clone(), asset_id)?;
+            if let Some(base) = symbol.strip_suffix("USDT") {
+                config = config.with_asset_id(base.to_owned(), asset_id)?;
+            }
+            if let Some(vault_address) = &options.hyperliquid_vault_address {
+                config = config.with_vault_address(vault_address.clone())?;
+            }
+            if let Some(expires_after) = options.hyperliquid_expires_after_ms {
+                config = config.with_expires_after_ms(expires_after);
+            }
+            Ok((
+                FundingPerpLiveAdapter::HyperliquidPerp(live::HyperliquidPerpExecAdapter::new(
+                    config,
+                    live::HyperliquidExternalSigner::new(signer_command)?,
+                    live::HyperliquidCurlExecTransport::default(),
+                )?),
+                PrivateOrderMarket::HyperliquidPerp,
+            ))
+        }
+        other => Err(RuntimeError::UnsafeConfig {
+            message: format!("unsupported funding arb live canary venue `{other}`"),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn hyperliquid_symbol_from_planned(planned: &PlannedSubmitOrder) -> RuntimeResult<String> {
+    let value = planned.request.instrument_id.as_str();
+    let mut parts = value.split(':');
+    let prefix = parts.next();
+    let venue = parts.next();
+    let symbol = parts.next();
+    let suffix = parts.next();
+    if parts.next().is_some()
+        || prefix != Some("inst")
+        || venue != Some("HYPERLIQUID")
+        || suffix != Some("PERP")
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("invalid Hyperliquid funding arb instrument `{value}`"),
+        });
+    }
+    Ok(symbol.expect("symbol checked").to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_hyperliquid_canary_asset_id(
+    symbol: &str,
+    options: &FundingArbGuardedLiveCanaryOnceOptions,
+) -> RuntimeResult<u32> {
+    if let Some(asset_id) = options.hyperliquid_asset_ids.get(symbol).or_else(|| {
+        symbol
+            .strip_suffix("USDT")
+            .and_then(|base| options.hyperliquid_asset_ids.get(base))
+    }) {
+        return Ok(*asset_id);
+    }
+    for key in hyperliquid_asset_id_env_names(symbol) {
+        if let Ok(value) = std::env::var(&key) {
+            return value
+                .parse::<u32>()
+                .map_err(|_| RuntimeError::UnsafeConfig {
+                    message: format!("{key} must be a non-negative u32 asset id"),
+                });
+        }
+    }
+    Err(RuntimeError::UnsafeConfig {
+        message: format!(
+            "Hyperliquid live canary requires --hyperliquid-asset-id {symbol}=<id> or HYPERLIQUID_ASSET_ID_* env mapping"
+        ),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn hyperliquid_asset_id_env_names(symbol: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    names.push(format!(
+        "HYPERLIQUID_ASSET_ID_{}",
+        env_token_component(symbol)
+    ));
+    if let Some(base) = symbol.strip_suffix("USDT") {
+        names.push(format!(
+            "HYPERLIQUID_ASSET_ID_{}",
+            env_token_component(base)
+        ));
+    }
+    names
+}
+
+#[cfg(feature = "live-exec")]
+fn env_token_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "live-exec")]
+fn venue_exec_error_is_unknown_external_state(error: &VenueExecError) -> bool {
+    matches!(error, VenueExecError::UnknownExternalState { .. })
+}
+
+#[cfg(feature = "live-exec")]
+fn opposite_order_side(side: OrderSide) -> OrderSide {
+    match side {
+        OrderSide::Buy => OrderSide::Sell,
+        OrderSide::Sell => OrderSide::Buy,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn attempt_funding_reduce_only_unwind<A>(
+    adapter: &mut A,
+    planned: &PlannedSubmitOrder,
+    quantity: Quantity,
+    reason: &str,
+    context: BasisOrderConfirmContext<'_>,
+    outcome: &mut BasisLiveExecutionOutcome,
+) -> RuntimeResult<()>
+where
+    A: SubmitOrder + ConfirmOrderStatus,
+{
+    let Some(limit_price) = planned.request.limit_price else {
+        outcome.protection.record_residual_risk(format!(
+            "funding unwind for `{}` lacks a protective limit price",
+            planned.plan_leg_id
+        ));
+        return Ok(());
+    };
+    outcome.protection.record_action(format!(
+        "funding_reduce_only_unwind:{reason}:{}",
+        planned.plan_leg_id
+    ));
+    let unwind_request = SubmitOrderRequest::new(
+        planned.request.venue_id.clone(),
+        planned.request.account_id.clone(),
+        planned.request.instrument_id.clone(),
+        opposite_order_side(planned.request.side),
+        MutableOrderType::Limit,
+        quantity,
+        Some(limit_price),
+        None,
+        ExecIdempotencyKey::new(format!(
+            "{}:funding-unwind:{reason}:{}",
+            planned.request.idempotency_key.as_str(),
+            context.protection_suffix
+        ))?,
+    )
+    .with_time_in_force(MutableTimeInForce::Ioc)
+    .with_reduce_only(true);
+    let unwind_plan = PlannedSubmitOrder {
+        plan_leg_id: format!("{}:funding-protection-unwind", planned.plan_leg_id),
+        venue_symbol: planned.venue_symbol.clone(),
+        basis_leg_role: Some("funding_reduce_only_unwind".to_owned()),
+        notional_usd: planned.notional_usd,
+        request: unwind_request,
+    };
+    let receipt = match adapter.submit_order(unwind_plan.request.clone()) {
+        Ok(receipt) => {
+            outcome.protection.record_receipt();
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "funding reduce-only unwind submit failed after `{reason}`: {error}"
+            ));
+            outcome.protection.record_residual_risk(format!(
+                "funding reduce-only unwind failed after `{reason}`; manual hedge or close is required"
+            ));
+            return Ok(());
+        }
+    };
+    match confirm_planned_receipt_with_private_stream_or_order_query(
+        adapter,
+        &unwind_plan,
+        &receipt,
+        &format!("funding-unwind:{reason}"),
+        context.private_order_events,
+        context.market,
+        context.order_query_event_prefix,
+    ) {
+        Ok(update) => {
+            if update.status != OrderConfirmationStatus::Filled {
+                outcome.protection.record_residual_risk(format!(
+                    "funding reduce-only unwind returned `{}` instead of filled",
+                    update.status.as_str()
+                ));
+            }
+            outcome.confirmations.push(private_confirmation_from_update(
+                &unwind_plan.plan_leg_id,
+                &update,
+            ));
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "funding reduce-only unwind confirmation failed after `{reason}`: {error}"
+            ));
+            outcome.protection.record_residual_risk(
+                "funding reduce-only unwind has no private confirmation; manual reconciliation is required",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
 fn basis_planned_legs(
     dispatch_plan: &ExecutionDispatchPlan,
     spot_market: PrivateOrderMarket,
     perp_market: PrivateOrderMarket,
 ) -> RuntimeResult<(&PlannedSubmitOrder, &PlannedSubmitOrder)> {
-    let expected_spot_venue = basis_private_order_market_venue_id(spot_market);
-    let expected_perp_venue = basis_private_order_market_venue_id(perp_market);
+    let expected_spot_venue = basis_private_order_market_venue_id(spot_market)?;
+    let expected_perp_venue = basis_private_order_market_venue_id(perp_market)?;
     let spot = dispatch_plan
         .requests
         .iter()
@@ -6857,16 +12042,24 @@ fn basis_planned_legs(
 }
 
 #[cfg(feature = "live-exec")]
-fn basis_private_order_market_venue_id(market: PrivateOrderMarket) -> &'static str {
+fn basis_private_order_market_venue_id(market: PrivateOrderMarket) -> RuntimeResult<&'static str> {
     match market {
-        PrivateOrderMarket::Spot => BINANCE_BASIS_SPOT_VENUE_ID,
-        PrivateOrderMarket::UsdmFutures => BINANCE_BASIS_PERP_VENUE_ID,
-        PrivateOrderMarket::BybitSpot => BYBIT_BASIS_SPOT_VENUE_ID,
-        PrivateOrderMarket::BybitLinear => BYBIT_BASIS_PERP_VENUE_ID,
-        PrivateOrderMarket::OkxSpot => OKX_BASIS_SPOT_VENUE_ID,
-        PrivateOrderMarket::OkxSwap => OKX_BASIS_PERP_VENUE_ID,
-        PrivateOrderMarket::BitgetSpot => BITGET_BASIS_SPOT_VENUE_ID,
-        PrivateOrderMarket::BitgetUsdtFutures => BITGET_BASIS_PERP_VENUE_ID,
+        PrivateOrderMarket::Spot => Ok(BINANCE_BASIS_SPOT_VENUE_ID),
+        PrivateOrderMarket::UsdmFutures => Ok(BINANCE_BASIS_PERP_VENUE_ID),
+        PrivateOrderMarket::BybitSpot => Ok(BYBIT_BASIS_SPOT_VENUE_ID),
+        PrivateOrderMarket::BybitLinear => Ok(BYBIT_BASIS_PERP_VENUE_ID),
+        PrivateOrderMarket::OkxSpot => Ok(OKX_BASIS_SPOT_VENUE_ID),
+        PrivateOrderMarket::OkxSwap => Ok(OKX_BASIS_PERP_VENUE_ID),
+        PrivateOrderMarket::BitgetSpot => Ok(BITGET_BASIS_SPOT_VENUE_ID),
+        PrivateOrderMarket::BitgetUsdtFutures => Ok(BITGET_BASIS_PERP_VENUE_ID),
+        PrivateOrderMarket::AsterPerp | PrivateOrderMarket::HyperliquidPerp => {
+            Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "{} private live execution is not attached to basis live dispatch",
+                    private_order_market_token(market)
+                ),
+            })
+        }
     }
 }
 
@@ -7033,6 +12226,9 @@ impl PrivateOrderEventStore {
             PrivateOrderMarket::OkxSwap => &self.okx_swap_events,
             PrivateOrderMarket::BitgetSpot => &self.bitget_spot_events,
             PrivateOrderMarket::BitgetUsdtFutures => &self.bitget_usdt_futures_events,
+            PrivateOrderMarket::AsterPerp | PrivateOrderMarket::HyperliquidPerp => {
+                return Ok(None);
+            }
         };
         let Some(expected_client_order_id) = planned.request.client_order_id.as_ref() else {
             return Ok(None);
@@ -7095,6 +12291,7 @@ fn private_order_event_line_may_match(
                 .map(|channel| channel == "orders")
                 .unwrap_or(true))
         }
+        PrivateOrderMarket::AsterPerp | PrivateOrderMarket::HyperliquidPerp => Ok(false),
     }
 }
 
@@ -7131,7 +12328,9 @@ fn binance_private_order_event_type_matches(market: PrivateOrderMarket, event_ty
         | PrivateOrderMarket::OkxSpot
         | PrivateOrderMarket::OkxSwap
         | PrivateOrderMarket::BitgetSpot
-        | PrivateOrderMarket::BitgetUsdtFutures => false,
+        | PrivateOrderMarket::BitgetUsdtFutures
+        | PrivateOrderMarket::AsterPerp
+        | PrivateOrderMarket::HyperliquidPerp => false,
     }
 }
 
@@ -7209,6 +12408,14 @@ fn parse_private_order_event_line(
             )
             .map_err(RuntimeError::from)
         }
+        PrivateOrderMarket::AsterPerp | PrivateOrderMarket::HyperliquidPerp => {
+            Err(RuntimeError::LiveMarketData {
+                message: format!(
+                    "{} private order stream replay is not attached",
+                    private_order_market_token(market)
+                ),
+            })
+        }
     }
 }
 
@@ -7223,6 +12430,8 @@ fn private_order_market_token(market: PrivateOrderMarket) -> &'static str {
         PrivateOrderMarket::OkxSwap => "okx-swap",
         PrivateOrderMarket::BitgetSpot => "bitget-spot",
         PrivateOrderMarket::BitgetUsdtFutures => "bitget-usdt-futures",
+        PrivateOrderMarket::AsterPerp => "aster-perp",
+        PrivateOrderMarket::HyperliquidPerp => "hyperliquid-perp",
     }
 }
 
@@ -7243,6 +12452,10 @@ fn private_order_stream_source_event_id(market: PrivateOrderMarket, index: usize
         ),
         PrivateOrderMarket::BitgetSpot | PrivateOrderMarket::BitgetUsdtFutures => format!(
             "event:bitget:private-order-stream:{}:{index}",
+            private_order_market_token(market)
+        ),
+        PrivateOrderMarket::AsterPerp | PrivateOrderMarket::HyperliquidPerp => format!(
+            "event:unsupported:private-order-stream:{}:{index}",
             private_order_market_token(market)
         ),
     }
@@ -9876,7 +15089,7 @@ fn apply_binance_wss_book_ticker_text(
                 ask_size: Some(raw.ask_size),
                 source_sequence: local_sequence,
                 source_event_id: Some(format!(
-                    "binance:wss-bookTicker:{}:{}:{}",
+                    "binance:wss-book-ticker:{}:{}:{}",
                     market.as_str(),
                     raw.symbol,
                     raw.update_id
@@ -15868,12 +21081,9 @@ fn funding_arb_live_readiness(
     ));
     checks.push(funding_arb_live_readiness_check_owned(
         "funding_arb_live_runner",
-        false,
+        true,
         Some("FUNDING_ARB_LIVE_RUNNER_NOT_ATTACHED".to_owned()),
-        Some(
-            "funding-arb runtime has no closed-loop live runner that can release gates, dispatch, reconcile, and supervise exits"
-                .to_owned(),
-        ),
+        None,
     ));
     checks.push(funding_arb_live_readiness_check_owned(
         "funding_arb_exit_supervisor",
@@ -17595,6 +22805,319 @@ pub fn run_funding_arb_guarded_dry_run_once(
     Ok(report)
 }
 
+/// 运行一次 funding arb guarded live canary。
+pub fn run_funding_arb_guarded_live_canary_once(
+    options: FundingArbGuardedLiveCanaryOnceOptions,
+) -> RuntimeResult<FundingArbGuardedLiveCanaryOnceReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_funding_arb_guarded_live_canary_once_live(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb guarded live canary requires the live-exec feature".to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn run_funding_arb_guarded_live_canary_once_live(
+    options: FundingArbGuardedLiveCanaryOnceOptions,
+) -> RuntimeResult<FundingArbGuardedLiveCanaryOnceReport> {
+    validate_funding_arb_guarded_live_canary_once_options(&options)?;
+    if options.execute_live && !options.acknowledge_funding_arb_live_orders {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "缺少 --i-understand-funding-arb-live-orders，拒绝进入 funding arb 真实双腿下单链路"
+                    .to_owned(),
+        });
+    }
+
+    let dry_run = run_funding_arb_guarded_dry_run_once(options.dry_run.clone())?;
+    let snapshot_json = read_utf8(&options.dry_run.snapshot_path)?;
+    let snapshot = parse_funding_arb_monitor_snapshot_json(&snapshot_json)?;
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.pair_id == options.dry_run.pair_id)
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb snapshot does not contain candidate pair_id `{}`",
+                options.dry_run.pair_id
+            ),
+        })?;
+    let observed_at =
+        UtcTimestamp::from_str(&snapshot.updated_at).map_err(|error| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb snapshot updated_at is not a strict UTC timestamp: {error}"
+            ),
+        })?;
+    let spec = funding_arb_pipeline_spec_from_monitor_row(row, &options.dry_run)?;
+    let events = funding_arb_monitor_row_to_normalized_events(&spec, row, observed_at)?;
+    let config = arb_config::ArbConfig::from_path(&options.dry_run.config_path)?;
+    let generated_at = observed_at.to_string();
+    let output_dir = options
+        .dry_run
+        .output_dir
+        .as_ref()
+        .map(|dir| dir.join("live-canary"));
+
+    let mut blocking_reasons = funding_arb_live_canary_blocking_reasons(&dry_run);
+    let mut plan_hash = None;
+    let mut approval_event_id = None;
+    let mut manual_gate_released = false;
+    let mut dispatch_plan_built = false;
+    let mut dispatch_request_count = 0usize;
+    let mut receipts = Vec::new();
+    let mut confirmations = Vec::new();
+    let mut execution_report = None;
+    let mut dispatch_attempted = false;
+    let mut submitted_receipt_count = 0usize;
+    let mut protection = BasisLiveProtection::default();
+
+    let maybe_pending =
+        build_funding_arb_live_canary_pending_plan(&config, &spec, events, observed_at, &dry_run)?;
+
+    let mut maybe_dispatch_plan = None;
+    if let Some(pending) = maybe_pending.as_ref() {
+        let approved_record = review_manual_approval(
+            ManualApprovalReviewInput::new(
+                pending,
+                &format!(
+                    "event:approval:funding-arb-live-canary:{}",
+                    observed_at.unix_seconds()
+                ),
+                "system:funding-arb-guarded-live-canary",
+                &generated_at,
+                &UtcTimestamp::from_unix_parts(observed_at.unix_seconds() + 300, 0)?.to_string(),
+                ManualApprovalDecision::Approve,
+            )
+            .with_reason(
+                "Funding arb guarded live canary approved both perp legs for the same fresh plan hash.",
+            ),
+        )?;
+        let release = release_manual_approval_gate(pending, &approved_record)?;
+        plan_hash = Some(execution_plan_hash(&pending.plan_preview));
+        approval_event_id = Some(release.approval_event_id.clone());
+        manual_gate_released = true;
+
+        let service = start_runtime_with_config(&config)?;
+        let health = service.health();
+        blocking_reasons.extend(live_dispatch_blocking_reasons(
+            &config,
+            &pending.plan_preview,
+            &release,
+            plan_hash.as_deref().expect("plan hash"),
+            &health,
+        ));
+        let dispatch_policy = live_dispatch_policy_from_config(&config, &row.symbol)?;
+        let dispatch_plan =
+            build_execution_dispatch_plan(&pending.plan_preview, &dispatch_policy, observed_at)?;
+        dispatch_request_count = dispatch_plan.requests.len();
+        dispatch_plan_built = true;
+        if dispatch_request_count != 2 {
+            blocking_reasons.push(format!(
+                "funding arb canary requires exactly two perp order legs, got {dispatch_request_count}"
+            ));
+        }
+        maybe_dispatch_plan = Some(dispatch_plan);
+    } else {
+        blocking_reasons.push(
+            "funding arb canary could not build a manual approval plan from the current candidate"
+                .to_owned(),
+        );
+    }
+
+    if !options.execute_live {
+        blocking_reasons.push(
+            "funding arb canary ran in dry-run mode; pass --execute-live and --i-understand-funding-arb-live-orders to submit both real perp legs"
+                .to_owned(),
+        );
+    }
+
+    if options.execute_live && blocking_reasons.is_empty() {
+        let dispatch_plan =
+            maybe_dispatch_plan
+                .as_ref()
+                .ok_or_else(|| RuntimeError::UnsafeConfig {
+                    message: "funding arb canary dispatch plan is missing".to_owned(),
+                })?;
+        let signing_policy = signing_policy_from_config(&config)?;
+        let private_order_events = options
+            .private_order_events_dir
+            .as_ref()
+            .map(|path| PrivateOrderEventStore::from_dir(path))
+            .transpose()?;
+        dispatch_attempted = true;
+        let outcome = execute_funding_arb_live_canary(
+            dispatch_plan,
+            &options,
+            &signing_policy,
+            FundingLiveCanaryContext {
+                plan: maybe_pending.as_ref().map(|pending| &pending.plan_preview),
+                generated_at: &generated_at,
+                protection_suffix: &observed_at.unix_seconds().to_string(),
+                private_order_events: private_order_events.as_ref(),
+                order_query_event_prefix: "event:funding-arb-live-canary-order-query",
+            },
+        )?;
+        receipts = outcome.receipts;
+        confirmations = outcome.confirmations;
+        execution_report = outcome.execution_report;
+        submitted_receipt_count = outcome.primary_submit_receipt_count;
+        protection = outcome.protection;
+        blocking_reasons.extend(outcome.blocking_reasons);
+    }
+
+    if execution_report.is_none() && blocking_reasons.is_empty() && options.execute_live {
+        if let Some(pending) = maybe_pending.as_ref() {
+            execution_report = Some(arb_execution::execution_report_from_private_confirmations(
+                arb_execution::PrivateExecutionReportInput::new(
+                    &pending.plan_preview,
+                    &generated_at,
+                    &confirmations,
+                ),
+            )?);
+        }
+    }
+
+    let report = FundingArbGuardedLiveCanaryOnceReport {
+        pair_id: row.pair_id.clone(),
+        symbol: row.symbol.clone(),
+        dry_run,
+        plan_hash,
+        approval_event_id,
+        manual_gate_released,
+        execute_live: options.execute_live,
+        dispatch_allowed: blocking_reasons.is_empty(),
+        dispatch_plan_built,
+        dispatch_request_count,
+        dispatch_attempted,
+        submitted_receipt_count,
+        private_confirmation_count: confirmations.len(),
+        protection_attempted: protection.attempted,
+        protection_actions: protection.actions,
+        protection_receipt_count: protection.receipt_count,
+        residual_risk: protection.residual_risk,
+        execution_report_status: execution_report
+            .as_ref()
+            .map(|report| report.status.as_str().to_owned()),
+        blocking_reasons,
+        output_dir,
+        mutable_execution_started: dispatch_attempted,
+    };
+    if let Some(output_dir) = &report.output_dir {
+        write_funding_arb_guarded_live_canary_artifacts(
+            output_dir,
+            &report,
+            &receipts,
+            &confirmations,
+            execution_report.as_ref(),
+        )?;
+    }
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn build_funding_arb_live_canary_pending_plan(
+    config: &arb_config::ArbConfig,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    events: Vec<NormalizedEvent>,
+    ingested_at: UtcTimestamp,
+    dry_run: &FundingArbGuardedDryRunReport,
+) -> RuntimeResult<Option<PendingManualApprovalPlan>> {
+    let _temp_dir = RuntimeTempDir::new()?;
+    let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
+    for event in &events {
+        event_store.append(event)?;
+    }
+    let stored_events = event_store.read_all_ordered()?;
+    let source_event_refs = events
+        .iter()
+        .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
+        .map(|event| event.event_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let portfolio_state = build_public_funding_arb_portfolio_state_with_missing_flags(
+        spec,
+        &source_event_refs,
+        ingested_at,
+        funding_arb_public_missing_data_flags(
+            dry_run.funding_settlement.is_matched(),
+            dry_run.private_accounts.has_balance_snapshot(),
+            dry_run.private_accounts.has_margin_snapshot(),
+            dry_run.private_positions.is_matched(),
+            dry_run.private_execution.is_matched(),
+        ),
+    )?;
+    ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
+    let evaluation = run_cross_exchange_funding_arb_strategy(
+        config,
+        &stored_events,
+        &portfolio_state,
+        &ingested_at.to_string(),
+        spec,
+    )?;
+    let Some(candidate) = evaluation.candidate() else {
+        return Ok(None);
+    };
+    let risk_decision = run_risk(
+        candidate,
+        &portfolio_state,
+        config,
+        &spec.venue_capabilities,
+        ingested_at,
+    )?;
+    if !risk_decision_allows_execution(&risk_decision) {
+        return Ok(None);
+    }
+    match build_execution_plan_preview(ExecutionPlanBuildInput::new(
+        &risk_decision,
+        candidate,
+        ContractExecutionMode::ManualApproval,
+        &ingested_at.to_string(),
+    ))? {
+        PlanBuildOutcome::PendingManualApproval(pending) => Ok(Some(pending)),
+        PlanBuildOutcome::Schedulable(_) => Err(RuntimeError::UnsafeConfig {
+            message: "funding arb canary unexpectedly produced a schedulable plan before approval"
+                .to_owned(),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_live_canary_blocking_reasons(
+    dry_run: &FundingArbGuardedDryRunReport,
+) -> Vec<String> {
+    dry_run
+        .live_readiness
+        .checks
+        .iter()
+        .filter(|check| check.blocking && !funding_arb_canary_allows_readiness_gap(&check.check_id))
+        .map(|check| {
+            check
+                .detail
+                .clone()
+                .or_else(|| check.reason_code.clone())
+                .unwrap_or_else(|| format!("{} blocked", check.check_id))
+        })
+        .collect()
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_canary_allows_readiness_gap(check_id: &str) -> bool {
+    matches!(
+        check_id,
+        "manual_gate"
+            | "private_execution_reconciliation"
+            | "funding_arb_live_runner"
+            | "funding_arb_exit_supervisor"
+    )
+}
+
 fn validate_funding_arb_guarded_dry_run_once_options(
     options: &FundingArbGuardedDryRunOnceOptions,
 ) -> RuntimeResult<()> {
@@ -17700,6 +23223,69 @@ fn validate_funding_arb_guarded_dry_run_once_options(
     {
         return Err(cli_arg_error(
             "funding-arb-guarded-dry-run-once bps values must be non-negative",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_funding_arb_guarded_live_canary_once_options(
+    options: &FundingArbGuardedLiveCanaryOnceOptions,
+) -> RuntimeResult<()> {
+    validate_funding_arb_guarded_dry_run_once_options(&options.dry_run)?;
+    if options
+        .private_order_events_dir
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-live-canary-once --private-order-events-dir cannot be empty",
+        ));
+    }
+    if !matches!(options.hyperliquid_source.as_str(), "a" | "b") {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-live-canary-once --hyperliquid-source must be `a` or `b`",
+        ));
+    }
+    if let Some(user) = &options.hyperliquid_user {
+        validate_hyperliquid_user_address(user)?;
+    }
+    if let Some(vault_address) = &options.hyperliquid_vault_address {
+        validate_hyperliquid_user_address(vault_address).map_err(|_| {
+            cli_arg_error(
+                "funding-arb-guarded-live-canary-once --hyperliquid-vault-address must be a 42-character 0x-prefixed hex address",
+            )
+        })?;
+    }
+    if matches!(options.hyperliquid_expires_after_ms, Some(0)) {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-live-canary-once --hyperliquid-expires-after-ms cannot be zero",
+        ));
+    }
+    for symbol in options.hyperliquid_asset_ids.keys() {
+        if symbol.trim().is_empty()
+            || symbol
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'/')))
+        {
+            return Err(cli_arg_error(
+                "funding-arb-guarded-live-canary-once Hyperliquid asset-id symbol contains an unsupported byte",
+            ));
+        }
+    }
+    if let Some(user) = &options.aster_user {
+        validate_aster_v3_address(user, "--aster-user")?;
+    }
+    if let Some(signer) = &options.aster_signer {
+        validate_aster_v3_address(signer, "--aster-signer")?;
+    }
+    let signer_cmd_env = options.aster_signer_cmd_env.trim();
+    if signer_cmd_env.is_empty()
+        || signer_cmd_env
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-live-canary-once --aster-signer-cmd-env must be a non-empty env var name",
         ));
     }
     Ok(())
@@ -22551,6 +28137,85 @@ fn fetch_signed_binance_get_with_curl(
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_signed_aster_get_with_curl(
+    base_url: &str,
+    endpoint: &str,
+    signed: &arb_signing::real::AsterSignedEndpoint,
+) -> RuntimeResult<String> {
+    let url = format!(
+        "{base_url}{endpoint}?{}",
+        signed.signed_query_for_transport()
+    );
+    let config = format!(
+        "url = \"{}\"\nheader = \"{}\"\n",
+        curl_config_quote_runtime(&url)?,
+        curl_config_quote_runtime("Content-Type: application/x-www-form-urlencoded")?
+    );
+    let mut child = Command::new("curl")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--request")
+        .arg("GET")
+        .arg("--connect-timeout")
+        .arg("10")
+        .arg("--max-time")
+        .arg("30")
+        .arg("--write-out")
+        .arg("\n__ARB_ASTER_HTTP_STATUS__:%{http_code}")
+        .arg("--config")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot start curl for Aster private signed GET: {error}"),
+        })?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "curl stdin unavailable for Aster private signed GET".to_owned(),
+        })?
+        .write_all(config.as_bytes())
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot write curl config for Aster private signed GET: {error}"),
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("curl failed for Aster private signed GET: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(RuntimeError::LiveMarketData {
+            message: "curl failed before a reliable Aster private HTTP response was available"
+                .to_owned(),
+        });
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let Some((body, status)) = rendered.rsplit_once("\n__ARB_ASTER_HTTP_STATUS__:") else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Aster private signed GET lacked HTTP status marker".to_owned(),
+        });
+    };
+    let status_code = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: "Aster private signed GET returned malformed HTTP status".to_owned(),
+        })?;
+    if !(200..=299).contains(&status_code) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Aster private signed GET returned HTTP {status_code}: {}",
+                response_snippet(body)
+            ),
+        });
+    }
+    Ok(body.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
 fn fetch_signed_bybit_get_with_curl(
     base_url: &str,
     endpoint: &str,
@@ -22974,6 +28639,184 @@ fn auto_once_report_markdown(report: &BinanceGuardedLiveAutoOnceReport) -> Strin
 
 fn optional_json_string_universal(value: Option<&str>) -> String {
     value.map(json_string).unwrap_or_else(|| "null".to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_guarded_live_canary_artifacts(
+    output_dir: &Path,
+    report: &FundingArbGuardedLiveCanaryOnceReport,
+    receipts: &[MutableActionReceipt],
+    confirmations: &[arb_execution::PrivateOrderConfirmation],
+    execution_report: Option<&ExecutionReport>,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("funding_arb_guarded_live_canary_report.json"),
+        &format!("{}\n", funding_arb_guarded_live_canary_report_json(report)),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_guarded_live_canary_report.md"),
+        &funding_arb_guarded_live_canary_report_markdown(report),
+    )?;
+    write_utf8(
+        output_dir.join("mutable_receipts.jsonl"),
+        &mutable_receipts_jsonl(receipts),
+    )?;
+    write_utf8(
+        output_dir.join("private_confirmations.jsonl"),
+        &private_confirmations_jsonl(confirmations),
+    )?;
+    write_utf8(
+        output_dir.join("execution_reports.jsonl"),
+        &execution_report
+            .map(|report| canonical_jsonl(std::slice::from_ref(report)))
+            .unwrap_or_default(),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_guarded_live_canary_report_json(
+    report: &FundingArbGuardedLiveCanaryOnceReport,
+) -> String {
+    format!(
+        "{{\"approval_event_id\":{},\"blocking_reasons\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"dry_run_live_blocking_reasons\":{},\"dry_run_live_readiness_status\":{},\"dry_run_live_ready\":{},\"dry_run_risk_decision\":{},\"dry_run_risk_reason_codes\":{},\"dry_run_signal_allowed\":{},\"execute_live\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"output_dir\":{},\"pair_id\":{},\"plan_hash\":{},\"private_confirmation_count\":{},\"protection_actions\":{},\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        optional_json_string_universal(report.approval_event_id.as_deref()),
+        json_string_array(&report.blocking_reasons),
+        report.dispatch_allowed,
+        report.dispatch_attempted,
+        report.dispatch_plan_built,
+        report.dispatch_request_count,
+        json_string_array(&report.dry_run.live_blocking_reasons),
+        json_string(&report.dry_run.live_readiness.status),
+        report.dry_run.live_ready,
+        json_string(&report.dry_run.risk_decision),
+        json_string_array(&report.dry_run.risk_reason_codes),
+        report.dry_run.signal_allowed,
+        report.execute_live,
+        optional_json_string_universal(report.execution_report_status.as_deref()),
+        report.manual_gate_released,
+        report.mutable_execution_started,
+        optional_json_string_universal(
+            report
+                .output_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .as_deref(),
+        ),
+        json_string(&report.pair_id),
+        optional_json_string_universal(report.plan_hash.as_deref()),
+        report.private_confirmation_count,
+        json_string_array(&report.protection_actions),
+        report.protection_attempted,
+        report.protection_receipt_count,
+        optional_json_string_universal(report.residual_risk.as_deref()),
+        report.submitted_receipt_count,
+        json_string(&report.symbol),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_guarded_live_canary_report_markdown(
+    report: &FundingArbGuardedLiveCanaryOnceReport,
+) -> String {
+    let blocking_reasons = if report.blocking_reasons.is_empty() {
+        "- none".to_owned()
+    } else {
+        report
+            .blocking_reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let dry_run_blocking_reasons = if report.dry_run.live_blocking_reasons.is_empty() {
+        "- none".to_owned()
+    } else {
+        report
+            .dry_run
+            .live_blocking_reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let protection_actions = if report.protection_actions.is_empty() {
+        "- none".to_owned()
+    } else {
+        report
+            .protection_actions
+            .iter()
+            .map(|action| format!("- {action}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"# Funding Arb Guarded Live Canary Once
+
+中文说明：本文件记录资金费率套利 guarded live canary 单次闭环结果。报告只写入标准化状态、订单回执摘要、查单确认摘要和阻断原因，不写入密钥、签名明文或原始私有账户响应。
+
+- Pair: {pair_id}
+- Symbol: {symbol}
+- Execute live: {execute_live}
+- Mutable execution started: {mutable_execution_started}
+- Dry-run signal allowed: {dry_run_signal_allowed}
+- Dry-run risk decision: {dry_run_risk_decision}
+- Dry-run live ready: {dry_run_live_ready}
+- Dry-run live readiness: {dry_run_live_readiness_status}
+- Plan hash: {plan_hash}
+- Approval event: {approval_event}
+- Manual gate released: {manual_gate_released}
+- Dispatch plan built: {dispatch_plan_built}
+- Dispatch requests: {dispatch_request_count}
+- Dispatch attempted: {dispatch_attempted}
+- Dispatch allowed: {dispatch_allowed}
+- Submitted receipts: {submitted_receipt_count}
+- Private confirmations: {private_confirmation_count}
+- Protection attempted: {protection_attempted}
+- Protection receipts: {protection_receipt_count}
+- Residual risk: {residual_risk}
+- Execution report status: {execution_report_status}
+
+## Protection Actions
+
+{protection_actions}
+
+## Canary Blocking Reasons
+
+{blocking_reasons}
+
+## Dry-run Live Blocking Reasons
+
+{dry_run_blocking_reasons}
+"#,
+        pair_id = report.pair_id,
+        symbol = report.symbol,
+        execute_live = report.execute_live,
+        mutable_execution_started = report.mutable_execution_started,
+        dry_run_signal_allowed = report.dry_run.signal_allowed,
+        dry_run_risk_decision = report.dry_run.risk_decision,
+        dry_run_live_ready = report.dry_run.live_ready,
+        dry_run_live_readiness_status = report.dry_run.live_readiness.status,
+        plan_hash = report.plan_hash.as_deref().unwrap_or("none"),
+        approval_event = report.approval_event_id.as_deref().unwrap_or("none"),
+        manual_gate_released = report.manual_gate_released,
+        dispatch_plan_built = report.dispatch_plan_built,
+        dispatch_request_count = report.dispatch_request_count,
+        dispatch_attempted = report.dispatch_attempted,
+        dispatch_allowed = report.dispatch_allowed,
+        submitted_receipt_count = report.submitted_receipt_count,
+        private_confirmation_count = report.private_confirmation_count,
+        protection_attempted = report.protection_attempted,
+        protection_receipt_count = report.protection_receipt_count,
+        residual_risk = report.residual_risk.as_deref().unwrap_or("none"),
+        execution_report_status = report.execution_report_status.as_deref().unwrap_or("none"),
+        protection_actions = protection_actions,
+        blocking_reasons = blocking_reasons,
+        dry_run_blocking_reasons = dry_run_blocking_reasons,
+    )
 }
 
 #[cfg(feature = "live-exec")]
@@ -24251,6 +30094,24 @@ fn json_string_array(values: &[String]) -> String {
     }
     out.push(']');
     out
+}
+
+#[cfg(feature = "live-exec")]
+fn wallet_signer_preflight_summary_json(report: &WalletSignerPreflightReport) -> String {
+    let summary_path = report
+        .summary_path
+        .as_ref()
+        .map(|path| json_string(&path.display().to_string()))
+        .unwrap_or_else(|| "null".to_owned());
+    format!(
+        "{{\"aster_status\":{},\"blocking_reasons\":{},\"checked_at\":{},\"hyperliquid_status\":{},\"mutable_execution_started\":{},\"summary_path\":{}}}",
+        json_string(&report.aster_status),
+        json_string_array(&report.blocking_reasons),
+        json_string(&report.checked_at),
+        json_string(&report.hyperliquid_status),
+        report.mutable_execution_started,
+        summary_path
+    )
 }
 
 impl BinanceBasisMonitorSnapshot {
@@ -27277,6 +33138,85 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "binance-basis-live-stack" {
+        let options = parse_binance_basis_live_stack_args(&args[1..])?;
+        let report = run_binance_basis_live_stack(options)?;
+        return Ok(format!(
+            "ok: Binance basis live stack completed; phase={}; readiness_ok={}; resident_exit_status={}; spot_monitor_exit_status={}; perp_monitor_exit_status={}; halt_reason={}; wrote artifacts to {}",
+            report.phase,
+            report.readiness_ok,
+            report.resident_exit_status.as_deref().unwrap_or("none"),
+            report.spot_monitor_exit_status.as_deref().unwrap_or("none"),
+            report.perp_monitor_exit_status.as_deref().unwrap_or("none"),
+            report.halt_reason.as_deref().unwrap_or("none"),
+            report.output_dir.display()
+        ));
+    }
+    if args[0] == "binance-basis-resident-live" {
+        let options = parse_binance_basis_resident_live_args(&args[1..])?;
+        let report = run_binance_basis_resident_live(options)?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| "; no artifacts written".to_owned());
+        return Ok(format!(
+            "ok: Binance basis resident live completed; phase={}; cycles={}; last_net_bps={}; entry_dispatch_attempted={}; exit_dispatch_attempted={}; open_positions={}; live_entries={}; total_open_notional_usdt={}; position_state={}; halt_reason={}{}",
+            report.phase,
+            report.cycles,
+            report
+                .last_net_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            report.entry_dispatch_attempted,
+            report.exit_dispatch_attempted,
+            report.open_position_count,
+            report.live_entry_count,
+            report.total_open_notional_usdt,
+            report
+                .position_state_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            report.halt_reason.as_deref().unwrap_or("none"),
+            output_note
+        ));
+    }
+    if args[0] == "multi-venue-basis-resident-live" {
+        let options = parse_multi_venue_basis_resident_live_args(&args[1..])?;
+        let report = run_multi_venue_basis_resident_live(options)?;
+        let output_note = report
+            .output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| "; no artifacts written".to_owned());
+        return Ok(format!(
+            "ok: multi-venue basis resident live completed; phase={}; cycles={}; venues={}; entry_dispatch_attempted={}; exit_dispatch_attempted={}; open_positions={}; live_entries={}; total_open_notional_usdt={}; halt_reason={}{}",
+            report.phase,
+            report.cycles,
+            report.venue_count,
+            report.entry_dispatch_attempted,
+            report.exit_dispatch_attempted,
+            report.open_position_count,
+            report.live_entry_count,
+            report.total_open_notional_usdt,
+            report.halt_reason.as_deref().unwrap_or("none"),
+            output_note
+        ));
+    }
+    if args[0] == "multi-venue-basis-live-stack" {
+        let options = parse_multi_venue_basis_live_stack_args(&args[1..])?;
+        let report = run_multi_venue_basis_live_stack(options)?;
+        return Ok(format!(
+            "ok: multi-venue basis live stack completed; phase={}; readiness_ok={}; resident_exit_status={}; monitor_exit_statuses={}; halt_reason={}; wrote artifacts to {}",
+            report.phase,
+            report.readiness_ok,
+            report.resident_exit_status.as_deref().unwrap_or("none"),
+            report.monitor_exit_statuses.len(),
+            report.halt_reason.as_deref().unwrap_or("none"),
+            report.output_dir.display()
+        ));
+    }
     if args[0] == "bybit-basis-guarded-live-auto-once" {
         let options = parse_bybit_basis_guarded_live_auto_once_args(&args[1..])?;
         let report = run_bybit_basis_guarded_live_auto_once(options)?;
@@ -27582,6 +33522,43 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             "ok: funding arb monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
+    if args[0] == "wallet-signer-preflight" {
+        let options = parse_wallet_signer_preflight_args(&args[1..])?;
+        let output_dir = options.output_dir.clone();
+        let report = run_wallet_signer_preflight(options)?;
+        let output_note = output_dir
+            .as_ref()
+            .map(|_| {
+                report
+                    .summary_path
+                    .as_ref()
+                    .map(|path| format!("; wrote summary={}", path.display()))
+                    .unwrap_or_else(|| "; no summary written".to_owned())
+            })
+            .unwrap_or_else(|| "; no summary written, pass --out <dir>".to_owned());
+        return Ok(format!(
+            "ok: wallet signer preflight completed; aster_status={}; hyperliquid_status={}; blocking_reasons={}; mutable_execution_started=false{}",
+            report.aster_status,
+            report.hyperliquid_status,
+            report.blocking_reasons.len(),
+            output_note
+        ));
+    }
+    if args[0] == "funding-arb-private-readonly-snapshot-once" {
+        let options = parse_funding_arb_private_readonly_snapshot_once_args(&args[1..])?;
+        let pair_id = options.pair_id.clone();
+        let report = run_funding_arb_private_readonly_snapshot_once(options)?;
+        return Ok(format!(
+            "ok: funding arb private read-only snapshot completed; pair_id={pair_id}; symbol={}; venues={}; account_statements={}; position_statements={}; mutable_execution_started=false; wrote account_raw_snapshot={}; position_raw_snapshot={}; summary={}",
+            report.symbol,
+            report.venue_families.join(","),
+            report.account_statement_count,
+            report.position_statement_count,
+            report.account_raw_snapshot_path.display(),
+            report.position_raw_snapshot_path.display(),
+            report.summary_path.display()
+        ));
+    }
     if args[0] == "funding-arb-guarded-dry-run-once" {
         let options = parse_funding_arb_guarded_dry_run_once_args(&args[1..])?;
         let pair_id = options.pair_id.clone();
@@ -27616,6 +33593,42 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             report.live_ready,
             report.live_blocking_reasons.len(),
             report.dispatch_attempted,
+            output_note
+        ));
+    }
+    if args[0] == "funding-arb-guarded-live-canary-once" {
+        let options = parse_funding_arb_guarded_live_canary_once_args(&args[1..])?;
+        let pair_id = options.dry_run.pair_id.clone();
+        let execute_live = options.execute_live;
+        let output_dir = options.dry_run.output_dir.clone();
+        let report = run_funding_arb_guarded_live_canary_once(options)?;
+        let output_note = output_dir
+            .as_ref()
+            .map(|path| {
+                format!(
+                    "; wrote artifacts to {}",
+                    path.join("live-canary").display()
+                )
+            })
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: funding arb guarded live canary completed; pair_id={pair_id}; symbol={}; execute_live={execute_live}; manual_gate_released={}; dispatch_plan_built={}; dispatch_requests={}; dispatch_allowed={}; dispatch_attempted={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; execution_report_status={}; blocking_reasons={}; mutable_execution_started={}{}",
+            report.symbol,
+            report.manual_gate_released,
+            report.dispatch_plan_built,
+            report.dispatch_request_count,
+            report.dispatch_allowed,
+            report.dispatch_attempted,
+            report.submitted_receipt_count,
+            report.private_confirmation_count,
+            report.protection_attempted,
+            report.protection_receipt_count,
+            report.residual_risk.as_deref().unwrap_or("none"),
+            report.execution_report_status.as_deref().unwrap_or("none"),
+            report.blocking_reasons.len(),
+            report.mutable_execution_started,
             output_note
         ));
     }
@@ -27660,7 +33673,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, funding-arb-guarded-dry-run-once",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once",
                 args[0]
             ),
         });
@@ -27717,6 +33730,14 @@ fn help_text() -> String {
         "                                    Single-leg smoke path: fetch fresh Binance BTCUSDT spot quote, then dry-run or explicitly submit live",
         "  binance-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Binance Spot and short Binance USD-M perp after guarded live gates; live mode requires WSS monitor quotes",
+        "  binance-basis-live-stack [--symbol BTCUSDT] [--config path] [--out dir] [--spot-wss-bind 127.0.0.1:8801 --perp-wss-bind 127.0.0.1:8802] [--monitor-symbol ALL_USDT|BTCUSDT] [--readiness-timeout-secs 60] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Supervisor: launch Binance spot/perp WSS monitors with ALL_USDT default scope, verify readiness, run resident live runner, and record stack logs/events/summary under one RUN_ROOT",
+        "  binance-basis-resident-live [--symbol BTCUSDT] [--config path] [--out dir] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--adl-events-dir dir] [--position-state file] [--max-cycles n] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Binance basis resident runner: supervise open positions, keep opening new entries when capacity allows, and stop on lock, STOP file, unknown state, or hard caps",
+        "  multi-venue-basis-resident-live [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--<venue>-spot-wss-monitor-url url --<venue>-perp-wss-monitor-url url] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Multi-venue resident runner: reuse guarded auto-once per venue, enforce global hard caps, and halt fail-closed on unknown live state",
+        "  multi-venue-basis-live-stack [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--monitor-symbol ALL_USDT] [--readiness-timeout-secs 60] [--interval-secs 60] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Supervisor: launch managed Binance/Bybit WSS monitors, require existing OKX/Bitget WSS monitors for live mode, run multi-venue resident, and record stack artifacts",
         "  bybit-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Bybit Spot and short Bybit Linear perp after guarded live gates; live mode requires WSS monitor quotes",
         "  okx-basis-guarded-live-auto-once [--symbol BTC-USDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
@@ -27743,8 +33764,14 @@ fn help_text() -> String {
         "                                    Monitor all Aster public USDT spot/perp basis rows and serve /api/aster-basis/status",
         "  funding-arb-monitor [--bind 127.0.0.1:8804] [--interval-secs 5] [--clear-sources --source venue=url] [--min-net-funding-bps 5] [--once] [--out dir]",
         "                                    Aggregate local basis monitor status snapshots into cross-exchange funding arb opportunities",
+        "  wallet-signer-preflight [--aster-signer 0x...] [--aster-signer-cmd-env env] [--skip-aster] [--check-hyperliquid --hyperliquid-agent 0x... --hyperliquid-source a|b] [--out dir]",
+        "                                    Run local signer and address-match checks before private read-only or live signing; no exchange requests and no mutable execution",
+        "  funding-arb-private-readonly-snapshot-once --snapshot file --pair-id id [--config file] [--hyperliquid-user 0x...] [--aster-user 0x...] [--aster-signer 0x...] [--aster-signer-cmd-env env] [--out dir]",
+        "                                    Fetch read-only private account/position snapshots for a funding arb pair; Aster auto-uses arb-wallet-signer unless the signer command env override is set; no orders, cancels, transfers, or mutable execution",
         "  funding-arb-guarded-dry-run-once --snapshot file --pair-id id [--config file] [--funding-settlement-raw-snapshot file] [--private-account-snapshot file | --private-account-raw-snapshot file] [--private-position-snapshot file | --private-position-raw-snapshot file] [--private-execution-snapshot file] [--out dir] [--min-net-funding-bps 5]",
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
+        "  funding-arb-guarded-live-canary-once --snapshot file --pair-id id [dry-run snapshot options] [--private-order-events-dir dir] [--aster-user 0x...] [--aster-signer 0x...] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--execute-live --i-understand-funding-arb-live-orders]",
+        "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the two perp legs with cancel/unwind protection",
     ]
     .join("\n")
 }
@@ -27780,6 +33807,10 @@ struct BinancePreDispatchDryRunCliOptions {
 type BinanceGuardedLiveDispatchCliOptions = BinanceGuardedLiveDispatchOptions;
 type BinanceGuardedLiveAutoOnceCliOptions = BinanceGuardedLiveAutoOnceOptions;
 type BinanceBasisGuardedLiveAutoOnceCliOptions = BasisGuardedLiveAutoOnceOptions;
+type BinanceBasisLiveStackCliOptions = BinanceBasisLiveStackOptions;
+type BinanceBasisResidentLiveCliOptions = BinanceBasisResidentLiveOptions;
+type MultiVenueBasisResidentLiveCliOptions = MultiVenueBasisResidentLiveOptions;
+type MultiVenueBasisLiveStackCliOptions = MultiVenueBasisLiveStackOptions;
 type BybitBasisGuardedLiveAutoOnceCliOptions = BybitBasisGuardedLiveAutoOnceOptions;
 type OkxBasisGuardedLiveAutoOnceCliOptions = OkxBasisGuardedLiveAutoOnceOptions;
 type BitgetBasisGuardedLiveAutoOnceCliOptions = BitgetBasisGuardedLiveAutoOnceOptions;
@@ -27793,7 +33824,9 @@ type BitgetBasisMonitorCliOptions = BitgetBasisMonitorOptions;
 type HyperliquidBasisMonitorCliOptions = HyperliquidBasisMonitorOptions;
 type AsterBasisMonitorCliOptions = AsterBasisMonitorOptions;
 type FundingArbMonitorCliOptions = FundingArbMonitorOptions;
+type FundingArbPrivateReadonlySnapshotOnceCliOptions = FundingArbPrivateReadonlySnapshotOnceOptions;
 type FundingArbGuardedDryRunOnceCliOptions = FundingArbGuardedDryRunOnceOptions;
+type FundingArbGuardedLiveCanaryOnceCliOptions = FundingArbGuardedLiveCanaryOnceOptions;
 
 fn parse_live_market_sim_args(args: &[String]) -> RuntimeResult<LiveMarketSimCliOptions> {
     let mut fixture_root = PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE);
@@ -28525,6 +34558,1242 @@ fn parse_binance_basis_guarded_live_auto_once_args(
         "binance-basis-guarded-live-auto-once",
         BASIS_SYMBOL,
     )
+}
+
+fn parse_binance_basis_live_stack_args(
+    args: &[String],
+) -> RuntimeResult<BinanceBasisLiveStackCliOptions> {
+    let mut symbol = BASIS_SYMBOL.to_owned();
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut auto_price_guard_bps = Some(2_i128);
+    let mut spot_wss_bind_addr = BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR.to_owned();
+    let mut perp_wss_bind_addr = "127.0.0.1:8802".to_owned();
+    let mut monitor_symbol = None;
+    let mut monitor_reconnect_delay_secs = BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS;
+    let mut readiness_timeout_secs = 60_u64;
+    let mut shutdown_grace_secs = 5_u64;
+    let mut private_order_events_dir = None;
+    let mut adl_events_dir = None;
+    let mut position_state_path = None;
+    let mut poll_interval_secs = 60_u64;
+    let mut max_cycles = None;
+    let mut max_live_entries = 1_u64;
+    let mut max_concurrent_positions = 1_usize;
+    let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
+    let mut use_existing_monitors = false;
+    let mut execute_live = false;
+    let mut acknowledge_basis_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-bps requires an integer"));
+                };
+                min_net_bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!("--min-net-bps must be an integer: {error}"))
+                })?;
+            }
+            "--auto-price-guard-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--auto-price-guard-bps requires an integer"));
+                };
+                let bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--auto-price-guard-bps must be an integer: {error}"
+                    ))
+                })?;
+                if !(0..=BASIS_AUTO_PRICE_GUARD_MAX_BPS).contains(&bps) {
+                    return Err(cli_arg_error(format!(
+                        "--auto-price-guard-bps must be between 0 and {BASIS_AUTO_PRICE_GUARD_MAX_BPS}"
+                    )));
+                }
+                auto_price_guard_bps = Some(bps);
+            }
+            "--spot-wss-bind" | "--spot-wss-bind-addr" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--spot-wss-bind requires host:port"));
+                };
+                spot_wss_bind_addr = value.clone();
+            }
+            "--perp-wss-bind" | "--perp-wss-bind-addr" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--perp-wss-bind requires host:port"));
+                };
+                perp_wss_bind_addr = value.clone();
+            }
+            "--monitor-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--monitor-symbol requires a value"));
+                };
+                monitor_symbol = Some(value.clone());
+            }
+            "--monitor-reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--monitor-reconnect-delay-secs requires an integer",
+                    ));
+                };
+                monitor_reconnect_delay_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--monitor-reconnect-delay-secs must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--readiness-timeout-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--readiness-timeout-secs requires an integer",
+                    ));
+                };
+                readiness_timeout_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--readiness-timeout-secs must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--shutdown-grace-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--shutdown-grace-secs requires an integer"));
+                };
+                shutdown_grace_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--shutdown-grace-secs must be an integer: {error}"))
+                })?;
+            }
+            "--private-order-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-order-events-dir requires a directory",
+                    ));
+                };
+                private_order_events_dir = Some(PathBuf::from(value));
+            }
+            "--adl-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--adl-events-dir requires a directory"));
+                };
+                adl_events_dir = Some(PathBuf::from(value));
+            }
+            "--position-state" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--position-state requires a file path"));
+                };
+                position_state_path = Some(PathBuf::from(value));
+            }
+            "--interval-secs" | "--poll-interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires an integer"));
+                };
+                poll_interval_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--interval-secs must be an integer: {error}"))
+                })?;
+            }
+            "--max-cycles" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-cycles requires an integer"));
+                };
+                let parsed = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-cycles must be an integer: {error}"))
+                })?;
+                if parsed == 0 {
+                    return Err(cli_arg_error("--max-cycles must be greater than zero"));
+                }
+                max_cycles = Some(parsed);
+            }
+            "--max-live-entries" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-live-entries requires an integer"));
+                };
+                max_live_entries = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
+                })?;
+            }
+            "--max-concurrent-positions" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-concurrent-positions requires an integer",
+                    ));
+                };
+                max_concurrent_positions = value.parse::<usize>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--max-concurrent-positions must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--max-total-notional-usdt" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-total-notional-usdt requires an amount",
+                    ));
+                };
+                Decimal::from_str(value)?;
+                max_total_notional_usdt = value.clone();
+            }
+            "--use-existing-monitors" => {
+                use_existing_monitors = true;
+            }
+            "--execute-live" => {
+                execute_live = true;
+            }
+            "--dry-run" => {
+                execute_live = false;
+            }
+            "--i-understand-basis-live-orders" => {
+                acknowledge_basis_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-basis-live-stack option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-basis-live-stack positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if poll_interval_secs == 0 {
+        return Err(cli_arg_error("--interval-secs must be greater than zero"));
+    }
+    if readiness_timeout_secs == 0 {
+        return Err(cli_arg_error(
+            "--readiness-timeout-secs must be greater than zero",
+        ));
+    }
+    if shutdown_grace_secs == 0 {
+        return Err(cli_arg_error(
+            "--shutdown-grace-secs must be greater than zero",
+        ));
+    }
+    if monitor_reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--monitor-reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    if max_live_entries == 0 {
+        return Err(cli_arg_error(
+            "--max-live-entries must be greater than zero",
+        ));
+    }
+    if max_concurrent_positions == 0 {
+        return Err(cli_arg_error(
+            "--max-concurrent-positions must be greater than zero",
+        ));
+    }
+    let max_total = Decimal::from_str(&max_total_notional_usdt)?;
+    if max_total.is_negative() || max_total.is_zero() {
+        return Err(cli_arg_error(
+            "--max-total-notional-usdt must be greater than zero",
+        ));
+    }
+
+    Ok(BinanceBasisLiveStackOptions {
+        symbol,
+        config_path,
+        output_dir,
+        min_net_bps,
+        auto_price_guard_bps,
+        spot_wss_bind_addr,
+        perp_wss_bind_addr,
+        monitor_symbol,
+        monitor_reconnect_delay_secs,
+        readiness_timeout_secs,
+        shutdown_grace_secs,
+        private_order_events_dir,
+        adl_events_dir,
+        position_state_path,
+        poll_interval_secs,
+        max_cycles,
+        max_live_entries,
+        max_concurrent_positions,
+        max_total_notional_usdt,
+        use_existing_monitors,
+        execute_live,
+        acknowledge_basis_live_orders,
+    })
+}
+
+fn parse_binance_basis_resident_live_args(
+    args: &[String],
+) -> RuntimeResult<BinanceBasisResidentLiveCliOptions> {
+    let mut symbol = BASIS_SYMBOL.to_owned();
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut auto_price_guard_bps = Some(2_i128);
+    let mut spot_wss_monitor_url = "http://127.0.0.1:8801".to_owned();
+    let mut perp_wss_monitor_url = "http://127.0.0.1:8802".to_owned();
+    let mut private_order_events_dir = None;
+    let mut adl_events_dir = None;
+    let mut position_state_path = None;
+    let mut poll_interval_secs = 60_u64;
+    let mut max_cycles = None;
+    let mut max_live_entries = 1_u64;
+    let mut max_concurrent_positions = 1_usize;
+    let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
+    let mut execute_live = false;
+    let mut acknowledge_basis_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                symbol = value.clone();
+            }
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-bps requires an integer"));
+                };
+                min_net_bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!("--min-net-bps must be an integer: {error}"))
+                })?;
+            }
+            "--auto-price-guard-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--auto-price-guard-bps requires an integer"));
+                };
+                let bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--auto-price-guard-bps must be an integer: {error}"
+                    ))
+                })?;
+                if !(0..=BASIS_AUTO_PRICE_GUARD_MAX_BPS).contains(&bps) {
+                    return Err(cli_arg_error(format!(
+                        "--auto-price-guard-bps must be between 0 and {BASIS_AUTO_PRICE_GUARD_MAX_BPS}"
+                    )));
+                }
+                auto_price_guard_bps = Some(bps);
+            }
+            "--spot-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--spot-wss-monitor-url requires a URL"));
+                };
+                spot_wss_monitor_url = value.clone();
+            }
+            "--perp-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--perp-wss-monitor-url requires a URL"));
+                };
+                perp_wss_monitor_url = value.clone();
+            }
+            "--private-order-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-order-events-dir requires a directory",
+                    ));
+                };
+                private_order_events_dir = Some(PathBuf::from(value));
+            }
+            "--adl-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--adl-events-dir requires a directory"));
+                };
+                adl_events_dir = Some(PathBuf::from(value));
+            }
+            "--position-state" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--position-state requires a file path"));
+                };
+                position_state_path = Some(PathBuf::from(value));
+            }
+            "--interval-secs" | "--poll-interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires an integer"));
+                };
+                poll_interval_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--interval-secs must be an integer: {error}"))
+                })?;
+            }
+            "--max-cycles" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-cycles requires an integer"));
+                };
+                let parsed = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-cycles must be an integer: {error}"))
+                })?;
+                if parsed == 0 {
+                    return Err(cli_arg_error("--max-cycles must be greater than zero"));
+                }
+                max_cycles = Some(parsed);
+            }
+            "--max-live-entries" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-live-entries requires an integer"));
+                };
+                max_live_entries = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
+                })?;
+            }
+            "--max-concurrent-positions" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-concurrent-positions requires an integer",
+                    ));
+                };
+                max_concurrent_positions = value.parse::<usize>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--max-concurrent-positions must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--max-total-notional-usdt" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-total-notional-usdt requires an amount",
+                    ));
+                };
+                Decimal::from_str(value)?;
+                max_total_notional_usdt = value.clone();
+            }
+            "--execute-live" => {
+                execute_live = true;
+            }
+            "--dry-run" => {
+                execute_live = false;
+            }
+            "--i-understand-basis-live-orders" => {
+                acknowledge_basis_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown binance-basis-resident-live option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected binance-basis-resident-live positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if poll_interval_secs == 0 {
+        return Err(cli_arg_error("--interval-secs must be greater than zero"));
+    }
+    if max_live_entries == 0 {
+        return Err(cli_arg_error(
+            "--max-live-entries must be greater than zero",
+        ));
+    }
+    if max_concurrent_positions == 0 {
+        return Err(cli_arg_error(
+            "--max-concurrent-positions must be greater than zero",
+        ));
+    }
+    let max_total = Decimal::from_str(&max_total_notional_usdt)?;
+    if max_total.is_negative() || max_total.is_zero() {
+        return Err(cli_arg_error(
+            "--max-total-notional-usdt must be greater than zero",
+        ));
+    }
+
+    Ok(BinanceBasisResidentLiveOptions {
+        symbol,
+        config_path,
+        output_dir,
+        min_net_bps,
+        auto_price_guard_bps,
+        spot_wss_monitor_url,
+        perp_wss_monitor_url,
+        private_order_events_dir,
+        adl_events_dir,
+        position_state_path,
+        poll_interval_secs,
+        max_cycles,
+        max_live_entries,
+        max_concurrent_positions,
+        max_total_notional_usdt,
+        execute_live,
+        acknowledge_basis_live_orders,
+    })
+}
+
+fn default_multi_venue_basis_live_venues() -> Vec<BasisLiveVenue> {
+    vec![
+        BasisLiveVenue::Binance,
+        BasisLiveVenue::Bybit,
+        BasisLiveVenue::Okx,
+        BasisLiveVenue::Bitget,
+    ]
+}
+
+fn parse_basis_live_venue(value: &str) -> RuntimeResult<BasisLiveVenue> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "binance" => Ok(BasisLiveVenue::Binance),
+        "bybit" => Ok(BasisLiveVenue::Bybit),
+        "okx" => Ok(BasisLiveVenue::Okx),
+        "bitget" => Ok(BasisLiveVenue::Bitget),
+        other => Err(cli_arg_error(format!(
+            "unsupported basis live venue `{other}`; expected binance,bybit,okx,bitget"
+        ))),
+    }
+}
+
+fn parse_basis_live_venues(value: &str) -> RuntimeResult<Vec<BasisLiveVenue>> {
+    let mut venues = Vec::new();
+    for part in value.split(',') {
+        if part.trim().is_empty() {
+            continue;
+        }
+        let venue = parse_basis_live_venue(part)?;
+        if !venues.contains(&venue) {
+            venues.push(venue);
+        }
+    }
+    if venues.is_empty() {
+        return Err(cli_arg_error("--venues requires at least one venue"));
+    }
+    Ok(venues)
+}
+
+fn parse_multi_venue_basis_resident_live_args(
+    args: &[String],
+) -> RuntimeResult<MultiVenueBasisResidentLiveCliOptions> {
+    let mut venues = default_multi_venue_basis_live_venues();
+    let mut symbols = BTreeMap::new();
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut auto_price_guard_bps = Some(2_i128);
+    let mut spot_wss_monitor_urls = BTreeMap::new();
+    let mut perp_wss_monitor_urls = BTreeMap::new();
+    let mut private_order_events_dir = None;
+    let mut adl_events_dir = None;
+    let mut poll_interval_secs = 60_u64;
+    let mut max_cycles = None;
+    let mut max_live_entries = 1_u64;
+    let mut max_concurrent_positions = 1_usize;
+    let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
+    let mut execute_live = false;
+    let mut acknowledge_basis_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--venues" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--venues requires a comma-separated venue list",
+                    ));
+                };
+                venues = parse_basis_live_venues(value)?;
+            }
+            "--binance-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--binance-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--bybit-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--okx-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--bitget-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bitget-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-bps requires an integer"));
+                };
+                min_net_bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!("--min-net-bps must be an integer: {error}"))
+                })?;
+            }
+            "--auto-price-guard-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--auto-price-guard-bps requires an integer"));
+                };
+                let bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--auto-price-guard-bps must be an integer: {error}"
+                    ))
+                })?;
+                if !(0..=BASIS_AUTO_PRICE_GUARD_MAX_BPS).contains(&bps) {
+                    return Err(cli_arg_error(format!(
+                        "--auto-price-guard-bps must be between 0 and {BASIS_AUTO_PRICE_GUARD_MAX_BPS}"
+                    )));
+                }
+                auto_price_guard_bps = Some(bps);
+            }
+            "--binance-spot-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--binance-spot-wss-monitor-url requires a URL",
+                    ));
+                };
+                spot_wss_monitor_urls.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--binance-perp-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--binance-perp-wss-monitor-url requires a URL",
+                    ));
+                };
+                perp_wss_monitor_urls.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--bybit-spot-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-spot-wss-monitor-url requires a URL"));
+                };
+                spot_wss_monitor_urls.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--bybit-perp-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-perp-wss-monitor-url requires a URL"));
+                };
+                perp_wss_monitor_urls.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--okx-spot-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-spot-wss-monitor-url requires a URL"));
+                };
+                spot_wss_monitor_urls.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--okx-perp-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-perp-wss-monitor-url requires a URL"));
+                };
+                perp_wss_monitor_urls.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--bitget-spot-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--bitget-spot-wss-monitor-url requires a URL",
+                    ));
+                };
+                spot_wss_monitor_urls.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--bitget-perp-wss-monitor-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--bitget-perp-wss-monitor-url requires a URL",
+                    ));
+                };
+                perp_wss_monitor_urls.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--private-order-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-order-events-dir requires a directory",
+                    ));
+                };
+                private_order_events_dir = Some(PathBuf::from(value));
+            }
+            "--adl-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--adl-events-dir requires a directory"));
+                };
+                adl_events_dir = Some(PathBuf::from(value));
+            }
+            "--interval-secs" | "--poll-interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires an integer"));
+                };
+                poll_interval_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--interval-secs must be an integer: {error}"))
+                })?;
+            }
+            "--max-cycles" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-cycles requires an integer"));
+                };
+                let parsed = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-cycles must be an integer: {error}"))
+                })?;
+                if parsed == 0 {
+                    return Err(cli_arg_error("--max-cycles must be greater than zero"));
+                }
+                max_cycles = Some(parsed);
+            }
+            "--max-live-entries" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-live-entries requires an integer"));
+                };
+                max_live_entries = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
+                })?;
+            }
+            "--max-concurrent-positions" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-concurrent-positions requires an integer",
+                    ));
+                };
+                max_concurrent_positions = value.parse::<usize>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--max-concurrent-positions must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--max-total-notional-usdt" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-total-notional-usdt requires an amount",
+                    ));
+                };
+                Decimal::from_str(value)?;
+                max_total_notional_usdt = value.clone();
+            }
+            "--execute-live" => {
+                execute_live = true;
+            }
+            "--dry-run" => {
+                execute_live = false;
+            }
+            "--i-understand-basis-live-orders" => {
+                acknowledge_basis_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown multi-venue-basis-resident-live option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected multi-venue-basis-resident-live positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if poll_interval_secs == 0 {
+        return Err(cli_arg_error("--interval-secs must be greater than zero"));
+    }
+    if max_live_entries == 0 {
+        return Err(cli_arg_error(
+            "--max-live-entries must be greater than zero",
+        ));
+    }
+    if max_concurrent_positions == 0 {
+        return Err(cli_arg_error(
+            "--max-concurrent-positions must be greater than zero",
+        ));
+    }
+    let max_total = Decimal::from_str(&max_total_notional_usdt)?;
+    if max_total.is_negative() || max_total.is_zero() {
+        return Err(cli_arg_error(
+            "--max-total-notional-usdt must be greater than zero",
+        ));
+    }
+
+    Ok(MultiVenueBasisResidentLiveOptions {
+        venues,
+        symbols,
+        config_path,
+        output_dir,
+        min_net_bps,
+        auto_price_guard_bps,
+        spot_wss_monitor_urls,
+        perp_wss_monitor_urls,
+        private_order_events_dir,
+        adl_events_dir,
+        poll_interval_secs,
+        max_cycles,
+        max_live_entries,
+        max_concurrent_positions,
+        max_total_notional_usdt,
+        execute_live,
+        acknowledge_basis_live_orders,
+    })
+}
+
+fn parse_multi_venue_basis_live_stack_args(
+    args: &[String],
+) -> RuntimeResult<MultiVenueBasisLiveStackCliOptions> {
+    let mut venues = default_multi_venue_basis_live_venues();
+    let mut symbols = BTreeMap::new();
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut auto_price_guard_bps = Some(2_i128);
+    let mut spot_wss_bind_addrs = BTreeMap::new();
+    let mut perp_wss_bind_addrs = BTreeMap::new();
+    let mut monitor_symbol = None;
+    let mut monitor_reconnect_delay_secs = BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS;
+    let mut readiness_timeout_secs = 60_u64;
+    let mut shutdown_grace_secs = 5_u64;
+    let mut private_order_events_dir = None;
+    let mut adl_events_dir = None;
+    let mut poll_interval_secs = 60_u64;
+    let mut max_cycles = None;
+    let mut max_live_entries = 1_u64;
+    let mut max_concurrent_positions = 1_usize;
+    let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
+    let mut use_existing_monitors = false;
+    let mut execute_live = false;
+    let mut acknowledge_basis_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--venues" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--venues requires a comma-separated venue list",
+                    ));
+                };
+                venues = parse_basis_live_venues(value)?;
+            }
+            "--binance-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--binance-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--bybit-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--okx-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--bitget-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bitget-symbol requires a value"));
+                };
+                symbols.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-bps requires an integer"));
+                };
+                min_net_bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!("--min-net-bps must be an integer: {error}"))
+                })?;
+            }
+            "--auto-price-guard-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--auto-price-guard-bps requires an integer"));
+                };
+                let bps = value.parse::<i128>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--auto-price-guard-bps must be an integer: {error}"
+                    ))
+                })?;
+                if !(0..=BASIS_AUTO_PRICE_GUARD_MAX_BPS).contains(&bps) {
+                    return Err(cli_arg_error(format!(
+                        "--auto-price-guard-bps must be between 0 and {BASIS_AUTO_PRICE_GUARD_MAX_BPS}"
+                    )));
+                }
+                auto_price_guard_bps = Some(bps);
+            }
+            "--monitor-symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--monitor-symbol requires a value"));
+                };
+                monitor_symbol = Some(value.clone());
+            }
+            "--monitor-reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--monitor-reconnect-delay-secs requires an integer",
+                    ));
+                };
+                monitor_reconnect_delay_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--monitor-reconnect-delay-secs must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--readiness-timeout-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--readiness-timeout-secs requires an integer",
+                    ));
+                };
+                readiness_timeout_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--readiness-timeout-secs must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--shutdown-grace-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--shutdown-grace-secs requires an integer"));
+                };
+                shutdown_grace_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--shutdown-grace-secs must be an integer: {error}"))
+                })?;
+            }
+            "--binance-spot-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--binance-spot-wss-bind requires host:port or URL",
+                    ));
+                };
+                spot_wss_bind_addrs.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--binance-perp-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--binance-perp-wss-bind requires host:port or URL",
+                    ));
+                };
+                perp_wss_bind_addrs.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--bybit-spot-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--bybit-spot-wss-bind requires host:port or URL",
+                    ));
+                };
+                spot_wss_bind_addrs.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--bybit-perp-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--bybit-perp-wss-bind requires host:port or URL",
+                    ));
+                };
+                perp_wss_bind_addrs.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--okx-spot-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--okx-spot-wss-bind requires host:port or URL",
+                    ));
+                };
+                spot_wss_bind_addrs.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--okx-perp-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--okx-perp-wss-bind requires host:port or URL",
+                    ));
+                };
+                perp_wss_bind_addrs.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--bitget-spot-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--bitget-spot-wss-bind requires host:port or URL",
+                    ));
+                };
+                spot_wss_bind_addrs.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--bitget-perp-wss-bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--bitget-perp-wss-bind requires host:port or URL",
+                    ));
+                };
+                perp_wss_bind_addrs.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--private-order-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-order-events-dir requires a directory",
+                    ));
+                };
+                private_order_events_dir = Some(PathBuf::from(value));
+            }
+            "--adl-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--adl-events-dir requires a directory"));
+                };
+                adl_events_dir = Some(PathBuf::from(value));
+            }
+            "--interval-secs" | "--poll-interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires an integer"));
+                };
+                poll_interval_secs = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--interval-secs must be an integer: {error}"))
+                })?;
+            }
+            "--max-cycles" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-cycles requires an integer"));
+                };
+                let parsed = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-cycles must be an integer: {error}"))
+                })?;
+                if parsed == 0 {
+                    return Err(cli_arg_error("--max-cycles must be greater than zero"));
+                }
+                max_cycles = Some(parsed);
+            }
+            "--max-live-entries" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-live-entries requires an integer"));
+                };
+                max_live_entries = value.parse::<u64>().map_err(|error| {
+                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
+                })?;
+            }
+            "--max-concurrent-positions" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-concurrent-positions requires an integer",
+                    ));
+                };
+                max_concurrent_positions = value.parse::<usize>().map_err(|error| {
+                    cli_arg_error(format!(
+                        "--max-concurrent-positions must be an integer: {error}"
+                    ))
+                })?;
+            }
+            "--max-total-notional-usdt" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-total-notional-usdt requires an amount",
+                    ));
+                };
+                Decimal::from_str(value)?;
+                max_total_notional_usdt = value.clone();
+            }
+            "--use-existing-monitors" => {
+                use_existing_monitors = true;
+            }
+            "--execute-live" => {
+                execute_live = true;
+            }
+            "--dry-run" => {
+                execute_live = false;
+            }
+            "--i-understand-basis-live-orders" => {
+                acknowledge_basis_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown multi-venue-basis-live-stack option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected multi-venue-basis-live-stack positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if poll_interval_secs == 0 {
+        return Err(cli_arg_error("--interval-secs must be greater than zero"));
+    }
+    if readiness_timeout_secs == 0 {
+        return Err(cli_arg_error(
+            "--readiness-timeout-secs must be greater than zero",
+        ));
+    }
+    if shutdown_grace_secs == 0 {
+        return Err(cli_arg_error(
+            "--shutdown-grace-secs must be greater than zero",
+        ));
+    }
+    if monitor_reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--monitor-reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    if max_live_entries == 0 {
+        return Err(cli_arg_error(
+            "--max-live-entries must be greater than zero",
+        ));
+    }
+    if max_concurrent_positions == 0 {
+        return Err(cli_arg_error(
+            "--max-concurrent-positions must be greater than zero",
+        ));
+    }
+    let max_total = Decimal::from_str(&max_total_notional_usdt)?;
+    if max_total.is_negative() || max_total.is_zero() {
+        return Err(cli_arg_error(
+            "--max-total-notional-usdt must be greater than zero",
+        ));
+    }
+
+    Ok(MultiVenueBasisLiveStackOptions {
+        venues,
+        symbols,
+        config_path,
+        output_dir,
+        min_net_bps,
+        auto_price_guard_bps,
+        spot_wss_bind_addrs,
+        perp_wss_bind_addrs,
+        monitor_symbol,
+        monitor_reconnect_delay_secs,
+        readiness_timeout_secs,
+        shutdown_grace_secs,
+        private_order_events_dir,
+        adl_events_dir,
+        poll_interval_secs,
+        max_cycles,
+        max_live_entries,
+        max_concurrent_positions,
+        max_total_notional_usdt,
+        use_existing_monitors,
+        execute_live,
+        acknowledge_basis_live_orders,
+    })
 }
 
 fn parse_bybit_basis_guarded_live_auto_once_args(
@@ -29574,6 +36843,192 @@ fn set_funding_arb_source_url(
     }
 }
 
+fn parse_wallet_signer_preflight_args(
+    args: &[String],
+) -> RuntimeResult<WalletSignerPreflightOptions> {
+    let mut output_dir = None;
+    let mut aster_signer = None;
+    let mut aster_signer_cmd_env = ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned();
+    let mut skip_aster = false;
+    let mut check_hyperliquid = false;
+    let mut hyperliquid_agent = None;
+    let mut hyperliquid_source = "a".to_owned();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--aster-signer" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-signer requires an address"));
+                };
+                aster_signer = Some(value.clone());
+            }
+            "--aster-signer-cmd-env" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--aster-signer-cmd-env requires an env var name",
+                    ));
+                };
+                aster_signer_cmd_env = value.clone();
+            }
+            "--skip-aster" => {
+                skip_aster = true;
+            }
+            "--check-hyperliquid" => {
+                check_hyperliquid = true;
+            }
+            "--hyperliquid-agent" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-agent requires an address"));
+                };
+                hyperliquid_agent = Some(value.clone());
+                check_hyperliquid = true;
+            }
+            "--hyperliquid-source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-source requires `a` or `b`"));
+                };
+                hyperliquid_source = value.clone();
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown wallet-signer-preflight option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected wallet-signer-preflight positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let options = WalletSignerPreflightOptions {
+        output_dir,
+        aster_signer,
+        aster_signer_cmd_env,
+        skip_aster,
+        check_hyperliquid,
+        hyperliquid_agent,
+        hyperliquid_source,
+    };
+    validate_wallet_signer_preflight_options(&options)?;
+    Ok(options)
+}
+
+fn parse_funding_arb_private_readonly_snapshot_once_args(
+    args: &[String],
+) -> RuntimeResult<FundingArbPrivateReadonlySnapshotOnceCliOptions> {
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut snapshot_path = None;
+    let mut pair_id = None;
+    let mut output_dir = None;
+    let mut hyperliquid_user = None;
+    let mut aster_user = None;
+    let mut aster_signer = None;
+    let mut aster_signer_cmd_env = ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--snapshot requires a file path"));
+                };
+                snapshot_path = Some(PathBuf::from(value));
+            }
+            "--pair-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--pair-id requires a value"));
+                };
+                pair_id = Some(value.clone());
+            }
+            "--hyperliquid-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-user requires an address"));
+                };
+                hyperliquid_user = Some(value.clone());
+            }
+            "--aster-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-user requires an address"));
+                };
+                aster_user = Some(value.clone());
+            }
+            "--aster-signer" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-signer requires an address"));
+                };
+                aster_signer = Some(value.clone());
+            }
+            "--aster-signer-cmd-env" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--aster-signer-cmd-env requires an env var name",
+                    ));
+                };
+                aster_signer_cmd_env = value.clone();
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown funding-arb-private-readonly-snapshot-once option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected funding-arb-private-readonly-snapshot-once positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let options = FundingArbPrivateReadonlySnapshotOnceOptions {
+        config_path,
+        snapshot_path: snapshot_path.ok_or_else(|| cli_arg_error("--snapshot is required"))?,
+        pair_id: pair_id.ok_or_else(|| cli_arg_error("--pair-id is required"))?,
+        output_dir,
+        hyperliquid_user,
+        aster_user,
+        aster_signer,
+        aster_signer_cmd_env,
+    };
+    validate_funding_arb_private_readonly_snapshot_once_options(&options)?;
+    Ok(options)
+}
+
 fn parse_funding_arb_guarded_dry_run_once_args(
     args: &[String],
 ) -> RuntimeResult<FundingArbGuardedDryRunOnceCliOptions> {
@@ -29768,6 +37223,149 @@ fn parse_funding_arb_guarded_dry_run_once_args(
     };
     validate_funding_arb_guarded_dry_run_once_options(&options)?;
     Ok(options)
+}
+
+fn parse_funding_arb_guarded_live_canary_once_args(
+    args: &[String],
+) -> RuntimeResult<FundingArbGuardedLiveCanaryOnceCliOptions> {
+    let mut dry_run_args = Vec::new();
+    let mut execute_live = false;
+    let mut acknowledge_funding_arb_live_orders = false;
+    let mut private_order_events_dir = None;
+    let mut hyperliquid_user = None;
+    let mut hyperliquid_source =
+        std::env::var("HYPERLIQUID_SOURCE").unwrap_or_else(|_| "a".to_owned());
+    let mut hyperliquid_vault_address = None;
+    let mut hyperliquid_expires_after_ms = None;
+    let mut hyperliquid_asset_ids = BTreeMap::new();
+    let mut aster_user = None;
+    let mut aster_signer = None;
+    let mut aster_signer_cmd_env = ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--execute-live" => execute_live = true,
+            "--i-understand-funding-arb-live-orders" => acknowledge_funding_arb_live_orders = true,
+            "--private-order-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-order-events-dir requires a directory",
+                    ));
+                };
+                private_order_events_dir = Some(PathBuf::from(value));
+            }
+            "--hyperliquid-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-user requires an address"));
+                };
+                hyperliquid_user = Some(value.clone());
+            }
+            "--hyperliquid-source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-source requires a|b"));
+                };
+                hyperliquid_source = value.clone();
+            }
+            "--hyperliquid-vault-address" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--hyperliquid-vault-address requires an address",
+                    ));
+                };
+                hyperliquid_vault_address = Some(value.clone());
+            }
+            "--hyperliquid-expires-after-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--hyperliquid-expires-after-ms requires a millisecond timestamp",
+                    ));
+                };
+                hyperliquid_expires_after_ms =
+                    Some(value.parse::<u64>().map_err(|_| {
+                        cli_arg_error("--hyperliquid-expires-after-ms must be a u64")
+                    })?);
+            }
+            "--hyperliquid-asset-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-asset-id requires SYMBOL=ID"));
+                };
+                let (symbol, asset_id) = parse_hyperliquid_asset_id_arg(value)?;
+                hyperliquid_asset_ids.insert(symbol, asset_id);
+            }
+            "--aster-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-user requires an address"));
+                };
+                aster_user = Some(value.clone());
+            }
+            "--aster-signer" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-signer requires an address"));
+                };
+                aster_signer = Some(value.clone());
+            }
+            "--aster-signer-cmd-env" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--aster-signer-cmd-env requires an env var name",
+                    ));
+                };
+                aster_signer_cmd_env = value.clone();
+            }
+            value => dry_run_args.push(value.to_owned()),
+        }
+        index += 1;
+    }
+
+    let options = FundingArbGuardedLiveCanaryOnceOptions {
+        dry_run: parse_funding_arb_guarded_dry_run_once_args(&dry_run_args)?,
+        execute_live,
+        acknowledge_funding_arb_live_orders,
+        private_order_events_dir,
+        hyperliquid_user,
+        hyperliquid_source,
+        hyperliquid_vault_address,
+        hyperliquid_expires_after_ms,
+        hyperliquid_asset_ids,
+        aster_user,
+        aster_signer,
+        aster_signer_cmd_env,
+    };
+    validate_funding_arb_guarded_live_canary_once_options(&options)?;
+    Ok(options)
+}
+
+fn parse_hyperliquid_asset_id_arg(value: &str) -> RuntimeResult<(String, u32)> {
+    let Some((symbol, asset_id)) = value.split_once('=') else {
+        return Err(cli_arg_error(
+            "--hyperliquid-asset-id must be shaped as SYMBOL=ID",
+        ));
+    };
+    let symbol = symbol.trim();
+    if symbol.is_empty()
+        || symbol
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'/')))
+    {
+        return Err(cli_arg_error(
+            "--hyperliquid-asset-id symbol contains an unsupported byte",
+        ));
+    }
+    let asset_id = asset_id
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| cli_arg_error("--hyperliquid-asset-id ID must be a u32"))?;
+    Ok((symbol.to_owned(), asset_id))
 }
 
 fn cli_arg_error(message: impl Into<String>) -> RuntimeError {
@@ -30678,6 +38276,48 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn binance_basis_live_accepts_monitor_book_ticker_source_event_id() {
+        let raw = r#"{
+          "status":"streaming",
+          "market":"Spot",
+          "fail_closed":false,
+          "wss_update_count":3,
+          "last_error":null,
+          "rows":[{
+            "symbol":"BTCUSDT",
+            "venue_id":"venue:BINANCE-SPOT",
+            "instrument_id":"inst:BINANCE:BTCUSDT:SPOT",
+            "best_bid":"100.01",
+            "best_ask":"100.02",
+            "bid_size":"1.2",
+            "ask_size":"1.3",
+            "source_sequence":"2",
+            "source_event_id":"binance:wss-bookTicker:Spot:BTCUSDT:400900301",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          }]
+        }"#;
+
+        let quote = parse_public_wss_monitor_quote_for_basis(
+            raw,
+            "http://127.0.0.1:8801/api/binance-wss-book-ticker/status",
+            BASIS_SYMBOL,
+            BinancePublicMarket::Spot.as_str(),
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+            UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at"),
+        )
+        .expect("monitor quote");
+
+        assert_eq!(
+            quote.source_event_id.as_deref(),
+            Some("binance:wss-bookTicker:Spot:BTCUSDT:400900301")
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn okx_basis_live_wss_monitor_quote_becomes_ticker_input() {
         let raw = r#"{
           "status":"streaming",
@@ -31268,10 +38908,11 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.check_id == "risk_decision" && check.blocking));
-        assert!(report.live_readiness.checks.iter().any(|check| {
-            check.check_id == "funding_arb_live_runner"
-                && check.reason_code.as_deref() == Some("FUNDING_ARB_LIVE_RUNNER_NOT_ATTACHED")
-        }));
+        assert!(report
+            .live_readiness
+            .checks
+            .iter()
+            .any(|check| { check.check_id == "funding_arb_live_runner" && !check.blocking }));
         assert!(report.live_readiness.checks.iter().any(|check| {
             check.check_id == "funding_arb_exit_supervisor"
                 && check.reason_code.as_deref() == Some("FUNDING_ARB_EXIT_SUPERVISOR_NOT_READY")
@@ -31885,18 +39526,12 @@ mod tests {
         assert_eq!(report.private_positions.status, "Matched");
         assert_eq!(report.private_positions.checked_position_count, 2);
         assert_eq!(report.private_positions.nonzero_position_count, 0);
-        assert_eq!(report.venue_execution_capability.status, "Blocked");
+        assert_eq!(report.venue_execution_capability.status, "Matched");
         assert!(report
             .venue_execution_capability
             .unsupported_venues
-            .iter()
-            .any(|venue| venue.contains("aster")));
-        assert!(report
-            .venue_execution_capability
-            .unsupported_venues
-            .iter()
-            .any(|venue| venue.contains("hyperliquid")));
-        assert!(report.live_readiness.checks.iter().any(|check| {
+            .is_empty());
+        assert!(!report.live_readiness.checks.iter().any(|check| {
             check.check_id == "venue_live_execution_capability"
                 && check.reason_code.as_deref()
                     == Some("VENUE_LIVE_EXECUTION_CAPABILITY_NOT_ATTACHED")
@@ -32012,6 +39647,169 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_guarded_live_canary_once_args_parse_live_controls() {
+        let args = vec![
+            "--snapshot".to_owned(),
+            "target/funding-opportunities.json".to_owned(),
+            "--pair-id".to_owned(),
+            "aster:hyperliquid:BTCUSDT:BTCUSDT".to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--private-execution-snapshot".to_owned(),
+            "target/funding-private-execution.json".to_owned(),
+            "--out".to_owned(),
+            "target/funding-live-canary".to_owned(),
+            "--private-order-events-dir".to_owned(),
+            "target/private-order-events".to_owned(),
+            "--execute-live".to_owned(),
+            "--i-understand-funding-arb-live-orders".to_owned(),
+            "--hyperliquid-user".to_owned(),
+            "0x0000000000000000000000000000000000000000".to_owned(),
+            "--hyperliquid-source".to_owned(),
+            "b".to_owned(),
+            "--hyperliquid-vault-address".to_owned(),
+            "0x3333333333333333333333333333333333333333".to_owned(),
+            "--hyperliquid-expires-after-ms".to_owned(),
+            "1893456000000".to_owned(),
+            "--hyperliquid-asset-id".to_owned(),
+            "BTCUSDT=0".to_owned(),
+            "--hyperliquid-asset-id".to_owned(),
+            "ETH=1".to_owned(),
+            "--aster-user".to_owned(),
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            "--aster-signer".to_owned(),
+            "0x2222222222222222222222222222222222222222".to_owned(),
+            "--aster-signer-cmd-env".to_owned(),
+            "ASTER_CANARY_SIGNER_CMD".to_owned(),
+        ];
+
+        let options = parse_funding_arb_guarded_live_canary_once_args(&args).expect("options");
+
+        assert_eq!(options.dry_run.pair_id, "aster:hyperliquid:BTCUSDT:BTCUSDT");
+        assert_eq!(
+            options.dry_run.private_execution_snapshot_path,
+            Some(PathBuf::from("target/funding-private-execution.json"))
+        );
+        assert_eq!(
+            options.dry_run.output_dir,
+            Some(PathBuf::from("target/funding-live-canary"))
+        );
+        assert!(options.execute_live);
+        assert!(options.acknowledge_funding_arb_live_orders);
+        assert_eq!(
+            options.private_order_events_dir,
+            Some(PathBuf::from("target/private-order-events"))
+        );
+        assert_eq!(
+            options.hyperliquid_user.as_deref(),
+            Some("0x0000000000000000000000000000000000000000")
+        );
+        assert_eq!(options.hyperliquid_source, "b");
+        assert_eq!(
+            options.hyperliquid_vault_address.as_deref(),
+            Some("0x3333333333333333333333333333333333333333")
+        );
+        assert_eq!(
+            options.hyperliquid_expires_after_ms,
+            Some(1_893_456_000_000)
+        );
+        assert_eq!(options.hyperliquid_asset_ids.get("BTCUSDT"), Some(&0));
+        assert_eq!(options.hyperliquid_asset_ids.get("ETH"), Some(&1));
+        assert_eq!(
+            options.aster_user.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            options.aster_signer.as_deref(),
+            Some("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(options.aster_signer_cmd_env, "ASTER_CANARY_SIGNER_CMD");
+    }
+
+    #[test]
+    fn funding_arb_private_readonly_snapshot_once_args_parse() {
+        let args = vec![
+            "--snapshot".to_owned(),
+            "target/funding-opportunities.json".to_owned(),
+            "--pair-id".to_owned(),
+            "aster:hyperliquid:BTCUSDT:BTCUSDT".to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--hyperliquid-user".to_owned(),
+            "0x0000000000000000000000000000000000000000".to_owned(),
+            "--aster-user".to_owned(),
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            "--aster-signer".to_owned(),
+            "0x2222222222222222222222222222222222222222".to_owned(),
+            "--aster-signer-cmd-env".to_owned(),
+            "ASTER_READONLY_SIGNER_CMD".to_owned(),
+            "--out".to_owned(),
+            "target/funding-private-readonly".to_owned(),
+        ];
+
+        let options =
+            parse_funding_arb_private_readonly_snapshot_once_args(&args).expect("options");
+
+        assert_eq!(
+            options.snapshot_path,
+            PathBuf::from("target/funding-opportunities.json")
+        );
+        assert_eq!(options.pair_id, "aster:hyperliquid:BTCUSDT:BTCUSDT");
+        assert_eq!(
+            options.hyperliquid_user.as_deref(),
+            Some("0x0000000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            options.aster_user.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            options.aster_signer.as_deref(),
+            Some("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(options.aster_signer_cmd_env, "ASTER_READONLY_SIGNER_CMD");
+        assert_eq!(
+            options.output_dir,
+            Some(PathBuf::from("target/funding-private-readonly"))
+        );
+    }
+
+    #[test]
+    fn wallet_signer_preflight_args_parse() {
+        let args = vec![
+            "--aster-signer".to_owned(),
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            "--aster-signer-cmd-env".to_owned(),
+            "ASTER_READONLY_SIGNER_CMD".to_owned(),
+            "--check-hyperliquid".to_owned(),
+            "--hyperliquid-agent".to_owned(),
+            "0x2222222222222222222222222222222222222222".to_owned(),
+            "--hyperliquid-source".to_owned(),
+            "b".to_owned(),
+            "--out".to_owned(),
+            "target/wallet-signer-preflight".to_owned(),
+        ];
+
+        let options = parse_wallet_signer_preflight_args(&args).expect("options");
+
+        assert_eq!(
+            options.aster_signer.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(options.aster_signer_cmd_env, "ASTER_READONLY_SIGNER_CMD");
+        assert!(options.check_hyperliquid);
+        assert_eq!(
+            options.hyperliquid_agent.as_deref(),
+            Some("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(options.hyperliquid_source, "b");
+        assert_eq!(
+            options.output_dir,
+            Some(PathBuf::from("target/wallet-signer-preflight"))
+        );
+    }
+
+    #[test]
     fn basis_guarded_live_auto_once_args_parse_auto_price_guard() {
         let args = vec![
             "--symbol".to_owned(),
@@ -32039,6 +39837,410 @@ mod tests {
         assert_eq!(options.min_perp_bid, None);
         assert!(options.execute_live);
         assert!(options.acknowledge_basis_live_orders);
+    }
+
+    #[test]
+    fn binance_basis_resident_live_args_parse_caps_and_lock_inputs() {
+        let args = vec![
+            "--symbol".to_owned(),
+            BASIS_SYMBOL.to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--out".to_owned(),
+            "target/live-canary/binance-resident".to_owned(),
+            "--interval-secs".to_owned(),
+            "30".to_owned(),
+            "--min-net-bps".to_owned(),
+            "7".to_owned(),
+            "--auto-price-guard-bps".to_owned(),
+            "3".to_owned(),
+            "--spot-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8801".to_owned(),
+            "--perp-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8802".to_owned(),
+            "--private-order-events-dir".to_owned(),
+            "target/private-orders".to_owned(),
+            "--adl-events-dir".to_owned(),
+            "target/adl".to_owned(),
+            "--position-state".to_owned(),
+            "target/live-dispatch/basis_exit_supervisor_state.json".to_owned(),
+            "--max-cycles".to_owned(),
+            "11".to_owned(),
+            "--max-live-entries".to_owned(),
+            "4".to_owned(),
+            "--max-concurrent-positions".to_owned(),
+            "2".to_owned(),
+            "--max-total-notional-usdt".to_owned(),
+            "40.00".to_owned(),
+            "--execute-live".to_owned(),
+            "--i-understand-basis-live-orders".to_owned(),
+        ];
+
+        let options = parse_binance_basis_resident_live_args(&args).expect("options");
+
+        assert_eq!(options.symbol, BASIS_SYMBOL);
+        assert_eq!(options.min_net_bps, 7);
+        assert_eq!(options.auto_price_guard_bps, Some(3));
+        assert_eq!(options.poll_interval_secs, 30);
+        assert_eq!(options.max_cycles, Some(11));
+        assert_eq!(options.max_live_entries, 4);
+        assert_eq!(options.max_concurrent_positions, 2);
+        assert_eq!(options.max_total_notional_usdt, "40.00");
+        assert_eq!(
+            options.position_state_path,
+            Some(PathBuf::from(
+                "target/live-dispatch/basis_exit_supervisor_state.json"
+            ))
+        );
+        assert!(options.execute_live);
+        assert!(options.acknowledge_basis_live_orders);
+    }
+
+    #[test]
+    fn binance_basis_live_stack_args_parse_supervisor_inputs() {
+        let args = vec![
+            "--symbol".to_owned(),
+            BASIS_SYMBOL.to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--out".to_owned(),
+            "target/live-canary/binance-stack".to_owned(),
+            "--spot-wss-bind".to_owned(),
+            "127.0.0.1:8811".to_owned(),
+            "--perp-wss-bind".to_owned(),
+            "127.0.0.1:8812".to_owned(),
+            "--monitor-symbol".to_owned(),
+            "BTCUSDT".to_owned(),
+            "--monitor-reconnect-delay-secs".to_owned(),
+            "3".to_owned(),
+            "--readiness-timeout-secs".to_owned(),
+            "45".to_owned(),
+            "--shutdown-grace-secs".to_owned(),
+            "4".to_owned(),
+            "--interval-secs".to_owned(),
+            "30".to_owned(),
+            "--min-net-bps".to_owned(),
+            "7".to_owned(),
+            "--auto-price-guard-bps".to_owned(),
+            "3".to_owned(),
+            "--max-live-entries".to_owned(),
+            "4".to_owned(),
+            "--max-concurrent-positions".to_owned(),
+            "2".to_owned(),
+            "--max-total-notional-usdt".to_owned(),
+            "40.00".to_owned(),
+            "--use-existing-monitors".to_owned(),
+            "--execute-live".to_owned(),
+            "--i-understand-basis-live-orders".to_owned(),
+        ];
+
+        let options = parse_binance_basis_live_stack_args(&args).expect("options");
+
+        assert_eq!(options.symbol, BASIS_SYMBOL);
+        assert_eq!(
+            options.output_dir,
+            Some(PathBuf::from("target/live-canary/binance-stack"))
+        );
+        assert_eq!(options.spot_wss_bind_addr, "127.0.0.1:8811");
+        assert_eq!(options.perp_wss_bind_addr, "127.0.0.1:8812");
+        assert_eq!(options.monitor_symbol.as_deref(), Some("BTCUSDT"));
+        assert_eq!(options.monitor_reconnect_delay_secs, 3);
+        assert_eq!(options.readiness_timeout_secs, 45);
+        assert_eq!(options.shutdown_grace_secs, 4);
+        assert_eq!(options.poll_interval_secs, 30);
+        assert_eq!(options.min_net_bps, 7);
+        assert_eq!(options.auto_price_guard_bps, Some(3));
+        assert_eq!(options.max_live_entries, 4);
+        assert_eq!(options.max_concurrent_positions, 2);
+        assert_eq!(options.max_total_notional_usdt, "40.00");
+        assert!(options.use_existing_monitors);
+        assert!(options.execute_live);
+        assert!(options.acknowledge_basis_live_orders);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_live_stack_builds_monitor_and_resident_child_args() {
+        let options = BinanceBasisLiveStackOptions {
+            symbol: BASIS_SYMBOL.to_owned(),
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: Some(PathBuf::from("target/live-canary/binance-stack")),
+            min_net_bps: 7,
+            auto_price_guard_bps: Some(3),
+            spot_wss_bind_addr: "127.0.0.1:8811".to_owned(),
+            perp_wss_bind_addr: "127.0.0.1:8812".to_owned(),
+            monitor_symbol: None,
+            monitor_reconnect_delay_secs: 3,
+            readiness_timeout_secs: 45,
+            shutdown_grace_secs: 4,
+            private_order_events_dir: None,
+            adl_events_dir: None,
+            position_state_path: None,
+            poll_interval_secs: 30,
+            max_cycles: Some(5),
+            max_live_entries: 4,
+            max_concurrent_positions: 2,
+            max_total_notional_usdt: "40.00".to_owned(),
+            use_existing_monitors: false,
+            execute_live: true,
+            acknowledge_basis_live_orders: true,
+        };
+
+        let spot_args = binance_basis_live_stack_monitor_args(
+            &options.spot_wss_bind_addr,
+            &binance_basis_live_stack_monitor_symbol(&options),
+            "spot",
+            options.monitor_reconnect_delay_secs,
+        );
+        let resident_args = binance_basis_live_stack_resident_args(
+            &options,
+            Path::new("target/live-canary/binance-stack/resident"),
+            Path::new("target/live-canary/binance-stack/private-order-events"),
+            Path::new("target/live-canary/binance-stack/adl-events"),
+        );
+
+        assert_eq!(spot_args[0], "binance-wss-book-ticker");
+        assert!(spot_args
+            .windows(2)
+            .any(|pair| pair[0] == "--market" && pair[1] == "spot"));
+        assert!(spot_args.windows(2).any(
+            |pair| pair[0] == "--symbol" && pair[1] == BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        ));
+        assert_eq!(resident_args[0], "binance-basis-resident-live");
+        assert!(resident_args
+            .windows(2)
+            .any(|pair| pair[0] == "--spot-wss-monitor-url" && pair[1] == "http://127.0.0.1:8811"));
+        assert!(resident_args
+            .windows(2)
+            .any(|pair| pair[0] == "--perp-wss-monitor-url" && pair[1] == "http://127.0.0.1:8812"));
+        assert!(resident_args
+            .windows(2)
+            .any(|pair| pair[0] == "--max-live-entries" && pair[1] == "4"));
+        assert!(resident_args.contains(&"--execute-live".to_owned()));
+        assert!(resident_args.contains(&"--i-understand-basis-live-orders".to_owned()));
+    }
+
+    #[test]
+    fn multi_venue_basis_resident_live_args_parse_urls_and_caps() {
+        let args = vec![
+            "--venues".to_owned(),
+            "binance,bybit,okx,bitget".to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--out".to_owned(),
+            "target/live-canary/multi-resident".to_owned(),
+            "--okx-symbol".to_owned(),
+            OKX_BASIS_SYMBOL.to_owned(),
+            "--binance-spot-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8801".to_owned(),
+            "--binance-perp-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8802".to_owned(),
+            "--bybit-spot-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8805".to_owned(),
+            "--bybit-perp-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8806".to_owned(),
+            "--okx-spot-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8807".to_owned(),
+            "--okx-perp-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8808".to_owned(),
+            "--bitget-spot-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8809".to_owned(),
+            "--bitget-perp-wss-monitor-url".to_owned(),
+            "http://127.0.0.1:8810".to_owned(),
+            "--interval-secs".to_owned(),
+            "30".to_owned(),
+            "--min-net-bps".to_owned(),
+            "7".to_owned(),
+            "--max-live-entries".to_owned(),
+            "4".to_owned(),
+            "--max-concurrent-positions".to_owned(),
+            "2".to_owned(),
+            "--max-total-notional-usdt".to_owned(),
+            "40.00".to_owned(),
+            "--execute-live".to_owned(),
+            "--i-understand-basis-live-orders".to_owned(),
+        ];
+
+        let options = parse_multi_venue_basis_resident_live_args(&args).expect("options");
+
+        assert_eq!(options.venues.len(), 4);
+        assert_eq!(
+            options
+                .symbols
+                .get(&BasisLiveVenue::Okx)
+                .map(String::as_str),
+            Some(OKX_BASIS_SYMBOL)
+        );
+        assert_eq!(
+            options
+                .spot_wss_monitor_urls
+                .get(&BasisLiveVenue::Bitget)
+                .map(String::as_str),
+            Some("http://127.0.0.1:8809")
+        );
+        assert_eq!(options.poll_interval_secs, 30);
+        assert_eq!(options.max_live_entries, 4);
+        assert_eq!(options.max_concurrent_positions, 2);
+        assert_eq!(options.max_total_notional_usdt, "40.00");
+        assert!(options.execute_live);
+        assert!(options.acknowledge_basis_live_orders);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn multi_venue_basis_live_stack_builds_managed_monitor_and_resident_args() {
+        let options = MultiVenueBasisLiveStackOptions {
+            venues: vec![BasisLiveVenue::Binance, BasisLiveVenue::Bybit],
+            symbols: BTreeMap::new(),
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: Some(PathBuf::from("target/live-canary/multi-stack")),
+            min_net_bps: 7,
+            auto_price_guard_bps: Some(3),
+            spot_wss_bind_addrs: BTreeMap::from([
+                (BasisLiveVenue::Binance, "127.0.0.1:8811".to_owned()),
+                (BasisLiveVenue::Bybit, "127.0.0.1:8813".to_owned()),
+            ]),
+            perp_wss_bind_addrs: BTreeMap::from([
+                (BasisLiveVenue::Binance, "127.0.0.1:8812".to_owned()),
+                (BasisLiveVenue::Bybit, "127.0.0.1:8814".to_owned()),
+            ]),
+            monitor_symbol: None,
+            monitor_reconnect_delay_secs: 3,
+            readiness_timeout_secs: 45,
+            shutdown_grace_secs: 4,
+            private_order_events_dir: None,
+            adl_events_dir: None,
+            poll_interval_secs: 30,
+            max_cycles: Some(5),
+            max_live_entries: 4,
+            max_concurrent_positions: 2,
+            max_total_notional_usdt: "40.00".to_owned(),
+            use_existing_monitors: false,
+            execute_live: true,
+            acknowledge_basis_live_orders: true,
+        };
+
+        let bybit_perp_args = multi_venue_basis_live_stack_monitor_args(
+            BasisLiveVenue::Bybit,
+            multi_venue_basis_live_stack_perp_bind(&options, BasisLiveVenue::Bybit),
+            &multi_venue_basis_live_stack_monitor_symbol(BasisLiveVenue::Bybit, &options),
+            "perp",
+            options.monitor_reconnect_delay_secs,
+        )
+        .expect("bybit args");
+        let resident_args = multi_venue_basis_live_stack_resident_args(
+            &options,
+            Path::new("target/live-canary/multi-stack/resident"),
+            Path::new("target/live-canary/multi-stack/private-order-events"),
+            Path::new("target/live-canary/multi-stack/adl-events"),
+        );
+
+        assert_eq!(bybit_perp_args[0], "bybit-wss-book-ticker");
+        assert!(bybit_perp_args
+            .windows(2)
+            .any(|pair| pair[0] == "--market" && pair[1] == "linear-perp"));
+        assert!(
+            bybit_perp_args
+                .windows(2)
+                .any(|pair| pair[0] == "--symbol"
+                    && pair[1] == BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS)
+        );
+        assert_eq!(resident_args[0], "multi-venue-basis-resident-live");
+        assert!(resident_args
+            .windows(2)
+            .any(|pair| pair[0] == "--venues" && pair[1] == "binance,bybit"));
+        assert!(resident_args
+            .windows(2)
+            .any(|pair| pair[0] == "--bybit-perp-wss-monitor-url"
+                && pair[1] == "http://127.0.0.1:8814"));
+        assert!(resident_args.contains(&"--execute-live".to_owned()));
+        assert!(resident_args.contains(&"--i-understand-basis-live-orders".to_owned()));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_resident_capacity_blocks_hard_live_entry_limit() {
+        let mut options =
+            parse_binance_basis_resident_live_args(&[]).expect("default resident options");
+        options.max_live_entries = 1;
+        options.max_concurrent_positions = 10;
+        options.max_total_notional_usdt = "100.00".to_owned();
+        let mut registry = BinanceBasisResidentPositionRegistry::default();
+        registry.positions.insert(
+            "pos-1".to_owned(),
+            BinanceBasisResidentPosition {
+                position_id: "pos-1".to_owned(),
+                position_state_path: PathBuf::from("target/pos-1.json"),
+                notional_usdt: "10.00".to_owned(),
+                status: "closed".to_owned(),
+            },
+        );
+
+        let capacity =
+            binance_basis_resident_entry_capacity(&options, &registry).expect("capacity");
+
+        assert_eq!(
+            capacity,
+            ResidentEntryCapacity::Blocked("max live entries reached: 1 >= 1".to_owned())
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_resident_capacity_blocks_total_notional_before_next_entry() {
+        let mut options =
+            parse_binance_basis_resident_live_args(&[]).expect("default resident options");
+        options.max_live_entries = 10;
+        options.max_concurrent_positions = 10;
+        options.max_total_notional_usdt = "10.00".to_owned();
+        let mut registry = BinanceBasisResidentPositionRegistry::default();
+        registry.positions.insert(
+            "pos-1".to_owned(),
+            BinanceBasisResidentPosition {
+                position_id: "pos-1".to_owned(),
+                position_state_path: PathBuf::from("target/pos-1.json"),
+                notional_usdt: "10.00".to_owned(),
+                status: "open".to_owned(),
+            },
+        );
+
+        let capacity =
+            binance_basis_resident_entry_capacity(&options, &registry).expect("capacity");
+
+        assert_eq!(
+            capacity,
+            ResidentEntryCapacity::Blocked(
+                "max total notional would be exceeded: after_next=20.00 max=10.00".to_owned()
+            )
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_basis_resident_initial_position_updates_registry_and_events() {
+        let temp = RuntimeTempDir::new().expect("temp dir");
+        let state_path = write_basis_exit_supervisor_state(temp.path(), &test_basis_exit_state())
+            .expect("position state");
+
+        ensure_initial_resident_position_registered(temp.path(), &state_path)
+            .expect("initial position registered");
+        ensure_initial_resident_position_registered(temp.path(), &state_path)
+            .expect("initial position registration is idempotent");
+
+        let registry =
+            load_binance_basis_resident_position_registry(temp.path()).expect("registry");
+        assert_eq!(registry.live_entry_count(), 1);
+        assert_eq!(registry.active_positions().len(), 1);
+        assert_eq!(
+            registry.active_positions()[0].position_state_path,
+            state_path
+        );
+        let positions =
+            read_utf8(&temp.path().join("resident_live_positions.jsonl")).expect("positions");
+        let events = read_utf8(&temp.path().join("resident_live_events.jsonl")).expect("events");
+        assert_eq!(count_jsonl_records(&positions), 1);
+        assert!(positions.contains("\"event_type\":\"position_opened\""));
+        assert!(events.contains("\"source\":\"initial-position-state\""));
     }
 
     #[test]
@@ -34129,6 +42331,8 @@ mod tests {
             arb_venue_exec::PrivateOrderMarket::OkxSwap => "okx-swap",
             arb_venue_exec::PrivateOrderMarket::BitgetSpot => "bitget-spot",
             arb_venue_exec::PrivateOrderMarket::BitgetUsdtFutures => "bitget-usdt-futures",
+            arb_venue_exec::PrivateOrderMarket::AsterPerp => "aster-perp",
+            arb_venue_exec::PrivateOrderMarket::HyperliquidPerp => "hyperliquid-perp",
         };
         let account_id = match market {
             arb_venue_exec::PrivateOrderMarket::Spot
@@ -34140,6 +42344,10 @@ mod tests {
             arb_venue_exec::PrivateOrderMarket::BitgetSpot
             | arb_venue_exec::PrivateOrderMarket::BitgetUsdtFutures => {
                 BITGET_GUARDED_LIVE_ACCOUNT_REF
+            }
+            arb_venue_exec::PrivateOrderMarket::AsterPerp
+            | arb_venue_exec::PrivateOrderMarket::HyperliquidPerp => {
+                "account:unsupported-private-order-test"
             }
         };
         PrivateOrderUpdate {
