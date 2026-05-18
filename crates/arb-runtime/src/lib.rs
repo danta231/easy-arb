@@ -27,7 +27,8 @@ use arb_contracts::{
     ExecutionMode as ContractExecutionMode, ExecutionPlan, ExecutionReport, Incident, JsonValue,
     LedgerDirection as ContractLedgerDirection, LedgerEntry as ContractLedgerEntry,
     LedgerEntryType as ContractLedgerEntryType, LedgerNamespace as ContractLedgerNamespace,
-    NormalizedEvent, NormalizedEventType, PortfolioState, RiskDecision, VenueCapabilityDescriptor,
+    NormalizedEvent, NormalizedEventType, PortfolioState, RiskDecision, TransitionLeg,
+    VenueCapabilityDescriptor,
 };
 #[cfg(feature = "live-exec")]
 use arb_domain::OrderId;
@@ -222,6 +223,11 @@ const BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS: i128 = 10;
 const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
+const FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD: &str = "0.01";
+const FUNDING_PRIVATE_ACCOUNT_MIN_COLLATERAL_RATIO_BPS: i128 = 1_000;
+const FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS: i128 = 60_000;
+const FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS: i128 = 150;
+const FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS: i128 = 5;
 const BASIS_AUTO_PRICE_GUARD_MAX_BPS: i128 = 100;
 #[cfg(feature = "live-exec")]
 const BASIS_EXIT_DEFAULT_TARGET_PROFIT_BPS: i128 = 40;
@@ -388,6 +394,9 @@ pub struct ArbVenueCapabilityProfile {
     pub funding_interval_hours: Option<u64>,
     pub funding_settlement_price_source: FundingSettlementPriceSource,
     pub dry_run_execution_supported: bool,
+    pub runtime_live_execution_supported: bool,
+    pub runtime_private_order_confirmation_supported: bool,
+    pub runtime_auto_funding_settlement_supported: bool,
 }
 
 /// 资金费率结算价格来源。
@@ -470,6 +479,9 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(8),
             funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
+            runtime_live_execution_supported: true,
+            runtime_private_order_confirmation_supported: true,
+            runtime_auto_funding_settlement_supported: true,
         },
         ArbVenueCapabilityProfile {
             venue_family: "bybit".to_owned(),
@@ -482,6 +494,9 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(8),
             funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
+            runtime_live_execution_supported: true,
+            runtime_private_order_confirmation_supported: true,
+            runtime_auto_funding_settlement_supported: true,
         },
         ArbVenueCapabilityProfile {
             venue_family: "okx".to_owned(),
@@ -494,6 +509,9 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(8),
             funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
+            runtime_live_execution_supported: true,
+            runtime_private_order_confirmation_supported: true,
+            runtime_auto_funding_settlement_supported: true,
         },
         ArbVenueCapabilityProfile {
             venue_family: "bitget".to_owned(),
@@ -506,6 +524,9 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(8),
             funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
+            runtime_live_execution_supported: true,
+            runtime_private_order_confirmation_supported: true,
+            runtime_auto_funding_settlement_supported: true,
         },
         ArbVenueCapabilityProfile {
             venue_family: "aster".to_owned(),
@@ -518,6 +539,9 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(8),
             funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
             dry_run_execution_supported: true,
+            runtime_live_execution_supported: false,
+            runtime_private_order_confirmation_supported: false,
+            runtime_auto_funding_settlement_supported: false,
         },
         ArbVenueCapabilityProfile {
             venue_family: "hyperliquid".to_owned(),
@@ -530,6 +554,9 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             funding_interval_hours: Some(1),
             funding_settlement_price_source: FundingSettlementPriceSource::OraclePrice,
             dry_run_execution_supported: true,
+            runtime_live_execution_supported: false,
+            runtime_private_order_confirmation_supported: false,
+            runtime_auto_funding_settlement_supported: false,
         },
     ]
 }
@@ -751,10 +778,19 @@ pub fn arb_venue_capability_descriptors(
 }
 
 fn normalize_venue_family(venue_family: &str) -> String {
-    venue_family
+    let compact = venue_family
         .trim()
         .to_ascii_lowercase()
-        .replace(['_', '-'], "")
+        .replace(['_', '-', ' '], "");
+    match compact.as_str() {
+        value if value.starts_with("binance") => "binance".to_owned(),
+        value if value.starts_with("bybit") => "bybit".to_owned(),
+        value if value.starts_with("okx") => "okx".to_owned(),
+        value if value.starts_with("bitget") => "bitget".to_owned(),
+        value if value.starts_with("aster") => "aster".to_owned(),
+        value if value.starts_with("hyperliquid") => "hyperliquid".to_owned(),
+        _ => compact,
+    }
 }
 
 fn public_venue_capability_descriptor(
@@ -1188,18 +1224,376 @@ pub struct BinancePreDispatchDryRunReport {
 
 /// 跨所 funding arb guarded dry-run 报告。
 ///
-/// 中文说明：该报告只证明公开信号、人工门禁预览和分发前计划数量可被构建；
-/// `dispatch_attempted=false` 和 `mutable_execution_started=false` 表示没有真实下单、
-/// 撤单、转账或签名。
+/// 中文说明：该报告只证明公开信号能否进入风控，并列出从 dry-run 候选升级为
+/// live 执行前仍然阻断的账户、账单和两腿执行闭环缺口；不会释放人工门禁、
+/// 真实下单、撤单、转账或签名。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FundingArbGuardedDryRunReport {
     pub signal_allowed: bool,
     pub risk_decision: String,
+    pub risk_reason_codes: Vec<String>,
+    pub funding_settlement: FundingSettlementReconciliationSummary,
+    pub funding_settlement_ingestion: FundingSettlementIngestionSummary,
+    pub private_accounts: FundingPrivateAccountReconciliationSummary,
+    pub private_positions: FundingPrivatePositionReconciliationSummary,
+    pub private_execution: FundingPrivateExecutionReconciliationSummary,
+    pub venue_execution_capability: FundingArbVenueExecutionCapabilitySummary,
+    pub execution_constraints: FundingArbExecutionConstraintSummary,
+    pub exit_readiness: FundingArbExitReadinessSummary,
+    pub snapshot_lineage: FundingArbSnapshotLineageSummary,
+    pub live_readiness: FundingArbLiveReadinessSummary,
+    pub execution_preflight: FundingArbExecutionPreflightSummary,
     pub manual_gate_released: bool,
     pub dispatch_plan_built: bool,
     pub dispatch_request_count: usize,
+    pub live_ready: bool,
+    pub live_blocking_reasons: Vec<String>,
     pub dispatch_attempted: bool,
     pub mutable_execution_started: bool,
+}
+
+/// funding arb live readiness 汇总。
+///
+/// 中文说明：该汇总把公开信号、风控、人工门禁、资金费账单、私有账户、
+/// 私有持仓和两腿执行闭环整理成机器可读检查结果；`ready=false` 时不得执行真实订单。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbLiveReadinessSummary {
+    pub status: String,
+    pub ready: bool,
+    pub check_count: usize,
+    pub passed_check_count: usize,
+    pub blocking_check_count: usize,
+    pub checks: Vec<FundingArbLiveReadinessCheck>,
+}
+
+/// funding arb live readiness 单项检查。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbLiveReadinessCheck {
+    pub check_id: String,
+    pub status: String,
+    pub blocking: bool,
+    pub reason_code: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// funding arb 两腿执行预检摘要。
+///
+/// 中文说明：该摘要只检查候选两腿形态、人工审批计划预览和执行回执对账缺口；
+/// 不释放人工门禁、不调用交易所适配器、不提交订单。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbExecutionPreflightSummary {
+    pub status: String,
+    pub candidate_trade_leg_count: usize,
+    pub candidate_perp_long_count: usize,
+    pub candidate_perp_short_count: usize,
+    pub plan_preview_status: String,
+    pub plan_hash: Option<String>,
+    pub preview_plan_leg_count: usize,
+    pub preview_place_order_count: usize,
+    pub preview_manual_gate_count: usize,
+    pub dispatch_shape_status: String,
+    pub dispatch_request_count: usize,
+    pub private_execution_reconciliation_status: String,
+    pub blocking_reasons: Vec<String>,
+}
+
+impl FundingArbExecutionPreflightSummary {
+    fn no_candidate() -> Self {
+        Self {
+            status: "Blocked".to_owned(),
+            candidate_trade_leg_count: 0,
+            candidate_perp_long_count: 0,
+            candidate_perp_short_count: 0,
+            plan_preview_status: "NotAttempted".to_owned(),
+            plan_hash: None,
+            preview_plan_leg_count: 0,
+            preview_place_order_count: 0,
+            preview_manual_gate_count: 0,
+            dispatch_shape_status: "Blocked".to_owned(),
+            dispatch_request_count: 0,
+            private_execution_reconciliation_status: "NotProvided".to_owned(),
+            blocking_reasons: vec![
+                "funding-arb execution preflight cannot run because no candidate was emitted"
+                    .to_owned(),
+            ],
+        }
+    }
+
+    fn two_leg_shape_matched(&self) -> bool {
+        self.dispatch_shape_status == "Matched"
+    }
+
+    fn plan_preview_built(&self) -> bool {
+        self.plan_preview_status == "Built"
+    }
+
+    fn private_execution_reconciliation_matched(&self) -> bool {
+        self.private_execution_reconciliation_status == "Matched"
+    }
+}
+
+/// funding arb 资金费结算对账摘要。
+///
+/// 中文说明：该摘要只比较公开候选预期资金费与外部提供的真实资金费账单快照；
+/// 不访问交易所私有接口，也不写账本。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingSettlementReconciliationSummary {
+    pub status: String,
+    pub snapshot_updated_at: Option<String>,
+    pub expected_funding_usd: Option<String>,
+    pub actual_funding_usd: Option<String>,
+    pub difference_usd: Option<String>,
+    pub checked_entry_count: usize,
+    pub reason: Option<String>,
+}
+
+impl FundingSettlementReconciliationSummary {
+    fn not_provided() -> Self {
+        Self {
+            status: "NotProvided".to_owned(),
+            snapshot_updated_at: None,
+            expected_funding_usd: None,
+            actual_funding_usd: None,
+            difference_usd: None,
+            checked_entry_count: 0,
+            reason: Some("funding settlement ledger snapshot was not provided".to_owned()),
+        }
+    }
+
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+}
+
+/// funding arb 私有账户余额和保证金快照对账摘要。
+///
+/// 中文说明：该摘要只消费外部提供的归一化只读账户快照，用于证明两个
+/// funding arb 账户都有足够可用余额和保证金缓冲；不访问交易所私有接口，
+/// 也不读取或写入凭证。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingPrivateAccountReconciliationSummary {
+    pub status: String,
+    pub snapshot_updated_at: Option<String>,
+    pub checked_account_count: usize,
+    pub min_required_available_usd: Option<String>,
+    pub min_available_usd: Option<String>,
+    pub min_margin_buffer_usd: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl FundingPrivateAccountReconciliationSummary {
+    fn not_provided() -> Self {
+        Self {
+            status: "NotProvided".to_owned(),
+            snapshot_updated_at: None,
+            checked_account_count: 0,
+            min_required_available_usd: None,
+            min_available_usd: None,
+            min_margin_buffer_usd: None,
+            reason: Some("private account snapshot was not provided".to_owned()),
+        }
+    }
+
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+
+    fn has_balance_snapshot(&self) -> bool {
+        self.status == "Matched" || self.status == "Insufficient"
+    }
+
+    fn has_margin_snapshot(&self) -> bool {
+        self.status == "Matched" || self.status == "Insufficient"
+    }
+}
+
+/// funding arb 私有持仓快照对账摘要。
+///
+/// 中文说明：该摘要只消费外部提供的归一化只读持仓快照，用于证明入场前两个
+/// funding arb 账户为空仓；不访问交易所私有接口，也不读取或写入凭证。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingPrivatePositionReconciliationSummary {
+    pub status: String,
+    pub snapshot_updated_at: Option<String>,
+    pub checked_position_count: usize,
+    pub nonzero_position_count: usize,
+    pub reason: Option<String>,
+}
+
+impl FundingPrivatePositionReconciliationSummary {
+    fn not_provided() -> Self {
+        Self {
+            status: "NotProvided".to_owned(),
+            snapshot_updated_at: None,
+            checked_position_count: 0,
+            nonzero_position_count: 0,
+            reason: Some("private position snapshot was not provided".to_owned()),
+        }
+    }
+
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+}
+
+/// funding arb 私有订单和成交对账摘要。
+///
+/// 中文说明：该摘要只消费调用方提供的订单/成交快照，用于证明两腿执行结果；
+/// 不查询交易所、不签名、不提交订单。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingPrivateExecutionReconciliationSummary {
+    pub status: String,
+    pub snapshot_updated_at: Option<String>,
+    pub plan_hash: Option<String>,
+    pub expected_order_count: usize,
+    pub checked_order_count: usize,
+    pub matched_order_count: usize,
+    pub side_match_count: usize,
+    pub filled_quantity_match_count: usize,
+    pub order_identifier_count: usize,
+    pub terminal_order_count: usize,
+    pub filled_order_count: usize,
+    pub fill_count: usize,
+    pub unknown_order_count: usize,
+    pub mismatch_count: usize,
+    pub reason: Option<String>,
+}
+
+impl FundingPrivateExecutionReconciliationSummary {
+    fn not_provided() -> Self {
+        Self {
+            status: "NotProvided".to_owned(),
+            snapshot_updated_at: None,
+            plan_hash: None,
+            expected_order_count: 2,
+            checked_order_count: 0,
+            matched_order_count: 0,
+            side_match_count: 0,
+            filled_quantity_match_count: 0,
+            order_identifier_count: 0,
+            terminal_order_count: 0,
+            filled_order_count: 0,
+            fill_count: 0,
+            unknown_order_count: 0,
+            mismatch_count: 0,
+            reason: Some(
+                "private execution fill/order reconciliation snapshot was not provided".to_owned(),
+            ),
+        }
+    }
+
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+}
+
+/// funding arb 交易所执行能力边界摘要。
+///
+/// 中文说明：该摘要描述当前 runtime 是否已接入指定 venue 的真实下单、查单和
+/// 私有订单确认路径；交易所本身支持 API 不等于本系统已启用实盘路径。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbVenueExecutionCapabilitySummary {
+    pub status: String,
+    pub checked_venue_count: usize,
+    pub live_execution_supported_count: usize,
+    pub private_confirmation_supported_count: usize,
+    pub auto_settlement_supported_count: usize,
+    pub unsupported_venues: Vec<String>,
+    pub reason: Option<String>,
+}
+
+impl FundingArbVenueExecutionCapabilitySummary {
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+}
+
+/// funding arb 执行约束预检摘要。
+///
+/// 中文说明：该摘要检查候选/计划是否携带真实下单前必须稳定的数量、价格、
+/// 名义金额和场所符号约束；不提交订单。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbExecutionConstraintSummary {
+    pub status: String,
+    pub checked_leg_count: usize,
+    pub checked_role_side_count: usize,
+    pub checked_symbol_count: usize,
+    pub checked_quantity_count: usize,
+    pub checked_limit_price_count: usize,
+    pub checked_notional_count: usize,
+    pub checked_exchange_rule_count: usize,
+    pub reason: Option<String>,
+}
+
+impl FundingArbExecutionConstraintSummary {
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+}
+
+/// funding arb 资金费结算来源摘要。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingSettlementIngestionSummary {
+    pub status: String,
+    pub source: String,
+    pub source_updated_at: Option<String>,
+    pub auto_supported_venue_count: usize,
+    pub manual_snapshot_required_venue_count: usize,
+    pub reason: Option<String>,
+}
+
+impl FundingSettlementIngestionSummary {
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+}
+
+/// funding arb 退出/降风险监督 readiness 摘要。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbExitReadinessSummary {
+    pub status: String,
+    pub supervisor_attached: bool,
+    pub emergency_derisk_attached: bool,
+    pub reduce_only_exit_required: bool,
+    pub monitoring_interval_secs: Option<u64>,
+    pub checked_position_count: usize,
+    pub nonzero_position_count: usize,
+    pub liquidation_buffer_bps: Option<i128>,
+    pub max_position_imbalance_bps: i128,
+    pub reason: Option<String>,
+}
+
+impl FundingArbExitReadinessSummary {
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
+}
+
+/// funding arb 外部快照 lineage/freshness 摘要。
+///
+/// 中文说明：该摘要校验调用方提供的只读快照是否带有严格 UTC `updated_at`，
+/// 并要求私有账户、持仓、执行快照与 observer 候选时间足够接近；资金费结算
+/// 快照按结算周期独立校验时间戳存在性。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbSnapshotLineageSummary {
+    pub status: String,
+    pub observer_updated_at: String,
+    pub funding_settlement_updated_at: Option<String>,
+    pub private_account_updated_at: Option<String>,
+    pub private_position_updated_at: Option<String>,
+    pub private_execution_updated_at: Option<String>,
+    pub max_private_snapshot_age_ms: i128,
+    pub checked_timestamp_count: usize,
+    pub missing_updated_at_count: usize,
+    pub invalid_updated_at_count: usize,
+    pub stale_private_snapshot_count: usize,
+    pub reason: Option<String>,
+}
+
+impl FundingArbSnapshotLineageSummary {
+    fn is_matched(&self) -> bool {
+        self.status == "Matched"
+    }
 }
 
 /// Binance BTCUSDT 受控实盘分发选项。
@@ -1814,6 +2208,13 @@ pub struct FundingArbGuardedDryRunOnceOptions {
     pub config_path: PathBuf,
     pub snapshot_path: PathBuf,
     pub pair_id: String,
+    pub funding_settlement_ledger_path: Option<PathBuf>,
+    pub funding_settlement_raw_snapshot_path: Option<PathBuf>,
+    pub private_account_snapshot_path: Option<PathBuf>,
+    pub private_account_raw_snapshot_path: Option<PathBuf>,
+    pub private_position_snapshot_path: Option<PathBuf>,
+    pub private_position_raw_snapshot_path: Option<PathBuf>,
+    pub private_execution_snapshot_path: Option<PathBuf>,
     pub output_dir: Option<PathBuf>,
     pub notional_usd: String,
     pub taker_fee_bps: i128,
@@ -12326,6 +12727,32 @@ impl MonitorDecimal {
         self.raw.unsigned_abs() < other.raw.unsigned_abs()
     }
 
+    fn abs_lte(self, other: Self) -> bool {
+        self.raw.unsigned_abs() <= other.raw.unsigned_abs()
+    }
+
+    fn checked_add(self, other: Self, context: &'static str) -> RuntimeResult<Self> {
+        Ok(Self {
+            raw: self
+                .raw
+                .checked_add(other.raw)
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("{context} overflowed"),
+                })?,
+        })
+    }
+
+    fn checked_sub(self, other: Self, context: &'static str) -> RuntimeResult<Self> {
+        Ok(Self {
+            raw: self
+                .raw
+                .checked_sub(other.raw)
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("{context} overflowed"),
+                })?,
+        })
+    }
+
     fn checked_mul_i128(self, value: i128, context: &'static str) -> RuntimeResult<Self> {
         Ok(Self {
             raw: self
@@ -13605,6 +14032,22 @@ fn optional_json_bool(
     }
 }
 
+fn optional_json_usize(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<Option<usize>> {
+    let Some(value) = optional_json_value_string(fields, field, source)? else {
+        return Ok(None);
+    };
+    value
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: format!("{source} field `{field}` is not a non-negative integer: `{value}`"),
+        })
+}
+
 fn json_value_to_string(
     value: &str,
     field: &'static str,
@@ -14024,6 +14467,111 @@ struct FundingArbVenueMarket {
     source_status: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingSettlementLedgerSnapshot {
+    status: String,
+    updated_at: Option<String>,
+    entries: Vec<FundingSettlementLedgerEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingSettlementLedgerEntry {
+    venue_family: String,
+    symbol: String,
+    account_id: String,
+    amount_usd: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingSettlementRawSnapshot {
+    status: String,
+    updated_at: Option<String>,
+    statements: Vec<FundingSettlementRawStatement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingSettlementRawStatement {
+    venue_family: String,
+    account_id: String,
+    payload_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateRawSnapshot {
+    status: String,
+    updated_at: Option<String>,
+    statements: Vec<FundingPrivateRawStatement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateRawStatement {
+    venue_family: String,
+    account_id: String,
+    payload_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateAccountSnapshot {
+    status: String,
+    updated_at: Option<String>,
+    accounts: Vec<FundingPrivateAccountEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateAccountEntry {
+    venue_family: String,
+    account_id: String,
+    available_usd: Option<String>,
+    margin_balance_usd: Option<String>,
+    maintenance_margin_usd: Option<String>,
+    margin_buffer_usd: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivatePositionSnapshot {
+    status: String,
+    updated_at: Option<String>,
+    positions: Vec<FundingPrivatePositionEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivatePositionEntry {
+    venue_family: String,
+    symbol: String,
+    account_id: String,
+    quantity: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateExecutionSnapshot {
+    status: String,
+    updated_at: Option<String>,
+    plan_hash: Option<String>,
+    orders: Vec<FundingPrivateExecutionOrder>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingPrivateExecutionOrder {
+    venue_family: String,
+    symbol: String,
+    account_id: String,
+    basis_leg_role: Option<String>,
+    client_order_id: Option<String>,
+    venue_order_id: Option<String>,
+    side: Option<String>,
+    order_status: String,
+    filled_quantity: Option<String>,
+    fill_count: usize,
+}
+
+struct FundingArbGuardedDryRunReconciliations {
+    funding_settlement: FundingSettlementReconciliationSummary,
+    funding_settlement_ingestion: FundingSettlementIngestionSummary,
+    private_accounts: FundingPrivateAccountReconciliationSummary,
+    private_positions: FundingPrivatePositionReconciliationSummary,
+    private_execution: FundingPrivateExecutionReconciliationSummary,
+}
+
 fn assemble_binance_basis_pipeline_from_raw_json(
     replay: &ReplayInput,
     inputs: BinanceBasisRawInputs<'_>,
@@ -14287,6 +14835,49 @@ pub fn run_funding_arb_guarded_dry_run_from_normalized_events(
     events: Vec<NormalizedEvent>,
     ingested_at: UtcTimestamp,
 ) -> RuntimeResult<FundingArbGuardedDryRunReport> {
+    run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
+        config,
+        spec,
+        events,
+        ingested_at,
+        FundingArbGuardedDryRunReconciliations {
+            funding_settlement: FundingSettlementReconciliationSummary::not_provided(),
+            funding_settlement_ingestion: FundingSettlementIngestionSummary {
+                status: "Missing".to_owned(),
+                source: "not_provided".to_owned(),
+                source_updated_at: None,
+                auto_supported_venue_count: 0,
+                manual_snapshot_required_venue_count: 2,
+                reason: Some("funding settlement source was not provided".to_owned()),
+            },
+            private_accounts: FundingPrivateAccountReconciliationSummary::not_provided(),
+            private_positions: FundingPrivatePositionReconciliationSummary::not_provided(),
+            private_execution: FundingPrivateExecutionReconciliationSummary::not_provided(),
+        },
+    )
+}
+
+fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
+    config: &arb_config::ArbConfig,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    events: Vec<NormalizedEvent>,
+    ingested_at: UtcTimestamp,
+    reconciliations: FundingArbGuardedDryRunReconciliations,
+) -> RuntimeResult<FundingArbGuardedDryRunReport> {
+    let FundingArbGuardedDryRunReconciliations {
+        funding_settlement,
+        funding_settlement_ingestion,
+        private_accounts,
+        private_positions,
+        private_execution,
+    } = reconciliations;
+    let snapshot_lineage = funding_arb_snapshot_lineage(
+        ingested_at,
+        &funding_settlement,
+        &private_accounts,
+        &private_positions,
+        &private_execution,
+    );
     let _temp_dir = RuntimeTempDir::new()?;
     let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
     for event in &events {
@@ -14298,8 +14889,18 @@ pub fn run_funding_arb_guarded_dry_run_from_normalized_events(
         .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
         .map(|event| event.event_id.as_str().to_owned())
         .collect::<Vec<_>>();
-    let portfolio_state =
-        build_public_funding_arb_portfolio_state(spec, &source_event_refs, ingested_at)?;
+    let portfolio_state = build_public_funding_arb_portfolio_state_with_missing_flags(
+        spec,
+        &source_event_refs,
+        ingested_at,
+        funding_arb_public_missing_data_flags(
+            funding_settlement.is_matched(),
+            private_accounts.has_balance_snapshot(),
+            private_accounts.has_margin_snapshot(),
+            private_positions.is_matched(),
+            private_execution.is_matched(),
+        ),
+    )?;
     ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
     let evaluation = run_cross_exchange_funding_arb_strategy(
         config,
@@ -14308,8 +14909,9 @@ pub fn run_funding_arb_guarded_dry_run_from_normalized_events(
         &ingested_at.to_string(),
         spec,
     )?;
-    let dispatch_request_count = evaluation
-        .candidate()
+    let candidate = evaluation.candidate().cloned();
+    let dispatch_request_count = candidate
+        .as_ref()
         .map(|candidate| {
             candidate
                 .legs
@@ -14318,20 +14920,2563 @@ pub fn run_funding_arb_guarded_dry_run_from_normalized_events(
                 .count()
         })
         .unwrap_or(0);
+    let (
+        risk_decision,
+        risk_reason_codes,
+        live_readiness,
+        execution_preflight,
+        venue_execution_capability,
+        execution_constraints,
+        exit_readiness,
+    ) = if let Some(candidate) = candidate.as_ref() {
+        let decision = run_risk(
+            candidate,
+            &portfolio_state,
+            config,
+            &spec.venue_capabilities,
+            ingested_at,
+        )?;
+        let venue_execution_capability = funding_arb_venue_execution_capability(spec);
+        let execution_constraints = funding_arb_execution_constraints(candidate);
+        let exit_readiness = funding_arb_exit_readiness(&private_positions);
+        let execution_preflight = funding_arb_execution_preflight(
+            candidate,
+            Some(&decision),
+            ingested_at,
+            &private_execution,
+        )?;
+        (
+            decision.decision.as_str().to_owned(),
+            decision
+                .reason_codes
+                .iter()
+                .map(|reason| reason.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            funding_arb_live_readiness(FundingArbLiveReadinessInput {
+                spec,
+                portfolio_state: &portfolio_state,
+                signal_allowed: true,
+                risk_decision: Some(&decision),
+                funding_settlement: &funding_settlement,
+                funding_settlement_ingestion: &funding_settlement_ingestion,
+                private_accounts: &private_accounts,
+                private_positions: &private_positions,
+                private_execution: &private_execution,
+                venue_execution_capability: &venue_execution_capability,
+                execution_constraints: &execution_constraints,
+                exit_readiness: &exit_readiness,
+                snapshot_lineage: &snapshot_lineage,
+                execution_preflight: &execution_preflight,
+            }),
+            execution_preflight,
+            venue_execution_capability,
+            execution_constraints,
+            exit_readiness,
+        )
+    } else {
+        let execution_preflight = FundingArbExecutionPreflightSummary::no_candidate();
+        let venue_execution_capability = funding_arb_venue_execution_capability(spec);
+        let execution_constraints = FundingArbExecutionConstraintSummary {
+            status: "Blocked".to_owned(),
+            checked_leg_count: 0,
+            checked_role_side_count: 0,
+            checked_symbol_count: 0,
+            checked_quantity_count: 0,
+            checked_limit_price_count: 0,
+            checked_notional_count: 0,
+            checked_exchange_rule_count: 0,
+            reason: Some(
+                "funding-arb execution constraints cannot be checked without a candidate"
+                    .to_owned(),
+            ),
+        };
+        let exit_readiness = funding_arb_exit_readiness(&private_positions);
+        (
+            "NoCandidate".to_owned(),
+            Vec::new(),
+            funding_arb_live_readiness(FundingArbLiveReadinessInput {
+                spec,
+                portfolio_state: &portfolio_state,
+                signal_allowed: false,
+                risk_decision: None,
+                funding_settlement: &funding_settlement,
+                funding_settlement_ingestion: &funding_settlement_ingestion,
+                private_accounts: &private_accounts,
+                private_positions: &private_positions,
+                private_execution: &private_execution,
+                venue_execution_capability: &venue_execution_capability,
+                execution_constraints: &execution_constraints,
+                exit_readiness: &exit_readiness,
+                snapshot_lineage: &snapshot_lineage,
+                execution_preflight: &execution_preflight,
+            }),
+            execution_preflight,
+            venue_execution_capability,
+            execution_constraints,
+            exit_readiness,
+        )
+    };
+    let live_ready = live_readiness.ready;
+    let live_blocking_reasons = funding_arb_live_blocking_reasons_from_readiness(&live_readiness);
 
     Ok(FundingArbGuardedDryRunReport {
-        signal_allowed: evaluation.candidate().is_some(),
-        risk_decision: if evaluation.candidate().is_some() {
-            "RequiresManualApproval".to_owned()
-        } else {
-            "NoCandidate".to_owned()
-        },
-        manual_gate_released: evaluation.candidate().is_some(),
-        dispatch_plan_built: dispatch_request_count == 2,
+        signal_allowed: candidate.is_some(),
+        risk_decision,
+        risk_reason_codes,
+        funding_settlement,
+        funding_settlement_ingestion,
+        private_accounts,
+        private_positions,
+        private_execution,
+        venue_execution_capability,
+        execution_constraints,
+        exit_readiness,
+        snapshot_lineage,
+        live_readiness,
+        execution_preflight,
+        manual_gate_released: false,
+        dispatch_plan_built: live_ready && dispatch_request_count == 2,
         dispatch_request_count,
+        live_ready,
+        live_blocking_reasons,
         dispatch_attempted: false,
         mutable_execution_started: false,
     })
+}
+
+fn funding_arb_execution_preflight(
+    candidate: &CandidatePortfolioTransition,
+    risk_decision: Option<&RiskDecision>,
+    ingested_at: UtcTimestamp,
+    private_execution: &FundingPrivateExecutionReconciliationSummary,
+) -> RuntimeResult<FundingArbExecutionPreflightSummary> {
+    let trade_legs = candidate
+        .legs
+        .iter()
+        .filter(|leg| leg.leg_type.as_str() == "Trade")
+        .collect::<Vec<_>>();
+    let candidate_trade_leg_count = trade_legs.len();
+    let candidate_perp_long_count = trade_legs
+        .iter()
+        .filter(|leg| candidate_leg_basis_role(leg).as_deref() == Some("perp_long"))
+        .count();
+    let candidate_perp_short_count = trade_legs
+        .iter()
+        .filter(|leg| candidate_leg_basis_role(leg).as_deref() == Some("perp_short"))
+        .count();
+    let mut blocking_reasons = Vec::new();
+
+    if candidate_trade_leg_count != 2 {
+        blocking_reasons.push(format!(
+            "funding-arb candidate must contain exactly two trade legs; observed {candidate_trade_leg_count}"
+        ));
+    }
+    if candidate_perp_long_count != 1 || candidate_perp_short_count != 1 {
+        blocking_reasons.push(format!(
+            "funding-arb candidate must contain one perp_long and one perp_short leg; observed long={candidate_perp_long_count}, short={candidate_perp_short_count}"
+        ));
+    }
+    for leg in &trade_legs {
+        if leg.venue_id.is_none() {
+            blocking_reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks venue_id",
+                leg.leg_id.as_str()
+            ));
+        }
+        if leg.instrument_id.is_none() {
+            blocking_reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks instrument_id",
+                leg.leg_id.as_str()
+            ));
+        }
+        if leg.account_id.is_none() {
+            blocking_reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks account_id",
+                leg.leg_id.as_str()
+            ));
+        }
+        if leg.side.is_none() {
+            blocking_reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks side",
+                leg.leg_id.as_str()
+            ));
+        }
+    }
+
+    let dispatch_shape_status = if blocking_reasons.is_empty() {
+        "Matched"
+    } else {
+        "Blocked"
+    }
+    .to_owned();
+    let dispatch_request_count = if dispatch_shape_status == "Matched" {
+        2
+    } else {
+        candidate_trade_leg_count
+    };
+
+    let mut plan_preview_status = "NotAttempted".to_owned();
+    let mut plan_hash = None;
+    let mut preview_plan_leg_count = 0;
+    let mut preview_place_order_count = 0;
+    let mut preview_manual_gate_count = 0;
+
+    match risk_decision {
+        Some(decision)
+            if matches!(
+                decision.decision.as_str(),
+                "Approved" | "ApprovedWithConstraints" | "RequiresManualApproval"
+            ) =>
+        {
+            let created_at = ingested_at.to_string();
+            match build_execution_plan_preview(ExecutionPlanBuildInput::new(
+                decision,
+                candidate,
+                ContractExecutionMode::ManualApproval,
+                &created_at,
+            )) {
+                Ok(PlanBuildOutcome::PendingManualApproval(pending)) => {
+                    plan_hash = Some(pending.approval_material.plan_hash.clone());
+                    preview_plan_leg_count = pending.plan_preview.legs.len();
+                    preview_place_order_count = pending
+                        .plan_preview
+                        .legs
+                        .iter()
+                        .filter(|leg| leg.action_type.as_str() == "PlaceOrder")
+                        .count();
+                    preview_manual_gate_count = pending
+                        .plan_preview
+                        .legs
+                        .iter()
+                        .filter(|leg| leg.action_type.as_str() == "ManualApprovalGate")
+                        .count();
+                    if preview_place_order_count == 2 && preview_manual_gate_count == 1 {
+                        plan_preview_status = "Built".to_owned();
+                    } else {
+                        plan_preview_status = "Blocked".to_owned();
+                        blocking_reasons.push(format!(
+                            "funding-arb manual approval plan preview produced manual_gate={preview_manual_gate_count}, place_order={preview_place_order_count}, expected 1/2"
+                        ));
+                    }
+                }
+                Ok(PlanBuildOutcome::Schedulable(_)) => {
+                    plan_preview_status = "Blocked".to_owned();
+                    blocking_reasons.push(
+                        "funding-arb dry-run unexpectedly produced a schedulable plan preview before manual approval"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    plan_preview_status = "Blocked".to_owned();
+                    blocking_reasons.push(format!(
+                        "funding-arb manual approval plan preview failed: {error}"
+                    ));
+                }
+            }
+        }
+        Some(decision) => {
+            blocking_reasons.push(format!(
+                "funding-arb manual approval plan preview was not attempted because risk decision is {}",
+                decision.decision.as_str()
+            ));
+        }
+        None => {
+            blocking_reasons.push(
+                "funding-arb manual approval plan preview was not attempted because risk decision is unavailable"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let mut private_execution_reconciliation_status = private_execution.status.clone();
+    if !private_execution.is_matched() {
+        blocking_reasons.push(private_execution.reason.clone().unwrap_or_else(|| {
+            "private execution fill/order reconciliation snapshot was not matched; dry-run cannot prove the submitted two-leg outcome"
+                .to_owned()
+        }));
+    } else if let Some(expected_plan_hash) = plan_hash.as_deref() {
+        match private_execution.plan_hash.as_deref() {
+            Some(snapshot_plan_hash) if snapshot_plan_hash == expected_plan_hash => {}
+            Some(snapshot_plan_hash) => {
+                private_execution_reconciliation_status = "Mismatch".to_owned();
+                blocking_reasons.push(format!(
+                    "private execution snapshot plan_hash `{snapshot_plan_hash}` does not match current plan_hash `{expected_plan_hash}`"
+                ));
+            }
+            None => {
+                private_execution_reconciliation_status = "Mismatch".to_owned();
+                blocking_reasons.push(
+                    "private execution snapshot lacks plan_hash and cannot be bound to the current execution plan"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    let status = if blocking_reasons.is_empty() {
+        "Matched"
+    } else {
+        "Blocked"
+    }
+    .to_owned();
+
+    Ok(FundingArbExecutionPreflightSummary {
+        status,
+        candidate_trade_leg_count,
+        candidate_perp_long_count,
+        candidate_perp_short_count,
+        plan_preview_status,
+        plan_hash,
+        preview_plan_leg_count,
+        preview_place_order_count,
+        preview_manual_gate_count,
+        dispatch_shape_status,
+        dispatch_request_count,
+        private_execution_reconciliation_status,
+        blocking_reasons,
+    })
+}
+
+fn candidate_leg_basis_role(leg: &TransitionLeg) -> Option<String> {
+    match leg.constraints.get("basis_leg_role") {
+        Some(JsonValue::String(value)) => Some(value.to_owned()),
+        Some(JsonValue::Number(value)) => Some(value.as_str().to_owned()),
+        _ => None,
+    }
+}
+
+fn candidate_leg_role_side_matches(leg: &TransitionLeg) -> bool {
+    matches!(
+        (candidate_leg_basis_role(leg).as_deref(), leg.side.as_ref()),
+        (
+            Some("perp_long"),
+            Some(arb_contracts::TransitionSide::Buy | arb_contracts::TransitionSide::Long)
+        ) | (
+            Some("perp_short"),
+            Some(arb_contracts::TransitionSide::Sell | arb_contracts::TransitionSide::Short)
+        )
+    )
+}
+
+fn candidate_leg_exchange_rule_surface_present(leg: &TransitionLeg) -> bool {
+    leg.venue_id.is_some()
+        && leg.instrument_id.is_some()
+        && leg.account_id.is_some()
+        && leg.side.is_some()
+        && candidate_leg_constraint_string(leg, "venue_symbol").is_some()
+        && candidate_leg_limit_price(leg).is_some()
+        && candidate_leg_notional_usd(leg).is_some()
+}
+
+fn funding_arb_venue_execution_capability(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+) -> FundingArbVenueExecutionCapabilitySummary {
+    let venue_families = [
+        normalize_venue_family(&spec.strategy_config.venues.venue_a.venue_label),
+        normalize_venue_family(&spec.strategy_config.venues.venue_b.venue_label),
+    ];
+    let mut live_execution_supported_count = 0_usize;
+    let mut private_confirmation_supported_count = 0_usize;
+    let mut auto_settlement_supported_count = 0_usize;
+    let mut unsupported_venues = Vec::new();
+
+    for family in &venue_families {
+        match arb_venue_capability_profile(family) {
+            Some(profile)
+                if profile.runtime_live_execution_supported
+                    && profile.runtime_private_order_confirmation_supported =>
+            {
+                live_execution_supported_count += 1;
+                private_confirmation_supported_count += 1;
+                if profile.runtime_auto_funding_settlement_supported {
+                    auto_settlement_supported_count += 1;
+                }
+            }
+            Some(profile) => {
+                if profile.runtime_live_execution_supported {
+                    live_execution_supported_count += 1;
+                }
+                if profile.runtime_private_order_confirmation_supported {
+                    private_confirmation_supported_count += 1;
+                }
+                if profile.runtime_auto_funding_settlement_supported {
+                    auto_settlement_supported_count += 1;
+                }
+                unsupported_venues.push(format!(
+                    "{}: live_execution={}, private_confirmation={}, auto_settlement={}",
+                    family,
+                    profile.runtime_live_execution_supported,
+                    profile.runtime_private_order_confirmation_supported,
+                    profile.runtime_auto_funding_settlement_supported
+                ));
+            }
+            None => unsupported_venues.push(format!("{family}: unknown venue capability profile")),
+        }
+    }
+
+    let checked_venue_count = venue_families.len();
+    let matched = live_execution_supported_count == checked_venue_count
+        && private_confirmation_supported_count == checked_venue_count;
+    FundingArbVenueExecutionCapabilitySummary {
+        status: if matched { "Matched" } else { "Blocked" }.to_owned(),
+        checked_venue_count,
+        live_execution_supported_count,
+        private_confirmation_supported_count,
+        auto_settlement_supported_count,
+        unsupported_venues,
+        reason: (!matched).then(|| {
+            "selected funding-arb venues are not all attached to runtime live execution and private order confirmation"
+                .to_owned()
+        }),
+    }
+}
+
+fn funding_arb_execution_constraints(
+    candidate: &CandidatePortfolioTransition,
+) -> FundingArbExecutionConstraintSummary {
+    let trade_legs = candidate
+        .legs
+        .iter()
+        .filter(|leg| leg.leg_type.as_str() == "Trade")
+        .collect::<Vec<_>>();
+    let mut checked_symbol_count = 0_usize;
+    let mut checked_quantity_count = 0_usize;
+    let mut checked_limit_price_count = 0_usize;
+    let mut checked_notional_count = 0_usize;
+    let mut checked_role_side_count = 0_usize;
+    let mut checked_exchange_rule_count = 0_usize;
+    let mut reasons = Vec::new();
+
+    for leg in &trade_legs {
+        if candidate_leg_role_side_matches(leg) {
+            checked_role_side_count += 1;
+        } else {
+            reasons.push(format!(
+                "funding-arb candidate leg `{}` role and side are not a valid perp long/short pair",
+                leg.leg_id.as_str()
+            ));
+        }
+        if candidate_leg_constraint_string(leg, "venue_symbol").is_some() {
+            checked_symbol_count += 1;
+        } else {
+            reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks venue_symbol",
+                leg.leg_id.as_str()
+            ));
+        }
+        if candidate_leg_quantity(candidate, leg).is_some() {
+            checked_quantity_count += 1;
+        } else {
+            reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks quantity delta for dispatch sizing",
+                leg.leg_id.as_str()
+            ));
+        }
+        if candidate_leg_limit_price(leg).is_some() {
+            checked_limit_price_count += 1;
+        } else {
+            reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks reference limit price",
+                leg.leg_id.as_str()
+            ));
+        }
+        if candidate_leg_notional_usd(leg).is_some() {
+            checked_notional_count += 1;
+        } else {
+            reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks notional_usd",
+                leg.leg_id.as_str()
+            ));
+        }
+        if candidate_leg_exchange_rule_surface_present(leg) {
+            checked_exchange_rule_count += 1;
+        } else {
+            reasons.push(format!(
+                "funding-arb candidate leg `{}` lacks exchange-rule surface for venue symbol, side, price, quantity, and order type",
+                leg.leg_id.as_str()
+            ));
+        }
+    }
+
+    let matched = reasons.is_empty() && trade_legs.len() == 2;
+    if trade_legs.len() != 2 {
+        reasons.push(format!(
+            "funding-arb candidate must contain exactly two trade legs; observed {}",
+            trade_legs.len()
+        ));
+    }
+    FundingArbExecutionConstraintSummary {
+        status: if matched { "Matched" } else { "Blocked" }.to_owned(),
+        checked_leg_count: trade_legs.len(),
+        checked_role_side_count,
+        checked_symbol_count,
+        checked_quantity_count,
+        checked_limit_price_count,
+        checked_notional_count,
+        checked_exchange_rule_count,
+        reason: (!matched).then(|| reasons.join("; ")),
+    }
+}
+
+fn funding_arb_exit_readiness(
+    private_positions: &FundingPrivatePositionReconciliationSummary,
+) -> FundingArbExitReadinessSummary {
+    if !private_positions.is_matched() {
+        return FundingArbExitReadinessSummary {
+            status: "Blocked".to_owned(),
+            supervisor_attached: false,
+            emergency_derisk_attached: false,
+            reduce_only_exit_required: true,
+            monitoring_interval_secs: None,
+            checked_position_count: private_positions.checked_position_count,
+            nonzero_position_count: private_positions.nonzero_position_count,
+            liquidation_buffer_bps: None,
+            max_position_imbalance_bps: FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS,
+            reason: private_positions.reason.clone().or_else(|| {
+                Some(
+                    "funding-arb exit supervisor requires matched private positions before live entry"
+                        .to_owned(),
+                )
+            }),
+        };
+    }
+
+    FundingArbExitReadinessSummary {
+        status: "Blocked".to_owned(),
+        supervisor_attached: false,
+        emergency_derisk_attached: false,
+        reduce_only_exit_required: true,
+        monitoring_interval_secs: None,
+        checked_position_count: private_positions.checked_position_count,
+        nonzero_position_count: private_positions.nonzero_position_count,
+        liquidation_buffer_bps: Some(FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS),
+        max_position_imbalance_bps: FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS,
+        reason: Some(
+            "funding-arb exit/de-risk runtime supervisor is not attached; matched flat-position snapshot is only a pre-entry proof"
+                .to_owned(),
+        ),
+    }
+}
+
+fn candidate_leg_constraint_string(leg: &TransitionLeg, field_name: &str) -> Option<String> {
+    match leg.constraints.get(field_name) {
+        Some(JsonValue::String(value)) => Some(value.to_owned()),
+        Some(JsonValue::Number(value)) => Some(value.as_str().to_owned()),
+        _ => None,
+    }
+}
+
+fn candidate_leg_limit_price(leg: &TransitionLeg) -> Option<String> {
+    candidate_leg_constraint_string(leg, "limit_price").or_else(|| match leg.side.as_ref()? {
+        arb_contracts::TransitionSide::Buy | arb_contracts::TransitionSide::Long => {
+            candidate_leg_constraint_string(leg, "reference_best_ask")
+                .or_else(|| candidate_leg_constraint_string(leg, "reference_last_price"))
+        }
+        arb_contracts::TransitionSide::Sell | arb_contracts::TransitionSide::Short => {
+            candidate_leg_constraint_string(leg, "reference_best_bid")
+                .or_else(|| candidate_leg_constraint_string(leg, "reference_last_price"))
+        }
+        _ => None,
+    })
+}
+
+fn candidate_leg_notional_usd(leg: &TransitionLeg) -> Option<String> {
+    candidate_leg_constraint_string(leg, "notional_usd")
+        .or_else(|| candidate_leg_constraint_string(leg, "notional_usdt"))
+}
+
+fn candidate_leg_quantity(
+    candidate: &CandidatePortfolioTransition,
+    leg: &TransitionLeg,
+) -> Option<String> {
+    let instrument_id = leg.instrument_id.as_ref()?;
+    let account_id = leg
+        .account_id
+        .as_ref()
+        .map(|account_id| account_id.as_str());
+    candidate
+        .expected_post_state_delta
+        .position_deltas
+        .iter()
+        .find(|delta| {
+            delta.instrument_id.as_str() == instrument_id.as_str()
+                && delta.account_id.as_ref().map(|id| id.as_str()) == account_id
+        })
+        .map(|delta| {
+            delta
+                .quantity_delta
+                .as_str()
+                .trim_start_matches('-')
+                .to_owned()
+        })
+}
+
+fn funding_arb_snapshot_lineage(
+    observed_at: UtcTimestamp,
+    funding_settlement: &FundingSettlementReconciliationSummary,
+    private_accounts: &FundingPrivateAccountReconciliationSummary,
+    private_positions: &FundingPrivatePositionReconciliationSummary,
+    private_execution: &FundingPrivateExecutionReconciliationSummary,
+) -> FundingArbSnapshotLineageSummary {
+    let mut checked_timestamp_count = 0_usize;
+    let mut missing_updated_at_count = 0_usize;
+    let mut invalid_updated_at_count = 0_usize;
+    let mut stale_private_snapshot_count = 0_usize;
+    let mut reasons = Vec::new();
+
+    funding_arb_check_snapshot_timestamp(
+        "funding_settlement",
+        &funding_settlement.status,
+        funding_settlement.snapshot_updated_at.as_deref(),
+        observed_at,
+        false,
+        &mut checked_timestamp_count,
+        &mut missing_updated_at_count,
+        &mut invalid_updated_at_count,
+        &mut stale_private_snapshot_count,
+        &mut reasons,
+    );
+    funding_arb_check_snapshot_timestamp(
+        "private_account",
+        &private_accounts.status,
+        private_accounts.snapshot_updated_at.as_deref(),
+        observed_at,
+        true,
+        &mut checked_timestamp_count,
+        &mut missing_updated_at_count,
+        &mut invalid_updated_at_count,
+        &mut stale_private_snapshot_count,
+        &mut reasons,
+    );
+    funding_arb_check_snapshot_timestamp(
+        "private_position",
+        &private_positions.status,
+        private_positions.snapshot_updated_at.as_deref(),
+        observed_at,
+        true,
+        &mut checked_timestamp_count,
+        &mut missing_updated_at_count,
+        &mut invalid_updated_at_count,
+        &mut stale_private_snapshot_count,
+        &mut reasons,
+    );
+    funding_arb_check_snapshot_timestamp(
+        "private_execution",
+        &private_execution.status,
+        private_execution.snapshot_updated_at.as_deref(),
+        observed_at,
+        true,
+        &mut checked_timestamp_count,
+        &mut missing_updated_at_count,
+        &mut invalid_updated_at_count,
+        &mut stale_private_snapshot_count,
+        &mut reasons,
+    );
+
+    let matched = missing_updated_at_count == 0
+        && invalid_updated_at_count == 0
+        && stale_private_snapshot_count == 0;
+    FundingArbSnapshotLineageSummary {
+        status: if matched { "Matched" } else { "Blocked" }.to_owned(),
+        observer_updated_at: observed_at.to_string(),
+        funding_settlement_updated_at: funding_settlement.snapshot_updated_at.clone(),
+        private_account_updated_at: private_accounts.snapshot_updated_at.clone(),
+        private_position_updated_at: private_positions.snapshot_updated_at.clone(),
+        private_execution_updated_at: private_execution.snapshot_updated_at.clone(),
+        max_private_snapshot_age_ms: FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS,
+        checked_timestamp_count,
+        missing_updated_at_count,
+        invalid_updated_at_count,
+        stale_private_snapshot_count,
+        reason: (!matched).then(|| reasons.join("; ")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn funding_arb_check_snapshot_timestamp(
+    label: &'static str,
+    status: &str,
+    updated_at: Option<&str>,
+    observed_at: UtcTimestamp,
+    enforce_private_freshness: bool,
+    checked_timestamp_count: &mut usize,
+    missing_updated_at_count: &mut usize,
+    invalid_updated_at_count: &mut usize,
+    stale_private_snapshot_count: &mut usize,
+    reasons: &mut Vec<String>,
+) {
+    if status == "NotProvided" {
+        return;
+    }
+    let Some(updated_at) = updated_at.filter(|value| !value.trim().is_empty()) else {
+        *missing_updated_at_count += 1;
+        reasons.push(format!("{label} snapshot is missing strict updated_at"));
+        return;
+    };
+    *checked_timestamp_count += 1;
+    let Ok(snapshot_time) = UtcTimestamp::from_str(updated_at) else {
+        *invalid_updated_at_count += 1;
+        reasons.push(format!(
+            "{label} snapshot updated_at `{updated_at}` is not strict UTC"
+        ));
+        return;
+    };
+    if enforce_private_freshness {
+        let age_ms = utc_timestamp_abs_delta_ms(observed_at, snapshot_time);
+        if age_ms > FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS {
+            *stale_private_snapshot_count += 1;
+            reasons.push(format!(
+                "{label} snapshot updated_at `{updated_at}` is {age_ms}ms away from observer time; max {}ms",
+                FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS
+            ));
+        }
+    }
+}
+
+fn utc_timestamp_abs_delta_ms(left: UtcTimestamp, right: UtcTimestamp) -> i128 {
+    let left_ns = (left.unix_seconds() as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(left.nanoseconds() as i128);
+    let right_ns = (right.unix_seconds() as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(right.nanoseconds() as i128);
+    left_ns.saturating_sub(right_ns).abs() / 1_000_000
+}
+
+struct FundingArbLiveReadinessInput<'a> {
+    spec: &'a CrossExchangeFundingArbPipelineSpec,
+    portfolio_state: &'a PortfolioState,
+    signal_allowed: bool,
+    risk_decision: Option<&'a RiskDecision>,
+    funding_settlement: &'a FundingSettlementReconciliationSummary,
+    funding_settlement_ingestion: &'a FundingSettlementIngestionSummary,
+    private_accounts: &'a FundingPrivateAccountReconciliationSummary,
+    private_positions: &'a FundingPrivatePositionReconciliationSummary,
+    private_execution: &'a FundingPrivateExecutionReconciliationSummary,
+    venue_execution_capability: &'a FundingArbVenueExecutionCapabilitySummary,
+    execution_constraints: &'a FundingArbExecutionConstraintSummary,
+    exit_readiness: &'a FundingArbExitReadinessSummary,
+    snapshot_lineage: &'a FundingArbSnapshotLineageSummary,
+    execution_preflight: &'a FundingArbExecutionPreflightSummary,
+}
+
+fn funding_arb_live_readiness(
+    input: FundingArbLiveReadinessInput<'_>,
+) -> FundingArbLiveReadinessSummary {
+    let mut checks = Vec::new();
+    checks.push(funding_arb_live_readiness_check(
+        "public_signal",
+        input.signal_allowed,
+        "NO_FUNDING_ARB_CANDIDATE",
+        "strategy did not emit a funding-arb candidate",
+    ));
+    let risk_allowed = input
+        .risk_decision
+        .is_some_and(risk_decision_allows_execution);
+    let risk_detail = input
+        .risk_decision
+        .map(|decision| {
+            if risk_decision_allows_execution(decision) {
+                "risk decision allows funding-arb execution".to_owned()
+            } else {
+                format!(
+                    "risk decision is {}; no funding-arb dispatch may be built",
+                    decision.decision.as_str()
+                )
+            }
+        })
+        .unwrap_or_else(|| {
+            "risk decision is unavailable; no funding-arb dispatch may be built".to_owned()
+        });
+    checks.push(funding_arb_live_readiness_check_owned(
+        "risk_decision",
+        risk_allowed,
+        Some("RISK_DECISION_BLOCKED".to_owned()),
+        Some(risk_detail),
+    ));
+    checks.push(funding_arb_live_readiness_check(
+        "manual_gate",
+        false,
+        "MANUAL_GATE_NOT_RELEASED",
+        "funding-arb guarded dry-run never releases the manual approval gate",
+    ));
+    for flag in &input.portfolio_state.missing_data_flags {
+        if flag.as_str() == "TWO_LEG_EXECUTION_RECONCILIATION_UNAVAILABLE" {
+            continue;
+        }
+        checks.push(funding_arb_live_readiness_check_owned(
+            format!("portfolio_missing_data:{}", flag.as_str()),
+            false,
+            Some(flag.as_str().to_owned()),
+            Some(format!(
+                "portfolio state missing data flag blocks live funding arb: {}",
+                flag.as_str()
+            )),
+        ));
+    }
+    checks.push(funding_arb_live_readiness_check_owned(
+        "funding_settlement",
+        input.funding_settlement.is_matched(),
+        Some("FUNDING_SETTLEMENT_NOT_MATCHED".to_owned()),
+        input.funding_settlement.reason.clone().or_else(|| {
+            (!input.funding_settlement.is_matched()).then(|| {
+                "actual funding settlement ledger reconciliation is not matched".to_owned()
+            })
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "funding_settlement_ingestion",
+        input.funding_settlement_ingestion.is_matched(),
+        Some("FUNDING_SETTLEMENT_INGESTION_NOT_ATTACHED".to_owned()),
+        input
+            .funding_settlement_ingestion
+            .reason
+            .clone()
+            .or_else(|| {
+                (!input.funding_settlement_ingestion.is_matched()).then(|| {
+                    "funding settlement auto/manual ingestion source is not attached".to_owned()
+                })
+            }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "snapshot_lineage_freshness",
+        input.snapshot_lineage.is_matched(),
+        Some("SNAPSHOT_LINEAGE_NOT_MATCHED".to_owned()),
+        input.snapshot_lineage.reason.clone().or_else(|| {
+            (!input.snapshot_lineage.is_matched()).then(|| {
+                "external funding-arb snapshots are missing strict updated_at lineage or freshness"
+                    .to_owned()
+            })
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "private_account_balance_margin",
+        input.private_accounts.is_matched(),
+        Some("PRIVATE_ACCOUNT_NOT_MATCHED".to_owned()),
+        input.private_accounts.reason.clone().or_else(|| {
+            (!input.private_accounts.is_matched()).then(|| {
+                "private account balance and margin snapshot reconciliation is not matched"
+                    .to_owned()
+            })
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "private_positions",
+        input.private_positions.is_matched(),
+        Some("PRIVATE_POSITION_NOT_MATCHED".to_owned()),
+        input.private_positions.reason.clone().or_else(|| {
+            (!input.private_positions.is_matched())
+                .then(|| "private position snapshot reconciliation is not matched".to_owned())
+        }),
+    ));
+    if !input.private_positions.is_matched() {
+        for leg in [
+            &input.spec.strategy_config.venues.venue_a,
+            &input.spec.strategy_config.venues.venue_b,
+        ] {
+            if leg.venue_id.contains("ASTER") || leg.venue_id.contains("HYPERLIQUID") {
+                checks.push(funding_arb_live_readiness_check_owned(
+                    format!(
+                        "venue_private_runtime:{}",
+                        normalize_venue_family(&leg.venue_label)
+                    ),
+                    false,
+                    Some("VENUE_PRIVATE_RUNTIME_NOT_ATTACHED".to_owned()),
+                    Some(format!(
+                        "{} private account runtime reconciliation is not attached",
+                        leg.venue_label
+                    )),
+                ));
+            }
+        }
+    }
+    checks.push(funding_arb_live_readiness_check_owned(
+        "venue_live_execution_capability",
+        input.venue_execution_capability.is_matched(),
+        Some("VENUE_LIVE_EXECUTION_CAPABILITY_NOT_ATTACHED".to_owned()),
+        input
+            .venue_execution_capability
+            .reason
+            .clone()
+            .or_else(|| {
+                (!input.venue_execution_capability.is_matched()).then(|| {
+                    "one or more funding-arb venues do not have runtime live execution and private confirmation attached".to_owned()
+                })
+            }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "execution_constraints",
+        input.execution_constraints.is_matched(),
+        Some("EXECUTION_CONSTRAINTS_NOT_MATCHED".to_owned()),
+        input.execution_constraints.reason.clone().or_else(|| {
+            (!input.execution_constraints.is_matched())
+                .then(|| "funding-arb execution constraints are incomplete".to_owned())
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "candidate_two_leg_dispatch_shape",
+        input.execution_preflight.two_leg_shape_matched(),
+        Some("TWO_LEG_DISPATCH_SHAPE_INVALID".to_owned()),
+        (!input.execution_preflight.two_leg_shape_matched()).then(|| {
+            input
+                .execution_preflight
+                .blocking_reasons
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "funding-arb dispatch requires exactly two trade requests; observed {}",
+                        input.execution_preflight.candidate_trade_leg_count
+                    )
+                })
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "manual_approval_plan_preview",
+        input.execution_preflight.plan_preview_built(),
+        Some("FUNDING_ARB_PLAN_PREVIEW_NOT_BUILT".to_owned()),
+        (!input.execution_preflight.plan_preview_built()).then(|| {
+            format!(
+                "funding-arb manual approval plan preview status is {}",
+                input.execution_preflight.plan_preview_status
+            )
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "private_execution_reconciliation",
+        input
+            .execution_preflight
+            .private_execution_reconciliation_matched(),
+        Some("PRIVATE_EXECUTION_RECONCILIATION_UNAVAILABLE".to_owned()),
+        (!input
+            .execution_preflight
+            .private_execution_reconciliation_matched())
+        .then(|| {
+            input.private_execution.reason.clone().unwrap_or_else(|| {
+                "private execution fill/order reconciliation snapshot was not matched; dry-run cannot prove the submitted two-leg outcome"
+                    .to_owned()
+            })
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "two_leg_live_dispatcher",
+        input.venue_execution_capability.is_matched(),
+        Some("TWO_LEG_LIVE_DISPATCHER_NOT_ATTACHED".to_owned()),
+        (!input.venue_execution_capability.is_matched()).then(|| {
+            "cross-exchange funding-arb live dispatcher is not attached for every selected venue"
+                .to_owned()
+        }),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "funding_arb_live_runner",
+        false,
+        Some("FUNDING_ARB_LIVE_RUNNER_NOT_ATTACHED".to_owned()),
+        Some(
+            "funding-arb runtime has no closed-loop live runner that can release gates, dispatch, reconcile, and supervise exits"
+                .to_owned(),
+        ),
+    ));
+    checks.push(funding_arb_live_readiness_check_owned(
+        "funding_arb_exit_supervisor",
+        input.exit_readiness.is_matched(),
+        Some("FUNDING_ARB_EXIT_SUPERVISOR_NOT_READY".to_owned()),
+        input.exit_readiness.reason.clone().or_else(|| {
+            (!input.exit_readiness.is_matched())
+                .then(|| "funding-arb exit/de-risk supervisor is not ready".to_owned())
+        }),
+    ));
+    funding_arb_live_readiness_from_checks(checks)
+}
+
+fn funding_arb_live_readiness_check(
+    check_id: impl Into<String>,
+    passed: bool,
+    reason_code: &'static str,
+    detail: &'static str,
+) -> FundingArbLiveReadinessCheck {
+    funding_arb_live_readiness_check_owned(
+        check_id,
+        passed,
+        Some(reason_code.to_owned()),
+        Some(detail.to_owned()),
+    )
+}
+
+fn funding_arb_live_readiness_check_owned(
+    check_id: impl Into<String>,
+    passed: bool,
+    reason_code: Option<String>,
+    detail: Option<String>,
+) -> FundingArbLiveReadinessCheck {
+    FundingArbLiveReadinessCheck {
+        check_id: check_id.into(),
+        status: if passed { "Passed" } else { "Blocked" }.to_owned(),
+        blocking: !passed,
+        reason_code: (!passed).then_some(reason_code).flatten(),
+        detail: (!passed).then_some(detail).flatten(),
+    }
+}
+
+fn funding_arb_live_readiness_from_checks(
+    checks: Vec<FundingArbLiveReadinessCheck>,
+) -> FundingArbLiveReadinessSummary {
+    let check_count = checks.len();
+    let blocking_check_count = checks.iter().filter(|check| check.blocking).count();
+    let passed_check_count = check_count.saturating_sub(blocking_check_count);
+    FundingArbLiveReadinessSummary {
+        status: if blocking_check_count == 0 {
+            "Ready"
+        } else {
+            "Blocked"
+        }
+        .to_owned(),
+        ready: blocking_check_count == 0,
+        check_count,
+        passed_check_count,
+        blocking_check_count,
+        checks,
+    }
+}
+
+fn funding_arb_live_blocking_reasons_from_readiness(
+    readiness: &FundingArbLiveReadinessSummary,
+) -> Vec<String> {
+    let mut reasons = BTreeSet::new();
+    for check in &readiness.checks {
+        if check.blocking {
+            if let Some(detail) = &check.detail {
+                reasons.insert(detail.clone());
+            } else if let Some(reason_code) = &check.reason_code {
+                reasons.insert(reason_code.clone());
+            } else {
+                reasons.insert(format!(
+                    "funding-arb live readiness check blocked: {}",
+                    check.check_id
+                ));
+            }
+        }
+    }
+    reasons.into_iter().collect()
+}
+
+fn reconcile_funding_settlement_ledger_json(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    ledger_json: &str,
+) -> RuntimeResult<FundingSettlementReconciliationSummary> {
+    let snapshot = parse_funding_settlement_ledger_snapshot_json(ledger_json)?;
+    reconcile_funding_settlement_ledger_snapshot(row, spec, &snapshot, "funding settlement ledger")
+}
+
+fn reconcile_funding_settlement_raw_snapshot_json(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    raw_json: &str,
+) -> RuntimeResult<FundingSettlementReconciliationSummary> {
+    let raw_snapshot = parse_funding_settlement_raw_snapshot_json(raw_json)?;
+    let entries = funding_settlement_entries_from_raw_snapshot(&raw_snapshot)?;
+    let ledger_snapshot = FundingSettlementLedgerSnapshot {
+        status: raw_snapshot.status,
+        updated_at: raw_snapshot.updated_at,
+        entries,
+    };
+    reconcile_funding_settlement_ledger_snapshot(
+        row,
+        spec,
+        &ledger_snapshot,
+        "funding settlement raw snapshot",
+    )
+}
+
+fn reconcile_funding_settlement_ledger_snapshot(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot: &FundingSettlementLedgerSnapshot,
+    source_label: &str,
+) -> RuntimeResult<FundingSettlementReconciliationSummary> {
+    if snapshot.status != "complete" && snapshot.status != "matched" && snapshot.status != "healthy"
+    {
+        return Ok(FundingSettlementReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            expected_funding_usd: expected_gross_funding_usd(row, spec)
+                .ok()
+                .map(MonitorDecimal::format_trimmed),
+            actual_funding_usd: None,
+            difference_usd: None,
+            checked_entry_count: 0,
+            reason: Some(format!(
+                "{source_label} snapshot status is {}",
+                snapshot.status.as_str()
+            )),
+        });
+    }
+
+    let expected = expected_gross_funding_usd(row, spec)?;
+    let mut actual = MonitorDecimal { raw: 0 };
+    let mut checked_entry_count = 0_usize;
+    let venue_a_family = normalize_venue_family(&row.venue_a_family);
+    let venue_b_family = normalize_venue_family(&row.venue_b_family);
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    for entry in &snapshot.entries {
+        let entry_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol));
+        let venue_matches = matches!(
+            normalize_venue_family(&entry.venue_family).as_str(),
+            family if family == venue_a_family || family == venue_b_family
+        );
+        let account_matches = entry.account_id == spec.strategy_config.venues.venue_a.account_id
+            || entry.account_id == spec.strategy_config.venues.venue_b.account_id;
+        if entry_symbol == expected_symbol && venue_matches && account_matches {
+            actual = actual.checked_add(
+                MonitorDecimal::parse("funding_settlement.amount_usd", &entry.amount_usd)?,
+                "funding settlement actual amount sum",
+            )?;
+            checked_entry_count += 1;
+        }
+    }
+
+    if checked_entry_count == 0 {
+        return Ok(FundingSettlementReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            expected_funding_usd: Some(expected.format_trimmed()),
+            actual_funding_usd: None,
+            difference_usd: None,
+            checked_entry_count,
+            reason: Some(format!(
+                "funding settlement ledger has no entries for {} on {}/{} accounts",
+                expected_symbol,
+                spec.strategy_config.venues.venue_a.account_id,
+                spec.strategy_config.venues.venue_b.account_id
+            )),
+        });
+    }
+
+    let difference = actual.checked_sub(expected, "funding settlement difference")?;
+    let tolerance = MonitorDecimal::parse(
+        "funding_settlement_tolerance_usd",
+        FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD,
+    )?;
+    let matched = difference.abs_lte(tolerance);
+    Ok(FundingSettlementReconciliationSummary {
+        status: if matched { "Matched" } else { "Mismatch" }.to_owned(),
+        snapshot_updated_at: snapshot.updated_at.clone(),
+        expected_funding_usd: Some(expected.format_trimmed()),
+        actual_funding_usd: Some(actual.format_trimmed()),
+        difference_usd: Some(difference.format_trimmed()),
+        checked_entry_count,
+        reason: (!matched).then(|| {
+            format!(
+                "funding settlement difference {} USD exceeds tolerance {} USD",
+                difference.format_trimmed(),
+                FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD
+            )
+        }),
+    })
+}
+
+fn expected_gross_funding_usd(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+) -> RuntimeResult<MonitorDecimal> {
+    let notional = MonitorDecimal::parse(
+        "funding_arb.notional_usd",
+        &spec.strategy_config.economics.notional_usd,
+    )?;
+    let gross_bps = row
+        .gross_funding_spread_bps
+        .as_deref()
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: "funding arb row is missing gross_funding_spread_bps".to_owned(),
+        })?
+        .parse::<i128>()
+        .map_err(|_| RuntimeError::Module {
+            module: "arb-runtime",
+            message: "funding arb row gross_funding_spread_bps must be an integer".to_owned(),
+        })?;
+    notional
+        .checked_mul_i128(gross_bps, "expected gross funding USD")
+        .and_then(|value| value.checked_div_i128(10_000, "expected gross funding USD"))
+}
+
+fn parse_funding_settlement_ledger_snapshot_json(
+    input: &str,
+) -> RuntimeResult<FundingSettlementLedgerSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status =
+        required_json_value_string(&fields, "status", "funding settlement ledger snapshot")?;
+    let updated_at =
+        optional_json_value_string(&fields, "updated_at", "funding settlement ledger snapshot")?;
+    let entries_value = fields.get("entries").ok_or_else(|| RuntimeError::Module {
+        module: "arb-runtime",
+        message: "funding settlement ledger snapshot is missing entries".to_owned(),
+    })?;
+    let mut entries = Vec::new();
+    for object in json_object_slices(entries_value)? {
+        let fields = parse_json_object_value_slices(object)?;
+        entries.push(FundingSettlementLedgerEntry {
+            venue_family: required_json_value_string(
+                &fields,
+                "venue_family",
+                "funding settlement ledger entry",
+            )?,
+            symbol: required_json_value_string(
+                &fields,
+                "symbol",
+                "funding settlement ledger entry",
+            )?,
+            account_id: required_json_value_string(
+                &fields,
+                "account_id",
+                "funding settlement ledger entry",
+            )?,
+            amount_usd: required_json_value_string(
+                &fields,
+                "amount_usd",
+                "funding settlement ledger entry",
+            )?,
+        });
+    }
+    Ok(FundingSettlementLedgerSnapshot {
+        status,
+        updated_at,
+        entries,
+    })
+}
+
+fn parse_funding_settlement_raw_snapshot_json(
+    input: &str,
+) -> RuntimeResult<FundingSettlementRawSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status = required_json_value_string(&fields, "status", "funding settlement raw snapshot")?;
+    let updated_at =
+        optional_json_value_string(&fields, "updated_at", "funding settlement raw snapshot")?;
+    let statements_value = fields
+        .get("statements")
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: "funding settlement raw snapshot is missing statements".to_owned(),
+        })?;
+    let mut statements = Vec::new();
+    for object in json_object_slices(statements_value)? {
+        let fields = parse_json_object_value_slices(object)?;
+        let payload_json = fields
+            .get("payload")
+            .or_else(|| fields.get("raw_json"))
+            .or_else(|| fields.get("response"))
+            .or_else(|| fields.get("entries"))
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message:
+                    "funding settlement raw statement is missing payload/raw_json/response/entries"
+                        .to_owned(),
+            })?;
+        statements.push(FundingSettlementRawStatement {
+            venue_family: required_json_value_string(
+                &fields,
+                "venue_family",
+                "funding settlement raw statement",
+            )?,
+            account_id: required_json_value_string(
+                &fields,
+                "account_id",
+                "funding settlement raw statement",
+            )?,
+            payload_json: (*payload_json).to_owned(),
+        });
+    }
+    Ok(FundingSettlementRawSnapshot {
+        status,
+        updated_at,
+        statements,
+    })
+}
+
+fn funding_settlement_entries_from_raw_snapshot(
+    snapshot: &FundingSettlementRawSnapshot,
+) -> RuntimeResult<Vec<FundingSettlementLedgerEntry>> {
+    let mut entries = Vec::new();
+    for statement in &snapshot.statements {
+        entries.extend(funding_settlement_entries_from_raw_statement(statement)?);
+    }
+    Ok(entries)
+}
+
+fn funding_settlement_entries_from_raw_statement(
+    statement: &FundingSettlementRawStatement,
+) -> RuntimeResult<Vec<FundingSettlementLedgerEntry>> {
+    let mut object_slices = Vec::new();
+    collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+    let mut entries = Vec::new();
+    for object in object_slices {
+        let fields = parse_json_object_value_slices(object)?;
+        if let Some(entry) = funding_settlement_entry_from_raw_fields(statement, &fields)? {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn collect_json_objects_recursive<'a>(
+    input: &'a str,
+    objects: &mut Vec<&'a str>,
+) -> RuntimeResult<()> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(());
+    }
+    if trimmed.starts_with('{') {
+        objects.push(trimmed);
+        let fields = parse_json_object_value_slices(trimmed)?;
+        for value in fields.values() {
+            if value.trim().starts_with('{') || value.trim().starts_with('[') {
+                collect_json_objects_recursive(value, objects)?;
+            }
+        }
+        return Ok(());
+    }
+    if trimmed.starts_with('[') {
+        for value in json_array_value_slices(trimmed)? {
+            collect_json_objects_recursive(value, objects)?;
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn funding_settlement_entry_from_raw_fields(
+    statement: &FundingSettlementRawStatement,
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<FundingSettlementLedgerEntry>> {
+    if let Some(delta_json) = fields.get("delta") {
+        if delta_json.trim().starts_with('{') {
+            let delta_fields = parse_json_object_value_slices(delta_json)?;
+            if funding_settlement_raw_fields_are_funding(&delta_fields)? {
+                let Some(amount_usd) = first_json_scalar_string(
+                    &delta_fields,
+                    &["usdc", "amount_usd", "amount", "funding", "funding_fee"],
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(raw_symbol) =
+                    first_json_scalar_string(fields, &["symbol", "instId", "coin", "asset"])?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(FundingSettlementLedgerEntry {
+                    venue_family: statement.venue_family.clone(),
+                    symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
+                    account_id: statement.account_id.clone(),
+                    amount_usd,
+                }));
+            }
+        }
+    }
+
+    if !funding_settlement_raw_fields_are_funding(fields)? {
+        return Ok(None);
+    }
+    let Some(amount_usd) = first_json_scalar_string(
+        fields,
+        &[
+            "amount_usd",
+            "income",
+            "cashFlow",
+            "amount",
+            "funding",
+            "fundingFee",
+            "funding_fee",
+            "balChg",
+            "balanceChange",
+            "pnl",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(raw_symbol) =
+        first_json_scalar_string(fields, &["symbol", "instId", "instrument", "coin"])?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(FundingSettlementLedgerEntry {
+        venue_family: statement.venue_family.clone(),
+        symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
+        account_id: statement.account_id.clone(),
+        amount_usd,
+    }))
+}
+
+fn funding_settlement_raw_fields_are_funding(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<bool> {
+    for field in [
+        "incomeType",
+        "type",
+        "transactionType",
+        "businessType",
+        "billType",
+        "event",
+        "category",
+    ] {
+        if let Some(value) = json_scalar_string_from_fields(fields, field)? {
+            let lower = value.to_ascii_lowercase();
+            if lower.contains("fund") || lower.contains("settlement") || lower.contains("settle") {
+                return Ok(true);
+            }
+        }
+    }
+    for field in ["funding", "fundingFee", "funding_fee"] {
+        if fields.contains_key(field) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn funding_settlement_display_symbol_from_raw(raw_symbol: &str) -> String {
+    let upper = raw_symbol.trim().to_ascii_uppercase();
+    if let Some(usdt_index) = upper.find("USDT") {
+        if usdt_index > 0 {
+            let base = upper[..usdt_index]
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .collect::<String>();
+            if !base.is_empty() {
+                return funding_display_symbol(&base);
+            }
+        }
+    }
+    funding_display_symbol(&funding_base_asset_from_symbol(&upper))
+}
+
+fn first_json_scalar_string(
+    fields: &BTreeMap<String, &str>,
+    field_names: &[&'static str],
+) -> RuntimeResult<Option<String>> {
+    for field in field_names {
+        if let Some(value) = json_scalar_string_from_fields(fields, field)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn json_scalar_string_from_fields(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+) -> RuntimeResult<Option<String>> {
+    let Some(value) = fields.get(field) else {
+        return Ok(None);
+    };
+    json_value_to_optional_scalar_string(value, field, "funding settlement raw entry")
+}
+
+fn json_value_to_optional_scalar_string(
+    value: &str,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<Option<String>> {
+    let value = value.trim();
+    if value == "null" {
+        return Ok(None);
+    }
+    if value.starts_with('{') || value.starts_with('[') {
+        return Ok(None);
+    }
+    json_value_to_string(value, field, source).map(Some)
+}
+
+fn reconcile_funding_private_account_snapshot_json(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot_json: &str,
+) -> RuntimeResult<FundingPrivateAccountReconciliationSummary> {
+    let snapshot = parse_funding_private_account_snapshot_json(snapshot_json)?;
+    reconcile_funding_private_account_snapshot(spec, &snapshot)
+}
+
+fn reconcile_funding_private_account_raw_snapshot_json(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    raw_json: &str,
+) -> RuntimeResult<FundingPrivateAccountReconciliationSummary> {
+    let raw_snapshot =
+        parse_funding_private_raw_snapshot_json(raw_json, "funding private account raw snapshot")?;
+    let snapshot = funding_private_account_snapshot_from_raw_snapshot(&raw_snapshot)?;
+    reconcile_funding_private_account_snapshot(spec, &snapshot)
+}
+
+fn reconcile_funding_private_account_snapshot(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot: &FundingPrivateAccountSnapshot,
+) -> RuntimeResult<FundingPrivateAccountReconciliationSummary> {
+    if snapshot.status != "complete" && snapshot.status != "matched" && snapshot.status != "healthy"
+    {
+        return Ok(FundingPrivateAccountReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            checked_account_count: 0,
+            min_required_available_usd: expected_private_account_min_collateral_usd(spec)
+                .ok()
+                .map(MonitorDecimal::format_trimmed),
+            min_available_usd: None,
+            min_margin_buffer_usd: None,
+            reason: Some(format!(
+                "private account snapshot status is {}",
+                snapshot.status
+            )),
+        });
+    }
+
+    let fallback_required_accounts = [
+        spec.strategy_config.venues.venue_a.account_id.as_str(),
+        spec.strategy_config.venues.venue_b.account_id.as_str(),
+    ];
+    let min_required = expected_private_account_min_collateral_usd(spec)?;
+    let mut checked_accounts = BTreeSet::new();
+    let mut missing_balance_accounts = Vec::new();
+    let mut missing_margin_accounts = Vec::new();
+    let mut min_available: Option<MonitorDecimal> = None;
+    let mut min_margin_buffer: Option<MonitorDecimal> = None;
+
+    for entry in &snapshot.accounts {
+        let entry_family = normalize_venue_family(&entry.venue_family);
+        if entry_family.is_empty() {
+            continue;
+        }
+        if !fallback_required_accounts.contains(&entry.account_id.as_str()) {
+            continue;
+        }
+        checked_accounts.insert(entry.account_id.clone());
+
+        let Some(available_usd) = entry.available_usd.as_deref() else {
+            missing_balance_accounts.push(entry.account_id.clone());
+            continue;
+        };
+        let available =
+            MonitorDecimal::parse("funding_private_account.available_usd", available_usd)?;
+        min_available = Some(match min_available {
+            Some(current) if current.raw <= available.raw => current,
+            _ => available,
+        });
+
+        let margin_buffer = if let Some(buffer) = entry.margin_buffer_usd.as_deref() {
+            MonitorDecimal::parse("funding_private_account.margin_buffer_usd", buffer)?
+        } else {
+            let Some(margin_balance) = entry.margin_balance_usd.as_deref() else {
+                missing_margin_accounts.push(entry.account_id.clone());
+                continue;
+            };
+            let Some(maintenance_margin) = entry.maintenance_margin_usd.as_deref() else {
+                missing_margin_accounts.push(entry.account_id.clone());
+                continue;
+            };
+            MonitorDecimal::parse("funding_private_account.margin_balance_usd", margin_balance)?
+                .checked_sub(
+                    MonitorDecimal::parse(
+                        "funding_private_account.maintenance_margin_usd",
+                        maintenance_margin,
+                    )?,
+                    "funding private account margin buffer",
+                )?
+        };
+        min_margin_buffer = Some(match min_margin_buffer {
+            Some(current) if current.raw <= margin_buffer.raw => current,
+            _ => margin_buffer,
+        });
+    }
+
+    let missing_accounts = fallback_required_accounts
+        .iter()
+        .filter(|account_id| !checked_accounts.contains::<str>(*account_id))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_accounts.is_empty()
+        || !missing_balance_accounts.is_empty()
+        || !missing_margin_accounts.is_empty()
+    {
+        let mut reasons = Vec::new();
+        if !missing_accounts.is_empty() {
+            reasons.push(format!("missing accounts: {}", missing_accounts.join(",")));
+        }
+        if !missing_balance_accounts.is_empty() {
+            reasons.push(format!(
+                "missing available balance: {}",
+                missing_balance_accounts.join(",")
+            ));
+        }
+        if !missing_margin_accounts.is_empty() {
+            reasons.push(format!(
+                "missing margin fields: {}",
+                missing_margin_accounts.join(",")
+            ));
+        }
+        return Ok(FundingPrivateAccountReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            checked_account_count: checked_accounts.len(),
+            min_required_available_usd: Some(min_required.format_trimmed()),
+            min_available_usd: min_available.map(MonitorDecimal::format_trimmed),
+            min_margin_buffer_usd: min_margin_buffer.map(MonitorDecimal::format_trimmed),
+            reason: Some(format!(
+                "private account snapshot is incomplete for funding-arb accounts: {}",
+                reasons.join("; ")
+            )),
+        });
+    }
+
+    let Some(min_available) = min_available else {
+        return Ok(FundingPrivateAccountReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            checked_account_count: checked_accounts.len(),
+            min_required_available_usd: Some(min_required.format_trimmed()),
+            min_available_usd: None,
+            min_margin_buffer_usd: min_margin_buffer.map(MonitorDecimal::format_trimmed),
+            reason: Some("private account snapshot has no available balance values".to_owned()),
+        });
+    };
+    let Some(min_margin_buffer) = min_margin_buffer else {
+        return Ok(FundingPrivateAccountReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            checked_account_count: checked_accounts.len(),
+            min_required_available_usd: Some(min_required.format_trimmed()),
+            min_available_usd: Some(min_available.format_trimmed()),
+            min_margin_buffer_usd: None,
+            reason: Some("private account snapshot has no margin buffer values".to_owned()),
+        });
+    };
+
+    let insufficient_available = min_available.raw < min_required.raw;
+    let insufficient_margin = min_margin_buffer.raw < min_required.raw;
+    Ok(FundingPrivateAccountReconciliationSummary {
+        status: if insufficient_available || insufficient_margin {
+            "Insufficient"
+        } else {
+            "Matched"
+        }
+        .to_owned(),
+        snapshot_updated_at: snapshot.updated_at.clone(),
+        checked_account_count: checked_accounts.len(),
+        min_required_available_usd: Some(min_required.format_trimmed()),
+        min_available_usd: Some(min_available.format_trimmed()),
+        min_margin_buffer_usd: Some(min_margin_buffer.format_trimmed()),
+        reason: (insufficient_available || insufficient_margin).then(|| {
+            format!(
+                "private account minimum available={} USD and margin_buffer={} USD must both be at least {} USD",
+                min_available.format_trimmed(),
+                min_margin_buffer.format_trimmed(),
+                min_required.format_trimmed()
+            )
+        }),
+    })
+}
+
+fn funding_private_account_snapshot_from_raw_snapshot(
+    snapshot: &FundingPrivateRawSnapshot,
+) -> RuntimeResult<FundingPrivateAccountSnapshot> {
+    let mut accounts = Vec::new();
+    for statement in &snapshot.statements {
+        if let Some(entry) = funding_private_account_entry_from_raw_statement(statement)? {
+            accounts.push(entry);
+        }
+    }
+    Ok(FundingPrivateAccountSnapshot {
+        status: snapshot.status.clone(),
+        updated_at: snapshot.updated_at.clone(),
+        accounts,
+    })
+}
+
+fn funding_private_account_entry_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+) -> RuntimeResult<Option<FundingPrivateAccountEntry>> {
+    match normalize_venue_family(&statement.venue_family).as_str() {
+        "hyperliquid" => hyperliquid_private_account_entry_from_raw_statement(statement),
+        _ => generic_private_account_entry_from_raw_statement(statement),
+    }
+}
+
+fn hyperliquid_private_account_entry_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+) -> RuntimeResult<Option<FundingPrivateAccountEntry>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('{') {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(payload)?;
+    let available_usd = first_json_scalar_string(&fields, &["withdrawable", "available"])?;
+    let mut margin_balance_usd =
+        first_json_scalar_string(&fields, &["accountValue", "totalRawUsd"])?;
+    if margin_balance_usd.is_none() {
+        margin_balance_usd = first_json_scalar_string_from_object_field(
+            &fields,
+            "marginSummary",
+            &["accountValue", "totalRawUsd"],
+        )?;
+    }
+    if margin_balance_usd.is_none() {
+        margin_balance_usd = first_json_scalar_string_from_object_field(
+            &fields,
+            "crossMarginSummary",
+            &["accountValue", "totalRawUsd"],
+        )?;
+    }
+    let maintenance_margin_usd = first_json_scalar_string(
+        &fields,
+        &["crossMaintenanceMarginUsed", "maintenanceMargin"],
+    )?;
+    let margin_buffer_usd = if maintenance_margin_usd.is_none() {
+        available_usd.clone()
+    } else {
+        None
+    };
+    if available_usd.is_none() && margin_balance_usd.is_none() && margin_buffer_usd.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(FundingPrivateAccountEntry {
+        venue_family: statement.venue_family.clone(),
+        account_id: statement.account_id.clone(),
+        available_usd,
+        margin_balance_usd,
+        maintenance_margin_usd,
+        margin_buffer_usd,
+    }))
+}
+
+fn generic_private_account_entry_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+) -> RuntimeResult<Option<FundingPrivateAccountEntry>> {
+    let mut object_slices = Vec::new();
+    collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+    for object in object_slices {
+        let fields = parse_json_object_value_slices(object)?;
+        if let Some(asset) =
+            first_json_scalar_string(&fields, &["asset", "marginCoin", "coin", "currency"])?
+        {
+            if !funding_private_margin_asset_is_usd(&asset) {
+                continue;
+            }
+        }
+        let available_usd = first_json_scalar_string(
+            &fields,
+            &[
+                "available_usd",
+                "availableBalance",
+                "available_balance",
+                "available",
+                "availableToWithdraw",
+                "maxWithdrawAmount",
+                "free",
+            ],
+        )?;
+        let margin_balance_usd = first_json_scalar_string(
+            &fields,
+            &[
+                "margin_balance_usd",
+                "marginBalance",
+                "crossWalletBalance",
+                "walletBalance",
+                "balance",
+                "equity",
+                "accountEquity",
+                "totalEq",
+            ],
+        )?;
+        let maintenance_margin_usd = first_json_scalar_string(
+            &fields,
+            &[
+                "maintenance_margin_usd",
+                "maintMargin",
+                "maintenanceMargin",
+                "mmr",
+            ],
+        )?;
+        let margin_buffer_usd = first_json_scalar_string(
+            &fields,
+            &[
+                "margin_buffer_usd",
+                "available_margin_usd",
+                "availableMargin",
+                "availableBalance",
+                "available",
+            ],
+        )?;
+        if available_usd.is_some()
+            || margin_balance_usd.is_some()
+            || maintenance_margin_usd.is_some()
+            || margin_buffer_usd.is_some()
+        {
+            return Ok(Some(FundingPrivateAccountEntry {
+                venue_family: statement.venue_family.clone(),
+                account_id: statement.account_id.clone(),
+                available_usd,
+                margin_balance_usd,
+                maintenance_margin_usd,
+                margin_buffer_usd,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn funding_private_margin_asset_is_usd(asset: &str) -> bool {
+    matches!(
+        asset.trim().to_ascii_uppercase().as_str(),
+        "USDT" | "USDC" | "USD"
+    )
+}
+
+fn first_json_scalar_string_from_object_field(
+    fields: &BTreeMap<String, &str>,
+    object_field: &'static str,
+    field_names: &[&'static str],
+) -> RuntimeResult<Option<String>> {
+    let Some(value) = fields.get(object_field) else {
+        return Ok(None);
+    };
+    if !value.trim().starts_with('{') {
+        return Ok(None);
+    }
+    let nested = parse_json_object_value_slices(value)?;
+    first_json_scalar_string(&nested, field_names)
+}
+
+fn expected_private_account_min_collateral_usd(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+) -> RuntimeResult<MonitorDecimal> {
+    MonitorDecimal::parse(
+        "funding_arb.notional_usd",
+        &spec.strategy_config.economics.notional_usd,
+    )?
+    .checked_mul_i128(
+        FUNDING_PRIVATE_ACCOUNT_MIN_COLLATERAL_RATIO_BPS,
+        "funding private account min collateral",
+    )
+    .and_then(|value| value.checked_div_i128(10_000, "funding private account min collateral"))
+}
+
+fn parse_funding_private_account_snapshot_json(
+    input: &str,
+) -> RuntimeResult<FundingPrivateAccountSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status = required_json_value_string(&fields, "status", "funding private account snapshot")?;
+    let updated_at =
+        optional_json_value_string(&fields, "updated_at", "funding private account snapshot")?;
+    let accounts_value = fields.get("accounts").ok_or_else(|| RuntimeError::Module {
+        module: "arb-runtime",
+        message: "funding private account snapshot is missing accounts".to_owned(),
+    })?;
+    let mut accounts = Vec::new();
+    for object in json_object_slices(accounts_value)? {
+        let fields = parse_json_object_value_slices(object)?;
+        accounts.push(FundingPrivateAccountEntry {
+            venue_family: required_json_value_string(
+                &fields,
+                "venue_family",
+                "funding private account entry",
+            )?,
+            account_id: required_json_value_string(
+                &fields,
+                "account_id",
+                "funding private account entry",
+            )?,
+            available_usd: optional_first_json_value_string(
+                &fields,
+                &[
+                    "available_usd",
+                    "available_balance_usd",
+                    "available_collateral_usd",
+                    "available",
+                ],
+                "funding private account entry",
+            )?,
+            margin_balance_usd: optional_first_json_value_string(
+                &fields,
+                &["margin_balance_usd", "account_equity_usd", "equity_usd"],
+                "funding private account entry",
+            )?,
+            maintenance_margin_usd: optional_first_json_value_string(
+                &fields,
+                &["maintenance_margin_usd", "maint_margin_usd"],
+                "funding private account entry",
+            )?,
+            margin_buffer_usd: optional_first_json_value_string(
+                &fields,
+                &["margin_buffer_usd", "available_margin_usd"],
+                "funding private account entry",
+            )?,
+        });
+    }
+    Ok(FundingPrivateAccountSnapshot {
+        status,
+        updated_at,
+        accounts,
+    })
+}
+
+fn parse_funding_private_raw_snapshot_json(
+    input: &str,
+    source: &'static str,
+) -> RuntimeResult<FundingPrivateRawSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status = required_json_value_string(&fields, "status", source)?;
+    let updated_at = optional_json_value_string(&fields, "updated_at", source)?;
+    let statements_value = fields
+        .get("statements")
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("{source} is missing statements"),
+        })?;
+    let mut statements = Vec::new();
+    for object in json_object_slices(statements_value)? {
+        let fields = parse_json_object_value_slices(object)?;
+        let payload_json = fields
+            .get("payload")
+            .or_else(|| fields.get("raw_json"))
+            .or_else(|| fields.get("response"))
+            .or_else(|| fields.get("data"))
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("{source} statement is missing payload/raw_json/response/data"),
+            })?;
+        statements.push(FundingPrivateRawStatement {
+            venue_family: required_json_value_string(&fields, "venue_family", source)?,
+            account_id: required_json_value_string(&fields, "account_id", source)?,
+            payload_json: raw_json_payload_string(payload_json, source)?,
+        });
+    }
+    Ok(FundingPrivateRawSnapshot {
+        status,
+        updated_at,
+        statements,
+    })
+}
+
+fn raw_json_payload_string(value: &str, source: &'static str) -> RuntimeResult<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('"') {
+        return json_value_to_string(trimmed, "payload", source);
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn reconcile_funding_private_position_snapshot_json(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot_json: &str,
+) -> RuntimeResult<FundingPrivatePositionReconciliationSummary> {
+    let snapshot = parse_funding_private_position_snapshot_json(snapshot_json)?;
+    reconcile_funding_private_position_snapshot(row, spec, &snapshot)
+}
+
+fn reconcile_funding_private_position_raw_snapshot_json(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    raw_json: &str,
+) -> RuntimeResult<FundingPrivatePositionReconciliationSummary> {
+    let raw_snapshot =
+        parse_funding_private_raw_snapshot_json(raw_json, "funding private position raw snapshot")?;
+    let snapshot = funding_private_position_snapshot_from_raw_snapshot(row, &raw_snapshot)?;
+    reconcile_funding_private_position_snapshot(row, spec, &snapshot)
+}
+
+fn reconcile_funding_private_position_snapshot(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot: &FundingPrivatePositionSnapshot,
+) -> RuntimeResult<FundingPrivatePositionReconciliationSummary> {
+    if snapshot.status != "complete" && snapshot.status != "matched" && snapshot.status != "healthy"
+    {
+        return Ok(FundingPrivatePositionReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            checked_position_count: 0,
+            nonzero_position_count: 0,
+            reason: Some(format!(
+                "private position snapshot status is {}",
+                snapshot.status
+            )),
+        });
+    }
+
+    let venue_a_family = normalize_venue_family(&row.venue_a_family);
+    let venue_b_family = normalize_venue_family(&row.venue_b_family);
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let required_accounts = [
+        spec.strategy_config.venues.venue_a.account_id.as_str(),
+        spec.strategy_config.venues.venue_b.account_id.as_str(),
+    ];
+    let mut checked_accounts = BTreeSet::new();
+    let mut checked_position_count = 0_usize;
+    let mut nonzero_position_count = 0_usize;
+    for entry in &snapshot.positions {
+        let entry_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol));
+        let entry_family = normalize_venue_family(&entry.venue_family);
+        let venue_matches = entry_family == venue_a_family || entry_family == venue_b_family;
+        let account_matches = required_accounts
+            .iter()
+            .any(|account_id| entry.account_id == *account_id);
+        if entry_symbol == expected_symbol && venue_matches && account_matches {
+            checked_position_count += 1;
+            checked_accounts.insert(entry.account_id.clone());
+            let quantity =
+                MonitorDecimal::parse("funding_private_position.quantity", &entry.quantity)?;
+            if quantity.raw != 0 {
+                nonzero_position_count += 1;
+            }
+        }
+    }
+
+    let missing_accounts = required_accounts
+        .iter()
+        .filter(|account_id| !checked_accounts.contains::<str>(*account_id))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_accounts.is_empty() {
+        return Ok(FundingPrivatePositionReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            checked_position_count,
+            nonzero_position_count,
+            reason: Some(format!(
+                "private position snapshot has no checked flat-position entries for {} accounts: {}",
+                expected_symbol,
+                missing_accounts.join(",")
+            )),
+        });
+    }
+
+    Ok(FundingPrivatePositionReconciliationSummary {
+        status: if nonzero_position_count == 0 {
+            "Matched"
+        } else {
+            "Mismatch"
+        }
+        .to_owned(),
+        snapshot_updated_at: snapshot.updated_at.clone(),
+        checked_position_count,
+        nonzero_position_count,
+        reason: (nonzero_position_count > 0).then(|| {
+            format!(
+                "private position snapshot has {} non-zero {} positions before funding-arb entry",
+                nonzero_position_count, expected_symbol
+            )
+        }),
+    })
+}
+
+fn funding_private_position_snapshot_from_raw_snapshot(
+    row: &FundingArbMarketRow,
+    snapshot: &FundingPrivateRawSnapshot,
+) -> RuntimeResult<FundingPrivatePositionSnapshot> {
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let mut positions = Vec::new();
+    for statement in &snapshot.statements {
+        match normalize_venue_family(&statement.venue_family).as_str() {
+            "hyperliquid" => {
+                positions.extend(hyperliquid_private_position_entries_from_raw_statement(
+                    statement,
+                    &expected_symbol,
+                )?)
+            }
+            _ => positions.extend(generic_private_position_entries_from_raw_statement(
+                statement,
+            )?),
+        }
+    }
+    Ok(FundingPrivatePositionSnapshot {
+        status: snapshot.status.clone(),
+        updated_at: snapshot.updated_at.clone(),
+        positions,
+    })
+}
+
+fn generic_private_position_entries_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+) -> RuntimeResult<Vec<FundingPrivatePositionEntry>> {
+    let mut object_slices = Vec::new();
+    collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+    let mut positions = Vec::new();
+    for object in object_slices {
+        let fields = parse_json_object_value_slices(object)?;
+        let Some(raw_symbol) = first_json_scalar_string(
+            &fields,
+            &["symbol", "instId", "instrument", "coin", "asset"],
+        )?
+        else {
+            continue;
+        };
+        let Some(quantity) = first_json_scalar_string(
+            &fields,
+            &[
+                "quantity",
+                "position_size",
+                "size",
+                "positionAmt",
+                "szi",
+                "total",
+                "pos",
+            ],
+        )?
+        else {
+            continue;
+        };
+        positions.push(FundingPrivatePositionEntry {
+            venue_family: statement.venue_family.clone(),
+            symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
+            account_id: statement.account_id.clone(),
+            quantity,
+        });
+    }
+    Ok(positions)
+}
+
+fn hyperliquid_private_position_entries_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    expected_symbol: &str,
+) -> RuntimeResult<Vec<FundingPrivatePositionEntry>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('{') {
+        return Ok(Vec::new());
+    }
+    let root_fields = parse_json_object_value_slices(payload)?;
+    let has_asset_positions = root_fields.contains_key("assetPositions");
+    let mut object_slices = Vec::new();
+    collect_json_objects_recursive(payload, &mut object_slices)?;
+    let mut positions = Vec::new();
+    for object in object_slices {
+        let fields = parse_json_object_value_slices(object)?;
+        let Some(position_json) = fields.get("position") else {
+            continue;
+        };
+        if !position_json.trim().starts_with('{') {
+            continue;
+        }
+        let position_fields = parse_json_object_value_slices(position_json)?;
+        let Some(raw_symbol) =
+            first_json_scalar_string(&position_fields, &["coin", "symbol", "asset"])?
+        else {
+            continue;
+        };
+        let Some(quantity) =
+            first_json_scalar_string(&position_fields, &["szi", "quantity", "size"])?
+        else {
+            continue;
+        };
+        positions.push(FundingPrivatePositionEntry {
+            venue_family: statement.venue_family.clone(),
+            symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
+            account_id: statement.account_id.clone(),
+            quantity,
+        });
+    }
+    if has_asset_positions
+        && !positions.iter().any(|entry| {
+            entry.symbol == expected_symbol && entry.account_id == statement.account_id
+        })
+    {
+        positions.push(FundingPrivatePositionEntry {
+            venue_family: statement.venue_family.clone(),
+            symbol: expected_symbol.to_owned(),
+            account_id: statement.account_id.clone(),
+            quantity: "0".to_owned(),
+        });
+    }
+    Ok(positions)
+}
+
+fn parse_funding_private_position_snapshot_json(
+    input: &str,
+) -> RuntimeResult<FundingPrivatePositionSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status =
+        required_json_value_string(&fields, "status", "funding private position snapshot")?;
+    let updated_at =
+        optional_json_value_string(&fields, "updated_at", "funding private position snapshot")?;
+    let positions_value = fields
+        .get("positions")
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: "funding private position snapshot is missing positions".to_owned(),
+        })?;
+    let mut positions = Vec::new();
+    for object in json_object_slices(positions_value)? {
+        let fields = parse_json_object_value_slices(object)?;
+        positions.push(FundingPrivatePositionEntry {
+            venue_family: required_json_value_string(
+                &fields,
+                "venue_family",
+                "funding private position entry",
+            )?,
+            symbol: required_json_value_string(
+                &fields,
+                "symbol",
+                "funding private position entry",
+            )?,
+            account_id: required_json_value_string(
+                &fields,
+                "account_id",
+                "funding private position entry",
+            )?,
+            quantity: required_first_json_value_string(
+                &fields,
+                &["quantity", "position_size", "size"],
+                "funding private position entry",
+            )?,
+        });
+    }
+    Ok(FundingPrivatePositionSnapshot {
+        status,
+        updated_at,
+        positions,
+    })
+}
+
+fn funding_settlement_ingestion_summary(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    source: &str,
+    source_updated_at: Option<String>,
+) -> FundingSettlementIngestionSummary {
+    let venue_families = [
+        normalize_venue_family(&spec.strategy_config.venues.venue_a.venue_label),
+        normalize_venue_family(&spec.strategy_config.venues.venue_b.venue_label),
+    ];
+    let auto_supported_venue_count = venue_families
+        .iter()
+        .filter(|family| {
+            arb_venue_capability_profile(family)
+                .is_some_and(|profile| profile.runtime_auto_funding_settlement_supported)
+        })
+        .count();
+    let manual_snapshot_required_venue_count = venue_families.len() - auto_supported_venue_count;
+    let provided = source != "not_provided";
+    let matched = provided && manual_snapshot_required_venue_count == 0;
+    FundingSettlementIngestionSummary {
+        status: if matched {
+            "Matched"
+        } else if provided {
+            "ManualSnapshot"
+        } else {
+            "Missing"
+        }
+        .to_owned(),
+        source: source.to_owned(),
+        source_updated_at,
+        auto_supported_venue_count,
+        manual_snapshot_required_venue_count,
+        reason: if matched {
+            None
+        } else if provided {
+            Some(format!(
+                "funding settlement source `{source}` was provided; {} selected venue(s) still require manual snapshot ingestion",
+                manual_snapshot_required_venue_count
+            ))
+        } else {
+            Some(
+                "funding settlement auto ingestion is not attached for every selected venue and no settlement snapshot was provided"
+                    .to_owned(),
+            )
+        },
+    }
+}
+
+fn reconcile_funding_private_execution_snapshot_json(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot_json: &str,
+) -> RuntimeResult<FundingPrivateExecutionReconciliationSummary> {
+    let snapshot = parse_funding_private_execution_snapshot_json(snapshot_json)?;
+    reconcile_funding_private_execution_snapshot(row, spec, &snapshot)
+}
+
+fn parse_funding_private_execution_snapshot_json(
+    input: &str,
+) -> RuntimeResult<FundingPrivateExecutionSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status =
+        required_json_value_string(&fields, "status", "funding private execution snapshot")?;
+    let updated_at =
+        optional_json_value_string(&fields, "updated_at", "funding private execution snapshot")?;
+    let plan_hash =
+        optional_json_value_string(&fields, "plan_hash", "funding private execution snapshot")?;
+    let orders_value = fields.get("orders").ok_or_else(|| RuntimeError::Module {
+        module: "arb-runtime",
+        message: "funding private execution snapshot is missing orders".to_owned(),
+    })?;
+    let mut orders = Vec::new();
+    for object in json_object_slices(orders_value)? {
+        let fields = parse_json_object_value_slices(object)?;
+        orders.push(FundingPrivateExecutionOrder {
+            venue_family: required_json_value_string(
+                &fields,
+                "venue_family",
+                "funding private execution order",
+            )?,
+            symbol: required_json_value_string(
+                &fields,
+                "symbol",
+                "funding private execution order",
+            )?,
+            account_id: required_json_value_string(
+                &fields,
+                "account_id",
+                "funding private execution order",
+            )?,
+            basis_leg_role: optional_json_value_string(
+                &fields,
+                "basis_leg_role",
+                "funding private execution order",
+            )?,
+            client_order_id: optional_json_value_string(
+                &fields,
+                "client_order_id",
+                "funding private execution order",
+            )?,
+            venue_order_id: optional_json_value_string(
+                &fields,
+                "venue_order_id",
+                "funding private execution order",
+            )?,
+            side: optional_json_value_string(&fields, "side", "funding private execution order")?,
+            order_status: required_first_json_value_string(
+                &fields,
+                &["order_status", "status"],
+                "funding private execution order",
+            )?,
+            filled_quantity: optional_first_json_value_string(
+                &fields,
+                &["filled_quantity", "executed_quantity", "cum_qty", "filled"],
+                "funding private execution order",
+            )?,
+            fill_count: optional_json_usize(
+                &fields,
+                "fill_count",
+                "funding private execution order",
+            )?
+            .unwrap_or(0),
+        });
+    }
+    Ok(FundingPrivateExecutionSnapshot {
+        status,
+        updated_at,
+        plan_hash,
+        orders,
+    })
+}
+
+fn reconcile_funding_private_execution_snapshot(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot: &FundingPrivateExecutionSnapshot,
+) -> RuntimeResult<FundingPrivateExecutionReconciliationSummary> {
+    let expected_order_count = 2_usize;
+    if snapshot.status != "complete" && snapshot.status != "matched" && snapshot.status != "healthy"
+    {
+        return Ok(FundingPrivateExecutionReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            plan_hash: snapshot.plan_hash.clone(),
+            expected_order_count,
+            checked_order_count: 0,
+            matched_order_count: 0,
+            side_match_count: 0,
+            filled_quantity_match_count: 0,
+            order_identifier_count: 0,
+            terminal_order_count: 0,
+            filled_order_count: 0,
+            fill_count: 0,
+            unknown_order_count: 0,
+            mismatch_count: 0,
+            reason: Some(format!(
+                "private execution snapshot status is {}",
+                snapshot.status
+            )),
+        });
+    }
+
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let venue_a_family = normalize_venue_family(&row.venue_a_family);
+    let venue_b_family = normalize_venue_family(&row.venue_b_family);
+    let required_accounts = [
+        spec.strategy_config.venues.venue_a.account_id.as_str(),
+        spec.strategy_config.venues.venue_b.account_id.as_str(),
+    ];
+    let mut checked_order_count = 0_usize;
+    let mut matched_order_count = 0_usize;
+    let mut side_match_count = 0_usize;
+    let mut filled_quantity_match_count = 0_usize;
+    let mut order_identifier_count = 0_usize;
+    let mut terminal_order_count = 0_usize;
+    let mut filled_order_count = 0_usize;
+    let mut fill_count = 0_usize;
+    let mut unknown_order_count = 0_usize;
+    let mut mismatch_count = 0_usize;
+    let mut matched_roles = BTreeSet::new();
+
+    for order in &snapshot.orders {
+        let order_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&order.symbol));
+        let venue_family = normalize_venue_family(&order.venue_family);
+        let venue_matches = venue_family == venue_a_family || venue_family == venue_b_family;
+        let account_matches = required_accounts
+            .iter()
+            .any(|account_id| order.account_id == *account_id);
+        if order_symbol != expected_symbol || !venue_matches || !account_matches {
+            continue;
+        }
+
+        checked_order_count += 1;
+        let normalized_status = normalize_execution_order_status(&order.order_status);
+        if matches!(
+            normalized_status.as_str(),
+            "filled" | "canceled" | "rejected" | "expired"
+        ) {
+            terminal_order_count += 1;
+        }
+        if normalized_status == "unknown" {
+            unknown_order_count += 1;
+        }
+        if normalized_status == "filled" {
+            filled_order_count += 1;
+        }
+        if order.client_order_id.is_some() || order.venue_order_id.is_some() {
+            order_identifier_count += 1;
+        }
+        fill_count += order.fill_count;
+        let filled = order
+            .filled_quantity
+            .as_deref()
+            .map(|value| {
+                MonitorDecimal::parse("funding_private_execution.filled_quantity", value)
+                    .map(|quantity| quantity.raw != 0)
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if filled {
+            filled_quantity_match_count += 1;
+        }
+        if normalized_status == "filled" && filled {
+            if let Some(role) = order.basis_leg_role.as_deref() {
+                let side_matches =
+                    funding_private_execution_order_side_matches(role, order.side.as_deref());
+                if side_matches {
+                    side_match_count += 1;
+                }
+                if (role == "perp_long" || role == "perp_short")
+                    && side_matches
+                    && (order.client_order_id.is_some() || order.venue_order_id.is_some())
+                {
+                    matched_roles.insert(role.to_owned());
+                    matched_order_count += 1;
+                } else {
+                    mismatch_count += 1;
+                }
+            } else {
+                mismatch_count += 1;
+            }
+        } else if normalized_status != "unknown" {
+            mismatch_count += 1;
+        }
+    }
+
+    let missing_roles = ["perp_long", "perp_short"]
+        .iter()
+        .filter(|role| !matched_roles.contains::<str>(*role))
+        .copied()
+        .collect::<Vec<_>>();
+    let matched = checked_order_count >= expected_order_count
+        && matched_roles.len() == expected_order_count
+        && side_match_count >= expected_order_count
+        && filled_quantity_match_count >= expected_order_count
+        && order_identifier_count >= expected_order_count
+        && unknown_order_count == 0
+        && mismatch_count == 0;
+    Ok(FundingPrivateExecutionReconciliationSummary {
+        status: if matched {
+            "Matched"
+        } else if checked_order_count == 0 {
+            "Missing"
+        } else if unknown_order_count > 0 {
+            "Unknown"
+        } else {
+            "Mismatch"
+        }
+        .to_owned(),
+        snapshot_updated_at: snapshot.updated_at.clone(),
+        plan_hash: snapshot.plan_hash.clone(),
+        expected_order_count,
+        checked_order_count,
+        matched_order_count,
+        side_match_count,
+        filled_quantity_match_count,
+        order_identifier_count,
+        terminal_order_count,
+        filled_order_count,
+        fill_count,
+        unknown_order_count,
+        mismatch_count,
+        reason: (!matched).then(|| {
+            if checked_order_count == 0 {
+                format!(
+                    "private execution snapshot has no checked orders for {} on funding-arb accounts",
+                    expected_symbol
+                )
+            } else if !missing_roles.is_empty() {
+                format!(
+                    "private execution snapshot is missing matched roles: {}",
+                    missing_roles.join(",")
+                )
+            } else if unknown_order_count > 0 {
+                format!(
+                    "private execution snapshot contains {} unknown order(s)",
+                    unknown_order_count
+                )
+            } else if side_match_count < expected_order_count {
+                format!(
+                    "private execution snapshot side_match_count={} expected={}",
+                    side_match_count, expected_order_count
+                )
+            } else if filled_quantity_match_count < expected_order_count {
+                format!(
+                    "private execution snapshot filled_quantity_match_count={} expected={}",
+                    filled_quantity_match_count, expected_order_count
+                )
+            } else if order_identifier_count < expected_order_count {
+                format!(
+                    "private execution snapshot order_identifier_count={} expected={}",
+                    order_identifier_count, expected_order_count
+                )
+            } else {
+                format!(
+                    "private execution snapshot mismatch_count={} matched_order_count={} expected={}",
+                    mismatch_count, matched_order_count, expected_order_count
+                )
+            }
+        }),
+    })
+}
+
+fn funding_private_execution_order_side_matches(role: &str, side: Option<&str>) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    matches!(
+        (role, side.trim().to_ascii_lowercase().as_str()),
+        ("perp_long", "buy" | "long") | ("perp_short", "sell" | "short")
+    )
+}
+
+fn normalize_execution_order_status(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "filled" | "fill" | "full_fill" | "fully_filled" => "filled".to_owned(),
+        "partially_filled" | "partial_fill" | "partial" => "partial".to_owned(),
+        "new" | "open" | "created" | "accepted" | "live" => "open".to_owned(),
+        "canceled" | "cancelled" => "canceled".to_owned(),
+        "rejected" | "reject" => "rejected".to_owned(),
+        "expired" => "expired".to_owned(),
+        _ => "unknown".to_owned(),
+    }
 }
 
 /// 从 funding arb observer 快照中选择一个候选并生成 guarded dry-run 报告。
@@ -14370,12 +17515,73 @@ pub fn run_funding_arb_guarded_dry_run_once(
         })?;
     let spec = funding_arb_pipeline_spec_from_monitor_row(row, &options)?;
     let events = funding_arb_monitor_row_to_normalized_events(&spec, row, observed_at)?;
+    let mut funding_settlement_source = "not_provided";
+    let funding_settlement = match &options.funding_settlement_ledger_path {
+        Some(path) => {
+            funding_settlement_source = "ledger_snapshot";
+            let ledger_json = read_utf8(path)?;
+            reconcile_funding_settlement_ledger_json(row, &spec, &ledger_json)?
+        }
+        None => match &options.funding_settlement_raw_snapshot_path {
+            Some(path) => {
+                funding_settlement_source = "raw_snapshot";
+                let raw_json = read_utf8(path)?;
+                reconcile_funding_settlement_raw_snapshot_json(row, &spec, &raw_json)?
+            }
+            None => FundingSettlementReconciliationSummary::not_provided(),
+        },
+    };
+    let funding_settlement_ingestion = funding_settlement_ingestion_summary(
+        &spec,
+        funding_settlement_source,
+        funding_settlement.snapshot_updated_at.clone(),
+    );
+    let private_accounts = match &options.private_account_snapshot_path {
+        Some(path) => {
+            let account_json = read_utf8(path)?;
+            reconcile_funding_private_account_snapshot_json(&spec, &account_json)?
+        }
+        None => match &options.private_account_raw_snapshot_path {
+            Some(path) => {
+                let account_json = read_utf8(path)?;
+                reconcile_funding_private_account_raw_snapshot_json(&spec, &account_json)?
+            }
+            None => FundingPrivateAccountReconciliationSummary::not_provided(),
+        },
+    };
+    let private_positions = match &options.private_position_snapshot_path {
+        Some(path) => {
+            let snapshot_json = read_utf8(path)?;
+            reconcile_funding_private_position_snapshot_json(row, &spec, &snapshot_json)?
+        }
+        None => match &options.private_position_raw_snapshot_path {
+            Some(path) => {
+                let snapshot_json = read_utf8(path)?;
+                reconcile_funding_private_position_raw_snapshot_json(row, &spec, &snapshot_json)?
+            }
+            None => FundingPrivatePositionReconciliationSummary::not_provided(),
+        },
+    };
+    let private_execution = match &options.private_execution_snapshot_path {
+        Some(path) => {
+            let execution_json = read_utf8(path)?;
+            reconcile_funding_private_execution_snapshot_json(row, &spec, &execution_json)?
+        }
+        None => FundingPrivateExecutionReconciliationSummary::not_provided(),
+    };
     let config = arb_config::ArbConfig::from_path(&options.config_path)?;
-    let report = run_funding_arb_guarded_dry_run_from_normalized_events(
+    let report = run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
         &config,
         &spec,
         events,
         observed_at,
+        FundingArbGuardedDryRunReconciliations {
+            funding_settlement,
+            funding_settlement_ingestion,
+            private_accounts,
+            private_positions,
+            private_execution,
+        },
     )?;
     if let Some(output_dir) = &options.output_dir {
         write_funding_arb_guarded_dry_run_artifacts(
@@ -14400,6 +17606,90 @@ fn validate_funding_arb_guarded_dry_run_once_options(
     if options.snapshot_path.as_os_str().is_empty() {
         return Err(cli_arg_error(
             "funding-arb-guarded-dry-run-once requires --snapshot",
+        ));
+    }
+    if options
+        .funding_settlement_ledger_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once --funding-settlement-ledger cannot be empty",
+        ));
+    }
+    if options
+        .funding_settlement_raw_snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once --funding-settlement-raw-snapshot cannot be empty",
+        ));
+    }
+    if options.funding_settlement_ledger_path.is_some()
+        && options.funding_settlement_raw_snapshot_path.is_some()
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once cannot combine --funding-settlement-ledger and --funding-settlement-raw-snapshot",
+        ));
+    }
+    if options
+        .private_position_snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once --private-position-snapshot cannot be empty",
+        ));
+    }
+    if options
+        .private_position_raw_snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once --private-position-raw-snapshot cannot be empty",
+        ));
+    }
+    if options.private_position_snapshot_path.is_some()
+        && options.private_position_raw_snapshot_path.is_some()
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once cannot combine --private-position-snapshot and --private-position-raw-snapshot",
+        ));
+    }
+    if options
+        .private_account_snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once --private-account-snapshot cannot be empty",
+        ));
+    }
+    if options
+        .private_account_raw_snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once --private-account-raw-snapshot cannot be empty",
+        ));
+    }
+    if options.private_account_snapshot_path.is_some()
+        && options.private_account_raw_snapshot_path.is_some()
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once cannot combine --private-account-snapshot and --private-account-raw-snapshot",
+        ));
+    }
+    if options
+        .private_execution_snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once --private-execution-snapshot cannot be empty",
         ));
     }
     MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
@@ -15433,6 +18723,20 @@ fn build_public_funding_arb_portfolio_state(
     source_event_refs: &[String],
     as_of: UtcTimestamp,
 ) -> RuntimeResult<PortfolioState> {
+    build_public_funding_arb_portfolio_state_with_missing_flags(
+        spec,
+        source_event_refs,
+        as_of,
+        funding_arb_public_missing_data_flags(false, false, false, false, false),
+    )
+}
+
+fn build_public_funding_arb_portfolio_state_with_missing_flags(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    source_event_refs: &[String],
+    as_of: UtcTimestamp,
+    missing_data_flags: Vec<String>,
+) -> RuntimeResult<PortfolioState> {
     let portfolio_json = format!(
         r#"{{
   "schema_version": "1.0.0",
@@ -15445,18 +18749,42 @@ fn build_public_funding_arb_portfolio_state(
   "open_orders": [],
   "pending_transfers": [],
   "confidence": 0.5,
-  "missing_data_flags": [
-    "PRIVATE_BALANCE_UNAVAILABLE",
-    "PRIVATE_MARGIN_UNAVAILABLE"
-  ],
+  "missing_data_flags": {},
   "state_hash": {}
 }}"#,
         json_string(&spec.portfolio_state_id),
         json_string(&as_of.to_string()),
         json_string_array(source_event_refs),
+        json_string_array(&missing_data_flags),
         json_string(&spec.portfolio_state_hash),
     );
     Ok(from_json_strict::<PortfolioState>(&portfolio_json)?)
+}
+
+fn funding_arb_public_missing_data_flags(
+    funding_settlement_reconciled: bool,
+    private_balance_reconciled: bool,
+    private_margin_reconciled: bool,
+    private_positions_reconciled: bool,
+    private_execution_reconciled: bool,
+) -> Vec<String> {
+    let mut flags = Vec::new();
+    if !private_execution_reconciled {
+        flags.push("TWO_LEG_EXECUTION_RECONCILIATION_UNAVAILABLE".to_owned());
+    }
+    if !private_balance_reconciled {
+        flags.push("PRIVATE_BALANCE_UNAVAILABLE".to_owned());
+    }
+    if !private_margin_reconciled {
+        flags.push("PRIVATE_MARGIN_UNAVAILABLE".to_owned());
+    }
+    if !private_positions_reconciled {
+        flags.push("PRIVATE_POSITION_UNAVAILABLE".to_owned());
+    }
+    if !funding_settlement_reconciled {
+        flags.push("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE".to_owned());
+    }
+    flags
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20756,6 +24084,83 @@ fn write_funding_arb_guarded_dry_run_artifacts(
         ),
     )?;
     write_utf8(
+        output_dir.join("funding_arb_live_readiness.json"),
+        &format!(
+            "{}\n",
+            funding_arb_live_readiness_json(&report.live_readiness)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_execution_preflight.json"),
+        &format!(
+            "{}\n",
+            funding_arb_execution_preflight_json(&report.execution_preflight)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_private_execution_reconciliation.json"),
+        &format!(
+            "{}\n",
+            funding_private_execution_reconciliation_json(&report.private_execution)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_venue_execution_capability.json"),
+        &format!(
+            "{}\n",
+            funding_arb_venue_execution_capability_json(&report.venue_execution_capability)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_execution_constraints.json"),
+        &format!(
+            "{}\n",
+            funding_arb_execution_constraints_json(&report.execution_constraints)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_exit_readiness.json"),
+        &format!(
+            "{}\n",
+            funding_arb_exit_readiness_json(&report.exit_readiness)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_snapshot_lineage.json"),
+        &format!(
+            "{}\n",
+            funding_arb_snapshot_lineage_json(&report.snapshot_lineage)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_settlement_reconciliation.json"),
+        &format!(
+            "{}\n",
+            funding_settlement_reconciliation_json(&report.funding_settlement)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_settlement_ingestion.json"),
+        &format!(
+            "{}\n",
+            funding_settlement_ingestion_json(&report.funding_settlement_ingestion)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_private_position_reconciliation.json"),
+        &format!(
+            "{}\n",
+            funding_private_position_reconciliation_json(&report.private_positions)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_private_account_reconciliation.json"),
+        &format!(
+            "{}\n",
+            funding_private_account_reconciliation_json(&report.private_accounts)
+        ),
+    )?;
+    write_utf8(
         output_dir.join("funding_arb_guarded_dry_run_report.md"),
         &funding_arb_guarded_dry_run_report_markdown(row, spec, report),
     )
@@ -21116,22 +24521,233 @@ fn funding_arb_guarded_dry_run_report_json(
     report: &FundingArbGuardedDryRunReport,
 ) -> String {
     format!(
-        "{{\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"expected_funding_usd\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"risk_decision\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"strategy_id\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{}}}",
+        "{{\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_constraints\":{},\"execution_preflight\":{},\"exit_readiness\":{},\"expected_funding_usd\":{},\"funding_settlement\":{},\"funding_settlement_ingestion\":{},\"live_blocking_reasons\":{},\"live_readiness\":{},\"live_ready\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_accounts\":{},\"private_execution\":{},\"private_positions\":{},\"risk_decision\":{},\"risk_reason_codes\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"snapshot_lineage\":{},\"strategy_id\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{},\"venue_execution_capability\":{}}}",
         report.dispatch_attempted,
         report.dispatch_plan_built,
         report.dispatch_request_count,
+        funding_arb_execution_constraints_json(&report.execution_constraints),
+        funding_arb_execution_preflight_json(&report.execution_preflight),
+        funding_arb_exit_readiness_json(&report.exit_readiness),
         json_option_string(&row.expected_funding_usd),
+        funding_settlement_reconciliation_json(&report.funding_settlement),
+        funding_settlement_ingestion_json(&report.funding_settlement_ingestion),
+        json_string_array(&report.live_blocking_reasons),
+        funding_arb_live_readiness_json(&report.live_readiness),
+        report.live_ready,
         report.manual_gate_released,
         report.mutable_execution_started,
         json_option_string(&row.net_funding_bps),
         json_string(&row.pair_id),
+        funding_private_account_reconciliation_json(&report.private_accounts),
+        funding_private_execution_reconciliation_json(&report.private_execution),
+        funding_private_position_reconciliation_json(&report.private_positions),
         json_string(&report.risk_decision),
+        json_string_array(&report.risk_reason_codes),
         report.signal_allowed,
+        funding_arb_snapshot_lineage_json(&report.snapshot_lineage),
         json_string(&spec.strategy_config.instance.strategy_id),
         json_string(&row.symbol),
         json_string(&spec.strategy_config.output.transition_id),
         json_string(&row.venue_a_family),
         json_string(&row.venue_b_family),
+        funding_arb_venue_execution_capability_json(&report.venue_execution_capability),
+    )
+}
+
+fn funding_arb_live_readiness_json(summary: &FundingArbLiveReadinessSummary) -> String {
+    format!(
+        "{{\"blocking_check_count\":{},\"check_count\":{},\"checks\":[{}],\"passed_check_count\":{},\"ready\":{},\"status\":{}}}",
+        summary.blocking_check_count,
+        summary.check_count,
+        summary
+            .checks
+            .iter()
+            .map(funding_arb_live_readiness_check_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        summary.passed_check_count,
+        summary.ready,
+        json_string(&summary.status),
+    )
+}
+
+fn funding_arb_live_readiness_check_json(check: &FundingArbLiveReadinessCheck) -> String {
+    format!(
+        "{{\"blocking\":{},\"check_id\":{},\"detail\":{},\"reason_code\":{},\"status\":{}}}",
+        check.blocking,
+        json_string(&check.check_id),
+        json_option_string(&check.detail),
+        json_option_string(&check.reason_code),
+        json_string(&check.status),
+    )
+}
+
+fn funding_arb_execution_preflight_json(summary: &FundingArbExecutionPreflightSummary) -> String {
+    format!(
+        "{{\"blocking_reasons\":{},\"candidate_perp_long_count\":{},\"candidate_perp_short_count\":{},\"candidate_trade_leg_count\":{},\"dispatch_request_count\":{},\"dispatch_shape_status\":{},\"plan_hash\":{},\"plan_preview_status\":{},\"preview_manual_gate_count\":{},\"preview_place_order_count\":{},\"preview_plan_leg_count\":{},\"private_execution_reconciliation_status\":{},\"status\":{}}}",
+        json_string_array(&summary.blocking_reasons),
+        summary.candidate_perp_long_count,
+        summary.candidate_perp_short_count,
+        summary.candidate_trade_leg_count,
+        summary.dispatch_request_count,
+        json_string(&summary.dispatch_shape_status),
+        json_option_string(&summary.plan_hash),
+        json_string(&summary.plan_preview_status),
+        summary.preview_manual_gate_count,
+        summary.preview_place_order_count,
+        summary.preview_plan_leg_count,
+        json_string(&summary.private_execution_reconciliation_status),
+        json_string(&summary.status),
+    )
+}
+
+fn funding_private_execution_reconciliation_json(
+    summary: &FundingPrivateExecutionReconciliationSummary,
+) -> String {
+    format!(
+        "{{\"checked_order_count\":{},\"expected_order_count\":{},\"fill_count\":{},\"filled_order_count\":{},\"filled_quantity_match_count\":{},\"matched_order_count\":{},\"mismatch_count\":{},\"order_identifier_count\":{},\"plan_hash\":{},\"reason\":{},\"side_match_count\":{},\"snapshot_updated_at\":{},\"status\":{},\"terminal_order_count\":{},\"unknown_order_count\":{}}}",
+        summary.checked_order_count,
+        summary.expected_order_count,
+        summary.fill_count,
+        summary.filled_order_count,
+        summary.filled_quantity_match_count,
+        summary.matched_order_count,
+        summary.mismatch_count,
+        summary.order_identifier_count,
+        json_option_string(&summary.plan_hash),
+        json_option_string(&summary.reason),
+        summary.side_match_count,
+        json_option_string(&summary.snapshot_updated_at),
+        json_string(&summary.status),
+        summary.terminal_order_count,
+        summary.unknown_order_count,
+    )
+}
+
+fn funding_arb_venue_execution_capability_json(
+    summary: &FundingArbVenueExecutionCapabilitySummary,
+) -> String {
+    format!(
+        "{{\"auto_settlement_supported_count\":{},\"checked_venue_count\":{},\"live_execution_supported_count\":{},\"private_confirmation_supported_count\":{},\"reason\":{},\"status\":{},\"unsupported_venues\":{}}}",
+        summary.auto_settlement_supported_count,
+        summary.checked_venue_count,
+        summary.live_execution_supported_count,
+        summary.private_confirmation_supported_count,
+        json_option_string(&summary.reason),
+        json_string(&summary.status),
+        json_string_array(&summary.unsupported_venues),
+    )
+}
+
+fn funding_arb_execution_constraints_json(
+    summary: &FundingArbExecutionConstraintSummary,
+) -> String {
+    format!(
+        "{{\"checked_exchange_rule_count\":{},\"checked_leg_count\":{},\"checked_limit_price_count\":{},\"checked_notional_count\":{},\"checked_quantity_count\":{},\"checked_role_side_count\":{},\"checked_symbol_count\":{},\"reason\":{},\"status\":{}}}",
+        summary.checked_exchange_rule_count,
+        summary.checked_leg_count,
+        summary.checked_limit_price_count,
+        summary.checked_notional_count,
+        summary.checked_quantity_count,
+        summary.checked_role_side_count,
+        summary.checked_symbol_count,
+        json_option_string(&summary.reason),
+        json_string(&summary.status),
+    )
+}
+
+fn funding_settlement_ingestion_json(summary: &FundingSettlementIngestionSummary) -> String {
+    format!(
+        "{{\"auto_supported_venue_count\":{},\"manual_snapshot_required_venue_count\":{},\"reason\":{},\"source\":{},\"source_updated_at\":{},\"status\":{}}}",
+        summary.auto_supported_venue_count,
+        summary.manual_snapshot_required_venue_count,
+        json_option_string(&summary.reason),
+        json_string(&summary.source),
+        json_option_string(&summary.source_updated_at),
+        json_string(&summary.status),
+    )
+}
+
+fn funding_arb_exit_readiness_json(summary: &FundingArbExitReadinessSummary) -> String {
+    format!(
+        "{{\"checked_position_count\":{},\"emergency_derisk_attached\":{},\"liquidation_buffer_bps\":{},\"max_position_imbalance_bps\":{},\"monitoring_interval_secs\":{},\"nonzero_position_count\":{},\"reason\":{},\"reduce_only_exit_required\":{},\"status\":{},\"supervisor_attached\":{}}}",
+        summary.checked_position_count,
+        summary.emergency_derisk_attached,
+        summary
+            .liquidation_buffer_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        summary.max_position_imbalance_bps,
+        summary
+            .monitoring_interval_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        summary.nonzero_position_count,
+        json_option_string(&summary.reason),
+        summary.reduce_only_exit_required,
+        json_string(&summary.status),
+        summary.supervisor_attached,
+    )
+}
+
+fn funding_arb_snapshot_lineage_json(summary: &FundingArbSnapshotLineageSummary) -> String {
+    format!(
+        "{{\"checked_timestamp_count\":{},\"funding_settlement_updated_at\":{},\"invalid_updated_at_count\":{},\"max_private_snapshot_age_ms\":{},\"missing_updated_at_count\":{},\"observer_updated_at\":{},\"private_account_updated_at\":{},\"private_execution_updated_at\":{},\"private_position_updated_at\":{},\"reason\":{},\"stale_private_snapshot_count\":{},\"status\":{}}}",
+        summary.checked_timestamp_count,
+        json_option_string(&summary.funding_settlement_updated_at),
+        summary.invalid_updated_at_count,
+        summary.max_private_snapshot_age_ms,
+        summary.missing_updated_at_count,
+        json_string(&summary.observer_updated_at),
+        json_option_string(&summary.private_account_updated_at),
+        json_option_string(&summary.private_execution_updated_at),
+        json_option_string(&summary.private_position_updated_at),
+        json_option_string(&summary.reason),
+        summary.stale_private_snapshot_count,
+        json_string(&summary.status),
+    )
+}
+
+fn funding_settlement_reconciliation_json(
+    summary: &FundingSettlementReconciliationSummary,
+) -> String {
+    format!(
+        "{{\"actual_funding_usd\":{},\"checked_entry_count\":{},\"difference_usd\":{},\"expected_funding_usd\":{},\"reason\":{},\"snapshot_updated_at\":{},\"status\":{}}}",
+        json_option_string(&summary.actual_funding_usd),
+        summary.checked_entry_count,
+        json_option_string(&summary.difference_usd),
+        json_option_string(&summary.expected_funding_usd),
+        json_option_string(&summary.reason),
+        json_option_string(&summary.snapshot_updated_at),
+        json_string(&summary.status),
+    )
+}
+
+fn funding_private_account_reconciliation_json(
+    summary: &FundingPrivateAccountReconciliationSummary,
+) -> String {
+    format!(
+        "{{\"checked_account_count\":{},\"min_available_usd\":{},\"min_margin_buffer_usd\":{},\"min_required_available_usd\":{},\"reason\":{},\"snapshot_updated_at\":{},\"status\":{}}}",
+        summary.checked_account_count,
+        json_option_string(&summary.min_available_usd),
+        json_option_string(&summary.min_margin_buffer_usd),
+        json_option_string(&summary.min_required_available_usd),
+        json_option_string(&summary.reason),
+        json_option_string(&summary.snapshot_updated_at),
+        json_string(&summary.status),
+    )
+}
+
+fn funding_private_position_reconciliation_json(
+    summary: &FundingPrivatePositionReconciliationSummary,
+) -> String {
+    format!(
+        "{{\"checked_position_count\":{},\"nonzero_position_count\":{},\"reason\":{},\"snapshot_updated_at\":{},\"status\":{}}}",
+        summary.checked_position_count,
+        summary.nonzero_position_count,
+        json_option_string(&summary.reason),
+        json_option_string(&summary.snapshot_updated_at),
+        json_string(&summary.status),
     )
 }
 
@@ -21140,8 +24756,17 @@ fn funding_arb_guarded_dry_run_report_markdown(
     spec: &CrossExchangeFundingArbPipelineSpec,
     report: &FundingArbGuardedDryRunReport,
 ) -> String {
+    let live_blocking_reasons = if report.live_blocking_reasons.is_empty() {
+        "- none\n".to_owned()
+    } else {
+        report
+            .live_blocking_reasons
+            .iter()
+            .map(|reason| format!("- {reason}\n"))
+            .collect::<String>()
+    };
     format!(
-        "# Funding Arb Guarded Dry-run\n\n中文说明：本报告由 funding arb observer 候选生成，只验证公开信号、人工门禁预览和分发前计划构建，不真实下单、不撤单、不转账、不签名。\n\n- strategy_id: `{}`\n- transition_id: `{}`\n- pair_id: `{}`\n- symbol: `{}`\n- venues: `{}` / `{}`\n- signal_allowed: `{}`\n- risk_decision: `{}`\n- manual_gate_released: `{}`\n- dispatch_plan_built: `{}`\n- dispatch_request_count: `{}`\n- dispatch_attempted: `{}`\n- mutable_execution_started: `{}`\n",
+        "# Funding Arb Guarded Dry-run\n\n中文说明：本报告由 funding arb observer 候选生成，只验证公开信号和风险门禁，不真实下单、不撤单、不转账、不签名；`live_ready=false` 时不得把候选转换为真实订单。\n\n- strategy_id: `{}`\n- transition_id: `{}`\n- pair_id: `{}`\n- symbol: `{}`\n- venues: `{}` / `{}`\n- signal_allowed: `{}`\n- risk_decision: `{}`\n- risk_reason_codes: `{}`\n- funding_settlement_status: `{}`\n- funding_settlement_expected_usd: `{}`\n- funding_settlement_actual_usd: `{}`\n- funding_settlement_difference_usd: `{}`\n- funding_settlement_ingestion_status: `{}`\n- funding_settlement_ingestion_source: `{}`\n- private_account_status: `{}`\n- private_account_checked_count: `{}`\n- private_account_min_required_usd: `{}`\n- private_account_min_available_usd: `{}`\n- private_account_min_margin_buffer_usd: `{}`\n- private_position_status: `{}`\n- private_position_checked_count: `{}`\n- private_position_nonzero_count: `{}`\n- private_execution_status: `{}`\n- private_execution_checked_orders: `{}`\n- snapshot_lineage_status: `{}`\n- snapshot_lineage_checked_timestamps: `{}`\n- snapshot_lineage_stale_private_snapshots: `{}`\n- venue_execution_capability_status: `{}`\n- execution_constraints_status: `{}`\n- exit_readiness_status: `{}`\n- execution_preflight_status: `{}`\n- execution_preflight_plan_preview_status: `{}`\n- execution_preflight_dispatch_shape_status: `{}`\n- execution_preflight_private_reconciliation_status: `{}`\n- live_readiness_status: `{}`\n- live_readiness_checks: `{}`\n- live_readiness_blocking_checks: `{}`\n- manual_gate_released: `{}`\n- dispatch_plan_built: `{}`\n- dispatch_request_count: `{}`\n- live_ready: `{}`\n- dispatch_attempted: `{}`\n- mutable_execution_started: `{}`\n\n## Live blocking reasons\n\n{}",
         spec.strategy_config.instance.strategy_id,
         spec.strategy_config.output.transition_id,
         row.pair_id,
@@ -21150,11 +24775,70 @@ fn funding_arb_guarded_dry_run_report_markdown(
         row.venue_b_family,
         report.signal_allowed,
         report.risk_decision,
+        report.risk_reason_codes.join(","),
+        report.funding_settlement.status.as_str(),
+        report
+            .funding_settlement
+            .expected_funding_usd
+            .as_deref()
+            .unwrap_or("missing"),
+        report
+            .funding_settlement
+            .actual_funding_usd
+            .as_deref()
+            .unwrap_or("missing"),
+        report
+            .funding_settlement
+            .difference_usd
+            .as_deref()
+            .unwrap_or("missing"),
+        report.funding_settlement_ingestion.status.as_str(),
+        report.funding_settlement_ingestion.source.as_str(),
+        report.private_accounts.status.as_str(),
+        report.private_accounts.checked_account_count,
+        report
+            .private_accounts
+            .min_required_available_usd
+            .as_deref()
+            .unwrap_or("missing"),
+        report
+            .private_accounts
+            .min_available_usd
+            .as_deref()
+            .unwrap_or("missing"),
+        report
+            .private_accounts
+            .min_margin_buffer_usd
+            .as_deref()
+            .unwrap_or("missing"),
+        report.private_positions.status.as_str(),
+        report.private_positions.checked_position_count,
+        report.private_positions.nonzero_position_count,
+        report.private_execution.status.as_str(),
+        report.private_execution.checked_order_count,
+        report.snapshot_lineage.status.as_str(),
+        report.snapshot_lineage.checked_timestamp_count,
+        report.snapshot_lineage.stale_private_snapshot_count,
+        report.venue_execution_capability.status.as_str(),
+        report.execution_constraints.status.as_str(),
+        report.exit_readiness.status.as_str(),
+        report.execution_preflight.status.as_str(),
+        report.execution_preflight.plan_preview_status.as_str(),
+        report.execution_preflight.dispatch_shape_status.as_str(),
+        report
+            .execution_preflight
+            .private_execution_reconciliation_status
+            .as_str(),
+        report.live_readiness.status.as_str(),
+        report.live_readiness.check_count,
+        report.live_readiness.blocking_check_count,
         report.manual_gate_released,
         report.dispatch_plan_built,
         report.dispatch_request_count,
+        report.live_ready,
         report.dispatch_attempted,
         report.mutable_execution_started,
+        live_blocking_reasons,
     )
 }
 
@@ -23910,12 +27594,27 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
                 "; no artifacts written, pass --out <dir> to persist them".to_owned()
             });
         return Ok(format!(
-            "ok: funding arb guarded dry-run completed; pair_id={pair_id}; signal_allowed={}; risk_decision={}; manual_gate_released={}; dispatch_plan_built={}; dispatch_requests={}; dispatch_attempted={}; mutable_execution_started=false{}",
+            "ok: funding arb guarded dry-run completed; pair_id={pair_id}; signal_allowed={}; risk_decision={}; funding_settlement_status={}; funding_settlement_ingestion_status={}; private_account_status={}; private_position_status={}; private_execution_status={}; snapshot_lineage_status={}; venue_execution_capability_status={}; execution_constraints_status={}; exit_readiness_status={}; execution_preflight_status={}; execution_preflight_plan_preview_status={}; live_readiness_status={}; live_readiness_blocking_checks={}; manual_gate_released={}; dispatch_plan_built={}; dispatch_requests={}; live_ready={}; live_blocking_reasons={}; dispatch_attempted={}; mutable_execution_started=false{}",
             report.signal_allowed,
             report.risk_decision,
+            report.funding_settlement.status.as_str(),
+            report.funding_settlement_ingestion.status.as_str(),
+            report.private_accounts.status.as_str(),
+            report.private_positions.status.as_str(),
+            report.private_execution.status.as_str(),
+            report.snapshot_lineage.status.as_str(),
+            report.venue_execution_capability.status.as_str(),
+            report.execution_constraints.status.as_str(),
+            report.exit_readiness.status.as_str(),
+            report.execution_preflight.status.as_str(),
+            report.execution_preflight.plan_preview_status.as_str(),
+            report.live_readiness.status.as_str(),
+            report.live_readiness.blocking_check_count,
             report.manual_gate_released,
             report.dispatch_plan_built,
             report.dispatch_request_count,
+            report.live_ready,
+            report.live_blocking_reasons.len(),
             report.dispatch_attempted,
             output_note
         ));
@@ -24044,7 +27743,7 @@ fn help_text() -> String {
         "                                    Monitor all Aster public USDT spot/perp basis rows and serve /api/aster-basis/status",
         "  funding-arb-monitor [--bind 127.0.0.1:8804] [--interval-secs 5] [--clear-sources --source venue=url] [--min-net-funding-bps 5] [--once] [--out dir]",
         "                                    Aggregate local basis monitor status snapshots into cross-exchange funding arb opportunities",
-        "  funding-arb-guarded-dry-run-once --snapshot file --pair-id id [--config file] [--out dir] [--min-net-funding-bps 5]",
+        "  funding-arb-guarded-dry-run-once --snapshot file --pair-id id [--config file] [--funding-settlement-raw-snapshot file] [--private-account-snapshot file | --private-account-raw-snapshot file] [--private-position-snapshot file | --private-position-raw-snapshot file] [--private-execution-snapshot file] [--out dir] [--min-net-funding-bps 5]",
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
     ]
     .join("\n")
@@ -25881,6 +29580,13 @@ fn parse_funding_arb_guarded_dry_run_once_args(
     let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
     let mut snapshot_path = None;
     let mut pair_id = None;
+    let mut funding_settlement_ledger_path = None;
+    let mut funding_settlement_raw_snapshot_path = None;
+    let mut private_account_snapshot_path = None;
+    let mut private_account_raw_snapshot_path = None;
+    let mut private_position_snapshot_path = None;
+    let mut private_position_raw_snapshot_path = None;
+    let mut private_execution_snapshot_path = None;
     let mut output_dir = None;
     let mut notional_usd = BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned();
     let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS;
@@ -25911,6 +29617,69 @@ fn parse_funding_arb_guarded_dry_run_once_args(
                     return Err(cli_arg_error("--pair-id requires a value"));
                 };
                 pair_id = Some(value.clone());
+            }
+            "--funding-settlement-ledger" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--funding-settlement-ledger requires a file path",
+                    ));
+                };
+                funding_settlement_ledger_path = Some(PathBuf::from(value));
+            }
+            "--funding-settlement-raw-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--funding-settlement-raw-snapshot requires a file path",
+                    ));
+                };
+                funding_settlement_raw_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--private-account-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-account-snapshot requires a file path",
+                    ));
+                };
+                private_account_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--private-account-raw-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-account-raw-snapshot requires a file path",
+                    ));
+                };
+                private_account_raw_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--private-position-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-position-snapshot requires a file path",
+                    ));
+                };
+                private_position_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--private-position-raw-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-position-raw-snapshot requires a file path",
+                    ));
+                };
+                private_position_raw_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--private-execution-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-execution-snapshot requires a file path",
+                    ));
+                };
+                private_execution_snapshot_path = Some(PathBuf::from(value));
             }
             "--out" => {
                 index += 1;
@@ -25983,6 +29752,13 @@ fn parse_funding_arb_guarded_dry_run_once_args(
         config_path,
         snapshot_path: snapshot_path.ok_or_else(|| cli_arg_error("--snapshot is required"))?,
         pair_id: pair_id.ok_or_else(|| cli_arg_error("--pair-id is required"))?,
+        funding_settlement_ledger_path,
+        funding_settlement_raw_snapshot_path,
+        private_account_snapshot_path,
+        private_account_raw_snapshot_path,
+        private_position_snapshot_path,
+        private_position_raw_snapshot_path,
+        private_execution_snapshot_path,
         output_dir,
         notional_usd,
         taker_fee_bps,
@@ -27448,6 +31224,13 @@ mod tests {
             config_path,
             snapshot_path,
             pair_id: pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
             taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
@@ -27458,13 +31241,690 @@ mod tests {
         .expect("funding arb dry-run once report");
 
         assert!(report.signal_allowed);
-        assert!(report.dispatch_plan_built);
+        assert_eq!(report.risk_decision, "Rejected");
+        assert_eq!(report.funding_settlement.status, "NotProvided");
+        assert_eq!(report.funding_settlement_ingestion.status, "Missing");
+        assert_eq!(report.private_execution.status, "NotProvided");
+        assert_eq!(report.venue_execution_capability.status, "Matched");
+        assert_eq!(report.execution_constraints.status, "Matched");
+        assert_eq!(report.exit_readiness.status, "Blocked");
+        assert_eq!(report.snapshot_lineage.status, "Matched");
+        assert!(!report.manual_gate_released);
+        assert!(!report.dispatch_plan_built);
         assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.live_ready);
+        assert_eq!(report.live_readiness.status, "Blocked");
+        assert!(!report.live_readiness.ready);
+        assert!(report.live_readiness.blocking_check_count > 0);
+        assert_eq!(report.execution_preflight.status, "Blocked");
+        assert_eq!(report.execution_preflight.dispatch_shape_status, "Matched");
+        assert_eq!(report.execution_preflight.dispatch_request_count, 2);
+        assert_eq!(
+            report.execution_preflight.plan_preview_status,
+            "NotAttempted"
+        );
+        assert!(report
+            .live_readiness
+            .checks
+            .iter()
+            .any(|check| check.check_id == "risk_decision" && check.blocking));
+        assert!(report.live_readiness.checks.iter().any(|check| {
+            check.check_id == "funding_arb_live_runner"
+                && check.reason_code.as_deref() == Some("FUNDING_ARB_LIVE_RUNNER_NOT_ATTACHED")
+        }));
+        assert!(report.live_readiness.checks.iter().any(|check| {
+            check.check_id == "funding_arb_exit_supervisor"
+                && check.reason_code.as_deref() == Some("FUNDING_ARB_EXIT_SUPERVISOR_NOT_READY")
+        }));
+        assert!(report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE")));
         assert!(!report.dispatch_attempted);
         let report_json = read_utf8(&output_dir.join("funding_arb_guarded_dry_run_report.json"))
             .expect("report json");
         assert!(report_json.contains(&pair_id));
+        assert!(report_json.contains("\"funding_settlement_ingestion\""));
+        assert!(report_json.contains("\"private_execution\""));
+        assert!(report_json.contains("\"venue_execution_capability\""));
+        assert!(report_json.contains("\"execution_constraints\""));
+        assert!(report_json.contains("\"exit_readiness\""));
+        assert!(report_json.contains("\"snapshot_lineage\""));
+        assert!(report_json.contains("\"live_readiness\""));
+        assert!(report_json.contains("\"execution_preflight\""));
+        assert!(report_json.contains("\"status\":\"NotProvided\""));
+        assert!(report_json.contains("\"live_ready\":false"));
         assert!(report_json.contains("\"mutable_execution_started\":false"));
+        let readiness_json = read_utf8(&output_dir.join("funding_arb_live_readiness.json"))
+            .expect("live readiness json");
+        assert!(readiness_json.contains("\"status\":\"Blocked\""));
+        assert!(readiness_json.contains("\"check_id\":\"risk_decision\""));
+        assert!(readiness_json.contains("\"check_id\":\"candidate_two_leg_dispatch_shape\""));
+        let preflight_json = read_utf8(&output_dir.join("funding_arb_execution_preflight.json"))
+            .expect("execution preflight json");
+        assert!(preflight_json.contains("\"dispatch_shape_status\":\"Matched\""));
+        assert!(output_dir
+            .join("funding_arb_private_execution_reconciliation.json")
+            .exists());
+        assert!(output_dir
+            .join("funding_arb_venue_execution_capability.json")
+            .exists());
+        assert!(output_dir
+            .join("funding_arb_execution_constraints.json")
+            .exists());
+        assert!(output_dir.join("funding_arb_exit_readiness.json").exists());
+        assert!(output_dir
+            .join("funding_arb_snapshot_lineage.json")
+            .exists());
+        assert!(output_dir
+            .join("funding_arb_settlement_ingestion.json")
+            .exists());
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_reconciles_funding_settlement_ledger() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let settlement_path = root.path().join("funding-settlements.json");
+        write_utf8(
+            settlement_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","entries":[{"venue_family":"binance","symbol":"BTCUSDT","account_id":"acct:binance-funding-arb-readonly","amount_usd":"-0.01"},{"venue_family":"bybit","symbol":"BTCUSDT","account_id":"acct:bybit-funding-arb-readonly","amount_usd":"0.30"}]}"#,
+        )
+        .expect("write settlement ledger");
+        let output_dir = root.path().join("funding-dry-run");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: Some(settlement_path),
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: Some(output_dir.clone()),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.risk_decision, "Rejected");
+        assert_eq!(report.funding_settlement.status, "Matched");
+        assert_eq!(
+            report.funding_settlement.expected_funding_usd.as_deref(),
+            Some("0.29")
+        );
+        assert_eq!(
+            report.funding_settlement.actual_funding_usd.as_deref(),
+            Some("0.29")
+        );
+        assert!(!report.live_ready);
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE")));
+        assert!(report.live_blocking_reasons.iter().any(|reason| reason
+            .contains("private execution fill/order reconciliation snapshot was not provided")));
+        let settlement_json =
+            read_utf8(&output_dir.join("funding_arb_settlement_reconciliation.json"))
+                .expect("settlement reconciliation json");
+        assert!(settlement_json.contains("\"status\":\"Matched\""));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_normalizes_raw_funding_settlements() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let raw_settlement_path = root.path().join("funding-raw-settlements.json");
+        write_utf8(
+            raw_settlement_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01"}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30"}]}}}]}"#,
+        )
+        .expect("write raw settlement snapshot");
+        let output_dir = root.path().join("funding-dry-run");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: Some(raw_settlement_path),
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: Some(output_dir.clone()),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.risk_decision, "Rejected");
+        assert_eq!(report.funding_settlement.status, "Matched");
+        assert_eq!(
+            report.funding_settlement.actual_funding_usd.as_deref(),
+            Some("0.29")
+        );
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE")));
+        let settlement_json =
+            read_utf8(&output_dir.join("funding_arb_settlement_reconciliation.json"))
+                .expect("settlement reconciliation json");
+        assert!(settlement_json.contains("\"status\":\"Matched\""));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_reconciles_private_accounts() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_accounts_path = root.path().join("funding-private-accounts.json");
+        write_utf8(
+            private_accounts_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","accounts":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","available_usd":"25","margin_balance_usd":"25","maintenance_margin_usd":"1"},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","available_usd":"30","margin_balance_usd":"30","maintenance_margin_usd":"2"}]}"#,
+        )
+        .expect("write private accounts");
+        let output_dir = root.path().join("funding-dry-run");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: Some(private_accounts_path),
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: Some(output_dir.clone()),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.risk_decision, "Rejected");
+        assert_eq!(report.private_accounts.status, "Matched");
+        assert_eq!(report.private_accounts.checked_account_count, 2);
+        assert_eq!(
+            report
+                .private_accounts
+                .min_required_available_usd
+                .as_deref(),
+            Some("10")
+        );
+        assert!(!report.live_ready);
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_BALANCE_UNAVAILABLE")));
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_MARGIN_UNAVAILABLE")));
+        assert!(report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_POSITION_UNAVAILABLE")));
+        let private_json =
+            read_utf8(&output_dir.join("funding_arb_private_account_reconciliation.json"))
+                .expect("private account reconciliation json");
+        assert!(private_json.contains("\"status\":\"Matched\""));
+        let report_json = read_utf8(&output_dir.join("funding_arb_guarded_dry_run_report.json"))
+            .expect("report json");
+        assert!(report_json.contains("\"private_accounts\""));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_reconciles_private_flat_positions() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_positions_path = root.path().join("funding-private-positions.json");
+        write_utf8(
+            private_positions_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","positions":[{"venue_family":"binance","symbol":"BTCUSDT","account_id":"acct:binance-funding-arb-readonly","quantity":"0"},{"venue_family":"bybit","symbol":"BTCUSDT","account_id":"acct:bybit-funding-arb-readonly","quantity":"0"}]}"#,
+        )
+        .expect("write private positions");
+        let output_dir = root.path().join("funding-dry-run");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: Some(private_positions_path),
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: Some(output_dir.clone()),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.risk_decision, "Rejected");
+        assert_eq!(report.private_positions.status, "Matched");
+        assert_eq!(report.private_positions.checked_position_count, 2);
+        assert_eq!(report.private_positions.nonzero_position_count, 0);
+        assert!(!report.live_ready);
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_POSITION_UNAVAILABLE")));
+        assert!(report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE")));
+        let private_json =
+            read_utf8(&output_dir.join("funding_arb_private_position_reconciliation.json"))
+                .expect("private position reconciliation json");
+        assert!(private_json.contains("\"status\":\"Matched\""));
+        let report_json = read_utf8(&output_dir.join("funding_arb_guarded_dry_run_report.json"))
+            .expect("report json");
+        assert!(report_json.contains("\"private_positions\""));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_reconciles_private_execution_orders() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_execution_path = root.path().join("funding-private-execution.json");
+        write_utf8(
+            private_execution_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:02Z","plan_hash":"hash:funding-arb-private-execution-test","orders":[{"venue_family":"binance","symbol":"BTCUSDT","account_id":"acct:binance-funding-arb-readonly","basis_leg_role":"perp_long","side":"buy","client_order_id":"client-binance-long","venue_order_id":"venue-binance-long","order_status":"FILLED","filled_quantity":"0.001","fill_count":1},{"venue_family":"bybit","symbol":"BTCUSDT","account_id":"acct:bybit-funding-arb-readonly","basis_leg_role":"perp_short","side":"sell","client_order_id":"client-bybit-short","venue_order_id":"venue-bybit-short","order_status":"FILLED","filled_quantity":"0.001","fill_count":1}]}"#,
+        )
+        .expect("write private execution snapshot");
+        let output_dir = root.path().join("funding-dry-run");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: Some(private_execution_path),
+            output_dir: Some(output_dir.clone()),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.private_execution.status, "Matched");
+        assert_eq!(report.private_execution.checked_order_count, 2);
+        assert_eq!(report.private_execution.matched_order_count, 2);
+        assert_eq!(report.private_execution.side_match_count, 2);
+        assert_eq!(report.private_execution.filled_quantity_match_count, 2);
+        assert_eq!(report.private_execution.order_identifier_count, 2);
+        assert_eq!(report.private_execution.terminal_order_count, 2);
+        assert_eq!(report.private_execution.filled_order_count, 2);
+        assert_eq!(report.private_execution.fill_count, 2);
+        assert_eq!(report.snapshot_lineage.status, "Matched");
+        assert_eq!(
+            report
+                .execution_preflight
+                .private_execution_reconciliation_status,
+            "Matched"
+        );
+        assert!(!report.live_blocking_reasons.iter().any(|reason| reason
+            .contains("private execution fill/order reconciliation snapshot was not provided")));
+        let private_execution_json =
+            read_utf8(&output_dir.join("funding_arb_private_execution_reconciliation.json"))
+                .expect("private execution reconciliation json");
+        assert!(private_execution_json.contains("\"status\":\"Matched\""));
+        assert!(private_execution_json.contains("\"checked_order_count\":2"));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_blocks_stale_private_snapshot_lineage() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_accounts_path = root.path().join("funding-private-accounts-stale.json");
+        write_utf8(
+            private_accounts_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-12T23:58:00Z","accounts":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","available_usd":"25","margin_balance_usd":"25","maintenance_margin_usd":"1"},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","available_usd":"30","margin_balance_usd":"30","maintenance_margin_usd":"2"}]}"#,
+        )
+        .expect("write stale private accounts");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: Some(private_accounts_path),
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert_eq!(report.private_accounts.status, "Matched");
+        assert_eq!(report.snapshot_lineage.status, "Blocked");
+        assert_eq!(report.snapshot_lineage.stale_private_snapshot_count, 1);
+        assert!(report.live_readiness.checks.iter().any(|check| {
+            check.check_id == "snapshot_lineage_freshness"
+                && check.reason_code.as_deref() == Some("SNAPSHOT_LINEAGE_NOT_MATCHED")
+        }));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_rejects_execution_snapshot_without_side_binding() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_execution_path = root.path().join("funding-private-execution-no-side.json");
+        write_utf8(
+            private_execution_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:02Z","plan_hash":"hash:funding-arb-private-execution-test","orders":[{"venue_family":"binance","symbol":"BTCUSDT","account_id":"acct:binance-funding-arb-readonly","basis_leg_role":"perp_long","client_order_id":"client-binance-long","venue_order_id":"venue-binance-long","order_status":"FILLED","filled_quantity":"0.001","fill_count":1},{"venue_family":"bybit","symbol":"BTCUSDT","account_id":"acct:bybit-funding-arb-readonly","basis_leg_role":"perp_short","client_order_id":"client-bybit-short","venue_order_id":"venue-bybit-short","order_status":"FILLED","filled_quantity":"0.001","fill_count":1}]}"#,
+        )
+        .expect("write private execution snapshot");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: Some(private_execution_path),
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert_eq!(report.private_execution.status, "Mismatch");
+        assert_eq!(report.private_execution.checked_order_count, 2);
+        assert_eq!(report.private_execution.side_match_count, 0);
+        assert!(report
+            .private_execution
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("missing matched roles")));
+        assert!(report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("private execution snapshot is missing matched roles")));
+    }
+
+    #[test]
+    fn funding_arb_execution_preflight_blocks_private_execution_plan_hash_mismatch() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let events = funding_arb_test_events();
+        let temp_dir = RuntimeTempDir::new().expect("temp dir");
+        let event_store = JsonlEventStore::open(temp_dir.path().join("events.jsonl"));
+        for event in &events {
+            event_store.append(event).expect("append event");
+        }
+        let stored_events = event_store.read_all_ordered().expect("stored events");
+        let source_event_refs = events
+            .iter()
+            .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
+            .map(|event| event.event_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let portfolio_state = build_public_funding_arb_portfolio_state_with_missing_flags(
+            &spec,
+            &source_event_refs,
+            ingested_at,
+            Vec::new(),
+        )
+        .expect("portfolio state");
+        let evaluation = run_cross_exchange_funding_arb_strategy(
+            replay.config(),
+            &stored_events,
+            &portfolio_state,
+            &ingested_at.to_string(),
+            &spec,
+        )
+        .expect("funding arb strategy evaluation");
+        let candidate = evaluation.candidate().expect("candidate");
+        let mut decision = run_risk(
+            candidate,
+            &portfolio_state,
+            replay.config(),
+            &spec.venue_capabilities,
+            ingested_at,
+        )
+        .expect("risk decision");
+        decision.decision = arb_contracts::RiskDecisionKind::RequiresManualApproval;
+        let private_execution = FundingPrivateExecutionReconciliationSummary {
+            status: "Matched".to_owned(),
+            snapshot_updated_at: Some("2026-05-13T00:00:02Z".to_owned()),
+            plan_hash: Some("hash:stale-private-execution".to_owned()),
+            expected_order_count: 2,
+            checked_order_count: 2,
+            matched_order_count: 2,
+            side_match_count: 2,
+            filled_quantity_match_count: 2,
+            order_identifier_count: 2,
+            terminal_order_count: 2,
+            filled_order_count: 2,
+            fill_count: 2,
+            unknown_order_count: 0,
+            mismatch_count: 0,
+            reason: None,
+        };
+
+        let preflight = funding_arb_execution_preflight(
+            candidate,
+            Some(&decision),
+            ingested_at,
+            &private_execution,
+        )
+        .expect("execution preflight");
+
+        assert_eq!(preflight.plan_preview_status, "Built");
+        assert_eq!(
+            preflight.private_execution_reconciliation_status,
+            "Mismatch"
+        );
+        assert!(preflight
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("does not match current plan_hash")));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_normalizes_aster_hyperliquid_private_raw_snapshots() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let mut row = funding_arb_test_row("0.00010000", "0.00400000");
+        row.pair_id = "aster:hyperliquid:BTCUSDT:BTCUSDT".to_owned();
+        row.venue_a_family = "aster".to_owned();
+        row.venue_b_family = "hyperliquid".to_owned();
+        row.long_venue_family = Some("aster".to_owned());
+        row.short_venue_family = Some("hyperliquid".to_owned());
+        row.venue_b_funding_interval_hours = "1".to_owned();
+        row.funding_interval_hours = "1".to_owned();
+        row.gross_funding_spread_bps = Some("24".to_owned());
+        row.net_funding_bps = Some("14".to_owned());
+        row.expected_funding_usd = Some("0.24".to_owned());
+        let pair_id = row.pair_id.clone();
+        let snapshot = funding_arb_test_snapshot(vec![row], "2026-05-13T00:00:00Z".to_owned());
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_accounts_path = root.path().join("funding-private-accounts-raw.json");
+        write_utf8(
+            private_accounts_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","statements":[{"venue_family":"aster","account_id":"acct:aster-funding-arb-readonly","payload":[{"asset":"USDT","balance":"50.00","availableBalance":"40.00","marginAvailable":true}]},{"venue_family":"hyperliquid","account_id":"acct:hyperliquid-funding-arb-readonly","payload":{"marginSummary":{"accountValue":"60.00","totalRawUsd":"60.00","totalMarginUsed":"5.00"},"crossMaintenanceMarginUsed":"2.00","withdrawable":"35.00","assetPositions":[]}}]}"#,
+        )
+        .expect("write raw private accounts");
+        let private_positions_path = root.path().join("funding-private-positions-raw.json");
+        write_utf8(
+            private_positions_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","statements":[{"venue_family":"aster","account_id":"acct:aster-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0","entryPrice":"0","markPrice":"100.00","unRealizedProfit":"0","liquidationPrice":"0"}]},{"venue_family":"hyperliquid","account_id":"acct:hyperliquid-funding-arb-readonly","payload":{"marginSummary":{"accountValue":"60.00"},"withdrawable":"35.00","assetPositions":[]}}]}"#,
+        )
+        .expect("write raw private positions");
+        let output_dir = root.path().join("funding-dry-run");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: Some(private_accounts_path),
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: Some(private_positions_path),
+            private_execution_snapshot_path: None,
+            output_dir: Some(output_dir.clone()),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.private_accounts.status, "Matched");
+        assert_eq!(report.private_accounts.checked_account_count, 2);
+        assert_eq!(report.private_positions.status, "Matched");
+        assert_eq!(report.private_positions.checked_position_count, 2);
+        assert_eq!(report.private_positions.nonzero_position_count, 0);
+        assert_eq!(report.venue_execution_capability.status, "Blocked");
+        assert!(report
+            .venue_execution_capability
+            .unsupported_venues
+            .iter()
+            .any(|venue| venue.contains("aster")));
+        assert!(report
+            .venue_execution_capability
+            .unsupported_venues
+            .iter()
+            .any(|venue| venue.contains("hyperliquid")));
+        assert!(report.live_readiness.checks.iter().any(|check| {
+            check.check_id == "venue_live_execution_capability"
+                && check.reason_code.as_deref()
+                    == Some("VENUE_LIVE_EXECUTION_CAPABILITY_NOT_ATTACHED")
+        }));
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_BALANCE_UNAVAILABLE")));
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_MARGIN_UNAVAILABLE")));
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_POSITION_UNAVAILABLE")));
+        assert!(!report.live_blocking_reasons.iter().any(|reason| {
+            reason.contains("Aster private account runtime reconciliation")
+                || reason.contains("Hyperliquid private account runtime reconciliation")
+        }));
+        let private_account_json =
+            read_utf8(&output_dir.join("funding_arb_private_account_reconciliation.json"))
+                .expect("private account reconciliation json");
+        assert!(private_account_json.contains("\"status\":\"Matched\""));
+        let private_position_json =
+            read_utf8(&output_dir.join("funding_arb_private_position_reconciliation.json"))
+                .expect("private position reconciliation json");
+        assert!(private_position_json.contains("\"status\":\"Matched\""));
     }
 
     #[test]
@@ -27476,6 +31936,12 @@ mod tests {
             "binance:bybit:BTCUSDT:BTCUSDT".to_owned(),
             "--config".to_owned(),
             "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--funding-settlement-raw-snapshot".to_owned(),
+            "target/funding-raw-settlements.json".to_owned(),
+            "--private-account-snapshot".to_owned(),
+            "target/funding-private-accounts.json".to_owned(),
+            "--private-position-snapshot".to_owned(),
+            "target/funding-private-positions.json".to_owned(),
             "--out".to_owned(),
             "target/funding-dry-run".to_owned(),
             "--min-net-funding-bps".to_owned(),
@@ -27490,10 +31956,58 @@ mod tests {
             PathBuf::from("target/funding-opportunities.json")
         );
         assert_eq!(options.pair_id, "binance:bybit:BTCUSDT:BTCUSDT");
+        assert_eq!(options.funding_settlement_ledger_path, None);
+        assert_eq!(
+            options.funding_settlement_raw_snapshot_path,
+            Some(PathBuf::from("target/funding-raw-settlements.json"))
+        );
+        assert_eq!(
+            options.private_account_snapshot_path,
+            Some(PathBuf::from("target/funding-private-accounts.json"))
+        );
+        assert_eq!(options.private_account_raw_snapshot_path, None);
+        assert_eq!(
+            options.private_position_snapshot_path,
+            Some(PathBuf::from("target/funding-private-positions.json"))
+        );
+        assert_eq!(options.private_position_raw_snapshot_path, None);
         assert_eq!(options.min_net_funding_bps, 9);
         assert_eq!(
             options.output_dir,
             Some(PathBuf::from("target/funding-dry-run"))
+        );
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_args_parse_private_raw_snapshots() {
+        let args = vec![
+            "--snapshot".to_owned(),
+            "target/funding-opportunities.json".to_owned(),
+            "--pair-id".to_owned(),
+            "aster:hyperliquid:BTCUSDT:BTCUSDT".to_owned(),
+            "--private-account-raw-snapshot".to_owned(),
+            "target/funding-private-accounts-raw.json".to_owned(),
+            "--private-position-raw-snapshot".to_owned(),
+            "target/funding-private-positions-raw.json".to_owned(),
+            "--private-execution-snapshot".to_owned(),
+            "target/funding-private-execution.json".to_owned(),
+        ];
+
+        let options = parse_funding_arb_guarded_dry_run_once_args(&args).expect("options");
+
+        assert_eq!(options.private_account_snapshot_path, None);
+        assert_eq!(
+            options.private_account_raw_snapshot_path,
+            Some(PathBuf::from("target/funding-private-accounts-raw.json"))
+        );
+        assert_eq!(options.private_position_snapshot_path, None);
+        assert_eq!(
+            options.private_position_raw_snapshot_path,
+            Some(PathBuf::from("target/funding-private-positions-raw.json"))
+        );
+        assert_eq!(
+            options.private_execution_snapshot_path,
+            Some(PathBuf::from("target/funding-private-execution.json"))
         );
     }
 
@@ -27762,10 +32276,17 @@ mod tests {
         .expect("funding arb guarded dry-run report");
 
         assert!(report.signal_allowed);
-        assert_eq!(report.risk_decision, "RequiresManualApproval");
-        assert!(report.manual_gate_released);
-        assert!(report.dispatch_plan_built);
+        assert_eq!(report.risk_decision, "Rejected");
+        assert!(report
+            .risk_reason_codes
+            .iter()
+            .any(|reason| reason == "UNKNOWN_STATE"));
+        assert!(!report.manual_gate_released);
+        assert!(!report.dispatch_plan_built);
         assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.live_ready);
+        assert!(report.live_blocking_reasons.iter().any(|reason| reason
+            .contains("private execution fill/order reconciliation snapshot was not provided")));
         assert!(!report.dispatch_attempted);
         assert!(!report.mutable_execution_started);
     }
@@ -27787,7 +32308,10 @@ mod tests {
         .expect("funding arb guarded dry-run report");
 
         assert!(report.signal_allowed);
+        assert_eq!(report.risk_decision, "Rejected");
         assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.dispatch_plan_built);
+        assert!(!report.live_ready);
         assert!(!report.dispatch_attempted);
         assert!(!report.mutable_execution_started);
     }
@@ -27898,8 +32422,14 @@ mod tests {
         .expect("Hyperliquid guarded dry-run report");
 
         assert!(report.signal_allowed);
-        assert!(report.dispatch_plan_built);
+        assert_eq!(report.risk_decision, "Rejected");
+        assert!(!report.dispatch_plan_built);
         assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.live_ready);
+        assert!(report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("Hyperliquid private account runtime reconciliation")));
         assert!(!report.dispatch_attempted);
         assert!(!report.mutable_execution_started);
     }
