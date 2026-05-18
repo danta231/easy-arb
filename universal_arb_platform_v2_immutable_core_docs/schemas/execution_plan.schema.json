@@ -162,6 +162,18 @@
           ],
           "description": "Mutable order type for adapter mapping. 中文：进入适配器前使用的订单类型。"
         },
+        "time_in_force": {
+          "enum": [
+            "GTC",
+            "IOC",
+            "FOK"
+          ],
+          "description": "Limit order time-in-force. 中文：限价单有效期/成交策略；IOC 表示立即成交剩余撤销，FOK 表示必须全部立即成交，否则撤销。"
+        },
+        "reduce_only": {
+          "type": "boolean",
+          "description": "Whether the derivative order may only reduce an existing position. 中文：是否只允许减少已有衍生品持仓，避免异常反向开仓。"
+        },
         "quantity": {
           "$ref": "common.defs.schema.json#/$defs/NonNegativeDecimalString",
           "description": "Base quantity for order submission. 中文：提交订单使用的基础数量。"

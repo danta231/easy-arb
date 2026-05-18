@@ -111,9 +111,9 @@ use arb_venue_exec::{
     CancelOrderRequest, ConfirmOrderStatus, ConfirmOrderStatusRequest, DispatchKillSwitch,
     ExecutionDispatchPlan, ExecutionDispatchPolicy, ExternalActionRef,
     IdempotencyKey as ExecIdempotencyKey, MutableActionKind, MutableActionReceipt,
-    MutableActionStatus, MutableOrderType, OrderConfirmationSource, OrderConfirmationStatus,
-    OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate, PrivateOrderMarket,
-    PrivateOrderUpdate, SubmitOrder, SubmitOrderRequest, VenueExecError,
+    MutableActionStatus, MutableOrderType, MutableTimeInForce, OrderConfirmationSource,
+    OrderConfirmationStatus, OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate,
+    PrivateOrderMarket, PrivateOrderUpdate, SubmitOrder, SubmitOrderRequest, VenueExecError,
 };
 
 const DEFAULT_FULL_PIPELINE_FIXTURE: &str = "fixtures/replay/full_pipeline_simulated";
@@ -6952,7 +6952,8 @@ where
             spot.request.idempotency_key.as_str(),
             context.protection_suffix
         ))?,
-    );
+    )
+    .with_time_in_force(MutableTimeInForce::Ioc);
     let unwind_plan = PlannedSubmitOrder {
         plan_leg_id: format!("{}:protection-unwind", spot.plan_leg_id),
         venue_symbol: spot.venue_symbol.clone(),
@@ -8251,7 +8252,9 @@ fn basis_exit_close_planned_order(
             Some(Price::from_str(limit_price)?),
             Some(client_order_id),
             idempotency_key,
-        ),
+        )
+        .with_time_in_force(MutableTimeInForce::Ioc)
+        .with_reduce_only(role == "perp_close"),
     })
 }
 
@@ -15860,6 +15863,7 @@ fn binance_guarded_live_candidate(
         "max_slippage_bps": "5",
         "max_notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "reference_best_ask": {best_ask},
         "reference_best_bid": {best_bid},
         "reference_bid_size": {bid_size},
@@ -16074,6 +16078,7 @@ fn binance_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {spot_ask},
         "reference_best_bid": {spot_bid},
@@ -16100,6 +16105,7 @@ fn binance_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {perp_ask},
         "reference_best_bid": {perp_bid},
@@ -16361,6 +16367,7 @@ fn bybit_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {spot_ask},
         "reference_best_bid": {spot_bid},
@@ -16387,6 +16394,7 @@ fn bybit_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {perp_ask},
         "reference_best_bid": {perp_bid},
@@ -16648,6 +16656,7 @@ fn bitget_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {spot_ask},
         "reference_best_bid": {spot_bid},
@@ -16674,6 +16683,7 @@ fn bitget_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {perp_ask},
         "reference_best_bid": {perp_bid},
@@ -16889,6 +16899,7 @@ fn okx_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {spot_ask},
         "reference_best_bid": {spot_bid},
@@ -16915,6 +16926,7 @@ fn okx_basis_guarded_live_candidate(
         "net_basis_bps": {net_bps},
         "notional_usdt": {notional},
         "post_only": false,
+        "time_in_force": "IOC",
         "venue_symbol": {venue_symbol},
         "reference_best_ask": {perp_ask},
         "reference_best_bid": {perp_bid},
@@ -26120,6 +26132,47 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn basis_exit_close_orders_use_ioc_and_reduce_only_on_perp_leg() {
+        let state = test_basis_exit_state();
+        let perp_close = basis_exit_close_planned_order(
+            &state,
+            "perp_close",
+            &state.perp_venue_id,
+            &state.perp_account_id,
+            &state.perp_instrument_id,
+            OrderSide::Buy,
+            Quantity::from_str("0.100").expect("quantity"),
+            "101.00",
+            "1778630400",
+        )
+        .expect("perp close plan");
+        let spot_close = basis_exit_close_planned_order(
+            &state,
+            "spot_close",
+            &state.spot_venue_id,
+            &state.spot_account_id,
+            &state.spot_instrument_id,
+            OrderSide::Sell,
+            Quantity::from_str("0.100").expect("quantity"),
+            "99.90",
+            "1778630400",
+        )
+        .expect("spot close plan");
+
+        assert_eq!(
+            perp_close.request.time_in_force,
+            Some(MutableTimeInForce::Ioc)
+        );
+        assert!(perp_close.request.reduce_only);
+        assert_eq!(
+            spot_close.request.time_in_force,
+            Some(MutableTimeInForce::Ioc)
+        );
+        assert!(!spot_close.request.reduce_only);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn basis_exit_supervisor_reads_adl_events_as_runtime_trigger() {
         let state = test_basis_exit_state();
         let temp = RuntimeTempDir::new().expect("temp dir");
@@ -28297,6 +28350,10 @@ mod tests {
             .any(|action| action.contains("spot_unwind_sell:perp-submit-failed")));
         assert_eq!(spot_adapter.submitted.len(), 2);
         assert_eq!(spot_adapter.submitted[1].side, OrderSide::Sell);
+        assert_eq!(
+            spot_adapter.submitted[1].time_in_force,
+            Some(MutableTimeInForce::Ioc)
+        );
         assert_eq!(spot_adapter.submitted[1].quantity.to_string(), "0.100");
         assert_eq!(
             spot_adapter.submitted[1]

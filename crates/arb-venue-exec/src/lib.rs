@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use arb_contracts::{
     ExecutionActionType, ExecutionLeg, ExecutionLegState, ExecutionMode, ExecutionOrderType,
-    ExecutionPlan, TransitionSide,
+    ExecutionPlan, ExecutionTimeInForce, TransitionSide,
 };
 use arb_domain::{
     AccountId, Amount, AssetId, Decimal, InstrumentId, OrderId, Price, Quantity, UtcTimestamp,
@@ -444,6 +444,24 @@ impl MutableOrderType {
     }
 }
 
+/// 限价订单有效期/成交策略。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutableTimeInForce {
+    Gtc,
+    Ioc,
+    Fok,
+}
+
+impl MutableTimeInForce {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gtc => "GTC",
+            Self::Ioc => "IOC",
+            Self::Fok => "FOK",
+        }
+    }
+}
+
 /// 订单引用。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OrderReference {
@@ -479,6 +497,8 @@ pub struct SubmitOrderRequest {
     pub instrument_id: InstrumentId,
     pub side: OrderSide,
     pub order_type: MutableOrderType,
+    pub time_in_force: Option<MutableTimeInForce>,
+    pub reduce_only: bool,
     pub quantity: Quantity,
     pub limit_price: Option<Price>,
     pub client_order_id: Option<OrderId>,
@@ -504,11 +524,23 @@ impl SubmitOrderRequest {
             instrument_id,
             side,
             order_type,
+            time_in_force: None,
+            reduce_only: false,
             quantity,
             limit_price,
             client_order_id,
             idempotency_key,
         }
+    }
+
+    pub fn with_time_in_force(mut self, time_in_force: MutableTimeInForce) -> Self {
+        self.time_in_force = Some(time_in_force);
+        self
+    }
+
+    pub fn with_reduce_only(mut self, reduce_only: bool) -> Self {
+        self.reduce_only = reduce_only;
+        self
     }
 
     pub fn validate(&self) -> VenueExecResult<()> {
@@ -524,18 +556,31 @@ impl SubmitOrderRequest {
                 reason: "market orders must not carry a limit price",
             }),
             _ => Ok(()),
+        }?;
+        match (self.order_type, self.time_in_force) {
+            (MutableOrderType::Limit, _) | (_, None) => Ok(()),
+            (MutableOrderType::Market, Some(_)) => Err(VenueExecError::InvalidRequest {
+                field: "time_in_force",
+                reason: "market orders must not carry time_in_force",
+            }),
+            (MutableOrderType::PostOnly, Some(_)) => Err(VenueExecError::InvalidRequest {
+                field: "time_in_force",
+                reason: "post-only orders encode their own maker-only time-in-force",
+            }),
         }
     }
 
     fn fingerprint(&self) -> RequestFingerprint {
         RequestFingerprint(format!(
-            "kind={};venue={};account={};instrument={};side={};order_type={};quantity={};limit_price={};client_order_id={}",
+            "kind={};venue={};account={};instrument={};side={};order_type={};time_in_force={};reduce_only={};quantity={};limit_price={};client_order_id={}",
             MutableActionKind::SubmitOrder,
             self.venue_id,
             self.account_id,
             self.instrument_id,
             self.side.as_str(),
             self.order_type.as_str(),
+            self.time_in_force.map(MutableTimeInForce::as_str).unwrap_or(""),
+            self.reduce_only,
             self.quantity,
             optional_display(self.limit_price),
             optional_display(self.client_order_id.as_ref())
@@ -1255,7 +1300,7 @@ fn planned_submit_order_from_leg(
         }
     }
 
-    let request = SubmitOrderRequest::new(
+    let mut request = SubmitOrderRequest::new(
         venue_id,
         account_id,
         instrument_id,
@@ -1284,6 +1329,12 @@ fn planned_submit_order_from_leg(
             .map_err(domain_invalid_request)?,
         IdempotencyKey::new(leg.idempotency_key.as_str())?,
     );
+    if let Some(time_in_force) = leg.time_in_force.as_ref() {
+        request = request.with_time_in_force(mutable_time_in_force(time_in_force));
+    }
+    if leg.reduce_only.unwrap_or(false) {
+        request = request.with_reduce_only(true);
+    }
     request.validate()?;
 
     Ok(PlannedSubmitOrder {
@@ -1452,6 +1503,14 @@ fn mutable_order_type(
         None => Err(VenueExecError::DispatchBlocked {
             reason: "order leg lacks order_type".to_owned(),
         }),
+    }
+}
+
+fn mutable_time_in_force(time_in_force: &ExecutionTimeInForce) -> MutableTimeInForce {
+    match time_in_force {
+        ExecutionTimeInForce::Gtc => MutableTimeInForce::Gtc,
+        ExecutionTimeInForce::Ioc => MutableTimeInForce::Ioc,
+        ExecutionTimeInForce::Fok => MutableTimeInForce::Fok,
     }
 }
 
@@ -3147,10 +3206,10 @@ pub mod live {
         unknown_status_report, CancelOrder, CancelOrderRequest, ConfirmOrderStatus,
         ConfirmOrderStatusRequest, ExternalActionRef, ExternalOrderId, IdempotencyKey,
         MutableActionId, MutableActionKind, MutableActionReceipt, MutableActionStatus,
-        MutableActionStatusReport, MutableOrderType, OrderReference, OrderSide, PrivateOrderMarket,
-        PrivateOrderUpdate, QueryActionStatus, QueryActionStatusRequest, RequestFingerprint,
-        RequestTransfer, SubmitOrder, SubmitOrderRequest, TransferRequest, VenueExecError,
-        VenueExecResult,
+        MutableActionStatusReport, MutableOrderType, MutableTimeInForce, OrderReference, OrderSide,
+        PrivateOrderMarket, PrivateOrderUpdate, QueryActionStatus, QueryActionStatusRequest,
+        RequestFingerprint, RequestTransfer, SubmitOrder, SubmitOrderRequest, TransferRequest,
+        VenueExecError, VenueExecResult,
     };
 
     /// Binance Spot 下单、撤单和查单 endpoint。
@@ -3161,6 +3220,10 @@ pub mod live {
     pub const DEFAULT_BINANCE_RECV_WINDOW_MS: u64 = 5_000;
     const MAX_BINANCE_RECV_WINDOW_MS: u64 = 60_000;
     const CURL_STATUS_MARKER: &str = "\n__ARB_BINANCE_HTTP_STATUS__:";
+
+    fn limit_time_in_force(request: &SubmitOrderRequest) -> MutableTimeInForce {
+        request.time_in_force.unwrap_or(MutableTimeInForce::Gtc)
+    }
 
     /// Binance 可变执行市场。
     ///
@@ -4191,7 +4254,10 @@ pub mod live {
             }
             (BinanceExecMarket::Spot, MutableOrderType::Limit) => {
                 params.push(binance_param("type", "LIMIT")?);
-                params.push(binance_param("timeInForce", "GTC")?);
+                params.push(binance_param(
+                    "timeInForce",
+                    binance_time_in_force(limit_time_in_force(request)),
+                )?);
                 params.push(binance_param("quantity", request.quantity.to_string())?);
                 params.push(binance_param(
                     "price",
@@ -4214,7 +4280,10 @@ pub mod live {
             }
             (BinanceExecMarket::UsdmFutures, MutableOrderType::Limit) => {
                 params.push(binance_param("type", "LIMIT")?);
-                params.push(binance_param("timeInForce", "GTC")?);
+                params.push(binance_param(
+                    "timeInForce",
+                    binance_time_in_force(limit_time_in_force(request)),
+                )?);
                 params.push(binance_param("quantity", request.quantity.to_string())?);
                 params.push(binance_param(
                     "price",
@@ -4235,6 +4304,19 @@ pub mod live {
                         .expect("validated post-only order price")
                         .to_string(),
                 )?);
+            }
+        }
+        if request.reduce_only {
+            match config.market {
+                BinanceExecMarket::Spot => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "reduce_only",
+                        reason: "Binance spot orders do not support reduce_only",
+                    });
+                }
+                BinanceExecMarket::UsdmFutures => {
+                    params.push(binance_param("reduceOnly", "true")?);
+                }
             }
         }
         if let Some(client_order_id) = &request.client_order_id {
@@ -4456,6 +4538,14 @@ pub mod live {
         match side {
             OrderSide::Buy => "BUY",
             OrderSide::Sell => "SELL",
+        }
+    }
+
+    fn binance_time_in_force(time_in_force: MutableTimeInForce) -> &'static str {
+        match time_in_force {
+            MutableTimeInForce::Gtc => "GTC",
+            MutableTimeInForce::Ioc => "IOC",
+            MutableTimeInForce::Fok => "FOK",
         }
     }
 
@@ -5669,7 +5759,12 @@ pub mod live {
                         .expect("validated limit order price")
                         .to_string(),
                 )?;
-                push_json_string_field(&mut body, &mut first, "timeInForce", "GTC")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "timeInForce",
+                    bybit_time_in_force(limit_time_in_force(request)),
+                )?;
             }
             MutableOrderType::PostOnly => {
                 push_json_string_field(&mut body, &mut first, "orderType", "Limit")?;
@@ -5689,6 +5784,19 @@ pub mod live {
                         .to_string(),
                 )?;
                 push_json_string_field(&mut body, &mut first, "timeInForce", "PostOnly")?;
+            }
+        }
+        if request.reduce_only {
+            match config.market {
+                BybitExecMarket::Spot => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "reduce_only",
+                        reason: "Bybit spot orders do not support reduce_only",
+                    });
+                }
+                BybitExecMarket::LinearPerpetual => {
+                    push_json_bool_field(&mut body, &mut first, "reduceOnly", true);
+                }
             }
         }
         if let Some(client_order_id) = &request.client_order_id {
@@ -5920,6 +6028,14 @@ pub mod live {
         }
     }
 
+    fn bybit_time_in_force(time_in_force: MutableTimeInForce) -> &'static str {
+        match time_in_force {
+            MutableTimeInForce::Gtc => "GTC",
+            MutableTimeInForce::Ioc => "IOC",
+            MutableTimeInForce::Fok => "FOK",
+        }
+    }
+
     fn push_json_string_field(
         body: &mut String,
         first: &mut bool,
@@ -5936,6 +6052,17 @@ pub mod live {
         push_json_escaped(body, value)?;
         body.push('"');
         Ok(())
+    }
+
+    fn push_json_bool_field(body: &mut String, first: &mut bool, name: &str, value: bool) {
+        if !*first {
+            body.push(',');
+        }
+        *first = false;
+        body.push('"');
+        body.push_str(name);
+        body.push_str("\":");
+        body.push_str(if value { "true" } else { "false" });
     }
 
     fn push_json_escaped(body: &mut String, value: &str) -> VenueExecResult<()> {
@@ -7098,7 +7225,12 @@ pub mod live {
                 push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
             }
             MutableOrderType::Limit => {
-                push_json_string_field(&mut body, &mut first, "ordType", "limit")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "ordType",
+                    okx_limit_ord_type(limit_time_in_force(request)),
+                )?;
                 push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
                 push_json_string_field(
                     &mut body,
@@ -7122,6 +7254,19 @@ pub mod live {
                         .expect("validated post-only order price")
                         .to_string(),
                 )?;
+            }
+        }
+        if request.reduce_only {
+            match config.market {
+                OkxExecMarket::Spot => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "reduce_only",
+                        reason: "OKX spot orders do not support reduce_only",
+                    });
+                }
+                OkxExecMarket::Swap => {
+                    push_json_string_field(&mut body, &mut first, "reduceOnly", "true")?;
+                }
             }
         }
         if let Some(client_order_id) = &request.client_order_id {
@@ -7343,6 +7488,14 @@ pub mod live {
         match side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
+        }
+    }
+
+    fn okx_limit_ord_type(time_in_force: MutableTimeInForce) -> &'static str {
+        match time_in_force {
+            MutableTimeInForce::Gtc => "limit",
+            MutableTimeInForce::Ioc => "ioc",
+            MutableTimeInForce::Fok => "fok",
         }
     }
 
@@ -8490,7 +8643,12 @@ pub mod live {
             }
             MutableOrderType::Limit => {
                 push_json_string_field(&mut body, &mut first, "orderType", "limit")?;
-                push_json_string_field(&mut body, &mut first, "force", "gtc")?;
+                push_json_string_field(
+                    &mut body,
+                    &mut first,
+                    "force",
+                    bitget_force(limit_time_in_force(request)),
+                )?;
                 push_json_string_field(
                     &mut body,
                     &mut first,
@@ -8525,6 +8683,19 @@ pub mod live {
                         .expect("validated post-only order price")
                         .to_string(),
                 )?;
+            }
+        }
+        if request.reduce_only {
+            match config.market {
+                BitgetExecMarket::Spot => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "reduce_only",
+                        reason: "Bitget spot orders do not support reduce_only",
+                    });
+                }
+                BitgetExecMarket::UsdtFutures => {
+                    push_json_string_field(&mut body, &mut first, "reduceOnly", "YES")?;
+                }
             }
         }
         if let Some(client_order_id) = &request.client_order_id {
@@ -8753,6 +8924,14 @@ pub mod live {
         match side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
+        }
+    }
+
+    fn bitget_force(time_in_force: MutableTimeInForce) -> &'static str {
+        match time_in_force {
+            MutableTimeInForce::Gtc => "gtc",
+            MutableTimeInForce::Ioc => "ioc",
+            MutableTimeInForce::Fok => "fok",
         }
     }
 
@@ -9460,6 +9639,50 @@ mod tests {
     }
 
     #[test]
+    fn time_in_force_is_only_valid_for_plain_limit_orders() {
+        let market_ioc = SubmitOrderRequest::new(
+            venue("sim-venue"),
+            account("acct:main"),
+            instrument("BTC-USDC-PERP"),
+            OrderSide::Buy,
+            MutableOrderType::Market,
+            quantity("1.0").unwrap(),
+            None,
+            None,
+            IdempotencyKey::new("idem:order:market-ioc").unwrap(),
+        )
+        .with_time_in_force(MutableTimeInForce::Ioc);
+        let post_only_ioc = SubmitOrderRequest::new(
+            venue("sim-venue"),
+            account("acct:main"),
+            instrument("BTC-USDC-PERP"),
+            OrderSide::Buy,
+            MutableOrderType::PostOnly,
+            quantity("1.0").unwrap(),
+            Some(price("10.0").unwrap()),
+            None,
+            IdempotencyKey::new("idem:order:post-only-ioc").unwrap(),
+        )
+        .with_time_in_force(MutableTimeInForce::Ioc);
+        let limit_ioc = SubmitOrderRequest::new(
+            venue("sim-venue"),
+            account("acct:main"),
+            instrument("BTC-USDC-PERP"),
+            OrderSide::Buy,
+            MutableOrderType::Limit,
+            quantity("1.0").unwrap(),
+            Some(price("10.0").unwrap()),
+            None,
+            IdempotencyKey::new("idem:order:limit-ioc").unwrap(),
+        )
+        .with_time_in_force(MutableTimeInForce::Ioc);
+
+        assert!(market_ioc.validate().is_err());
+        assert!(post_only_ioc.validate().is_err());
+        assert!(limit_ioc.validate().is_ok());
+    }
+
+    #[test]
     fn execution_plan_maps_to_submit_order_requests_after_final_gates() {
         let plan = basis_execution_plan();
         let policy = dispatch_policy("10.00")
@@ -9479,6 +9702,7 @@ mod tests {
         );
         assert_eq!(requests[0].side, OrderSide::Buy);
         assert_eq!(requests[0].order_type, MutableOrderType::Limit);
+        assert_eq!(requests[0].time_in_force, Some(MutableTimeInForce::Ioc));
         assert_eq!(requests[0].quantity.to_string(), "0.001");
         assert_eq!(
             requests[0].limit_price.expect("spot limit").to_string(),
@@ -9487,6 +9711,7 @@ mod tests {
         assert_eq!(requests[0].idempotency_key.as_str(), "idem:plan:basis:spot");
         assert_eq!(requests[1].venue_id.as_str(), "venue:BINANCE-USDM");
         assert_eq!(requests[1].side, OrderSide::Sell);
+        assert_eq!(requests[1].time_in_force, Some(MutableTimeInForce::Ioc));
         assert_eq!(requests[1].idempotency_key.as_str(), "idem:plan:basis:perp");
     }
 
@@ -9768,6 +9993,49 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn binance_usdm_adapter_maps_ioc_reduce_only_limit() {
+        let mut adapter = live::BinanceUsdmExecAdapter::new(
+            live::BinanceExecConfig::usdm_futures(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                "https://fapi.binance.com",
+                binance_signing_policy("kms-policy/binance-usdm-exec-unit"),
+            )
+            .unwrap(),
+            binance_test_signer(1_700_000_000_789),
+            RecordingTransport::ok(
+                200,
+                r#"{"symbol":"BTCUSDT","orderId":992,"clientOrderId":"client:usdm:ioc","status":"NEW"}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BINANCE-USDM"),
+                    account("account:binance-usdm-unit"),
+                    instrument("inst:BINANCE:BTCUSDT:USDM-PERP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.002").unwrap(),
+                    Some(price("43200.00").unwrap()),
+                    Some(OrderId::new("client:usdm:ioc").unwrap()),
+                    IdempotencyKey::new("idem:binance:usdm:ioc").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc)
+                .with_reduce_only(true),
+            )
+            .expect("signed reduce-only IOC usdm order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.signed_query.contains("type=LIMIT"));
+        assert!(call.signed_query.contains("timeInForce=IOC"));
+        assert!(call.signed_query.contains("reduceOnly=true"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_order_query_uses_signed_get_confirmation_path() {
         let mut adapter = live::BinanceSpotExecAdapter::new(
             live::BinanceExecConfig::spot(
@@ -9873,6 +10141,49 @@ mod tests {
         assert!(!call.debug.contains(&call.api_key_header_value));
         assert!(!call.debug.contains(&call.signature));
         assert!(!call.debug.contains(&call.payload));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_linear_adapter_maps_ioc_reduce_only_limit() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-submit-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffb","orderLinkId":"bybitUnitIoc"},"retExtInfo":{},"time":1700000000124}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BYBIT-LINEAR"),
+                    account("account:bybit-unit"),
+                    instrument("inst:BYBIT:BTCUSDT:LINEAR-PERP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("bybitUnitIoc").unwrap()),
+                    IdempotencyKey::new("idem:bybit:linear:ioc").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc)
+                .with_reduce_only(true),
+            )
+            .expect("signed Bybit reduce-only IOC order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.payload.contains(r#""orderType":"Limit""#));
+        assert!(call.payload.contains(r#""timeInForce":"IOC""#));
+        assert!(call.payload.contains(r#""reduceOnly":true"#));
     }
 
     #[cfg(feature = "live-exec")]
@@ -10108,6 +10419,48 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn okx_swap_adapter_maps_ioc_reduce_only_limit() {
+        let mut adapter = live::OkxSwapExecAdapter::new(
+            live::OkxExecConfig::swap(
+                venue("venue:OKX-SWAP"),
+                account("account:okx-unit"),
+                "https://www.okx.com",
+                okx_signing_policy("kms-policy/okx-swap-submit-unit"),
+            )
+            .unwrap(),
+            okx_test_signer("2026-05-17T12:34:56.789Z"),
+            RecordingOkxTransport::ok(
+                200,
+                r#"{"code":"0","msg":"","data":[{"ordId":"612269865356374016","clOrdId":"rvoP2","sCode":"0","sMsg":""}]}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:OKX-SWAP"),
+                    account("account:okx-unit"),
+                    instrument("inst:OKX:BTC-USDT-SWAP:SWAP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("rvoP2").unwrap()),
+                    IdempotencyKey::new("idem:okx:swap:ioc").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc)
+                .with_reduce_only(true),
+            )
+            .expect("signed OKX reduce-only IOC order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""ordType":"ioc""#));
+        assert!(call.body.contains(r#""reduceOnly":"true""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn okx_swap_order_query_uses_signed_get_confirmation_path() {
         let mut adapter = live::OkxSwapExecAdapter::new(
             live::OkxExecConfig::swap(
@@ -10248,6 +10601,51 @@ mod tests {
         assert!(cancel_call.body.contains(r#""productType":"USDT-FUTURES""#));
         assert!(cancel_call.body.contains(r#""marginCoin":"USDT""#));
         assert!(cancel_call.body.contains(r#""orderId":"1234567890""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bitget_usdt_futures_adapter_maps_ioc_reduce_only_limit() {
+        let mut adapter = live::BitgetUsdtFuturesExecAdapter::new(
+            live::BitgetExecConfig::usdt_futures(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-usdt-futures-submit-unit"),
+            )
+            .unwrap()
+            .with_trade_side("close")
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000000124,"data":{"orderId":"1234567891","clientOid":"bitgetIoc1"}}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BITGET-USDT-FUTURES"),
+                    account("account:bitget-unit"),
+                    instrument("inst:BITGET:BTCUSDT:USDT-FUTURES"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("bitgetIoc1").unwrap()),
+                    IdempotencyKey::new("idem:bitget:usdt-futures:ioc").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc)
+                .with_reduce_only(true),
+            )
+            .expect("signed Bitget reduce-only IOC order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""tradeSide":"close""#));
+        assert!(call.body.contains(r#""force":"ioc""#));
+        assert!(call.body.contains(r#""reduceOnly":"YES""#));
     }
 
     #[cfg(feature = "live-exec")]
@@ -10458,6 +10856,7 @@ mod tests {
       "venue_symbol": "BTCUSDT",
       "side": "Buy",
       "order_type": "Limit",
+      "time_in_force": "IOC",
       "quantity": "0.001",
       "limit_price": "50000.00",
       "notional_usd": "5.00",
@@ -10477,6 +10876,7 @@ mod tests {
       "venue_symbol": "BTCUSDT",
       "side": "Short",
       "order_type": "Limit",
+      "time_in_force": "IOC",
       "quantity": "0.001",
       "limit_price": "50100.00",
       "notional_usd": "5.00",

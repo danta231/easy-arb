@@ -14,10 +14,11 @@ use arb_contracts::{
     from_json_strict, to_canonical_json, CancelDefaultAction, CandidatePortfolioTransition,
     CapitalReservation, CapitalReservationState, ContractError, ExecutionActionType,
     ExecutionFailureSeverity, ExecutionLegState, ExecutionMode, ExecutionOrderType, ExecutionPlan,
-    ExecutionReport, ExecutionReportStatus, FailureMode, FillSide, HedgeResidualAction, Incident,
-    LedgerEntry, LedgerNamespace, LegReportStatus, PartialFillAction, PortfolioState,
-    ReconciliationStatus, RiskCheckType, RiskConstraint, RiskConstraintType, RiskDecision,
-    RiskDecisionKind, TransitionLeg, TransitionLegType, TransitionSide,
+    ExecutionReport, ExecutionReportStatus, ExecutionTimeInForce, FailureMode, FillSide,
+    HedgeResidualAction, Incident, LedgerEntry, LedgerNamespace, LegReportStatus,
+    PartialFillAction, PortfolioState, ReconciliationStatus, RiskCheckType, RiskConstraint,
+    RiskConstraintType, RiskDecision, RiskDecisionKind, TransitionLeg, TransitionLegType,
+    TransitionSide,
 };
 
 /// 执行层统一返回类型。
@@ -1978,7 +1979,7 @@ fn build_plan_contract(
             dependencies: &dependencies,
             initial_state: &initial_state,
             pending_manual_approval,
-        }));
+        })?);
         previous_plan_leg_id = Some(plan_leg_id);
     }
 
@@ -2083,7 +2084,7 @@ struct ExecutionLegRenderInput<'a> {
     pending_manual_approval: bool,
 }
 
-fn render_execution_leg(input: ExecutionLegRenderInput<'_>) -> String {
+fn render_execution_leg(input: ExecutionLegRenderInput<'_>) -> ExecutionResult<String> {
     let leg = input.leg;
     let action_type = if input.pending_manual_approval {
         intended_action_type(&leg.leg_type)
@@ -2117,6 +2118,15 @@ fn render_execution_leg(input: ExecutionLegRenderInput<'_>) -> String {
     if requires_order_intent(&action_type) {
         if let Some(order_type) = execution_order_type(leg) {
             fields.push(render_pair("order_type", json_string(order_type.as_str())));
+        }
+        if let Some(time_in_force) = execution_time_in_force(leg)? {
+            fields.push(render_pair(
+                "time_in_force",
+                json_string(time_in_force.as_str()),
+            ));
+        }
+        if bool_constraint(leg, "reduce_only") == Some(true) {
+            fields.push(render_pair("reduce_only", "true".to_owned()));
         }
         if let Some(quantity) = execution_quantity(input.candidate, leg) {
             fields.push(render_pair("quantity", json_string(&quantity)));
@@ -2169,7 +2179,7 @@ fn render_execution_leg(input: ExecutionLegRenderInput<'_>) -> String {
         "failure_semantics",
         json_string(selected_failure_mode(&leg.failure_modes).as_str()),
     ));
-    format!("{{{}}}", fields.join(","))
+    Ok(format!("{{{}}}", fields.join(",")))
 }
 
 fn requires_order_intent(action_type: &ExecutionActionType) -> bool {
@@ -2188,6 +2198,34 @@ fn execution_order_type(leg: &TransitionLeg) -> Option<ExecutionOrderType> {
         Some(ExecutionOrderType::Market)
     } else {
         None
+    }
+}
+
+fn execution_time_in_force(leg: &TransitionLeg) -> ExecutionResult<Option<ExecutionTimeInForce>> {
+    if bool_constraint(leg, "post_only") == Some(true) {
+        if leg.constraints.contains_key("time_in_force") {
+            return Err(ExecutionError::MissingRequiredField {
+                field: "candidate.legs[].constraints.time_in_force",
+                detail: format!(
+                    "candidate leg `{}` cannot combine post_only=true with time_in_force",
+                    leg.leg_id.as_str()
+                ),
+            });
+        }
+        return Ok(None);
+    }
+    match string_constraint(leg, "time_in_force").as_deref() {
+        Some("GTC") => Ok(Some(ExecutionTimeInForce::Gtc)),
+        Some("IOC") => Ok(Some(ExecutionTimeInForce::Ioc)),
+        Some("FOK") => Ok(Some(ExecutionTimeInForce::Fok)),
+        Some(other) => Err(ExecutionError::MissingRequiredField {
+            field: "candidate.legs[].constraints.time_in_force",
+            detail: format!(
+                "candidate leg `{}` time_in_force `{other}` must be GTC, IOC, or FOK",
+                leg.leg_id.as_str()
+            ),
+        }),
+        None => Ok(None),
     }
 }
 
@@ -4096,6 +4134,31 @@ mod tests {
             UnknownStateAction::HaltAndIncident
         );
         assert_eq!(plan.failure_policy.retry_limit, 0);
+    }
+
+    #[test]
+    fn invalid_time_in_force_fails_plan_building() {
+        let candidate_json = CANDIDATE.replace(
+            r#""post_only": false"#,
+            r#""post_only": false, "time_in_force": "DAY""#,
+        );
+        let candidate = candidate(&candidate_json);
+        let risk_decision = decision(&manual_decision_json());
+        let error = build_execution_plan_preview(ExecutionPlanBuildInput::new(
+            &risk_decision,
+            &candidate,
+            ExecutionMode::ReadOnly,
+            "2026-01-01T00:00:04Z",
+        ))
+        .expect_err("invalid time_in_force must fail closed");
+
+        assert!(matches!(
+            error,
+            ExecutionError::MissingRequiredField {
+                field: "candidate.legs[].constraints.time_in_force",
+                ..
+            }
+        ));
     }
 
     #[test]

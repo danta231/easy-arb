@@ -581,6 +581,11 @@ define_string_enum!(ExecutionOrderType {
     Limit => "Limit",
     PostOnly => "PostOnly",
 });
+define_string_enum!(ExecutionTimeInForce {
+    Gtc => "GTC",
+    Ioc => "IOC",
+    Fok => "FOK",
+});
 define_string_enum!(ExecutionLegState {
     Prepared => "Prepared",
     WaitingDependency => "WaitingDependency",
@@ -1140,6 +1145,8 @@ pub struct ExecutionLeg {
     pub venue_symbol: Option<Identifier>,
     pub side: Option<TransitionSide>,
     pub order_type: Option<ExecutionOrderType>,
+    pub time_in_force: Option<ExecutionTimeInForce>,
+    pub reduce_only: Option<bool>,
     pub quantity: Option<NonNegativeDecimalString>,
     pub limit_price: Option<NonNegativeDecimalString>,
     pub notional_usd: Option<NonNegativeDecimalString>,
@@ -2470,6 +2477,8 @@ impl ExecutionLeg {
             venue_symbol: object.optional("venue_symbol", parse_identifier)?,
             side: object.optional("side", parse_enum::<TransitionSide>)?,
             order_type: object.optional("order_type", parse_enum::<ExecutionOrderType>)?,
+            time_in_force: object.optional("time_in_force", parse_enum::<ExecutionTimeInForce>)?,
+            reduce_only: object.optional("reduce_only", parse_bool)?,
             quantity: object.optional("quantity", parse_non_negative_decimal)?,
             limit_price: object.optional("limit_price", parse_non_negative_decimal)?,
             notional_usd: object.optional("notional_usd", parse_non_negative_decimal)?,
@@ -2500,6 +2509,8 @@ impl CanonicalJson for ExecutionLeg {
             opt("venue_symbol", &self.venue_symbol),
             opt("side", &self.side),
             opt("order_type", &self.order_type),
+            opt("time_in_force", &self.time_in_force),
+            opt("reduce_only", &self.reduce_only),
             opt("quantity", &self.quantity),
             opt("limit_price", &self.limit_price),
             opt("notional_usd", &self.notional_usd),
