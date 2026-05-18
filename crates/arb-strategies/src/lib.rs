@@ -47,6 +47,11 @@ const OKX_BASIS_PERP_VENUE_ID: &str = "venue:OKX-SWAP";
 const OKX_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:OKX:BTC-USDT:SPOT";
 const OKX_BASIS_PERP_INSTRUMENT_ID: &str = "inst:OKX:BTC-USDT-SWAP:SWAP";
 const OKX_BASIS_TRANSITION_ID: &str = "trans:okx-basis-btc-usdt-001";
+const CROSS_EXCHANGE_FUNDING_ARB_STRATEGY_ID: &str = "strat:cross-exchange-funding-arb";
+const CROSS_EXCHANGE_FUNDING_ARB_STRATEGY_VERSION: &str = "1.0.0";
+const CROSS_EXCHANGE_FUNDING_ARB_CODE_VERSION: &str = "code:cross-exchange-funding-arb-1";
+const CROSS_EXCHANGE_FUNDING_ARB_TRANSITION_ID: &str =
+    "trans:cross-exchange-funding-arb-btcusdt-001";
 const FIXED_SCALE: i128 = 100_000_000;
 const FIXED_SCALE_DIGITS: usize = 8;
 
@@ -537,6 +542,122 @@ pub struct BasisOutputConfig {
     pub recovery_buffer_usd: String,
 }
 
+/// 跨交易所资金费率套利策略配置。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingArbStrategyConfig {
+    pub instance: StrategyInstanceConfig,
+    pub symbol: CrossExchangeFundingSymbolConfig,
+    pub venues: CrossExchangeFundingVenuesConfig,
+    pub economics: CrossExchangeFundingEconomicsConfig,
+    pub output: CrossExchangeFundingOutputConfig,
+}
+
+impl CrossExchangeFundingArbStrategyConfig {
+    /// 返回 Binance/Bybit BTCUSDT 默认只读配置。
+    pub fn binance_bybit_btcusdt() -> Self {
+        Self {
+            instance: StrategyInstanceConfig {
+                strategy_id: CROSS_EXCHANGE_FUNDING_ARB_STRATEGY_ID.to_owned(),
+                strategy_version: CROSS_EXCHANGE_FUNDING_ARB_STRATEGY_VERSION.to_owned(),
+                code_version: CROSS_EXCHANGE_FUNDING_ARB_CODE_VERSION.to_owned(),
+                strategy_label: "cross-exchange funding arbitrage strategy".to_owned(),
+                venue_family_label: "Binance-Bybit".to_owned(),
+            },
+            symbol: CrossExchangeFundingSymbolConfig {
+                symbol: "BTCUSDT".to_owned(),
+                base_asset_id: "asset:BTC".to_owned(),
+                settlement_asset_id: "asset:USDT".to_owned(),
+            },
+            venues: CrossExchangeFundingVenuesConfig {
+                venue_a: CrossExchangeFundingLegConfig {
+                    venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+                    instrument_id: BINANCE_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                    leg_id: "candleg:funding-arb-binance-usdm-btcusdt".to_owned(),
+                    venue_label: "Binance USD-M".to_owned(),
+                    instrument_label: "USD-M perp".to_owned(),
+                },
+                venue_b: CrossExchangeFundingLegConfig {
+                    venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                    instrument_id: BYBIT_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                    account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                    leg_id: "candleg:funding-arb-bybit-linear-btcusdt".to_owned(),
+                    venue_label: "Bybit linear".to_owned(),
+                    instrument_label: "linear perp".to_owned(),
+                },
+            },
+            economics: CrossExchangeFundingEconomicsConfig {
+                notional_usd: "100.00".to_owned(),
+                venue_a_taker_fee_bps: 5,
+                venue_b_taker_fee_bps: 6,
+                slippage_buffer_bps: 4,
+                max_entry_price_divergence_bps: 20,
+                min_net_funding_bps: 5,
+            },
+            output: CrossExchangeFundingOutputConfig {
+                transition_id: CROSS_EXCHANGE_FUNDING_ARB_TRANSITION_ID.to_owned(),
+                assumption_id: "asm:cross-exchange-funding-public-data-readonly".to_owned(),
+                expected_economics_confidence: "0.70".to_owned(),
+                funding_impact_confidence: "0.70".to_owned(),
+                liquidity_impact_confidence: "0.90".to_owned(),
+                margin_impact_confidence: "0.90".to_owned(),
+                assumption_confidence: "0.70".to_owned(),
+                recovery_buffer_usd: "2.00".to_owned(),
+            },
+        }
+    }
+}
+
+/// 跨所 funding arb 标的配置。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingSymbolConfig {
+    pub symbol: String,
+    pub base_asset_id: String,
+    pub settlement_asset_id: String,
+}
+
+/// 跨所 funding arb 双场所配置。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingVenuesConfig {
+    pub venue_a: CrossExchangeFundingLegConfig,
+    pub venue_b: CrossExchangeFundingLegConfig,
+}
+
+/// 跨所 funding arb 单腿配置。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingLegConfig {
+    pub venue_id: String,
+    pub instrument_id: String,
+    pub account_id: String,
+    pub leg_id: String,
+    pub venue_label: String,
+    pub instrument_label: String,
+}
+
+/// 跨所 funding arb 静态经济参数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingEconomicsConfig {
+    pub notional_usd: String,
+    pub venue_a_taker_fee_bps: i128,
+    pub venue_b_taker_fee_bps: i128,
+    pub slippage_buffer_bps: i128,
+    pub max_entry_price_divergence_bps: i128,
+    pub min_net_funding_bps: i128,
+}
+
+/// 跨所 funding arb candidate 输出参数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingOutputConfig {
+    pub transition_id: String,
+    pub assumption_id: String,
+    pub expected_economics_confidence: String,
+    pub funding_impact_confidence: String,
+    pub liquidity_impact_confidence: String,
+    pub margin_impact_confidence: String,
+    pub assumption_confidence: String,
+    pub recovery_buffer_usd: String,
+}
+
 fn validate_spot_perp_basis_config(config: &SpotPerpBasisStrategyConfig) -> StrategyApiResult<()> {
     ensure_non_empty_basis_config("symbol.symbol", &config.symbol.symbol)?;
     let notional = parse_non_negative_basis_config_decimal(
@@ -580,6 +701,93 @@ fn validate_spot_perp_basis_config(config: &SpotPerpBasisStrategyConfig) -> Stra
         &config.output.assumption_confidence,
     )?;
     Ok(())
+}
+
+fn validate_cross_exchange_funding_arb_config(
+    config: &CrossExchangeFundingArbStrategyConfig,
+) -> StrategyApiResult<()> {
+    ensure_non_empty_basis_config("symbol.symbol", &config.symbol.symbol)?;
+    ensure_non_empty_basis_config("symbol.base_asset_id", &config.symbol.base_asset_id)?;
+    ensure_non_empty_basis_config(
+        "symbol.settlement_asset_id",
+        &config.symbol.settlement_asset_id,
+    )?;
+    ensure_non_empty_funding_leg("venues.venue_a", &config.venues.venue_a)?;
+    ensure_non_empty_funding_leg("venues.venue_b", &config.venues.venue_b)?;
+    if config.venues.venue_a.venue_id == config.venues.venue_b.venue_id {
+        return Err(invalid_basis_config(
+            "venues",
+            "cross-exchange funding arbitrage requires two distinct venues",
+        ));
+    }
+
+    let notional = parse_non_negative_basis_config_decimal(
+        "economics.notional_usd",
+        &config.economics.notional_usd,
+    )?;
+    if notional.is_zero() {
+        return Err(invalid_basis_config(
+            "economics.notional_usd",
+            "notional must be greater than zero",
+        ));
+    }
+    ensure_non_negative_basis_bps(
+        "economics.venue_a_taker_fee_bps",
+        config.economics.venue_a_taker_fee_bps,
+    )?;
+    ensure_non_negative_basis_bps(
+        "economics.venue_b_taker_fee_bps",
+        config.economics.venue_b_taker_fee_bps,
+    )?;
+    ensure_non_negative_basis_bps(
+        "economics.slippage_buffer_bps",
+        config.economics.slippage_buffer_bps,
+    )?;
+    ensure_non_negative_basis_bps(
+        "economics.max_entry_price_divergence_bps",
+        config.economics.max_entry_price_divergence_bps,
+    )?;
+    ensure_non_negative_basis_bps(
+        "economics.min_net_funding_bps",
+        config.economics.min_net_funding_bps,
+    )?;
+    parse_non_negative_basis_config_decimal(
+        "output.recovery_buffer_usd",
+        &config.output.recovery_buffer_usd,
+    )?;
+    validate_basis_confidence(
+        "output.expected_economics_confidence",
+        &config.output.expected_economics_confidence,
+    )?;
+    validate_basis_confidence(
+        "output.funding_impact_confidence",
+        &config.output.funding_impact_confidence,
+    )?;
+    validate_basis_confidence(
+        "output.liquidity_impact_confidence",
+        &config.output.liquidity_impact_confidence,
+    )?;
+    validate_basis_confidence(
+        "output.margin_impact_confidence",
+        &config.output.margin_impact_confidence,
+    )?;
+    validate_basis_confidence(
+        "output.assumption_confidence",
+        &config.output.assumption_confidence,
+    )?;
+    Ok(())
+}
+
+fn ensure_non_empty_funding_leg(
+    prefix: &'static str,
+    leg: &CrossExchangeFundingLegConfig,
+) -> StrategyApiResult<()> {
+    ensure_non_empty_basis_config(prefix, &leg.venue_id)?;
+    ensure_non_empty_basis_config(prefix, &leg.instrument_id)?;
+    ensure_non_empty_basis_config(prefix, &leg.account_id)?;
+    ensure_non_empty_basis_config(prefix, &leg.leg_id)?;
+    ensure_non_empty_basis_config(prefix, &leg.venue_label)?;
+    ensure_non_empty_basis_config(prefix, &leg.instrument_label)
 }
 
 fn ensure_non_empty_basis_config(field: &'static str, value: &str) -> StrategyApiResult<()> {
@@ -1194,6 +1402,640 @@ impl Strategy for SpotPerpBasisStrategy {
     }
 }
 
+/// 跨交易所资金费率套利只读策略。
+///
+/// 中文说明：策略只读取两个 perp/swap 市场的公开 top-of-book 与 funding 数据；
+/// 缺能力、缺 funding、缺深度或数据 stale 时失败关闭。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingArbStrategy {
+    metadata: StrategyMetadata,
+    config: CrossExchangeFundingArbStrategyConfig,
+}
+
+impl CrossExchangeFundingArbStrategy {
+    pub fn new() -> StrategyApiResult<Self> {
+        Self::with_config(CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt())
+    }
+
+    pub fn with_config(config: CrossExchangeFundingArbStrategyConfig) -> StrategyApiResult<Self> {
+        validate_cross_exchange_funding_arb_config(&config)?;
+        Ok(Self {
+            metadata: StrategyMetadata::new(
+                &config.instance.strategy_id,
+                &config.instance.strategy_version,
+                &config.instance.code_version,
+            )?,
+            config,
+        })
+    }
+
+    fn reject(
+        &self,
+        context: &dyn StrategyReadContext,
+        reason: StrategyRejectReason,
+        detail: impl Into<String>,
+    ) -> StrategyApiResult<StrategyEvaluation> {
+        let detail = detail.into();
+        let rejection = StrategyRejection::new(
+            &self.metadata,
+            context.time().now(),
+            reason,
+            Some(detail.clone()),
+            source_event_refs(context),
+            context.snapshot().portfolio_state_id(),
+        )?;
+        let diagnostic = StrategyDiagnostic::new(
+            "CROSS_EXCHANGE_FUNDING_ARB_REJECTED",
+            detail,
+            context.time().now(),
+        )?;
+        Ok(StrategyEvaluation::rejected(rejection).with_diagnostic(diagnostic))
+    }
+
+    fn ensure_capabilities(
+        &self,
+        context: &dyn StrategyReadContext,
+    ) -> StrategyApiResult<Option<StrategyEvaluation>> {
+        for leg in [&self.config.venues.venue_a, &self.config.venues.venue_b] {
+            for (capability, detail) in [
+                (
+                    MarketCapability::ProvidesPerpetuals,
+                    format!("{} lacks ProvidesPerpetuals capability", leg.venue_label),
+                ),
+                (
+                    MarketCapability::ProvidesOrderBookMarkets,
+                    format!(
+                        "{} lacks ProvidesOrderBookMarkets capability",
+                        leg.venue_label
+                    ),
+                ),
+                (
+                    MarketCapability::ProvidesFundingRates,
+                    format!("{} lacks ProvidesFundingRates capability", leg.venue_label),
+                ),
+            ] {
+                if !context
+                    .capabilities()
+                    .has_market_capability(&leg.venue_id, &capability)
+                {
+                    return Ok(Some(self.reject(
+                        context,
+                        StrategyRejectReason::VenueCapabilityMissing,
+                        detail,
+                    )?));
+                }
+            }
+            if !context
+                .capabilities()
+                .has_data_surface(&leg.venue_id, &DataSurface::RestPolling)
+            {
+                return Ok(Some(self.reject(
+                    context,
+                    StrategyRejectReason::VenueCapabilityMissing,
+                    format!("{} lacks RESTPolling data surface", leg.venue_id),
+                )?));
+            }
+        }
+        Ok(None)
+    }
+
+    fn build_candidate(
+        &self,
+        context: &dyn StrategyReadContext,
+        opportunity: &CrossExchangeFundingOpportunity<'_>,
+    ) -> StrategyApiResult<CandidatePortfolioTransition> {
+        let config = &self.config;
+        let input_event_refs = source_event_refs(context);
+        let input_event_refs_json = json_string_array(&input_event_refs);
+        let expected_profit_bps = opportunity.signal.net_funding_bps.to_string();
+        let gross_spread_bps = opportunity.signal.gross_funding_spread_bps.to_string();
+        let entry_price_divergence_bps = opportunity.signal.entry_price_divergence_bps.to_string();
+        let funding_summary = format!(
+            "Cross-exchange funding spread: long {} rate={}, short {} rate={}, normalized_gross_spread_bps={}, net_funding_bps={}, interval_hours={}.",
+            opportunity.long_leg.venue_label,
+            opportunity.long_premium.last_funding_rate,
+            opportunity.short_leg.venue_label,
+            opportunity.short_premium.last_funding_rate,
+            gross_spread_bps,
+            expected_profit_bps,
+            opportunity.funding_interval_hours
+        );
+        let liquidity_summary = format!(
+            "Top-of-book depth checked before candidate emission: long_ask_depth_usd={}, short_bid_depth_usd={}, required_notional_usd={}.",
+            opportunity
+                .signal
+                .long_ask_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity
+                .signal
+                .short_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity.signal.liquidity_required_usd
+        );
+        let margin_summary = "Dry-run candidate reserves notional on both venues; private margin and account balances are not read by the strategy.";
+        let assumption = format!(
+            "Read-only cross-exchange funding arbitrage signal for {}: long {} at {}, short {} at {}. Static fees and public top-of-book data are assumptions, not execution authorization.",
+            config.symbol.symbol,
+            opportunity.long_leg.venue_label,
+            opportunity.long_book.best_ask.format_trimmed(),
+            opportunity.short_leg.venue_label,
+            opportunity.short_book.best_bid.format_trimmed()
+        );
+
+        let candidate_json = format!(
+            r#"{{
+  "schema_version": "1.0.0",
+  "transition_id": {},
+  "strategy_id": {},
+  "strategy_version": {},
+  "code_version": {},
+  "config_version": {},
+  "created_at": {},
+  "input_event_refs": {},
+  "current_portfolio_state_ref": {},
+  "holding_period": {{
+    "kind": "UntilFundingTimestamp"
+  }},
+  "legs": [
+    {{
+      "leg_id": {},
+      "leg_type": "Trade",
+      "venue_id": {},
+      "instrument_id": {},
+      "account_id": {},
+      "side": "Long",
+      "asset_flows": [],
+      "constraints": {{
+        "basis_leg_role": "perp_long",
+        "entry_price_divergence_bps": {},
+        "funding_interval_hours": {},
+        "funding_rate": {},
+        "gross_funding_spread_bps": {},
+        "max_slippage_bps": {},
+        "net_funding_bps": {},
+        "notional_usd": {},
+        "reference_best_ask": {},
+        "reference_best_bid": {},
+        "reference_bid_size": {},
+        "reference_ask_size": {},
+        "reference_market_event_id": {},
+        "reference_premium_event_id": {},
+        "venue_symbol": {}
+      }},
+      "failure_modes": [
+        "PartialFill",
+        "VenueOutage"
+      ]
+    }},
+    {{
+      "leg_id": {},
+      "leg_type": "Trade",
+      "venue_id": {},
+      "instrument_id": {},
+      "account_id": {},
+      "side": "Short",
+      "asset_flows": [],
+      "constraints": {{
+        "basis_leg_role": "perp_short",
+        "entry_price_divergence_bps": {},
+        "funding_interval_hours": {},
+        "funding_rate": {},
+        "gross_funding_spread_bps": {},
+        "max_slippage_bps": {},
+        "net_funding_bps": {},
+        "notional_usd": {},
+        "reference_best_ask": {},
+        "reference_best_bid": {},
+        "reference_bid_size": {},
+        "reference_ask_size": {},
+        "reference_market_event_id": {},
+        "reference_premium_event_id": {},
+        "venue_symbol": {}
+      }},
+      "failure_modes": [
+        "PartialFill",
+        "VenueOutage"
+      ]
+    }}
+  ],
+  "expected_post_state_delta": {{
+    "asset_flows": [],
+    "position_deltas": [
+      {{
+        "instrument_id": {},
+        "account_id": {},
+        "quantity_delta": {}
+      }},
+      {{
+        "instrument_id": {},
+        "account_id": {},
+        "quantity_delta": {}
+      }}
+    ]
+  }},
+  "expected_economics": {{
+    "expected_profit_usd": {},
+    "expected_profit_bps": {},
+    "fee_estimate_usd": {},
+    "slippage_estimate_usd": {},
+    "confidence": {}
+  }},
+  "required_capital": {{
+    "asset_requirements": [
+      {{
+        "asset_id": {},
+        "direction": "Out",
+        "amount": {},
+        "account_id": {}
+      }},
+      {{
+        "asset_id": {},
+        "direction": "Out",
+        "amount": {},
+        "account_id": {}
+      }}
+    ],
+    "recovery_buffer_usd": {}
+  }},
+  "margin_impact": {{
+    "summary": {},
+    "impact_usd": "0",
+    "confidence": {}
+  }},
+  "funding_impact": {{
+    "summary": {},
+    "impact_usd": {},
+    "confidence": {}
+  }},
+  "liquidity_impact": {{
+    "summary": {},
+    "impact_usd": {},
+    "confidence": {}
+  }},
+  "failure_modes": [
+    "PartialFill",
+    "VenueOutage"
+  ],
+  "risk_flags": [],
+  "assumptions": [
+    {{
+      "assumption_id": {},
+      "statement": {},
+      "confidence": {},
+      "source_event_refs": {}
+    }}
+  ]
+}}"#,
+            json_string(&config.output.transition_id),
+            json_string(self.metadata.strategy_id()),
+            json_string(self.metadata.strategy_version()),
+            json_string(self.metadata.code_version()),
+            json_string(context.config().config_version()),
+            json_string(&context.time().now_rfc3339_z()),
+            input_event_refs_json,
+            json_string(context.snapshot().portfolio_state_id()),
+            json_string(&opportunity.long_leg.leg_id),
+            json_string(&opportunity.long_leg.venue_id),
+            json_string(&opportunity.long_leg.instrument_id),
+            json_string(&opportunity.long_leg.account_id),
+            json_string(&entry_price_divergence_bps),
+            json_string(&opportunity.funding_interval_hours),
+            json_string(&opportunity.long_premium.last_funding_rate),
+            json_string(&gross_spread_bps),
+            json_string(&config.economics.slippage_buffer_bps.to_string()),
+            json_string(&expected_profit_bps),
+            json_string(&config.economics.notional_usd),
+            json_string(&opportunity.long_book.best_ask.format_trimmed()),
+            json_string(&opportunity.long_book.best_bid.format_trimmed()),
+            json_string(&opportunity.long_book.bid_size.format_trimmed()),
+            json_string(&opportunity.long_book.ask_size.format_trimmed()),
+            json_string(&opportunity.long_book.event_id),
+            json_string(&opportunity.long_premium.event_id),
+            json_string(&config.symbol.symbol),
+            json_string(&opportunity.short_leg.leg_id),
+            json_string(&opportunity.short_leg.venue_id),
+            json_string(&opportunity.short_leg.instrument_id),
+            json_string(&opportunity.short_leg.account_id),
+            json_string(&entry_price_divergence_bps),
+            json_string(&opportunity.funding_interval_hours),
+            json_string(&opportunity.short_premium.last_funding_rate),
+            json_string(&gross_spread_bps),
+            json_string(&config.economics.slippage_buffer_bps.to_string()),
+            json_string(&expected_profit_bps),
+            json_string(&config.economics.notional_usd),
+            json_string(&opportunity.short_book.best_ask.format_trimmed()),
+            json_string(&opportunity.short_book.best_bid.format_trimmed()),
+            json_string(&opportunity.short_book.bid_size.format_trimmed()),
+            json_string(&opportunity.short_book.ask_size.format_trimmed()),
+            json_string(&opportunity.short_book.event_id),
+            json_string(&opportunity.short_premium.event_id),
+            json_string(&config.symbol.symbol),
+            json_string(&opportunity.long_leg.instrument_id),
+            json_string(&opportunity.long_leg.account_id),
+            json_string(&opportunity.signal.quantity),
+            json_string(&opportunity.short_leg.instrument_id),
+            json_string(&opportunity.short_leg.account_id),
+            json_string(&format!("-{}", opportunity.signal.quantity)),
+            json_string(&opportunity.signal.expected_funding_usd),
+            json_string(&expected_profit_bps),
+            json_string(&opportunity.signal.fee_estimate_usd),
+            json_string(&opportunity.signal.slippage_estimate_usd),
+            config.output.expected_economics_confidence.as_str(),
+            json_string(&config.symbol.settlement_asset_id),
+            json_string(&config.economics.notional_usd),
+            json_string(&opportunity.long_leg.account_id),
+            json_string(&config.symbol.settlement_asset_id),
+            json_string(&config.economics.notional_usd),
+            json_string(&opportunity.short_leg.account_id),
+            json_string(&config.output.recovery_buffer_usd),
+            json_string(margin_summary),
+            config.output.margin_impact_confidence.as_str(),
+            json_string(&funding_summary),
+            json_string(&opportunity.signal.expected_funding_usd),
+            config.output.funding_impact_confidence.as_str(),
+            json_string(&liquidity_summary),
+            json_string(&opportunity.signal.slippage_estimate_usd),
+            config.output.liquidity_impact_confidence.as_str(),
+            json_string(&config.output.assumption_id),
+            json_string(&assumption),
+            config.output.assumption_confidence.as_str(),
+            json_string_array(&input_event_refs),
+        );
+
+        candidate_from_json_strict(&candidate_json)
+    }
+}
+
+impl Default for CrossExchangeFundingArbStrategy {
+    fn default() -> Self {
+        Self::new().expect("cross-exchange funding strategy metadata is static and valid")
+    }
+}
+
+impl Strategy for CrossExchangeFundingArbStrategy {
+    fn metadata(&self) -> &StrategyMetadata {
+        &self.metadata
+    }
+
+    fn evaluate(&self, context: &dyn StrategyReadContext) -> StrategyApiResult<StrategyEvaluation> {
+        if context.config().kill_switch_triggered() {
+            return self.reject(
+                context,
+                StrategyRejectReason::KillSwitchTriggered,
+                "global or execution kill switch is active",
+            );
+        }
+        if context
+            .config()
+            .strategy_disabled(self.metadata.strategy_id())
+        {
+            return self.reject(
+                context,
+                StrategyRejectReason::ConfigDisabled,
+                "cross-exchange funding arbitrage strategy is disabled by read-only config",
+            );
+        }
+        for leg in [&self.config.venues.venue_a, &self.config.venues.venue_b] {
+            if context.config().venue_disabled(&leg.venue_id) {
+                return self.reject(
+                    context,
+                    StrategyRejectReason::ConfigDisabled,
+                    format!("{} is disabled by read-only config", leg.venue_id),
+                );
+            }
+        }
+        if context.snapshot().source_event_refs().is_empty() {
+            return self.reject(
+                context,
+                StrategyRejectReason::MissingData,
+                "portfolio snapshot has no input event references",
+            );
+        }
+        if let Some(rejection) = self.ensure_capabilities(context)? {
+            return Ok(rejection);
+        }
+
+        let venue_a = &self.config.venues.venue_a;
+        let venue_b = &self.config.venues.venue_b;
+        let book_a = match latest_basis_book_ticker(
+            context,
+            &venue_a.venue_id,
+            &venue_a.instrument_id,
+            "Perp",
+            &venue_a.venue_label,
+        ) {
+            Ok(book) => book,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+        let book_b = match latest_basis_book_ticker(
+            context,
+            &venue_b.venue_id,
+            &venue_b.instrument_id,
+            "Perp",
+            &venue_b.venue_label,
+        ) {
+            Ok(book) => book,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+        let premium_a = match latest_basis_premium_index(
+            context,
+            &venue_a.venue_id,
+            &venue_a.instrument_id,
+            &venue_a.venue_label,
+        ) {
+            Ok(premium) => premium,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+        let premium_b = match latest_basis_premium_index(
+            context,
+            &venue_b.venue_id,
+            &venue_b.instrument_id,
+            &venue_b.venue_label,
+        ) {
+            Ok(premium) => premium,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+        if book_a.is_stale || book_b.is_stale || premium_a.is_stale || premium_b.is_stale {
+            return self.reject(
+                context,
+                StrategyRejectReason::DataStale,
+                "funding arbitrage input contains stale public market data",
+            );
+        }
+
+        let interval_a = match premium_a.funding_interval_hours.as_deref() {
+            Some(value) => value,
+            None => {
+                return self.reject(
+                    context,
+                    StrategyRejectReason::MissingData,
+                    "venue A premium event is missing funding_interval_hours",
+                );
+            }
+        };
+        let interval_b = match premium_b.funding_interval_hours.as_deref() {
+            Some(value) => value,
+            None => {
+                return self.reject(
+                    context,
+                    StrategyRejectReason::MissingData,
+                    "venue B premium event is missing funding_interval_hours",
+                );
+            }
+        };
+        let rate_a = match FixedDecimal::parse_signed_rate(
+            "venue_a_funding_rate",
+            &premium_a.last_funding_rate,
+        ) {
+            Ok(rate) => rate,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+        let rate_b = match FixedDecimal::parse_signed_rate(
+            "venue_b_funding_rate",
+            &premium_b.last_funding_rate,
+        ) {
+            Ok(rate) => rate,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+        let interval_a_hours =
+            match parse_positive_u64("venue_a_funding_interval_hours", interval_a) {
+                Ok(value) => value,
+                Err(detail) => {
+                    return self.reject(context, StrategyRejectReason::MissingData, detail)
+                }
+            };
+        let interval_b_hours =
+            match parse_positive_u64("venue_b_funding_interval_hours", interval_b) {
+                Ok(value) => value,
+                Err(detail) => {
+                    return self.reject(context, StrategyRejectReason::MissingData, detail)
+                }
+            };
+        let normalized_rate_a = match normalize_funding_rate_to_8h(rate_a, interval_a_hours) {
+            Ok(rate) => rate,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+        let normalized_rate_b = match normalize_funding_rate_to_8h(rate_b, interval_b_hours) {
+            Ok(rate) => rate,
+            Err(detail) => return self.reject(context, StrategyRejectReason::MissingData, detail),
+        };
+
+        let (
+            long_leg,
+            short_leg,
+            long_book,
+            short_book,
+            long_premium,
+            short_premium,
+            long_signal_funding_rate,
+            short_signal_funding_rate,
+            long_fee,
+            short_fee,
+        ) = if normalized_rate_a.raw <= normalized_rate_b.raw {
+            (
+                venue_a,
+                venue_b,
+                &book_a,
+                &book_b,
+                &premium_a,
+                &premium_b,
+                normalized_rate_a.format_trimmed(),
+                normalized_rate_b.format_trimmed(),
+                self.config.economics.venue_a_taker_fee_bps,
+                self.config.economics.venue_b_taker_fee_bps,
+            )
+        } else {
+            (
+                venue_b,
+                venue_a,
+                &book_b,
+                &book_a,
+                &premium_b,
+                &premium_a,
+                normalized_rate_b.format_trimmed(),
+                normalized_rate_a.format_trimmed(),
+                self.config.economics.venue_b_taker_fee_bps,
+                self.config.economics.venue_a_taker_fee_bps,
+            )
+        };
+        let signal =
+            match evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+                symbol: self.config.symbol.symbol.clone(),
+                long_venue_id: long_leg.venue_id.clone(),
+                short_venue_id: short_leg.venue_id.clone(),
+                long_best_bid: long_book.best_bid.format_trimmed(),
+                long_best_ask: long_book.best_ask.format_trimmed(),
+                long_ask_size: Some(long_book.ask_size.format_trimmed()),
+                short_best_bid: short_book.best_bid.format_trimmed(),
+                short_best_ask: short_book.best_ask.format_trimmed(),
+                short_bid_size: Some(short_book.bid_size.format_trimmed()),
+                long_funding_rate: long_signal_funding_rate,
+                short_funding_rate: short_signal_funding_rate,
+                funding_interval_hours: "8".to_owned(),
+                notional_usd: self.config.economics.notional_usd.clone(),
+                long_taker_fee_bps: long_fee,
+                short_taker_fee_bps: short_fee,
+                slippage_buffer_bps: self.config.economics.slippage_buffer_bps,
+                max_entry_price_divergence_bps: self
+                    .config
+                    .economics
+                    .max_entry_price_divergence_bps,
+                min_net_funding_bps: self.config.economics.min_net_funding_bps,
+            }) {
+                Ok(signal) => signal,
+                Err(detail) => {
+                    return self.reject(context, StrategyRejectReason::MissingData, detail)
+                }
+            };
+        if !signal.is_candidate {
+            return self.reject(
+                context,
+                StrategyRejectReason::NoCandidate,
+                signal.reason.clone().unwrap_or_else(|| {
+                    "funding spread did not satisfy candidate checks".to_owned()
+                }),
+            );
+        }
+
+        let opportunity = CrossExchangeFundingOpportunity {
+            long_leg,
+            short_leg,
+            long_book,
+            short_book,
+            long_premium,
+            short_premium,
+            funding_interval_hours: "8".to_owned(),
+            signal,
+        };
+        let candidate = self.build_candidate(context, &opportunity)?;
+        validate_candidate_for_context(context, self.metadata(), &candidate)?;
+        let diagnostic = StrategyDiagnostic::new(
+            "CROSS_EXCHANGE_FUNDING_ARB_CANDIDATE",
+            format!(
+                "candidate {} emitted with long venue {} and short venue {}",
+                candidate.transition_id.as_str(),
+                opportunity.long_leg.venue_id,
+                opportunity.short_leg.venue_id
+            ),
+            context.time().now(),
+        )?;
+        Ok(StrategyEvaluation::candidate(candidate).with_diagnostic(diagnostic))
+    }
+}
+
+struct CrossExchangeFundingOpportunity<'a> {
+    long_leg: &'a CrossExchangeFundingLegConfig,
+    short_leg: &'a CrossExchangeFundingLegConfig,
+    long_book: &'a BasisBookTickerInput,
+    short_book: &'a BasisBookTickerInput,
+    long_premium: &'a BasisPremiumIndexInput,
+    short_premium: &'a BasisPremiumIndexInput,
+    funding_interval_hours: String,
+    signal: CrossExchangeFundingArbSignal,
+}
+
 /// 返回 Binance spot-perp basis 只读策略。
 pub fn binance_spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
     SpotPerpBasisStrategy::new()
@@ -1212,6 +2054,11 @@ pub fn okx_spot_swap_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy
 /// 返回默认 spot-perp basis 只读策略；当前默认保持为 Binance。
 pub fn spot_perp_basis_strategy() -> StrategyApiResult<SpotPerpBasisStrategy> {
     binance_spot_perp_basis_strategy()
+}
+
+/// 返回默认跨交易所资金费率套利只读策略。
+pub fn cross_exchange_funding_arb_strategy() -> StrategyApiResult<CrossExchangeFundingArbStrategy> {
+    CrossExchangeFundingArbStrategy::new()
 }
 
 /// spot-perp basis 只读信号输入。
@@ -1254,6 +2101,51 @@ pub struct SpotPerpBasisSignal {
     pub liquidity_required_usd: String,
     pub spot_ask_depth_usd: Option<String>,
     pub perp_bid_depth_usd: Option<String>,
+    pub is_candidate: bool,
+    pub reason: Option<String>,
+}
+
+/// 跨交易所资金费率套利只读信号输入。
+///
+/// 中文说明：调用方必须先根据 funding rate 决定 long/short 方向。这里仅基于公开
+/// 行情、静态手续费和阈值计算候选资格，不代表真实执行授权。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingArbSignalInput {
+    pub symbol: String,
+    pub long_venue_id: String,
+    pub short_venue_id: String,
+    pub long_best_bid: String,
+    pub long_best_ask: String,
+    pub long_ask_size: Option<String>,
+    pub short_best_bid: String,
+    pub short_best_ask: String,
+    pub short_bid_size: Option<String>,
+    pub long_funding_rate: String,
+    pub short_funding_rate: String,
+    pub funding_interval_hours: String,
+    pub notional_usd: String,
+    pub long_taker_fee_bps: i128,
+    pub short_taker_fee_bps: i128,
+    pub slippage_buffer_bps: i128,
+    pub max_entry_price_divergence_bps: i128,
+    pub min_net_funding_bps: i128,
+}
+
+/// 跨交易所资金费率套利只读信号输出。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingArbSignal {
+    pub symbol: String,
+    pub gross_funding_spread_bps: i128,
+    pub total_cost_bps: i128,
+    pub net_funding_bps: i128,
+    pub entry_price_divergence_bps: i128,
+    pub quantity: String,
+    pub expected_funding_usd: String,
+    pub fee_estimate_usd: String,
+    pub slippage_estimate_usd: String,
+    pub liquidity_required_usd: String,
+    pub long_ask_depth_usd: Option<String>,
+    pub short_bid_depth_usd: Option<String>,
     pub is_candidate: bool,
     pub reason: Option<String>,
 }
@@ -1355,6 +2247,122 @@ pub fn evaluate_spot_perp_basis_signal(
         liquidity_required_usd: notional.format_trimmed(),
         spot_ask_depth_usd: spot_ask_depth_usd.map(FixedDecimal::format_trimmed),
         perp_bid_depth_usd: perp_bid_depth_usd.map(FixedDecimal::format_trimmed),
+        is_candidate,
+        reason,
+    })
+}
+
+/// 计算跨交易所资金费率套利只读信号。
+pub fn evaluate_cross_exchange_funding_arb_signal(
+    input: &CrossExchangeFundingArbSignalInput,
+) -> Result<CrossExchangeFundingArbSignal, String> {
+    ensure_non_negative_signal_bps("long_taker_fee_bps", input.long_taker_fee_bps)?;
+    ensure_non_negative_signal_bps("short_taker_fee_bps", input.short_taker_fee_bps)?;
+    ensure_non_negative_signal_bps("slippage_buffer_bps", input.slippage_buffer_bps)?;
+    ensure_non_negative_signal_bps(
+        "max_entry_price_divergence_bps",
+        input.max_entry_price_divergence_bps,
+    )?;
+    ensure_non_negative_signal_bps("min_net_funding_bps", input.min_net_funding_bps)?;
+    if input.long_venue_id == input.short_venue_id {
+        return Err("long_venue_id and short_venue_id must be distinct".to_owned());
+    }
+
+    let long_bid = FixedDecimal::parse_non_negative("long_best_bid", &input.long_best_bid)?;
+    let long_ask = FixedDecimal::parse_non_negative("long_best_ask", &input.long_best_ask)?;
+    let short_bid = FixedDecimal::parse_non_negative("short_best_bid", &input.short_best_bid)?;
+    let short_ask = FixedDecimal::parse_non_negative("short_best_ask", &input.short_best_ask)?;
+    if long_bid.raw <= 0 || long_ask.raw <= 0 || short_bid.raw <= 0 || short_ask.raw <= 0 {
+        return Err("top-of-book prices must be greater than zero".to_owned());
+    }
+    let notional = FixedDecimal::parse_non_negative("notional_usd", &input.notional_usd)?;
+    if notional.is_zero() {
+        return Err("notional_usd must be greater than zero".to_owned());
+    }
+    let interval_hours =
+        parse_positive_u64("funding_interval_hours", &input.funding_interval_hours)?;
+    let long_rate = FixedDecimal::parse_signed_rate("long_funding_rate", &input.long_funding_rate)?;
+    let short_rate =
+        FixedDecimal::parse_signed_rate("short_funding_rate", &input.short_funding_rate)?;
+    let raw_spread = short_rate
+        .raw
+        .checked_sub(long_rate.raw)
+        .ok_or_else(|| "funding spread calculation overflowed".to_owned())?;
+    let normalized_spread = raw_spread
+        .checked_mul(8)
+        .and_then(|value| value.checked_div(i128::from(interval_hours)))
+        .ok_or_else(|| "funding interval normalization overflowed".to_owned())?;
+    let gross_funding_spread_bps = FixedDecimal::bps_from_rate(FixedDecimal {
+        raw: normalized_spread,
+    })?;
+    let total_cost_bps =
+        input.long_taker_fee_bps + input.short_taker_fee_bps + input.slippage_buffer_bps;
+    let net_funding_bps = gross_funding_spread_bps - total_cost_bps;
+    let entry_price_divergence_bps = price_divergence_bps(long_ask, short_bid)?;
+    let quantity = FixedDecimal::quantity_for_notional(notional, long_ask)?;
+    let expected_funding_usd = FixedDecimal::usd_from_bps(notional, net_funding_bps)?;
+    let fee_estimate_usd = FixedDecimal::usd_from_bps(
+        notional,
+        input.long_taker_fee_bps + input.short_taker_fee_bps,
+    )?;
+    let slippage_estimate_usd = FixedDecimal::usd_from_bps(notional, input.slippage_buffer_bps)?;
+    let long_ask_depth_usd = input
+        .long_ask_size
+        .as_deref()
+        .ok_or_else(|| "long_ask_size is required for fail-closed liquidity checks".to_owned())
+        .and_then(|value| {
+            FixedDecimal::parse_non_negative("long_ask_size", value).and_then(|size| {
+                long_ask.checked_mul_decimal(size, "long ask depth calculation overflowed")
+            })
+        })?;
+    let short_bid_depth_usd = input
+        .short_bid_size
+        .as_deref()
+        .ok_or_else(|| "short_bid_size is required for fail-closed liquidity checks".to_owned())
+        .and_then(|value| {
+            FixedDecimal::parse_non_negative("short_bid_size", value).and_then(|size| {
+                short_bid.checked_mul_decimal(size, "short bid depth calculation overflowed")
+            })
+        })?;
+    let depth_is_sufficient =
+        long_ask_depth_usd.raw >= notional.raw && short_bid_depth_usd.raw >= notional.raw;
+    let divergence_is_allowed = entry_price_divergence_bps <= input.max_entry_price_divergence_bps;
+    let threshold_is_satisfied = net_funding_bps >= input.min_net_funding_bps;
+    let is_candidate = depth_is_sufficient && divergence_is_allowed && threshold_is_satisfied;
+    let reason = if !depth_is_sufficient {
+        Some(format!(
+            "insufficient top-of-book depth: long_ask_depth_usd={}, short_bid_depth_usd={}, required_notional_usd={}",
+            long_ask_depth_usd.format_trimmed(),
+            short_bid_depth_usd.format_trimmed(),
+            notional.format_trimmed()
+        ))
+    } else if !divergence_is_allowed {
+        Some(format!(
+            "entry_price_divergence_bps={entry_price_divergence_bps} exceeds maximum {}",
+            input.max_entry_price_divergence_bps
+        ))
+    } else if !threshold_is_satisfied {
+        Some(format!(
+            "net_funding_bps={net_funding_bps} below minimum {}; gross_funding_spread_bps={gross_funding_spread_bps}, total_cost_bps={total_cost_bps}",
+            input.min_net_funding_bps
+        ))
+    } else {
+        None
+    };
+
+    Ok(CrossExchangeFundingArbSignal {
+        symbol: input.symbol.clone(),
+        gross_funding_spread_bps,
+        total_cost_bps,
+        net_funding_bps,
+        entry_price_divergence_bps,
+        quantity: quantity.format_trimmed(),
+        expected_funding_usd: expected_funding_usd.format_trimmed(),
+        fee_estimate_usd: fee_estimate_usd.format_trimmed(),
+        slippage_estimate_usd: slippage_estimate_usd.format_trimmed(),
+        liquidity_required_usd: notional.format_trimmed(),
+        long_ask_depth_usd: Some(long_ask_depth_usd.format_trimmed()),
+        short_bid_depth_usd: Some(short_bid_depth_usd.format_trimmed()),
         is_candidate,
         reason,
     })
@@ -1856,6 +2864,7 @@ struct BasisPremiumIndexInput {
     mark_price: FixedDecimal,
     index_price: FixedDecimal,
     last_funding_rate: String,
+    funding_interval_hours: Option<String>,
     next_funding_time_ms: String,
     is_stale: bool,
 }
@@ -1927,6 +2936,11 @@ fn latest_basis_premium_index(
                 )
             })?
             .to_owned(),
+        funding_interval_hours: match event.payload.get("funding_interval_hours") {
+            Some(JsonValue::Number(value)) => Some(value.as_str().to_owned()),
+            Some(JsonValue::String(value)) => Some(value.to_owned()),
+            _ => None,
+        },
         next_funding_time_ms: match event.payload.get("next_funding_time_ms") {
             Some(JsonValue::Number(value)) => value.as_str().to_owned(),
             Some(JsonValue::String(value)) => value.to_owned(),
@@ -1985,6 +2999,25 @@ fn gross_basis_bps(perp_bid: FixedDecimal, spot_ask: FixedDecimal) -> Result<i12
         .ok_or_else(|| "basis bps calculation overflowed".to_owned())
 }
 
+fn price_divergence_bps(left: FixedDecimal, right: FixedDecimal) -> Result<i128, String> {
+    if left.raw <= 0 || right.raw <= 0 {
+        return Err("entry prices must be greater than zero".to_owned());
+    }
+    let diff = left
+        .raw
+        .checked_sub(right.raw)
+        .and_then(|value| value.checked_abs())
+        .ok_or_else(|| "entry price divergence calculation overflowed".to_owned())?;
+    let midpoint = left
+        .raw
+        .checked_add(right.raw)
+        .and_then(|value| value.checked_div(2))
+        .ok_or_else(|| "entry price midpoint calculation overflowed".to_owned())?;
+    diff.checked_mul(10_000)
+        .and_then(|value| value.checked_div(midpoint))
+        .ok_or_else(|| "entry price divergence calculation overflowed".to_owned())
+}
+
 fn tradable_close_basis_bps(
     perp_ask: FixedDecimal,
     spot_bid: FixedDecimal,
@@ -1998,6 +3031,31 @@ fn tradable_close_basis_bps(
         .and_then(|value| value.checked_mul(10_000))
         .and_then(|value| value.checked_div(spot_bid.raw))
         .ok_or_else(|| "close basis bps calculation overflowed".to_owned())
+}
+
+fn parse_positive_u64(field: &'static str, value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("field `{field}` must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("field `{field}` must be greater than zero"));
+    }
+    Ok(parsed)
+}
+
+fn normalize_funding_rate_to_8h(
+    rate: FixedDecimal,
+    interval_hours: u64,
+) -> Result<FixedDecimal, String> {
+    if interval_hours == 0 {
+        return Err("funding interval must be greater than zero".to_owned());
+    }
+    let raw = rate
+        .raw
+        .checked_mul(8)
+        .and_then(|value| value.checked_div(i128::from(interval_hours)))
+        .ok_or_else(|| "funding interval normalization overflowed".to_owned())?;
+    Ok(FixedDecimal { raw })
 }
 
 fn nullable_identifier_matches(value: &Option<Option<Identifier>>, expected: &str) -> bool {
@@ -2370,6 +3428,91 @@ mod tests {
         assert_eq!(
             evaluation.diagnostics()[0].code(),
             "SPOT_PERP_BASIS_CANDIDATE"
+        );
+    }
+
+    #[test]
+    fn cross_exchange_funding_strategy_outputs_candidate() {
+        let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
+        let context = basis_test_context(cross_exchange_funding_events(
+            "0.00010000",
+            "0.00300000",
+            "8",
+            "8",
+        ));
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        let candidate = evaluation.candidate().expect("candidate");
+        assert_eq!(
+            candidate.transition_id.as_str(),
+            CROSS_EXCHANGE_FUNDING_ARB_TRANSITION_ID
+        );
+        assert_eq!(candidate.legs.len(), 2);
+        assert_eq!(
+            candidate.legs[0].side.as_ref().expect("side").as_str(),
+            "Long"
+        );
+        assert_eq!(
+            candidate.legs[1].side.as_ref().expect("side").as_str(),
+            "Short"
+        );
+        assert_eq!(
+            leg_constraint(candidate, 0, "basis_leg_role"),
+            Some("perp_long")
+        );
+        assert_eq!(
+            leg_constraint(candidate, 1, "basis_leg_role"),
+            Some("perp_short")
+        );
+        assert_eq!(
+            candidate.expected_economics.expected_profit_bps.as_str(),
+            "14"
+        );
+        assert_eq!(
+            candidate.expected_economics.expected_profit_usd.as_str(),
+            "0.14"
+        );
+        assert!(candidate.margin_impact.is_some());
+        assert!(candidate.risk_flags.is_empty());
+    }
+
+    #[test]
+    fn cross_exchange_funding_strategy_normalizes_interval_mismatch() {
+        let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
+        let context = basis_test_context(cross_exchange_funding_events(
+            "0.00010000",
+            "0.00050000",
+            "8",
+            "1",
+        ));
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        let candidate = evaluation.candidate().expect("candidate");
+        assert_eq!(
+            candidate.expected_economics.expected_profit_bps.as_str(),
+            "24"
+        );
+    }
+
+    #[test]
+    fn cross_exchange_funding_strategy_rejects_missing_capability() {
+        let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
+        let mut context = basis_test_context(cross_exchange_funding_events(
+            "0.00010000",
+            "0.00300000",
+            "8",
+            "8",
+        ));
+        context.capabilities.has_basis_funding = false;
+
+        let evaluation = strategy.evaluate(&context).expect("evaluation");
+
+        assert!(evaluation.candidate().is_none());
+        assert_eq!(
+            evaluation.rejection().expect("rejection").reason().as_str(),
+            StrategyRejectReason::VenueCapabilityMissing.as_str()
         );
     }
 
@@ -2800,6 +3943,98 @@ mod tests {
     }
 
     #[test]
+    fn cross_exchange_funding_signal_outputs_candidate_when_spread_survives_costs() {
+        let signal =
+            evaluate_cross_exchange_funding_arb_signal(&cross_exchange_funding_signal_input())
+                .expect("signal");
+
+        assert!(signal.is_candidate);
+        assert_eq!(signal.gross_funding_spread_bps, 29);
+        assert_eq!(signal.total_cost_bps, 15);
+        assert_eq!(signal.net_funding_bps, 14);
+        assert_eq!(signal.expected_funding_usd, "0.14");
+        assert_eq!(signal.fee_estimate_usd, "0.11");
+        assert_eq!(signal.slippage_estimate_usd, "0.04");
+        assert_eq!(signal.long_ask_depth_usd.as_deref(), Some("200"));
+        assert_eq!(signal.short_bid_depth_usd.as_deref(), Some("200.1"));
+        assert_eq!(signal.quantity, "1");
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_rejects_insufficient_spread() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.short_funding_rate = "0.00100000".to_owned();
+
+        let signal = evaluate_cross_exchange_funding_arb_signal(&input).expect("signal");
+
+        assert!(!signal.is_candidate);
+        assert!(signal
+            .reason
+            .as_deref()
+            .expect("reason")
+            .contains("below minimum"));
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_rejects_insufficient_depth() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.long_ask_size = Some("0.5".to_owned());
+
+        let signal = evaluate_cross_exchange_funding_arb_signal(&input).expect("signal");
+
+        assert!(!signal.is_candidate);
+        assert_eq!(signal.long_ask_depth_usd.as_deref(), Some("50"));
+        assert!(signal
+            .reason
+            .as_deref()
+            .expect("reason")
+            .contains("insufficient top-of-book depth"));
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_normalizes_hourly_funding_interval() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.short_funding_rate = "0.00050000".to_owned();
+        input.funding_interval_hours = "1".to_owned();
+
+        let signal = evaluate_cross_exchange_funding_arb_signal(&input).expect("signal");
+
+        assert!(signal.is_candidate);
+        assert_eq!(signal.gross_funding_spread_bps, 32);
+        assert_eq!(signal.net_funding_bps, 17);
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_rejects_entry_price_divergence() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.short_best_bid = "104.00".to_owned();
+
+        let signal = evaluate_cross_exchange_funding_arb_signal(&input).expect("signal");
+
+        assert!(!signal.is_candidate);
+        assert!(signal
+            .reason
+            .as_deref()
+            .expect("reason")
+            .contains("entry_price_divergence_bps"));
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_rejects_invalid_config() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.notional_usd = "0".to_owned();
+        assert!(evaluate_cross_exchange_funding_arb_signal(&input)
+            .expect_err("zero notional must fail")
+            .contains("notional_usd"));
+
+        let mut input = cross_exchange_funding_signal_input();
+        input.long_taker_fee_bps = -1;
+        assert!(evaluate_cross_exchange_funding_arb_signal(&input)
+            .expect_err("negative fee must fail")
+            .contains("long_taker_fee_bps"));
+    }
+
+    #[test]
     fn spot_perp_basis_exit_signal_closes_on_profit_or_convergence() {
         let signal = evaluate_spot_perp_basis_exit_signal(&basis_exit_input("100.90", "101.00"))
             .expect("exit signal");
@@ -3136,6 +4371,7 @@ mod tests {
                     | BINANCE_BASIS_STRATEGY_ID
                     | BYBIT_BASIS_STRATEGY_ID
                     | OKX_BASIS_STRATEGY_ID
+                    | CROSS_EXCHANGE_FUNDING_ARB_STRATEGY_ID
             ) && self.disabled_strategy
         }
 
@@ -3180,6 +4416,111 @@ mod tests {
             },
             time: FixedTimeSource::from_rfc3339_z("2026-01-01T00:00:02Z").expect("fixed time"),
         }
+    }
+
+    fn cross_exchange_funding_signal_input() -> CrossExchangeFundingArbSignalInput {
+        CrossExchangeFundingArbSignalInput {
+            symbol: "BTCUSDT".to_owned(),
+            long_venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+            short_venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+            long_best_bid: "99.95".to_owned(),
+            long_best_ask: "100.00".to_owned(),
+            long_ask_size: Some("2.0".to_owned()),
+            short_best_bid: "100.05".to_owned(),
+            short_best_ask: "100.10".to_owned(),
+            short_bid_size: Some("2.0".to_owned()),
+            long_funding_rate: "0.00010000".to_owned(),
+            short_funding_rate: "0.00300000".to_owned(),
+            funding_interval_hours: "8".to_owned(),
+            notional_usd: "100.00".to_owned(),
+            long_taker_fee_bps: 5,
+            short_taker_fee_bps: 6,
+            slippage_buffer_bps: 4,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: 5,
+        }
+    }
+
+    fn cross_exchange_funding_events(
+        binance_funding_rate: &str,
+        bybit_funding_rate: &str,
+        binance_interval_hours: &str,
+        bybit_interval_hours: &str,
+    ) -> Vec<NormalizedEvent> {
+        vec![
+            basis_book_event(
+                "funding-binance",
+                BINANCE_BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_INSTRUMENT_ID,
+                "Perp",
+                "99.95",
+                "100.00",
+                "CHECK_PASSED",
+            ),
+            basis_book_event(
+                "funding-bybit",
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                "Perp",
+                "100.05",
+                "100.10",
+                "CHECK_PASSED",
+            ),
+            funding_premium_event(
+                "binance",
+                BINANCE_BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_INSTRUMENT_ID,
+                binance_funding_rate,
+                binance_interval_hours,
+            ),
+            funding_premium_event(
+                "bybit",
+                BYBIT_BASIS_PERP_VENUE_ID,
+                BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                bybit_funding_rate,
+                bybit_interval_hours,
+            ),
+        ]
+    }
+
+    fn funding_premium_event(
+        tag: &str,
+        venue_id: &str,
+        instrument_id: &str,
+        last_funding_rate: &str,
+        funding_interval_hours: &str,
+    ) -> NormalizedEvent {
+        normalized_event_from_json_strict(&format!(
+            r#"{{
+  "event_id": "event:funding-arb-test:{tag}:premium-index",
+  "event_type": "NormalizedMarketDataEvent",
+  "event_version": "1.0.0",
+  "timestamp_event": "2026-01-01T00:00:01Z",
+  "timestamp_ingested": "2026-01-01T00:00:02Z",
+  "source": "test:funding-arb",
+  "source_sequence": "funding-arb-test:{tag}:premium-index",
+  "correlation_id": "corr:funding-arb-test:{tag}:premium-index",
+  "schema_version": "1.0.0",
+  "venue_id": {},
+  "instrument_id": {},
+  "payload": {{
+    "basis_role": "Perp",
+    "funding_interval_hours": {},
+    "index_price": "100.00",
+    "kind": "PerpPremiumIndex",
+    "last_funding_rate": {},
+    "mark_price": "100.00",
+    "next_funding_time_ms": 1767254400000,
+    "risk_reason_code": "CHECK_PASSED"
+  }},
+  "checksum": "sha256:fixture-funding-arb-premium-{tag}"
+}}"#,
+            json_string(venue_id),
+            json_string(instrument_id),
+            json_string(funding_interval_hours),
+            json_string(last_funding_rate),
+        ))
+        .expect("funding premium event")
     }
 
     fn bybit_basis_test_context(
@@ -3308,6 +4649,22 @@ mod tests {
         last_funding_rate: &str,
         risk_reason_code: &str,
     ) -> NormalizedEvent {
+        basis_premium_event_for_with_interval(
+            venue_id,
+            instrument_id,
+            last_funding_rate,
+            "8",
+            risk_reason_code,
+        )
+    }
+
+    fn basis_premium_event_for_with_interval(
+        venue_id: &str,
+        instrument_id: &str,
+        last_funding_rate: &str,
+        funding_interval_hours: &str,
+        risk_reason_code: &str,
+    ) -> NormalizedEvent {
         normalized_event_from_json_strict(&format!(
             r#"{{
   "event_id": "event:basis-test:premium-index",
@@ -3323,6 +4680,7 @@ mod tests {
   "instrument_id": {},
   "payload": {{
     "basis_role": "Perp",
+    "funding_interval_hours": {},
     "index_price": "100.00",
     "kind": "PerpPremiumIndex",
     "last_funding_rate": {},
@@ -3334,6 +4692,7 @@ mod tests {
 }}"#,
             json_string(venue_id),
             json_string(instrument_id),
+            json_string(funding_interval_hours),
             json_string(last_funding_rate),
             json_string(risk_reason_code),
         ))

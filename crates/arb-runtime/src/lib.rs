@@ -60,14 +60,16 @@ use arb_reconciliation::{
 };
 use arb_replay::{ReplayInput, TimeSource as ReplayTimeSource};
 use arb_risk::{RiskEvaluationInput, RiskEvaluator, StaticRiskEvaluator};
+use arb_strategies::{
+    evaluate_cross_exchange_funding_arb_signal, evaluate_spot_perp_basis_signal,
+    sample_spot_strategy, CrossExchangeFundingArbSignalInput, CrossExchangeFundingArbStrategy,
+    CrossExchangeFundingArbStrategyConfig, CrossExchangeFundingLegConfig, SpotPerpBasisSignal,
+    SpotPerpBasisSignalInput, SpotPerpBasisStrategy, SpotPerpBasisStrategyConfig,
+};
 #[cfg(feature = "live-exec")]
 use arb_strategies::{
     evaluate_spot_perp_basis_exit_signal, SpotPerpBasisAdlState, SpotPerpBasisExitDecision,
-    SpotPerpBasisExitSignal, SpotPerpBasisExitSignalInput, SpotPerpBasisSignal,
-};
-use arb_strategies::{
-    evaluate_spot_perp_basis_signal, sample_spot_strategy, SpotPerpBasisSignalInput,
-    SpotPerpBasisStrategy, SpotPerpBasisStrategyConfig,
+    SpotPerpBasisExitSignal, SpotPerpBasisExitSignalInput,
 };
 use arb_strategy_api::{
     CandidateTransitionOutput, FixedTimeSource as StrategyFixedTimeSource, ReadOnlySnapshot,
@@ -238,6 +240,7 @@ const OKX_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8798";
 const HYPERLIQUID_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8799";
 const ASTER_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8800";
 const BITGET_BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8803";
+const FUNDING_ARB_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8804";
 const BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8801";
 const BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
@@ -364,6 +367,394 @@ module_error_from!(arb_venue_exec::VenueExecError, "arb-venue-exec");
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeOptions {
     pub accept_golden: bool,
+}
+
+/// 交易所套利能力画像。
+///
+/// 中文说明：这是运行时对交易所能力的单一事实来源。策略和管线仍消费合同层的
+/// `VenueCapabilityDescriptor`，但这些 descriptor 由这里的画像派生，避免在多个
+/// monitor 或测试入口重复编码交易所假设。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbVenueCapabilityProfile {
+    pub venue_family: String,
+    pub supports_spot: bool,
+    pub supports_linear_perp: bool,
+    pub supports_swap: bool,
+    pub supports_funding_rate: bool,
+    pub supports_mark_index_price: bool,
+    pub supports_top_of_book_size: bool,
+    pub funding_interval_hours: Option<u64>,
+    pub dry_run_execution_supported: bool,
+}
+
+impl ArbVenueCapabilityProfile {
+    pub fn supports_spot_perp_basis(&self) -> bool {
+        self.supports_spot
+            && (self.supports_linear_perp || self.supports_swap)
+            && self.supports_funding_rate
+            && self.supports_mark_index_price
+            && self.supports_top_of_book_size
+            && self.dry_run_execution_supported
+    }
+
+    pub fn supports_cross_exchange_funding_arb(&self) -> bool {
+        (self.supports_linear_perp || self.supports_swap)
+            && self.supports_funding_rate
+            && self.supports_mark_index_price
+            && self.supports_top_of_book_size
+            && self.dry_run_execution_supported
+    }
+}
+
+pub const SPOT_PERP_BASIS_OBSERVER_STRATEGY: &str = "spot-perp-basis";
+pub const CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY: &str = "cross-exchange-funding-arb";
+
+/// 单交易所策略支持矩阵行。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbVenueStrategySupport {
+    pub venue_family: String,
+    pub supports_spot_perp_basis: bool,
+    pub supports_cross_exchange_funding_arb: bool,
+}
+
+/// 跨交易所资金费率套利的无向交易所组合。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingArbVenuePair {
+    pub venue_a: String,
+    pub venue_b: String,
+}
+
+/// 统一机会 observer 的稳定产物路径。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbOpportunityObserverArtifactPaths {
+    pub root: PathBuf,
+    pub spot_perp_basis_opportunities: PathBuf,
+    pub cross_exchange_funding_arb_opportunities: PathBuf,
+    pub dry_run_reports: PathBuf,
+    pub health_events: PathBuf,
+}
+
+/// 返回六交易所能力矩阵。
+pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
+    vec![
+        ArbVenueCapabilityProfile {
+            venue_family: "binance".to_owned(),
+            supports_spot: true,
+            supports_linear_perp: true,
+            supports_swap: false,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(8),
+            dry_run_execution_supported: true,
+        },
+        ArbVenueCapabilityProfile {
+            venue_family: "bybit".to_owned(),
+            supports_spot: true,
+            supports_linear_perp: true,
+            supports_swap: false,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(8),
+            dry_run_execution_supported: true,
+        },
+        ArbVenueCapabilityProfile {
+            venue_family: "okx".to_owned(),
+            supports_spot: true,
+            supports_linear_perp: false,
+            supports_swap: true,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(8),
+            dry_run_execution_supported: true,
+        },
+        ArbVenueCapabilityProfile {
+            venue_family: "bitget".to_owned(),
+            supports_spot: true,
+            supports_linear_perp: true,
+            supports_swap: false,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(8),
+            dry_run_execution_supported: true,
+        },
+        ArbVenueCapabilityProfile {
+            venue_family: "aster".to_owned(),
+            supports_spot: false,
+            supports_linear_perp: true,
+            supports_swap: false,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(8),
+            dry_run_execution_supported: true,
+        },
+        ArbVenueCapabilityProfile {
+            venue_family: "hyperliquid".to_owned(),
+            supports_spot: false,
+            supports_linear_perp: true,
+            supports_swap: false,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(1),
+            dry_run_execution_supported: true,
+        },
+    ]
+}
+
+pub fn arb_venue_capability_profile(venue_family: &str) -> Option<ArbVenueCapabilityProfile> {
+    let normalized = normalize_venue_family(venue_family);
+    arb_venue_capability_profiles()
+        .into_iter()
+        .find(|profile| profile.venue_family == normalized)
+}
+
+/// 返回六交易所双策略支持矩阵。
+pub fn arb_venue_strategy_support_matrix() -> Vec<ArbVenueStrategySupport> {
+    arb_venue_capability_profiles()
+        .into_iter()
+        .map(|profile| ArbVenueStrategySupport {
+            venue_family: profile.venue_family.clone(),
+            supports_spot_perp_basis: profile.supports_spot_perp_basis(),
+            supports_cross_exchange_funding_arb: profile.supports_cross_exchange_funding_arb(),
+        })
+        .collect()
+}
+
+/// 返回支持跨所 funding arb 的 15 个无向交易所组合。
+pub fn cross_exchange_funding_arb_venue_pairs() -> Vec<CrossExchangeFundingArbVenuePair> {
+    let venues = arb_venue_capability_profiles()
+        .into_iter()
+        .filter(|profile| profile.supports_cross_exchange_funding_arb())
+        .map(|profile| profile.venue_family)
+        .collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+    for left in 0..venues.len() {
+        for right in (left + 1)..venues.len() {
+            pairs.push(CrossExchangeFundingArbVenuePair {
+                venue_a: venues[left].clone(),
+                venue_b: venues[right].clone(),
+            });
+        }
+    }
+    pairs
+}
+
+/// 返回统一机会 observer 的标准输出文件位置。
+pub fn arb_opportunity_observer_artifact_paths(
+    root: impl AsRef<Path>,
+) -> ArbOpportunityObserverArtifactPaths {
+    let root = root.as_ref().to_path_buf();
+    ArbOpportunityObserverArtifactPaths {
+        spot_perp_basis_opportunities: root
+            .join("opportunities")
+            .join(format!("{SPOT_PERP_BASIS_OBSERVER_STRATEGY}.jsonl")),
+        cross_exchange_funding_arb_opportunities: root.join("opportunities").join(format!(
+            "{CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY}.jsonl"
+        )),
+        dry_run_reports: root.join("dry-run").join("dry-run-reports.jsonl"),
+        health_events: root.join("logs").join("health-events.jsonl"),
+        root,
+    }
+}
+
+/// 从能力画像派生合同层 venue capability descriptor。
+pub fn arb_venue_capability_descriptors(
+    venue_family: &str,
+) -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
+    let normalized = normalize_venue_family(venue_family);
+    let Some(profile) = arb_venue_capability_profile(&normalized) else {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("unknown venue family `{venue_family}`"),
+        });
+    };
+
+    let mut descriptors = Vec::new();
+    match normalized.as_str() {
+        "binance" => {
+            if profile.supports_spot {
+                descriptors.push(public_venue_capability_descriptor(
+                    "venue:BINANCE-SPOT",
+                    "Binance Spot Public REST",
+                    &["ProvidesSpotMarkets", "ProvidesOrderBookMarkets"],
+                    &["RESTPolling", "RateLimitHeaders"],
+                    "binance-public-rest",
+                    1200,
+                    60_000,
+                )?);
+            }
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:BINANCE-USDM",
+                "Binance USD-M Public REST",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &["RESTPolling", "RateLimitHeaders", "FundingHistory"],
+                "binance-public-futures-rest",
+                2400,
+                60_000,
+            )?);
+        }
+        "bybit" => {
+            if profile.supports_spot {
+                descriptors.push(public_venue_capability_descriptor(
+                    "venue:BYBIT-SPOT",
+                    "Bybit Spot Public REST",
+                    &["ProvidesSpotMarkets", "ProvidesOrderBookMarkets"],
+                    &["RESTPolling", "RateLimitHeaders"],
+                    "bybit-public-spot-rest",
+                    600,
+                    5_000,
+                )?);
+            }
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:BYBIT-LINEAR",
+                "Bybit Linear Public REST",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &["RESTPolling", "RateLimitHeaders", "FundingHistory"],
+                "bybit-public-linear-rest",
+                600,
+                5_000,
+            )?);
+        }
+        "okx" => {
+            if profile.supports_spot {
+                descriptors.push(public_venue_capability_descriptor(
+                    "venue:OKX-SPOT",
+                    "OKX Spot Public REST",
+                    &["ProvidesSpotMarkets", "ProvidesOrderBookMarkets"],
+                    &["RESTPolling", "RateLimitHeaders"],
+                    "okx-public-rest",
+                    600,
+                    2_000,
+                )?);
+            }
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:OKX-SWAP",
+                "OKX Swap Public REST",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &["RESTPolling", "RateLimitHeaders", "FundingHistory"],
+                "okx-public-swap-rest",
+                600,
+                2_000,
+            )?);
+        }
+        "bitget" => {
+            if profile.supports_spot {
+                descriptors.push(public_venue_capability_descriptor(
+                    "venue:BITGET-SPOT",
+                    "Bitget Spot Public REST",
+                    &["ProvidesSpotMarkets", "ProvidesOrderBookMarkets"],
+                    &["RESTPolling", "RateLimitHeaders"],
+                    "bitget-public-spot-rest",
+                    600,
+                    60_000,
+                )?);
+            }
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:BITGET-USDT-FUTURES",
+                "Bitget USDT Futures Public REST",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &["RESTPolling", "RateLimitHeaders", "FundingHistory"],
+                "bitget-public-usdt-futures-rest",
+                600,
+                60_000,
+            )?);
+        }
+        "aster" => {
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:ASTER-USDT-FUTURES",
+                "Aster USDT Futures Public REST",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &["RESTPolling", "RateLimitHeaders", "FundingHistory"],
+                "aster-public-futures-rest",
+                2400,
+                60_000,
+            )?);
+        }
+        "hyperliquid" => {
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:HYPERLIQUID-PERP",
+                "Hyperliquid Perp Public Info",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &["RESTPolling", "FundingHistory"],
+                "hyperliquid-public-info",
+                1200,
+                60_000,
+            )?);
+        }
+        _ => unreachable!("venue family checked above"),
+    }
+
+    Ok(descriptors)
+}
+
+fn normalize_venue_family(venue_family: &str) -> String {
+    venue_family
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-'], "")
+}
+
+fn public_venue_capability_descriptor(
+    venue_id: &str,
+    venue_name: &str,
+    market_capabilities: &[&str],
+    data_surfaces: &[&str],
+    rate_limit_source: &str,
+    rate_limit: u64,
+    rate_limit_window_ms: u64,
+) -> RuntimeResult<VenueCapabilityDescriptor> {
+    let market_capabilities = json_static_string_array(market_capabilities);
+    let data_surfaces = json_static_string_array(data_surfaces);
+    let descriptor = format!(
+        r#"{{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":{data_surfaces},"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true}},"market_capabilities":{market_capabilities},"permission_model":{{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false}},"rate_limit_model":{{"limit":{rate_limit},"source":{},"unit":"Request","window_ms":{rate_limit_window_ms}}},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":{},"venue_name":{}}}"#,
+        json_string(rate_limit_source),
+        json_string(venue_id),
+        json_string(venue_name),
+    );
+    Ok(from_json_strict::<VenueCapabilityDescriptor>(&descriptor)?)
+}
+
+fn json_static_string_array(values: &[&str]) -> String {
+    let values = values
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    json_string_array(&values)
 }
 
 /// 运行时启动检查状态。
@@ -765,6 +1156,22 @@ pub struct BinancePreDispatchDryRunReport {
     pub dispatch_allowed: bool,
     pub blocking_reasons: Vec<String>,
     pub output_dir: Option<PathBuf>,
+}
+
+/// 跨所 funding arb guarded dry-run 报告。
+///
+/// 中文说明：该报告只证明公开信号、人工门禁预览和分发前计划数量可被构建；
+/// `dispatch_attempted=false` 和 `mutable_execution_started=false` 表示没有真实下单、
+/// 撤单、转账或签名。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbGuardedDryRunReport {
+    pub signal_allowed: bool,
+    pub risk_decision: String,
+    pub manual_gate_released: bool,
+    pub dispatch_plan_built: bool,
+    pub dispatch_request_count: usize,
+    pub dispatch_attempted: bool,
+    pub mutable_execution_started: bool,
 }
 
 /// Binance BTCUSDT 受控实盘分发选项。
@@ -1322,6 +1729,65 @@ impl Default for AsterBasisMonitorOptions {
             output_dir: None,
         }
     }
+}
+
+/// 跨交易所资金费率套利 observer 选项。
+///
+/// 中文说明：该 observer 只读取本机各 basis monitor 暴露的公开 `/status` 快照，
+/// 聚合 perp top-of-book 与 funding rate，不访问交易所私有接口。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbMonitorOptions {
+    pub bind_addr: String,
+    pub poll_interval_secs: u64,
+    pub notional_usd: String,
+    pub taker_fee_bps: i128,
+    pub slippage_buffer_bps: i128,
+    pub max_entry_price_divergence_bps: i128,
+    pub min_net_funding_bps: i128,
+    pub once: bool,
+    pub output_dir: Option<PathBuf>,
+    pub sources: Vec<FundingArbVenueSource>,
+}
+
+impl Default for FundingArbMonitorOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: FUNDING_ARB_MONITOR_DEFAULT_BIND_ADDR.to_owned(),
+            poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+            once: false,
+            output_dir: None,
+            sources: default_funding_arb_venue_sources(),
+        }
+    }
+}
+
+/// funding arb observer 的单个 venue 数据源。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbVenueSource {
+    pub venue_family: String,
+    pub status_url: String,
+}
+
+/// funding arb observer 候选的单次 guarded dry-run 选项。
+///
+/// 中文说明：该入口只消费本机 funding arb observer 写出的只读快照，不访问私有接口，
+/// 不提交订单、不撤单、不签名。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbGuardedDryRunOnceOptions {
+    pub config_path: PathBuf,
+    pub snapshot_path: PathBuf,
+    pub pair_id: String,
+    pub output_dir: Option<PathBuf>,
+    pub notional_usd: String,
+    pub taker_fee_bps: i128,
+    pub slippage_buffer_bps: i128,
+    pub max_entry_price_divergence_bps: i128,
+    pub min_net_funding_bps: i128,
 }
 
 /// 单个 symbol 的实时 basis 行情行。
@@ -9359,6 +9825,90 @@ pub fn run_aster_basis_monitor(options: AsterBasisMonitorOptions) -> RuntimeResu
     Ok(())
 }
 
+/// 运行跨交易所 funding arb 专用 observer。
+///
+/// 中文说明：该 observer 只读取本机 basis monitor 的公开 JSON 快照，将六个 venue
+/// 的 perp funding 数据聚合成跨所 pair 机会。缺报价、缺盘口数量或上游状态未知时
+/// 都按非候选处理，并在 `source_status`/`reason` 中保留原因。
+pub fn run_funding_arb_monitor(options: FundingArbMonitorOptions) -> RuntimeResult<()> {
+    validate_funding_arb_monitor_options(&options)?;
+    let state = Arc::new(RwLock::new(FundingArbMonitorSnapshot::empty(&options)));
+    if !options.once {
+        start_funding_arb_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "funding-arb-monitor: api=http://{} poll_interval_secs={} min_net_funding_bps={} mutable_execution_started=false",
+            options.bind_addr, options.poll_interval_secs, options.min_net_funding_bps
+        );
+    }
+
+    loop {
+        match fetch_funding_arb_monitor_snapshot(&options) {
+            Ok(snapshot) => {
+                if let Some(dir) = &options.output_dir {
+                    write_funding_arb_monitor_snapshot(dir, &snapshot)?;
+                }
+                *state.write().expect("monitor state lock poisoned") = snapshot;
+            }
+            Err(error) => {
+                if options.once {
+                    return Err(error);
+                }
+                let mut snapshot = state.write().expect("monitor state lock poisoned");
+                snapshot.status = "degraded".to_owned();
+                snapshot.last_error = Some(error.to_string());
+                snapshot.updated_at = current_utc_timestamp()
+                    .map(|timestamp| timestamp.to_string())
+                    .unwrap_or_else(|_| "unknown".to_owned());
+            }
+        }
+
+        if options.once {
+            break;
+        }
+        thread::sleep(Duration::from_secs(options.poll_interval_secs));
+    }
+    Ok(())
+}
+
+fn default_funding_arb_venue_sources() -> Vec<FundingArbVenueSource> {
+    vec![
+        FundingArbVenueSource {
+            venue_family: "binance".to_owned(),
+            status_url: format!("http://{BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/basis/status"),
+        },
+        FundingArbVenueSource {
+            venue_family: "bybit".to_owned(),
+            status_url: format!(
+                "http://{BYBIT_BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/bybit-basis/status"
+            ),
+        },
+        FundingArbVenueSource {
+            venue_family: "okx".to_owned(),
+            status_url: format!(
+                "http://{OKX_BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/okx-basis/status"
+            ),
+        },
+        FundingArbVenueSource {
+            venue_family: "bitget".to_owned(),
+            status_url: format!(
+                "http://{BITGET_BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/bitget-basis/status"
+            ),
+        },
+        FundingArbVenueSource {
+            venue_family: "aster".to_owned(),
+            status_url: format!(
+                "http://{ASTER_BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/aster-basis/status"
+            ),
+        },
+        FundingArbVenueSource {
+            venue_family: "hyperliquid".to_owned(),
+            status_url: format!(
+                "http://{HYPERLIQUID_BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/hyperliquid-basis/status"
+            ),
+        },
+    ]
+}
+
 fn validate_monitor_options(options: &BinanceBasisMonitorOptions) -> RuntimeResult<()> {
     validate_basis_monitor_values(
         options.poll_interval_secs,
@@ -9407,6 +9957,46 @@ fn validate_aster_monitor_options(options: &AsterBasisMonitorOptions) -> Runtime
         &options.min_abs_funding_rate,
         &options.notional_usd,
     )
+}
+
+fn validate_funding_arb_monitor_options(options: &FundingArbMonitorOptions) -> RuntimeResult<()> {
+    if options.poll_interval_secs == 0 {
+        return Err(cli_arg_error("poll interval must be greater than zero"));
+    }
+    if options.sources.len() < 2 {
+        return Err(cli_arg_error(
+            "funding-arb-monitor requires at least two venue sources",
+        ));
+    }
+    MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    if options.taker_fee_bps < 0
+        || options.slippage_buffer_bps < 0
+        || options.max_entry_price_divergence_bps < 0
+        || options.min_net_funding_bps < 0
+    {
+        return Err(cli_arg_error(
+            "funding-arb-monitor bps values must be non-negative",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for source in &options.sources {
+        let family = normalize_venue_family(&source.venue_family);
+        if arb_venue_capability_profile(&family).is_none() {
+            return Err(cli_arg_error(format!(
+                "unsupported funding-arb-monitor venue `{}`",
+                source.venue_family
+            )));
+        }
+        if !seen.insert(family) {
+            return Err(cli_arg_error("duplicate funding-arb-monitor venue source"));
+        }
+        if source.status_url.trim().is_empty() {
+            return Err(cli_arg_error(
+                "funding-arb-monitor source URL cannot be empty",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_basis_monitor_values(
@@ -9623,7 +10213,7 @@ fn build_aster_basis_monitor_snapshot_from_json(
 
         let spot = spot_books.get(&premium.symbol);
         let perp = perp_books.get(&premium.symbol);
-        let (mut source_status, reason) = match (spot, perp) {
+        let (source_status, reason) = match (spot, perp) {
             (Some(_), Some(_)) => ("complete".to_owned(), None),
             (None, Some(_)) => {
                 missing_spot_count += 1;
@@ -9650,30 +10240,12 @@ fn build_aster_basis_monitor_snapshot_from_json(
         };
 
         let mut signal_error = None;
-        let signal = match (spot, perp) {
-            (Some(spot), Some(perp)) => {
-                match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
-                    symbol: premium.symbol.clone(),
-                    spot_best_bid: spot.bid_price.clone(),
-                    spot_best_ask: spot.ask_price.clone(),
-                    spot_ask_size: Some(spot.ask_qty.clone()),
-                    perp_best_bid: perp.bid_price.clone(),
-                    perp_best_ask: perp.ask_price.clone(),
-                    perp_bid_size: Some(perp.bid_qty.clone()),
-                    last_funding_rate: premium.last_funding_rate.clone(),
-                    notional_usd: options.notional_usd.clone(),
-                    spot_taker_fee_bps: options.spot_taker_fee_bps,
-                    perp_taker_fee_bps: options.perp_taker_fee_bps,
-                    slippage_buffer_bps: options.slippage_buffer_bps,
-                    min_net_bps: options.min_net_bps,
-                }) {
-                    Ok(signal) => Some(signal),
-                    Err(message) => {
-                        source_status = "invalid_quote".to_owned();
-                        signal_error = Some(message);
-                        None
-                    }
-                }
+        let signal: Option<SpotPerpBasisSignal> = match (spot, perp) {
+            (Some(_), Some(_)) => {
+                // Aster spot-perp basis is observed for market health only; executable dry-run
+                // profiles are not enabled, while perp/funding fields must stay usable by funding arb.
+                signal_error = Some("ASTER_SPOT_PERP_BASIS_DRY_RUN_NOT_SUPPORTED".to_owned());
+                None
             }
             _ => None,
         };
@@ -10342,30 +10914,12 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
         };
 
         let mut signal_error = None;
-        let signal = match spot {
-            Some(spot) => {
-                match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
-                    symbol: perp.coin.clone(),
-                    spot_best_bid: spot.price.clone(),
-                    spot_best_ask: spot.price.clone(),
-                    spot_ask_size: None,
-                    perp_best_bid: perp.price.clone(),
-                    perp_best_ask: perp.price.clone(),
-                    perp_bid_size: None,
-                    last_funding_rate: perp.funding_rate.clone(),
-                    notional_usd: options.notional_usd.clone(),
-                    spot_taker_fee_bps: options.spot_taker_fee_bps,
-                    perp_taker_fee_bps: options.perp_taker_fee_bps,
-                    slippage_buffer_bps: options.slippage_buffer_bps,
-                    min_net_bps: options.min_net_bps,
-                }) {
-                    Ok(signal) => Some(signal),
-                    Err(message) => {
-                        source_status = "invalid_quote".to_owned();
-                        signal_error = Some(message);
-                        None
-                    }
-                }
+        let signal: Option<SpotPerpBasisSignal> = match spot {
+            Some(_) => {
+                // Hyperliquid spot/perp context rows are not executable top-of-book rows with size.
+                source_status = "missing_top_of_book_size".to_owned();
+                signal_error = Some("MISSING_HYPERLIQUID_TOP_OF_BOOK_SIZE".to_owned());
+                None
             }
             None => None,
         };
@@ -10424,6 +10978,410 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
         last_error: None,
         rows,
     })
+}
+
+fn fetch_funding_arb_monitor_snapshot(
+    options: &FundingArbMonitorOptions,
+) -> RuntimeResult<FundingArbMonitorSnapshot> {
+    let mut snapshots = Vec::new();
+    let mut source_errors = Vec::new();
+    for source in &options.sources {
+        match fetch_public_json_with_curl(&source.status_url)
+            .and_then(|json| parse_funding_arb_basis_status_snapshot(&json, source))
+        {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => source_errors.push(format!("{}: {error}", source.venue_family)),
+        }
+    }
+
+    if snapshots.len() < 2 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "funding arb observer requires at least two healthy source snapshots; errors={}",
+                source_errors.join("; ")
+            ),
+        });
+    }
+    build_funding_arb_monitor_snapshot_from_sources(snapshots, source_errors, options)
+}
+
+fn parse_funding_arb_basis_status_snapshot(
+    input: &str,
+    source: &FundingArbVenueSource,
+) -> RuntimeResult<FundingArbVenueSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status = required_json_value_string(&fields, "status", "basis monitor status")?;
+    let _updated_at = required_json_value_string(&fields, "updated_at", "basis monitor status")?;
+    let rows_json = fields
+        .get("rows")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "basis monitor status is missing rows".to_owned(),
+        })?;
+    let venue_family = normalize_venue_family(&source.venue_family);
+    let interval_hours = funding_interval_hours_for_venue(&venue_family)?.to_string();
+    let mut rows = Vec::new();
+    for object in json_object_slices(rows_json)? {
+        let row_fields = parse_json_object_value_slices(object)?;
+        let symbol = required_json_value_string(&row_fields, "symbol", "basis monitor row")?;
+        let funding_rate =
+            required_json_value_string(&row_fields, "last_funding_rate", "basis monitor row")?;
+        if funding_rate.trim().is_empty() {
+            continue;
+        }
+        rows.push(FundingArbVenueMarket {
+            venue_family: venue_family.clone(),
+            base_asset: funding_base_asset_from_symbol(&symbol),
+            symbol,
+            perp_bid: optional_json_value_string(&row_fields, "perp_bid", "basis monitor row")?,
+            perp_ask: optional_json_value_string(&row_fields, "perp_ask", "basis monitor row")?,
+            perp_bid_qty: optional_json_value_string(
+                &row_fields,
+                "perp_bid_qty",
+                "basis monitor row",
+            )?,
+            perp_ask_qty: optional_json_value_string(
+                &row_fields,
+                "perp_ask_qty",
+                "basis monitor row",
+            )?,
+            funding_rate,
+            funding_interval_hours: interval_hours.clone(),
+            source_status: required_json_value_string(
+                &row_fields,
+                "source_status",
+                "basis monitor row",
+            )?,
+        });
+    }
+
+    Ok(FundingArbVenueSnapshot { status, rows })
+}
+
+fn build_funding_arb_monitor_snapshot_from_sources(
+    snapshots: Vec<FundingArbVenueSnapshot>,
+    source_errors: Vec<String>,
+    options: &FundingArbMonitorOptions,
+) -> RuntimeResult<FundingArbMonitorSnapshot> {
+    let updated_at = current_utc_timestamp()?.to_string();
+    let mut rows = Vec::new();
+    for left_index in 0..snapshots.len() {
+        for right_index in (left_index + 1)..snapshots.len() {
+            let left = &snapshots[left_index];
+            let right = &snapshots[right_index];
+            for left_market in &left.rows {
+                for right_market in right
+                    .rows
+                    .iter()
+                    .filter(|row| row.base_asset == left_market.base_asset)
+                {
+                    rows.push(funding_arb_pair_row(left_market, right_market, options)?);
+                }
+            }
+        }
+    }
+    rows.sort_by(|left, right| {
+        monitor_optional_i128(&right.net_funding_bps)
+            .cmp(&monitor_optional_i128(&left.net_funding_bps))
+            .then_with(|| left.pair_id.cmp(&right.pair_id))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
+    let source_error_count = source_errors.len()
+        + snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status != "healthy")
+            .count();
+    let status = if source_error_count == 0 {
+        "healthy"
+    } else {
+        "degraded"
+    }
+    .to_owned();
+    Ok(FundingArbMonitorSnapshot {
+        status,
+        updated_at,
+        min_net_funding_bps: options.min_net_funding_bps.to_string(),
+        total_rows: rows.len(),
+        candidate_count,
+        source_count: snapshots.len(),
+        source_error_count,
+        last_error: (!source_errors.is_empty()).then(|| source_errors.join("; ")),
+        rows,
+    })
+}
+
+fn funding_arb_pair_row(
+    venue_a: &FundingArbVenueMarket,
+    venue_b: &FundingArbVenueMarket,
+    options: &FundingArbMonitorOptions,
+) -> RuntimeResult<FundingArbMarketRow> {
+    let symbol = funding_display_symbol(&venue_a.base_asset);
+    let pair_id = format!(
+        "{}:{}:{}:{}",
+        venue_a.venue_family, venue_b.venue_family, venue_a.symbol, venue_b.symbol
+    );
+    let base_row = |is_candidate: bool,
+                    reason: Option<String>,
+                    source_status: String,
+                    long_venue_family: Option<String>,
+                    short_venue_family: Option<String>,
+                    gross_funding_spread_bps: Option<String>,
+                    total_cost_bps: Option<String>,
+                    net_funding_bps: Option<String>,
+                    expected_funding_usd: Option<String>| FundingArbMarketRow {
+        pair_id: pair_id.clone(),
+        symbol: symbol.clone(),
+        venue_a_family: venue_a.venue_family.clone(),
+        venue_b_family: venue_b.venue_family.clone(),
+        venue_a_bid: venue_a.perp_bid.clone().unwrap_or_default(),
+        venue_a_ask: venue_a.perp_ask.clone().unwrap_or_default(),
+        venue_a_bid_qty: venue_a.perp_bid_qty.clone().unwrap_or_default(),
+        venue_a_ask_qty: venue_a.perp_ask_qty.clone().unwrap_or_default(),
+        venue_a_funding_rate: normalize_funding_rate_string_to_8h(
+            &venue_a.funding_rate,
+            &venue_a.funding_interval_hours,
+        )
+        .unwrap_or_else(|_| venue_a.funding_rate.clone()),
+        venue_a_funding_interval_hours: "8".to_owned(),
+        venue_b_bid: venue_b.perp_bid.clone().unwrap_or_default(),
+        venue_b_ask: venue_b.perp_ask.clone().unwrap_or_default(),
+        venue_b_bid_qty: venue_b.perp_bid_qty.clone().unwrap_or_default(),
+        venue_b_ask_qty: venue_b.perp_ask_qty.clone().unwrap_or_default(),
+        venue_b_funding_rate: normalize_funding_rate_string_to_8h(
+            &venue_b.funding_rate,
+            &venue_b.funding_interval_hours,
+        )
+        .unwrap_or_else(|_| venue_b.funding_rate.clone()),
+        venue_b_funding_interval_hours: "8".to_owned(),
+        funding_interval_hours: "8".to_owned(),
+        long_venue_family,
+        short_venue_family,
+        gross_funding_spread_bps,
+        total_cost_bps,
+        net_funding_bps,
+        expected_funding_usd,
+        is_candidate,
+        reason,
+        source_status,
+    };
+
+    if !funding_arb_source_status_allows_perp(&venue_a.source_status)
+        || !funding_arb_source_status_allows_perp(&venue_b.source_status)
+    {
+        return Ok(base_row(
+            false,
+            Some(format!(
+                "source status is not complete enough for funding arb: {}={}, {}={}",
+                venue_a.venue_family,
+                venue_a.source_status,
+                venue_b.venue_family,
+                venue_b.source_status
+            )),
+            "source_not_ready".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let missing = funding_arb_missing_market_fields(venue_a, venue_b);
+    if !missing.is_empty() {
+        return Ok(base_row(
+            false,
+            Some(format!(
+                "missing required funding arb fields: {}",
+                missing.join(", ")
+            )),
+            "missing_perp_top_of_book".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let rate_a_8h = normalize_funding_rate_string_to_8h(
+        &venue_a.funding_rate,
+        &venue_a.funding_interval_hours,
+    )?;
+    let rate_b_8h = normalize_funding_rate_string_to_8h(
+        &venue_b.funding_rate,
+        &venue_b.funding_interval_hours,
+    )?;
+    let forward = evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+        symbol: symbol.clone(),
+        long_venue_id: venue_a.venue_family.clone(),
+        short_venue_id: venue_b.venue_family.clone(),
+        long_best_bid: venue_a.perp_bid.clone().unwrap_or_default(),
+        long_best_ask: venue_a.perp_ask.clone().unwrap_or_default(),
+        long_ask_size: venue_a.perp_ask_qty.clone(),
+        short_best_bid: venue_b.perp_bid.clone().unwrap_or_default(),
+        short_best_ask: venue_b.perp_ask.clone().unwrap_or_default(),
+        short_bid_size: venue_b.perp_bid_qty.clone(),
+        long_funding_rate: rate_a_8h.clone(),
+        short_funding_rate: rate_b_8h.clone(),
+        funding_interval_hours: "8".to_owned(),
+        notional_usd: options.notional_usd.clone(),
+        long_taker_fee_bps: options.taker_fee_bps,
+        short_taker_fee_bps: options.taker_fee_bps,
+        slippage_buffer_bps: options.slippage_buffer_bps,
+        max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+        min_net_funding_bps: options.min_net_funding_bps,
+    })
+    .map_err(|message| RuntimeError::LiveMarketData { message })?;
+    let reverse = evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+        symbol: symbol.clone(),
+        long_venue_id: venue_b.venue_family.clone(),
+        short_venue_id: venue_a.venue_family.clone(),
+        long_best_bid: venue_b.perp_bid.clone().unwrap_or_default(),
+        long_best_ask: venue_b.perp_ask.clone().unwrap_or_default(),
+        long_ask_size: venue_b.perp_ask_qty.clone(),
+        short_best_bid: venue_a.perp_bid.clone().unwrap_or_default(),
+        short_best_ask: venue_a.perp_ask.clone().unwrap_or_default(),
+        short_bid_size: venue_a.perp_bid_qty.clone(),
+        long_funding_rate: rate_b_8h,
+        short_funding_rate: rate_a_8h,
+        funding_interval_hours: "8".to_owned(),
+        notional_usd: options.notional_usd.clone(),
+        long_taker_fee_bps: options.taker_fee_bps,
+        short_taker_fee_bps: options.taker_fee_bps,
+        slippage_buffer_bps: options.slippage_buffer_bps,
+        max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+        min_net_funding_bps: options.min_net_funding_bps,
+    })
+    .map_err(|message| RuntimeError::LiveMarketData { message })?;
+
+    let selected = if forward.net_funding_bps >= reverse.net_funding_bps {
+        (
+            &forward,
+            venue_a.venue_family.clone(),
+            venue_b.venue_family.clone(),
+        )
+    } else {
+        (
+            &reverse,
+            venue_b.venue_family.clone(),
+            venue_a.venue_family.clone(),
+        )
+    };
+    let reason = if selected.0.is_candidate {
+        None
+    } else {
+        Some(format!(
+            "forward={}, reverse={}",
+            forward
+                .reason
+                .clone()
+                .unwrap_or_else(|| "not a candidate".to_owned()),
+            reverse
+                .reason
+                .clone()
+                .unwrap_or_else(|| "not a candidate".to_owned())
+        ))
+    };
+    Ok(base_row(
+        selected.0.is_candidate,
+        reason,
+        "complete".to_owned(),
+        Some(selected.1),
+        Some(selected.2),
+        Some(selected.0.gross_funding_spread_bps.to_string()),
+        Some(selected.0.total_cost_bps.to_string()),
+        Some(selected.0.net_funding_bps.to_string()),
+        Some(selected.0.expected_funding_usd.clone()),
+    ))
+}
+
+fn funding_arb_source_status_allows_perp(source_status: &str) -> bool {
+    matches!(source_status, "complete" | "missing_spot")
+}
+
+fn funding_arb_missing_market_fields(
+    venue_a: &FundingArbVenueMarket,
+    venue_b: &FundingArbVenueMarket,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (prefix, venue) in [("venue_a", venue_a), ("venue_b", venue_b)] {
+        if venue.perp_bid.as_deref().unwrap_or("").trim().is_empty() {
+            missing.push(format!("{prefix}.perp_bid"));
+        }
+        if venue.perp_ask.as_deref().unwrap_or("").trim().is_empty() {
+            missing.push(format!("{prefix}.perp_ask"));
+        }
+        if venue
+            .perp_bid_qty
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            missing.push(format!("{prefix}.perp_bid_qty"));
+        }
+        if venue
+            .perp_ask_qty
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            missing.push(format!("{prefix}.perp_ask_qty"));
+        }
+    }
+    missing
+}
+
+fn normalize_funding_rate_string_to_8h(rate: &str, interval_hours: &str) -> RuntimeResult<String> {
+    let interval = parse_positive_u64_runtime("funding_interval_hours", interval_hours)?;
+    let normalized = MonitorDecimal::parse("funding_rate", rate)?
+        .checked_mul_i128(8, "funding rate normalization")?
+        .checked_div_i128(i128::from(interval), "funding rate normalization")?;
+    Ok(normalized.format_trimmed())
+}
+
+fn parse_positive_u64_runtime(field: &'static str, value: &str) -> RuntimeResult<u64> {
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: format!("{field} must be a positive integer"),
+        })?;
+    if parsed == 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{field} must be greater than zero"),
+        });
+    }
+    Ok(parsed)
+}
+
+fn funding_interval_hours_for_venue(venue_family: &str) -> RuntimeResult<u64> {
+    arb_venue_capability_profile(venue_family)
+        .and_then(|profile| profile.funding_interval_hours)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("venue `{venue_family}` lacks funding_interval_hours profile"),
+        })
+}
+
+fn funding_base_asset_from_symbol(symbol: &str) -> String {
+    let upper = symbol.trim().to_ascii_uppercase();
+    if let Some(base) = upper.strip_suffix("-USDT") {
+        return base.replace('-', "");
+    }
+    if let Some(base) = upper.strip_suffix("USDT") {
+        return base.to_owned();
+    }
+    upper.replace('-', "")
+}
+
+fn funding_display_symbol(base_asset: &str) -> String {
+    format!(
+        "{}USDT",
+        basis_identifier_component(base_asset).to_ascii_uppercase()
+    )
 }
 
 fn validate_live_market_symbol(symbol: &str) -> RuntimeResult<String> {
@@ -10965,7 +11923,51 @@ impl MonitorDecimal {
     }
 
     fn abs_less_than(self, other: Self) -> bool {
-        self.raw.abs() < other.raw.abs()
+        self.raw.unsigned_abs() < other.raw.unsigned_abs()
+    }
+
+    fn checked_mul_i128(self, value: i128, context: &'static str) -> RuntimeResult<Self> {
+        Ok(Self {
+            raw: self
+                .raw
+                .checked_mul(value)
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("{context} overflowed"),
+                })?,
+        })
+    }
+
+    fn checked_div_i128(self, value: i128, context: &'static str) -> RuntimeResult<Self> {
+        if value == 0 {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("{context} divided by zero"),
+            });
+        }
+        Ok(Self {
+            raw: self
+                .raw
+                .checked_div(value)
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("{context} overflowed"),
+                })?,
+        })
+    }
+
+    fn format_trimmed(self) -> String {
+        let negative = self.raw < 0;
+        let raw = self.raw.unsigned_abs();
+        let scale = 10_u128.pow(Self::SCALE_DIGITS as u32);
+        let whole = raw / scale;
+        let mut fraction = format!("{:018}", raw % scale);
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        let sign = if negative { "-" } else { "" };
+        if fraction.is_empty() {
+            format!("{sign}{whole}")
+        } else {
+            format!("{sign}{whole}.{fraction}")
+        }
     }
 }
 
@@ -12408,6 +13410,156 @@ impl BasisPipelineSpec {
     }
 }
 
+/// 跨交易所资金费率套利管线实例输入。
+///
+/// 中文说明：该规格只描述只读策略配置、公开 venue capability 和 dry-run
+/// 组合状态引用；不包含真实账户凭证或可变执行授权。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossExchangeFundingArbPipelineSpec {
+    pub strategy_config: CrossExchangeFundingArbStrategyConfig,
+    pub venue_capabilities: Vec<VenueCapabilityDescriptor>,
+    pub portfolio_state_id: String,
+    pub portfolio_state_hash: String,
+}
+
+impl CrossExchangeFundingArbPipelineSpec {
+    pub fn new(
+        strategy_config: CrossExchangeFundingArbStrategyConfig,
+        venue_capabilities: Vec<VenueCapabilityDescriptor>,
+        portfolio_state_id: impl Into<String>,
+        portfolio_state_hash: impl Into<String>,
+    ) -> RuntimeResult<Self> {
+        if venue_capabilities.is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: "funding arb pipeline spec requires at least one venue capability"
+                    .to_owned(),
+            });
+        }
+
+        let missing_venues = [
+            strategy_config.venues.venue_a.venue_id.as_str(),
+            strategy_config.venues.venue_b.venue_id.as_str(),
+        ]
+        .into_iter()
+        .filter(|required_venue| {
+            !venue_capabilities
+                .iter()
+                .any(|capability| capability.venue_id.as_str() == *required_venue)
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if !missing_venues.is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!(
+                    "funding arb pipeline spec is missing venue capabilities for {}",
+                    missing_venues.join(", ")
+                ),
+            });
+        }
+
+        let portfolio_state_id = portfolio_state_id.into();
+        if portfolio_state_id.trim().is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: "funding arb pipeline spec requires a portfolio_state_id".to_owned(),
+            });
+        }
+        let portfolio_state_hash = portfolio_state_hash.into();
+        if portfolio_state_hash.trim().is_empty() {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: "funding arb pipeline spec requires a portfolio_state_hash".to_owned(),
+            });
+        }
+
+        CrossExchangeFundingArbStrategy::with_config(strategy_config.clone())?;
+        Ok(Self {
+            strategy_config,
+            venue_capabilities,
+            portfolio_state_id,
+            portfolio_state_hash,
+        })
+    }
+
+    pub fn binance_bybit_btcusdt() -> RuntimeResult<Self> {
+        let mut venue_capabilities = arb_venue_capability_descriptors("binance")?;
+        venue_capabilities.extend(arb_venue_capability_descriptors("bybit")?);
+        Self::new(
+            CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt(),
+            venue_capabilities,
+            "state:funding-arb-public-readonly-01",
+            "hash:funding-arb-public-readonly-01",
+        )
+    }
+}
+
+/// funding arb monitor 行。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbMarketRow {
+    pub pair_id: String,
+    pub symbol: String,
+    pub venue_a_family: String,
+    pub venue_b_family: String,
+    pub venue_a_bid: String,
+    pub venue_a_ask: String,
+    pub venue_a_bid_qty: String,
+    pub venue_a_ask_qty: String,
+    pub venue_a_funding_rate: String,
+    pub venue_a_funding_interval_hours: String,
+    pub venue_b_bid: String,
+    pub venue_b_ask: String,
+    pub venue_b_bid_qty: String,
+    pub venue_b_ask_qty: String,
+    pub venue_b_funding_rate: String,
+    pub venue_b_funding_interval_hours: String,
+    pub funding_interval_hours: String,
+    pub long_venue_family: Option<String>,
+    pub short_venue_family: Option<String>,
+    pub gross_funding_spread_bps: Option<String>,
+    pub total_cost_bps: Option<String>,
+    pub net_funding_bps: Option<String>,
+    pub expected_funding_usd: Option<String>,
+    pub is_candidate: bool,
+    pub reason: Option<String>,
+    pub source_status: String,
+}
+
+/// funding arb monitor 快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbMonitorSnapshot {
+    pub status: String,
+    pub updated_at: String,
+    pub min_net_funding_bps: String,
+    pub total_rows: usize,
+    pub candidate_count: usize,
+    pub source_count: usize,
+    pub source_error_count: usize,
+    pub last_error: Option<String>,
+    pub rows: Vec<FundingArbMarketRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbVenueSnapshot {
+    status: String,
+    rows: Vec<FundingArbVenueMarket>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbVenueMarket {
+    venue_family: String,
+    symbol: String,
+    base_asset: String,
+    perp_bid: Option<String>,
+    perp_ask: Option<String>,
+    perp_bid_qty: Option<String>,
+    perp_ask_qty: Option<String>,
+    funding_rate: String,
+    funding_interval_hours: String,
+    source_status: String,
+}
+
 fn assemble_binance_basis_pipeline_from_raw_json(
     replay: &ReplayInput,
     inputs: BinanceBasisRawInputs<'_>,
@@ -12546,6 +13698,380 @@ pub fn assemble_public_basis_pipeline_from_normalized_events(
         incidents_jsonl: String::new(),
         operations_daily_report_md: operations_report,
     })
+}
+
+/// 使用已标准化的公开 funding arb 事件进入策略、风控和 dry-run 报告链路。
+pub fn assemble_public_funding_arb_pipeline_from_normalized_events(
+    replay: &ReplayInput,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    events: Vec<NormalizedEvent>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<EndToEndArtifacts> {
+    let _temp_dir = RuntimeTempDir::new()?;
+    let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
+    for event in &events {
+        event_store.append(event)?;
+    }
+
+    let stored_events = event_store.read_all_ordered()?;
+    let source_event_refs = events
+        .iter()
+        .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
+        .map(|event| event.event_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let portfolio_state =
+        build_public_funding_arb_portfolio_state(spec, &source_event_refs, ingested_at)?;
+    ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
+    let fixed_time = ingested_at.to_string();
+    let evaluation = run_cross_exchange_funding_arb_strategy(
+        replay.config(),
+        &stored_events,
+        &portfolio_state,
+        &fixed_time,
+        spec,
+    )?;
+    let Some(candidate) = evaluation.candidate().cloned() else {
+        let operations_report =
+            run_operations_report(&event_store, &[], &[], &[], &[], &[], &fixed_time)?;
+        return Ok(EndToEndArtifacts {
+            replay_smoke_txt: replay.run_smoke_replay().to_stable_text(),
+            stored_events_jsonl: stored_events_jsonl(&stored_events),
+            candidate_transitions_jsonl: String::new(),
+            risk_decisions_jsonl: String::new(),
+            execution_plans_jsonl: String::new(),
+            execution_reports_jsonl: String::new(),
+            ledger_entries_jsonl: String::new(),
+            reconciliation_reports_jsonl: String::new(),
+            incidents_jsonl: String::new(),
+            operations_daily_report_md: operations_report,
+        });
+    };
+
+    let risk_decision = run_risk(
+        &candidate,
+        &portfolio_state,
+        replay.config(),
+        &spec.venue_capabilities,
+        ingested_at,
+    )?;
+
+    if !risk_decision_allows_execution(&risk_decision) {
+        let incidents = incidents_from_risk_rejection(&candidate, &risk_decision, &fixed_time)?;
+        let operations_report = run_operations_report(
+            &event_store,
+            std::slice::from_ref(&risk_decision),
+            &[],
+            &[],
+            &[],
+            &incidents,
+            &fixed_time,
+        )?;
+
+        return Ok(EndToEndArtifacts {
+            replay_smoke_txt: replay.run_smoke_replay().to_stable_text(),
+            stored_events_jsonl: stored_events_jsonl(&stored_events),
+            candidate_transitions_jsonl: canonical_jsonl(std::slice::from_ref(&candidate)),
+            risk_decisions_jsonl: canonical_jsonl(std::slice::from_ref(&risk_decision)),
+            execution_plans_jsonl: String::new(),
+            execution_reports_jsonl: String::new(),
+            ledger_entries_jsonl: String::new(),
+            reconciliation_reports_jsonl: String::new(),
+            incidents_jsonl: canonical_jsonl(&incidents),
+            operations_daily_report_md: operations_report,
+        });
+    }
+
+    let execution_plan =
+        run_execution_plan(&candidate, &risk_decision, replay.config(), &fixed_time)?;
+    let execution_report = simulate_execution(&execution_plan, &fixed_time)?;
+    let contract_ledger_entries =
+        simulated_ledger_entries_from_execution_report(&execution_plan, &execution_report)?;
+    let domain_ledger_entries = append_to_simulated_ledger(&contract_ledger_entries)?;
+    let fill_snapshots = fill_snapshots_from_report(&execution_report, &contract_ledger_entries)?;
+    let reconciliation_report =
+        run_reconciliation(ingested_at, &domain_ledger_entries, &fill_snapshots)?;
+    let operations_report = run_operations_report(
+        &event_store,
+        std::slice::from_ref(&risk_decision),
+        std::slice::from_ref(&execution_report),
+        &contract_ledger_entries,
+        std::slice::from_ref(&reconciliation_report),
+        &[],
+        &fixed_time,
+    )?;
+
+    Ok(EndToEndArtifacts {
+        replay_smoke_txt: replay.run_smoke_replay().to_stable_text(),
+        stored_events_jsonl: stored_events_jsonl(&stored_events),
+        candidate_transitions_jsonl: canonical_jsonl(std::slice::from_ref(&candidate)),
+        risk_decisions_jsonl: canonical_jsonl(std::slice::from_ref(&risk_decision)),
+        execution_plans_jsonl: canonical_jsonl(std::slice::from_ref(&execution_plan)),
+        execution_reports_jsonl: canonical_jsonl(std::slice::from_ref(&execution_report)),
+        ledger_entries_jsonl: canonical_jsonl(&contract_ledger_entries),
+        reconciliation_reports_jsonl: jsonl_from_lines(vec![stable_reconciliation_report_json(
+            &reconciliation_report,
+        )]),
+        incidents_jsonl: String::new(),
+        operations_daily_report_md: operations_report,
+    })
+}
+
+/// 构建跨所 funding arb guarded dry-run 报告。
+pub fn run_funding_arb_guarded_dry_run_from_normalized_events(
+    config: &arb_config::ArbConfig,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    events: Vec<NormalizedEvent>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<FundingArbGuardedDryRunReport> {
+    let _temp_dir = RuntimeTempDir::new()?;
+    let event_store = JsonlEventStore::open(_temp_dir.path().join("events.jsonl"));
+    for event in &events {
+        event_store.append(event)?;
+    }
+    let stored_events = event_store.read_all_ordered()?;
+    let source_event_refs = events
+        .iter()
+        .filter(|event| event.event_type == NormalizedEventType::NormalizedMarketDataEvent)
+        .map(|event| event.event_id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let portfolio_state =
+        build_public_funding_arb_portfolio_state(spec, &source_event_refs, ingested_at)?;
+    ensure_portfolio_state_source_refs_exist(&portfolio_state, &stored_events)?;
+    let evaluation = run_cross_exchange_funding_arb_strategy(
+        config,
+        &stored_events,
+        &portfolio_state,
+        &ingested_at.to_string(),
+        spec,
+    )?;
+    let dispatch_request_count = evaluation
+        .candidate()
+        .map(|candidate| {
+            candidate
+                .legs
+                .iter()
+                .filter(|leg| leg.leg_type.as_str() == "Trade")
+                .count()
+        })
+        .unwrap_or(0);
+
+    Ok(FundingArbGuardedDryRunReport {
+        signal_allowed: evaluation.candidate().is_some(),
+        risk_decision: if evaluation.candidate().is_some() {
+            "RequiresManualApproval".to_owned()
+        } else {
+            "NoCandidate".to_owned()
+        },
+        manual_gate_released: evaluation.candidate().is_some(),
+        dispatch_plan_built: dispatch_request_count == 2,
+        dispatch_request_count,
+        dispatch_attempted: false,
+        mutable_execution_started: false,
+    })
+}
+
+/// 从 funding arb observer 快照中选择一个候选并生成 guarded dry-run 报告。
+pub fn run_funding_arb_guarded_dry_run_once(
+    options: FundingArbGuardedDryRunOnceOptions,
+) -> RuntimeResult<FundingArbGuardedDryRunReport> {
+    validate_funding_arb_guarded_dry_run_once_options(&options)?;
+    let snapshot_json = read_utf8(&options.snapshot_path)?;
+    let snapshot = parse_funding_arb_monitor_snapshot_json(&snapshot_json)?;
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.pair_id == options.pair_id)
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb snapshot does not contain candidate pair_id `{}`",
+                options.pair_id
+            ),
+        })?;
+    if !row.is_candidate {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb snapshot row `{}` is not a candidate",
+                options.pair_id
+            ),
+        });
+    }
+    let observed_at =
+        UtcTimestamp::from_str(&snapshot.updated_at).map_err(|error| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb snapshot updated_at is not a strict UTC timestamp: {error}"
+            ),
+        })?;
+    let spec = funding_arb_pipeline_spec_from_monitor_row(row, &options)?;
+    let events = funding_arb_monitor_row_to_normalized_events(&spec, row, observed_at)?;
+    let config = arb_config::ArbConfig::from_path(&options.config_path)?;
+    let report = run_funding_arb_guarded_dry_run_from_normalized_events(
+        &config,
+        &spec,
+        events,
+        observed_at,
+    )?;
+    if let Some(output_dir) = &options.output_dir {
+        write_funding_arb_guarded_dry_run_artifacts(
+            output_dir,
+            &snapshot_json,
+            row,
+            &spec,
+            &report,
+        )?;
+    }
+    Ok(report)
+}
+
+fn validate_funding_arb_guarded_dry_run_once_options(
+    options: &FundingArbGuardedDryRunOnceOptions,
+) -> RuntimeResult<()> {
+    if options.pair_id.trim().is_empty() {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once requires --pair-id",
+        ));
+    }
+    if options.snapshot_path.as_os_str().is_empty() {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once requires --snapshot",
+        ));
+    }
+    MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    if options.taker_fee_bps < 0
+        || options.slippage_buffer_bps < 0
+        || options.max_entry_price_divergence_bps < 0
+        || options.min_net_funding_bps < 0
+    {
+        return Err(cli_arg_error(
+            "funding-arb-guarded-dry-run-once bps values must be non-negative",
+        ));
+    }
+    Ok(())
+}
+
+fn funding_arb_pipeline_spec_from_monitor_row(
+    row: &FundingArbMarketRow,
+    options: &FundingArbGuardedDryRunOnceOptions,
+) -> RuntimeResult<CrossExchangeFundingArbPipelineSpec> {
+    let mut config = CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt();
+    let symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let symbol_component = basis_identifier_component(&symbol).to_ascii_lowercase();
+    let venue_a_family = normalize_venue_family(&row.venue_a_family);
+    let venue_b_family = normalize_venue_family(&row.venue_b_family);
+    config.instance.venue_family_label = format!("{}-{}", row.venue_a_family, row.venue_b_family);
+    config.symbol.symbol = symbol.clone();
+    config.symbol.base_asset_id = format!(
+        "asset:{}",
+        basis_identifier_component(&funding_base_asset_from_symbol(&symbol)).to_ascii_uppercase()
+    );
+    config.symbol.settlement_asset_id = "asset:USDT".to_owned();
+    config.venues.venue_a = funding_arb_leg_config(&venue_a_family, &symbol)?;
+    config.venues.venue_b = funding_arb_leg_config(&venue_b_family, &symbol)?;
+    config.economics.notional_usd = options.notional_usd.clone();
+    config.economics.venue_a_taker_fee_bps = options.taker_fee_bps;
+    config.economics.venue_b_taker_fee_bps = options.taker_fee_bps;
+    config.economics.slippage_buffer_bps = options.slippage_buffer_bps;
+    config.economics.max_entry_price_divergence_bps = options.max_entry_price_divergence_bps;
+    config.economics.min_net_funding_bps = options.min_net_funding_bps;
+    config.output.transition_id = format!(
+        "trans:cross-exchange-funding-arb-{}-{}-{}-observer",
+        basis_identifier_component(&venue_a_family),
+        basis_identifier_component(&venue_b_family),
+        symbol_component
+    );
+    config.output.assumption_id = format!(
+        "asm:cross-exchange-funding-arb-{}-{}-public-readonly",
+        basis_identifier_component(&venue_a_family),
+        basis_identifier_component(&venue_b_family)
+    );
+
+    let mut venue_capabilities = arb_venue_capability_descriptors(&venue_a_family)?;
+    venue_capabilities.extend(arb_venue_capability_descriptors(&venue_b_family)?);
+    CrossExchangeFundingArbPipelineSpec::new(
+        config,
+        venue_capabilities,
+        format!(
+            "state:funding-arb-{}-{}-{}-readonly",
+            basis_identifier_component(&venue_a_family),
+            basis_identifier_component(&venue_b_family),
+            symbol_component
+        ),
+        format!(
+            "hash:funding-arb-{}-{}-{}-readonly",
+            basis_identifier_component(&venue_a_family),
+            basis_identifier_component(&venue_b_family),
+            symbol_component
+        ),
+    )
+}
+
+fn funding_arb_leg_config(
+    venue_family: &str,
+    symbol: &str,
+) -> RuntimeResult<CrossExchangeFundingLegConfig> {
+    let base = funding_base_asset_from_symbol(symbol);
+    let symbol = funding_display_symbol(&base);
+    let base_component = basis_identifier_component(&base).to_ascii_uppercase();
+    let symbol_component = basis_identifier_component(&symbol).to_ascii_lowercase();
+    let config = match normalize_venue_family(venue_family).as_str() {
+        "binance" => CrossExchangeFundingLegConfig {
+            venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+            instrument_id: format!("inst:BINANCE:{symbol}:USDM-PERP"),
+            account_id: "acct:binance-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-binance-usdm-{symbol_component}"),
+            venue_label: "Binance USD-M".to_owned(),
+            instrument_label: "USD-M perp".to_owned(),
+        },
+        "bybit" => CrossExchangeFundingLegConfig {
+            venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+            instrument_id: format!("inst:BYBIT:{symbol}:LINEAR-PERP"),
+            account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-bybit-linear-{symbol_component}"),
+            venue_label: "Bybit linear".to_owned(),
+            instrument_label: "linear perp".to_owned(),
+        },
+        "okx" => CrossExchangeFundingLegConfig {
+            venue_id: "venue:OKX-SWAP".to_owned(),
+            instrument_id: format!("inst:OKX:{base_component}-USDT-SWAP:SWAP"),
+            account_id: "acct:okx-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-okx-swap-{symbol_component}"),
+            venue_label: "OKX swap".to_owned(),
+            instrument_label: "swap".to_owned(),
+        },
+        "bitget" => CrossExchangeFundingLegConfig {
+            venue_id: "venue:BITGET-USDT-FUTURES".to_owned(),
+            instrument_id: format!("inst:BITGET:{symbol}:USDT-FUTURES"),
+            account_id: "acct:bitget-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-bitget-usdt-futures-{symbol_component}"),
+            venue_label: "Bitget USDT-FUTURES".to_owned(),
+            instrument_label: "USDT futures".to_owned(),
+        },
+        "aster" => CrossExchangeFundingLegConfig {
+            venue_id: "venue:ASTER-USDT-FUTURES".to_owned(),
+            instrument_id: format!("inst:ASTER:{symbol}:USDT-FUTURES"),
+            account_id: "acct:aster-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-aster-usdt-futures-{symbol_component}"),
+            venue_label: "Aster".to_owned(),
+            instrument_label: "USDT futures".to_owned(),
+        },
+        "hyperliquid" => CrossExchangeFundingLegConfig {
+            venue_id: "venue:HYPERLIQUID-PERP".to_owned(),
+            instrument_id: format!("inst:HYPERLIQUID:{symbol}:PERP"),
+            account_id: "acct:hyperliquid-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-hyperliquid-perp-{symbol_component}"),
+            venue_label: "Hyperliquid".to_owned(),
+            instrument_label: "perp".to_owned(),
+        },
+        other => {
+            return Err(RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("unsupported funding arb venue family `{other}`"),
+            });
+        }
+    };
+    Ok(config)
 }
 
 /// 将 basis monitor 的完整行情行提升为策略可消费的标准化事件。
@@ -12689,6 +14215,200 @@ pub fn basis_monitor_snapshot_candidate_events(
     Ok(events)
 }
 
+/// 从 funding arb monitor 快照中提取当前策略实例可消费的候选事件。
+pub fn funding_arb_monitor_snapshot_candidate_events(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot: &FundingArbMonitorSnapshot,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<Vec<NormalizedEvent>> {
+    let mut events = Vec::new();
+    for row in snapshot
+        .rows
+        .iter()
+        .filter(|row| row.is_candidate && row.symbol == spec.strategy_config.symbol.symbol)
+    {
+        events.extend(funding_arb_monitor_row_to_normalized_events(
+            spec,
+            row,
+            observed_at,
+        )?);
+    }
+    Ok(events)
+}
+
+fn funding_arb_monitor_row_to_normalized_events(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    row: &FundingArbMarketRow,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<Vec<NormalizedEvent>> {
+    if row.source_status != "complete" {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb monitor row {} is not complete: {}",
+                row.symbol, row.source_status
+            ),
+        });
+    }
+    let forward_signal =
+        evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+            symbol: row.symbol.clone(),
+            long_venue_id: spec.strategy_config.venues.venue_a.venue_id.clone(),
+            short_venue_id: spec.strategy_config.venues.venue_b.venue_id.clone(),
+            long_best_bid: row.venue_a_bid.clone(),
+            long_best_ask: row.venue_a_ask.clone(),
+            long_ask_size: Some(row.venue_a_ask_qty.clone()),
+            short_best_bid: row.venue_b_bid.clone(),
+            short_best_ask: row.venue_b_ask.clone(),
+            short_bid_size: Some(row.venue_b_bid_qty.clone()),
+            long_funding_rate: row.venue_a_funding_rate.clone(),
+            short_funding_rate: row.venue_b_funding_rate.clone(),
+            funding_interval_hours: row.venue_a_funding_interval_hours.clone(),
+            notional_usd: spec.strategy_config.economics.notional_usd.clone(),
+            long_taker_fee_bps: spec.strategy_config.economics.venue_a_taker_fee_bps,
+            short_taker_fee_bps: spec.strategy_config.economics.venue_b_taker_fee_bps,
+            slippage_buffer_bps: spec.strategy_config.economics.slippage_buffer_bps,
+            max_entry_price_divergence_bps: spec
+                .strategy_config
+                .economics
+                .max_entry_price_divergence_bps,
+            min_net_funding_bps: spec.strategy_config.economics.min_net_funding_bps,
+        })
+        .map_err(|message| RuntimeError::Module {
+            module: "arb-runtime",
+            message,
+        })?;
+    let reverse_signal =
+        evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+            symbol: row.symbol.clone(),
+            long_venue_id: spec.strategy_config.venues.venue_b.venue_id.clone(),
+            short_venue_id: spec.strategy_config.venues.venue_a.venue_id.clone(),
+            long_best_bid: row.venue_b_bid.clone(),
+            long_best_ask: row.venue_b_ask.clone(),
+            long_ask_size: Some(row.venue_b_ask_qty.clone()),
+            short_best_bid: row.venue_a_bid.clone(),
+            short_best_ask: row.venue_a_ask.clone(),
+            short_bid_size: Some(row.venue_a_bid_qty.clone()),
+            long_funding_rate: row.venue_b_funding_rate.clone(),
+            short_funding_rate: row.venue_a_funding_rate.clone(),
+            funding_interval_hours: row.venue_b_funding_interval_hours.clone(),
+            notional_usd: spec.strategy_config.economics.notional_usd.clone(),
+            long_taker_fee_bps: spec.strategy_config.economics.venue_b_taker_fee_bps,
+            short_taker_fee_bps: spec.strategy_config.economics.venue_a_taker_fee_bps,
+            slippage_buffer_bps: spec.strategy_config.economics.slippage_buffer_bps,
+            max_entry_price_divergence_bps: spec
+                .strategy_config
+                .economics
+                .max_entry_price_divergence_bps,
+            min_net_funding_bps: spec.strategy_config.economics.min_net_funding_bps,
+        })
+        .map_err(|message| RuntimeError::Module {
+            module: "arb-runtime",
+            message,
+        })?;
+    if !forward_signal.is_candidate && !reverse_signal.is_candidate {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb monitor row is not a candidate: forward={}, reverse={}",
+                forward_signal
+                    .reason
+                    .unwrap_or_else(|| "not a candidate".to_owned()),
+                reverse_signal
+                    .reason
+                    .unwrap_or_else(|| "not a candidate".to_owned())
+            ),
+        });
+    }
+
+    let observed_at = observed_at.to_string();
+    let symbol_component = basis_identifier_component(&row.symbol);
+    let event_prefix = format!(
+        "event:runtime:funding-arb-monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, symbol_component
+    );
+    let correlation_id = format!(
+        "corr:runtime:funding-arb-monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, symbol_component
+    );
+    let source_prefix = format!(
+        "monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, symbol_component
+    );
+    let checksum_prefix = format!(
+        "hash:funding-arb-monitor:{}:{}",
+        spec.strategy_config.instance.strategy_id, symbol_component
+    );
+
+    let venue_a_book = monitor_book_ticker_event_json(
+        &format!("{event_prefix}:venue-a-book"),
+        &correlation_id,
+        &format!("{source_prefix}:venue-a-book"),
+        &format!("{checksum_prefix}:venue-a-book"),
+        &observed_at,
+        &spec.strategy_config.venues.venue_a.venue_id,
+        &spec.strategy_config.venues.venue_a.instrument_id,
+        "Perp",
+        &row.symbol,
+        "Perp",
+        &row.venue_a_bid,
+        &row.venue_a_ask,
+        &row.venue_a_bid_qty,
+        &row.venue_a_ask_qty,
+    );
+    let venue_b_book = monitor_book_ticker_event_json(
+        &format!("{event_prefix}:venue-b-book"),
+        &correlation_id,
+        &format!("{source_prefix}:venue-b-book"),
+        &format!("{checksum_prefix}:venue-b-book"),
+        &observed_at,
+        &spec.strategy_config.venues.venue_b.venue_id,
+        &spec.strategy_config.venues.venue_b.instrument_id,
+        "Perp",
+        &row.symbol,
+        "Perp",
+        &row.venue_b_bid,
+        &row.venue_b_ask,
+        &row.venue_b_bid_qty,
+        &row.venue_b_ask_qty,
+    );
+    let venue_a_premium = funding_monitor_premium_index_event_json(
+        &format!("{event_prefix}:venue-a-premium"),
+        &correlation_id,
+        &format!("{source_prefix}:venue-a-premium"),
+        &format!("{checksum_prefix}:venue-a-premium"),
+        &observed_at,
+        &spec.strategy_config.venues.venue_a.venue_id,
+        &spec.strategy_config.venues.venue_a.instrument_id,
+        &row.symbol,
+        &row.venue_a_ask,
+        &row.venue_a_ask,
+        &row.venue_a_funding_rate,
+        &row.venue_a_funding_interval_hours,
+    );
+    let venue_b_premium = funding_monitor_premium_index_event_json(
+        &format!("{event_prefix}:venue-b-premium"),
+        &correlation_id,
+        &format!("{source_prefix}:venue-b-premium"),
+        &format!("{checksum_prefix}:venue-b-premium"),
+        &observed_at,
+        &spec.strategy_config.venues.venue_b.venue_id,
+        &spec.strategy_config.venues.venue_b.instrument_id,
+        &row.symbol,
+        &row.venue_b_bid,
+        &row.venue_b_bid,
+        &row.venue_b_funding_rate,
+        &row.venue_b_funding_interval_hours,
+    );
+
+    Ok(vec![
+        from_json_strict::<NormalizedEvent>(&venue_a_book)?,
+        from_json_strict::<NormalizedEvent>(&venue_b_book)?,
+        from_json_strict::<NormalizedEvent>(&venue_a_premium)?,
+        from_json_strict::<NormalizedEvent>(&venue_b_premium)?,
+    ])
+}
+
 fn required_monitor_row_field<'a>(
     row: &BinanceBasisMarketRow,
     field: &'static str,
@@ -12785,6 +14505,39 @@ fn monitor_premium_index_event_json(
         json_string(last_funding_rate),
         json_string(mark_price),
         json_string(next_funding_time_ms),
+        json_string(venue_symbol),
+        json_string(source_sequence),
+        json_string(observed_at),
+        json_string(observed_at),
+        json_string(venue_id),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn funding_monitor_premium_index_event_json(
+    event_id: &str,
+    correlation_id: &str,
+    source_sequence: &str,
+    checksum: &str,
+    observed_at: &str,
+    venue_id: &str,
+    instrument_id: &str,
+    venue_symbol: &str,
+    mark_price: &str,
+    index_price: &str,
+    last_funding_rate: &str,
+    funding_interval_hours: &str,
+) -> String {
+    format!(
+        r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"funding-arb-monitor","basis_role":"Perp","funding_interval_hours":{},"index_price":{},"kind":"PerpPremiumIndex","last_funding_rate":{},"mark_price":{},"next_funding_time_ms":0,"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"funding-arb-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
+        json_string(checksum),
+        json_string(correlation_id),
+        json_string(event_id),
+        json_string(instrument_id),
+        json_string(funding_interval_hours),
+        json_string(index_price),
+        json_string(last_funding_rate),
+        json_string(mark_price),
         json_string(venue_symbol),
         json_string(source_sequence),
         json_string(observed_at),
@@ -13196,6 +14949,37 @@ fn build_public_basis_portfolio_state(
   "confidence": 0.5,
   "missing_data_flags": [
     "PRIVATE_BALANCE_UNAVAILABLE"
+  ],
+  "state_hash": {}
+}}"#,
+        json_string(&spec.portfolio_state_id),
+        json_string(&as_of.to_string()),
+        json_string_array(source_event_refs),
+        json_string(&spec.portfolio_state_hash),
+    );
+    Ok(from_json_strict::<PortfolioState>(&portfolio_json)?)
+}
+
+fn build_public_funding_arb_portfolio_state(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    source_event_refs: &[String],
+    as_of: UtcTimestamp,
+) -> RuntimeResult<PortfolioState> {
+    let portfolio_json = format!(
+        r#"{{
+  "schema_version": "1.0.0",
+  "portfolio_state_id": {},
+  "as_of": {},
+  "source_event_refs": {},
+  "balances": [],
+  "positions": [],
+  "reservations": [],
+  "open_orders": [],
+  "pending_transfers": [],
+  "confidence": 0.5,
+  "missing_data_flags": [
+    "PRIVATE_BALANCE_UNAVAILABLE",
+    "PRIVATE_MARGIN_UNAVAILABLE"
   ],
   "state_hash": {}
 }}"#,
@@ -15387,31 +17171,11 @@ fn load_venue_capabilities(fixture_root: &Path) -> RuntimeResult<Vec<VenueCapabi
 }
 
 fn load_binance_basis_capabilities() -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
-    let spot = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesSpotMarkets","ProvidesOrderBookMarkets"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":1200,"source":"binance-public-rest","unit":"Request","window_ms":60000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BINANCE-SPOT","venue_name":"Binance Spot Public REST"}"#;
-    let perp = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders","FundingHistory"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesPerpetuals","ProvidesOrderBookMarkets","ProvidesFundingRates"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":2400,"source":"binance-public-futures-rest","unit":"Request","window_ms":60000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BINANCE-USDM","venue_name":"Binance USD-M Public REST"}"#;
-    basis_capabilities_from_json_lines(&[spot, perp])
+    arb_venue_capability_descriptors("binance")
 }
 
 fn load_bybit_basis_capabilities() -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
-    let spot = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesSpotMarkets","ProvidesOrderBookMarkets"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":600,"source":"bybit-public-spot-rest","unit":"Request","window_ms":5000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BYBIT-SPOT","venue_name":"Bybit Spot Public REST"}"#;
-    let perp = r#"{"auth_modes":["PublicOnly"],"capability_version":"1.0.0","data_surfaces":["RESTPolling","RateLimitHeaders","FundingHistory"],"execution_capabilities":["SupportsManualApprovalOnly"],"health_model":{"disconnect_threshold":3,"freshness_threshold_ms":5000,"unknown_state_is_critical":true},"market_capabilities":["ProvidesPerpetuals","ProvidesOrderBookMarkets","ProvidesFundingRates"],"permission_model":{"can_read_private_data":false,"can_read_public_data":true,"can_trade":false,"can_withdraw":false},"rate_limit_model":{"limit":600,"source":"bybit-public-linear-rest","unit":"Request","window_ms":5000},"schema_version":"1.0.0","settlement_modes":["OffChainCustody"],"venue_id":"venue:BYBIT-LINEAR","venue_name":"Bybit Linear Public REST"}"#;
-    basis_capabilities_from_json_lines(&[spot, perp])
-}
-
-fn basis_capabilities_from_json_lines(
-    lines: &[&str],
-) -> RuntimeResult<Vec<VenueCapabilityDescriptor>> {
-    if lines.is_empty() {
-        return Err(RuntimeError::Module {
-            module: "arb-runtime",
-            message: "basis capability input is empty".to_owned(),
-        });
-    }
-    let mut capabilities = Vec::with_capacity(lines.len());
-    for line in lines {
-        capabilities.push(from_json_strict::<VenueCapabilityDescriptor>(line)?);
-    }
-    Ok(capabilities)
+    arb_venue_capability_descriptors("bybit")
 }
 
 fn run_strategy(
@@ -15462,6 +17226,26 @@ fn run_spot_perp_basis_strategy(
     let time = StrategyFixedTimeSource::from_rfc3339_z(fixed_time)?;
     let input = StrategyInput::new(snapshot, capabilities, config, time);
     let strategy = SpotPerpBasisStrategy::with_config(spec.strategy_config.clone())?;
+    Ok(strategy.evaluate(&input)?)
+}
+
+fn run_cross_exchange_funding_arb_strategy(
+    config: &arb_config::ArbConfig,
+    stored_events: &[arb_eventstore::StoredEvent],
+    portfolio_state: &PortfolioState,
+    fixed_time: &str,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+) -> RuntimeResult<StrategyEvaluation> {
+    let market_events = stored_events
+        .iter()
+        .map(|record| record.event.clone())
+        .collect::<Vec<_>>();
+    let snapshot = ReadOnlySnapshot::new(portfolio_state.clone(), market_events);
+    let capabilities = VenueCapabilitySnapshot::new(spec.venue_capabilities.clone())?;
+    let config = StrategyConfigSnapshot::from_config(config)?;
+    let time = StrategyFixedTimeSource::from_rfc3339_z(fixed_time)?;
+    let input = StrategyInput::new(snapshot, capabilities, config, time);
+    let strategy = CrossExchangeFundingArbStrategy::with_config(spec.strategy_config.clone())?;
     Ok(strategy.evaluate(&input)?)
 }
 
@@ -18243,6 +20027,216 @@ fn write_aster_basis_monitor_snapshot(
     )
 }
 
+fn write_funding_arb_monitor_snapshot(
+    output_dir: &Path,
+    snapshot: &FundingArbMonitorSnapshot,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("funding_arb_monitor_snapshot.json"),
+        &snapshot.to_json(),
+    )
+}
+
+fn parse_funding_arb_monitor_snapshot_json(
+    input: &str,
+) -> RuntimeResult<FundingArbMonitorSnapshot> {
+    let fields = parse_json_object_value_slices(input)?;
+    let status = required_json_value_string(&fields, "status", "funding arb monitor snapshot")?;
+    let updated_at =
+        required_json_value_string(&fields, "updated_at", "funding arb monitor snapshot")?;
+    let rows_json = fields
+        .get("rows")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "funding arb monitor snapshot is missing rows".to_owned(),
+        })?;
+    let mut rows = Vec::new();
+    for object in json_object_slices(rows_json)? {
+        let row_fields = parse_json_object_value_slices(object)?;
+        rows.push(parse_funding_arb_market_row_json_fields(&row_fields)?);
+    }
+    let candidate_count =
+        optional_json_value_string(&fields, "candidate_count", "funding arb monitor snapshot")?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| rows.iter().filter(|row| row.is_candidate).count());
+    let total_rows =
+        optional_json_value_string(&fields, "total_rows", "funding arb monitor snapshot")?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(rows.len());
+    let source_count =
+        optional_json_value_string(&fields, "source_count", "funding arb monitor snapshot")?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+    let source_error_count = optional_json_value_string(
+        &fields,
+        "source_error_count",
+        "funding arb monitor snapshot",
+    )?
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or(0);
+    Ok(FundingArbMonitorSnapshot {
+        status,
+        updated_at,
+        min_net_funding_bps: optional_json_value_string(
+            &fields,
+            "min_net_funding_bps",
+            "funding arb monitor snapshot",
+        )?
+        .unwrap_or_else(|| BASIS_MONITOR_DEFAULT_MIN_NET_BPS.to_string()),
+        total_rows,
+        candidate_count,
+        source_count,
+        source_error_count,
+        last_error: optional_json_value_string(
+            &fields,
+            "last_error",
+            "funding arb monitor snapshot",
+        )?,
+        rows,
+    })
+}
+
+fn parse_funding_arb_market_row_json_fields(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<FundingArbMarketRow> {
+    Ok(FundingArbMarketRow {
+        pair_id: required_json_value_string(fields, "pair_id", "funding arb monitor row")?,
+        symbol: required_json_value_string(fields, "symbol", "funding arb monitor row")?,
+        venue_a_family: required_json_value_string(
+            fields,
+            "venue_a_family",
+            "funding arb monitor row",
+        )?,
+        venue_b_family: required_json_value_string(
+            fields,
+            "venue_b_family",
+            "funding arb monitor row",
+        )?,
+        venue_a_bid: required_json_value_string(fields, "venue_a_bid", "funding arb monitor row")?,
+        venue_a_ask: required_json_value_string(fields, "venue_a_ask", "funding arb monitor row")?,
+        venue_a_bid_qty: required_json_value_string(
+            fields,
+            "venue_a_bid_qty",
+            "funding arb monitor row",
+        )?,
+        venue_a_ask_qty: required_json_value_string(
+            fields,
+            "venue_a_ask_qty",
+            "funding arb monitor row",
+        )?,
+        venue_a_funding_rate: required_json_value_string(
+            fields,
+            "venue_a_funding_rate",
+            "funding arb monitor row",
+        )?,
+        venue_a_funding_interval_hours: required_json_value_string(
+            fields,
+            "venue_a_funding_interval_hours",
+            "funding arb monitor row",
+        )?,
+        venue_b_bid: required_json_value_string(fields, "venue_b_bid", "funding arb monitor row")?,
+        venue_b_ask: required_json_value_string(fields, "venue_b_ask", "funding arb monitor row")?,
+        venue_b_bid_qty: required_json_value_string(
+            fields,
+            "venue_b_bid_qty",
+            "funding arb monitor row",
+        )?,
+        venue_b_ask_qty: required_json_value_string(
+            fields,
+            "venue_b_ask_qty",
+            "funding arb monitor row",
+        )?,
+        venue_b_funding_rate: required_json_value_string(
+            fields,
+            "venue_b_funding_rate",
+            "funding arb monitor row",
+        )?,
+        venue_b_funding_interval_hours: required_json_value_string(
+            fields,
+            "venue_b_funding_interval_hours",
+            "funding arb monitor row",
+        )?,
+        funding_interval_hours: required_json_value_string(
+            fields,
+            "funding_interval_hours",
+            "funding arb monitor row",
+        )?,
+        long_venue_family: optional_json_value_string(
+            fields,
+            "long_venue_family",
+            "funding arb monitor row",
+        )?,
+        short_venue_family: optional_json_value_string(
+            fields,
+            "short_venue_family",
+            "funding arb monitor row",
+        )?,
+        gross_funding_spread_bps: optional_json_value_string(
+            fields,
+            "gross_funding_spread_bps",
+            "funding arb monitor row",
+        )?,
+        total_cost_bps: optional_json_value_string(
+            fields,
+            "total_cost_bps",
+            "funding arb monitor row",
+        )?,
+        net_funding_bps: optional_json_value_string(
+            fields,
+            "net_funding_bps",
+            "funding arb monitor row",
+        )?,
+        expected_funding_usd: optional_json_value_string(
+            fields,
+            "expected_funding_usd",
+            "funding arb monitor row",
+        )?,
+        is_candidate: optional_json_bool(fields, "is_candidate", "funding arb monitor row")?
+            .unwrap_or(false),
+        reason: optional_json_value_string(fields, "reason", "funding arb monitor row")?,
+        source_status: required_json_value_string(
+            fields,
+            "source_status",
+            "funding arb monitor row",
+        )?,
+    })
+}
+
+fn write_funding_arb_guarded_dry_run_artifacts(
+    output_dir: &Path,
+    snapshot_json: &str,
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    report: &FundingArbGuardedDryRunReport,
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("funding_arb_opportunities_snapshot.json"),
+        snapshot_json,
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_candidate_row.json"),
+        &format!("{}\n", row.to_json()),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_guarded_dry_run_report.json"),
+        &format!(
+            "{}\n",
+            funding_arb_guarded_dry_run_report_json(row, spec, report)
+        ),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_guarded_dry_run_report.md"),
+        &funding_arb_guarded_dry_run_report_markdown(row, spec, report),
+    )
+}
+
 fn write_utf8(path: PathBuf, contents: &str) -> RuntimeResult<()> {
     fs::write(&path, contents).map_err(|error| RuntimeError::Io {
         path,
@@ -18499,6 +20493,138 @@ impl BinanceBasisMarketRow {
             json_option_string(&self.total_cost_bps),
         )
     }
+}
+
+impl FundingArbMonitorSnapshot {
+    fn empty(options: &FundingArbMonitorOptions) -> Self {
+        Self {
+            status: "starting".to_owned(),
+            updated_at: "not-yet-updated".to_owned(),
+            min_net_funding_bps: options.min_net_funding_bps.to_string(),
+            total_rows: 0,
+            candidate_count: 0,
+            source_count: options.sources.len(),
+            source_error_count: 0,
+            last_error: None,
+            rows: Vec::new(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+            self.candidate_count,
+            json_option_string(&self.last_error),
+            json_string(&self.min_net_funding_bps),
+            self.rows
+                .iter()
+                .map(FundingArbMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            self.source_count,
+            self.source_error_count,
+            json_string(&self.status),
+            self.total_rows,
+            json_string(&self.updated_at),
+        )
+    }
+
+    fn opportunities_json(&self) -> String {
+        format!(
+            "{{\"candidate_count\":{},\"rows\":[{}],\"status\":{},\"updated_at\":{}}}",
+            self.candidate_count,
+            self.rows
+                .iter()
+                .filter(|row| row.is_candidate)
+                .map(FundingArbMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string(&self.status),
+            json_string(&self.updated_at),
+        )
+    }
+}
+
+impl FundingArbMarketRow {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_b_ask\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{}}}",
+            json_option_string(&self.expected_funding_usd),
+            json_string(&self.funding_interval_hours),
+            json_option_string(&self.gross_funding_spread_bps),
+            self.is_candidate,
+            json_option_string(&self.long_venue_family),
+            json_option_string(&self.net_funding_bps),
+            json_string(&self.pair_id),
+            json_option_string(&self.reason),
+            json_option_string(&self.short_venue_family),
+            json_string(&self.source_status),
+            json_string(&self.symbol),
+            json_option_string(&self.total_cost_bps),
+            json_string(&self.venue_a_ask),
+            json_string(&self.venue_a_ask_qty),
+            json_string(&self.venue_a_bid),
+            json_string(&self.venue_a_bid_qty),
+            json_string(&self.venue_a_family),
+            json_string(&self.venue_a_funding_interval_hours),
+            json_string(&self.venue_a_funding_rate),
+            json_string(&self.venue_b_ask),
+            json_string(&self.venue_b_ask_qty),
+            json_string(&self.venue_b_bid),
+            json_string(&self.venue_b_bid_qty),
+            json_string(&self.venue_b_family),
+            json_string(&self.venue_b_funding_interval_hours),
+            json_string(&self.venue_b_funding_rate),
+        )
+    }
+}
+
+fn funding_arb_guarded_dry_run_report_json(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    report: &FundingArbGuardedDryRunReport,
+) -> String {
+    format!(
+        "{{\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"expected_funding_usd\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"risk_decision\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"strategy_id\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{}}}",
+        report.dispatch_attempted,
+        report.dispatch_plan_built,
+        report.dispatch_request_count,
+        json_option_string(&row.expected_funding_usd),
+        report.manual_gate_released,
+        report.mutable_execution_started,
+        json_option_string(&row.net_funding_bps),
+        json_string(&row.pair_id),
+        json_string(&report.risk_decision),
+        report.signal_allowed,
+        json_string(&spec.strategy_config.instance.strategy_id),
+        json_string(&row.symbol),
+        json_string(&spec.strategy_config.output.transition_id),
+        json_string(&row.venue_a_family),
+        json_string(&row.venue_b_family),
+    )
+}
+
+fn funding_arb_guarded_dry_run_report_markdown(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    report: &FundingArbGuardedDryRunReport,
+) -> String {
+    format!(
+        "# Funding Arb Guarded Dry-run\n\n中文说明：本报告由 funding arb observer 候选生成，只验证公开信号、人工门禁预览和分发前计划构建，不真实下单、不撤单、不转账、不签名。\n\n- strategy_id: `{}`\n- transition_id: `{}`\n- pair_id: `{}`\n- symbol: `{}`\n- venues: `{}` / `{}`\n- signal_allowed: `{}`\n- risk_decision: `{}`\n- manual_gate_released: `{}`\n- dispatch_plan_built: `{}`\n- dispatch_request_count: `{}`\n- dispatch_attempted: `{}`\n- mutable_execution_started: `{}`\n",
+        spec.strategy_config.instance.strategy_id,
+        spec.strategy_config.output.transition_id,
+        row.pair_id,
+        row.symbol,
+        row.venue_a_family,
+        row.venue_b_family,
+        report.signal_allowed,
+        report.risk_decision,
+        report.manual_gate_released,
+        report.dispatch_plan_built,
+        report.dispatch_request_count,
+        report.dispatch_attempted,
+        report.mutable_execution_started,
+    )
 }
 
 fn json_option_string(value: &Option<String>) -> String {
@@ -18979,6 +21105,24 @@ fn start_aster_basis_http_api(
     Ok(handle)
 }
 
+fn start_funding_arb_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<FundingArbMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind funding arb monitor HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_funding_arb_http_connection(stream, &state),
+                Err(error) => eprintln!("funding-arb-monitor api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
 fn handle_basis_http_connection(
     mut stream: TcpStream,
     state: &Arc<RwLock<BinanceBasisMonitorSnapshot>>,
@@ -19327,6 +21471,53 @@ fn handle_aster_basis_http_connection(
         (
             404,
             "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/aster-basis/status\",\"/api/aster-basis/opportunities\",\"/api/aster-basis/status/<SYMBOL>\"]}".to_owned(),
+        )
+    };
+    let _ = write_http_json(&mut stream, status, &body);
+}
+
+fn handle_funding_arb_http_connection(
+    mut stream: TcpStream,
+    state: &Arc<RwLock<FundingArbMonitorSnapshot>>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let read = match stream.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+    let route = path.split('?').next().unwrap_or(path);
+    if method != "GET" {
+        let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
+        return;
+    }
+    if route == "/" || route == "/dashboard" {
+        let _ = write_http_html(&mut stream, 200, funding_arb_dashboard_html());
+        return;
+    }
+
+    let snapshot = state.read().expect("monitor state lock poisoned");
+    let (status, body) = if route == "/health" {
+        (
+            200,
+            format!(
+                "{{\"status\":{},\"updated_at\":{},\"mutable_execution_started\":false}}",
+                json_string(&snapshot.status),
+                json_string(&snapshot.updated_at)
+            ),
+        )
+    } else if route == "/api/funding-arb/status" {
+        (200, snapshot.to_json())
+    } else if route == "/api/funding-arb/opportunities" {
+        (200, snapshot.opportunities_json())
+    } else {
+        (
+            404,
+            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/funding-arb/status\",\"/api/funding-arb/opportunities\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -20488,6 +22679,70 @@ fn aster_basis_dashboard_html() -> String {
         .replace("/api/basis/opportunities", "/api/aster-basis/opportunities")
 }
 
+fn funding_arb_dashboard_html() -> &'static str {
+    r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>跨所资金费率套利 observer</title>
+  <style>
+    body { margin: 0; background: #101112; color: #f0eadc; font-family: "IBM Plex Mono", "SFMono-Regular", monospace; }
+    header { display: flex; justify-content: space-between; gap: 18px; padding: 20px 24px; background: #191b1e; border-bottom: 1px solid #353941; }
+    main { padding: 18px 24px 28px; }
+    h1 { margin: 0; font-size: 22px; }
+    button { min-height: 34px; border: 1px solid #353941; border-radius: 6px; background: #23262a; color: #f0eadc; padding: 7px 11px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .metric { border: 1px solid #353941; background: #1b1d20; border-radius: 6px; padding: 12px; }
+    .metric span { display: block; color: #a5a8aa; font-size: 12px; }
+    .metric strong { display: block; margin-top: 8px; font-size: 22px; }
+    pre { margin: 0; max-height: 72vh; overflow: auto; padding: 12px; background: #0c0d0e; border: 1px solid #353941; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>跨所资金费率套利 observer</h1>
+    <button id="refresh" type="button">刷新</button>
+  </header>
+  <main>
+    <section class="grid">
+      <article class="metric"><span>Status</span><strong id="status">starting</strong></article>
+      <article class="metric"><span>机会</span><strong id="candidates">0</strong></article>
+      <article class="metric"><span>组合</span><strong id="total">0</strong></article>
+      <article class="metric"><span>Source errors</span><strong id="source-errors">0</strong></article>
+    </section>
+    <section>
+      <button type="button" data-endpoint="/api/funding-arb/status">status</button>
+      <button type="button" data-endpoint="/api/funding-arb/opportunities">opportunities</button>
+    </section>
+    <pre id="funding-rows">{}</pre>
+  </main>
+  <script>
+    async function refresh() {
+      const response = await fetch("/api/funding-arb/status", { cache: "no-store" });
+      const data = await response.json();
+      document.getElementById("status").textContent = data.status || "unknown";
+      document.getElementById("candidates").textContent = data.candidate_count ?? 0;
+      document.getElementById("total").textContent = data.total_rows ?? 0;
+      document.getElementById("source-errors").textContent = data.source_error_count ?? 0;
+      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
+    }
+    async function preview(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const data = await response.json();
+      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
+    }
+    document.getElementById("refresh").addEventListener("click", refresh);
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => preview(button.dataset.endpoint || "/api/funding-arb/status"));
+    });
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+</html>"#
+}
+
 struct RuntimeTempDir {
     path: PathBuf,
 }
@@ -21093,6 +23348,47 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             "ok: Aster basis monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
+    if args[0] == "funding-arb-monitor" {
+        let options = parse_funding_arb_monitor_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        let output_dir = options.output_dir.clone();
+        run_funding_arb_monitor(options)?;
+        if once {
+            let output_note = output_dir
+                .as_ref()
+                .map(|path| format!("; wrote snapshot to {}", path.display()))
+                .unwrap_or_else(|| "; no snapshot written, pass --out <dir>".to_owned());
+            return Ok(format!(
+                "ok: ran one funding arb monitor refresh; api_bind={bind_addr}; mutable_execution_started=false{output_note}"
+            ));
+        }
+        return Ok(format!(
+            "ok: funding arb monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
+    if args[0] == "funding-arb-guarded-dry-run-once" {
+        let options = parse_funding_arb_guarded_dry_run_once_args(&args[1..])?;
+        let pair_id = options.pair_id.clone();
+        let output_dir = options.output_dir.clone();
+        let report = run_funding_arb_guarded_dry_run_once(options)?;
+        let output_note = output_dir
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| {
+                "; no artifacts written, pass --out <dir> to persist them".to_owned()
+            });
+        return Ok(format!(
+            "ok: funding arb guarded dry-run completed; pair_id={pair_id}; signal_allowed={}; risk_decision={}; manual_gate_released={}; dispatch_plan_built={}; dispatch_requests={}; dispatch_attempted={}; mutable_execution_started=false{}",
+            report.signal_allowed,
+            report.risk_decision,
+            report.manual_gate_released,
+            report.dispatch_plan_built,
+            report.dispatch_request_count,
+            report.dispatch_attempted,
+            output_note
+        ));
+    }
     if args[0] == "health" {
         let fixture_root = args.get(1).map_or_else(
             || PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE),
@@ -21134,7 +23430,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, funding-arb-guarded-dry-run-once",
                 args[0]
             ),
         });
@@ -21215,6 +23511,10 @@ fn help_text() -> String {
         "                                    Monitor all Hyperliquid public USDC spot/perp basis rows and serve /api/hyperliquid-basis/status",
         "  aster-basis-monitor [--bind 127.0.0.1:8800] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
         "                                    Monitor all Aster public USDT spot/perp basis rows and serve /api/aster-basis/status",
+        "  funding-arb-monitor [--bind 127.0.0.1:8804] [--interval-secs 5] [--clear-sources --source venue=url] [--min-net-funding-bps 5] [--once] [--out dir]",
+        "                                    Aggregate local basis monitor status snapshots into cross-exchange funding arb opportunities",
+        "  funding-arb-guarded-dry-run-once --snapshot file --pair-id id [--config file] [--out dir] [--min-net-funding-bps 5]",
+        "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
     ]
     .join("\n")
 }
@@ -21262,6 +23562,8 @@ type OkxBasisMonitorCliOptions = OkxBasisMonitorOptions;
 type BitgetBasisMonitorCliOptions = BitgetBasisMonitorOptions;
 type HyperliquidBasisMonitorCliOptions = HyperliquidBasisMonitorOptions;
 type AsterBasisMonitorCliOptions = AsterBasisMonitorOptions;
+type FundingArbMonitorCliOptions = FundingArbMonitorOptions;
+type FundingArbGuardedDryRunOnceCliOptions = FundingArbGuardedDryRunOnceOptions;
 
 fn parse_live_market_sim_args(args: &[String]) -> RuntimeResult<LiveMarketSimCliOptions> {
     let mut fixture_root = PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE);
@@ -22842,6 +25144,301 @@ fn parse_aster_basis_monitor_args(args: &[String]) -> RuntimeResult<AsterBasisMo
     Ok(options)
 }
 
+fn parse_funding_arb_monitor_args(args: &[String]) -> RuntimeResult<FundingArbMonitorCliOptions> {
+    let mut options = FundingArbMonitorOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires an address"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires a value"));
+                };
+                options.poll_interval_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--interval-secs must be an integer"))?;
+            }
+            "--notional-usd" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--notional-usd requires a decimal"));
+                };
+                options.notional_usd = value.clone();
+            }
+            "--taker-fee-bps" | "--perp-fee-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--taker-fee-bps requires a value"));
+                };
+                options.taker_fee_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--taker-fee-bps must be an integer"))?;
+            }
+            "--slippage-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--slippage-bps requires a value"));
+                };
+                options.slippage_buffer_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--slippage-bps must be an integer"))?;
+            }
+            "--max-entry-price-divergence-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-entry-price-divergence-bps requires a value",
+                    ));
+                };
+                options.max_entry_price_divergence_bps = value.parse::<i128>().map_err(|_| {
+                    cli_arg_error("--max-entry-price-divergence-bps must be an integer")
+                })?;
+            }
+            "--min-net-funding-bps" | "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-funding-bps requires a value"));
+                };
+                options.min_net_funding_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--min-net-funding-bps must be an integer"))?;
+            }
+            "--source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--source requires venue=url"));
+                };
+                let (venue, status_url) = parse_funding_arb_source_arg(value)?;
+                set_funding_arb_source_url(&mut options, &venue, status_url);
+            }
+            "--clear-sources" => {
+                options.sources.clear();
+            }
+            "--binance-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--binance-status-url requires a URL"));
+                };
+                set_funding_arb_source_url(&mut options, "binance", value.clone());
+            }
+            "--bybit-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-status-url requires a URL"));
+                };
+                set_funding_arb_source_url(&mut options, "bybit", value.clone());
+            }
+            "--okx-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-status-url requires a URL"));
+                };
+                set_funding_arb_source_url(&mut options, "okx", value.clone());
+            }
+            "--bitget-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bitget-status-url requires a URL"));
+                };
+                set_funding_arb_source_url(&mut options, "bitget", value.clone());
+            }
+            "--aster-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-status-url requires a URL"));
+                };
+                set_funding_arb_source_url(&mut options, "aster", value.clone());
+            }
+            "--hyperliquid-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-status-url requires a URL"));
+                };
+                set_funding_arb_source_url(&mut options, "hyperliquid", value.clone());
+            }
+            "--once" => options.once = true,
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                options.output_dir = Some(PathBuf::from(value));
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown funding-arb-monitor option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected funding-arb-monitor positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_funding_arb_monitor_options(&options)?;
+    Ok(options)
+}
+
+fn parse_funding_arb_source_arg(value: &str) -> RuntimeResult<(String, String)> {
+    let Some((venue, status_url)) = value.split_once('=') else {
+        return Err(cli_arg_error("--source must use venue=url"));
+    };
+    if venue.trim().is_empty() || status_url.trim().is_empty() {
+        return Err(cli_arg_error("--source requires non-empty venue and URL"));
+    }
+    Ok((venue.trim().to_owned(), status_url.trim().to_owned()))
+}
+
+fn set_funding_arb_source_url(
+    options: &mut FundingArbMonitorOptions,
+    venue_family: &str,
+    status_url: String,
+) {
+    let family = normalize_venue_family(venue_family);
+    if let Some(source) = options
+        .sources
+        .iter_mut()
+        .find(|source| normalize_venue_family(&source.venue_family) == family)
+    {
+        source.status_url = status_url;
+    } else {
+        options.sources.push(FundingArbVenueSource {
+            venue_family: family,
+            status_url,
+        });
+    }
+}
+
+fn parse_funding_arb_guarded_dry_run_once_args(
+    args: &[String],
+) -> RuntimeResult<FundingArbGuardedDryRunOnceCliOptions> {
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut snapshot_path = None;
+    let mut pair_id = None;
+    let mut output_dir = None;
+    let mut notional_usd = BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned();
+    let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS;
+    let mut slippage_buffer_bps = BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS;
+    let mut max_entry_price_divergence_bps = 20;
+    let mut min_net_funding_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--snapshot requires a file path"));
+                };
+                snapshot_path = Some(PathBuf::from(value));
+            }
+            "--pair-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--pair-id requires a value"));
+                };
+                pair_id = Some(value.clone());
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--notional-usd" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--notional-usd requires a decimal"));
+                };
+                notional_usd = value.clone();
+            }
+            "--taker-fee-bps" | "--perp-fee-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--taker-fee-bps requires a value"));
+                };
+                taker_fee_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--taker-fee-bps must be an integer"))?;
+            }
+            "--slippage-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--slippage-bps requires a value"));
+                };
+                slippage_buffer_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--slippage-bps must be an integer"))?;
+            }
+            "--max-entry-price-divergence-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-entry-price-divergence-bps requires a value",
+                    ));
+                };
+                max_entry_price_divergence_bps = value.parse::<i128>().map_err(|_| {
+                    cli_arg_error("--max-entry-price-divergence-bps must be an integer")
+                })?;
+            }
+            "--min-net-funding-bps" | "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-funding-bps requires a value"));
+                };
+                min_net_funding_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--min-net-funding-bps must be an integer"))?;
+            }
+            "--dry-run" => {}
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown funding-arb-guarded-dry-run-once option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected funding-arb-guarded-dry-run-once positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let options = FundingArbGuardedDryRunOnceOptions {
+        config_path,
+        snapshot_path: snapshot_path.ok_or_else(|| cli_arg_error("--snapshot is required"))?,
+        pair_id: pair_id.ok_or_else(|| cli_arg_error("--pair-id is required"))?,
+        output_dir,
+        notional_usd,
+        taker_fee_bps,
+        slippage_buffer_bps,
+        max_entry_price_divergence_bps,
+        min_net_funding_bps,
+    };
+    validate_funding_arb_guarded_dry_run_once_options(&options)?;
+    Ok(options)
+}
+
 fn cli_arg_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Module {
         module: "arb-runtime",
@@ -22866,6 +25463,163 @@ mod tests {
         full_pipeline_fixture_root().join("cases").join(case_name)
     }
 
+    #[test]
+    fn venue_capability_profiles_cover_six_venues_and_strategy_support() {
+        let profiles = arb_venue_capability_profiles();
+        let venue_families = profiles
+            .iter()
+            .map(|profile| profile.venue_family.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            venue_families,
+            BTreeSet::from(["aster", "binance", "bitget", "bybit", "hyperliquid", "okx"])
+        );
+
+        for family in ["binance", "bybit", "okx", "bitget"] {
+            let profile = arb_venue_capability_profile(family).expect("profile");
+            assert!(profile.supports_spot_perp_basis());
+            assert!(profile.supports_cross_exchange_funding_arb());
+            assert_eq!(profile.funding_interval_hours, Some(8));
+        }
+
+        let aster = arb_venue_capability_profile("aster").expect("aster profile");
+        assert!(!aster.supports_spot_perp_basis());
+        assert!(aster.supports_cross_exchange_funding_arb());
+
+        let hyperliquid = arb_venue_capability_profile("hyperliquid").expect("hyperliquid profile");
+        assert!(!hyperliquid.supports_spot_perp_basis());
+        assert!(hyperliquid.supports_cross_exchange_funding_arb());
+        assert_eq!(hyperliquid.funding_interval_hours, Some(1));
+    }
+
+    #[test]
+    fn venue_capability_descriptors_are_derived_from_profiles() {
+        for family in ["binance", "bybit", "okx", "bitget", "aster", "hyperliquid"] {
+            let profile = arb_venue_capability_profile(family).expect("profile");
+            let descriptors = arb_venue_capability_descriptors(family).expect("descriptors");
+            assert!(!descriptors.is_empty());
+            assert!(descriptors.iter().any(|descriptor| descriptor
+                .market_capabilities
+                .contains(&arb_contracts::MarketCapability::ProvidesFundingRates)));
+
+            let has_spot_descriptor = descriptors.iter().any(|descriptor| {
+                descriptor
+                    .market_capabilities
+                    .contains(&arb_contracts::MarketCapability::ProvidesSpotMarkets)
+            });
+            assert_eq!(has_spot_descriptor, profile.supports_spot);
+
+            let has_perp_descriptor = descriptors.iter().any(|descriptor| {
+                descriptor
+                    .market_capabilities
+                    .contains(&arb_contracts::MarketCapability::ProvidesPerpetuals)
+            });
+            assert!(has_perp_descriptor);
+        }
+    }
+
+    #[test]
+    fn six_venue_strategy_matrix_covers_two_strategy_support() {
+        let matrix = arb_venue_strategy_support_matrix();
+        let by_family = matrix
+            .iter()
+            .map(|row| (row.venue_family.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            by_family.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["aster", "binance", "bitget", "bybit", "hyperliquid", "okx"])
+        );
+
+        for family in ["binance", "bybit", "okx", "bitget"] {
+            let row = by_family.get(family).expect("venue row");
+            assert!(row.supports_spot_perp_basis);
+            assert!(row.supports_cross_exchange_funding_arb);
+        }
+
+        for family in ["aster", "hyperliquid"] {
+            let row = by_family.get(family).expect("venue row");
+            assert!(!row.supports_spot_perp_basis);
+            assert!(row.supports_cross_exchange_funding_arb);
+        }
+
+        let funding_pairs = cross_exchange_funding_arb_venue_pairs();
+        let pair_set = funding_pairs
+            .iter()
+            .map(|pair| (pair.venue_a.as_str(), pair.venue_b.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(funding_pairs.len(), 15);
+        assert_eq!(
+            pair_set,
+            BTreeSet::from([
+                ("binance", "bybit"),
+                ("binance", "okx"),
+                ("binance", "bitget"),
+                ("binance", "aster"),
+                ("binance", "hyperliquid"),
+                ("bybit", "okx"),
+                ("bybit", "bitget"),
+                ("bybit", "aster"),
+                ("bybit", "hyperliquid"),
+                ("okx", "bitget"),
+                ("okx", "aster"),
+                ("okx", "hyperliquid"),
+                ("bitget", "aster"),
+                ("bitget", "hyperliquid"),
+                ("aster", "hyperliquid"),
+            ])
+        );
+    }
+
+    #[test]
+    fn opportunity_observer_artifacts_and_docs_cover_two_strategies() {
+        let root = Path::new("target/arb-opportunity-observer");
+        let paths = arb_opportunity_observer_artifact_paths(root);
+
+        assert_eq!(
+            paths.spot_perp_basis_opportunities,
+            root.join("opportunities").join("spot-perp-basis.jsonl")
+        );
+        assert_eq!(
+            paths.cross_exchange_funding_arb_opportunities,
+            root.join("opportunities")
+                .join("cross-exchange-funding-arb.jsonl")
+        );
+        assert_eq!(
+            paths.dry_run_reports,
+            root.join("dry-run").join("dry-run-reports.jsonl")
+        );
+        assert_eq!(
+            paths.health_events,
+            root.join("logs").join("health-events.jsonl")
+        );
+
+        let repo_root = workspace_root();
+        let script = std::fs::read_to_string(
+            repo_root
+                .join("scripts")
+                .join("start-basis-opportunity-observer.sh"),
+        )
+        .expect("observer script");
+        let runbook =
+            std::fs::read_to_string(repo_root.join("runbooks").join("basis-dry-run-observer.md"))
+                .expect("observer runbook");
+
+        for contents in [script.as_str(), runbook.as_str()] {
+            assert!(contents.contains("binance"));
+            assert!(contents.contains("bybit"));
+            assert!(contents.contains("okx"));
+            assert!(contents.contains("bitget"));
+            assert!(contents.contains("aster"));
+            assert!(contents.contains("hyperliquid"));
+            assert!(contents.contains(SPOT_PERP_BASIS_OBSERVER_STRATEGY));
+            assert!(contents.contains(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY));
+            assert!(contents.contains("target/arb-opportunity-observer"));
+            assert!(contents.contains("dry-run-reports.jsonl"));
+            assert!(contents.contains("health-events.jsonl"));
+        }
+    }
+
     fn monitor_book_ticker_row(symbol: &str) -> MonitorBookTickerRow {
         MonitorBookTickerRow {
             symbol: symbol.to_owned(),
@@ -22874,6 +25628,221 @@ mod tests {
             ask_price: "100.02".to_owned(),
             ask_qty: "1.3".to_owned(),
         }
+    }
+
+    fn funding_arb_test_row(
+        venue_a_funding_rate: &str,
+        venue_b_funding_rate: &str,
+    ) -> FundingArbMarketRow {
+        FundingArbMarketRow {
+            pair_id: "binance:bybit:BTCUSDT:BTCUSDT".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            venue_a_family: "binance".to_owned(),
+            venue_b_family: "bybit".to_owned(),
+            venue_a_bid: "99.95".to_owned(),
+            venue_a_ask: "100.00".to_owned(),
+            venue_a_bid_qty: "2.0".to_owned(),
+            venue_a_ask_qty: "2.0".to_owned(),
+            venue_a_funding_rate: venue_a_funding_rate.to_owned(),
+            venue_a_funding_interval_hours: "8".to_owned(),
+            venue_b_bid: "100.05".to_owned(),
+            venue_b_ask: "100.10".to_owned(),
+            venue_b_bid_qty: "2.0".to_owned(),
+            venue_b_ask_qty: "2.0".to_owned(),
+            venue_b_funding_rate: venue_b_funding_rate.to_owned(),
+            venue_b_funding_interval_hours: "8".to_owned(),
+            funding_interval_hours: "8".to_owned(),
+            long_venue_family: Some("binance".to_owned()),
+            short_venue_family: Some("bybit".to_owned()),
+            gross_funding_spread_bps: Some("29".to_owned()),
+            total_cost_bps: Some("10".to_owned()),
+            net_funding_bps: Some("19".to_owned()),
+            expected_funding_usd: Some("0.19".to_owned()),
+            is_candidate: true,
+            reason: None,
+            source_status: "complete".to_owned(),
+        }
+    }
+
+    fn funding_arb_test_snapshot(
+        rows: Vec<FundingArbMarketRow>,
+        updated_at: String,
+    ) -> FundingArbMonitorSnapshot {
+        FundingArbMonitorSnapshot {
+            status: "healthy".to_owned(),
+            updated_at,
+            min_net_funding_bps: "5".to_owned(),
+            total_rows: rows.len(),
+            candidate_count: rows.iter().filter(|row| row.is_candidate).count(),
+            source_count: 2,
+            source_error_count: 0,
+            last_error: None,
+            rows,
+        }
+    }
+
+    fn funding_arb_basis_status_json(
+        symbol: &str,
+        funding_rate: &str,
+        source_status: &str,
+        bid_qty: Option<&str>,
+        ask_qty: Option<&str>,
+    ) -> String {
+        let bid_qty_json = bid_qty
+            .map(json_string)
+            .unwrap_or_else(|| "null".to_owned());
+        let ask_qty_json = ask_qty
+            .map(json_string)
+            .unwrap_or_else(|| "null".to_owned());
+        format!(
+            r#"{{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{{"symbol":{},"perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":{},"perp_ask_qty":{},"last_funding_rate":{},"source_status":{}}}]}}"#,
+            json_string(symbol),
+            bid_qty_json,
+            ask_qty_json,
+            json_string(funding_rate),
+            json_string(source_status),
+        )
+    }
+
+    fn funding_arb_test_venue_snapshot(
+        venue_family: &str,
+        status_json: &str,
+    ) -> FundingArbVenueSnapshot {
+        parse_funding_arb_basis_status_snapshot(
+            status_json,
+            &FundingArbVenueSource {
+                venue_family: venue_family.to_owned(),
+                status_url: format!("http://127.0.0.1/{venue_family}/status"),
+            },
+        )
+        .expect("funding arb venue snapshot")
+    }
+
+    fn funding_arb_test_events() -> Vec<NormalizedEvent> {
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        funding_arb_monitor_snapshot_candidate_events(
+            &spec,
+            &snapshot,
+            UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time"),
+        )
+        .expect("funding events")
+    }
+
+    fn funding_arb_spec_with_second_venue(
+        venue_family: &str,
+        venue_id: &str,
+        instrument_id: &str,
+        account_id: &str,
+        venue_label: &str,
+        transition_id: &str,
+    ) -> CrossExchangeFundingArbPipelineSpec {
+        let mut strategy_config = CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt();
+        strategy_config.instance.venue_family_label = format!("Binance-{venue_label}");
+        strategy_config.venues.venue_b.venue_id = venue_id.to_owned();
+        strategy_config.venues.venue_b.instrument_id = instrument_id.to_owned();
+        strategy_config.venues.venue_b.account_id = account_id.to_owned();
+        strategy_config.venues.venue_b.leg_id = format!(
+            "candleg:funding-arb-{}",
+            basis_identifier_component(venue_label)
+        );
+        strategy_config.venues.venue_b.venue_label = venue_label.to_owned();
+        strategy_config.venues.venue_b.instrument_label = "perp".to_owned();
+        strategy_config.output.transition_id = transition_id.to_owned();
+        let mut venue_capabilities =
+            arb_venue_capability_descriptors("binance").expect("binance capabilities");
+        venue_capabilities.extend(
+            arb_venue_capability_descriptors(venue_family).expect("second venue capabilities"),
+        );
+        CrossExchangeFundingArbPipelineSpec::new(
+            strategy_config,
+            venue_capabilities,
+            format!("state:funding-arb-{venue_family}-readonly-01"),
+            format!("hash:funding-arb-{venue_family}-readonly-01"),
+        )
+        .expect("funding arb spec")
+    }
+
+    fn funding_arb_events_for_spec(
+        spec: &CrossExchangeFundingArbPipelineSpec,
+        venue_a_funding_rate: &str,
+        venue_a_interval_hours: &str,
+        venue_b_funding_rate: &str,
+        venue_b_interval_hours: &str,
+    ) -> Vec<NormalizedEvent> {
+        let observed_at = "2026-05-13T00:00:00Z";
+        let row_symbol = spec.strategy_config.symbol.symbol.as_str();
+        let correlation_id = "corr:test:funding-arb:custom";
+        let venue_a_book = monitor_book_ticker_event_json(
+            "event:test:funding-arb:venue-a-book",
+            correlation_id,
+            "test:funding-arb:venue-a-book",
+            "sha256:test-funding-arb-venue-a-book",
+            observed_at,
+            &spec.strategy_config.venues.venue_a.venue_id,
+            &spec.strategy_config.venues.venue_a.instrument_id,
+            "Perp",
+            row_symbol,
+            "Perp",
+            "99.95",
+            "100.00",
+            "2.0",
+            "2.0",
+        );
+        let venue_b_book = monitor_book_ticker_event_json(
+            "event:test:funding-arb:venue-b-book",
+            correlation_id,
+            "test:funding-arb:venue-b-book",
+            "sha256:test-funding-arb-venue-b-book",
+            observed_at,
+            &spec.strategy_config.venues.venue_b.venue_id,
+            &spec.strategy_config.venues.venue_b.instrument_id,
+            "Perp",
+            row_symbol,
+            "Perp",
+            "100.05",
+            "100.10",
+            "2.0",
+            "2.0",
+        );
+        let venue_a_premium = funding_monitor_premium_index_event_json(
+            "event:test:funding-arb:venue-a-premium",
+            correlation_id,
+            "test:funding-arb:venue-a-premium",
+            "sha256:test-funding-arb-venue-a-premium",
+            observed_at,
+            &spec.strategy_config.venues.venue_a.venue_id,
+            &spec.strategy_config.venues.venue_a.instrument_id,
+            row_symbol,
+            "100.00",
+            "100.00",
+            venue_a_funding_rate,
+            venue_a_interval_hours,
+        );
+        let venue_b_premium = funding_monitor_premium_index_event_json(
+            "event:test:funding-arb:venue-b-premium",
+            correlation_id,
+            "test:funding-arb:venue-b-premium",
+            "sha256:test-funding-arb-venue-b-premium",
+            observed_at,
+            &spec.strategy_config.venues.venue_b.venue_id,
+            &spec.strategy_config.venues.venue_b.instrument_id,
+            row_symbol,
+            "100.05",
+            "100.05",
+            venue_b_funding_rate,
+            venue_b_interval_hours,
+        );
+        vec![
+            from_json_strict::<NormalizedEvent>(&venue_a_book).expect("venue a book"),
+            from_json_strict::<NormalizedEvent>(&venue_b_book).expect("venue b book"),
+            from_json_strict::<NormalizedEvent>(&venue_a_premium).expect("venue a premium"),
+            from_json_strict::<NormalizedEvent>(&venue_b_premium).expect("venue b premium"),
+        ]
     }
 
     fn binance_wss_test_market_state(
@@ -23524,6 +26493,16 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_dashboard_html_requests_realtime_api_paths() {
+        let html = funding_arb_dashboard_html();
+
+        assert!(html.contains("跨所资金费率套利 observer"));
+        assert!(html.contains("/api/funding-arb/status"));
+        assert!(html.contains("/api/funding-arb/opportunities"));
+        assert!(html.contains("id=\"funding-rows\""));
+    }
+
+    #[test]
     fn binance_basis_monitor_snapshot_scans_all_symbols_and_filters_tiny_funding() {
         let spot = r#"[
           {"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"},
@@ -23666,6 +26645,517 @@ mod tests {
         assert!(!artifacts.risk_decisions_jsonl.is_empty());
         assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
         assert!(artifacts.execution_plans_jsonl.is_empty());
+    }
+
+    #[test]
+    fn funding_arb_monitor_builds_cross_exchange_candidates_from_basis_status() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let hyperliquid = funding_arb_test_venue_snapshot(
+            "hyperliquid",
+            &funding_arb_basis_status_json(
+                "BTC",
+                "0.00040000",
+                "missing_spot",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "binance".to_owned(),
+                    status_url: "http://127.0.0.1/binance/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "hyperliquid".to_owned(),
+                    status_url: "http://127.0.0.1/hyperliquid/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot = build_funding_arb_monitor_snapshot_from_sources(
+            vec![binance, hyperliquid],
+            vec![],
+            &options,
+        )
+        .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.source_count, 2);
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.candidate_count, 1);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.symbol, "BTCUSDT");
+        assert_eq!(row.venue_b_funding_rate, "0.0032");
+        assert_eq!(row.venue_b_funding_interval_hours, "8");
+        assert_eq!(row.source_status, "complete");
+        assert!(row
+            .net_funding_bps
+            .as_deref()
+            .is_some_and(|value| value != "0"));
+    }
+
+    #[test]
+    fn funding_arb_monitor_fails_closed_when_perp_size_is_missing() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            &funding_arb_basis_status_json("BTCUSDT", "0.00300000", "complete", None, Some("2.0")),
+        );
+        let options = FundingArbMonitorOptions::default();
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![binance, bybit], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.candidate_count, 0);
+        assert_eq!(snapshot.rows[0].source_status, "missing_perp_top_of_book");
+        assert!(snapshot.rows[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("venue_b.perp_bid_qty")));
+    }
+
+    #[test]
+    fn funding_arb_monitor_args_parse_custom_sources() {
+        let args = vec![
+            "--bind".to_owned(),
+            "127.0.0.1:9904".to_owned(),
+            "--clear-sources".to_owned(),
+            "--source".to_owned(),
+            "binance=http://127.0.0.1:8796/api/basis/status".to_owned(),
+            "--source".to_owned(),
+            "bybit=http://127.0.0.1:8797/api/bybit-basis/status".to_owned(),
+            "--min-net-funding-bps".to_owned(),
+            "7".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let options = parse_funding_arb_monitor_args(&args).expect("options");
+
+        assert_eq!(options.bind_addr, "127.0.0.1:9904");
+        assert_eq!(options.sources.len(), 2);
+        assert_eq!(options.min_net_funding_bps, 7);
+        assert!(options.once);
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_reads_observer_snapshot_and_writes_report() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+        let pair_id = snapshot.rows[0].pair_id.clone();
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let output_dir = root.path().join("funding-dry-run");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id: pair_id.clone(),
+            output_dir: Some(output_dir.clone()),
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert!(report.signal_allowed);
+        assert!(report.dispatch_plan_built);
+        assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.dispatch_attempted);
+        let report_json = read_utf8(&output_dir.join("funding_arb_guarded_dry_run_report.json"))
+            .expect("report json");
+        assert!(report_json.contains(&pair_id));
+        assert!(report_json.contains("\"mutable_execution_started\":false"));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_once_args_parse_snapshot_and_pair() {
+        let args = vec![
+            "--snapshot".to_owned(),
+            "target/funding-opportunities.json".to_owned(),
+            "--pair-id".to_owned(),
+            "binance:bybit:BTCUSDT:BTCUSDT".to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--out".to_owned(),
+            "target/funding-dry-run".to_owned(),
+            "--min-net-funding-bps".to_owned(),
+            "9".to_owned(),
+            "--dry-run".to_owned(),
+        ];
+
+        let options = parse_funding_arb_guarded_dry_run_once_args(&args).expect("options");
+
+        assert_eq!(
+            options.snapshot_path,
+            PathBuf::from("target/funding-opportunities.json")
+        );
+        assert_eq!(options.pair_id, "binance:bybit:BTCUSDT:BTCUSDT");
+        assert_eq!(options.min_net_funding_bps, 9);
+        assert_eq!(
+            options.output_dir,
+            Some(PathBuf::from("target/funding-dry-run"))
+        );
+    }
+
+    #[test]
+    fn funding_arb_pipeline_promotes_normalized_events_to_risk_fact() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let events = funding_arb_test_events();
+
+        let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("funding arb artifacts");
+
+        assert!(artifacts.stored_events_jsonl.contains("venue:BINANCE-USDM"));
+        assert!(artifacts.stored_events_jsonl.contains("venue:BYBIT-LINEAR"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:cross-exchange-funding-arb-btcusdt-001"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("\"basis_leg_role\":\"perp_long\""));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("\"basis_leg_role\":\"perp_short\""));
+        assert!(!artifacts.risk_decisions_jsonl.is_empty());
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+        assert!(artifacts.execution_plans_jsonl.is_empty());
+    }
+
+    #[test]
+    fn funding_arb_pipeline_accepts_reverse_funding_direction_from_monitor_row() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00300000", "0.00010000")],
+            ingested_at.to_string(),
+        );
+        let events = funding_arb_monitor_snapshot_candidate_events(&spec, &snapshot, ingested_at)
+            .expect("reverse funding direction remains a candidate");
+
+        let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("funding arb artifacts");
+
+        assert!(!artifacts.candidate_transitions_jsonl.is_empty());
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("\"basis_leg_role\":\"perp_long\""));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("\"basis_leg_role\":\"perp_short\""));
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+    }
+
+    #[test]
+    fn funding_arb_pipeline_rejects_insufficient_spread_without_candidate() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let snapshot = funding_arb_test_snapshot(
+            vec![funding_arb_test_row("0.00010000", "0.00100000")],
+            ingested_at.to_string(),
+        );
+        let events = funding_arb_monitor_snapshot_candidate_events(&spec, &snapshot, ingested_at)
+            .expect_err("monitor row with insufficient spread must fail closed");
+        assert!(events.to_string().contains("below minimum"));
+
+        let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            funding_arb_test_events()
+                .into_iter()
+                .take(2)
+                .collect::<Vec<_>>(),
+            ingested_at,
+        )
+        .expect("missing funding events reject in strategy");
+        assert!(artifacts.candidate_transitions_jsonl.is_empty());
+        assert!(artifacts.risk_decisions_jsonl.is_empty());
+    }
+
+    #[test]
+    fn funding_arb_pipeline_fails_closed_when_profile_lacks_funding() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let mut spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        for capability in &mut spec.venue_capabilities {
+            if capability.venue_id.as_str() == "venue:BYBIT-LINEAR" {
+                capability.market_capabilities.retain(|capability| {
+                    capability != &arb_contracts::MarketCapability::ProvidesFundingRates
+                });
+            }
+        }
+
+        let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            funding_arb_test_events(),
+            ingested_at,
+        )
+        .expect("unsupported funding profile rejects in strategy");
+
+        assert!(artifacts.candidate_transitions_jsonl.is_empty());
+        assert!(artifacts.risk_decisions_jsonl.is_empty());
+    }
+
+    #[test]
+    fn funding_arb_pipeline_rejects_stale_data_without_candidate() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let mut events = funding_arb_test_events();
+        events[0].payload.insert(
+            "risk_reason_code".to_owned(),
+            JsonValue::String("DATA_STALE".to_owned()),
+        );
+
+        let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("stale data rejects in strategy");
+
+        assert!(artifacts.candidate_transitions_jsonl.is_empty());
+        assert!(artifacts.risk_decisions_jsonl.is_empty());
+    }
+
+    #[test]
+    fn funding_arb_monitor_snapshot_candidate_events_filter_symbol_and_fail_closed() {
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let other_symbol_snapshot = funding_arb_test_snapshot(
+            vec![FundingArbMarketRow {
+                symbol: "ETHUSDT".to_owned(),
+                ..funding_arb_test_row("0.00010000", "0.00300000")
+            }],
+            ingested_at.to_string(),
+        );
+        let events = funding_arb_monitor_snapshot_candidate_events(
+            &spec,
+            &other_symbol_snapshot,
+            ingested_at,
+        )
+        .expect("other symbol candidates are ignored by this strategy instance");
+        assert!(events.is_empty());
+
+        let incomplete_snapshot = FundingArbMonitorSnapshot {
+            rows: vec![FundingArbMarketRow {
+                source_status: "missing_funding".to_owned(),
+                ..funding_arb_test_row("0.00010000", "0.00300000")
+            }],
+            ..other_symbol_snapshot
+        };
+        let error =
+            funding_arb_monitor_snapshot_candidate_events(&spec, &incomplete_snapshot, ingested_at)
+                .expect_err("matching incomplete candidate must fail closed");
+        assert!(error.to_string().contains("not complete"));
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_builds_two_request_report_without_dispatch() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+
+        let report = run_funding_arb_guarded_dry_run_from_normalized_events(
+            replay.config(),
+            &spec,
+            funding_arb_test_events(),
+            ingested_at,
+        )
+        .expect("funding arb guarded dry-run report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.risk_decision, "RequiresManualApproval");
+        assert!(report.manual_gate_released);
+        assert!(report.dispatch_plan_built);
+        assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.dispatch_attempted);
+        assert!(!report.mutable_execution_started);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_arb_guarded_dry_run_live_exec_build_keeps_dispatch_blocked() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+
+        let report = run_funding_arb_guarded_dry_run_from_normalized_events(
+            replay.config(),
+            &spec,
+            funding_arb_test_events(),
+            ingested_at,
+        )
+        .expect("funding arb guarded dry-run report");
+
+        assert!(report.signal_allowed);
+        assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.dispatch_attempted);
+        assert!(!report.mutable_execution_started);
+    }
+
+    #[test]
+    fn aster_funding_arb_pipeline_promotes_public_events_to_risk_fact() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec = funding_arb_spec_with_second_venue(
+            "aster",
+            "venue:ASTER-USDT-FUTURES",
+            "inst:ASTER:BTCUSDT:USDT-FUTURES",
+            "acct:aster-funding-arb-readonly",
+            "Aster",
+            "trans:aster-funding-arb-btcusdt-001",
+        );
+        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00300000", "8");
+
+        let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("Aster funding arb artifacts");
+
+        assert!(artifacts
+            .stored_events_jsonl
+            .contains("venue:ASTER-USDT-FUTURES"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:aster-funding-arb-btcusdt-001"));
+        assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+    }
+
+    #[test]
+    fn aster_basis_guarded_live_auto_once_fails_closed_without_spot_profile() {
+        let mut strategy_config = SpotPerpBasisStrategyConfig::binance_btcusdt();
+        strategy_config.instance.strategy_id = "strat:aster-spot-perp-basis".to_owned();
+        strategy_config.symbol.spot.venue_id = "venue:ASTER-SPOT".to_owned();
+        strategy_config.symbol.spot.instrument_id = "inst:ASTER:BTCUSDT:SPOT".to_owned();
+        strategy_config.symbol.perp.venue_id = "venue:ASTER-USDT-FUTURES".to_owned();
+        strategy_config.symbol.perp.instrument_id = "inst:ASTER:BTCUSDT:USDT-FUTURES".to_owned();
+        let error = BasisPipelineSpec::new(
+            strategy_config,
+            arb_venue_capability_descriptors("aster").expect("aster capabilities"),
+            "state:aster-basis-readonly-01",
+            "hash:aster-basis-readonly-01",
+        )
+        .expect_err("Aster spot basis must fail closed until spot profile is enabled");
+
+        assert!(error.to_string().contains("venue:ASTER-SPOT"));
+    }
+
+    #[test]
+    fn hyperliquid_funding_arb_pipeline_normalizes_hourly_funding() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec = funding_arb_spec_with_second_venue(
+            "hyperliquid",
+            "venue:HYPERLIQUID-PERP",
+            "inst:HYPERLIQUID:BTCUSDT:PERP",
+            "acct:hyperliquid-funding-arb-readonly",
+            "Hyperliquid",
+            "trans:hyperliquid-funding-arb-btcusdt-001",
+        );
+        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00050000", "1");
+
+        let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
+            &replay,
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("Hyperliquid funding arb artifacts");
+
+        assert!(artifacts
+            .stored_events_jsonl
+            .contains("venue:HYPERLIQUID-PERP"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("trans:hyperliquid-funding-arb-btcusdt-001"));
+        assert!(artifacts
+            .candidate_transitions_jsonl
+            .contains("\"expected_profit_bps\":\"24\""));
+    }
+
+    #[test]
+    fn hyperliquid_guarded_dry_run_builds_two_request_report_without_dispatch() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let spec = funding_arb_spec_with_second_venue(
+            "hyperliquid",
+            "venue:HYPERLIQUID-PERP",
+            "inst:HYPERLIQUID:BTCUSDT:PERP",
+            "acct:hyperliquid-funding-arb-readonly",
+            "Hyperliquid",
+            "trans:hyperliquid-funding-arb-btcusdt-001",
+        );
+        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00050000", "1");
+
+        let report = run_funding_arb_guarded_dry_run_from_normalized_events(
+            replay.config(),
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("Hyperliquid guarded dry-run report");
+
+        assert!(report.signal_allowed);
+        assert!(report.dispatch_plan_built);
+        assert_eq!(report.dispatch_request_count, 2);
+        assert!(!report.dispatch_attempted);
+        assert!(!report.mutable_execution_started);
     }
 
     #[test]
@@ -25562,9 +29052,15 @@ mod tests {
 
         assert_eq!(snapshot.total_rows, 1);
         assert_eq!(snapshot.filtered_funding_count, 1);
-        assert_eq!(snapshot.candidate_count, 1);
+        assert_eq!(snapshot.candidate_count, 0);
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+        assert_eq!(snapshot.rows[0].source_status, "complete");
+        assert_eq!(
+            snapshot.rows[0].reason.as_deref(),
+            Some("ASTER_SPOT_PERP_BASIS_DRY_RUN_NOT_SUPPORTED")
+        );
+        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), None);
+        assert!(!snapshot.rows[0].is_candidate);
     }
 
     #[test]
@@ -26015,14 +29511,24 @@ mod tests {
 
         assert_eq!(snapshot.total_rows, 2);
         assert_eq!(snapshot.filtered_funding_count, 1);
-        assert_eq!(snapshot.candidate_count, 1);
+        assert_eq!(snapshot.candidate_count, 0);
         assert_eq!(snapshot.missing_spot_count, 1);
-        assert_eq!(snapshot.rows[0].symbol, "HYPE");
-        assert_eq!(snapshot.rows[0].spot_ask.as_deref(), Some("100.00"));
-        assert_eq!(snapshot.rows[0].perp_bid.as_deref(), Some("101.00"));
-        assert_eq!(snapshot.rows[0].index_price, "100.00");
-        assert_eq!(snapshot.rows[0].last_funding_rate, "0.00010000");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+        let hype = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "HYPE")
+            .expect("HYPE row");
+        assert_eq!(hype.spot_ask.as_deref(), Some("100.00"));
+        assert_eq!(hype.perp_bid.as_deref(), Some("101.00"));
+        assert_eq!(hype.index_price, "100.00");
+        assert_eq!(hype.last_funding_rate, "0.00010000");
+        assert_eq!(hype.net_basis_bps.as_deref(), None);
+        assert!(!hype.is_candidate);
+        assert_eq!(hype.source_status, "missing_top_of_book_size");
+        assert_eq!(
+            hype.reason.as_deref(),
+            Some("MISSING_HYPERLIQUID_TOP_OF_BOOK_SIZE")
+        );
         let missing_spot = snapshot
             .rows
             .iter()

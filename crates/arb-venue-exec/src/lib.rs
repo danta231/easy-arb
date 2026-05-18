@@ -1083,6 +1083,19 @@ fn ordered_dispatch_legs(legs: Vec<&ExecutionLeg>) -> VenueExecResult<Vec<&Execu
         return Ok(legs);
     }
 
+    if legs
+        .iter()
+        .any(|leg| basis_role(leg) == Some(BasisLegRole::Spot))
+    {
+        return ordered_spot_perp_basis_dispatch_legs(legs);
+    }
+
+    ordered_funding_arb_dispatch_legs(legs)
+}
+
+fn ordered_spot_perp_basis_dispatch_legs(
+    legs: Vec<&ExecutionLeg>,
+) -> VenueExecResult<Vec<&ExecutionLeg>> {
     let spot = legs
         .iter()
         .copied()
@@ -1090,7 +1103,7 @@ fn ordered_dispatch_legs(legs: Vec<&ExecutionLeg>) -> VenueExecResult<Vec<&Execu
     let perp = legs
         .iter()
         .copied()
-        .find(|leg| basis_role(leg) == Some(BasisLegRole::Perp));
+        .find(|leg| basis_role(leg) == Some(BasisLegRole::PerpShort));
     let (Some(spot), Some(perp)) = (spot, perp) else {
         return Err(VenueExecError::DispatchBlocked {
             reason: "basis dispatch requires both spot and perp order legs".to_owned(),
@@ -1123,6 +1136,53 @@ fn ordered_dispatch_legs(legs: Vec<&ExecutionLeg>) -> VenueExecResult<Vec<&Execu
         });
     }
     Ok(vec![spot, perp])
+}
+
+fn ordered_funding_arb_dispatch_legs(
+    legs: Vec<&ExecutionLeg>,
+) -> VenueExecResult<Vec<&ExecutionLeg>> {
+    if legs.len() != 2 {
+        return Err(VenueExecError::DispatchBlocked {
+            reason: "funding arb dispatch currently supports exactly two perp order legs"
+                .to_owned(),
+        });
+    }
+    let long = legs
+        .iter()
+        .copied()
+        .find(|leg| basis_role(leg) == Some(BasisLegRole::PerpLong));
+    let short = legs
+        .iter()
+        .copied()
+        .find(|leg| basis_role(leg) == Some(BasisLegRole::PerpShort));
+    let (Some(long), Some(short)) = (long, short) else {
+        return Err(VenueExecError::DispatchBlocked {
+            reason: "funding arb dispatch requires both perp_long and perp_short order legs"
+                .to_owned(),
+        });
+    };
+    if execution_leg_symbol(long) != execution_leg_symbol(short) {
+        return Err(VenueExecError::DispatchBlocked {
+            reason: "funding arb perp legs must share the same venue symbol".to_owned(),
+        });
+    }
+    if !matches!(
+        long.side.as_ref(),
+        Some(TransitionSide::Buy | TransitionSide::Long)
+    ) {
+        return Err(VenueExecError::DispatchBlocked {
+            reason: "funding arb long leg must be buy/long".to_owned(),
+        });
+    }
+    if !matches!(
+        short.side.as_ref(),
+        Some(TransitionSide::Sell | TransitionSide::Short)
+    ) {
+        return Err(VenueExecError::DispatchBlocked {
+            reason: "funding arb short leg must be sell/short".to_owned(),
+        });
+    }
+    Ok(vec![long, short])
 }
 
 fn planned_submit_order_from_leg(
@@ -1273,7 +1333,7 @@ fn residual_risk_after_failure(
     if receipts.is_empty() {
         return None;
     }
-    if is_basis_dispatch(dispatch_plan)
+    if is_spot_perp_basis_dispatch(dispatch_plan)
         && failed.basis_leg_role.as_deref() == Some("perp_short")
         && receipts
             .iter()
@@ -1282,6 +1342,16 @@ fn residual_risk_after_failure(
         return Some(ResidualRisk {
             severity: "RiskCritical",
             detail: "basis spot leg was accepted before the perp leg failed or became unknown; residual long spot exposure requires manual hedge or unwind".to_owned(),
+        });
+    }
+    if is_funding_arb_dispatch(dispatch_plan)
+        && receipts
+            .iter()
+            .any(|receipt| receipt.status == MutableActionStatus::Accepted)
+    {
+        return Some(ResidualRisk {
+            severity: "RiskCritical",
+            detail: "funding arb one perp leg was accepted before the opposing perp leg failed or became unknown; residual directional perp exposure requires manual hedge or unwind".to_owned(),
         });
     }
     Some(ResidualRisk {
@@ -1294,30 +1364,48 @@ fn residual_risk_after_failure(
     })
 }
 
-fn is_basis_dispatch(dispatch_plan: &ExecutionDispatchPlan) -> bool {
+fn is_spot_perp_basis_dispatch(dispatch_plan: &ExecutionDispatchPlan) -> bool {
     dispatch_plan
         .requests
         .iter()
-        .any(|request| request.basis_leg_role.is_some())
+        .any(|request| request.basis_leg_role.as_deref() == Some("spot_buy"))
+}
+
+fn is_funding_arb_dispatch(dispatch_plan: &ExecutionDispatchPlan) -> bool {
+    let has_long = dispatch_plan
+        .requests
+        .iter()
+        .any(|request| request.basis_leg_role.as_deref() == Some("perp_long"));
+    let has_short = dispatch_plan
+        .requests
+        .iter()
+        .any(|request| request.basis_leg_role.as_deref() == Some("perp_short"));
+    has_long && has_short
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BasisLegRole {
     Spot,
-    Perp,
+    PerpLong,
+    PerpShort,
 }
 
 fn basis_role(leg: &ExecutionLeg) -> Option<BasisLegRole> {
     match leg.basis_leg_role.as_ref().map(|role| role.as_str()) {
         Some("spot_buy") | Some("spot_long") => return Some(BasisLegRole::Spot),
-        Some("perp_short") | Some("perp_sell") => return Some(BasisLegRole::Perp),
+        Some("perp_long") | Some("perp_buy") => return Some(BasisLegRole::PerpLong),
+        Some("perp_short") | Some("perp_sell") => return Some(BasisLegRole::PerpShort),
         _ => {}
     }
     let instrument_id = leg.instrument_id.as_ref()?.as_str();
     if instrument_id.ends_with(":SPOT") {
         Some(BasisLegRole::Spot)
     } else if instrument_id.ends_with(":USDM-PERP") || instrument_id.ends_with(":PERP") {
-        Some(BasisLegRole::Perp)
+        match leg.side.as_ref() {
+            Some(TransitionSide::Buy | TransitionSide::Long) => Some(BasisLegRole::PerpLong),
+            Some(TransitionSide::Sell | TransitionSide::Short) => Some(BasisLegRole::PerpShort),
+            _ => None,
+        }
     } else {
         None
     }
@@ -9469,6 +9557,70 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_dispatch_builds_perp_long_and_short_requests() {
+        let plan = funding_arb_execution_plan();
+        let policy = dispatch_policy("10.00")
+            .with_manual_gate_released(true)
+            .allow_symbol("BTCUSDT")
+            .expect("symbol");
+
+        let dispatch_plan =
+            build_execution_dispatch_plan(&plan, &policy, dispatch_time("00:00:10"))
+                .expect("funding arb dispatch plan");
+
+        assert_eq!(dispatch_plan.requests.len(), 2);
+        assert_eq!(
+            dispatch_plan.requests[0].basis_leg_role.as_deref(),
+            Some("perp_long")
+        );
+        assert_eq!(
+            dispatch_plan.requests[1].basis_leg_role.as_deref(),
+            Some("perp_short")
+        );
+        assert_eq!(
+            dispatch_plan.requests[0].request.venue_id.as_str(),
+            "venue:BINANCE-USDM"
+        );
+        assert_eq!(dispatch_plan.requests[0].request.side, OrderSide::Buy);
+        assert_eq!(
+            dispatch_plan.requests[1].request.venue_id.as_str(),
+            "venue:BYBIT-LINEAR"
+        );
+        assert_eq!(dispatch_plan.requests[1].request.side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn funding_arb_dispatch_reports_residual_perp_exposure_when_second_leg_fails() {
+        let plan = funding_arb_execution_plan();
+        let policy = dispatch_policy("10.00")
+            .with_manual_gate_released(true)
+            .allow_symbol("BTCUSDT")
+            .expect("symbol");
+        let mut adapter = FailSecondSubmitOrder::default();
+
+        let outcome =
+            dispatch_execution_plan(&mut adapter, &plan, &policy, dispatch_time("00:00:10"))
+                .expect("dispatch outcome");
+
+        assert!(!outcome.completed());
+        assert_eq!(outcome.receipts.len(), 1);
+        assert_eq!(
+            outcome
+                .residual_risk
+                .as_ref()
+                .expect("residual risk")
+                .severity,
+            "RiskCritical"
+        );
+        assert!(outcome
+            .residual_risk
+            .as_ref()
+            .expect("residual risk")
+            .detail
+            .contains("directional perp exposure"));
+    }
+
+    #[test]
     fn live_like_rest_receipt_stops_before_dependent_leg_until_private_confirmation() {
         let plan = basis_execution_plan();
         let policy = dispatch_policy("10.00")
@@ -10365,6 +10517,97 @@ mod tests {
 }"#,
         )
         .expect("basis execution plan")
+    }
+
+    fn funding_arb_execution_plan() -> ExecutionPlan {
+        from_json_strict(
+            r#"{
+  "schema_version": "1.0.0",
+  "plan_id": "plan:funding-arb",
+  "transition_id": "trans:funding-arb",
+  "risk_decision_id": "risk:funding-arb",
+  "created_at": "2026-01-01T00:00:00Z",
+  "execution_mode": "ManualApproval",
+  "idempotency_key": "idem:plan:funding-arb",
+  "legs": [
+    {
+      "plan_leg_id": "pleg:plan:funding-arb:manual-gate",
+      "candidate_leg_id": "manual-gate:risk:funding-arb",
+      "action_type": "ManualApprovalGate",
+      "account_id": "acct:funding-arb",
+      "idempotency_key": "idem:plan:funding-arb:manual",
+      "state": "Ready",
+      "failure_semantics": "ManualInterventionRequired"
+    },
+    {
+      "plan_leg_id": "pleg:plan:funding-arb:0001",
+      "candidate_leg_id": "candleg:funding-arb:long",
+      "action_type": "PlaceOrder",
+      "venue_id": "venue:BINANCE-USDM",
+      "instrument_id": "inst:BINANCE:BTCUSDT:USDM-PERP",
+      "account_id": "acct:binance-funding",
+      "venue_symbol": "BTCUSDT",
+      "side": "Long",
+      "order_type": "Limit",
+      "quantity": "1.0",
+      "limit_price": "100.00",
+      "notional_usd": "5.00",
+      "basis_leg_role": "perp_long",
+      "idempotency_key": "idem:plan:funding-arb:long",
+      "depends_on": ["pleg:plan:funding-arb:manual-gate"],
+      "state": "WaitingDependency",
+      "failure_semantics": "UnknownState"
+    },
+    {
+      "plan_leg_id": "pleg:plan:funding-arb:0002",
+      "candidate_leg_id": "candleg:funding-arb:short",
+      "action_type": "PlaceOrder",
+      "venue_id": "venue:BYBIT-LINEAR",
+      "instrument_id": "inst:BYBIT:BTCUSDT:LINEAR-PERP",
+      "account_id": "acct:bybit-funding",
+      "venue_symbol": "BTCUSDT",
+      "side": "Short",
+      "order_type": "Limit",
+      "quantity": "1.0",
+      "limit_price": "100.05",
+      "notional_usd": "5.00",
+      "basis_leg_role": "perp_short",
+      "idempotency_key": "idem:plan:funding-arb:short",
+      "depends_on": ["pleg:plan:funding-arb:0001"],
+      "state": "WaitingDependency",
+      "failure_semantics": "UnknownState"
+    }
+  ],
+  "dependency_graph": {
+    "edges": [
+      {
+        "from_leg_id": "pleg:plan:funding-arb:manual-gate",
+        "to_leg_id": "pleg:plan:funding-arb:0001",
+        "condition": "ManualRelease"
+      },
+      {
+        "from_leg_id": "pleg:plan:funding-arb:0001",
+        "to_leg_id": "pleg:plan:funding-arb:0002",
+        "condition": "OnSuccess"
+      }
+    ]
+  },
+  "constraints": {
+    "max_notional_usd": "10.00",
+    "slippage_limit_bps": "5"
+  },
+  "timeout_policy": {
+    "plan_timeout_ms": 60000,
+    "leg_timeout_ms": 10000,
+    "unknown_state_after_ms": 15000
+  },
+  "cancel_policy": {"default_action": "CancelAndHedgeResidual"},
+  "hedge_policy": {"residual_exposure_action": "HedgeAfterTimeout", "threshold_usd": "0"},
+  "partial_fill_policy": {"action": "HedgeFilledPortion", "max_unhedged_usd": "0"},
+  "failure_policy": {"unknown_state_action": "HaltAndIncident", "retry_limit": 0}
+}"#,
+        )
+        .expect("funding arb execution plan")
     }
 
     #[derive(Default)]

@@ -4164,6 +4164,42 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_preview_builds_perp_long_and_short_order_legs() {
+        let candidate = candidate(FUNDING_ARB_CANDIDATE);
+        let risk_decision = decision(&manual_decision_json());
+        let outcome = build_execution_plan_preview(ExecutionPlanBuildInput::new(
+            &risk_decision,
+            &candidate,
+            ExecutionMode::ReadOnly,
+            "2026-01-01T00:00:04Z",
+        ))
+        .expect("manual approval should produce a funding arb preview");
+
+        let pending = match outcome {
+            PlanBuildOutcome::PendingManualApproval(pending) => pending,
+            PlanBuildOutcome::Schedulable(_) => panic!("manual approval must not be dispatchable"),
+        };
+
+        assert_eq!(pending.plan_preview.legs.len(), 3);
+        let long = &pending.plan_preview.legs[1];
+        let short = &pending.plan_preview.legs[2];
+        assert_eq!(long.action_type, ExecutionActionType::PlaceOrder);
+        assert_eq!(short.action_type, ExecutionActionType::PlaceOrder);
+        assert_eq!(long.side.as_ref().expect("long side").as_str(), "Long");
+        assert_eq!(short.side.as_ref().expect("short side").as_str(), "Short");
+        assert_eq!(
+            long.basis_leg_role.as_ref().expect("long role").as_str(),
+            "perp_long"
+        );
+        assert_eq!(
+            short.basis_leg_role.as_ref().expect("short role").as_str(),
+            "perp_short"
+        );
+        assert_eq!(long.quantity.as_ref().expect("long qty").as_str(), "1");
+        assert_eq!(short.quantity.as_ref().expect("short qty").as_str(), "1");
+    }
+
+    #[test]
     fn approved_manual_approval_record_releases_only_the_manual_gate() {
         let pending = pending_manual_plan();
         let record = review_manual_approval(
@@ -5209,6 +5245,107 @@ mod tests {
           "assumption_id": "asm:01",
           "statement": "Fixture assumes deterministic offline prices.",
           "confidence": 0.9,
+          "source_event_refs": ["event:01"]
+        }
+      ]
+    }"#;
+
+    const FUNDING_ARB_CANDIDATE: &str = r#"{
+      "schema_version": "1.0.0",
+      "transition_id": "trans:01",
+      "strategy_id": "strat:demo",
+      "strategy_version": "1.0.0",
+      "code_version": "code:demo-1",
+      "config_version": "arb-config-v1",
+      "created_at": "2026-01-01T00:00:02Z",
+      "input_event_refs": ["event:01"],
+      "current_portfolio_state_ref": "state:01",
+      "holding_period": {"kind": "UntilFundingTimestamp"},
+      "legs": [
+        {
+          "leg_id": "candleg:funding:long",
+          "leg_type": "Trade",
+          "venue_id": "venue:BINANCE-USDM",
+          "instrument_id": "inst:BINANCE:BTCUSDT:USDM-PERP",
+          "account_id": "acct:binance-funding",
+          "side": "Long",
+          "asset_flows": [],
+          "constraints": {
+            "basis_leg_role": "perp_long",
+            "notional_usd": "100.00",
+            "reference_best_ask": "100.00",
+            "reference_best_bid": "99.95",
+            "venue_symbol": "BTCUSDT"
+          },
+          "failure_modes": ["PartialFill"]
+        },
+        {
+          "leg_id": "candleg:funding:short",
+          "leg_type": "Trade",
+          "venue_id": "venue:BYBIT-LINEAR",
+          "instrument_id": "inst:BYBIT:BTCUSDT:LINEAR-PERP",
+          "account_id": "acct:bybit-funding",
+          "side": "Short",
+          "asset_flows": [],
+          "constraints": {
+            "basis_leg_role": "perp_short",
+            "notional_usd": "100.00",
+            "reference_best_ask": "100.10",
+            "reference_best_bid": "100.05",
+            "venue_symbol": "BTCUSDT"
+          },
+          "failure_modes": ["PartialFill"]
+        }
+      ],
+      "expected_post_state_delta": {
+        "asset_flows": [],
+        "position_deltas": [
+          {
+            "instrument_id": "inst:BINANCE:BTCUSDT:USDM-PERP",
+            "account_id": "acct:binance-funding",
+            "quantity_delta": "1"
+          },
+          {
+            "instrument_id": "inst:BYBIT:BTCUSDT:LINEAR-PERP",
+            "account_id": "acct:bybit-funding",
+            "quantity_delta": "-1"
+          }
+        ]
+      },
+      "expected_economics": {
+        "expected_profit_usd": "0.14",
+        "expected_profit_bps": "14",
+        "fee_estimate_usd": "0.11",
+        "slippage_estimate_usd": "0.04",
+        "confidence": 0.70
+      },
+      "required_capital": {
+        "asset_requirements": [
+          {
+            "asset_id": "asset:USDT",
+            "direction": "Out",
+            "amount": "100.00",
+            "account_id": "acct:binance-funding"
+          },
+          {
+            "asset_id": "asset:USDT",
+            "direction": "Out",
+            "amount": "100.00",
+            "account_id": "acct:bybit-funding"
+          }
+        ],
+        "recovery_buffer_usd": "2.00"
+      },
+      "margin_impact": {"summary": "dry-run margin placeholder", "impact_usd": "0", "confidence": 0.90},
+      "funding_impact": {"summary": "funding spread", "impact_usd": "0.14", "confidence": 0.70},
+      "liquidity_impact": {"summary": "top-of-book depth checked", "impact_usd": "0.04", "confidence": 0.90},
+      "failure_modes": ["PartialFill"],
+      "risk_flags": [],
+      "assumptions": [
+        {
+          "assumption_id": "asm:funding:01",
+          "statement": "Fixture uses public funding and top-of-book data only.",
+          "confidence": 0.7,
           "source_event_refs": ["event:01"]
         }
       ]
