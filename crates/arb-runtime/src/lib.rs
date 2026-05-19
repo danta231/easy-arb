@@ -242,6 +242,14 @@ const BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS: i128 = 10;
 const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
+const ARB_RUNTIME_LEGACY_COMMANDS_ENV: &str = "ARB_RUNTIME_ENABLE_LEGACY_COMMANDS";
+const UNIFIED_RUNTIME_DEFAULT_CONFIG: &str = "templates/personal_guarded_live.preflight.yaml";
+const UNIFIED_RUNTIME_PAPER_DEFAULT_OUT: &str = "target/arb-runtime/paper";
+const UNIFIED_RUNTIME_LIVE_DEFAULT_OUT: &str = "target/arb-runtime/live";
+const UNIFIED_RUNTIME_DEFAULT_INTERVAL_SECS: u64 = 5;
+const UNIFIED_RUNTIME_DEFAULT_AUTO_ONCE_COOLDOWN_SECS: u64 = 60;
+const UNIFIED_RUNTIME_DEFAULT_STRATEGIES: &str = "spot-perp-basis,cross-exchange-funding-arb";
+const UNIFIED_RUNTIME_DEFAULT_MONITORS: &str = "binance bybit okx bitget aster hyperliquid";
 const FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD: &str = "0.01";
 const FUNDING_PRIVATE_ACCOUNT_MIN_COLLATERAL_RATIO_BPS: i128 = 1_000;
 const FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS: i128 = 60_000;
@@ -253,6 +261,7 @@ const FUNDING_ARB_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/funding-arb-resident
 const FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS: i128 = 150;
 const FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS: i128 = 5;
 const BASIS_AUTO_PRICE_GUARD_MAX_BPS: i128 = 100;
+const PORTFOLIO_DASHBOARD_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8805";
 #[cfg(feature = "live-exec")]
 const BASIS_EXIT_DEFAULT_TARGET_PROFIT_BPS: i128 = 40;
 #[cfg(feature = "live-exec")]
@@ -2725,6 +2734,47 @@ pub struct FundingArbPrivateReadonlySnapshotReport {
     pub notes: Vec<String>,
 }
 
+/// 组合看板选项。
+///
+/// 中文说明：该看板只读取本地快照文件和 resident live 只读注册表，展示余额、
+/// 仓位和资金费率上下文；不会读取凭证、签名、下单、撤单或转账。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortfolioDashboardOptions {
+    pub bind_addr: String,
+    pub account_snapshot_path: Option<PathBuf>,
+    pub account_raw_snapshot_path: Option<PathBuf>,
+    pub position_snapshot_path: Option<PathBuf>,
+    pub position_raw_snapshot_path: Option<PathBuf>,
+    pub funding_snapshot_path: Option<PathBuf>,
+    pub resident_root: Option<PathBuf>,
+    pub once: bool,
+}
+
+impl Default for PortfolioDashboardOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: PORTFOLIO_DASHBOARD_DEFAULT_BIND_ADDR.to_owned(),
+            account_snapshot_path: None,
+            account_raw_snapshot_path: None,
+            position_snapshot_path: None,
+            position_raw_snapshot_path: None,
+            funding_snapshot_path: None,
+            resident_root: None,
+            once: false,
+        }
+    }
+}
+
+/// 组合看板启动报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortfolioDashboardReport {
+    pub bind_addr: String,
+    pub status: String,
+    pub balance_count: usize,
+    pub position_count: usize,
+    pub source_error_count: usize,
+}
+
 /// 单个 symbol 的实时 basis 行情行。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinanceBasisMarketRow {
@@ -4465,6 +4515,1261 @@ fn funding_private_readonly_snapshot_summary_json(
         json_string(&report.updated_at),
         json_string_array(&report.venue_families)
     )
+}
+
+/// 启动只读组合看板。
+///
+/// 中文说明：该入口只读取本地文件和 resident live 注册表；不会访问交易所私有
+/// 接口，不读取凭证，不提交订单。
+pub fn run_portfolio_dashboard(
+    options: PortfolioDashboardOptions,
+) -> RuntimeResult<PortfolioDashboardReport> {
+    validate_portfolio_dashboard_options(&options)?;
+    if options.once {
+        let snapshot = build_portfolio_dashboard_snapshot(&options)?;
+        return Ok(PortfolioDashboardReport {
+            bind_addr: options.bind_addr,
+            status: snapshot.status,
+            balance_count: snapshot.balances.len(),
+            position_count: snapshot.positions.len(),
+            source_error_count: snapshot.source_errors.len(),
+        });
+    }
+
+    let bind_addr = options.bind_addr.clone();
+    let state = Arc::new(options);
+    let _handle = start_portfolio_dashboard_http_api(&bind_addr, Arc::clone(&state))?;
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+fn validate_portfolio_dashboard_options(options: &PortfolioDashboardOptions) -> RuntimeResult<()> {
+    if options.bind_addr.trim().is_empty() {
+        return Err(cli_arg_error(
+            "portfolio-dashboard --bind must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn build_portfolio_dashboard_snapshot(
+    options: &PortfolioDashboardOptions,
+) -> RuntimeResult<PortfolioDashboardSnapshot> {
+    let mut balances = Vec::new();
+    let mut positions = Vec::new();
+    let mut source_errors = Vec::new();
+    let mut source_timestamps = Vec::new();
+
+    load_portfolio_account_sources(
+        options,
+        &mut balances,
+        &mut source_timestamps,
+        &mut source_errors,
+    );
+    let funding_contexts =
+        load_portfolio_funding_contexts(options, &mut source_timestamps, &mut source_errors);
+    load_portfolio_position_sources(
+        options,
+        &funding_contexts,
+        &mut positions,
+        &mut source_timestamps,
+        &mut source_errors,
+    );
+
+    let status = if balances.is_empty() && positions.is_empty() {
+        "missing"
+    } else if source_errors.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    }
+    .to_owned();
+    let updated_at = source_timestamps
+        .into_iter()
+        .max()
+        .unwrap_or_else(current_utc_timestamp_string);
+
+    Ok(PortfolioDashboardSnapshot {
+        status,
+        updated_at,
+        balances,
+        positions,
+        source_errors,
+    })
+}
+
+fn load_portfolio_account_sources(
+    options: &PortfolioDashboardOptions,
+    balances: &mut Vec<PortfolioBalanceRow>,
+    source_timestamps: &mut Vec<String>,
+    source_errors: &mut Vec<String>,
+) {
+    let mut loaded = false;
+    if let Some(path) = &options.account_snapshot_path {
+        loaded = true;
+        match read_utf8(path).and_then(|json| portfolio_balance_rows_from_snapshot_json(&json)) {
+            Ok((updated_at, mut rows)) => {
+                if let Some(updated_at) = updated_at {
+                    source_timestamps.push(updated_at);
+                }
+                balances.append(&mut rows);
+            }
+            Err(error) => source_errors.push(format!(
+                "account snapshot `{}` failed: {error}",
+                path.display()
+            )),
+        }
+    }
+    if let Some(path) = &options.account_raw_snapshot_path {
+        loaded = true;
+        match read_utf8(path).and_then(|json| portfolio_balance_rows_from_raw_snapshot_json(&json))
+        {
+            Ok((updated_at, mut rows)) => {
+                if let Some(updated_at) = updated_at {
+                    source_timestamps.push(updated_at);
+                }
+                balances.append(&mut rows);
+            }
+            Err(error) => source_errors.push(format!(
+                "account raw snapshot `{}` failed: {error}",
+                path.display()
+            )),
+        }
+    }
+    if !loaded {
+        source_errors.push("account snapshot source was not provided".to_owned());
+    }
+}
+
+fn load_portfolio_funding_contexts(
+    options: &PortfolioDashboardOptions,
+    source_timestamps: &mut Vec<String>,
+    source_errors: &mut Vec<String>,
+) -> Vec<PortfolioFundingContext> {
+    let Some(path) = &options.funding_snapshot_path else {
+        return Vec::new();
+    };
+    match read_utf8(path).and_then(|json| portfolio_funding_contexts_from_snapshot_json(&json)) {
+        Ok((updated_at, contexts)) => {
+            if let Some(updated_at) = updated_at {
+                source_timestamps.push(updated_at);
+            }
+            contexts
+        }
+        Err(error) => {
+            source_errors.push(format!(
+                "funding snapshot `{}` failed: {error}",
+                path.display()
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn load_portfolio_position_sources(
+    options: &PortfolioDashboardOptions,
+    funding_contexts: &[PortfolioFundingContext],
+    positions: &mut Vec<PortfolioPositionRow>,
+    source_timestamps: &mut Vec<String>,
+    source_errors: &mut Vec<String>,
+) {
+    let mut loaded = false;
+    if let Some(path) = &options.position_snapshot_path {
+        loaded = true;
+        match read_utf8(path)
+            .and_then(|json| portfolio_position_rows_from_snapshot_json(&json, funding_contexts))
+        {
+            Ok((updated_at, mut rows)) => {
+                if let Some(updated_at) = updated_at {
+                    source_timestamps.push(updated_at);
+                }
+                positions.append(&mut rows);
+            }
+            Err(error) => source_errors.push(format!(
+                "position snapshot `{}` failed: {error}",
+                path.display()
+            )),
+        }
+    }
+    if let Some(path) = &options.position_raw_snapshot_path {
+        loaded = true;
+        match read_utf8(path).and_then(|json| {
+            portfolio_position_rows_from_raw_snapshot_json(&json, funding_contexts)
+        }) {
+            Ok((updated_at, mut rows)) => {
+                if let Some(updated_at) = updated_at {
+                    source_timestamps.push(updated_at);
+                }
+                positions.append(&mut rows);
+            }
+            Err(error) => source_errors.push(format!(
+                "position raw snapshot `{}` failed: {error}",
+                path.display()
+            )),
+        }
+    }
+    if let Some(path) = &options.resident_root {
+        loaded = true;
+        match portfolio_position_rows_from_resident_root(path, funding_contexts) {
+            Ok(mut rows) => positions.append(&mut rows),
+            Err(error) => source_errors.push(format!(
+                "resident root `{}` failed: {error}",
+                path.display()
+            )),
+        }
+    }
+    if !loaded {
+        source_errors.push("position snapshot source was not provided".to_owned());
+    }
+}
+
+fn portfolio_dashboard_snapshot_json(snapshot: &PortfolioDashboardSnapshot) -> String {
+    format!(
+        "{{\"balance_count\":{},\"balances\":[{}],\"mutable_execution_started\":false,\"position_count\":{},\"positions\":[{}],\"source_error_count\":{},\"source_errors\":{},\"status\":{},\"updated_at\":{}}}",
+        snapshot.balances.len(),
+        snapshot
+            .balances
+            .iter()
+            .map(portfolio_balance_row_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        snapshot.positions.len(),
+        snapshot
+            .positions
+            .iter()
+            .map(portfolio_position_row_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        snapshot.source_errors.len(),
+        json_string_array(&snapshot.source_errors),
+        json_string(&snapshot.status),
+        json_string(&snapshot.updated_at),
+    )
+}
+
+fn portfolio_balances_json(snapshot: &PortfolioDashboardSnapshot) -> String {
+    format!(
+        "{{\"balance_count\":{},\"balances\":[{}],\"status\":{},\"updated_at\":{}}}",
+        snapshot.balances.len(),
+        snapshot
+            .balances
+            .iter()
+            .map(portfolio_balance_row_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        json_string(&snapshot.status),
+        json_string(&snapshot.updated_at),
+    )
+}
+
+fn portfolio_positions_json(snapshot: &PortfolioDashboardSnapshot) -> String {
+    format!(
+        "{{\"position_count\":{},\"positions\":[{}],\"status\":{},\"updated_at\":{}}}",
+        snapshot.positions.len(),
+        snapshot
+            .positions
+            .iter()
+            .map(portfolio_position_row_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        json_string(&snapshot.status),
+        json_string(&snapshot.updated_at),
+    )
+}
+
+fn portfolio_balance_row_json(row: &PortfolioBalanceRow) -> String {
+    format!(
+        "{{\"account_id\":{},\"asset\":{},\"available\":{},\"borrowed\":{},\"free\":{},\"lent\":{},\"locked\":{},\"maintenance_margin\":{},\"margin_balance\":{},\"margin_buffer\":{},\"pending\":{},\"reserved\":{},\"source_status\":{},\"unsettled\":{},\"venue_family\":{}}}",
+        json_string(&row.account_id),
+        json_string(&row.asset),
+        json_option_string(&row.available),
+        json_option_string(&row.borrowed),
+        json_option_string(&row.free),
+        json_option_string(&row.lent),
+        json_option_string(&row.locked),
+        json_option_string(&row.maintenance_margin),
+        json_option_string(&row.margin_balance),
+        json_option_string(&row.margin_buffer),
+        json_option_string(&row.pending),
+        json_option_string(&row.reserved),
+        json_string(&row.source_status),
+        json_option_string(&row.unsettled),
+        json_string(&row.venue_family),
+    )
+}
+
+fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String {
+    format!(
+        "{{\"account_id\":{},\"accumulated_position\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"funding_settlement_time\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_rate\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
+        json_string(&row.account_id),
+        json_option_string(&row.accumulated_position),
+        json_option_string(&row.close_average_price),
+        json_string(&row.coin),
+        json_option_string(&row.fee),
+        json_option_string(&row.funding_settlement_time),
+        json_option_string(&row.open_average_price),
+        json_option_string(&row.open_close_condition),
+        json_option_string(&row.open_close_spread_pct),
+        json_option_string(&row.position_limit),
+        json_string(&row.position_quantity),
+        json_string(&row.position_status),
+        json_option_string(&row.realtime_funding_rate),
+        json_string(&row.source),
+        json_string(&row.strategy),
+        json_string(&row.symbol),
+        json_string(&row.venue_family),
+    )
+}
+
+fn portfolio_balance_rows_from_snapshot_json(
+    input: &str,
+) -> RuntimeResult<(Option<String>, Vec<PortfolioBalanceRow>)> {
+    let snapshot = parse_funding_private_account_snapshot_json(input)?;
+    let rows = portfolio_balance_rows_from_private_account_snapshot(&snapshot);
+    Ok((snapshot.updated_at, rows))
+}
+
+fn portfolio_balance_rows_from_private_account_snapshot(
+    snapshot: &FundingPrivateAccountSnapshot,
+) -> Vec<PortfolioBalanceRow> {
+    snapshot
+        .accounts
+        .iter()
+        .map(|entry| PortfolioBalanceRow {
+            venue_family: normalize_venue_family(&entry.venue_family),
+            account_id: entry.account_id.clone(),
+            asset: "USD".to_owned(),
+            available: entry.available_usd.clone(),
+            margin_balance: entry.margin_balance_usd.clone(),
+            maintenance_margin: entry.maintenance_margin_usd.clone(),
+            margin_buffer: entry.margin_buffer_usd.clone().or_else(|| {
+                portfolio_margin_buffer(
+                    entry.margin_balance_usd.as_deref(),
+                    entry.maintenance_margin_usd.as_deref(),
+                )
+            }),
+            free: None,
+            locked: None,
+            reserved: None,
+            pending: None,
+            borrowed: None,
+            lent: None,
+            unsettled: None,
+            source_status: snapshot.status.clone(),
+        })
+        .collect()
+}
+
+fn portfolio_balance_rows_from_raw_snapshot_json(
+    input: &str,
+) -> RuntimeResult<(Option<String>, Vec<PortfolioBalanceRow>)> {
+    let snapshot =
+        parse_funding_private_raw_snapshot_json(input, "portfolio account raw snapshot")?;
+    let mut rows = Vec::new();
+    for statement in &snapshot.statements {
+        rows.extend(portfolio_balance_rows_from_raw_statement(
+            statement,
+            &snapshot.status,
+        )?);
+    }
+    if rows.is_empty() {
+        rows = portfolio_balance_rows_from_private_account_snapshot(
+            &funding_private_account_snapshot_from_raw_snapshot(&snapshot)?,
+        );
+    }
+    Ok((snapshot.updated_at, rows))
+}
+
+fn portfolio_balance_rows_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+) -> RuntimeResult<Vec<PortfolioBalanceRow>> {
+    let mut object_slices = Vec::new();
+    collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for object in object_slices {
+        let fields = parse_json_object_value_slices(object)?;
+        let asset = first_json_scalar_string(
+            &fields,
+            &[
+                "asset",
+                "marginCoin",
+                "coin",
+                "ccy",
+                "currency",
+                "token",
+                "symbol",
+            ],
+        )?
+        .map(|value| portfolio_balance_asset_from_raw(&value));
+        let available = first_json_scalar_string(
+            &fields,
+            &[
+                "available",
+                "availableBalance",
+                "available_balance",
+                "availableToWithdraw",
+                "maxWithdrawAmount",
+                "withdrawable",
+            ],
+        )?;
+        let free = first_json_scalar_string(&fields, &["free", "cashBal", "cashBalance"])?;
+        let locked = first_json_scalar_string(
+            &fields,
+            &["locked", "frozenBal", "frozen", "hold", "holdBalance"],
+        )?;
+        let reserved = first_json_scalar_string(&fields, &["reserved", "reservation"])?;
+        let pending = first_json_scalar_string(&fields, &["pending", "pendingBalance"])?;
+        let borrowed = first_json_scalar_string(&fields, &["borrowed", "debt", "liability"])?;
+        let lent = first_json_scalar_string(&fields, &["lent", "loaned"])?;
+        let unsettled =
+            first_json_scalar_string(&fields, &["unsettled", "unsettledBalance", "upl"])?;
+        let margin_balance = first_json_scalar_string(
+            &fields,
+            &[
+                "margin_balance_usd",
+                "marginBalance",
+                "crossWalletBalance",
+                "walletBalance",
+                "balance",
+                "equity",
+                "accountEquity",
+                "totalEq",
+                "accountValue",
+            ],
+        )?;
+        let maintenance_margin = first_json_scalar_string(
+            &fields,
+            &[
+                "maintenance_margin_usd",
+                "maintMargin",
+                "maintenanceMargin",
+                "mmr",
+                "crossMaintenanceMarginUsed",
+            ],
+        )?;
+        let margin_buffer = first_json_scalar_string(
+            &fields,
+            &[
+                "margin_buffer_usd",
+                "available_margin_usd",
+                "availableMargin",
+                "availEq",
+            ],
+        )?
+        .or_else(|| {
+            portfolio_margin_buffer(margin_balance.as_deref(), maintenance_margin.as_deref())
+        });
+
+        let has_balance_value = available.is_some()
+            || free.is_some()
+            || locked.is_some()
+            || reserved.is_some()
+            || pending.is_some()
+            || borrowed.is_some()
+            || lent.is_some()
+            || unsettled.is_some()
+            || margin_balance.is_some()
+            || maintenance_margin.is_some()
+            || margin_buffer.is_some();
+        if !has_balance_value {
+            continue;
+        }
+        let asset = asset.unwrap_or_else(|| "USD".to_owned());
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}",
+            normalize_venue_family(&statement.venue_family),
+            statement.account_id,
+            asset,
+            available,
+            margin_balance,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        rows.push(PortfolioBalanceRow {
+            venue_family: normalize_venue_family(&statement.venue_family),
+            account_id: statement.account_id.clone(),
+            asset,
+            available,
+            margin_balance,
+            maintenance_margin,
+            margin_buffer,
+            free,
+            locked,
+            reserved,
+            pending,
+            borrowed,
+            lent,
+            unsettled,
+            source_status: source_status.to_owned(),
+        });
+    }
+    Ok(rows)
+}
+
+fn portfolio_funding_contexts_from_snapshot_json(
+    input: &str,
+) -> RuntimeResult<(Option<String>, Vec<PortfolioFundingContext>)> {
+    let snapshot = parse_funding_arb_monitor_snapshot_json(input)?;
+    let mut contexts = Vec::new();
+    for row in &snapshot.rows {
+        contexts.push(PortfolioFundingContext {
+            venue_family: normalize_venue_family(&row.venue_a_family),
+            symbol: funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol)),
+            funding_rate: row.venue_a_funding_rate.clone(),
+            next_funding_time_ms: row.venue_a_next_funding_time_ms.clone(),
+            funding_interval_hours: row.venue_a_funding_interval_hours.clone(),
+        });
+        contexts.push(PortfolioFundingContext {
+            venue_family: normalize_venue_family(&row.venue_b_family),
+            symbol: funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol)),
+            funding_rate: row.venue_b_funding_rate.clone(),
+            next_funding_time_ms: row.venue_b_next_funding_time_ms.clone(),
+            funding_interval_hours: row.venue_b_funding_interval_hours.clone(),
+        });
+    }
+    Ok((Some(snapshot.updated_at), contexts))
+}
+
+fn portfolio_position_rows_from_snapshot_json(
+    input: &str,
+    funding_contexts: &[PortfolioFundingContext],
+) -> RuntimeResult<(Option<String>, Vec<PortfolioPositionRow>)> {
+    let fields = parse_json_object_value_slices(input)?;
+    let updated_at =
+        optional_json_value_string(&fields, "updated_at", "portfolio position snapshot")?;
+    let source_status =
+        optional_json_value_string(&fields, "status", "portfolio position snapshot")?
+            .unwrap_or_else(|| "healthy".to_owned());
+    let positions_value = fields
+        .get("positions")
+        .or_else(|| fields.get("rows"))
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: "portfolio position snapshot is missing positions/rows".to_owned(),
+        })?;
+    let mut rows = Vec::new();
+    for object in json_object_slices(positions_value)? {
+        let fields = parse_json_object_value_slices(object)?;
+        if let Some(row) = portfolio_position_row_from_fields(
+            &fields,
+            None,
+            None,
+            "position-snapshot",
+            Some(source_status.as_str()),
+            funding_contexts,
+        )? {
+            rows.push(row);
+        }
+    }
+    Ok((updated_at, rows))
+}
+
+fn portfolio_position_rows_from_raw_snapshot_json(
+    input: &str,
+    funding_contexts: &[PortfolioFundingContext],
+) -> RuntimeResult<(Option<String>, Vec<PortfolioPositionRow>)> {
+    let snapshot =
+        parse_funding_private_raw_snapshot_json(input, "portfolio position raw snapshot")?;
+    let mut rows = Vec::new();
+    for statement in &snapshot.statements {
+        let mut object_slices = Vec::new();
+        collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+        for object in object_slices {
+            let fields = parse_json_object_value_slices(object)?;
+            if let Some(row) = portfolio_position_row_from_fields(
+                &fields,
+                Some(statement.venue_family.as_str()),
+                Some(statement.account_id.as_str()),
+                "position-raw-snapshot",
+                Some(snapshot.status.as_str()),
+                funding_contexts,
+            )? {
+                rows.push(row);
+            }
+        }
+    }
+    Ok((snapshot.updated_at, rows))
+}
+
+fn portfolio_position_row_from_fields(
+    fields: &BTreeMap<String, &str>,
+    default_venue_family: Option<&str>,
+    default_account_id: Option<&str>,
+    source: &str,
+    source_status: Option<&str>,
+    funding_contexts: &[PortfolioFundingContext],
+) -> RuntimeResult<Option<PortfolioPositionRow>> {
+    let Some(raw_symbol) = first_json_scalar_string(
+        fields,
+        &[
+            "symbol",
+            "instId",
+            "instrument",
+            "coin",
+            "asset",
+            "base_asset",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(position_quantity) = first_json_scalar_string(
+        fields,
+        &[
+            "position_quantity",
+            "quantity",
+            "position_size",
+            "size",
+            "positionAmt",
+            "szi",
+            "total",
+            "pos",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let symbol = funding_settlement_display_symbol_from_raw(&raw_symbol);
+    let venue_family = first_json_scalar_string(
+        fields,
+        &[
+            "venue_family",
+            "exchange",
+            "venue",
+            "venueFamily",
+            "platform",
+        ],
+    )?
+    .or_else(|| default_venue_family.map(str::to_owned))
+    .or_else(|| {
+        first_json_scalar_string(fields, &["venue_id", "spot_venue_id", "perp_venue_id"])
+            .ok()
+            .flatten()
+            .and_then(|value| portfolio_venue_family_from_venue_id(&value))
+    })
+    .map(|value| normalize_venue_family(&value))
+    .unwrap_or_else(|| "unknown".to_owned());
+    let account_id = first_json_scalar_string(
+        fields,
+        &[
+            "account_id",
+            "account",
+            "accountId",
+            "uid",
+            "user",
+            "spot_account_id",
+            "perp_account_id",
+        ],
+    )?
+    .or_else(|| default_account_id.map(str::to_owned))
+    .unwrap_or_else(|| "unknown".to_owned());
+    let strategy = first_json_scalar_string(
+        fields,
+        &[
+            "arbitrage_strategy",
+            "strategy",
+            "strategy_id",
+            "strategyId",
+            "basis_strategy",
+        ],
+    )?
+    .unwrap_or_else(|| "unknown".to_owned());
+    let fee = first_json_scalar_string(
+        fields,
+        &[
+            "fee",
+            "fees",
+            "fee_bps",
+            "taker_fee_bps",
+            "entry_total_cost_bps",
+            "total_cost_bps",
+        ],
+    )?
+    .map(|value| portfolio_fee_display(&value));
+    let accumulated_position = first_json_scalar_string(
+        fields,
+        &[
+            "accumulated_position",
+            "cumulative_position",
+            "notional_usd",
+            "notional_usdt",
+            "position_value",
+            "positionValue",
+        ],
+    )?
+    .or_else(|| Some(position_quantity.clone()));
+    let open_average_price = first_json_scalar_string(
+        fields,
+        &[
+            "open_average_price",
+            "open_avg_price",
+            "entry_average_price",
+            "entry_price",
+            "entryPrice",
+            "avgEntryPrice",
+            "avgPx",
+        ],
+    )?;
+    let close_average_price = first_json_scalar_string(
+        fields,
+        &[
+            "close_average_price",
+            "close_avg_price",
+            "exit_average_price",
+            "exit_price",
+            "closePrice",
+            "close_px",
+        ],
+    )?;
+    let open_close_spread_pct = first_json_scalar_string(
+        fields,
+        &[
+            "open_close_spread_pct",
+            "spread_pct",
+            "basis_pct",
+            "entry_spread_pct",
+        ],
+    )?
+    .or_else(|| {
+        portfolio_price_spread_pct(
+            open_average_price.as_deref(),
+            close_average_price.as_deref(),
+        )
+    });
+    let funding_context = portfolio_find_funding_context(funding_contexts, &venue_family, &symbol);
+    let realtime_funding_rate = first_json_scalar_string(
+        fields,
+        &[
+            "realtime_funding_rate",
+            "funding_rate",
+            "lastFundingRate",
+            "fundingRate",
+        ],
+    )?
+    .or_else(|| funding_context.map(|context| context.funding_rate.clone()));
+    let funding_settlement_time = first_json_scalar_string(
+        fields,
+        &[
+            "funding_settlement_time",
+            "next_funding_time",
+            "nextFundingTime",
+            "next_funding_time_ms",
+        ],
+    )?
+    .and_then(|value| portfolio_funding_settlement_time_hhmmss(&value))
+    .or_else(|| {
+        funding_context.and_then(|context| {
+            portfolio_funding_settlement_time_hhmmss(&context.next_funding_time_ms)
+        })
+    });
+    let open_close_condition = first_json_scalar_string(
+        fields,
+        &[
+            "open_close_condition",
+            "condition",
+            "reason",
+            "entry_exit_condition",
+        ],
+    )?
+    .or_else(|| {
+        Some("开仓按套利信号与风控通过；清仓按价差收敛、止盈、止损和风险信号。".to_owned())
+    });
+    let explicit_status = first_json_scalar_string(
+        fields,
+        &["position_status", "status", "state", "positionState"],
+    )?
+    .or_else(|| source_status.map(str::to_owned));
+    let position_status = portfolio_position_status(&position_quantity, explicit_status.as_deref());
+    let position_limit = first_json_scalar_string(
+        fields,
+        &[
+            "position_limit",
+            "limit",
+            "max_position",
+            "riskLimitValue",
+            "max_notional_usdt",
+        ],
+    )?;
+    Ok(Some(PortfolioPositionRow {
+        coin: funding_base_asset_from_symbol(&symbol),
+        symbol,
+        strategy,
+        venue_family,
+        account_id,
+        fee,
+        accumulated_position,
+        open_average_price,
+        close_average_price,
+        open_close_spread_pct,
+        realtime_funding_rate,
+        funding_settlement_time,
+        open_close_condition,
+        position_status,
+        position_quantity,
+        position_limit,
+        source: source.to_owned(),
+    }))
+}
+
+fn portfolio_position_rows_from_resident_root(
+    root: &Path,
+    funding_contexts: &[PortfolioFundingContext],
+) -> RuntimeResult<Vec<PortfolioPositionRow>> {
+    let mut registry_dirs = Vec::new();
+    let root_registry = root.join("resident_live_positions.jsonl");
+    if root_registry.exists() {
+        registry_dirs.push(root.to_path_buf());
+    }
+    if root.is_dir() {
+        for entry in fs::read_dir(root).map_err(|error| RuntimeError::Io {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })? {
+            let entry = entry.map_err(|error| RuntimeError::Io {
+                path: root.to_path_buf(),
+                message: error.to_string(),
+            })?;
+            let path = entry.path();
+            if path.is_dir() && path.join("resident_live_positions.jsonl").exists() {
+                registry_dirs.push(path);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    let mut seen_dirs = BTreeSet::new();
+    for registry_dir in registry_dirs {
+        let key = registry_dir.display().to_string();
+        if !seen_dirs.insert(key) {
+            continue;
+        }
+        let limit = portfolio_position_limit_from_config(&registry_dir)?;
+        for position_ref in portfolio_resident_position_refs_from_dir(&registry_dir, limit)? {
+            rows.push(portfolio_position_row_from_resident_ref(
+                &position_ref,
+                funding_contexts,
+            )?);
+        }
+    }
+    Ok(rows)
+}
+
+fn portfolio_position_limit_from_config(dir: &Path) -> RuntimeResult<Option<String>> {
+    for name in [
+        "resident_live_config.json",
+        "multi_venue_resident_live_config.json",
+        "stack_config.json",
+        "multi_venue_stack_config.json",
+    ] {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let input = read_utf8(&path)?;
+        let fields = parse_json_object_value_slices(&input)?;
+        let max_total =
+            optional_json_value_string(&fields, "max_total_notional_usdt", "resident live config")?;
+        let max_concurrent = optional_json_value_string(
+            &fields,
+            "max_concurrent_positions",
+            "resident live config",
+        )?;
+        let mut parts = Vec::new();
+        if let Some(max_total) = max_total {
+            parts.push(format!("总名义上限 {max_total} USDT"));
+        }
+        if let Some(max_concurrent) = max_concurrent {
+            parts.push(format!("并发仓位上限 {max_concurrent}"));
+        }
+        if !parts.is_empty() {
+            return Ok(Some(parts.join("；")));
+        }
+    }
+    Ok(None)
+}
+
+fn portfolio_resident_position_refs_from_dir(
+    dir: &Path,
+    position_limit: Option<String>,
+) -> RuntimeResult<Vec<PortfolioResidentPositionRef>> {
+    let path = dir.join("resident_live_positions.jsonl");
+    let input = read_utf8(&path)?;
+    let mut positions = BTreeMap::<String, PortfolioResidentPositionRef>::new();
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let fields = parse_json_object_value_slices(line)?;
+        let event_type =
+            required_json_value_string(&fields, "event_type", "resident position registry")?;
+        match event_type.as_str() {
+            "position_opened" => {
+                let position_id = required_json_value_string(
+                    &fields,
+                    "position_id",
+                    "resident position registry",
+                )?;
+                let position_state_path = required_json_value_string(
+                    &fields,
+                    "position_state_path",
+                    "resident position registry",
+                )?;
+                let position_state_path =
+                    portfolio_resolve_resident_path(dir, &position_state_path);
+                let notional_usdt = required_json_value_string(
+                    &fields,
+                    "notional_usdt",
+                    "resident position registry",
+                )?;
+                positions.insert(
+                    position_id.clone(),
+                    PortfolioResidentPositionRef {
+                        position_id,
+                        position_state_path,
+                        notional_usdt,
+                        status: "open".to_owned(),
+                        position_limit: position_limit.clone(),
+                    },
+                );
+            }
+            "position_closed" => {
+                let position_id = required_json_value_string(
+                    &fields,
+                    "position_id",
+                    "resident position registry",
+                )?;
+                if let Some(position) = positions.get_mut(&position_id) {
+                    position.status = "closed".to_owned();
+                }
+            }
+            "position_unknown" => {
+                let position_id = required_json_value_string(
+                    &fields,
+                    "position_id",
+                    "resident position registry",
+                )?;
+                if let Some(position) = positions.get_mut(&position_id) {
+                    position.status = "unknown".to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(positions.into_values().collect())
+}
+
+fn portfolio_position_row_from_resident_ref(
+    position_ref: &PortfolioResidentPositionRef,
+    funding_contexts: &[PortfolioFundingContext],
+) -> RuntimeResult<PortfolioPositionRow> {
+    let input = match read_utf8(&position_ref.position_state_path) {
+        Ok(input) => input,
+        Err(_) => {
+            return Ok(PortfolioPositionRow {
+                coin: "unknown".to_owned(),
+                symbol: position_ref.position_id.clone(),
+                strategy: "resident-live".to_owned(),
+                venue_family: "unknown".to_owned(),
+                account_id: "unknown".to_owned(),
+                fee: None,
+                accumulated_position: Some(position_ref.notional_usdt.clone()),
+                open_average_price: None,
+                close_average_price: None,
+                open_close_spread_pct: None,
+                realtime_funding_rate: None,
+                funding_settlement_time: None,
+                open_close_condition: Some(
+                    "仓位状态文件不可读，外部状态按风险/未知处理。".to_owned(),
+                ),
+                position_status: "unknown".to_owned(),
+                position_quantity: "unknown".to_owned(),
+                position_limit: position_ref.position_limit.clone(),
+                source: "resident-live".to_owned(),
+            });
+        }
+    };
+    let fields = parse_json_object_value_slices(&input)?;
+    let symbol = required_json_value_string(&fields, "symbol", "resident position state")
+        .map(|value| funding_settlement_display_symbol_from_raw(&value))?;
+    let strategy = optional_json_value_string(&fields, "strategy_id", "resident position state")?
+        .or_else(|| {
+            optional_json_value_string(&fields, "strategy", "resident position state")
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| "basis-resident-live".to_owned());
+    let venue_family =
+        optional_json_value_string(&fields, "venue_family", "resident position state")?
+            .or_else(|| {
+                optional_json_value_string(&fields, "spot_venue_id", "resident position state")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| portfolio_venue_family_from_venue_id(&value))
+            })
+            .map(|value| normalize_venue_family(&value))
+            .unwrap_or_else(|| "unknown".to_owned());
+    let spot_account =
+        optional_json_value_string(&fields, "spot_account_id", "resident position state")?;
+    let perp_account =
+        optional_json_value_string(&fields, "perp_account_id", "resident position state")?;
+    let account_id = portfolio_account_pair(spot_account.as_deref(), perp_account.as_deref());
+    let notional_usd =
+        optional_json_value_string(&fields, "notional_usd", "resident position state")?
+            .unwrap_or_else(|| position_ref.notional_usdt.clone());
+    let spot_quantity =
+        optional_json_value_string(&fields, "spot_quantity", "resident position state")?;
+    let perp_quantity =
+        optional_json_value_string(&fields, "perp_quantity", "resident position state")?;
+    let entry_gross_basis_bps =
+        portfolio_optional_i128_field(&fields, "entry_gross_basis_bps", "resident position state")?;
+    let entry_total_cost_bps =
+        portfolio_optional_i128_field(&fields, "entry_total_cost_bps", "resident position state")?;
+    let expected_next_funding_bps = portfolio_optional_i128_field(
+        &fields,
+        "expected_next_funding_bps",
+        "resident position state",
+    )?;
+    let funding_context = portfolio_find_funding_context(funding_contexts, &venue_family, &symbol);
+    let open_average_price =
+        optional_json_value_string(&fields, "open_average_price", "resident position state")?
+            .or_else(|| {
+                optional_json_value_string(
+                    &fields,
+                    "entry_average_price",
+                    "resident position state",
+                )
+                .ok()
+                .flatten()
+            })
+            .or_else(|| {
+                portfolio_average_price_from_notional_quantity(
+                    &notional_usd,
+                    spot_quantity.as_deref(),
+                )
+            });
+    let realtime_funding_rate = funding_context
+        .map(|context| context.funding_rate.clone())
+        .or_else(|| expected_next_funding_bps.map(portfolio_bps_to_percent_string));
+    let funding_settlement_time = funding_context.and_then(|context| {
+        portfolio_funding_settlement_time_hhmmss(&context.next_funding_time_ms)
+    });
+    Ok(PortfolioPositionRow {
+        coin: funding_base_asset_from_symbol(&symbol),
+        symbol,
+        strategy,
+        venue_family,
+        account_id,
+        fee: entry_total_cost_bps.map(|value| format!("{value} bps")),
+        accumulated_position: Some(format!("{notional_usd} USDT")),
+        open_average_price,
+        close_average_price: None,
+        open_close_spread_pct: entry_gross_basis_bps.map(portfolio_bps_to_percent_string),
+        realtime_funding_rate,
+        funding_settlement_time,
+        open_close_condition: Some(
+            "开仓按 basis 入场信号；清仓由 basis-exit-supervisor 按收敛、止盈、止损和风险信号判断。".to_owned(),
+        ),
+        position_status: position_ref.status.clone(),
+        position_quantity: portfolio_spot_perp_quantity(spot_quantity.as_deref(), perp_quantity.as_deref()),
+        position_limit: position_ref.position_limit.clone(),
+        source: "resident-live".to_owned(),
+    })
+}
+
+fn portfolio_balance_asset_from_raw(value: &str) -> String {
+    let value = value.trim().to_ascii_uppercase();
+    if value.ends_with("USDT") && value.len() > 4 {
+        funding_base_asset_from_symbol(&value)
+    } else {
+        value.replace('-', "")
+    }
+}
+
+fn portfolio_margin_buffer(
+    margin_balance: Option<&str>,
+    maintenance_margin: Option<&str>,
+) -> Option<String> {
+    let margin_balance = MonitorDecimal::parse("portfolio.margin_balance", margin_balance?).ok()?;
+    let maintenance_margin =
+        MonitorDecimal::parse("portfolio.maintenance_margin", maintenance_margin?).ok()?;
+    margin_balance
+        .checked_sub(maintenance_margin, "portfolio margin buffer")
+        .ok()
+        .map(MonitorDecimal::format_trimmed)
+}
+
+fn portfolio_fee_display(value: &str) -> String {
+    value.trim().to_owned()
+}
+
+fn portfolio_price_spread_pct(
+    open_price: Option<&str>,
+    close_price: Option<&str>,
+) -> Option<String> {
+    let open_price = MonitorDecimal::parse("portfolio.open_average_price", open_price?).ok()?;
+    let close_price = MonitorDecimal::parse("portfolio.close_average_price", close_price?).ok()?;
+    if open_price.raw == 0 {
+        return None;
+    }
+    let diff = close_price.raw.checked_sub(open_price.raw)?;
+    let scaled = diff
+        .checked_mul(100)
+        .and_then(|value| value.checked_mul(1_000_000))
+        .and_then(|value| value.checked_div(open_price.raw))?;
+    Some(format_scaled_i128(scaled, 6))
+}
+
+fn portfolio_average_price_from_notional_quantity(
+    notional: &str,
+    quantity: Option<&str>,
+) -> Option<String> {
+    let notional = MonitorDecimal::parse("portfolio.notional", notional).ok()?;
+    let quantity = MonitorDecimal::parse("portfolio.quantity", quantity?).ok()?;
+    let quantity_abs = quantity.raw.checked_abs()?;
+    if quantity_abs == 0 {
+        return None;
+    }
+    let scale = 10_i128.pow(MonitorDecimal::SCALE_DIGITS as u32);
+    let price_raw = notional.raw.checked_mul(scale)?.checked_div(quantity_abs)?;
+    Some(MonitorDecimal { raw: price_raw }.format_trimmed())
+}
+
+fn portfolio_bps_to_percent_string(value: i128) -> String {
+    format_scaled_i128(value, 2)
+}
+
+fn format_scaled_i128(value: i128, scale_digits: u32) -> String {
+    let negative = value < 0;
+    let raw = value.checked_abs().unwrap_or(i128::MAX);
+    let scale = 10_i128.pow(scale_digits);
+    let whole = raw / scale;
+    let mut fraction = format!(
+        "{:0width$}",
+        raw % scale,
+        width = usize::try_from(scale_digits).unwrap_or(0)
+    );
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    let sign = if negative { "-" } else { "" };
+    if fraction.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{fraction}")
+    }
+}
+
+fn portfolio_find_funding_context<'a>(
+    contexts: &'a [PortfolioFundingContext],
+    venue_family: &str,
+    symbol: &str,
+) -> Option<&'a PortfolioFundingContext> {
+    let venue_family = normalize_venue_family(venue_family);
+    let symbol = funding_display_symbol(&funding_base_asset_from_symbol(symbol));
+    contexts.iter().find(|context| {
+        normalize_venue_family(&context.venue_family) == venue_family
+            && funding_display_symbol(&funding_base_asset_from_symbol(&context.symbol)) == symbol
+    })
+}
+
+fn portfolio_funding_settlement_time_hhmmss(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() >= 8
+        && trimmed.as_bytes().get(2) == Some(&b':')
+        && trimmed.as_bytes().get(5) == Some(&b':')
+    {
+        return Some(trimmed[..8].to_owned());
+    }
+    if let Ok(millis) = trimmed.parse::<u64>() {
+        return timestamp_from_unix_millis(millis)
+            .ok()
+            .and_then(|timestamp| portfolio_hhmmss_from_timestamp(&timestamp.to_string()));
+    }
+    portfolio_hhmmss_from_timestamp(trimmed)
+}
+
+fn portfolio_hhmmss_from_timestamp(value: &str) -> Option<String> {
+    let time_start = value.find('T').or_else(|| value.find(' '))? + 1;
+    let time = value.get(time_start..)?;
+    if time.len() < 8 {
+        return None;
+    }
+    Some(time[..8].to_owned())
+}
+
+fn portfolio_position_status(quantity: &str, explicit_status: Option<&str>) -> String {
+    if let Some(status) = explicit_status.filter(|value| !value.trim().is_empty()) {
+        let lower = status.trim().to_ascii_lowercase();
+        if !matches!(lower.as_str(), "healthy" | "complete" | "matched") {
+            return status.trim().to_owned();
+        }
+    }
+    match MonitorDecimal::parse("portfolio.position_quantity", quantity) {
+        Ok(quantity) if quantity.raw == 0 => "flat".to_owned(),
+        Ok(_) => "open".to_owned(),
+        Err(_) => "unknown".to_owned(),
+    }
+}
+
+fn portfolio_venue_family_from_venue_id(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    for family in ["binance", "bybit", "okx", "bitget", "aster", "hyperliquid"] {
+        if lower.contains(family) {
+            return Some(family.to_owned());
+        }
+    }
+    None
+}
+
+fn portfolio_resolve_resident_path(dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    }
+}
+
+fn portfolio_optional_i128_field(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<Option<i128>> {
+    let Some(value) = optional_json_value_string(fields, field, source)? else {
+        return Ok(None);
+    };
+    value
+        .parse::<i128>()
+        .map(Some)
+        .map_err(|_| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("{source} field `{field}` is not an integer: `{value}`"),
+        })
+}
+
+fn portfolio_account_pair(spot_account: Option<&str>, perp_account: Option<&str>) -> String {
+    match (spot_account, perp_account) {
+        (Some(spot), Some(perp)) if spot == perp => spot.to_owned(),
+        (Some(spot), Some(perp)) => format!("spot={spot}; perp={perp}"),
+        (Some(spot), None) => spot.to_owned(),
+        (None, Some(perp)) => perp.to_owned(),
+        (None, None) => "unknown".to_owned(),
+    }
+}
+
+fn portfolio_spot_perp_quantity(
+    spot_quantity: Option<&str>,
+    perp_quantity: Option<&str>,
+) -> String {
+    match (spot_quantity, perp_quantity) {
+        (Some(spot), Some(perp)) => format!("spot={spot}; perp={perp}"),
+        (Some(spot), None) => spot.to_owned(),
+        (None, Some(perp)) => perp.to_owned(),
+        (None, None) => "unknown".to_owned(),
+    }
 }
 
 /// 拉取一次 Binance 公开 spot/perp basis 数据并进入正式模拟管线。
@@ -20895,6 +22200,73 @@ struct FundingPrivateExecutionOrder {
     fill_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortfolioDashboardSnapshot {
+    status: String,
+    updated_at: String,
+    balances: Vec<PortfolioBalanceRow>,
+    positions: Vec<PortfolioPositionRow>,
+    source_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortfolioBalanceRow {
+    venue_family: String,
+    account_id: String,
+    asset: String,
+    available: Option<String>,
+    margin_balance: Option<String>,
+    maintenance_margin: Option<String>,
+    margin_buffer: Option<String>,
+    free: Option<String>,
+    locked: Option<String>,
+    reserved: Option<String>,
+    pending: Option<String>,
+    borrowed: Option<String>,
+    lent: Option<String>,
+    unsettled: Option<String>,
+    source_status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortfolioPositionRow {
+    coin: String,
+    symbol: String,
+    strategy: String,
+    venue_family: String,
+    account_id: String,
+    fee: Option<String>,
+    accumulated_position: Option<String>,
+    open_average_price: Option<String>,
+    close_average_price: Option<String>,
+    open_close_spread_pct: Option<String>,
+    realtime_funding_rate: Option<String>,
+    funding_settlement_time: Option<String>,
+    open_close_condition: Option<String>,
+    position_status: String,
+    position_quantity: String,
+    position_limit: Option<String>,
+    source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortfolioFundingContext {
+    venue_family: String,
+    symbol: String,
+    funding_rate: String,
+    next_funding_time_ms: String,
+    funding_interval_hours: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortfolioResidentPositionRef {
+    position_id: String,
+    position_state_path: PathBuf,
+    notional_usdt: String,
+    status: String,
+    position_limit: Option<String>,
+}
+
 struct FundingArbGuardedDryRunReconciliations {
     funding_settlement: FundingSettlementReconciliationSummary,
     funding_settlement_ingestion: FundingSettlementIngestionSummary,
@@ -32845,7 +34217,8 @@ fn handle_binance_wss_book_ticker_http_connection(
     } else if route == "/api/binance-wss-book-ticker/quotes" {
         (200, snapshot.quotes_json())
     } else if route == "/" || route == "/dashboard" {
-        let _ = write_http_html(&mut stream, 200, binance_wss_book_ticker_dashboard_html());
+        let html = binance_wss_book_ticker_dashboard_html();
+        let _ = write_http_html(&mut stream, 200, &html);
         return;
     } else {
         (
@@ -33008,7 +34381,7 @@ fn handle_public_wss_book_ticker_http_connection(
     } else if route == quotes_path {
         (200, snapshot.quotes_json())
     } else if route == "/" || route == "/dashboard" {
-        let html = bybit_wss_book_ticker_dashboard_html();
+        let html = public_wss_book_ticker_dashboard_html_for_api(api_name);
         let _ = write_http_html(&mut stream, 200, &html);
         return;
     } else {
@@ -33142,6 +34515,24 @@ fn start_funding_arb_http_api(
             match stream {
                 Ok(stream) => handle_funding_arb_http_connection(stream, &state),
                 Err(error) => eprintln!("funding-arb-monitor api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+fn start_portfolio_dashboard_http_api(
+    bind_addr: &str,
+    state: Arc<PortfolioDashboardOptions>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind portfolio dashboard HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_portfolio_dashboard_http_connection(stream, &state),
+                Err(error) => eprintln!("portfolio-dashboard api accept failed: {error}"),
             }
         }
     });
@@ -33548,6 +34939,81 @@ fn handle_funding_arb_http_connection(
     let _ = write_http_json(&mut stream, status, &body);
 }
 
+fn handle_portfolio_dashboard_http_connection(
+    mut stream: TcpStream,
+    state: &Arc<PortfolioDashboardOptions>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let read = match stream.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+    let route = path.split('?').next().unwrap_or(path);
+    if method != "GET" {
+        let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
+        return;
+    }
+    if route == "/" || route == "/nav" || route == "/navigation" {
+        let _ = write_http_html(&mut stream, 200, navigation_dashboard_html());
+        return;
+    }
+    if route == "/dashboard" {
+        let _ = write_http_html(&mut stream, 200, portfolio_dashboard_html());
+        return;
+    }
+    if route == "/api/navigation/pages" {
+        let _ = write_http_json(&mut stream, 200, &system_navigation_pages_json());
+        return;
+    }
+
+    let snapshot = match build_portfolio_dashboard_snapshot(state.as_ref()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let body = format!(
+                "{{\"error\":\"snapshot_build_failed\",\"detail\":{}}}",
+                json_string(&error.to_string())
+            );
+            let _ = write_http_json(&mut stream, 500, &body);
+            return;
+        }
+    };
+    let (status, body) = if route == "/health" {
+        let http_status = if snapshot.status == "healthy" {
+            200
+        } else {
+            503
+        };
+        (
+            http_status,
+            format!(
+                "{{\"balance_count\":{},\"position_count\":{},\"source_error_count\":{},\"status\":{},\"updated_at\":{}}}",
+                snapshot.balances.len(),
+                snapshot.positions.len(),
+                snapshot.source_errors.len(),
+                json_string(&snapshot.status),
+                json_string(&snapshot.updated_at)
+            ),
+        )
+    } else if route == "/api/portfolio/status" {
+        (200, portfolio_dashboard_snapshot_json(&snapshot))
+    } else if route == "/api/portfolio/balances" {
+        (200, portfolio_balances_json(&snapshot))
+    } else if route == "/api/portfolio/positions" {
+        (200, portfolio_positions_json(&snapshot))
+    } else {
+        (
+            404,
+            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/nav\",\"/dashboard\",\"/health\",\"/api/navigation/pages\",\"/api/portfolio/status\",\"/api/portfolio/balances\",\"/api/portfolio/positions\"]}".to_owned(),
+        )
+    };
+    let _ = write_http_json(&mut stream, status, &body);
+}
+
 fn write_http_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
     write_http_response(stream, status, "application/json; charset=utf-8", body)
 }
@@ -33566,6 +35032,8 @@ fn write_http_response(
         200 => "OK",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     };
     write!(
@@ -33576,1087 +35044,73 @@ fn write_http_response(
     )
 }
 
-fn binance_wss_book_ticker_dashboard_html() -> &'static str {
-    r##"<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Binance WSS bookTicker</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #101112;
-      --band: #151719;
-      --panel: #1b1d20;
-      --panel-strong: #23262a;
-      --line: #353941;
-      --text: #f0eadc;
-      --muted: #a5a8aa;
-      --amber: #e2b650;
-      --green: #58c383;
-      --red: #e06a6a;
-    }
+fn public_wss_book_ticker_dashboard_template() -> &'static str {
+    include_str!(
+        "../../../universal_arb_platform_v2_immutable_core_docs/templates/public_wss_book_ticker_dashboard.html"
+    )
+}
 
-    * { box-sizing: border-box; }
+fn public_wss_book_ticker_dashboard_html(
+    dashboard_title: &str,
+    venue_label: &str,
+    stream_label: &str,
+    api_prefix: &str,
+) -> String {
+    public_wss_book_ticker_dashboard_template()
+        .replace("{{DASHBOARD_TITLE}}", dashboard_title)
+        .replace("{{VENUE_LABEL}}", venue_label)
+        .replace("{{STREAM_LABEL}}", stream_label)
+        .replace("{{API_PREFIX}}", api_prefix)
+}
 
-    body {
-      margin: 0;
-      min-width: 320px;
-      background: var(--bg);
-      color: var(--text);
-      font-family: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-      font-size: 14px;
-      letter-spacing: 0;
-    }
-
-    button,
-    input {
-      font: inherit;
-    }
-
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 24px;
-      padding: 22px 28px;
-      background: #191b1e;
-      border-bottom: 1px solid var(--line);
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 24px;
-      line-height: 1.2;
-    }
-
-    .kicker {
-      margin: 0 0 6px;
-      color: var(--amber);
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-
-    .status-strip {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 10px;
-      color: var(--muted);
-      text-align: right;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 28px;
-      padding: 4px 10px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel-strong);
-      color: var(--muted);
-      white-space: nowrap;
-    }
-
-    .pill.healthy,
-    .positive {
-      color: var(--green);
-      border-color: rgba(88, 195, 131, 0.45);
-    }
-
-    .pill.error,
-    .negative {
-      color: var(--red);
-      border-color: rgba(224, 106, 106, 0.45);
-    }
-
-    main {
-      padding: 18px 28px 32px;
-    }
-
-    .summary-grid,
-    .quote-grid {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(130px, 1fr));
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-
-    .metric,
-    .quote-field {
-      min-height: 72px;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel);
-    }
-
-    .metric span,
-    .quote-field span,
-    .section-head span {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-
-    .metric strong,
-    .quote-field strong {
-      display: block;
-      margin-top: 8px;
-      font-size: 22px;
-      line-height: 1.1;
-      overflow-wrap: anywhere;
-    }
-
-    .section {
-      margin-top: 14px;
-      border: 1px solid var(--line);
-      background: var(--band);
-    }
-
-    .section-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      min-height: 44px;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--line);
-      color: var(--muted);
-    }
-
-    .endpoint-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-
-    button {
-      min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel-strong);
-      color: var(--text);
-      padding: 8px 12px;
-      cursor: pointer;
-    }
-
-    button:hover {
-      border-color: var(--amber);
-    }
-
-    .control-bar {
-      display: grid;
-      grid-template-columns: minmax(150px, 220px) minmax(120px, max-content);
-      gap: 10px;
-      align-items: end;
-      padding: 12px;
-      margin-bottom: 14px;
-      border: 1px solid var(--line);
-      background: var(--band);
-    }
-
-    label span {
-      display: block;
-      margin-bottom: 6px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    input[type="search"] {
-      width: 100%;
-      min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #101214;
-      color: var(--text);
-      padding: 7px 9px;
-    }
-
-    .table-scroll {
-      overflow-x: auto;
-      max-height: 52vh;
-    }
-
-    table {
-      width: 100%;
-      min-width: 980px;
-      border-collapse: collapse;
-    }
-
-    th,
-    td {
-      height: 38px;
-      padding: 8px 10px;
-      border-bottom: 1px solid rgba(53, 57, 65, 0.7);
-      text-align: right;
-      white-space: nowrap;
-    }
-
-    th {
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      background: #202327;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-    }
-
-    th:first-child,
-    td:first-child {
-      text-align: left;
-    }
-
-    tbody tr:hover {
-      background: rgba(226, 182, 80, 0.08);
-    }
-
-    .empty-row {
-      height: 88px;
-      color: var(--muted);
-      text-align: center;
-    }
-
-    pre {
-      margin: 0;
-      max-height: 320px;
-      overflow: auto;
-      padding: 12px;
-      background: #0c0d0e;
-      color: #d7d1c2;
-      border-top: 1px solid var(--line);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-
-    @media (max-width: 980px) {
-      .topbar {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .status-strip {
-        justify-content: flex-start;
-        text-align: left;
-      }
-
-      .summary-grid,
-      .quote-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-
-      .control-bar {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    @media (max-width: 560px) {
-      main,
-      .topbar {
-        padding-left: 14px;
-        padding-right: 14px;
-      }
-
-      .summary-grid,
-      .quote-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-  </style>
-</head>
-<body>
-  <header class="topbar">
-    <div>
-      <p class="kicker">Binance public WSS</p>
-      <h1>bookTicker 实时行情</h1>
-    </div>
-    <div class="status-strip">
-      <span id="runtime-status" class="pill">starting</span>
-      <span id="updated-at">not-yet-updated</span>
-    </div>
-  </header>
-  <main>
-    <section class="summary-grid" aria-label="summary">
-      <article class="metric"><span>Symbol</span><strong id="metric-symbol">-</strong></article>
-      <article class="metric"><span>Market</span><strong id="metric-market">-</strong></article>
-      <article class="metric"><span>fail_closed</span><strong id="metric-fail-closed">false</strong></article>
-      <article class="metric"><span>断线次数</span><strong id="metric-disconnects">0</strong></article>
-      <article class="metric"><span>REST rebuild</span><strong id="metric-rebuilds">0</strong></article>
-      <article class="metric"><span>WSS updates</span><strong id="metric-updates">0</strong></article>
-    </section>
-
-    <section class="quote-grid" aria-label="latest quote">
-      <article class="quote-field"><span>Best Bid</span><strong id="quote-bid">-</strong></article>
-      <article class="quote-field"><span>Bid Size</span><strong id="quote-bid-size">-</strong></article>
-      <article class="quote-field"><span>Best Ask</span><strong id="quote-ask">-</strong></article>
-      <article class="quote-field"><span>Ask Size</span><strong id="quote-ask-size">-</strong></article>
-      <article class="quote-field"><span>Sequence</span><strong id="quote-sequence">-</strong></article>
-      <article class="quote-field"><span>Freshness</span><strong id="quote-freshness">-</strong></article>
-    </section>
-
-    <section class="control-bar" aria-label="controls">
-      <label>
-        <span>Symbol</span>
-        <input id="symbol-filter" type="search" autocomplete="off" placeholder="BTCUSDT">
-      </label>
-      <button id="refresh-button" type="button">刷新</button>
-    </section>
-
-    <section class="section" aria-label="book ticker table">
-      <div class="section-head">
-        <strong>全部 bookTicker</strong>
-        <span id="row-count">0 rows</span>
-      </div>
-      <div class="table-scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Bid</th>
-              <th>Bid Size</th>
-              <th>Ask</th>
-              <th>Ask Size</th>
-              <th>Sequence</th>
-              <th>Freshness</th>
-              <th>Observed</th>
-            </tr>
-          </thead>
-          <tbody id="quote-rows">
-            <tr><td class="empty-row" colspan="8">loading</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="section" aria-label="stream state">
-      <div class="section-head">
-        <strong>连接状态</strong>
-        <span id="stream-url">-</span>
-      </div>
-      <pre id="state-preview">{}</pre>
-    </section>
-
-    <section class="section" aria-label="realtime api">
-      <div class="section-head">
-        <strong>实时 API</strong>
-        <div class="endpoint-grid">
-          <button type="button" data-endpoint="/health">health</button>
-          <button type="button" data-endpoint="/api/binance-wss-book-ticker/quote">quote</button>
-          <button type="button" data-endpoint="/api/binance-wss-book-ticker/quotes">quotes</button>
-          <button type="button" data-endpoint="/api/binance-wss-book-ticker/status">status</button>
-        </div>
-      </div>
-      <pre id="api-preview">{}</pre>
-    </section>
-  </main>
-
-  <script>
-    const statusUrl = "/api/binance-wss-book-ticker/status";
-    const state = { timer: null };
-    const $ = (id) => document.getElementById(id);
-
-    async function requestJson(url) {
-      const response = await fetch(url, { cache: "no-store" });
-      const text = await response.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (error) {
-        throw new Error(`invalid json from ${url}: ${error.message}`);
-      }
-      if (!response.ok && url !== "/health") {
-        throw new Error(data.error || `http ${response.status}`);
-      }
-      return data;
-    }
-
-    function valueOrDash(value) {
-      return value === null || value === undefined || value === "" ? "-" : String(value);
-    }
-
-    function escapeHtml(value) {
-      return valueOrDash(value).replace(/[&<>"']/g, (ch) => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        "\"": "&quot;",
-        "'": "&#39;"
-      }[ch]));
-    }
-
-    function filteredRows(rows) {
-      const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
-      return (rows || [])
-        .filter((row) => !symbolFilter || String(row.symbol || "").includes(symbolFilter))
-        .sort((left, right) => String(left.symbol || "").localeCompare(String(right.symbol || "")));
-    }
-
-    function renderRows(rows) {
-      const body = $("quote-rows");
-      const view = filteredRows(rows);
-      $("row-count").textContent = `${view.length} / ${(rows || []).length} rows`;
-      if (!view.length) {
-        body.innerHTML = `<tr><td class="empty-row" colspan="8">no rows</td></tr>`;
-        return;
-      }
-      body.innerHTML = view.map((row) => `<tr>
-        <td>${escapeHtml(row.symbol)}</td>
-        <td>${escapeHtml(row.best_bid)}</td>
-        <td>${escapeHtml(row.bid_size)}</td>
-        <td>${escapeHtml(row.best_ask)}</td>
-        <td>${escapeHtml(row.ask_size)}</td>
-        <td>${escapeHtml(row.source_sequence)}</td>
-        <td>${escapeHtml(row.freshness_status)}</td>
-        <td>${escapeHtml(row.observed_at)}</td>
-      </tr>`).join("");
-    }
-
-    function render(snapshot) {
-      const quote = snapshot.latest_quote || {};
-      const healthy = snapshot.status === "streaming" && snapshot.fail_closed === false;
-      $("runtime-status").textContent = snapshot.status || "unknown";
-      $("runtime-status").className = `pill ${healthy ? "healthy" : "error"}`;
-      $("updated-at").textContent = snapshot.updated_at || "not-yet-updated";
-      $("metric-symbol").textContent = valueOrDash(snapshot.symbol);
-      $("metric-market").textContent = valueOrDash(snapshot.market);
-      $("metric-fail-closed").textContent = String(snapshot.fail_closed ?? false);
-      $("metric-fail-closed").className = snapshot.fail_closed ? "negative" : "positive";
-      $("metric-disconnects").textContent = snapshot.disconnect_count ?? 0;
-      $("metric-rebuilds").textContent = snapshot.rest_rebuild_count ?? 0;
-      $("metric-updates").textContent = snapshot.wss_update_count ?? 0;
-      $("quote-bid").textContent = valueOrDash(quote.best_bid);
-      $("quote-bid-size").textContent = valueOrDash(quote.bid_size);
-      $("quote-ask").textContent = valueOrDash(quote.best_ask);
-      $("quote-ask-size").textContent = valueOrDash(quote.ask_size);
-      $("quote-sequence").textContent = valueOrDash(quote.source_sequence);
-      $("quote-freshness").textContent = valueOrDash(quote.freshness_status);
-      renderRows(snapshot.rows || []);
-      $("stream-url").textContent = valueOrDash(snapshot.stream_url);
-      $("state-preview").textContent = JSON.stringify({
-        coordinator_status: snapshot.coordinator_status,
-        last_error: snapshot.last_error,
-        observed_at: quote.observed_at,
-        ingested_at: quote.ingested_at,
-        source_event_id: quote.source_event_id
-      }, null, 2);
-      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
-    }
-
-    async function refreshStatus() {
-      try {
-        const snapshot = await requestJson(statusUrl);
-        render(snapshot);
-      } catch (error) {
-        $("runtime-status").textContent = "error";
-        $("runtime-status").className = "pill error";
-        $("state-preview").textContent = error.message;
-      }
-    }
-
-    async function previewEndpoint(url) {
-      $("api-preview").textContent = "loading";
-      try {
-        const data = await requestJson(url);
-        $("api-preview").textContent = JSON.stringify(data, null, 2);
-      } catch (error) {
-        $("api-preview").textContent = error.message;
-      }
-    }
-
-    document.querySelectorAll("[data-endpoint]").forEach((button) => {
-      button.addEventListener("click", () => previewEndpoint(button.dataset.endpoint || statusUrl));
-    });
-    $("symbol-filter").addEventListener("input", refreshStatus);
-    $("refresh-button").addEventListener("click", refreshStatus);
-
-    state.timer = setInterval(refreshStatus, 2000);
-    refreshStatus();
-  </script>
-</body>
-</html>"##
+fn binance_wss_book_ticker_dashboard_html() -> String {
+    public_wss_book_ticker_dashboard_html(
+        "Binance WSS bookTicker",
+        "Binance public WSS",
+        "bookTicker 实时行情",
+        "/api/binance-wss-book-ticker",
+    )
 }
 
 fn bybit_wss_book_ticker_dashboard_html() -> String {
-    binance_wss_book_ticker_dashboard_html()
-        .replace("Binance public WSS", "Bybit public WSS")
-        .replace("bookTicker 实时行情", "orderbook.1 实时行情")
-        .replace(
-            "/api/binance-wss-book-ticker/",
-            "/api/bybit-wss-book-ticker/",
-        )
+    public_wss_book_ticker_dashboard_html(
+        "Bybit WSS orderbook.1",
+        "Bybit public WSS",
+        "orderbook.1 实时行情",
+        "/api/bybit-wss-book-ticker",
+    )
+}
+
+fn okx_wss_book_ticker_dashboard_html() -> String {
+    public_wss_book_ticker_dashboard_html(
+        "OKX WSS tickers",
+        "OKX public WSS",
+        "tickers 实时行情",
+        "/api/okx-wss-book-ticker",
+    )
+}
+
+fn bitget_wss_book_ticker_dashboard_html() -> String {
+    public_wss_book_ticker_dashboard_html(
+        "Bitget WSS ticker",
+        "Bitget public WSS",
+        "ticker 实时行情",
+        "/api/bitget-wss-book-ticker",
+    )
+}
+
+fn public_wss_book_ticker_dashboard_html_for_api(api_name: &str) -> String {
+    match api_name {
+        "okx-wss-book-ticker" => okx_wss_book_ticker_dashboard_html(),
+        "bitget-wss-book-ticker" => bitget_wss_book_ticker_dashboard_html(),
+        _ => bybit_wss_book_ticker_dashboard_html(),
+    }
 }
 
 fn basis_dashboard_html() -> &'static str {
-    r##"<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>实时套利监控</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #101112;
-      --band: #151719;
-      --panel: #1b1d20;
-      --panel-strong: #23262a;
-      --line: #353941;
-      --text: #f0eadc;
-      --muted: #a5a8aa;
-      --amber: #e2b650;
-      --green: #58c383;
-      --red: #e06a6a;
-      --blue: #77a7d9;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      min-width: 320px;
-      background: var(--bg);
-      color: var(--text);
-      font-family: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-      font-size: 14px;
-      letter-spacing: 0;
-    }
-
-    button,
-    input,
-    select {
-      font: inherit;
-    }
-
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 24px;
-      padding: 22px 28px;
-      background: #191b1e;
-      border-bottom: 1px solid var(--line);
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 24px;
-      font-weight: 700;
-      line-height: 1.2;
-    }
-
-    .kicker {
-      margin: 0 0 6px;
-      color: var(--amber);
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-
-    .status-strip {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 10px;
-      color: var(--muted);
-      text-align: right;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 28px;
-      padding: 4px 10px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel-strong);
-      color: var(--muted);
-      white-space: nowrap;
-    }
-
-    .pill.healthy,
-    .candidate {
-      color: var(--green);
-      border-color: rgba(88, 195, 131, 0.45);
-    }
-
-    .pill.error,
-    .negative {
-      color: var(--red);
-      border-color: rgba(224, 106, 106, 0.45);
-    }
-
-    .positive {
-      color: var(--green);
-    }
-
-    main {
-      padding: 18px 28px 32px;
-    }
-
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(130px, 1fr));
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-
-    .metric {
-      min-height: 72px;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel);
-    }
-
-    .metric span {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-
-    .metric strong {
-      display: block;
-      margin-top: 8px;
-      font-size: 22px;
-      line-height: 1.1;
-      overflow-wrap: anywhere;
-    }
-
-    .control-bar {
-      display: grid;
-      grid-template-columns: minmax(150px, 220px) repeat(2, minmax(116px, max-content)) minmax(170px, 220px) minmax(100px, max-content) minmax(130px, max-content);
-      gap: 10px;
-      align-items: end;
-      padding: 12px;
-      margin-bottom: 14px;
-      border: 1px solid var(--line);
-      background: var(--band);
-    }
-
-    label span,
-    .field-label {
-      display: block;
-      margin-bottom: 6px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    input[type="search"],
-    select {
-      width: 100%;
-      min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #101214;
-      color: var(--text);
-      padding: 7px 9px;
-    }
-
-    .toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 36px;
-      padding: 8px 10px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      color: var(--text);
-      background: var(--panel);
-      white-space: nowrap;
-    }
-
-    .toggle input {
-      width: 16px;
-      height: 16px;
-      accent-color: var(--amber);
-    }
-
-    button {
-      min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel-strong);
-      color: var(--text);
-      padding: 8px 12px;
-      cursor: pointer;
-    }
-
-    button:hover {
-      border-color: var(--amber);
-    }
-
-    .table-wrap,
-    .api-wrap {
-      border: 1px solid var(--line);
-      background: var(--band);
-    }
-
-    .table-head,
-    .api-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      min-height: 44px;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--line);
-      color: var(--muted);
-    }
-
-    .table-scroll {
-      overflow-x: auto;
-      max-height: 58vh;
-    }
-
-    table {
-      width: 100%;
-      min-width: 1180px;
-      border-collapse: collapse;
-    }
-
-    th,
-    td {
-      height: 38px;
-      padding: 8px 10px;
-      border-bottom: 1px solid rgba(53, 57, 65, 0.7);
-      text-align: right;
-      white-space: nowrap;
-    }
-
-    th {
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      background: #202327;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-    }
-
-    th:first-child,
-    td:first-child,
-    th:last-child,
-    td:last-child {
-      text-align: left;
-    }
-
-    tbody tr:hover {
-      background: rgba(226, 182, 80, 0.08);
-    }
-
-    .api-wrap {
-      margin-top: 14px;
-    }
-
-    .endpoint-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-
-    pre {
-      margin: 0;
-      max-height: 260px;
-      overflow: auto;
-      padding: 12px;
-      background: #0c0d0e;
-      color: #d7d1c2;
-      border-top: 1px solid var(--line);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-
-    .empty-row {
-      height: 88px;
-      color: var(--muted);
-      text-align: center;
-    }
-
-    @media (max-width: 980px) {
-      .topbar {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .status-strip {
-        justify-content: flex-start;
-        text-align: left;
-      }
-
-      .summary-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-
-      .control-bar {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    @media (max-width: 560px) {
-      main,
-      .topbar {
-        padding-left: 14px;
-        padding-right: 14px;
-      }
-
-      .summary-grid {
-        grid-template-columns: 1fr;
-      }
-    }
-  </style>
-</head>
-<body>
-  <header class="topbar">
-    <div>
-      <p class="kicker">Binance public basis</p>
-      <h1>实时套利监控</h1>
-    </div>
-    <div class="status-strip">
-      <span id="runtime-status" class="pill">starting</span>
-      <span id="updated-at">not-yet-updated</span>
-    </div>
-  </header>
-  <main>
-    <section class="summary-grid" aria-label="summary">
-      <article class="metric"><span>机会</span><strong id="metric-candidates">0</strong></article>
-      <article class="metric"><span>市场</span><strong id="metric-total">0</strong></article>
-      <article class="metric"><span>Funding 过滤</span><strong id="metric-filtered">0</strong></article>
-      <article class="metric"><span>缺现货</span><strong id="metric-missing-spot">0</strong></article>
-      <article class="metric"><span>缺永续</span><strong id="metric-missing-perp">0</strong></article>
-      <article class="metric"><span>最小净 Basis</span><strong id="metric-min-net">0</strong></article>
-    </section>
-
-    <section class="control-bar" aria-label="controls">
-      <label>
-        <span>Symbol</span>
-        <input id="symbol-filter" type="search" autocomplete="off" placeholder="BTCUSDT">
-      </label>
-      <label class="toggle"><input id="only-candidates" type="checkbox">只看机会</label>
-      <label class="toggle"><input id="only-complete" type="checkbox" checked>只看完整报价</label>
-      <label>
-        <span>排序</span>
-        <select id="sort-mode">
-          <option value="net-desc">净 Basis 降序</option>
-          <option value="funding-abs-desc">Funding 绝对值</option>
-          <option value="profit-desc">预期收益</option>
-          <option value="symbol-asc">Symbol</option>
-        </select>
-      </label>
-      <button id="refresh-button" type="button">刷新</button>
-      <label class="toggle"><input id="auto-refresh" type="checkbox" checked>自动刷新</label>
-    </section>
-
-    <section class="table-wrap" aria-label="basis table">
-      <div class="table-head">
-        <strong>行情与机会</strong>
-        <span id="api-state">waiting</span>
-      </div>
-      <div class="table-scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Spot Bid</th>
-              <th>Spot Ask</th>
-              <th>Perp Bid</th>
-              <th>Perp Ask</th>
-              <th>Mark</th>
-              <th>Index</th>
-              <th>Funding</th>
-              <th>Gross bps</th>
-              <th>Cost bps</th>
-              <th>Net bps</th>
-              <th>Qty</th>
-              <th>Profit USD</th>
-              <th>状态</th>
-              <th>原因</th>
-            </tr>
-          </thead>
-          <tbody id="basis-rows">
-            <tr><td class="empty-row" colspan="15">loading</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="api-wrap" aria-label="realtime api">
-      <div class="api-head">
-        <strong>实时 API</strong>
-        <div class="endpoint-grid">
-          <button type="button" data-endpoint="/api/basis/status">status</button>
-          <button type="button" data-endpoint="/api/basis/opportunities">opportunities</button>
-        </div>
-      </div>
-      <pre id="api-preview">{}</pre>
-    </section>
-  </main>
-
-  <script>
-    const statusUrl = "/api/basis/status";
-    const opportunitiesUrl = "/api/basis/opportunities";
-    const state = { snapshot: null, timer: null };
-    const $ = (id) => document.getElementById(id);
-
-    function escapeHtml(value) {
-      return String(value ?? "-").replace(/[&<>"']/g, (ch) => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        "\"": "&quot;",
-        "'": "&#39;"
-      }[ch]));
-    }
-
-    function numeric(value) {
-      const number = Number(value);
-      return Number.isFinite(number) ? number : null;
-    }
-
-    function signedClass(value) {
-      const number = numeric(value);
-      if (number === null || number === 0) return "";
-      return number > 0 ? "positive" : "negative";
-    }
-
-    async function requestJson(url) {
-      const response = await fetch(url, { cache: "no-store" });
-      const text = await response.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (error) {
-        throw new Error(`invalid json from ${url}: ${error.message}`);
-      }
-      if (!response.ok) {
-        throw new Error(data.error || `http ${response.status}`);
-      }
-      return data;
-    }
-
-    function filteredRows(rows) {
-      const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
-      const onlyCandidates = $("only-candidates").checked;
-      const onlyComplete = $("only-complete").checked;
-      const sortMode = $("sort-mode").value;
-      const result = rows.filter((row) => {
-        if (symbolFilter && !row.symbol.includes(symbolFilter)) return false;
-        if (onlyCandidates && !row.is_candidate) return false;
-        if (onlyComplete && row.source_status !== "complete") return false;
-        return true;
-      });
-      result.sort((left, right) => {
-        if (sortMode === "symbol-asc") return left.symbol.localeCompare(right.symbol);
-        if (sortMode === "funding-abs-desc") {
-          return Math.abs(numeric(right.last_funding_rate) ?? 0) - Math.abs(numeric(left.last_funding_rate) ?? 0);
-        }
-        if (sortMode === "profit-desc") {
-          return (numeric(right.expected_profit_usd) ?? -Infinity) - (numeric(left.expected_profit_usd) ?? -Infinity);
-        }
-        return (numeric(right.net_basis_bps) ?? -Infinity) - (numeric(left.net_basis_bps) ?? -Infinity);
-      });
-      return result;
-    }
-
-    function renderRows(rows) {
-      const body = $("basis-rows");
-      const view = filteredRows(rows);
-      if (!view.length) {
-        body.innerHTML = `<tr><td class="empty-row" colspan="15">no rows</td></tr>`;
-        return;
-      }
-      body.innerHTML = view.map((row) => {
-        const candidateClass = row.is_candidate ? "candidate" : "";
-        return `<tr>
-          <td class="${candidateClass}">${escapeHtml(row.symbol)}</td>
-          <td>${escapeHtml(row.spot_bid)}</td>
-          <td>${escapeHtml(row.spot_ask)}</td>
-          <td>${escapeHtml(row.perp_bid)}</td>
-          <td>${escapeHtml(row.perp_ask)}</td>
-          <td>${escapeHtml(row.mark_price)}</td>
-          <td>${escapeHtml(row.index_price)}</td>
-          <td class="${signedClass(row.last_funding_rate)}">${escapeHtml(row.last_funding_rate)}</td>
-          <td class="${signedClass(row.gross_basis_bps)}">${escapeHtml(row.gross_basis_bps)}</td>
-          <td>${escapeHtml(row.total_cost_bps)}</td>
-          <td class="${signedClass(row.net_basis_bps)}">${escapeHtml(row.net_basis_bps)}</td>
-          <td>${escapeHtml(row.quantity)}</td>
-          <td class="${signedClass(row.expected_profit_usd)}">${escapeHtml(row.expected_profit_usd)}</td>
-          <td>${escapeHtml(row.source_status)}</td>
-          <td>${escapeHtml(row.reason)}</td>
-        </tr>`;
-      }).join("");
-    }
-
-    function render(snapshot) {
-      $("runtime-status").textContent = snapshot.status || "unknown";
-      $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : ""}`;
-      $("updated-at").textContent = snapshot.updated_at || "not-yet-updated";
-      $("metric-candidates").textContent = snapshot.candidate_count ?? 0;
-      $("metric-total").textContent = snapshot.total_rows ?? 0;
-      $("metric-filtered").textContent = snapshot.filtered_funding_count ?? 0;
-      $("metric-missing-spot").textContent = snapshot.missing_spot_count ?? 0;
-      $("metric-missing-perp").textContent = snapshot.missing_perp_count ?? 0;
-      $("metric-min-net").textContent = snapshot.min_net_bps ?? "0";
-      $("api-state").textContent = snapshot.last_error ? snapshot.last_error : "ok";
-      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
-      renderRows(snapshot.rows || []);
-    }
-
-    async function refreshStatus() {
-      $("api-state").textContent = "loading";
-      try {
-        const snapshot = await requestJson(statusUrl);
-        state.snapshot = snapshot;
-        render(snapshot);
-      } catch (error) {
-        $("runtime-status").textContent = "error";
-        $("runtime-status").className = "pill error";
-        $("api-state").textContent = error.message;
-      }
-    }
-
-    async function previewEndpoint(url) {
-      $("api-preview").textContent = "loading";
-      try {
-        const data = await requestJson(url);
-        $("api-preview").textContent = JSON.stringify(data, null, 2);
-      } catch (error) {
-        $("api-preview").textContent = error.message;
-      }
-    }
-
-    function schedule() {
-      if (state.timer) clearInterval(state.timer);
-      if ($("auto-refresh").checked) {
-        state.timer = setInterval(refreshStatus, 2000);
-      }
-    }
-
-    ["symbol-filter", "only-candidates", "only-complete", "sort-mode"].forEach((id) => {
-      $(id).addEventListener("input", () => {
-        if (state.snapshot) renderRows(state.snapshot.rows || []);
-      });
-      $(id).addEventListener("change", () => {
-        if (state.snapshot) renderRows(state.snapshot.rows || []);
-      });
-    });
-    $("refresh-button").addEventListener("click", refreshStatus);
-    $("auto-refresh").addEventListener("change", schedule);
-    document.querySelectorAll("[data-endpoint]").forEach((button) => {
-      button.addEventListener("click", () => previewEndpoint(button.dataset.endpoint || opportunitiesUrl));
-    });
-
-    schedule();
-    refreshStatus();
-  </script>
-</body>
-</html>"##
+    include_str!(
+        "../../../universal_arb_platform_v2_immutable_core_docs/templates/basis_dashboard.html"
+    )
 }
 
 fn bybit_basis_dashboard_html() -> String {
@@ -34705,67 +35159,178 @@ fn aster_basis_dashboard_html() -> String {
 }
 
 fn funding_arb_dashboard_html() -> &'static str {
-    r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>跨所资金费率套利 observer</title>
-  <style>
-    body { margin: 0; background: #101112; color: #f0eadc; font-family: "IBM Plex Mono", "SFMono-Regular", monospace; }
-    header { display: flex; justify-content: space-between; gap: 18px; padding: 20px 24px; background: #191b1e; border-bottom: 1px solid #353941; }
-    main { padding: 18px 24px 28px; }
-    h1 { margin: 0; font-size: 22px; }
-    button { min-height: 34px; border: 1px solid #353941; border-radius: 6px; background: #23262a; color: #f0eadc; padding: 7px 11px; }
-    .grid { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
-    .metric { border: 1px solid #353941; background: #1b1d20; border-radius: 6px; padding: 12px; }
-    .metric span { display: block; color: #a5a8aa; font-size: 12px; }
-    .metric strong { display: block; margin-top: 8px; font-size: 22px; }
-    pre { margin: 0; max-height: 72vh; overflow: auto; padding: 12px; background: #0c0d0e; border: 1px solid #353941; line-height: 1.45; }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>跨所资金费率套利 observer</h1>
-    <button id="refresh" type="button">刷新</button>
-  </header>
-  <main>
-    <section class="grid">
-      <article class="metric"><span>Status</span><strong id="status">starting</strong></article>
-      <article class="metric"><span>机会</span><strong id="candidates">0</strong></article>
-      <article class="metric"><span>组合</span><strong id="total">0</strong></article>
-      <article class="metric"><span>Source errors</span><strong id="source-errors">0</strong></article>
-    </section>
-    <section>
-      <button type="button" data-endpoint="/api/funding-arb/status">status</button>
-      <button type="button" data-endpoint="/api/funding-arb/opportunities">opportunities</button>
-    </section>
-    <pre id="funding-rows">{}</pre>
-  </main>
-  <script>
-    async function refresh() {
-      const response = await fetch("/api/funding-arb/status", { cache: "no-store" });
-      const data = await response.json();
-      document.getElementById("status").textContent = data.status || "unknown";
-      document.getElementById("candidates").textContent = data.candidate_count ?? 0;
-      document.getElementById("total").textContent = data.total_rows ?? 0;
-      document.getElementById("source-errors").textContent = data.source_error_count ?? 0;
-      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
-    }
-    async function preview(url) {
-      const response = await fetch(url, { cache: "no-store" });
-      const data = await response.json();
-      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
-    }
-    document.getElementById("refresh").addEventListener("click", refresh);
-    document.querySelectorAll("[data-endpoint]").forEach((button) => {
-      button.addEventListener("click", () => preview(button.dataset.endpoint || "/api/funding-arb/status"));
-    });
-    setInterval(refresh, 2000);
-    refresh();
-  </script>
-</body>
-</html>"#
+    include_str!(
+        "../../../universal_arb_platform_v2_immutable_core_docs/templates/funding_arb_dashboard.html"
+    )
+}
+
+fn portfolio_dashboard_html() -> &'static str {
+    include_str!(
+        "../../../universal_arb_platform_v2_immutable_core_docs/templates/portfolio_dashboard.html"
+    )
+}
+
+fn navigation_dashboard_html() -> &'static str {
+    include_str!(
+        "../../../universal_arb_platform_v2_immutable_core_docs/templates/navigation_dashboard.html"
+    )
+}
+
+struct SystemNavigationEntry {
+    category: &'static str,
+    title: &'static str,
+    description: &'static str,
+    url: &'static str,
+    health_url: &'static str,
+}
+
+fn system_navigation_entries() -> &'static [SystemNavigationEntry] {
+    // 中文说明：新增 dashboard 或可访问页面时必须登记到这里，导航页和
+    // /api/navigation/pages 会自动展示该清单。
+    &[
+        SystemNavigationEntry {
+            category: "总览",
+            title: "系统导航",
+            description: "统一入口，管理系统内所有 dashboard 和状态页面。",
+            url: "http://127.0.0.1:8805/nav",
+            health_url: "http://127.0.0.1:8805/health",
+        },
+        SystemNavigationEntry {
+            category: "总览",
+            title: "组合余额与仓位",
+            description: "账户余额、开仓仓位、来源错误和资金费率上下文。",
+            url: "http://127.0.0.1:8805/dashboard",
+            health_url: "http://127.0.0.1:8805/health",
+        },
+        SystemNavigationEntry {
+            category: "basis",
+            title: "Binance basis",
+            description: "Binance 公开 spot/perp basis 全市场监控。",
+            url: "http://127.0.0.1:8796/dashboard",
+            health_url: "http://127.0.0.1:8796/health",
+        },
+        SystemNavigationEntry {
+            category: "basis",
+            title: "Bybit basis",
+            description: "Bybit 公开 spot/linear-perp basis 全市场监控。",
+            url: "http://127.0.0.1:8797/dashboard",
+            health_url: "http://127.0.0.1:8797/health",
+        },
+        SystemNavigationEntry {
+            category: "basis",
+            title: "OKX basis",
+            description: "OKX 公开 spot/swap basis 全市场监控。",
+            url: "http://127.0.0.1:8798/dashboard",
+            health_url: "http://127.0.0.1:8798/health",
+        },
+        SystemNavigationEntry {
+            category: "basis",
+            title: "Bitget basis",
+            description: "Bitget 公开 spot/USDT-FUTURES basis 全市场监控。",
+            url: "http://127.0.0.1:8803/dashboard",
+            health_url: "http://127.0.0.1:8803/health",
+        },
+        SystemNavigationEntry {
+            category: "basis",
+            title: "Aster basis",
+            description: "Aster 公开 spot/perp basis 全市场监控。",
+            url: "http://127.0.0.1:8800/dashboard",
+            health_url: "http://127.0.0.1:8800/health",
+        },
+        SystemNavigationEntry {
+            category: "basis",
+            title: "Hyperliquid basis",
+            description: "Hyperliquid 公开 spot/perp basis 全市场监控。",
+            url: "http://127.0.0.1:8799/dashboard",
+            health_url: "http://127.0.0.1:8799/health",
+        },
+        SystemNavigationEntry {
+            category: "资金费率",
+            title: "Funding arb",
+            description: "跨交易所 funding arb 机会聚合和候选记录。",
+            url: "http://127.0.0.1:8804/dashboard",
+            health_url: "http://127.0.0.1:8804/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Binance spot WSS",
+            description: "Binance spot bookTicker 实时前置行情。",
+            url: "http://127.0.0.1:8786/dashboard",
+            health_url: "http://127.0.0.1:8786/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Binance perp WSS",
+            description: "Binance USD-M perp bookTicker 实时前置行情。",
+            url: "http://127.0.0.1:8787/dashboard",
+            health_url: "http://127.0.0.1:8787/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Bybit spot WSS",
+            description: "Bybit spot orderbook.1 实时前置行情。",
+            url: "http://127.0.0.1:8788/dashboard",
+            health_url: "http://127.0.0.1:8788/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Bybit perp WSS",
+            description: "Bybit linear-perp orderbook.1 实时前置行情。",
+            url: "http://127.0.0.1:8789/dashboard",
+            health_url: "http://127.0.0.1:8789/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "OKX spot WSS",
+            description: "OKX spot tickers 实时前置行情。",
+            url: "http://127.0.0.1:8790/dashboard",
+            health_url: "http://127.0.0.1:8790/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "OKX swap WSS",
+            description: "OKX swap tickers 实时前置行情。",
+            url: "http://127.0.0.1:8791/dashboard",
+            health_url: "http://127.0.0.1:8791/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Bitget spot WSS",
+            description: "Bitget spot ticker 实时前置行情。",
+            url: "http://127.0.0.1:8792/dashboard",
+            health_url: "http://127.0.0.1:8792/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Bitget futures WSS",
+            description: "Bitget USDT-FUTURES ticker 实时前置行情。",
+            url: "http://127.0.0.1:8793/dashboard",
+            health_url: "http://127.0.0.1:8793/health",
+        },
+    ]
+}
+
+fn system_navigation_pages_json() -> String {
+    format!(
+        "{{\"pages\":[{}],\"schema_version\":\"1.0.0\",\"updated_at\":{}}}",
+        system_navigation_entries()
+            .iter()
+            .map(system_navigation_entry_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        json_string(&current_utc_timestamp_string()),
+    )
+}
+
+fn system_navigation_entry_json(entry: &SystemNavigationEntry) -> String {
+    format!(
+        "{{\"category\":{},\"description\":{},\"health_url\":{},\"title\":{},\"url\":{}}}",
+        json_string(entry.category),
+        json_string(entry.description),
+        json_string(entry.health_url),
+        json_string(entry.title),
+        json_string(entry.url),
+    )
 }
 
 struct RuntimeTempDir {
@@ -34818,6 +35383,19 @@ pub fn main_cli() -> i32 {
 fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
     if args.is_empty() || args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return Ok(help_text());
+    }
+    if let Some(mode) = UnifiedRuntimeMode::from_command(&args[0]) {
+        let options = parse_unified_runtime_args(mode, &args[1..])?;
+        let report = run_unified_runtime(options)?;
+        return Ok(format!(
+            "ok: arb-runtime {} exited; status={}; wrote artifacts to {}",
+            report.mode.label(),
+            report.exit_status,
+            report.output_dir.display()
+        ));
+    }
+    if !legacy_cli_commands_enabled() {
+        return Err(unknown_public_command_error(&args[0]));
     }
     if args[0] == "live-market-sim" {
         let options = parse_live_market_sim_args(&args[1..])?;
@@ -35503,6 +36081,25 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             "ok: funding arb monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
+    if args[0] == "portfolio-dashboard" {
+        let options = parse_portfolio_dashboard_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        let report = run_portfolio_dashboard(options)?;
+        if once {
+            return Ok(format!(
+                "ok: portfolio dashboard snapshot loaded; status={}; balances={}; positions={}; source_errors={}; api_bind={}; mutable_execution_started=false",
+                report.status,
+                report.balance_count,
+                report.position_count,
+                report.source_error_count,
+                report.bind_addr
+            ));
+        }
+        return Ok(format!(
+            "ok: portfolio dashboard stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
     if args[0] == "wallet-signer-preflight" {
         let options = parse_wallet_signer_preflight_args(&args[1..])?;
         let output_dir = options.output_dir.clone();
@@ -35680,7 +36277,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live",
                 args[0]
             ),
         });
@@ -35706,6 +36303,40 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
 }
 
 fn help_text() -> String {
+    public_help_text()
+}
+
+fn public_help_text() -> String {
+    [
+        "arb-runtime",
+        "中文说明：对外只保留两个运行模式。默认 7*24 小时监控全部交易所、全市场、全策略。",
+        "",
+        "Modes:",
+        "  live   正式实盘：全交易所、全市场、全策略监控，满足门禁时真实下单",
+        "  paper  测试盘：全交易所、全市场、全策略监控，满足门禁时只做模拟下单",
+        "",
+        "Common options:",
+        "  --config path                 配置文件，默认 templates/personal_guarded_live.preflight.yaml",
+        "  --out dir                     输出目录；live 默认 target/arb-runtime/live，paper 默认 target/arb-runtime/paper",
+        "  --interval-secs n             监控轮询间隔，默认 5",
+        "  --min-net-bps n               最小净收益门槛，默认 5",
+        "  --auto-once-cooldown-secs n   同一机会触发下单检查的冷却秒数，默认 60",
+        "  --no-auto-validate            只监控和记录机会，不触发下单前检查",
+        "",
+        "Live-only option:",
+        "  --i-understand-live-orders    正式实盘必须显式提供；表示接受真实下单风险",
+        "",
+        "Examples:",
+        "  target/debug/arb-runtime paper",
+        "  target/debug/arb-runtime live --i-understand-live-orders",
+        "",
+        "内部调试命令默认关闭；确需临时调用时设置 ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1。",
+    ]
+    .join("\n")
+}
+
+#[allow(dead_code)]
+fn legacy_help_text() -> String {
     [
         "arb-runtime",
         "中文说明：默认只运行离线、模拟、可回放的运行时装配；实盘分发命令需要 live-exec 构建和显式确认。",
@@ -35775,6 +36406,8 @@ fn help_text() -> String {
         "                                    Monitor all Aster public USDT spot/perp basis rows and serve /api/aster-basis/status",
         "  funding-arb-monitor [--bind 127.0.0.1:8804] [--interval-secs 5] [--clear-sources --source venue=url] [--min-net-funding-bps 5] [--once] [--out dir]",
         "                                    Aggregate local basis monitor status snapshots into cross-exchange funding arb opportunities",
+        "  portfolio-dashboard [--bind 127.0.0.1:8805] [--account-snapshot file | --account-raw-snapshot file] [--position-snapshot file | --position-raw-snapshot file | --resident-root dir] [--funding-snapshot file] [--once]",
+        "                                    Serve a read-only Chinese dashboard for exchange balances and all positions from local snapshots; no signing, orders, cancels, or transfers",
         "  wallet-signer-preflight [--aster-signer 0x...] [--aster-signer-cmd-env env] [--skip-aster] [--check-hyperliquid --hyperliquid-agent 0x... --hyperliquid-source a|b] [--out dir]",
         "                                    Run local signer and address-match checks before private read-only or live signing; no exchange requests and no mutable execution",
         "  funding-arb-private-readonly-snapshot-once --snapshot file --pair-id id [--config file] [--hyperliquid-user 0x...] [--aster-user 0x...] [--aster-signer 0x...] [--aster-signer-cmd-env env] [--out dir]",
@@ -35839,10 +36472,266 @@ type BitgetBasisMonitorCliOptions = BitgetBasisMonitorOptions;
 type HyperliquidBasisMonitorCliOptions = HyperliquidBasisMonitorOptions;
 type AsterBasisMonitorCliOptions = AsterBasisMonitorOptions;
 type FundingArbMonitorCliOptions = FundingArbMonitorOptions;
+type PortfolioDashboardCliOptions = PortfolioDashboardOptions;
 type FundingArbPrivateReadonlySnapshotOnceCliOptions = FundingArbPrivateReadonlySnapshotOnceOptions;
 type FundingArbGuardedDryRunOnceCliOptions = FundingArbGuardedDryRunOnceOptions;
 type FundingArbGuardedLiveCanaryOnceCliOptions = FundingArbGuardedLiveCanaryOnceOptions;
 type FundingArbResidentLiveCliOptions = FundingArbResidentLiveOptions;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnifiedRuntimeMode {
+    Live,
+    Paper,
+}
+
+impl UnifiedRuntimeMode {
+    fn from_command(command: &str) -> Option<Self> {
+        match command {
+            "live" | "official-live" | "real-live" | "正式实盘" => Some(Self::Live),
+            "paper" | "test" | "test-live" | "测试盘" => Some(Self::Paper),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Live => "正式实盘",
+            Self::Paper => "测试盘",
+        }
+    }
+
+    fn execution_mode_name(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Paper => "paper",
+        }
+    }
+
+    fn execute_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+
+    fn default_output_dir(self) -> PathBuf {
+        match self {
+            Self::Live => PathBuf::from(UNIFIED_RUNTIME_LIVE_DEFAULT_OUT),
+            Self::Paper => PathBuf::from(UNIFIED_RUNTIME_PAPER_DEFAULT_OUT),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UnifiedRuntimeCliOptions {
+    mode: UnifiedRuntimeMode,
+    config_path: PathBuf,
+    output_dir: PathBuf,
+    interval_secs: u64,
+    min_net_bps: i128,
+    auto_once_cooldown_secs: u64,
+    validate_auto_once: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UnifiedRuntimeReport {
+    mode: UnifiedRuntimeMode,
+    output_dir: PathBuf,
+    exit_status: String,
+}
+
+fn parse_unified_runtime_args(
+    mode: UnifiedRuntimeMode,
+    args: &[String],
+) -> RuntimeResult<UnifiedRuntimeCliOptions> {
+    let mut config_path = PathBuf::from(UNIFIED_RUNTIME_DEFAULT_CONFIG);
+    let mut output_dir = mode.default_output_dir();
+    let mut interval_secs = UNIFIED_RUNTIME_DEFAULT_INTERVAL_SECS;
+    let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut auto_once_cooldown_secs = UNIFIED_RUNTIME_DEFAULT_AUTO_ONCE_COOLDOWN_SECS;
+    let mut validate_auto_once = true;
+    let mut acknowledged_live_orders = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = PathBuf::from(value);
+            }
+            "--interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires a value"));
+                };
+                interval_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--interval-secs must be a positive integer"))?;
+                if interval_secs == 0 {
+                    return Err(cli_arg_error("--interval-secs must be greater than zero"));
+                }
+            }
+            "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-bps requires a value"));
+                };
+                min_net_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--min-net-bps must be an integer"))?;
+                if min_net_bps < 0 {
+                    return Err(cli_arg_error("--min-net-bps must be non-negative"));
+                }
+            }
+            "--auto-once-cooldown-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--auto-once-cooldown-secs requires a value"));
+                };
+                auto_once_cooldown_secs = value.parse::<u64>().map_err(|_| {
+                    cli_arg_error("--auto-once-cooldown-secs must be a non-negative integer")
+                })?;
+            }
+            "--no-auto-validate" => {
+                validate_auto_once = false;
+            }
+            "--i-understand-live-orders" | "--i-understand-real-orders" => {
+                acknowledged_live_orders = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown {} option `{value}`",
+                    mode.execution_mode_name()
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected {} positional argument `{value}`",
+                    mode.execution_mode_name()
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if mode.execute_live() && !acknowledged_live_orders {
+        return Err(cli_arg_error(
+            "live mode requires --i-understand-live-orders because it can submit real orders",
+        ));
+    }
+
+    Ok(UnifiedRuntimeCliOptions {
+        mode,
+        config_path,
+        output_dir,
+        interval_secs,
+        min_net_bps,
+        auto_once_cooldown_secs,
+        validate_auto_once,
+    })
+}
+
+fn run_unified_runtime(options: UnifiedRuntimeCliOptions) -> RuntimeResult<UnifiedRuntimeReport> {
+    let repo_root = workspace_root();
+    let script_path = repo_root
+        .join("scripts")
+        .join("start-basis-opportunity-observer.sh");
+    let status = Command::new("bash")
+        .arg(&script_path)
+        .current_dir(&repo_root)
+        .env("BASIS_OBSERVER_ROOT", &options.output_dir)
+        .env("BASIS_OBSERVER_CONFIG", &options.config_path)
+        .env(
+            "BASIS_OBSERVER_INTERVAL_SECS",
+            options.interval_secs.to_string(),
+        )
+        .env(
+            "BASIS_OBSERVER_MIN_NET_BPS",
+            options.min_net_bps.to_string(),
+        )
+        .env(
+            "BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS",
+            options.auto_once_cooldown_secs.to_string(),
+        )
+        .env(
+            "BASIS_OBSERVER_VALIDATE_AUTO_ONCE",
+            if options.validate_auto_once { "1" } else { "0" },
+        )
+        .env(
+            "BASIS_OBSERVER_STRATEGIES",
+            UNIFIED_RUNTIME_DEFAULT_STRATEGIES,
+        )
+        .env("BASIS_OBSERVER_MONITORS", UNIFIED_RUNTIME_DEFAULT_MONITORS)
+        .env("BASIS_OBSERVER_FOREGROUND", "1")
+        .env(
+            "BASIS_OBSERVER_EXECUTE_LIVE",
+            if options.mode.execute_live() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            "BASIS_OBSERVER_LIVE_ACK",
+            if options.mode.execute_live() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(ARB_RUNTIME_LEGACY_COMMANDS_ENV, "1")
+        .status()
+        .map_err(|error| RuntimeError::Io {
+            path: script_path.clone(),
+            message: error.to_string(),
+        })?;
+    let exit_status = process_exit_status_label(&status);
+    if !status.success() {
+        return Err(RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "{} mode exited with {exit_status}; artifacts may be under {}",
+                options.mode.execution_mode_name(),
+                options.output_dir.display()
+            ),
+        });
+    }
+
+    Ok(UnifiedRuntimeReport {
+        mode: options.mode,
+        output_dir: options.output_dir,
+        exit_status,
+    })
+}
+
+fn process_exit_status_label(status: &std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| format!("exit_code={code}"))
+        .unwrap_or_else(|| "terminated_by_signal".to_owned())
+}
+
+fn legacy_cli_commands_enabled() -> bool {
+    std::env::var(ARB_RUNTIME_LEGACY_COMMANDS_ENV)
+        .ok()
+        .map(|value| {
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+fn unknown_public_command_error(command: &str) -> RuntimeError {
+    cli_arg_error(format!(
+        "unknown command `{command}`; supported commands: live, paper"
+    ))
+}
 
 fn parse_live_market_sim_args(args: &[String]) -> RuntimeResult<LiveMarketSimCliOptions> {
     let mut fixture_root = PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE);
@@ -38963,6 +39852,82 @@ fn parse_funding_arb_monitor_args(args: &[String]) -> RuntimeResult<FundingArbMo
     Ok(options)
 }
 
+fn parse_portfolio_dashboard_args(args: &[String]) -> RuntimeResult<PortfolioDashboardCliOptions> {
+    let mut options = PortfolioDashboardOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires an address"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--account-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--account-snapshot requires a file path"));
+                };
+                options.account_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--account-raw-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--account-raw-snapshot requires a file path"));
+                };
+                options.account_raw_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--position-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--position-snapshot requires a file path"));
+                };
+                options.position_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--position-raw-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--position-raw-snapshot requires a file path",
+                    ));
+                };
+                options.position_raw_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--funding-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--funding-snapshot requires a file path"));
+                };
+                options.funding_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--resident-root" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--resident-root requires a directory"));
+                };
+                options.resident_root = Some(PathBuf::from(value));
+            }
+            "--once" => options.once = true,
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown portfolio-dashboard option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected portfolio-dashboard positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_portfolio_dashboard_options(&options)?;
+    Ok(options)
+}
+
 fn parse_funding_arb_source_arg(value: &str) -> RuntimeResult<(String, String)> {
     let Some((venue, status_url)) = value.split_once('=') else {
         return Err(cli_arg_error("--source must use venue=url"));
@@ -40473,6 +41438,45 @@ mod tests {
     }
 
     #[test]
+    fn public_help_lists_only_unified_runtime_modes() {
+        let help = help_text();
+
+        assert!(help.contains("live"));
+        assert!(help.contains("paper"));
+        assert!(help.contains("正式实盘"));
+        assert!(help.contains("测试盘"));
+        assert!(!help.contains("binance-basis-live-stack"));
+        assert!(!help.contains("replay [fixture_root]"));
+    }
+
+    #[test]
+    fn unified_runtime_paper_defaults_to_all_scope() {
+        let options =
+            parse_unified_runtime_args(UnifiedRuntimeMode::Paper, &[]).expect("paper args");
+
+        assert_eq!(options.mode, UnifiedRuntimeMode::Paper);
+        assert_eq!(
+            options.config_path,
+            PathBuf::from(UNIFIED_RUNTIME_DEFAULT_CONFIG)
+        );
+        assert_eq!(
+            options.output_dir,
+            PathBuf::from(UNIFIED_RUNTIME_PAPER_DEFAULT_OUT)
+        );
+        assert_eq!(options.interval_secs, UNIFIED_RUNTIME_DEFAULT_INTERVAL_SECS);
+        assert_eq!(options.min_net_bps, BASIS_MONITOR_DEFAULT_MIN_NET_BPS);
+        assert!(options.validate_auto_once);
+    }
+
+    #[test]
+    fn unified_runtime_live_requires_explicit_order_ack() {
+        let error = parse_unified_runtime_args(UnifiedRuntimeMode::Live, &[])
+            .expect_err("live must require acknowledgement");
+
+        assert!(error.to_string().contains("--i-understand-live-orders"));
+    }
+
+    #[test]
     fn basis_dashboard_html_requests_realtime_api_paths() {
         let html = basis_dashboard_html();
 
@@ -40972,6 +41976,33 @@ mod tests {
     }
 
     #[test]
+    fn bybit_wss_book_ticker_dashboard_requests_bybit_realtime_api_paths() {
+        let html = bybit_wss_book_ticker_dashboard_html();
+
+        assert!(html.contains("Bybit public WSS"));
+        assert!(html.contains("orderbook.1 实时行情"));
+        assert!(html.contains("/api/bybit-wss-book-ticker/quote"));
+        assert!(html.contains("/api/bybit-wss-book-ticker/status"));
+        assert!(html.contains("/api/bybit-wss-book-ticker/quotes"));
+        assert!(!html.contains("{{API_PREFIX}}"));
+    }
+
+    #[test]
+    fn public_wss_book_ticker_dashboard_requests_generic_api_paths() {
+        let okx = public_wss_book_ticker_dashboard_html_for_api("okx-wss-book-ticker");
+        let bitget = public_wss_book_ticker_dashboard_html_for_api("bitget-wss-book-ticker");
+
+        assert!(okx.contains("OKX public WSS"));
+        assert!(okx.contains("/api/okx-wss-book-ticker/status"));
+        assert!(okx.contains("/api/okx-wss-book-ticker/quote"));
+        assert!(okx.contains("/api/okx-wss-book-ticker/quotes"));
+        assert!(bitget.contains("Bitget public WSS"));
+        assert!(bitget.contains("/api/bitget-wss-book-ticker/status"));
+        assert!(bitget.contains("/api/bitget-wss-book-ticker/quote"));
+        assert!(bitget.contains("/api/bitget-wss-book-ticker/quotes"));
+    }
+
+    #[test]
     fn binance_wss_probe_instrument_maps_usdt_symbol_without_private_surface() {
         let instrument = binance_public_wss_instrument("ETHUSDT", BinancePublicMarket::Spot)
             .expect("instrument");
@@ -41076,6 +42107,111 @@ mod tests {
         assert!(html.contains("/api/funding-arb/status"));
         assert!(html.contains("/api/funding-arb/opportunities"));
         assert!(html.contains("id=\"funding-rows\""));
+    }
+
+    #[test]
+    fn portfolio_dashboard_html_requests_realtime_api_paths() {
+        let html = portfolio_dashboard_html();
+
+        assert!(html.contains("组合余额与仓位看板"));
+        assert!(html.contains("/api/portfolio/status"));
+        assert!(html.contains("/api/portfolio/balances"));
+        assert!(html.contains("/api/portfolio/positions"));
+        assert!(html.contains("id=\"portfolio-balance-rows\""));
+        assert!(html.contains("id=\"portfolio-position-rows\""));
+        assert!(html.contains("费率结算时间(hh:mm:ss)"));
+    }
+
+    #[test]
+    fn navigation_dashboard_registers_system_pages() {
+        let html = navigation_dashboard_html();
+        let json = system_navigation_pages_json();
+
+        assert!(html.contains("/api/navigation/pages"));
+        assert!(json.contains("系统导航"));
+        assert!(json.contains("组合余额与仓位"));
+        assert!(json.contains("Binance basis"));
+        assert!(json.contains("Funding arb"));
+        assert!(json.contains("Bitget futures WSS"));
+        assert!(json.contains("http://127.0.0.1:8805/nav"));
+        assert_eq!(system_navigation_entries().len(), 17);
+    }
+
+    #[test]
+    fn portfolio_dashboard_snapshot_combines_balance_position_and_funding_sources() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let account_path = root.path().join("accounts.json");
+        let position_path = root.path().join("positions.json");
+        let funding_path = root.path().join("funding.json");
+        write_utf8(
+            account_path.clone(),
+            r#"{"accounts":[{"account_id":"acct-binance","available_usd":"100.50","maintenance_margin_usd":"5","margin_balance_usd":"120.50","venue_family":"Binance"}],"status":"healthy","updated_at":"2026-05-19T00:00:00Z"}"#,
+        )
+        .expect("account snapshot");
+        write_utf8(
+            position_path.clone(),
+            r#"{"positions":[{"account_id":"acct-binance","accumulated_position":"100 USDT","close_average_price":"101","fee":"5 bps","open_average_price":"100","open_close_condition":"测试条件","position_limit":"总名义上限 100 USDT","quantity":"0.01","strategy":"cross-exchange-funding","symbol":"BTCUSDT","venue_family":"binance"}],"status":"healthy","updated_at":"2026-05-19T00:00:01Z"}"#,
+        )
+        .expect("position snapshot");
+        write_utf8(
+            funding_path.clone(),
+            r#"{"candidate_count":1,"rows":[{"funding_interval_hours":"8","is_candidate":true,"pair_id":"binance-bybit-btc","source_status":"complete","symbol":"BTCUSDT","venue_a_ask":"100","venue_a_ask_qty":"1","venue_a_bid":"99","venue_a_bid_qty":"1","venue_a_family":"binance","venue_a_funding_interval_hours":"8","venue_a_funding_rate":"0.00010000","venue_a_index_price":"100","venue_a_mark_price":"100","venue_a_next_funding_time_ms":"1778601600000","venue_b_ask":"100","venue_b_ask_qty":"1","venue_b_bid":"99","venue_b_bid_qty":"1","venue_b_family":"bybit","venue_b_funding_interval_hours":"8","venue_b_funding_rate":"0.00008000","venue_b_index_price":"100","venue_b_mark_price":"100","venue_b_next_funding_time_ms":"1778601600000"}],"source_count":2,"source_error_count":0,"status":"healthy","total_rows":1,"updated_at":"2026-05-19T00:00:02Z"}"#,
+        )
+        .expect("funding snapshot");
+        let options = PortfolioDashboardOptions {
+            account_snapshot_path: Some(account_path),
+            position_snapshot_path: Some(position_path),
+            funding_snapshot_path: Some(funding_path),
+            once: true,
+            ..PortfolioDashboardOptions::default()
+        };
+
+        let snapshot = build_portfolio_dashboard_snapshot(&options).expect("snapshot");
+        let json = portfolio_dashboard_snapshot_json(&snapshot);
+
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.balances.len(), 1);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.balances[0].asset, "USD");
+        assert_eq!(
+            snapshot.positions[0].realtime_funding_rate.as_deref(),
+            Some("0.00010000")
+        );
+        assert!(snapshot.positions[0]
+            .funding_settlement_time
+            .as_deref()
+            .is_some_and(|value| value.len() == 8));
+        assert!(json.contains("\"mutable_execution_started\":false"));
+        assert!(json.contains("\"open_close_spread_pct\":\"1\""));
+    }
+
+    #[test]
+    fn parse_portfolio_dashboard_args_accepts_multiple_local_position_sources() {
+        let args = vec![
+            "--account-snapshot".to_owned(),
+            "accounts.json".to_owned(),
+            "--position-snapshot".to_owned(),
+            "positions.json".to_owned(),
+            "--resident-root".to_owned(),
+            "target/resident".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let options = parse_portfolio_dashboard_args(&args).expect("options");
+
+        assert_eq!(
+            options.account_snapshot_path,
+            Some(PathBuf::from("accounts.json"))
+        );
+        assert_eq!(
+            options.position_snapshot_path,
+            Some(PathBuf::from("positions.json"))
+        );
+        assert_eq!(
+            options.resident_root,
+            Some(PathBuf::from("target/resident"))
+        );
+        assert!(options.once);
     }
 
     #[test]

@@ -1850,9 +1850,10 @@ impl BinancePublicWssBookTickerClient {
         ingested_at: UtcTimestamp,
     ) -> VenueDataResult<HybridMarketDataUpdate> {
         let raw = self.parse_wss_book_ticker(raw_json, ingested_at)?;
+        let effective_ingested_at = binance_wss_effective_ingested_at(raw.observed_at, ingested_at);
         if let Some(previous) = self.last_exchange_update_id {
             if raw.update_id <= previous {
-                return self.apply_non_advancing_update_gap(previous, &raw, ingested_at);
+                return self.apply_non_advancing_update_gap(previous, &raw, effective_ingested_at);
             }
         }
 
@@ -1875,7 +1876,7 @@ impl BinancePublicWssBookTickerClient {
                 raw.update_id,
             )),
             observed_at: raw.observed_at,
-            ingested_at,
+            ingested_at: effective_ingested_at,
         };
         let applied = self
             .coordinator
@@ -2134,6 +2135,17 @@ impl BinancePublicWssBookTickerClient {
                     detail: "local Binance WSS sequence overflow".to_owned(),
                 })?;
         Ok(self.local_sequence)
+    }
+}
+
+fn binance_wss_effective_ingested_at(
+    observed_at: UtcTimestamp,
+    ingested_at: UtcTimestamp,
+) -> UtcTimestamp {
+    if ingested_at < observed_at {
+        observed_at
+    } else {
+        ingested_at
     }
 }
 
@@ -10987,6 +10999,33 @@ mod tests {
             "2026-01-01T00:00:02.12Z"
         );
         assert_eq!(quote.freshness.age_ms(), 880);
+        assert_eq!(quote.best_bid.expect("bid").to_string(), "43250.10");
+    }
+
+    #[test]
+    fn binance_public_wss_client_tolerates_small_future_exchange_time() {
+        let mut client = binance_wss_client(BinancePublicMarket::UsdmPerpetual);
+
+        client
+            .apply_rest_snapshot(perp_rest_snapshot_quote("43250.00", "43251.00"))
+            .expect("REST snapshot");
+        let update = client
+            .apply_wss_text_message(
+                r#"{"e":"bookTicker","u":400900301,"E":1767225602123,"T":1767225602120,"s":"BTCUSDT","b":"43250.10","B":"1.00000000","a":"43251.20","A":"1.50000000"}"#,
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("USDM WSS bookTicker with exchange time slightly ahead of local ingest");
+
+        let quote = update.quote.expect("quote");
+        assert_eq!(
+            quote.freshness.observed_at.to_string(),
+            "2026-01-01T00:00:02.12Z"
+        );
+        assert_eq!(
+            quote.freshness.ingested_at.to_string(),
+            "2026-01-01T00:00:02.12Z"
+        );
+        assert_eq!(quote.freshness.age_ms(), 0);
         assert_eq!(quote.best_bid.expect("bid").to_string(), "43250.10");
     }
 

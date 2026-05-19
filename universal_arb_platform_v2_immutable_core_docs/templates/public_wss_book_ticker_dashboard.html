@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{DASHBOARD_TITLE}}</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101112;
+      --band: #151719;
+      --panel: #1b1d20;
+      --panel-strong: #23262a;
+      --line: #353941;
+      --text: #f0eadc;
+      --muted: #a5a8aa;
+      --amber: #e2b650;
+      --green: #58c383;
+      --red: #e06a6a;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 22px 28px;
+      background: #191b1e;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+
+    .kicker {
+      margin: 0 0 6px;
+      color: var(--amber);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .pill.healthy,
+    .positive {
+      color: var(--green);
+      border-color: rgba(88, 195, 131, 0.45);
+    }
+
+    .pill.error,
+    .negative {
+      color: var(--red);
+      border-color: rgba(224, 106, 106, 0.45);
+    }
+
+    main {
+      padding: 18px 28px 32px;
+    }
+
+    .summary-grid,
+    .quote-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric,
+    .quote-field {
+      min-height: 72px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+
+    .metric span,
+    .quote-field span,
+    .section-head span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .metric strong,
+    .quote-field strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 22px;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+
+    .section {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .endpoint-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--text);
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--amber);
+    }
+
+    .control-bar {
+      display: grid;
+      grid-template-columns: minmax(150px, 220px) minmax(120px, max-content);
+      gap: 10px;
+      align-items: end;
+      padding: 12px;
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    label span {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input[type="search"] {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101214;
+      color: var(--text);
+      padding: 7px 9px;
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+      max-height: 52vh;
+    }
+
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      height: 38px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(53, 57, 65, 0.7);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #202327;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    th:first-child,
+    td:first-child {
+      text-align: left;
+    }
+
+    tbody tr:hover {
+      background: rgba(226, 182, 80, 0.08);
+    }
+
+    .empty-row {
+      height: 88px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    pre {
+      margin: 0;
+      max-height: 320px;
+      overflow: auto;
+      padding: 12px;
+      background: #0c0d0e;
+      color: #d7d1c2;
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 980px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status-strip {
+        justify-content: flex-start;
+        text-align: left;
+      }
+
+      .summary-grid,
+      .quote-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .control-bar {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      main,
+      .topbar {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .summary-grid,
+      .quote-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="kicker">{{VENUE_LABEL}}</p>
+      <h1>{{STREAM_LABEL}}</h1>
+    </div>
+    <div class="status-strip">
+      <span id="runtime-status" class="pill">加载中</span>
+      <span id="updated-at">尚未更新</span>
+    </div>
+  </header>
+  <main>
+    <section class="summary-grid" aria-label="summary">
+      <article class="metric"><span>交易对</span><strong id="metric-symbol">-</strong></article>
+      <article class="metric"><span>市场类型</span><strong id="metric-market">-</strong></article>
+      <article class="metric"><span>失败关闭</span><strong id="metric-fail-closed">false</strong></article>
+      <article class="metric"><span>断线次数</span><strong id="metric-disconnects">0</strong></article>
+      <article class="metric"><span>REST 重建</span><strong id="metric-rebuilds">0</strong></article>
+      <article class="metric"><span>WSS 更新</span><strong id="metric-updates">0</strong></article>
+    </section>
+
+    <section class="quote-grid" aria-label="latest quote">
+      <article class="quote-field"><span>最优买价</span><strong id="quote-bid">-</strong></article>
+      <article class="quote-field"><span>买量</span><strong id="quote-bid-size">-</strong></article>
+      <article class="quote-field"><span>最优卖价</span><strong id="quote-ask">-</strong></article>
+      <article class="quote-field"><span>卖量</span><strong id="quote-ask-size">-</strong></article>
+      <article class="quote-field"><span>序列</span><strong id="quote-sequence">-</strong></article>
+      <article class="quote-field"><span>新鲜度</span><strong id="quote-freshness">-</strong></article>
+    </section>
+
+    <section class="control-bar" aria-label="controls">
+      <label>
+        <span>交易对</span>
+        <input id="symbol-filter" type="search" autocomplete="off" placeholder="BTCUSDT">
+      </label>
+      <button id="refresh-button" type="button">刷新</button>
+    </section>
+
+    <section class="section" aria-label="book ticker table">
+      <div class="section-head">
+        <strong>全部最优报价</strong>
+        <span id="row-count">0 行</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>交易对</th>
+              <th>买价</th>
+              <th>买量</th>
+              <th>卖价</th>
+              <th>卖量</th>
+              <th>序列</th>
+              <th>新鲜度</th>
+              <th>观测时间</th>
+            </tr>
+          </thead>
+          <tbody id="quote-rows">
+            <tr><td class="empty-row" colspan="8">加载中</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" aria-label="stream state">
+      <div class="section-head">
+        <strong>连接状态</strong>
+        <span id="stream-url">-</span>
+      </div>
+      <pre id="state-preview">{}</pre>
+    </section>
+
+    <section class="section" aria-label="realtime api">
+      <div class="section-head">
+        <strong>实时 API</strong>
+        <div class="endpoint-grid">
+          <button type="button" data-endpoint="/health">健康检查</button>
+          <button type="button" data-endpoint="{{API_PREFIX}}/quote">单行情接口</button>
+          <button type="button" data-endpoint="{{API_PREFIX}}/quotes">全行情接口</button>
+          <button type="button" data-endpoint="{{API_PREFIX}}/status">状态接口</button>
+        </div>
+      </div>
+      <pre id="api-preview">{}</pre>
+    </section>
+  </main>
+
+  <script>
+    const statusUrl = "{{API_PREFIX}}/status";
+    const state = { timer: null };
+    const $ = (id) => document.getElementById(id);
+
+    async function requestJson(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        throw new Error(`invalid json from ${url}: ${error.message}`);
+      }
+      if (!response.ok && url !== "/health") {
+        throw new Error(data.error || `http ${response.status}`);
+      }
+      return data;
+    }
+
+    function valueOrDash(value) {
+      return value === null || value === undefined || value === "" ? "-" : String(value);
+    }
+
+    function escapeHtml(value) {
+      return valueOrDash(value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function filteredRows(rows) {
+      const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
+      return (rows || [])
+        .filter((row) => !symbolFilter || String(row.symbol || "").includes(symbolFilter))
+        .sort((left, right) => String(left.symbol || "").localeCompare(String(right.symbol || "")));
+    }
+
+    function renderRows(rows) {
+      const body = $("quote-rows");
+      const view = filteredRows(rows);
+      $("row-count").textContent = `${view.length} / ${(rows || []).length} 行`;
+      if (!view.length) {
+        body.innerHTML = `<tr><td class="empty-row" colspan="8">无数据</td></tr>`;
+        return;
+      }
+      body.innerHTML = view.map((row) => `<tr>
+        <td>${escapeHtml(row.symbol)}</td>
+        <td>${escapeHtml(row.best_bid)}</td>
+        <td>${escapeHtml(row.bid_size)}</td>
+        <td>${escapeHtml(row.best_ask)}</td>
+        <td>${escapeHtml(row.ask_size)}</td>
+        <td>${escapeHtml(row.source_sequence)}</td>
+        <td>${escapeHtml(row.freshness_status)}</td>
+        <td>${escapeHtml(row.observed_at)}</td>
+      </tr>`).join("");
+    }
+
+    function render(snapshot) {
+      const quote = snapshot.latest_quote || {};
+      const healthy = snapshot.status === "streaming" && snapshot.fail_closed === false;
+      $("runtime-status").textContent = snapshot.status || "未知";
+      $("runtime-status").className = `pill ${healthy ? "healthy" : "error"}`;
+      $("updated-at").textContent = snapshot.updated_at || "尚未更新";
+      $("metric-symbol").textContent = valueOrDash(snapshot.symbol);
+      $("metric-market").textContent = valueOrDash(snapshot.market);
+      $("metric-fail-closed").textContent = String(snapshot.fail_closed ?? false);
+      $("metric-fail-closed").className = snapshot.fail_closed ? "negative" : "positive";
+      $("metric-disconnects").textContent = snapshot.disconnect_count ?? 0;
+      $("metric-rebuilds").textContent = snapshot.rest_rebuild_count ?? 0;
+      $("metric-updates").textContent = snapshot.wss_update_count ?? 0;
+      $("quote-bid").textContent = valueOrDash(quote.best_bid);
+      $("quote-bid-size").textContent = valueOrDash(quote.bid_size);
+      $("quote-ask").textContent = valueOrDash(quote.best_ask);
+      $("quote-ask-size").textContent = valueOrDash(quote.ask_size);
+      $("quote-sequence").textContent = valueOrDash(quote.source_sequence);
+      $("quote-freshness").textContent = valueOrDash(quote.freshness_status);
+      renderRows(snapshot.rows || []);
+      $("stream-url").textContent = valueOrDash(snapshot.stream_url);
+      $("state-preview").textContent = JSON.stringify({
+        coordinator_status: snapshot.coordinator_status,
+        last_error: snapshot.last_error,
+        observed_at: quote.observed_at,
+        ingested_at: quote.ingested_at,
+        source_event_id: quote.source_event_id
+      }, null, 2);
+      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
+    }
+
+    async function refreshStatus() {
+      try {
+        const snapshot = await requestJson(statusUrl);
+        render(snapshot);
+      } catch (error) {
+        $("runtime-status").textContent = "错误";
+        $("runtime-status").className = "pill error";
+        $("state-preview").textContent = error.message;
+      }
+    }
+
+    async function previewEndpoint(url) {
+      $("api-preview").textContent = "加载中";
+      try {
+        const data = await requestJson(url);
+        $("api-preview").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        $("api-preview").textContent = error.message;
+      }
+    }
+
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => previewEndpoint(button.dataset.endpoint || statusUrl));
+    });
+    $("symbol-filter").addEventListener("input", refreshStatus);
+    $("refresh-button").addEventListener("click", refreshStatus);
+
+    state.timer = setInterval(refreshStatus, 2000);
+    refreshStatus();
+  </script>
+</body>
+</html>

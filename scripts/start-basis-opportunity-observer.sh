@@ -2,30 +2,32 @@
 set -euo pipefail
 
 # 中文说明：启动六交易所套利机会观察链路。
-# 该脚本只启动公开行情监控和 dry-run 预下单验证，不传 --execute-live，
-# 不提交订单、不撤单、不转账，不要求或记录任何密钥。
+# 默认运行测试盘：公开行情监控 + 模拟下单验证，不提交订单、不撤单、不转账。
+# 只有 BASIS_OBSERVER_EXECUTE_LIVE=1 且 BASIS_OBSERVER_LIVE_ACK=1 时才进入正式实盘，
+# 并向底层 guarded live 命令传递真实下单确认参数。
 # 当前会主动轮询 spot-perp-basis monitor，并启动专用 funding-arb-monitor
 # 聚合本机 basis status 快照，生成 cross-exchange-funding-arb 机会文件。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export ARB_RUNTIME_ENABLE_LEGACY_COMMANDS="${ARB_RUNTIME_ENABLE_LEGACY_COMMANDS:-1}"
 
 usage() {
   cat <<'USAGE'
 用法:
   scripts/start-basis-opportunity-observer.sh [binance] [bybit] [okx] [bitget] [aster] [hyperliquid]
-  scripts/start-basis-opportunity-observer.sh --venues binance,bybit,okx,bitget,aster,hyperliquid --strategies spot-perp-basis,cross-exchange-funding-arb --dry-run
+  scripts/start-basis-opportunity-observer.sh --venues binance,bybit,okx,bitget,aster,hyperliquid --strategies spot-perp-basis,cross-exchange-funding-arb
 
 默认启动 binance、bybit、okx、bitget、aster、hyperliquid 六条公开行情链路。
 
 核心行为:
   1. 启动六条只读 basis monitor，持续刷新公开行情。
   2. 轮询 /opportunities，实时记录 candidate_count > 0 的 spot-perp-basis 机会。
-  3. 对支持 auto-once 的 /opportunities 候选 symbol 触发 guarded-live-auto-once --dry-run，
+  3. 对支持 auto-once 的 /opportunities 候选 symbol 触发 guarded-live-auto-once，
      生成候选、风险决策、人工门禁释放预览、分发计划等下单前 artifacts。
   4. 如果启用 cross-exchange-funding-arb，启动专用 funding-arb-monitor，
      聚合本机 basis /status 快照并记录真实候选，不伪造机会。
-  5. 永远不传 --execute-live 和 --i-understand-basis-live-orders。
+  5. 测试盘默认模拟下单；正式实盘必须显式设置 BASIS_OBSERVER_EXECUTE_LIVE=1 和 BASIS_OBSERVER_LIVE_ACK=1。
 
 常用环境变量:
   BASIS_OBSERVER_ROOT=target/arb-opportunity-observer
@@ -41,6 +43,9 @@ usage() {
   BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml
   BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1
   BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60
+  BASIS_OBSERVER_EXECUTE_LIVE=0
+  BASIS_OBSERVER_LIVE_ACK=0
+  BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2
   BASIS_OBSERVER_CURL_RETRIES=3
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1
   BASIS_OBSERVER_CURL_TIMEOUT_SECS=10
@@ -73,6 +78,7 @@ usage() {
   target/arb-opportunity-observer/opportunities/spot-perp-basis.jsonl
   target/arb-opportunity-observer/opportunities/cross-exchange-funding-arb.jsonl
   target/arb-opportunity-observer/dry-run/dry-run-reports.jsonl
+  target/arb-opportunity-observer/live/live-reports.jsonl
   target/arb-opportunity-observer/dry-run/<run-id>/
 USAGE
 }
@@ -134,7 +140,7 @@ strategy_enabled() {
   return 1
 }
 
-supports_auto_once_dry_run() {
+supports_auto_once_validation() {
   case "$1" in
     binance|bybit|okx|bitget) return 0 ;;
     aster|hyperliquid) return 1 ;;
@@ -492,8 +498,14 @@ run_validation_job() {
       --config "${CONFIG_PATH}"
       --out "${out_dir}"
       --min-net-bps "${MIN_NET_BPS}"
-      --dry-run
+      --auto-price-guard-bps "${AUTO_PRICE_GUARD_BPS}"
     )
+
+    if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+      args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-basis-live-orders)
+    else
+      args+=(--dry-run)
+    fi
 
     wss_values="$(wss_args_for_venue "${venue}")"
     if [[ -n "${wss_values}" ]]; then
@@ -528,8 +540,11 @@ run_validation_job() {
         --arg finished_at "${finished_at}" \
         --arg out_dir "${out_dir}" \
         --arg validation_result_class "${validation_result_class}" \
+        --arg execution_mode "${EXECUTION_MODE}" \
         --argjson exit_status "${status}" \
+        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
         '. + {
+          execution_mode: $execution_mode,
           venue: $venue,
           symbol: $symbol,
           run_id: $run_id,
@@ -538,18 +553,21 @@ run_validation_job() {
           validation_exit_status: $exit_status,
           validation_result_class: $validation_result_class,
           dry_run_output_dir: $out_dir,
-          mutable_execution_started: false
-        }' "${report_file}" >> "${DRY_RUN_REPORTS_JSONL}"
+          validation_output_dir: $out_dir,
+          mutable_execution_started: $mutable_execution_started
+        }' "${report_file}" >> "${EXECUTION_REPORTS_JSONL}"
     else
-      append_json_line "${DRY_RUN_REPORTS_JSONL}" \
+      append_json_line "${EXECUTION_REPORTS_JSONL}" \
         --arg venue "${venue}" \
         --arg symbol "${symbol}" \
         --arg run_id "${run_id}" \
         --arg started_at "${started_at}" \
         --arg finished_at "${finished_at}" \
         --arg out_dir "${out_dir}" \
+        --arg execution_mode "${EXECUTION_MODE}" \
         --argjson exit_status "${status}" \
-        '{venue:$venue,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,mutable_execution_started:false,report_missing:true}'
+        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
+        '{execution_mode:$execution_mode,venue:$venue,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,report_missing:true}'
     fi
 
     echo "[${finished_at}] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
@@ -568,16 +586,27 @@ run_funding_arb_validation_job() {
   local finished_at
   local status
   local report_file
+  local command_name
+  local args
+  local asset_id_arg
+  local -a hyperliquid_asset_id_args
   local validation_result_class="command_failed"
 
-  report_file="${out_dir}/funding_arb_guarded_dry_run_report.json"
+  if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+    command_name="funding-arb-guarded-live-canary-once"
+    report_file="${out_dir}/funding_arb_guarded_live_canary_report.json"
+  else
+    command_name="funding-arb-guarded-dry-run-once"
+    report_file="${out_dir}/funding_arb_guarded_dry_run_report.json"
+  fi
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   mkdir -p "${out_dir}"
 
   {
     echo "[${started_at}] funding_validation_start pair_id=${pair_id} symbol=${symbol} run_id=${run_id}"
 
-    "${RUNTIME_BIN}" funding-arb-guarded-dry-run-once \
+    args=(
+      "${RUNTIME_BIN}" "${command_name}"
       --snapshot "${snapshot_file}" \
       --pair-id "${pair_id}" \
       --config "${CONFIG_PATH}" \
@@ -586,8 +615,30 @@ run_funding_arb_validation_job() {
       --taker-fee-bps "${PERP_FEE_BPS}" \
       --slippage-bps "${SLIPPAGE_BPS}" \
       --max-entry-price-divergence-bps "${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}" \
-      --min-net-funding-bps "${MIN_NET_BPS}" \
-      --dry-run
+      --min-net-funding-bps "${MIN_NET_BPS}"
+    )
+
+    if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+      args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-funding-arb-live-orders)
+      [[ -n "${HYPERLIQUID_USER:-}" ]] && args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
+      [[ -n "${HYPERLIQUID_SOURCE:-}" ]] && args+=(--hyperliquid-source "${HYPERLIQUID_SOURCE}")
+      [[ -n "${HYPERLIQUID_VAULT_ADDRESS:-}" ]] && args+=(--hyperliquid-vault-address "${HYPERLIQUID_VAULT_ADDRESS}")
+      [[ -n "${HYPERLIQUID_EXPIRES_AFTER_MS:-}" ]] && args+=(--hyperliquid-expires-after-ms "${HYPERLIQUID_EXPIRES_AFTER_MS}")
+      if [[ -n "${HYPERLIQUID_ASSET_IDS:-}" ]]; then
+        IFS=',' read -r -a hyperliquid_asset_id_args <<< "${HYPERLIQUID_ASSET_IDS}"
+        for asset_id_arg in "${hyperliquid_asset_id_args[@]}"; do
+          asset_id_arg="${asset_id_arg//[[:space:]]/}"
+          [[ -n "${asset_id_arg}" ]] && args+=(--hyperliquid-asset-id "${asset_id_arg}")
+        done
+      fi
+      [[ -n "${ASTER_USER:-}" ]] && args+=(--aster-user "${ASTER_USER}")
+      [[ -n "${ASTER_SIGNER:-}" ]] && args+=(--aster-signer "${ASTER_SIGNER}")
+      [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && args+=(--aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
+    else
+      args+=(--dry-run)
+    fi
+
+    "${args[@]}"
     status="$?"
     finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -614,8 +665,11 @@ run_funding_arb_validation_job() {
         --arg finished_at "${finished_at}" \
         --arg out_dir "${out_dir}" \
         --arg validation_result_class "${validation_result_class}" \
+        --arg execution_mode "${EXECUTION_MODE}" \
         --argjson exit_status "${status}" \
+        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
         '. + {
+          execution_mode: $execution_mode,
           strategy: $strategy,
           pair_id: $pair_id,
           symbol: $symbol,
@@ -625,10 +679,11 @@ run_funding_arb_validation_job() {
           validation_exit_status: $exit_status,
           validation_result_class: $validation_result_class,
           dry_run_output_dir: $out_dir,
-          mutable_execution_started: false
-        }' "${report_file}" >> "${DRY_RUN_REPORTS_JSONL}"
+          validation_output_dir: $out_dir,
+          mutable_execution_started: $mutable_execution_started
+        }' "${report_file}" >> "${EXECUTION_REPORTS_JSONL}"
     else
-      append_json_line "${DRY_RUN_REPORTS_JSONL}" \
+      append_json_line "${EXECUTION_REPORTS_JSONL}" \
         --arg strategy "cross-exchange-funding-arb" \
         --arg pair_id "${pair_id}" \
         --arg symbol "${symbol}" \
@@ -636,8 +691,10 @@ run_funding_arb_validation_job() {
         --arg started_at "${started_at}" \
         --arg finished_at "${finished_at}" \
         --arg out_dir "${out_dir}" \
+        --arg execution_mode "${EXECUTION_MODE}" \
         --argjson exit_status "${status}" \
-        '{strategy:$strategy,pair_id:$pair_id,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,mutable_execution_started:false,report_missing:true}'
+        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
+        '{execution_mode:$execution_mode,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,report_missing:true}'
     fi
 
     echo "[${finished_at}] funding_validation_end pair_id=${pair_id} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
@@ -662,12 +719,13 @@ maybe_start_validation() {
   [[ "${VALIDATE_AUTO_ONCE}" == "1" ]] || return 0
 
   [[ -n "${symbol}" ]] || return 0
-  if ! supports_auto_once_dry_run "${venue}"; then
+  if ! supports_auto_once_validation "${venue}"; then
     append_json_line "${VALIDATION_EVENTS_JSONL}" \
       --arg venue "${venue}" \
       --arg symbol "${symbol}" \
       --arg recorded_at "${ts}" \
-      '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,event:"validation_skipped",reason:"auto_once_dry_run_not_supported",mutable_execution_started:false}'
+      --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
+      '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,event:"validation_skipped",reason:"auto_once_not_supported",mutable_execution_started:$mutable_execution_started}'
     return 0
   fi
 
@@ -705,8 +763,8 @@ maybe_start_validation() {
   printf '%s\n' "${now}" > "${last_file}"
 
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-${venue}-${slug}-$$-${RANDOM}"
-  out_dir="${DRY_RUN_DIR}/${run_id}"
-  job_log="${LOG_DIR}/${venue}-dry-run-${run_id}.log"
+  out_dir="${EXECUTION_DIR}/${run_id}"
+  job_log="${LOG_DIR}/${venue}-${EXECUTION_MODE}-${run_id}.log"
   run_validation_job "${venue}" "${symbol}" "${run_id}" "${out_dir}" "${job_log}" &
   pid="$!"
   printf '%s\n' "${pid}" > "${inflight_file}"
@@ -718,7 +776,9 @@ maybe_start_validation() {
     --arg run_id "${run_id}" \
     --arg out_dir "${out_dir}" \
     --argjson pid "${pid}" \
-    '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,event:"validation_started",run_id:$run_id,pid:$pid,dry_run_output_dir:$out_dir,mutable_execution_started:false}'
+    --arg execution_mode "${EXECUTION_MODE}" \
+    --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
+    '{recorded_at:$recorded_at,execution_mode:$execution_mode,venue:$venue,symbol:$symbol,event:"validation_started",run_id:$run_id,pid:$pid,dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started}'
 }
 
 maybe_start_funding_arb_validation() {
@@ -778,8 +838,8 @@ maybe_start_funding_arb_validation() {
   printf '%s\n' "${now}" > "${last_file}"
 
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-funding-arb-${symbol_part}-$$-${RANDOM}"
-  out_dir="${DRY_RUN_DIR}/${run_id}"
-  job_log="${LOG_DIR}/funding-arb-dry-run-${run_id}.log"
+  out_dir="${EXECUTION_DIR}/${run_id}"
+  job_log="${LOG_DIR}/funding-arb-${EXECUTION_MODE}-${run_id}.log"
   snapshot_file="${out_dir}/funding_arb_opportunities_snapshot.input.json"
   mkdir -p "${out_dir}"
   printf '%s\n' "${body}" > "${snapshot_file}"
@@ -796,7 +856,9 @@ maybe_start_funding_arb_validation() {
     --arg run_id "${run_id}" \
     --arg out_dir "${out_dir}" \
     --argjson pid "${pid}" \
-    '{recorded_at:$recorded_at,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,event:"validation_started",run_id:$run_id,pid:$pid,dry_run_output_dir:$out_dir,mutable_execution_started:false}'
+    --arg execution_mode "${EXECUTION_MODE}" \
+    --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
+    '{recorded_at:$recorded_at,execution_mode:$execution_mode,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,event:"validation_started",run_id:$run_id,pid:$pid,dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started}'
 }
 
 start_validations_for_candidates() {
@@ -969,14 +1031,16 @@ poll_funding_arb() {
 run_recorder() {
   cd "${REPO_ROOT}"
   trap 'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_stop" >> "${FEEDBACK_LOG}"; exit 0' INT TERM
-  mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${OPPORTUNITY_DIR}" "${DRY_RUN_DIR}" "${SNAPSHOT_DIR}"
+  mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${SNAPSHOT_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}"
   touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
+  touch "${VALIDATION_EVENTS_JSONL}" "${EXECUTION_REPORTS_JSONL}"
   IFS=' ' read -r -a RECORDER_MONITORS <<< "${EFFECTIVE_MONITORS}"
-  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_start monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}" >> "${FEEDBACK_LOG}"
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_start mode=${EXECUTION_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}" >> "${FEEDBACK_LOG}"
   append_json_line "${HEALTH_EVENTS_JSONL}" \
     --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg strategies "${EFFECTIVE_STRATEGIES}" \
-    '{recorded_at:$recorded_at,event:"observer_strategies_configured",strategies:$strategies,mutable_execution_started:false}'
+    --arg execution_mode "${EXECUTION_MODE}" \
+    '{recorded_at:$recorded_at,event:"observer_strategies_configured",execution_mode:$execution_mode,strategies:$strategies,mutable_execution_started:false}'
   while true; do
     if strategy_enabled "spot-perp-basis"; then
       for venue in "${RECORDER_MONITORS[@]}"; do
@@ -996,12 +1060,26 @@ if [[ "${1:-}" == "--recorder" ]]; then
   STATE_DIR="${RUN_ROOT}/state"
   SNAPSHOT_DIR="${RUN_ROOT}/snapshots"
   OPPORTUNITY_DIR="${RUN_ROOT}/opportunities"
-  DRY_RUN_DIR="${RUN_ROOT}/dry-run"
+  EXECUTE_LIVE="${BASIS_OBSERVER_EXECUTE_LIVE:-0}"
+  LIVE_ACK="${BASIS_OBSERVER_LIVE_ACK:-0}"
+  if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+    [[ "${LIVE_ACK}" == "1" ]] || die "recorder live mode requires BASIS_OBSERVER_LIVE_ACK=1"
+    EXECUTION_MODE="live"
+    MUTABLE_EXECUTION_STARTED_JSON="true"
+    EXECUTION_DIR="${RUN_ROOT}/live"
+    EXECUTION_REPORTS_JSONL="${EXECUTION_DIR}/live-reports.jsonl"
+  else
+    EXECUTION_MODE="paper"
+    MUTABLE_EXECUTION_STARTED_JSON="false"
+    EXECUTION_DIR="${RUN_ROOT}/dry-run"
+    EXECUTION_REPORTS_JSONL="${EXECUTION_DIR}/dry-run-reports.jsonl"
+  fi
+  DRY_RUN_DIR="${EXECUTION_DIR}"
   PID_FILE="${STATE_DIR}/basis-observer.pids"
   FEEDBACK_LOG="${LOG_DIR}/realtime-feedback.log"
   HEALTH_EVENTS_JSONL="${LOG_DIR}/health-events.jsonl"
-  VALIDATION_EVENTS_JSONL="${DRY_RUN_DIR}/validation-events.jsonl"
-  DRY_RUN_REPORTS_JSONL="${DRY_RUN_DIR}/dry-run-reports.jsonl"
+  VALIDATION_EVENTS_JSONL="${EXECUTION_DIR}/validation-events.jsonl"
+  DRY_RUN_REPORTS_JSONL="${EXECUTION_REPORTS_JSONL}"
   RUNTIME_BIN="${BASIS_OBSERVER_RUNTIME_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
   CONFIG_PATH="${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}"
   INTERVAL_SECS="${BASIS_OBSERVER_INTERVAL_SECS:-5}"
@@ -1010,6 +1088,16 @@ if [[ "${1:-}" == "--recorder" ]]; then
   PERP_FEE_BPS="${BASIS_OBSERVER_PERP_FEE_BPS:-5}"
   SLIPPAGE_BPS="${BASIS_OBSERVER_SLIPPAGE_BPS:-5}"
   FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS:-20}"
+  AUTO_PRICE_GUARD_BPS="${BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS:-2}"
+  PRIVATE_ORDER_EVENTS_DIR="${BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR:-${RUN_ROOT}/private-order-events}"
+  HYPERLIQUID_USER="${BASIS_OBSERVER_HYPERLIQUID_USER:-${HYPERLIQUID_USER:-}}"
+  HYPERLIQUID_SOURCE="${BASIS_OBSERVER_HYPERLIQUID_SOURCE:-${HYPERLIQUID_SOURCE:-}}"
+  HYPERLIQUID_VAULT_ADDRESS="${BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS:-${HYPERLIQUID_VAULT_ADDRESS:-}}"
+  HYPERLIQUID_EXPIRES_AFTER_MS="${BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS:-${HYPERLIQUID_EXPIRES_AFTER_MS:-}}"
+  HYPERLIQUID_ASSET_IDS="${BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS:-${HYPERLIQUID_ASSET_IDS:-}}"
+  ASTER_USER="${BASIS_OBSERVER_ASTER_USER:-${ASTER_USER:-}}"
+  ASTER_SIGNER="${BASIS_OBSERVER_ASTER_SIGNER:-${ASTER_SIGNER:-}}"
+  ASTER_SIGNER_CMD_ENV="${BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV:-${ASTER_SIGNER_CMD_ENV:-}}"
   VALIDATE_AUTO_ONCE="${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}"
   AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
   CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
@@ -1039,6 +1127,7 @@ require_command jq
 
 CLI_MONITORS=()
 CLI_STRATEGIES=""
+CLI_EXECUTE_LIVE=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --venues)
@@ -1052,6 +1141,15 @@ while [[ "$#" -gt 0 ]]; do
       shift 2
       ;;
     --dry-run)
+      CLI_EXECUTE_LIVE="0"
+      shift
+      ;;
+    --paper)
+      CLI_EXECUTE_LIVE="0"
+      shift
+      ;;
+    --live)
+      CLI_EXECUTE_LIVE="1"
       shift
       ;;
     --*)
@@ -1069,9 +1167,24 @@ LOG_DIR="${RUN_ROOT}/logs"
 STATE_DIR="${RUN_ROOT}/state"
 SNAPSHOT_DIR="${RUN_ROOT}/snapshots"
 OPPORTUNITY_DIR="${RUN_ROOT}/opportunities"
-DRY_RUN_DIR="${RUN_ROOT}/dry-run"
+EXECUTE_LIVE="${CLI_EXECUTE_LIVE:-${BASIS_OBSERVER_EXECUTE_LIVE:-0}}"
+LIVE_ACK="${BASIS_OBSERVER_LIVE_ACK:-0}"
+if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+  [[ "${LIVE_ACK}" == "1" ]] || die "正式实盘需要设置 BASIS_OBSERVER_LIVE_ACK=1，或改用测试盘 paper"
+  EXECUTION_MODE="live"
+  MUTABLE_EXECUTION_STARTED_JSON="true"
+  EXECUTION_DIR="${RUN_ROOT}/live"
+  EXECUTION_REPORTS_JSONL="${EXECUTION_DIR}/live-reports.jsonl"
+else
+  EXECUTE_LIVE="0"
+  EXECUTION_MODE="paper"
+  MUTABLE_EXECUTION_STARTED_JSON="false"
+  EXECUTION_DIR="${RUN_ROOT}/dry-run"
+  EXECUTION_REPORTS_JSONL="${EXECUTION_DIR}/dry-run-reports.jsonl"
+fi
+DRY_RUN_DIR="${EXECUTION_DIR}"
 PID_FILE="${STATE_DIR}/basis-observer.pids"
-RUNTIME_BIN="${REPO_ROOT}/target/debug/arb-runtime"
+RUNTIME_BIN="${BASIS_OBSERVER_RUNTIME_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
 CONFIG_PATH="${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}"
 INTERVAL_SECS="${BASIS_OBSERVER_INTERVAL_SECS:-5}"
 MIN_ABS_FUNDING_RATE="${BASIS_OBSERVER_MIN_ABS_FUNDING_RATE:-0}"
@@ -1088,6 +1201,16 @@ ASTER_BIND="${ASTER_BASIS_BIND:-127.0.0.1:8800}"
 HYPERLIQUID_BIND="${HYPERLIQUID_BASIS_BIND:-127.0.0.1:8799}"
 FUNDING_ARB_BIND="${FUNDING_ARB_BIND:-127.0.0.1:8804}"
 FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS:-20}"
+AUTO_PRICE_GUARD_BPS="${BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS:-2}"
+PRIVATE_ORDER_EVENTS_DIR="${BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR:-${RUN_ROOT}/private-order-events}"
+HYPERLIQUID_USER="${BASIS_OBSERVER_HYPERLIQUID_USER:-${HYPERLIQUID_USER:-}}"
+HYPERLIQUID_SOURCE="${BASIS_OBSERVER_HYPERLIQUID_SOURCE:-${HYPERLIQUID_SOURCE:-}}"
+HYPERLIQUID_VAULT_ADDRESS="${BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS:-${HYPERLIQUID_VAULT_ADDRESS:-}}"
+HYPERLIQUID_EXPIRES_AFTER_MS="${BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS:-${HYPERLIQUID_EXPIRES_AFTER_MS:-}}"
+HYPERLIQUID_ASSET_IDS="${BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS:-${HYPERLIQUID_ASSET_IDS:-}}"
+ASTER_USER="${BASIS_OBSERVER_ASTER_USER:-${ASTER_USER:-}}"
+ASTER_SIGNER="${BASIS_OBSERVER_ASTER_SIGNER:-${ASTER_SIGNER:-}}"
+ASTER_SIGNER_CMD_ENV="${BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV:-${ASTER_SIGNER_CMD_ENV:-}}"
 VALIDATE_AUTO_ONCE="${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}"
 AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
 CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
@@ -1126,7 +1249,7 @@ for strategy in "${STRATEGY_LIST[@]}"; do
   esac
 done
 
-mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${SNAPSHOT_DIR}" "${OPPORTUNITY_DIR}" "${DRY_RUN_DIR}"
+mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${SNAPSHOT_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}"
 touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
 
 if [[ -s "${PID_FILE}" ]]; then
@@ -1247,6 +1370,18 @@ nohup env \
   BASIS_OBSERVER_PERP_FEE_BPS="${PERP_FEE_BPS}" \
   BASIS_OBSERVER_SLIPPAGE_BPS="${SLIPPAGE_BPS}" \
   FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}" \
+  BASIS_OBSERVER_EXECUTE_LIVE="${EXECUTE_LIVE}" \
+  BASIS_OBSERVER_LIVE_ACK="${LIVE_ACK}" \
+  BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS="${AUTO_PRICE_GUARD_BPS}" \
+  BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR="${PRIVATE_ORDER_EVENTS_DIR}" \
+  BASIS_OBSERVER_HYPERLIQUID_USER="${HYPERLIQUID_USER}" \
+  BASIS_OBSERVER_HYPERLIQUID_SOURCE="${HYPERLIQUID_SOURCE}" \
+  BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS="${HYPERLIQUID_VAULT_ADDRESS}" \
+  BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS="${HYPERLIQUID_EXPIRES_AFTER_MS}" \
+  BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS="${HYPERLIQUID_ASSET_IDS}" \
+  BASIS_OBSERVER_ASTER_USER="${ASTER_USER}" \
+  BASIS_OBSERVER_ASTER_SIGNER="${ASTER_SIGNER}" \
+  BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV="${ASTER_SIGNER_CMD_ENV}" \
   BASIS_OBSERVER_VALIDATE_AUTO_ONCE="${VALIDATE_AUTO_ONCE}" \
   BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS="${AUTO_ONCE_COOLDOWN_SECS}" \
   BASIS_OBSERVER_CURL_TIMEOUT_SECS="${CURL_TIMEOUT_SECS}" \
@@ -1268,6 +1403,7 @@ printf '%s\t%s\t%s\n' "${RECORDER_PID}" "opportunity-recorder" "${RECORDER_LOG}"
 cat <<EOF
 
 started basis opportunity observer.
+mode: ${EXECUTION_MODE}
 pid file: ${PID_FILE}
 
 dashboards:
@@ -1293,10 +1429,10 @@ opportunity logs:
   ${OPPORTUNITY_DIR}/aster-opportunities.jsonl
   ${OPPORTUNITY_DIR}/hyperliquid-opportunities.jsonl
 
-dry-run validation reports:
-  ${DRY_RUN_DIR}/dry-run-reports.jsonl
+validation reports:
+  ${EXECUTION_REPORTS_JSONL}
 
-中文说明：脚本不会传 --execute-live，也不会传真实下单确认参数；mutable_execution_started=false。
+中文说明：paper 模式只模拟下单；live 模式会在机会满足门禁时传 --execute-live 并提交真实订单。
 EOF
 
 if [[ "${FOREGROUND}" == "1" ]]; then

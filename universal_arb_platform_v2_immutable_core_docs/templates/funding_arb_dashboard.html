@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>跨所资金费率套利 observer</title>
+  <style>
+    body { margin: 0; background: #101112; color: #f0eadc; font-family: "IBM Plex Mono", "SFMono-Regular", monospace; }
+    header { display: flex; justify-content: space-between; gap: 18px; padding: 20px 24px; background: #191b1e; border-bottom: 1px solid #353941; }
+    main { padding: 18px 24px 28px; }
+    h1 { margin: 0; font-size: 22px; }
+    button { min-height: 34px; border: 1px solid #353941; border-radius: 6px; background: #23262a; color: #f0eadc; padding: 7px 11px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .metric { border: 1px solid #353941; background: #1b1d20; border-radius: 6px; padding: 12px; }
+    .metric span { display: block; color: #a5a8aa; font-size: 12px; }
+    .metric strong { display: block; margin-top: 8px; font-size: 22px; }
+    pre { margin: 0; max-height: 72vh; overflow: auto; padding: 12px; background: #0c0d0e; border: 1px solid #353941; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>跨所资金费率套利 observer</h1>
+    <button id="refresh" type="button">刷新</button>
+  </header>
+  <main>
+    <section class="grid">
+      <article class="metric"><span>状态</span><strong id="status">加载中</strong></article>
+      <article class="metric"><span>机会</span><strong id="candidates">0</strong></article>
+      <article class="metric"><span>组合</span><strong id="total">0</strong></article>
+      <article class="metric"><span>来源错误</span><strong id="source-errors">0</strong></article>
+    </section>
+    <section>
+      <button type="button" data-endpoint="/api/funding-arb/status">状态接口</button>
+      <button type="button" data-endpoint="/api/funding-arb/opportunities">机会接口</button>
+    </section>
+    <pre id="funding-rows">{}</pre>
+  </main>
+  <script>
+    async function refresh() {
+      const response = await fetch("/api/funding-arb/status", { cache: "no-store" });
+      const data = await response.json();
+      document.getElementById("status").textContent = data.status || "未知";
+      document.getElementById("candidates").textContent = data.candidate_count ?? 0;
+      document.getElementById("total").textContent = data.total_rows ?? 0;
+      document.getElementById("source-errors").textContent = data.source_error_count ?? 0;
+      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
+    }
+    async function preview(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const data = await response.json();
+      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
+    }
+    document.getElementById("refresh").addEventListener("click", refresh);
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => preview(button.dataset.endpoint || "/api/funding-arb/status"));
+    });
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+</html>

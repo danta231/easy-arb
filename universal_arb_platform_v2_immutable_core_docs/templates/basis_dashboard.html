@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>实时套利监控</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101112;
+      --band: #151719;
+      --panel: #1b1d20;
+      --panel-strong: #23262a;
+      --line: #353941;
+      --text: #f0eadc;
+      --muted: #a5a8aa;
+      --amber: #e2b650;
+      --green: #58c383;
+      --red: #e06a6a;
+      --blue: #77a7d9;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 22px 28px;
+      background: #191b1e;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .kicker {
+      margin: 0 0 6px;
+      color: var(--amber);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .pill.healthy,
+    .candidate {
+      color: var(--green);
+      border-color: rgba(88, 195, 131, 0.45);
+    }
+
+    .pill.error,
+    .negative {
+      color: var(--red);
+      border-color: rgba(224, 106, 106, 0.45);
+    }
+
+    .positive {
+      color: var(--green);
+    }
+
+    main {
+      padding: 18px 28px 32px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      min-height: 72px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 22px;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+
+    .control-bar {
+      display: grid;
+      grid-template-columns: minmax(150px, 220px) repeat(2, minmax(116px, max-content)) minmax(170px, 220px) minmax(100px, max-content) minmax(130px, max-content);
+      gap: 10px;
+      align-items: end;
+      padding: 12px;
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    label span,
+    .field-label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input[type="search"],
+    select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101214;
+      color: var(--text);
+      padding: 7px 9px;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 36px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: var(--panel);
+      white-space: nowrap;
+    }
+
+    .toggle input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--amber);
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--text);
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--amber);
+    }
+
+    .table-wrap,
+    .api-wrap {
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    .table-head,
+    .api-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+      max-height: 58vh;
+    }
+
+    table {
+      width: 100%;
+      min-width: 1180px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      height: 38px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(53, 57, 65, 0.7);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #202327;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    th:first-child,
+    td:first-child,
+    th:last-child,
+    td:last-child {
+      text-align: left;
+    }
+
+    tbody tr:hover {
+      background: rgba(226, 182, 80, 0.08);
+    }
+
+    .api-wrap {
+      margin-top: 14px;
+    }
+
+    .endpoint-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    pre {
+      margin: 0;
+      max-height: 260px;
+      overflow: auto;
+      padding: 12px;
+      background: #0c0d0e;
+      color: #d7d1c2;
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .empty-row {
+      height: 88px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 980px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status-strip {
+        justify-content: flex-start;
+        text-align: left;
+      }
+
+      .summary-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .control-bar {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      main,
+      .topbar {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .summary-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="kicker">Binance public basis</p>
+      <h1>实时套利监控</h1>
+    </div>
+    <div class="status-strip">
+      <span id="runtime-status" class="pill">加载中</span>
+      <span id="updated-at">尚未更新</span>
+    </div>
+  </header>
+  <main>
+    <section class="summary-grid" aria-label="summary">
+      <article class="metric"><span>机会</span><strong id="metric-candidates">0</strong></article>
+      <article class="metric"><span>市场</span><strong id="metric-total">0</strong></article>
+      <article class="metric"><span>资金费率过滤</span><strong id="metric-filtered">0</strong></article>
+      <article class="metric"><span>缺现货</span><strong id="metric-missing-spot">0</strong></article>
+      <article class="metric"><span>缺永续</span><strong id="metric-missing-perp">0</strong></article>
+      <article class="metric"><span>最小净 Basis</span><strong id="metric-min-net">0</strong></article>
+    </section>
+
+    <section class="control-bar" aria-label="controls">
+      <label>
+        <span>交易对</span>
+        <input id="symbol-filter" type="search" autocomplete="off" placeholder="BTCUSDT">
+      </label>
+      <label class="toggle"><input id="only-candidates" type="checkbox">只看机会</label>
+      <label class="toggle"><input id="only-complete" type="checkbox" checked>只看完整报价</label>
+      <label>
+        <span>排序</span>
+        <select id="sort-mode">
+          <option value="net-desc">净 Basis 降序</option>
+          <option value="funding-abs-desc">资金费率绝对值</option>
+          <option value="profit-desc">预期收益</option>
+          <option value="symbol-asc">交易对</option>
+        </select>
+      </label>
+      <button id="refresh-button" type="button">刷新</button>
+      <label class="toggle"><input id="auto-refresh" type="checkbox" checked>自动刷新</label>
+    </section>
+
+    <section class="table-wrap" aria-label="basis table">
+      <div class="table-head">
+        <strong>行情与机会</strong>
+        <span id="api-state">等待中</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>交易对</th>
+              <th>现货买价 Spot Bid</th>
+              <th>现货卖价 Spot Ask</th>
+              <th>永续买价 Perp Bid</th>
+              <th>永续卖价 Perp Ask</th>
+              <th>标记价 Mark</th>
+              <th>指数价 Index</th>
+              <th>资金费率 Funding</th>
+              <th>毛收益 bps</th>
+              <th>成本 bps</th>
+              <th>净收益 bps</th>
+              <th>数量 Qty</th>
+              <th>收益 USD</th>
+              <th>状态</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody id="basis-rows">
+            <tr><td class="empty-row" colspan="15">加载中</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="api-wrap" aria-label="realtime api">
+      <div class="api-head">
+        <strong>实时 API</strong>
+        <div class="endpoint-grid">
+          <button type="button" data-endpoint="/api/basis/status">状态接口</button>
+          <button type="button" data-endpoint="/api/basis/opportunities">机会接口</button>
+        </div>
+      </div>
+      <pre id="api-preview">{}</pre>
+    </section>
+  </main>
+
+  <script>
+    const statusUrl = "/api/basis/status";
+    const opportunitiesUrl = "/api/basis/opportunities";
+    const state = { snapshot: null, timer: null };
+    const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(value) {
+      return String(value ?? "-").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function numeric(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function signedClass(value) {
+      const number = numeric(value);
+      if (number === null || number === 0) return "";
+      return number > 0 ? "positive" : "negative";
+    }
+
+    async function requestJson(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        throw new Error(`invalid json from ${url}: ${error.message}`);
+      }
+      if (!response.ok) {
+        throw new Error(data.error || `http ${response.status}`);
+      }
+      return data;
+    }
+
+    function filteredRows(rows) {
+      const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
+      const onlyCandidates = $("only-candidates").checked;
+      const onlyComplete = $("only-complete").checked;
+      const sortMode = $("sort-mode").value;
+      const result = rows.filter((row) => {
+        if (symbolFilter && !row.symbol.includes(symbolFilter)) return false;
+        if (onlyCandidates && !row.is_candidate) return false;
+        if (onlyComplete && row.source_status !== "complete") return false;
+        return true;
+      });
+      result.sort((left, right) => {
+        if (sortMode === "symbol-asc") return left.symbol.localeCompare(right.symbol);
+        if (sortMode === "funding-abs-desc") {
+          return Math.abs(numeric(right.last_funding_rate) ?? 0) - Math.abs(numeric(left.last_funding_rate) ?? 0);
+        }
+        if (sortMode === "profit-desc") {
+          return (numeric(right.expected_profit_usd) ?? -Infinity) - (numeric(left.expected_profit_usd) ?? -Infinity);
+        }
+        return (numeric(right.net_basis_bps) ?? -Infinity) - (numeric(left.net_basis_bps) ?? -Infinity);
+      });
+      return result;
+    }
+
+    function renderRows(rows) {
+      const body = $("basis-rows");
+      const view = filteredRows(rows);
+      if (!view.length) {
+        body.innerHTML = `<tr><td class="empty-row" colspan="15">无数据</td></tr>`;
+        return;
+      }
+      body.innerHTML = view.map((row) => {
+        const candidateClass = row.is_candidate ? "candidate" : "";
+        return `<tr>
+          <td class="${candidateClass}">${escapeHtml(row.symbol)}</td>
+          <td>${escapeHtml(row.spot_bid)}</td>
+          <td>${escapeHtml(row.spot_ask)}</td>
+          <td>${escapeHtml(row.perp_bid)}</td>
+          <td>${escapeHtml(row.perp_ask)}</td>
+          <td>${escapeHtml(row.mark_price)}</td>
+          <td>${escapeHtml(row.index_price)}</td>
+          <td class="${signedClass(row.last_funding_rate)}">${escapeHtml(row.last_funding_rate)}</td>
+          <td class="${signedClass(row.gross_basis_bps)}">${escapeHtml(row.gross_basis_bps)}</td>
+          <td>${escapeHtml(row.total_cost_bps)}</td>
+          <td class="${signedClass(row.net_basis_bps)}">${escapeHtml(row.net_basis_bps)}</td>
+          <td>${escapeHtml(row.quantity)}</td>
+          <td class="${signedClass(row.expected_profit_usd)}">${escapeHtml(row.expected_profit_usd)}</td>
+          <td>${escapeHtml(row.source_status)}</td>
+          <td>${escapeHtml(row.reason)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function render(snapshot) {
+      $("runtime-status").textContent = snapshot.status || "未知";
+      $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : ""}`;
+      $("updated-at").textContent = snapshot.updated_at || "尚未更新";
+      $("metric-candidates").textContent = snapshot.candidate_count ?? 0;
+      $("metric-total").textContent = snapshot.total_rows ?? 0;
+      $("metric-filtered").textContent = snapshot.filtered_funding_count ?? 0;
+      $("metric-missing-spot").textContent = snapshot.missing_spot_count ?? 0;
+      $("metric-missing-perp").textContent = snapshot.missing_perp_count ?? 0;
+      $("metric-min-net").textContent = snapshot.min_net_bps ?? "0";
+      $("api-state").textContent = snapshot.last_error ? snapshot.last_error : "正常";
+      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
+      renderRows(snapshot.rows || []);
+    }
+
+    async function refreshStatus() {
+      $("api-state").textContent = "加载中";
+      try {
+        const snapshot = await requestJson(statusUrl);
+        state.snapshot = snapshot;
+        render(snapshot);
+      } catch (error) {
+        $("runtime-status").textContent = "错误";
+        $("runtime-status").className = "pill error";
+        $("api-state").textContent = error.message;
+      }
+    }
+
+    async function previewEndpoint(url) {
+      $("api-preview").textContent = "加载中";
+      try {
+        const data = await requestJson(url);
+        $("api-preview").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        $("api-preview").textContent = error.message;
+      }
+    }
+
+    function schedule() {
+      if (state.timer) clearInterval(state.timer);
+      if ($("auto-refresh").checked) {
+        state.timer = setInterval(refreshStatus, 2000);
+      }
+    }
+
+    ["symbol-filter", "only-candidates", "only-complete", "sort-mode"].forEach((id) => {
+      $(id).addEventListener("input", () => {
+        if (state.snapshot) renderRows(state.snapshot.rows || []);
+      });
+      $(id).addEventListener("change", () => {
+        if (state.snapshot) renderRows(state.snapshot.rows || []);
+      });
+    });
+    $("refresh-button").addEventListener("click", refreshStatus);
+    $("auto-refresh").addEventListener("change", schedule);
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => previewEndpoint(button.dataset.endpoint || opportunitiesUrl));
+    });
+
+    schedule();
+    refreshStatus();
+  </script>
+</body>
+</html>

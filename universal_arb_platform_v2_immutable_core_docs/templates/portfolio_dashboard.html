@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>组合余额与仓位看板</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101112;
+      --band: #17191b;
+      --panel: #1d2023;
+      --line: #373c42;
+      --line-soft: #2a2f34;
+      --text: #f3ead8;
+      --muted: #a8adb2;
+      --accent: #d7b25d;
+      --good: #5dc48a;
+      --warn: #e4a753;
+      --bad: #e16d6d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Sans", "SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 14px;
+    }
+    header {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 18px 22px;
+      background: var(--band);
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 20px; line-height: 1.25; font-weight: 650; letter-spacing: 0; }
+    main { padding: 16px 22px 28px; }
+    button, input, select {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #202429;
+      color: var(--text);
+      padding: 7px 10px;
+      font: inherit;
+    }
+    button { cursor: pointer; }
+    button:hover, input:focus, select:focus { border-color: var(--accent); outline: none; }
+    label { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .metric {
+      min-height: 72px;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: var(--panel);
+      padding: 10px 12px;
+    }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 7px; font-size: 20px; font-weight: 650; }
+    .status-healthy { color: var(--good); }
+    .status-degraded { color: var(--warn); }
+    .status-missing, .status-unknown { color: var(--bad); }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 18px 0 8px;
+    }
+    h2 { margin: 0; font-size: 16px; font-weight: 650; }
+    .subtle { color: var(--muted); font-size: 12px; }
+    .table-wrap {
+      width: 100%;
+      overflow: auto;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: #141618;
+    }
+    table {
+      width: 100%;
+      min-width: 1180px;
+      border-collapse: collapse;
+      table-layout: fixed;
+      font-variant-numeric: tabular-nums;
+    }
+    #positions-table { min-width: 1760px; }
+    th, td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line-soft);
+      text-align: left;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: middle;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #202429;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    tr:hover td { background: #1b1f22; }
+    .mono { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 62px;
+      height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 8px;
+      font-size: 12px;
+      color: var(--muted);
+      background: #171a1d;
+    }
+    .pill.open { color: var(--good); border-color: rgba(93, 196, 138, .5); }
+    .pill.unknown, .pill.missing { color: var(--bad); border-color: rgba(225, 109, 109, .55); }
+    .empty { padding: 18px; color: var(--muted); }
+    #errors {
+      display: none;
+      margin-bottom: 14px;
+      border: 1px solid rgba(225, 109, 109, .45);
+      border-radius: 6px;
+      background: rgba(225, 109, 109, .08);
+      color: #f0b0a8;
+      padding: 10px 12px;
+      line-height: 1.45;
+    }
+    @media (max-width: 780px) {
+      header { grid-template-columns: 1fr; padding: 16px; }
+      main { padding: 14px 16px 22px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolbar { align-items: stretch; }
+      label, button, input, select { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>组合余额与仓位看板</h1>
+    <button id="refresh" type="button">刷新</button>
+  </header>
+  <main>
+    <section class="metrics" aria-label="组合状态">
+      <article class="metric"><span>状态</span><strong id="status" class="status-unknown">加载中</strong></article>
+      <article class="metric"><span>余额行</span><strong id="balance-count">0</strong></article>
+      <article class="metric"><span>仓位行</span><strong id="position-count">0</strong></article>
+      <article class="metric"><span>来源错误</span><strong id="source-error-count">0</strong></article>
+      <article class="metric"><span>更新时间</span><strong id="updated-at" class="mono">-</strong></article>
+    </section>
+    <div id="errors"></div>
+    <section class="toolbar" aria-label="筛选">
+      <label>交易所 <select id="venue-filter"><option value="">全部</option></select></label>
+      <label>币种 <input id="symbol-filter" type="search" placeholder="BTC / BTCUSDT"></label>
+      <label><input id="open-only" type="checkbox"> 仅开仓</label>
+      <button type="button" data-endpoint="/api/portfolio/status">状态接口</button>
+      <button type="button" data-endpoint="/api/portfolio/balances">余额接口</button>
+      <button type="button" data-endpoint="/api/portfolio/positions">仓位接口</button>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>交易所余额</h2>
+        <span class="subtle" id="balance-summary">0 行</span>
+      </div>
+      <div class="table-wrap">
+        <table id="balances-table">
+          <thead>
+            <tr>
+              <th>交易所</th>
+              <th>账户</th>
+              <th>资产</th>
+              <th>可用</th>
+              <th>保证金余额</th>
+              <th>维持保证金</th>
+              <th>保证金缓冲</th>
+              <th>空闲</th>
+              <th>锁定</th>
+              <th>预留</th>
+              <th>未结算</th>
+              <th>来源状态</th>
+            </tr>
+          </thead>
+          <tbody id="portfolio-balance-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>所有仓位</h2>
+        <span class="subtle" id="position-summary">0 行</span>
+      </div>
+      <div class="table-wrap">
+        <table id="positions-table">
+          <thead>
+            <tr>
+              <th>币种</th>
+              <th>套利策略</th>
+              <th>交易所</th>
+              <th>手续费</th>
+              <th>累计持仓</th>
+              <th>开仓均价</th>
+              <th>清仓均价</th>
+              <th>开/清价差(%)</th>
+              <th>实时费率</th>
+              <th>费率结算时间(hh:mm:ss)</th>
+              <th>开/清条件</th>
+              <th>仓位状态</th>
+              <th>仓位数量</th>
+              <th>仓位限额</th>
+              <th>账户</th>
+              <th>来源</th>
+            </tr>
+          </thead>
+          <tbody id="portfolio-position-rows"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    const state = { balances: [], positions: [] };
+    const fields = {
+      balances: ["venue_family", "account_id", "asset", "available", "margin_balance", "maintenance_margin", "margin_buffer", "free", "locked", "reserved", "unsettled", "source_status"],
+      positions: ["coin", "strategy", "venue_family", "fee", "accumulated_position", "open_average_price", "close_average_price", "open_close_spread_pct", "realtime_funding_rate", "funding_settlement_time", "open_close_condition", "position_status", "position_quantity", "position_limit", "account_id", "source"]
+    };
+    function text(value) {
+      if (value === null || value === undefined || value === "") return "-";
+      return String(value);
+    }
+    function escapeHtml(value) {
+      return text(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    }
+    function rowMatches(row) {
+      const venue = document.getElementById("venue-filter").value;
+      const symbol = document.getElementById("symbol-filter").value.trim().toUpperCase();
+      const openOnly = document.getElementById("open-only").checked;
+      if (venue && row.venue_family !== venue) return false;
+      if (symbol) {
+        const haystack = `${row.coin || ""} ${row.symbol || ""} ${row.asset || ""}`.toUpperCase();
+        if (!haystack.includes(symbol)) return false;
+      }
+      if (openOnly && row.position_status && row.position_status !== "open") return false;
+      return true;
+    }
+    function renderTable(tbodyId, rows, keys) {
+      const tbody = document.getElementById(tbodyId);
+      const filtered = rows.filter(rowMatches);
+      if (filtered.length === 0) {
+        tbody.innerHTML = `<tr><td class="empty" colspan="${keys.length}">无数据</td></tr>`;
+        return 0;
+      }
+      tbody.innerHTML = filtered.map((row) => {
+        return `<tr>${keys.map((key) => {
+          if (key === "position_status") {
+            const klass = String(row[key] || "unknown").toLowerCase();
+            return `<td><span class="pill ${escapeHtml(klass)}">${escapeHtml(row[key])}</span></td>`;
+          }
+          return `<td class="mono" title="${escapeHtml(row[key])}">${escapeHtml(row[key])}</td>`;
+        }).join("")}</tr>`;
+      }).join("");
+      return filtered.length;
+    }
+    function updateVenueFilter(rows) {
+      const select = document.getElementById("venue-filter");
+      const current = select.value;
+      const venues = Array.from(new Set(rows.map((row) => row.venue_family).filter(Boolean))).sort();
+      select.innerHTML = `<option value="">全部</option>${venues.map((venue) => `<option value="${escapeHtml(venue)}">${escapeHtml(venue)}</option>`).join("")}`;
+      if (venues.includes(current)) select.value = current;
+    }
+    function render() {
+      const allRows = state.balances.concat(state.positions);
+      updateVenueFilter(allRows);
+      const balanceCount = renderTable("portfolio-balance-rows", state.balances, fields.balances);
+      const positionCount = renderTable("portfolio-position-rows", state.positions, fields.positions);
+      document.getElementById("balance-summary").textContent = `${balanceCount} 行`;
+      document.getElementById("position-summary").textContent = `${positionCount} 行`;
+    }
+    async function refresh(endpoint = "/api/portfolio/status") {
+      const response = await fetch(endpoint, { cache: "no-store" });
+      const data = await response.json();
+      if (data.balances) state.balances = data.balances;
+      if (data.positions) state.positions = data.positions;
+      document.getElementById("status").textContent = data.status || "unknown";
+      document.getElementById("status").className = `status-${data.status || "unknown"}`;
+      document.getElementById("balance-count").textContent = data.balance_count ?? state.balances.length;
+      document.getElementById("position-count").textContent = data.position_count ?? state.positions.length;
+      document.getElementById("source-error-count").textContent = data.source_error_count ?? 0;
+      document.getElementById("updated-at").textContent = data.updated_at || "-";
+      const errors = document.getElementById("errors");
+      if (data.source_errors && data.source_errors.length) {
+        errors.style.display = "block";
+        errors.innerHTML = data.source_errors.map(escapeHtml).join("<br>");
+      } else {
+        errors.style.display = "none";
+        errors.textContent = "";
+      }
+      render();
+    }
+    document.getElementById("refresh").addEventListener("click", () => refresh());
+    document.getElementById("venue-filter").addEventListener("change", render);
+    document.getElementById("symbol-filter").addEventListener("input", render);
+    document.getElementById("open-only").addEventListener("change", render);
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => refresh(button.dataset.endpoint || "/api/portfolio/status"));
+    });
+    setInterval(() => refresh(), 3000);
+    refresh();
+  </script>
+</body>
+</html>
