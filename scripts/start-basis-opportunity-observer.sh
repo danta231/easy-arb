@@ -85,6 +85,8 @@ usage() {
   OKX_PERP_WSS_MONITOR_URL=http://127.0.0.1:8791/api/okx-wss-book-ticker/status
   BITGET_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8792/api/bitget-wss-book-ticker/status
   BITGET_PERP_WSS_MONITOR_URL=http://127.0.0.1:8793/api/bitget-wss-book-ticker/status
+  ASTER_PERP_WSS_MONITOR_URL=http://127.0.0.1:8794/api/aster-wss-book-ticker/status
+  HYPERLIQUID_PERP_WSS_MONITOR_URL=http://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status
 
 输出:
   target/arb-opportunity-observer/logs/realtime-feedback.log
@@ -228,6 +230,26 @@ wss_args_for_venue() {
     fi
     printf '%s\n%s\n' "${spot_var}" "${perp_var}"
   fi
+}
+
+append_basis_monitor_wss_args() {
+  local venue="$1"
+  case "${venue}" in
+    aster)
+      if [[ "${EXECUTE_LIVE}" == "1" && -z "${ASTER_PERP_WSS_MONITOR_URL:-}" && "${STRATEGIES}" == *cross-exchange-funding-arb* ]]; then
+        die "cross-exchange-funding-arb live requires ASTER_PERP_WSS_MONITOR_URL for aster"
+      fi
+      [[ -n "${ASTER_PERP_WSS_MONITOR_URL:-}" ]] && MONITOR_ARGS+=(--perp-wss-monitor-url "${ASTER_PERP_WSS_MONITOR_URL}")
+      ;;
+    hyperliquid)
+      if [[ "${EXECUTE_LIVE}" == "1" && -z "${HYPERLIQUID_PERP_WSS_MONITOR_URL:-}" && "${STRATEGIES}" == *cross-exchange-funding-arb* ]]; then
+        die "cross-exchange-funding-arb live requires HYPERLIQUID_PERP_WSS_MONITOR_URL for hyperliquid"
+      fi
+      [[ -n "${HYPERLIQUID_PERP_WSS_MONITOR_URL:-}" ]] && MONITOR_ARGS+=(--perp-wss-monitor-url "${HYPERLIQUID_PERP_WSS_MONITOR_URL}")
+      ;;
+    *)
+      ;;
+  esac
 }
 
 append_basis_resident_wss_args() {
@@ -1412,13 +1434,17 @@ start_monitor() {
   local log_file="${LOG_DIR}/${venue}-basis-monitor.log"
   local out_dir="${SNAPSHOT_DIR}/${venue}"
   local pid
+  local -a MONITOR_ARGS
+  MONITOR_ARGS=(
+    "${RUNTIME_BIN}" "${command}"
+    --bind "${bind_addr}"
+    --out "${out_dir}"
+    "${COMMON_ARGS[@]}"
+  )
+  append_basis_monitor_wss_args "${venue}"
 
   echo "starting ${venue} monitor: http://${bind_addr}/dashboard"
-  nohup "${RUNTIME_BIN}" "${command}" \
-    --bind "${bind_addr}" \
-    --out "${out_dir}" \
-    "${COMMON_ARGS[@]}" \
-    >> "${log_file}" 2>&1 &
+  nohup "${MONITOR_ARGS[@]}" >> "${log_file}" 2>&1 &
   pid="$!"
   printf '%s\t%s\t%s\n' "${pid}" "${venue}-basis-monitor" "${log_file}" >> "${PID_FILE}"
   echo "  pid=${pid} log=${log_file}"

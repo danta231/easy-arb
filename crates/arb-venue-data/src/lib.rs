@@ -1696,24 +1696,77 @@ impl PublicJsonWssTextStreamClient {
         &self,
         subscribe_payload: &str,
         max_text_messages: usize,
+        observer: F,
+    ) -> VenueDataResult<()>
+    where
+        F: FnMut(&str, UtcTimestamp) -> bool,
+    {
+        self.read_live_text_messages_observed_many(
+            &[subscribe_payload.to_owned()],
+            max_text_messages,
+            observer,
+        )
+    }
+
+    /// 连接真实公开 WSS，发送多条订阅请求，并按文本消息回调。
+    ///
+    /// 中文说明：部分交易所（例如 Hyperliquid）要求每个公开频道独立发送 subscribe
+    /// 消息；该入口仍只处理公开行情文本，不读取账户、不签名、不提交可变操作。
+    pub fn read_live_text_messages_observed_many<F>(
+        &self,
+        subscribe_payloads: &[String],
+        max_text_messages: usize,
         mut observer: F,
     ) -> VenueDataResult<()>
     where
         F: FnMut(&str, UtcTimestamp) -> bool,
     {
-        if subscribe_payload.trim().is_empty() {
+        if subscribe_payloads.is_empty()
+            || subscribe_payloads
+                .iter()
+                .any(|payload| payload.trim().is_empty())
+        {
             return Err(VenueDataError::InvalidQuery {
-                field: "public_json.wss.subscribe_payload",
-                reason: "must contain a public subscribe payload",
+                field: "public_json.wss.subscribe_payloads",
+                reason: "must contain at least one non-empty public subscribe payload",
             });
         }
+        self.read_live_text_messages_after_connect(
+            subscribe_payloads,
+            max_text_messages,
+            &mut observer,
+        )
+    }
+
+    /// 连接真实公开 WSS，不发送订阅请求，并按文本消息回调。
+    ///
+    /// 中文说明：用于 Aster/Binance 这类通过 URL path 选择公开 stream 的只读行情流。
+    pub fn read_live_text_messages_without_subscribe_observed<F>(
+        &self,
+        max_text_messages: usize,
+        mut observer: F,
+    ) -> VenueDataResult<()>
+    where
+        F: FnMut(&str, UtcTimestamp) -> bool,
+    {
+        self.read_live_text_messages_after_connect(&[], max_text_messages, &mut observer)
+    }
+
+    fn read_live_text_messages_after_connect<F>(
+        &self,
+        subscribe_payloads: &[String],
+        max_text_messages: usize,
+        observer: &mut F,
+    ) -> VenueDataResult<()>
+    where
+        F: FnMut(&str, UtcTimestamp) -> bool,
+    {
         if max_text_messages == 0 {
             return Err(VenueDataError::InvalidQuery {
                 field: "public_json.wss.max_text_messages",
                 reason: "must be greater than zero",
             });
         }
-
         let (mut socket, _response) =
             tungstenite::connect(self.stream_url.as_str()).map_err(|error| {
                 VenueDataError::External(ClassifiedExternalError::new(
@@ -1726,16 +1779,18 @@ impl PublicJsonWssTextStreamClient {
                     ),
                 ))
             })?;
-        socket
-            .send(tungstenite::Message::Text(subscribe_payload.to_owned()))
-            .map_err(|error| {
-                VenueDataError::External(ClassifiedExternalError::new(
-                    self.venue_id.clone(),
-                    ReadOnlySurface::MarketData,
-                    ExternalErrorClass::Disconnected,
-                    format!("{} public WSS subscribe send failed: {error}", self.label),
-                ))
-            })?;
+        for subscribe_payload in subscribe_payloads {
+            socket
+                .send(tungstenite::Message::Text(subscribe_payload.to_owned()))
+                .map_err(|error| {
+                    VenueDataError::External(ClassifiedExternalError::new(
+                        self.venue_id.clone(),
+                        ReadOnlySurface::MarketData,
+                        ExternalErrorClass::Disconnected,
+                        format!("{} public WSS subscribe send failed: {error}", self.label),
+                    ))
+                })?;
+        }
 
         let mut text_messages = 0_usize;
         while text_messages < max_text_messages {

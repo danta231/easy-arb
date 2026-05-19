@@ -1,0 +1,293 @@
+# 六交易所双策略长时间全自动实盘运行手册
+
+本文用于已经完成长时间 dry-run 验证后的正式实盘阶段。入口固定使用 `scripts/start-arb-runtime-live.sh`，由它先启动公开 WSS monitor，再启动 `arb-runtime live --i-understand-live-orders`，进入监控、筛选、风控、下单、平仓监督的常驻流程。
+
+本手册不包含任何 API key、secret、私钥、token、助记词、签名命令正文或 webhook secret。所有凭证和签名材料只能放在本机未提交的环境变量、密钥管理器或本地未跟踪文件中。
+
+## 当前闭环边界
+
+- `spot-perp-basis`：常驻实盘当前覆盖 Binance、Bybit、OKX、Bitget 的现货和永续基差闭环。Aster、Hyperliquid 的 spot-perp basis 仍按 fail closed 处理，不作为该策略的实盘开仓来源。
+- `cross-exchange-funding-arb`：常驻实盘覆盖 Binance、Bybit、OKX、Bitget、Aster、Hyperliquid 六个交易所的 perp 资金费率套利链路。
+- WSS 前置：启动脚本会启动 Binance、Bybit、OKX、Bitget 的 spot/perp WSS，以及 Aster、Hyperliquid 的 perp WSS，并等待 `status=streaming`、`total_rows>0`、`wss_update_count>0` 后才进入实盘 runtime。
+- 如果任一外部状态未知、WSS 健康未知、账户/仓位只读快照未知、订单确认未知，按风险状态处理，不按成功处理。
+
+## 路径约束
+
+长时间实盘阶段建议先使用默认路径：
+
+```text
+target/arb-runtime/live
+target/arb-runtime/live-prereq
+```
+
+当前外层启动脚本、`arb-runtime live` 子命令和 portfolio dashboard 都涉及运行根目录。自定义 `ARB_RUNTIME_LIVE_ROOT` 或 `ARB_RUNTIME_LIVE_PREREQ_ROOT` 前，必须先做一次短周期前台验证，确认 live artifacts、portfolio dashboard `--resident-root` 和停止脚本读取的是同一组目录。未验证前不要在长时间实盘中使用自定义 root。
+
+## 启动前检查
+
+在仓库根目录执行：
+
+```bash
+cd /Users/danta/WebstormProjects/easy-arb
+```
+
+版本切换、拉取新代码或改动实盘相关代码后，先跑完整本地验证：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+实盘启动前至少确认脚本语法、live-exec 构建和配置健康：
+
+```bash
+bash -n scripts/start-arb-runtime-live.sh
+bash -n scripts/stop-arb-runtime-live.sh
+bash -n scripts/start-basis-opportunity-observer.sh
+cargo build -p arb-runtime --features live-exec
+target/debug/arb-runtime health-config templates/personal_guarded_live.preflight.yaml
+```
+
+`health-config` 必须明确看到 `GuardedLive` 配置形态，并确认 `kill_switch.global=false`、`kill_switch.execution=false` 是本次实盘的主动选择。如果任何 kill switch 被打开，执行链路应 fail closed，不要绕过。
+
+## 本地环境文件
+
+建议使用本地未提交文件，例如 `.env.live`。文件权限建议限制为当前用户可读写：
+
+```bash
+chmod 600 .env.live
+```
+
+下面是变量清单模板。带 `<...>` 的值必须由本机真实配置替换，不能原样启动；不要把实际密钥或签名命令正文写入本手册、提交记录、日志或聊天内容。
+
+```bash
+# 基础配置。当前入口按默认 min net 5 bps 运行；改该阈值前先补入口脚本并验证。
+BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml
+BASIS_OBSERVER_STRATEGIES=spot-perp-basis,cross-exchange-funding-arb
+BASIS_OBSERVER_MIN_NET_BPS=5
+BASIS_OBSERVER_MIN_ABS_FUNDING_RATE=0
+BASIS_OBSERVER_NOTIONAL_USD=100.00
+BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2
+
+# WSS ready 等待。网络抖动时可适度加大，但不要用它掩盖长期不健康。
+ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=180
+
+# spot-perp-basis 实盘限额。首次长时间实盘建议保持最小并发和小额名义本金。
+BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60
+BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1
+BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1
+BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=100.00
+
+# cross-exchange-funding-arb 实盘限额。
+BASIS_OBSERVER_FUNDING_ARB_MODE=resident
+BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60
+BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1
+BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES=
+
+# 资金费率结算校验。当前推荐先接 raw snapshot，不要同时接 ledger。
+BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=target/arb-runtime/live/private-readonly/funding_settlement_raw_snapshot.json
+BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER=
+
+# portfolio dashboard 可选只读输入。没有稳定文件时留空，由 resident root 汇总仓位。
+ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT=
+ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT=
+
+# Hyperliquid 身份和参数。只写地址、source、asset id 映射，不写私钥。
+BASIS_OBSERVER_HYPERLIQUID_USER=<hyperliquid-user-address>
+BASIS_OBSERVER_HYPERLIQUID_SOURCE=a
+BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS=
+BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS=
+BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS=BTCUSDT=<asset-id>,ETHUSDT=<asset-id>
+
+# Aster 身份和签名命令 env 名称。实际签名命令内容放在该 env 指向的本机变量中。
+BASIS_OBSERVER_ASTER_USER=<aster-user-address>
+BASIS_OBSERVER_ASTER_SIGNER=<aster-signer-address>
+BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV=ASTER_EIP712_SIGNER_CMD
+```
+
+`BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT` 是可写 JSON 快照路径，用来镜像最新资金费率结算原始只读快照，并给退出和平仓监督做 reconciliation 输入。它不是人工维护的最终 ledger。只有当 raw snapshot 结构和 symbol、账户、币种归一化都稳定后，再切到 `BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER`。
+
+`BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT` 和 `BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER` 不能同时设置；脚本会拒绝组合使用。
+
+## 启动
+
+首次进入长时间实盘建议使用 detach 模式，让进程独立于当前终端：
+
+```bash
+scripts/start-arb-runtime-live.sh --detach --env-file .env.live
+```
+
+启动脚本会先构建 `arb-runtime` 的 `live-exec` 版本，然后启动 10 个 WSS monitor：
+
+```text
+127.0.0.1:8786  Binance spot WSS
+127.0.0.1:8787  Binance perp WSS
+127.0.0.1:8788  Bybit spot WSS
+127.0.0.1:8789  Bybit perp WSS
+127.0.0.1:8790  OKX spot WSS
+127.0.0.1:8791  OKX perp WSS
+127.0.0.1:8792  Bitget spot WSS
+127.0.0.1:8793  Bitget perp WSS
+127.0.0.1:8794  Aster perp WSS
+127.0.0.1:8795  Hyperliquid perp WSS
+```
+
+随后启动：
+
+```text
+target/debug/arb-runtime live --i-understand-live-orders
+```
+
+该入口会把 `BASIS_OBSERVER_EXECUTE_LIVE=1` 和 `BASIS_OBSERVER_LIVE_ACK=1` 传给常驻 observer。不要直接运行底层 observer 进入实盘，除非是在诊断脚本本身。
+
+当前 `scripts/start-arb-runtime-live.sh` 没有暴露 `arb-runtime live --min-net-bps` 参数，本手册按默认 `5` bps 运行。需要改动该阈值时，先补入口脚本并跑 dry-run/小额实盘验证，不要只修改 `.env.live` 后假设已经生效。
+
+## 启动后健康检查
+
+先看启动日志：
+
+```bash
+tail -f target/arb-runtime/live-prereq/logs/arb-runtime-live.log
+tail -f target/arb-runtime/live/logs/realtime-feedback.log
+```
+
+检查 WSS 状态。全部必须是 `streaming`，且 `wss_update_count` 持续增加：
+
+```bash
+for url in \
+  http://127.0.0.1:8786/api/binance-wss-book-ticker/status \
+  http://127.0.0.1:8787/api/binance-wss-book-ticker/status \
+  http://127.0.0.1:8788/api/bybit-wss-book-ticker/status \
+  http://127.0.0.1:8789/api/bybit-wss-book-ticker/status \
+  http://127.0.0.1:8790/api/okx-wss-book-ticker/status \
+  http://127.0.0.1:8791/api/okx-wss-book-ticker/status \
+  http://127.0.0.1:8792/api/bitget-wss-book-ticker/status \
+  http://127.0.0.1:8793/api/bitget-wss-book-ticker/status \
+  http://127.0.0.1:8794/api/aster-wss-book-ticker/status \
+  http://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status
+do
+  echo "$url"
+  curl -fsS --max-time 5 "$url" | jq '{status,total_rows,wss_update_count,fail_closed,last_error,updated_at}'
+done
+```
+
+检查六个 basis monitor 和 funding arb monitor：
+
+```bash
+curl -fsS --max-time 10 http://127.0.0.1:8796/api/basis/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
+curl -fsS --max-time 10 http://127.0.0.1:8797/api/bybit-basis/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
+curl -fsS --max-time 10 http://127.0.0.1:8798/api/okx-basis/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
+curl -fsS --max-time 10 http://127.0.0.1:8803/api/bitget-basis/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
+curl -fsS --max-time 10 http://127.0.0.1:8800/api/aster-basis/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
+curl -fsS --max-time 10 http://127.0.0.1:8799/api/hyperliquid-basis/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
+curl -fsS --max-time 10 http://127.0.0.1:8804/api/funding-arb/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
+```
+
+看 portfolio dashboard 的聚合状态：
+
+```bash
+curl -fsS --max-time 10 http://127.0.0.1:8805/api/portfolio/status | jq '.'
+curl -fsS --max-time 10 http://127.0.0.1:8805/api/portfolio/positions | jq '.'
+```
+
+浏览器入口：
+
+```text
+http://127.0.0.1:8805/nav
+http://127.0.0.1:8805/dashboard
+http://127.0.0.1:8804/dashboard
+```
+
+## 实盘产物位置
+
+常驻日志：
+
+```text
+target/arb-runtime/live/logs/realtime-feedback.log
+target/arb-runtime/live-prereq/logs/arb-runtime-live.log
+target/arb-runtime/live-prereq/logs/portfolio-dashboard.log
+```
+
+策略产物：
+
+```text
+target/arb-runtime/live/resident-live/spot-perp-basis
+target/arb-runtime/live/resident-live/cross-exchange-funding-arb
+target/arb-runtime/live/live/live-reports.jsonl
+target/arb-runtime/live/private-order-events
+target/arb-runtime/live/opportunities/all-opportunities.jsonl
+target/arb-runtime/live/opportunities/spot-perp-basis.jsonl
+target/arb-runtime/live/opportunities/cross-exchange-funding-arb.jsonl
+```
+
+资金费率 raw snapshot：
+
+```text
+target/arb-runtime/live/private-readonly/funding_settlement_raw_snapshot.json
+```
+
+如果该文件不存在、不是合法 JSON、`status` 非健康状态，或账户和 symbol 无法匹配，退出和平仓监督必须按未知结算状态处理。
+
+## 长时间运行规则
+
+- 首次长时间实盘保持 `max_live_entries=1`、`max_concurrent_positions=1` 和小额 `notional`。连续稳定后一次只提升一个维度。
+- 每次提升名义本金、并发数、交易所范围或 funding threshold 前，先回看最近一段 `live-reports.jsonl`、`private-order-events` 和 portfolio positions；涉及入口参数的调整必须先确认脚本传参实际生效。
+- `wss_update_count` 不增长、`last_error` 非空、basis/funding arb 状态过旧、portfolio source error 非空时，不要新增仓位。
+- Aster、Hyperliquid 的 WSS 是 funding arb 命中率、行情延迟和风控通过率的前置输入。任一缺失或不健康时，相关 funding arb 候选不应视为可执行。
+- 任何仓位状态进入 `unknown` 后，新开仓应停止，先处理未知仓位和残余风险。
+- 不用 `BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER` 直接替代 raw snapshot，除非已经用 raw snapshot 证明交易所原始结算字段、symbol 归一化、账户归属和时间窗口长期稳定。
+
+## 停止
+
+正常停止：
+
+```bash
+scripts/stop-arb-runtime-live.sh
+```
+
+停止脚本会停止 live observer、portfolio dashboard 和 WSS monitor。它停止的是自动化进程，不保证交易所真实仓位已经平掉。停止后必须检查：
+
+```bash
+curl -fsS --max-time 10 http://127.0.0.1:8805/api/portfolio/positions | jq '.'
+tail -n 20 target/arb-runtime/live/live/live-reports.jsonl
+tail -n 20 target/arb-runtime/live/resident-live/cross-exchange-funding-arb/funding_arb_resident_positions.jsonl
+```
+
+如果 dashboard 已停止或状态未知，直接到交易所后台或只读私有快照确认仓位。存在真实持仓时，按 reduce-only 或交易所后台手动降风险，不要假设 stop 脚本已经完成平仓。
+
+## 紧急处理
+
+满足任一条件时，进入紧急处理：
+
+- WSS 或 basis/funding arb monitor 进入 fail closed、停止更新或连续报错。
+- 订单 receipt、exchange confirmation、private position snapshot 三者无法互相印证。
+- funding arb 结算状态未知，且持仓已跨过预期资金费率结算窗口。
+- portfolio dashboard 显示 source error、unknown position 或无法读取 resident root。
+- 本地时间、交易所时间、结算时间窗口明显不一致。
+
+处理顺序：
+
+1. 停止自动化：`scripts/stop-arb-runtime-live.sh`。
+2. 从交易所后台或只读私有快照确认真实仓位和挂单。
+3. 取消非 reduce-only 挂单。
+4. 对残余真实仓位执行 reduce-only 降风险或手动平仓。
+5. 记录 incident：保留 `target/arb-runtime/live`、`target/arb-runtime/live-prereq`、`private-order-events`、`live-reports.jsonl` 和交易所确认记录。
+6. 未完成复盘前，不要重新启动实盘。
+
+## 复盘检查
+
+每个实盘时段结束后至少检查：
+
+```bash
+tail -n 50 target/arb-runtime/live/live/live-reports.jsonl | jq -c '.'
+tail -n 50 target/arb-runtime/live/opportunities/cross-exchange-funding-arb.jsonl | jq -c '.'
+tail -n 50 target/arb-runtime/live/private-order-events/*.jsonl
+```
+
+复盘结论必须能回答：
+
+- 开仓候选是否来自健康 WSS 和健康 monitor。
+- 策略信号、风控、价格保护、签名、下单确认是否完整。
+- 平仓监督是否按预期触发，是否存在 unknown position。
+- raw settlement snapshot 是否能解释资金费率收入或支出。
+- 当前限额是否应该保持、降低或只在下一次 dry-run 后调整。

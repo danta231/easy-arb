@@ -15,8 +15,8 @@ usage() {
 
 行为:
   1. 构建 arb-runtime live-exec。
-  2. 启动 Binance/Bybit/OKX/Bitget 的 spot/perp WSS bookTicker monitor。
-  3. 等待 WSS monitor 进入 healthy。
+  2. 启动 Binance/Bybit/OKX/Bitget 的 spot/perp WSS，以及 Aster/Hyperliquid perp WSS monitor。
+  3. 等待 WSS monitor 进入 streaming，且已收到真实 WSS 更新。
   4. 启动 arb-runtime live --i-understand-live-orders。
   5. arb-runtime live 会默认用常驻 runner 管理 spot-perp-basis 和
      cross-exchange-funding-arb，不再由 observer 反复触发 auto-once。
@@ -31,6 +31,8 @@ usage() {
   ARB_RUNTIME_LIVE_BUILD=1
   ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL=BTC-USDT
   ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL=BTCUSDT
+  ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL=ALL_USDT
+  ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL=ALL_USDT
   ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805
   BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1
@@ -132,11 +134,15 @@ OKX_SPOT_WSS_BIND="${ARB_RUNTIME_LIVE_OKX_SPOT_WSS_BIND:-127.0.0.1:8790}"
 OKX_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_OKX_PERP_WSS_BIND:-127.0.0.1:8791}"
 BITGET_SPOT_WSS_BIND="${ARB_RUNTIME_LIVE_BITGET_SPOT_WSS_BIND:-127.0.0.1:8792}"
 BITGET_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_BITGET_PERP_WSS_BIND:-127.0.0.1:8793}"
+ASTER_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_ASTER_PERP_WSS_BIND:-127.0.0.1:8794}"
+HYPERLIQUID_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_HYPERLIQUID_PERP_WSS_BIND:-127.0.0.1:8795}"
 
 BINANCE_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL:-ALL_USDT}"
 BYBIT_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL:-ALL_USDT}"
 OKX_WSS_SYMBOL="${ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL:-BTC-USDT}"
 BITGET_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL:-BTCUSDT}"
+ASTER_WSS_SYMBOL="${ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL:-ALL_USDT}"
+HYPERLIQUID_WSS_SYMBOL="${ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL:-ALL_USDT}"
 
 mkdir -p "${LOG_DIR}" "${STATE_DIR}"
 
@@ -193,6 +199,7 @@ wait_for_wss_monitor() {
   local body
   local status
   local total_rows
+  local wss_update_count
 
   while (( SECONDS <= deadline )); do
     if ! is_alive "${pid}"; then
@@ -203,8 +210,9 @@ wait_for_wss_monitor() {
     if body="$(curl -fsS --max-time 2 "${status_url}" 2>/dev/null)"; then
       status="$(printf '%s\n' "${body}" | jq -r '.status // "unknown"' 2>/dev/null || printf 'unknown')"
       total_rows="$(printf '%s\n' "${body}" | jq -r '.total_rows // 0' 2>/dev/null || printf '0')"
-      if [[ "${status}" == "healthy" && "${total_rows}" =~ ^[0-9]+$ && "${total_rows}" -gt 0 ]]; then
-        echo "wss_ready name=${name} status_url=${status_url} rows=${total_rows}"
+      wss_update_count="$(printf '%s\n' "${body}" | jq -r '.wss_update_count // 0' 2>/dev/null || printf '0')"
+      if [[ "${status}" == "streaming" && "${total_rows}" =~ ^[0-9]+$ && "${total_rows}" -gt 0 && "${wss_update_count}" =~ ^[0-9]+$ && "${wss_update_count}" -gt 0 ]]; then
+        echo "wss_ready name=${name} status_url=${status_url} rows=${total_rows} wss_updates=${wss_update_count}"
         return 0
       fi
     fi
@@ -277,6 +285,8 @@ start_wss_monitor okx-spot okx-wss-book-ticker "${OKX_SPOT_WSS_BIND}" "${OKX_WSS
 start_wss_monitor okx-perp okx-wss-book-ticker "${OKX_PERP_WSS_BIND}" "${OKX_WSS_SYMBOL}" swap /api/okx-wss-book-ticker
 start_wss_monitor bitget-spot bitget-wss-book-ticker "${BITGET_SPOT_WSS_BIND}" "${BITGET_WSS_SYMBOL}" spot /api/bitget-wss-book-ticker
 start_wss_monitor bitget-perp bitget-wss-book-ticker "${BITGET_PERP_WSS_BIND}" "${BITGET_WSS_SYMBOL}" usdt-futures /api/bitget-wss-book-ticker
+start_wss_monitor aster-perp aster-wss-book-ticker "${ASTER_PERP_WSS_BIND}" "${ASTER_WSS_SYMBOL}" usdt-futures /api/aster-wss-book-ticker
+start_wss_monitor hyperliquid-perp hyperliquid-wss-book-ticker "${HYPERLIQUID_PERP_WSS_BIND}" "${HYPERLIQUID_WSS_SYMBOL}" perp /api/hyperliquid-wss-book-ticker
 
 while IFS=$'\t' read -r pid name log_file status_url; do
   wait_for_wss_monitor "${name}" "${pid}" "${log_file}" "${status_url}"
@@ -305,6 +315,8 @@ WSS 前置 dashboard:
   OKX perp:           http://${OKX_PERP_WSS_BIND}/dashboard
   Bitget spot:        http://${BITGET_SPOT_WSS_BIND}/dashboard
   Bitget perp:        http://${BITGET_PERP_WSS_BIND}/dashboard
+  Aster perp:         http://${ASTER_PERP_WSS_BIND}/dashboard
+  Hyperliquid perp:   http://${HYPERLIQUID_PERP_WSS_BIND}/dashboard
 
 实时日志:
   tail -f ${RUN_ROOT}/logs/realtime-feedback.log
@@ -340,6 +352,8 @@ LIVE_ENV=(
   OKX_PERP_WSS_MONITOR_URL="http://${OKX_PERP_WSS_BIND}/api/okx-wss-book-ticker/status"
   BITGET_SPOT_WSS_MONITOR_URL="http://${BITGET_SPOT_WSS_BIND}/api/bitget-wss-book-ticker/status"
   BITGET_PERP_WSS_MONITOR_URL="http://${BITGET_PERP_WSS_BIND}/api/bitget-wss-book-ticker/status"
+  ASTER_PERP_WSS_MONITOR_URL="http://${ASTER_PERP_WSS_BIND}/api/aster-wss-book-ticker/status"
+  HYPERLIQUID_PERP_WSS_MONITOR_URL="http://${HYPERLIQUID_PERP_WSS_BIND}/api/hyperliquid-wss-book-ticker/status"
 )
 
 if [[ "${DETACH}" == "1" ]]; then
