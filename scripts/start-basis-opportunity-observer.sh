@@ -31,62 +31,71 @@ usage() {
   5. 测试盘默认模拟下单；正式实盘必须显式设置 BASIS_OBSERVER_EXECUTE_LIVE=1 和 BASIS_OBSERVER_LIVE_ACK=1。
 
 常用环境变量:
-  BASIS_OBSERVER_ROOT=target/arb-opportunity-observer
-  BASIS_OBSERVER_STRATEGIES=spot-perp-basis,cross-exchange-funding-arb
-  BASIS_OBSERVER_MONITORS="binance bybit okx bitget aster hyperliquid"
-  BASIS_OBSERVER_INTERVAL_SECS=5
-  BASIS_OBSERVER_MIN_NET_BPS=5
-  BASIS_OBSERVER_MIN_ABS_FUNDING_RATE=0
-  BASIS_OBSERVER_NOTIONAL_USD=100.00
-  BASIS_OBSERVER_SPOT_FEE_BPS=10
-  BASIS_OBSERVER_PERP_FEE_BPS=5
-  BASIS_OBSERVER_SLIPPAGE_BPS=5
-  BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml
-  BASIS_OBSERVER_SPOT_PERP_BASIS_MODE=resident
-  BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES=
-  BASIS_OBSERVER_FUNDING_ARB_MODE=resident
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES=
-  BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER=
-  BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=
-  BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1
-  BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60
-  BASIS_OBSERVER_EXECUTE_LIVE=0
-  BASIS_OBSERVER_LIVE_ACK=0
-  BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2
-  BASIS_OBSERVER_CURL_RETRIES=3
-  BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1
-  BASIS_OBSERVER_CURL_TIMEOUT_SECS=10
-  BASIS_OBSERVER_STARTUP_CHECK=1
-  BASIS_OBSERVER_STARTUP_WAIT_SECS=180
-  BASIS_OBSERVER_STOP_DRAIN_SECS=15
-  BASIS_OBSERVER_STOP_GRACE_SECS=3
-  BASIS_OBSERVER_FOREGROUND=0
-  BINANCE_BASIS_BIND=127.0.0.1:8796
-  BYBIT_BASIS_BIND=127.0.0.1:8797
-  OKX_BASIS_BIND=127.0.0.1:8798
-  BITGET_BASIS_BIND=127.0.0.1:8803
-  ASTER_BASIS_BIND=127.0.0.1:8800
-  HYPERLIQUID_BASIS_BIND=127.0.0.1:8799
-  FUNDING_ARB_BIND=127.0.0.1:8804
-  FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS=20
+  BASIS_OBSERVER_ROOT=target/arb-opportunity-observer # observer 主运行目录，保存日志、快照、机会和报告。
+  BASIS_OBSERVER_STRATEGIES=spot-perp-basis,cross-exchange-funding-arb # 启用策略列表。
+  BASIS_OBSERVER_MONITORS="binance bybit okx bitget aster hyperliquid" # 启用的交易所 monitor 列表。
+  BASIS_OBSERVER_INTERVAL_SECS=5 # observer 轮询公开 monitor 的间隔秒数。
+  BASIS_OBSERVER_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps。
+  BASIS_OBSERVER_MIN_ABS_FUNDING_RATE=0 # 最小绝对资金费率过滤阈值；0 表示不过滤。
+  BASIS_OBSERVER_NOTIONAL_USD=100.00 # 单次候选机会用于计算和下单的目标名义本金，单位美元。
+  BASIS_OBSERVER_SPOT_FEE_BPS=10 # spot 腿手续费估算，单位 bps。
+  BASIS_OBSERVER_PERP_FEE_BPS=5 # perp 腿手续费估算，单位 bps。
+  BASIS_OBSERVER_SLIPPAGE_BPS=5 # 滑点估算，单位 bps。
+  BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml # 风控和执行配置文件路径。
+  BASIS_OBSERVER_SPOT_PERP_BASIS_MODE=resident # spot-perp-basis 运行模式；resident 表示常驻运行。
+  BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60 # spot-perp-basis 常驻 runner 扫描间隔秒数。
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00 # spot-perp-basis 总名义本金上限，单位 USDT。
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES= # spot-perp-basis 最大循环次数；留空表示长期运行。
+  BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻运行。
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；启用 raw snapshot 时必须留空。
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT= # 资金费率结算原始只读快照输出路径。
+  BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1 # auto-once 模式是否执行候选验证。
+  BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60 # auto-once 两次触发之间的冷却秒数。
+  BASIS_OBSERVER_EXECUTE_LIVE=0 # 是否允许正式实盘下单；1 表示允许。
+  BASIS_OBSERVER_LIVE_ACK=0 # 正式实盘确认开关；进入 live 必须为 1。
+  BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2 # 自动价格保护缓冲，单位 bps。
+  BASIS_OBSERVER_CURL_RETRIES=3 # 拉取本地/公开 HTTP 端点的重试次数。
+  BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1 # HTTP 重试间隔秒数。
+  BASIS_OBSERVER_CURL_TIMEOUT_SECS=10 # 单次 HTTP 请求超时秒数。
+  BASIS_OBSERVER_STARTUP_CHECK=1 # 启动后是否等待 monitor 健康检查通过。
+  BASIS_OBSERVER_STARTUP_WAIT_SECS=180 # 启动健康检查最长等待秒数。
+  BASIS_OBSERVER_STOP_DRAIN_SECS=15 # 停止时等待子进程自然收尾的秒数。
+  BASIS_OBSERVER_STOP_GRACE_SECS=3 # 停止时发送终止信号后的宽限秒数。
+  BASIS_OBSERVER_FOREGROUND=0 # 是否前台运行 observer；1 表示前台。
+  BINANCE_BASIS_BIND=127.0.0.1:8796 # Binance basis monitor 监听地址。
+  BYBIT_BASIS_BIND=127.0.0.1:8797 # Bybit basis monitor 监听地址。
+  OKX_BASIS_BIND=127.0.0.1:8798 # OKX basis monitor 监听地址。
+  BITGET_BASIS_BIND=127.0.0.1:8803 # Bitget basis monitor 监听地址。
+  ASTER_BASIS_BIND=127.0.0.1:8800 # Aster basis monitor 监听地址。
+  HYPERLIQUID_BASIS_BIND=127.0.0.1:8799 # Hyperliquid basis monitor 监听地址。
+  FUNDING_ARB_BIND=127.0.0.1:8804 # funding-arb 聚合 monitor 监听地址。
+  FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS=20 # funding-arb 入场时允许的最大价格偏离，单位 bps。
+  ASTER_USER=0x... # Aster 账户/user 地址，用于账户归属、查询和订单归属。
+  ASTER_SIGNER=0x... # Aster 实际签名/API 地址，必须与 signer 私钥匹配。
+  ASTER_SIGNER_PRIVATE=<local-secret> # Aster signer/API 地址对应私钥，只放本机 env。
+  HYPERLIQUID_USER=0x... # Hyperliquid 账户/user 地址，用于账户归属、查询和订单归属。
+  HYPERLIQUID_SIGNER=0x... # Hyperliquid 实际签名/API/agent 地址，必须与 signer 私钥匹配。
+  HYPERLIQUID_SIGNER_PRIVATE=<local-secret> # Hyperliquid signer/API/agent 地址对应私钥，只放本机 env。
+
+Aster 默认按 USDT 结算；Hyperliquid 默认按 USDC 结算，并默认从 Hyperliquid public meta 自动解析 asset id。
+如果 user 地址和 signer/API 地址相同，也可以用 ASTER_ADDRESS + ASTER_PRIVATE_KEY、HYPERLIQUID_ADDRESS + HYPERLIQUID_PRIVATE_KEY。
 
 可选 WSS monitor URL:
-  BINANCE_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8786/api/binance-wss-book-ticker/status
-  BINANCE_PERP_WSS_MONITOR_URL=http://127.0.0.1:8787/api/binance-wss-book-ticker/status
-  BYBIT_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8788/api/bybit-wss-book-ticker/status
-  BYBIT_PERP_WSS_MONITOR_URL=http://127.0.0.1:8789/api/bybit-wss-book-ticker/status
-  OKX_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8790/api/okx-wss-book-ticker/status
-  OKX_PERP_WSS_MONITOR_URL=http://127.0.0.1:8791/api/okx-wss-book-ticker/status
-  BITGET_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8792/api/bitget-wss-book-ticker/status
-  BITGET_PERP_WSS_MONITOR_URL=http://127.0.0.1:8793/api/bitget-wss-book-ticker/status
-  ASTER_PERP_WSS_MONITOR_URL=http://127.0.0.1:8794/api/aster-wss-book-ticker/status
-  HYPERLIQUID_PERP_WSS_MONITOR_URL=http://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status
+  BINANCE_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8786/api/binance-wss-book-ticker/status # Binance spot WSS monitor 状态接口。
+  BINANCE_PERP_WSS_MONITOR_URL=http://127.0.0.1:8787/api/binance-wss-book-ticker/status # Binance USDM perp WSS monitor 状态接口。
+  BYBIT_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8788/api/bybit-wss-book-ticker/status # Bybit spot WSS monitor 状态接口。
+  BYBIT_PERP_WSS_MONITOR_URL=http://127.0.0.1:8789/api/bybit-wss-book-ticker/status # Bybit linear perp WSS monitor 状态接口。
+  OKX_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8790/api/okx-wss-book-ticker/status # OKX spot WSS monitor 状态接口。
+  OKX_PERP_WSS_MONITOR_URL=http://127.0.0.1:8791/api/okx-wss-book-ticker/status # OKX swap WSS monitor 状态接口。
+  BITGET_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8792/api/bitget-wss-book-ticker/status # Bitget spot WSS monitor 状态接口。
+  BITGET_PERP_WSS_MONITOR_URL=http://127.0.0.1:8793/api/bitget-wss-book-ticker/status # Bitget USDT-FUTURES WSS monitor 状态接口。
+  ASTER_PERP_WSS_MONITOR_URL=http://127.0.0.1:8794/api/aster-wss-book-ticker/status # Aster USDT perp WSS monitor 状态接口。
+  HYPERLIQUID_PERP_WSS_MONITOR_URL=http://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status # Hyperliquid perp WSS monitor 状态接口。
 
 输出:
   target/arb-opportunity-observer/logs/realtime-feedback.log
@@ -112,6 +121,36 @@ require_command() {
 is_alive() {
   local pid="$1"
   [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+set_default_env() {
+  local name="$1"
+  local value="${2:-}"
+  if [[ -n "${value}" && -z "${!name-}" ]]; then
+    printf -v "${name}" '%s' "${value}"
+    export "${name}"
+  fi
+}
+
+apply_simplified_wallet_env_aliases() {
+  local aster_user_address="${ASTER_USER_ADDRESS:-${ASTER_ACCOUNT_ADDRESS:-${ASTER_ADDRESS:-}}}"
+  local aster_signer_address="${ASTER_SIGNER_ADDRESS:-${ASTER_API_ADDRESS:-${ASTER_ADDRESS:-}}}"
+  local aster_signer_private="${ASTER_SIGNER_PRIVATE_KEY:-${ASTER_SIGNER_PRIVATE:-${ASTER_PRIVATE_KEY:-}}}"
+  set_default_env ASTER_USER "${BASIS_OBSERVER_ASTER_USER:-${aster_user_address}}"
+  set_default_env ASTER_SIGNER "${BASIS_OBSERVER_ASTER_SIGNER:-${aster_signer_address}}"
+  set_default_env ASTER_USER "${ASTER_SIGNER:-}"
+  set_default_env ASTER_SIGNER "${ASTER_USER:-}"
+  set_default_env BASIS_OBSERVER_ASTER_USER "${ASTER_USER:-}"
+  set_default_env BASIS_OBSERVER_ASTER_SIGNER "${ASTER_SIGNER:-}"
+  set_default_env ASTER_SIGNER_PRIVATE_KEY "${aster_signer_private}"
+
+  local hyperliquid_user_address="${HYPERLIQUID_USER_ADDRESS:-${HYPERLIQUID_ACCOUNT_ADDRESS:-${HYPERLIQUID_ADDRESS:-}}}"
+  local hyperliquid_signer_address="${HYPERLIQUID_SIGNER_ADDRESS:-${HYPERLIQUID_API_ADDRESS:-${HYPERLIQUID_SIGNER:-}}}"
+  local hyperliquid_signer_private="${HYPERLIQUID_SIGNER_PRIVATE_KEY:-${HYPERLIQUID_SIGNER_PRIVATE:-${HYPERLIQUID_PRIVATE_KEY:-}}}"
+  set_default_env HYPERLIQUID_USER "${BASIS_OBSERVER_HYPERLIQUID_USER:-${hyperliquid_user_address}}"
+  set_default_env BASIS_OBSERVER_HYPERLIQUID_USER "${HYPERLIQUID_USER:-}"
+  set_default_env HYPERLIQUID_AGENT "${hyperliquid_signer_address}"
+  set_default_env HYPERLIQUID_AGENT_PRIVATE_KEY "${hyperliquid_signer_private}"
 }
 
 opportunities_url() {
@@ -518,7 +557,7 @@ wait_for_monitor_opportunities() {
 
   echo "error: ${venue} monitor did not provide a healthy /opportunities response within ${STARTUP_WAIT_SECS}s: ${url}; last_status=${snapshot_status}" >&2
   if [[ -n "${last_body}" ]]; then
-    printf '%s\n' "${last_body}" | jq -c '{status:(.status // "unknown"),candidate_count:(.candidate_count // 0),updated_at:(.updated_at // "unknown"),rows:((.rows // []) | length)}' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+    printf '%s\n' "${last_body}" | jq -c '{status:(.status // "unknown"),candidate_count:(.candidate_count // 0),updated_at:(.updated_at // "unknown"),last_error:(.last_error // null),rows:((.rows // []) | length)}' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
   fi
   if [[ -n "${log_file}" && -f "${log_file}" ]]; then
     tail -n 40 "${log_file}" >&2 || true
@@ -564,7 +603,7 @@ wait_for_funding_arb_opportunities() {
 
   echo "error: funding arb monitor did not provide a healthy /opportunities response within ${STARTUP_WAIT_SECS}s: ${url}; last_status=${snapshot_status}" >&2
   if [[ -n "${last_body}" ]]; then
-    printf '%s\n' "${last_body}" | jq -c '{status:(.status // "unknown"),candidate_count:(.candidate_count // 0),updated_at:(.updated_at // "unknown"),rows:((.rows // []) | length)}' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+    printf '%s\n' "${last_body}" | jq -c '{status:(.status // "unknown"),candidate_count:(.candidate_count // 0),updated_at:(.updated_at // "unknown"),last_error:(.last_error // null),rows:((.rows // []) | length)}' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
   fi
   if [[ -n "${log_file}" && -f "${log_file}" ]]; then
     tail -n 40 "${log_file}" >&2 || true
@@ -1170,6 +1209,8 @@ run_recorder() {
   done
 }
 
+apply_simplified_wallet_env_aliases
+
 if [[ "${1:-}" == "--recorder" ]]; then
   RUN_ROOT="${BASIS_OBSERVER_ROOT:-${REPO_ROOT}/target/arb-opportunity-observer}"
   LOG_DIR="${RUN_ROOT}/logs"
@@ -1416,6 +1457,8 @@ fi
 cd "${REPO_ROOT}"
 echo "building arb-runtime with live-exec feature..."
 cargo build -p arb-runtime --features live-exec --manifest-path "${REPO_ROOT}/Cargo.toml"
+echo "building arb-wallet-signer..."
+cargo build -p arb-wallet-signer --manifest-path "${REPO_ROOT}/Cargo.toml"
 
 COMMON_ARGS=(
   --interval-secs "${INTERVAL_SECS}"

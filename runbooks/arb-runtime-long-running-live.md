@@ -52,58 +52,52 @@ target/debug/arb-runtime health-config templates/personal_guarded_live.preflight
 
 ## 本地环境文件
 
-建议使用本地未提交文件，例如 `.env.live`。文件权限建议限制为当前用户可读写：
+建议使用项目外的本地未提交文件，例如 `~/easy-arb-live.env`。文件权限建议限制为当前用户可读写：
 
 ```bash
-chmod 600 .env.live
+chmod 600 ~/easy-arb-live.env
 ```
 
 下面是变量清单模板。带 `<...>` 的值必须由本机真实配置替换，不能原样启动；不要把实际密钥或签名命令正文写入本手册、提交记录、日志或聊天内容。
 
 ```bash
-# 基础配置。当前入口按默认 min net 5 bps 运行；改该阈值前先补入口脚本并验证。
-BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml
-BASIS_OBSERVER_STRATEGIES=spot-perp-basis,cross-exchange-funding-arb
-BASIS_OBSERVER_MIN_NET_BPS=5
-BASIS_OBSERVER_MIN_ABS_FUNDING_RATE=0
-BASIS_OBSERVER_NOTIONAL_USD=100.00
-BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2
+BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml # 风控和执行配置文件路径，长时间实盘默认使用个人 guarded live 配置。
+BASIS_OBSERVER_STRATEGIES=spot-perp-basis,cross-exchange-funding-arb # 启用的策略列表，默认同时运行现货-永续 basis 和跨交易所资金费率套利。
+BASIS_OBSERVER_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps；低于该阈值的机会不会进入执行。
+BASIS_OBSERVER_MIN_ABS_FUNDING_RATE=0 # 最小绝对资金费率过滤阈值，0 表示不按资金费率绝对值预过滤。
+BASIS_OBSERVER_NOTIONAL_USD=100.00 # 单次候选机会用于计算和下单的目标名义本金，单位美元。
+BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2 # 自动价格保护缓冲，单位 bps，用于限制可接受成交价偏离。
 
-# WSS ready 等待。网络抖动时可适度加大，但不要用它掩盖长期不健康。
-ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=180
+ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=180 # 等待全部 WSS monitor 进入 streaming 且收到真实更新的最长秒数。
 
-# spot-perp-basis 实盘限额。首次长时间实盘建议保持最小并发和小额名义本金。
-BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60
-BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1
-BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1
-BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=100.00
+BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60 # spot-perp-basis 常驻 runner 每轮扫描间隔秒数。
+BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
+BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
+BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=100.00 # spot-perp-basis 总名义本金上限，单位 USDT。
 
-# cross-exchange-funding-arb 实盘限额。
-BASIS_OBSERVER_FUNDING_ARB_MODE=resident
-BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60
-BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1
-BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES=
+BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻扫描、入场和退出监督。
+BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 每轮扫描间隔秒数。
+BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
+BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
 
-# 资金费率结算校验。当前推荐先接 raw snapshot，不要同时接 ledger。
-BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=target/arb-runtime/live/private-readonly/funding_settlement_raw_snapshot.json
-BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER=
+BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=target/arb-runtime/live/private-readonly/funding_settlement_raw_snapshot.json # 资金费率结算原始只读快照输出路径，当前推荐启用。
+BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；接 raw snapshot 时必须留空，不能同时启用。
 
-# portfolio dashboard 可选只读输入。没有稳定文件时留空，由 resident root 汇总仓位。
-ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT=
-ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT=
+ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT= # portfolio dashboard 可选账户快照覆盖输入；留空时从 resident root 自动发现私有只读账户快照。
+ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT= # portfolio dashboard 可选仓位快照覆盖输入；留空时从 resident root 自动汇总常驻仓位。
 
-# Hyperliquid 身份和参数。只写地址、source、asset id 映射，不写私钥。
-BASIS_OBSERVER_HYPERLIQUID_USER=<hyperliquid-user-address>
-BASIS_OBSERVER_HYPERLIQUID_SOURCE=a
-BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS=
-BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS=
-BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS=BTCUSDT=<asset-id>,ETHUSDT=<asset-id>
+ASTER_USER=<aster-user-address> # Aster 账户/user 地址，用于账户归属、查询和订单归属。
+ASTER_SIGNER=<aster-signer-address> # Aster 实际签名/API 地址，必须与 signer 私钥匹配。
+ASTER_SIGNER_PRIVATE=<aster-signer-private-key> # Aster signer/API 地址对应的私钥，只放在本机 env 文件，不要提交或写入日志。
 
-# Aster 身份和签名命令 env 名称。实际签名命令内容放在该 env 指向的本机变量中。
-BASIS_OBSERVER_ASTER_USER=<aster-user-address>
-BASIS_OBSERVER_ASTER_SIGNER=<aster-signer-address>
-BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV=ASTER_EIP712_SIGNER_CMD
+HYPERLIQUID_USER=<hyperliquid-user-address> # Hyperliquid 账户/user 地址，用于账户归属、查询和订单归属。
+HYPERLIQUID_SIGNER=<hyperliquid-signer-address> # Hyperliquid 实际签名/API/agent 地址，必须与 signer 私钥匹配。
+HYPERLIQUID_SIGNER_PRIVATE=<hyperliquid-signer-private-key> # Hyperliquid signer/API/agent 地址对应的私钥，只放在本机 env 文件，不要提交或写入日志。
 ```
+
+如果某个交易所的 user 和 signer 确认是同一个地址，可以改用便捷别名：`ASTER_ADDRESS` + `ASTER_PRIVATE_KEY`，或 `HYPERLIQUID_ADDRESS` + `HYPERLIQUID_PRIVATE_KEY`。如果两者不同，必须使用上面的 user/signer 分离配置，不要用单地址别名。
+
+高级覆盖项只在确实需要时再加：`BASIS_OBSERVER_ASTER_USER`、`BASIS_OBSERVER_ASTER_SIGNER`、`ASTER_SIGNER_ADDRESS`、`ASTER_API_ADDRESS`、`ARB_WALLET_SIGNER_PATH`、`BASIS_OBSERVER_HYPERLIQUID_SOURCE`、`HYPERLIQUID_SIGNER_ADDRESS`、`HYPERLIQUID_API_ADDRESS`、`BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS`、`BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS`、`BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS`。其中 `BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS` 只是自动解析失败或你要强制指定 asset id 时的覆盖项，不再是默认必填项。
 
 `BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT` 是可写 JSON 快照路径，用来镜像最新资金费率结算原始只读快照，并给退出和平仓监督做 reconciliation 输入。它不是人工维护的最终 ledger。只有当 raw snapshot 结构和 symbol、账户、币种归一化都稳定后，再切到 `BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER`。
 
@@ -114,10 +108,10 @@ BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV=ASTER_EIP712_SIGNER_CMD
 首次进入长时间实盘建议使用 detach 模式，让进程独立于当前终端：
 
 ```bash
-scripts/start-arb-runtime-live.sh --detach --env-file .env.live
+scripts/start-arb-runtime-live.sh --detach --env-file ~/easy-arb-live.env
 ```
 
-启动脚本会先构建 `arb-runtime` 的 `live-exec` 版本，然后启动 10 个 WSS monitor：
+启动脚本会先构建 `arb-runtime` 的 `live-exec` 版本和本地 `arb-wallet-signer`，然后启动 10 个 WSS monitor：
 
 ```text
 127.0.0.1:8786  Binance spot WSS
@@ -140,7 +134,7 @@ target/debug/arb-runtime live --i-understand-live-orders
 
 该入口会把 `BASIS_OBSERVER_EXECUTE_LIVE=1` 和 `BASIS_OBSERVER_LIVE_ACK=1` 传给常驻 observer。不要直接运行底层 observer 进入实盘，除非是在诊断脚本本身。
 
-当前 `scripts/start-arb-runtime-live.sh` 没有暴露 `arb-runtime live --min-net-bps` 参数，本手册按默认 `5` bps 运行。需要改动该阈值时，先补入口脚本并跑 dry-run/小额实盘验证，不要只修改 `.env.live` 后假设已经生效。
+当前 `scripts/start-arb-runtime-live.sh` 没有暴露 `arb-runtime live --min-net-bps` 参数，本手册按默认 `5` bps 运行。需要改动该阈值时，先补入口脚本并跑 dry-run/小额实盘验证，不要只修改 env 文件后假设已经生效。
 
 ## 启动后健康检查
 

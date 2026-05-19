@@ -23,29 +23,38 @@ usage() {
   6. 打印所有实时 dashboard、日志和停止命令。
 
 常用环境变量:
-  ARB_RUNTIME_LIVE_ROOT=target/arb-runtime/live
-  ARB_RUNTIME_LIVE_PREREQ_ROOT=target/arb-runtime/live-prereq
-  ARB_RUNTIME_LIVE_ENV_FILE=.env.local
-  ARB_RUNTIME_LIVE_DETACH=0
-  ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120
-  ARB_RUNTIME_LIVE_BUILD=1
-  ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL=BTC-USDT
-  ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL=BTCUSDT
-  ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL=ALL_USDT
-  ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL=ALL_USDT
-  ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805
-  BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00
-  BASIS_OBSERVER_FUNDING_ARB_MODE=resident
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES=
-  BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER=
-  BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=
-  ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT=target/account_snapshot.json
-  ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT=target/position_snapshot.json
+  ARB_RUNTIME_LIVE_ROOT=target/arb-runtime/live # 实盘主运行目录，保存 resident 状态、机会和报告。
+  ARB_RUNTIME_LIVE_PREREQ_ROOT=target/arb-runtime/live-prereq # WSS 前置 monitor 的日志和 pid 状态目录。
+  ARB_RUNTIME_LIVE_ENV_FILE=.env.local # 可选 env 文件路径；等价于命令行 --env-file。
+  ARB_RUNTIME_LIVE_DETACH=0 # 是否后台运行 arb-runtime live；1 表示 detach。
+  ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120 # 等待 WSS monitor 就绪的最长秒数。
+  ARB_RUNTIME_LIVE_BUILD=1 # 启动前是否构建 arb-runtime 和 arb-wallet-signer。
+  ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL=ALL_USDT # OKX WSS monitor 订阅范围；ALL_USDT 表示全部 USDT spot/swap。
+  ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL=ALL_USDT # Bitget WSS monitor 订阅范围；ALL_USDT 表示全部 USDT spot/futures。
+  ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL=ALL_USDT # Aster perp WSS monitor 订阅范围；ALL_USDT 表示全部 USDT 合约。
+  ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL=ALL_USDT # Hyperliquid perp WSS monitor 订阅范围；ALL_USDT 表示全部永续合约。
+  ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805 # portfolio dashboard 监听地址。
+  BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60 # spot-perp-basis 常驻 runner 扫描间隔秒数。
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00 # spot-perp-basis 总名义本金上限，单位 USDT。
+  BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻运行。
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；启用 raw snapshot 时必须留空。
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT= # 资金费率结算原始只读快照输出路径。
+  ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT=target/account_snapshot.json # portfolio dashboard 可选账户快照覆盖输入路径；留空时从 resident root 自动发现。
+  ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT=target/position_snapshot.json # portfolio dashboard 可选仓位快照覆盖输入路径；留空时从 resident root 自动汇总。
+  ASTER_USER=0x... # Aster 账户/user 地址，用于账户归属、查询和订单归属。
+  ASTER_SIGNER=0x... # Aster 实际签名/API 地址，必须与 signer 私钥匹配。
+  ASTER_SIGNER_PRIVATE=<local-secret> # Aster signer/API 地址对应私钥，只放本机 env。
+  HYPERLIQUID_USER=0x... # Hyperliquid 账户/user 地址，用于账户归属、查询和订单归属。
+  HYPERLIQUID_SIGNER=0x... # Hyperliquid 实际签名/API/agent 地址，必须与 signer 私钥匹配。
+  HYPERLIQUID_SIGNER_PRIVATE=<local-secret> # Hyperliquid signer/API/agent 地址对应私钥，只放本机 env。
+
+Aster 默认按 USDT 结算；Hyperliquid 默认按 USDC 结算，并默认从 Hyperliquid public meta 自动解析 asset id。
+如果 user 地址和 signer/API 地址相同，也可以用 ASTER_ADDRESS + ASTER_PRIVATE_KEY、HYPERLIQUID_ADDRESS + HYPERLIQUID_PRIVATE_KEY。
 
 正式实盘凭证请放在 shell 环境或 --env-file 指向的本地文件中，不要写入命令行。
 USAGE
@@ -110,6 +119,38 @@ if [[ -n "${ENV_FILE}" ]]; then
   set +a
 fi
 
+set_default_env() {
+  local name="$1"
+  local value="${2:-}"
+  if [[ -n "${value}" && -z "${!name-}" ]]; then
+    printf -v "${name}" '%s' "${value}"
+    export "${name}"
+  fi
+}
+
+apply_simplified_wallet_env_aliases() {
+  local aster_user_address="${ASTER_USER_ADDRESS:-${ASTER_ACCOUNT_ADDRESS:-${ASTER_ADDRESS:-}}}"
+  local aster_signer_address="${ASTER_SIGNER_ADDRESS:-${ASTER_API_ADDRESS:-${ASTER_ADDRESS:-}}}"
+  local aster_signer_private="${ASTER_SIGNER_PRIVATE_KEY:-${ASTER_SIGNER_PRIVATE:-${ASTER_PRIVATE_KEY:-}}}"
+  set_default_env ASTER_USER "${BASIS_OBSERVER_ASTER_USER:-${aster_user_address}}"
+  set_default_env ASTER_SIGNER "${BASIS_OBSERVER_ASTER_SIGNER:-${aster_signer_address}}"
+  set_default_env ASTER_USER "${ASTER_SIGNER:-}"
+  set_default_env ASTER_SIGNER "${ASTER_USER:-}"
+  set_default_env BASIS_OBSERVER_ASTER_USER "${ASTER_USER:-}"
+  set_default_env BASIS_OBSERVER_ASTER_SIGNER "${ASTER_SIGNER:-}"
+  set_default_env ASTER_SIGNER_PRIVATE_KEY "${aster_signer_private}"
+
+  local hyperliquid_user_address="${HYPERLIQUID_USER_ADDRESS:-${HYPERLIQUID_ACCOUNT_ADDRESS:-${HYPERLIQUID_ADDRESS:-}}}"
+  local hyperliquid_signer_address="${HYPERLIQUID_SIGNER_ADDRESS:-${HYPERLIQUID_API_ADDRESS:-${HYPERLIQUID_SIGNER:-}}}"
+  local hyperliquid_signer_private="${HYPERLIQUID_SIGNER_PRIVATE_KEY:-${HYPERLIQUID_SIGNER_PRIVATE:-${HYPERLIQUID_PRIVATE_KEY:-}}}"
+  set_default_env HYPERLIQUID_USER "${BASIS_OBSERVER_HYPERLIQUID_USER:-${hyperliquid_user_address}}"
+  set_default_env BASIS_OBSERVER_HYPERLIQUID_USER "${HYPERLIQUID_USER:-}"
+  set_default_env HYPERLIQUID_AGENT "${hyperliquid_signer_address}"
+  set_default_env HYPERLIQUID_AGENT_PRIVATE_KEY "${hyperliquid_signer_private}"
+}
+
+apply_simplified_wallet_env_aliases
+
 require_command cargo
 require_command curl
 require_command jq
@@ -139,8 +180,8 @@ HYPERLIQUID_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_HYPERLIQUID_PERP_WSS_BIND:-127.0.0
 
 BINANCE_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL:-ALL_USDT}"
 BYBIT_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL:-ALL_USDT}"
-OKX_WSS_SYMBOL="${ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL:-BTC-USDT}"
-BITGET_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL:-BTCUSDT}"
+OKX_WSS_SYMBOL="${ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL:-ALL_USDT}"
+BITGET_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL:-ALL_USDT}"
 ASTER_WSS_SYMBOL="${ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL:-ALL_USDT}"
 HYPERLIQUID_WSS_SYMBOL="${ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL:-ALL_USDT}"
 
@@ -165,6 +206,8 @@ fi
 if [[ "${BUILD}" == "1" ]]; then
   echo "building arb-runtime with live-exec feature..."
   cargo build -p arb-runtime --features live-exec --manifest-path "${REPO_ROOT}/Cargo.toml"
+  echo "building arb-wallet-signer..."
+  cargo build -p arb-wallet-signer --manifest-path "${REPO_ROOT}/Cargo.toml"
 fi
 
 start_wss_monitor() {

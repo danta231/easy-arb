@@ -11,9 +11,27 @@ use sha3::{Digest, Keccak256};
 use std::fmt;
 
 const ASTER_KEY_ENV_DEFAULT: &str = "ASTER_SIGNER_PRIVATE_KEY";
+const ASTER_KEY_ENV_ALIASES: &[&str] = &["ASTER_SIGNER_PRIVATE", "ASTER_PRIVATE_KEY"];
 const HYPERLIQUID_KEY_ENV_DEFAULT: &str = "HYPERLIQUID_AGENT_PRIVATE_KEY";
+const HYPERLIQUID_KEY_ENV_ALIASES: &[&str] = &[
+    "HYPERLIQUID_SIGNER_PRIVATE_KEY",
+    "HYPERLIQUID_SIGNER_PRIVATE",
+    "HYPERLIQUID_PRIVATE_KEY",
+];
 const ASTER_EXPECT_ADDRESS_ENV_DEFAULT: &str = "ASTER_SIGNER";
+const ASTER_EXPECT_ADDRESS_ENV_ALIASES: &[&str] = &[
+    "ASTER_SIGNER_ADDRESS",
+    "ASTER_API_ADDRESS",
+    "ASTER_ADDRESS",
+    "ASTER_USER",
+];
 const HYPERLIQUID_EXPECT_ADDRESS_ENV_DEFAULT: &str = "HYPERLIQUID_AGENT";
+const HYPERLIQUID_EXPECT_ADDRESS_ENV_ALIASES: &[&str] = &[
+    "HYPERLIQUID_SIGNER",
+    "HYPERLIQUID_SIGNER_ADDRESS",
+    "HYPERLIQUID_API_ADDRESS",
+    "HYPERLIQUID_AGENT_ADDRESS",
+];
 const ZERO_ADDRESS: [u8; 20] = [0_u8; 20];
 
 type SignerResult<T> = Result<T, SignerError>;
@@ -97,12 +115,9 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let options = parse_cli(args)?;
-    let private_key = env(&options.key_env).ok_or_else(|| {
-        SignerError::new(format!(
-            "required private key environment variable `{}` is not set",
-            options.key_env
-        ))
-    })?;
+    let private_key = env(&options.key_env)
+        .or_else(|| default_private_key_alias(&options.mode, &options.key_env, &env))
+        .ok_or_else(|| SignerError::new(private_key_env_error(&options.mode, &options.key_env)))?;
     let expected_address = options
         .expect_address
         .or_else(|| default_expected_address(&options.mode, &env));
@@ -423,12 +438,70 @@ where
     F: Fn(&str) -> Option<String>,
 {
     match mode {
-        CommandMode::AsterEip712 => env(ASTER_EXPECT_ADDRESS_ENV_DEFAULT),
+        CommandMode::AsterEip712 => env(ASTER_EXPECT_ADDRESS_ENV_DEFAULT).or_else(|| {
+            ASTER_EXPECT_ADDRESS_ENV_ALIASES
+                .iter()
+                .find_map(|name| env(name))
+        }),
         CommandMode::HyperliquidL1Phantom | CommandMode::HyperliquidL1Action => {
-            env(HYPERLIQUID_EXPECT_ADDRESS_ENV_DEFAULT)
+            env(HYPERLIQUID_EXPECT_ADDRESS_ENV_DEFAULT).or_else(|| {
+                HYPERLIQUID_EXPECT_ADDRESS_ENV_ALIASES
+                    .iter()
+                    .find_map(|name| env(name))
+            })
         }
         CommandMode::Address => None,
     }
+}
+
+fn default_private_key_alias<F>(mode: &CommandMode, key_env: &str, env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match mode {
+        CommandMode::AsterEip712 | CommandMode::Address if key_env == ASTER_KEY_ENV_DEFAULT => {
+            first_env(ASTER_KEY_ENV_ALIASES, env)
+        }
+        CommandMode::HyperliquidL1Phantom | CommandMode::HyperliquidL1Action
+            if key_env == HYPERLIQUID_KEY_ENV_DEFAULT =>
+        {
+            first_env(HYPERLIQUID_KEY_ENV_ALIASES, env)
+        }
+        _ => None,
+    }
+}
+
+fn private_key_env_error(mode: &CommandMode, key_env: &str) -> String {
+    let aliases = match mode {
+        CommandMode::AsterEip712 | CommandMode::Address if key_env == ASTER_KEY_ENV_DEFAULT => {
+            ASTER_KEY_ENV_ALIASES
+        }
+        CommandMode::HyperliquidL1Phantom | CommandMode::HyperliquidL1Action
+            if key_env == HYPERLIQUID_KEY_ENV_DEFAULT =>
+        {
+            HYPERLIQUID_KEY_ENV_ALIASES
+        }
+        _ => &[],
+    };
+    if aliases.is_empty() {
+        format!("required private key environment variable `{key_env}` is not set")
+    } else {
+        format!(
+            "required private key environment variable `{key_env}` or one of {} is not set",
+            aliases
+                .iter()
+                .map(|alias| format!("`{alias}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn first_env<F>(names: &[&str], env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    names.iter().find_map(|name| env(name))
 }
 
 fn sign_digest_hex(
@@ -1097,6 +1170,43 @@ mod tests {
         })
         .expect("cli output");
         assert_eq!(output.len(), 132);
+    }
+
+    #[test]
+    fn cli_accepts_simplified_aster_key_env_alias() {
+        let key = test_key();
+        let payload = concat!(
+            "nonce=1748310859508867&signer=",
+            "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+        );
+        let output = run_cli(Vec::<String>::new(), payload, |name| match name {
+            "ASTER_SIGNER_PRIVATE" => Some(key.clone()),
+            "ASTER_SIGNER" => Some(ADDRESS.to_owned()),
+            _ => None,
+        })
+        .expect("cli output");
+        assert_eq!(output.len(), 132);
+    }
+
+    #[test]
+    fn cli_accepts_simplified_hyperliquid_key_env_alias() {
+        let key = test_key();
+        let args = vec![
+            "hyperliquid-l1-phantom".to_owned(),
+            "--source".to_owned(),
+            "a".to_owned(),
+            "--connection-id".to_owned(),
+            "0x1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+        ];
+        let output = run_cli(args, "", |name| match name {
+            "HYPERLIQUID_SIGNER_PRIVATE" => Some(key.clone()),
+            "HYPERLIQUID_SIGNER" => Some(ADDRESS.to_owned()),
+            _ => None,
+        })
+        .expect("cli output");
+        assert!(output.contains("\"r\":\"0x"));
+        assert!(output.contains("\"s\":\"0x"));
+        assert!(output.contains("\"v\":"));
     }
 
     fn test_key() -> String {

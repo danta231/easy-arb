@@ -139,6 +139,38 @@ const ASTER_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.asterdex.com";
 const ASTER_FUTURES_V3_REST_BASE_URL: &str = "https://fapi3.asterdex.com";
 const ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT: &str = "ASTER_EIP712_SIGNER_CMD";
 #[cfg(feature = "live-exec")]
+const ASTER_USER_ENV_NAMES: &[&str] = &[
+    "ASTER_USER",
+    "ASTER_USER_ADDRESS",
+    "ASTER_ACCOUNT_ADDRESS",
+    "ASTER_ADDRESS",
+    "ASTER_SIGNER",
+];
+#[cfg(feature = "live-exec")]
+const ASTER_SIGNER_ENV_NAMES: &[&str] = &[
+    "ASTER_SIGNER",
+    "ASTER_SIGNER_ADDRESS",
+    "ASTER_API_ADDRESS",
+    "ASTER_ADDRESS",
+    "ASTER_ACCOUNT_ADDRESS",
+    "ASTER_USER",
+];
+#[cfg(feature = "live-exec")]
+const HYPERLIQUID_USER_ENV_NAMES: &[&str] = &[
+    "HYPERLIQUID_USER",
+    "HYPERLIQUID_USER_ADDRESS",
+    "HYPERLIQUID_ACCOUNT_ADDRESS",
+    "HYPERLIQUID_ADDRESS",
+];
+#[cfg(feature = "live-exec")]
+const HYPERLIQUID_AGENT_ENV_NAMES: &[&str] = &[
+    "HYPERLIQUID_AGENT",
+    "HYPERLIQUID_SIGNER",
+    "HYPERLIQUID_SIGNER_ADDRESS",
+    "HYPERLIQUID_API_ADDRESS",
+    "HYPERLIQUID_AGENT_ADDRESS",
+];
+#[cfg(feature = "live-exec")]
 const ARB_WALLET_SIGNER_PATH_ENV_DEFAULT: &str = "ARB_WALLET_SIGNER_PATH";
 const FUNDING_ARB_MAX_MARK_INDEX_DIVERGENCE_BPS: i128 = 100;
 const RAW_TICKER_FILE: &str = "raw/binance_ticker_24hr.redacted.json";
@@ -296,6 +328,8 @@ const OKX_PUBLIC_WSS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 const BITGET_PUBLIC_WSS_URL: &str = "wss://ws.bitget.com/v2/ws/public";
 const OKX_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 const BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+const OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+const BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 const ASTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8794";
 const HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8795";
 const ASTER_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
@@ -2306,7 +2340,7 @@ impl Default for OkxWssBookTickerMonitorOptions {
     fn default() -> Self {
         Self {
             bind_addr: MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR.to_owned(),
-            symbol: OKX_BASIS_SYMBOL.to_owned(),
+            symbol: OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
             market: OkxPublicWssMarket::Spot,
             updates: 3,
             reconnect_delay_secs: OKX_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
@@ -2330,7 +2364,7 @@ impl Default for BitgetWssBookTickerMonitorOptions {
     fn default() -> Self {
         Self {
             bind_addr: MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR.to_owned(),
-            symbol: BITGET_BASIS_SYMBOL.to_owned(),
+            symbol: BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
             market: BitgetPublicWssMarket::Spot,
             updates: 3,
             reconnect_delay_secs: BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
@@ -3947,7 +3981,14 @@ fn run_wallet_signer_preflight_live(
 
     let should_check_hyperliquid = options.check_hyperliquid
         || options.hyperliquid_agent.is_some()
-        || std::env::var("HYPERLIQUID_AGENT").is_ok();
+        || first_non_empty_env(HYPERLIQUID_AGENT_ENV_NAMES).is_some()
+        || first_non_empty_env(&[
+            "HYPERLIQUID_AGENT_PRIVATE_KEY",
+            "HYPERLIQUID_SIGNER_PRIVATE_KEY",
+            "HYPERLIQUID_SIGNER_PRIVATE",
+            "HYPERLIQUID_PRIVATE_KEY",
+        ])
+        .is_some();
     let hyperliquid_status = if !should_check_hyperliquid {
         "Skipped".to_owned()
     } else {
@@ -4058,16 +4099,19 @@ fn run_aster_wallet_signer_preflight(options: &WalletSignerPreflightOptions) -> 
 fn run_hyperliquid_wallet_signer_preflight(
     options: &WalletSignerPreflightOptions,
 ) -> RuntimeResult<()> {
-    let agent = resolve_required_hyperliquid_agent_address(options.hyperliquid_agent.as_deref())?;
+    let agent = resolve_optional_hyperliquid_agent_address(options.hyperliquid_agent.as_deref())?;
     let signer_command = resolve_wallet_signer_command()?;
-    let output = Command::new(signer_command)
+    let mut command = Command::new(signer_command);
+    command
         .arg("hyperliquid-l1-phantom")
         .arg("--source")
         .arg(&options.hyperliquid_source)
         .arg("--connection-id")
-        .arg("0x0000000000000000000000000000000000000000000000000000000000000000")
-        .arg("--expect-address")
-        .arg(agent)
+        .arg("0x0000000000000000000000000000000000000000000000000000000000000000");
+    if let Some(agent) = agent {
+        command.arg("--expect-address").arg(agent);
+    }
+    let output = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -4088,27 +4132,30 @@ fn run_hyperliquid_wallet_signer_preflight(
 }
 
 #[cfg(feature = "live-exec")]
-fn resolve_required_hyperliquid_agent_address(option_value: Option<&str>) -> RuntimeResult<String> {
+fn resolve_optional_hyperliquid_agent_address(
+    option_value: Option<&str>,
+) -> RuntimeResult<Option<String>> {
     let value = option_value
         .map(str::to_owned)
-        .or_else(|| std::env::var("HYPERLIQUID_AGENT").ok())
-        .ok_or_else(|| RuntimeError::UnsafeConfig {
-            message:
-                "Hyperliquid signer preflight requires --hyperliquid-agent or HYPERLIQUID_AGENT"
-                    .to_owned(),
-        })?;
-    validate_hyperliquid_user_address(&value)?;
-    Ok(value.trim().to_ascii_lowercase())
+        .or_else(|| first_non_empty_env(HYPERLIQUID_AGENT_ENV_NAMES));
+    if let Some(value) = value {
+        validate_hyperliquid_user_address(&value)?;
+        Ok(Some(value.trim().to_ascii_lowercase()))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "live-exec")]
 fn resolve_required_hyperliquid_user(option_value: Option<&str>) -> RuntimeResult<String> {
     let value = option_value
         .map(str::to_owned)
-        .or_else(|| std::env::var("HYPERLIQUID_USER").ok())
+        .or_else(|| first_non_empty_env(HYPERLIQUID_USER_ENV_NAMES))
         .ok_or_else(|| RuntimeError::UnsafeConfig {
-            message: "Hyperliquid live canary requires --hyperliquid-user or HYPERLIQUID_USER"
-                .to_owned(),
+            message: format!(
+                "Hyperliquid live execution requires --hyperliquid-user or one of {}",
+                HYPERLIQUID_USER_ENV_NAMES.join(", ")
+            ),
         })?;
     validate_hyperliquid_user_address(&value)?;
     Ok(value.trim().to_ascii_lowercase())
@@ -4721,6 +4768,25 @@ fn platform_executable_name(name: &str) -> String {
 }
 
 #[cfg(feature = "live-exec")]
+fn first_non_empty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn aster_address_env_names(env_name: &str) -> &'static [&'static str] {
+    if env_name == "ASTER_USER" {
+        ASTER_USER_ENV_NAMES
+    } else {
+        ASTER_SIGNER_ENV_NAMES
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn resolve_required_aster_v3_address(
     option_value: Option<&str>,
     env_name: &str,
@@ -4730,11 +4796,15 @@ fn resolve_required_aster_v3_address(
     } else {
         "--aster-signer"
     };
+    let env_names = aster_address_env_names(env_name);
     let value = option_value
         .map(str::to_owned)
-        .or_else(|| std::env::var(env_name).ok())
+        .or_else(|| first_non_empty_env(env_names))
         .ok_or_else(|| RuntimeError::UnsafeConfig {
-            message: format!("Aster live signer requires {field} or {env_name}"),
+            message: format!(
+                "Aster live signer requires {field} or one of {}",
+                env_names.join(", ")
+            ),
         })?;
     validate_aster_v3_address(&value, field)?;
     Ok(value.trim().to_owned())
@@ -4746,9 +4816,10 @@ fn resolve_optional_aster_v3_address(
     env_name: &str,
     field: &str,
 ) -> RuntimeResult<Option<String>> {
+    let env_names = aster_address_env_names(env_name);
     let value = option_value
         .map(str::to_owned)
-        .or_else(|| std::env::var(env_name).ok());
+        .or_else(|| first_non_empty_env(env_names));
     if let Some(value) = value {
         validate_aster_v3_address(&value, field)?;
         Ok(Some(value.trim().to_owned()))
@@ -4762,11 +4833,7 @@ fn fetch_hyperliquid_funding_private_readonly_snapshots(
     account_id: &str,
     options: &FundingArbPrivateReadonlySnapshotOnceOptions,
 ) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
-    let Some(user) = options.hyperliquid_user.as_ref() else {
-        return Err(RuntimeError::UnsafeConfig {
-            message: "Hyperliquid read-only snapshot requires --hyperliquid-user with the master or sub-account address".to_owned(),
-        });
-    };
+    let user = resolve_required_hyperliquid_user(options.hyperliquid_user.as_deref())?;
     let body = format!(
         "{{\"type\":\"clearinghouseState\",\"user\":{}}}",
         json_string(user.trim())
@@ -4960,6 +5027,21 @@ fn load_portfolio_account_sources(
             }
             Err(error) => source_errors.push(format!(
                 "account raw snapshot `{}` failed: {error}",
+                path.display()
+            )),
+        }
+    }
+    if let Some(path) = &options.resident_root {
+        loaded = true;
+        match portfolio_balance_rows_from_resident_root(path) {
+            Ok((updated_at, mut rows)) => {
+                if let Some(updated_at) = updated_at {
+                    source_timestamps.push(updated_at);
+                }
+                balances.append(&mut rows);
+            }
+            Err(error) => source_errors.push(format!(
+                "resident root account snapshots `{}` failed: {error}",
                 path.display()
             )),
         }
@@ -5206,6 +5288,89 @@ fn portfolio_balance_rows_from_raw_snapshot_json(
         );
     }
     Ok((snapshot.updated_at, rows))
+}
+
+fn portfolio_balance_rows_from_resident_root(
+    root: &Path,
+) -> RuntimeResult<(Option<String>, Vec<PortfolioBalanceRow>)> {
+    let mut paths = Vec::new();
+    portfolio_collect_named_files(
+        root,
+        "funding_arb_private_account_raw_snapshot.json",
+        8,
+        &mut paths,
+    )?;
+    let mut latest_updated_at = None::<String>;
+    let mut rows_by_key = BTreeMap::<String, (String, PortfolioBalanceRow)>::new();
+
+    for path in paths {
+        let input = read_utf8(&path)?;
+        let (updated_at, rows) = portfolio_balance_rows_from_raw_snapshot_json(&input)?;
+        if let Some(updated_at) = &updated_at {
+            if latest_updated_at
+                .as_ref()
+                .is_none_or(|current| updated_at > current)
+            {
+                latest_updated_at = Some(updated_at.clone());
+            }
+        }
+        let sort_key = format!(
+            "{}\u{1f}{}",
+            updated_at.as_deref().unwrap_or_default(),
+            path.display()
+        );
+        for row in rows {
+            let row_key = format!(
+                "{}\u{1f}{}\u{1f}{}",
+                row.venue_family, row.account_id, row.asset
+            );
+            if rows_by_key
+                .get(&row_key)
+                .is_none_or(|(current_key, _)| &sort_key >= current_key)
+            {
+                rows_by_key.insert(row_key, (sort_key.clone(), row));
+            }
+        }
+    }
+
+    Ok((
+        latest_updated_at,
+        rows_by_key
+            .into_values()
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn portfolio_collect_named_files(
+    root: &Path,
+    file_name: &str,
+    remaining_depth: usize,
+    paths: &mut Vec<PathBuf>,
+) -> RuntimeResult<()> {
+    if root.file_name().and_then(|value| value.to_str()) == Some(file_name) && root.is_file() {
+        paths.push(root.to_path_buf());
+        return Ok(());
+    }
+    if remaining_depth == 0 || !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).map_err(|error| RuntimeError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| RuntimeError::Io {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            portfolio_collect_named_files(&path, file_name, remaining_depth - 1, paths)?;
+        } else if path.file_name().and_then(|value| value.to_str()) == Some(file_name) {
+            paths.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn portfolio_balance_rows_from_raw_statement(
@@ -9702,20 +9867,13 @@ fn multi_venue_basis_live_stack_monitor_symbol(
     options: &MultiVenueBasisLiveStackOptions,
 ) -> String {
     if let Some(symbol) = &options.monitor_symbol {
-        if matches!(venue, BasisLiveVenue::Okx | BasisLiveVenue::Bitget)
-            && matches!(
-                symbol.trim().to_ascii_uppercase().as_str(),
-                "ALL" | "ALL_USDT" | "*"
-            )
-        {
-            return venue.default_symbol().to_owned();
-        }
         return symbol.clone();
     }
     match venue {
         BasisLiveVenue::Binance => BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
         BasisLiveVenue::Bybit => BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
-        BasisLiveVenue::Okx | BasisLiveVenue::Bitget => venue.default_symbol().to_owned(),
+        BasisLiveVenue::Okx => OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+        BasisLiveVenue::Bitget => BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
     }
 }
 
@@ -11019,7 +11177,7 @@ fn ensure_public_wss_monitor_quote_runtime_usable(
                 "Public WSS monitor `{monitor_ref}` latest `{symbol}` quote is not from WSS bookTicker"
             ),
         })?;
-    if !source_event_id.contains(symbol) {
+    if !public_wss_source_event_id_matches_symbol(source_event_id, symbol) {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
                 "Public WSS monitor `{monitor_ref}` source event `{source_event_id}` does not include `{symbol}`"
@@ -11055,6 +11213,18 @@ fn ensure_public_wss_monitor_quote_runtime_usable(
 
 fn is_public_wss_book_ticker_source_event_id(value: &str) -> bool {
     value.contains(":wss-book-ticker:") || value.contains(":wss-bookTicker:")
+}
+
+fn public_wss_source_event_id_matches_symbol(source_event_id: &str, symbol: &str) -> bool {
+    if source_event_id.contains(symbol) {
+        return true;
+    }
+    if source_event_id.starts_with("hyperliquid:wss-book-ticker:") {
+        if let Ok(base_coin) = validate_hyperliquid_public_wss_coin(symbol) {
+            return source_event_id.split(':').any(|part| part == base_coin);
+        }
+    }
+    false
 }
 
 fn required_quote_field<'a>(
@@ -13990,10 +14160,18 @@ fn resolve_hyperliquid_canary_asset_id(
     symbol: &str,
     options: &FundingArbGuardedLiveCanaryOnceOptions,
 ) -> RuntimeResult<u32> {
-    if let Some(asset_id) = options.hyperliquid_asset_ids.get(symbol).or_else(|| {
+    resolve_hyperliquid_asset_id(symbol, &options.hyperliquid_asset_ids)
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_hyperliquid_asset_id(
+    symbol: &str,
+    asset_ids: &BTreeMap<String, u32>,
+) -> RuntimeResult<u32> {
+    if let Some(asset_id) = asset_ids.get(symbol).or_else(|| {
         symbol
             .strip_suffix("USDT")
-            .and_then(|base| options.hyperliquid_asset_ids.get(base))
+            .and_then(|base| asset_ids.get(base))
     }) {
         return Ok(*asset_id);
     }
@@ -14006,11 +14184,17 @@ fn resolve_hyperliquid_canary_asset_id(
                 });
         }
     }
-    Err(RuntimeError::UnsafeConfig {
-        message: format!(
-            "Hyperliquid live canary requires --hyperliquid-asset-id {symbol}=<id> or HYPERLIQUID_ASSET_ID_* env mapping"
-        ),
-    })
+    let payload_json = fetch_public_json_post_with_curl(
+        HYPERLIQUID_INFO_URL,
+        &hyperliquid_info_request_body("metaAndAssetCtxs"),
+    )?;
+    parse_hyperliquid_perp_asset_id_from_meta_and_contexts(&payload_json, symbol).map_err(
+        |error| RuntimeError::UnsafeConfig {
+            message: format!(
+                "Hyperliquid asset id auto-resolution failed for `{symbol}`: {error}; set --hyperliquid-asset-id {symbol}=<id> or HYPERLIQUID_ASSET_ID_* to override"
+            ),
+        },
+    )
 }
 
 #[cfg(feature = "live-exec")]
@@ -17777,36 +17961,56 @@ fn bootstrap_okx_wss_book_ticker(
     symbol_scope: &str,
     market: OkxPublicWssMarket,
 ) -> RuntimeResult<PublicTopOfBookAllMarketState> {
-    let symbol = normalize_okx_wss_symbol_scope(symbol_scope)?;
+    let symbol_scope = normalize_okx_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope = is_okx_wss_all_symbols_scope(&symbol_scope);
     let venue_id = VenueId::new(market.venue_id())?;
-    let instrument_id = okx_public_wss_instrument_id(&symbol, market)?;
-    let inst_id = okx_public_wss_inst_id(&symbol, market);
     let raw_rest_snapshot = fetch_public_json_with_curl(&okx_tickers_url(market.as_str()))?;
-    let row = parse_okx_ticker_rows(&raw_rest_snapshot, "okx wss bootstrap tickers")?
-        .into_iter()
-        .find(|row| row.inst_id == inst_id)
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: format!("OKX WSS REST bootstrap returned no ticker for `{inst_id}`"),
-        })?;
-    let observed_at = current_utc_timestamp()?;
-    let quote =
-        okx_wss_rest_quote_from_row(&row, &symbol, &venue_id, instrument_id.clone(), observed_at)?;
-    let mut coordinator = RestWssMarketDataCoordinator::new(
-        venue_id.clone(),
-        instrument_id,
-        observed_at,
-        MARKET_DATA_MAX_AGE_MS,
+    let rows = prepare_okx_wss_book_ticker_rest_rows(
+        parse_okx_ticker_rows(&raw_rest_snapshot, "okx wss bootstrap tickers")?,
+        &symbol_scope,
+        market,
+        all_symbols_scope,
     )?;
-    let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+    if rows.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("OKX WSS REST bootstrap returned no tickers for `{symbol_scope}`"),
+        });
+    }
+    let observed_at = current_utc_timestamp()?;
+    let mut coordinators = BTreeMap::new();
+    let mut local_sequences = BTreeMap::new();
+    let mut rest_updates = Vec::with_capacity(rows.len());
+    let mut subscribe_args = Vec::with_capacity(rows.len());
+    for (symbol, row) in rows {
+        let instrument_id = okx_public_wss_instrument_id(&symbol, market)?;
+        let quote = okx_wss_rest_quote_from_row(
+            &row,
+            &symbol,
+            &venue_id,
+            instrument_id.clone(),
+            observed_at,
+        )?;
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id,
+            observed_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )?;
+        let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+        local_sequences.insert(symbol.clone(), 1_u64);
+        coordinators.insert(symbol.clone(), coordinator);
+        rest_updates.push(update);
+        subscribe_args.push(okx_wss_ticker_subscribe_payload(&symbol, market));
+    }
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url: OKX_PUBLIC_WSS_URL.to_owned(),
-        subscribe_args: vec![okx_wss_ticker_subscribe_payload(&symbol, market)],
-        all_symbols_scope: false,
-        coordinators: BTreeMap::from([(symbol.clone(), coordinator)]),
-        local_sequences: BTreeMap::from([(symbol, 1_u64)]),
+        subscribe_args,
+        all_symbols_scope,
+        coordinators,
+        local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
-        rest_updates: vec![update],
+        rest_updates,
     })
 }
 
@@ -17814,23 +18018,22 @@ fn bootstrap_bitget_wss_book_ticker(
     symbol_scope: &str,
     market: BitgetPublicWssMarket,
 ) -> RuntimeResult<PublicTopOfBookAllMarketState> {
-    let symbol = normalize_bitget_wss_symbol_scope(symbol_scope)?;
+    let symbol_scope = normalize_bitget_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope = is_bitget_wss_all_symbols_scope(&symbol_scope);
     let venue_id = VenueId::new(market.venue_id())?;
-    let instrument_id = bitget_public_wss_instrument_id(&symbol, market)?;
     let raw_rest_snapshot = match market {
         BitgetPublicWssMarket::Spot => fetch_public_json_with_curl(&bitget_spot_tickers_url())?,
         BitgetPublicWssMarket::UsdtFutures => {
             fetch_public_json_with_curl(&bitget_usdt_futures_tickers_url())?
         }
     };
-    let rest_row = match market {
+    let rows = match market {
         BitgetPublicWssMarket::Spot => parse_bitget_spot_ticker_rows(&raw_rest_snapshot)?
             .into_iter()
-            .find(|row| row.symbol.eq_ignore_ascii_case(&symbol)),
+            .collect::<Vec<_>>(),
         BitgetPublicWssMarket::UsdtFutures => {
             parse_bitget_usdt_futures_ticker_rows(&raw_rest_snapshot)?
                 .into_iter()
-                .find(|row| row.symbol.eq_ignore_ascii_case(&symbol))
                 .map(|row| MonitorBookTickerRow {
                     symbol: row.symbol,
                     bid_price: row.bid_price,
@@ -17838,36 +18041,102 @@ fn bootstrap_bitget_wss_book_ticker(
                     ask_price: row.ask_price,
                     ask_qty: row.ask_qty,
                 })
+                .collect::<Vec<_>>()
         }
+    };
+    let rows =
+        prepare_bitget_wss_book_ticker_rest_rows(rows, &symbol_scope, market, all_symbols_scope)?;
+    if rows.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("Bitget WSS REST bootstrap returned no tickers for `{symbol_scope}`"),
+        });
     }
-    .ok_or_else(|| RuntimeError::LiveMarketData {
-        message: format!("Bitget WSS REST bootstrap returned no ticker for `{symbol}`"),
-    })?;
     let observed_at = current_utc_timestamp()?;
-    let quote = bitget_wss_rest_quote_from_row(
-        &rest_row,
-        &venue_id,
-        instrument_id.clone(),
-        market,
-        observed_at,
-    )?;
-    let mut coordinator = RestWssMarketDataCoordinator::new(
-        venue_id.clone(),
-        instrument_id,
-        observed_at,
-        MARKET_DATA_MAX_AGE_MS,
-    )?;
-    let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+    let mut coordinators = BTreeMap::new();
+    let mut local_sequences = BTreeMap::new();
+    let mut rest_updates = Vec::with_capacity(rows.len());
+    let mut subscribe_args = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = row.symbol.clone();
+        let instrument_id = bitget_public_wss_instrument_id(&symbol, market)?;
+        let quote = bitget_wss_rest_quote_from_row(
+            &row,
+            &venue_id,
+            instrument_id.clone(),
+            market,
+            observed_at,
+        )?;
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id,
+            observed_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )?;
+        let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+        local_sequences.insert(symbol.clone(), 1_u64);
+        coordinators.insert(symbol.clone(), coordinator);
+        rest_updates.push(update);
+        subscribe_args.push(bitget_wss_ticker_subscribe_payload(&symbol, market));
+    }
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url: BITGET_PUBLIC_WSS_URL.to_owned(),
-        subscribe_args: vec![bitget_wss_ticker_subscribe_payload(&symbol, market)],
-        all_symbols_scope: false,
-        coordinators: BTreeMap::from([(symbol.clone(), coordinator)]),
-        local_sequences: BTreeMap::from([(symbol, 1_u64)]),
+        subscribe_args,
+        all_symbols_scope,
+        coordinators,
+        local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
-        rest_updates: vec![update],
+        rest_updates,
     })
+}
+
+fn prepare_okx_wss_book_ticker_rest_rows(
+    rows: Vec<OkxTickerRow>,
+    symbol_scope: &str,
+    market: OkxPublicWssMarket,
+    all_symbols_scope: bool,
+) -> RuntimeResult<Vec<(String, OkxTickerRow)>> {
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows {
+        match okx_public_wss_symbol_from_inst_id(&row.inst_id, market) {
+            Ok(symbol) if all_symbols_scope || symbol == symbol_scope => {
+                prepared.push((symbol, row));
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    prepared.sort_by(|left, right| left.0.cmp(&right.0));
+    prepared.dedup_by(|left, right| left.0 == right.0);
+    Ok(prepared)
+}
+
+fn prepare_bitget_wss_book_ticker_rest_rows(
+    rows: Vec<MonitorBookTickerRow>,
+    symbol_scope: &str,
+    market: BitgetPublicWssMarket,
+    all_symbols_scope: bool,
+) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    let mut prepared = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match normalize_cex_usdt_basis_symbol(&row.symbol, "Bitget") {
+            Ok(symbol) if all_symbols_scope || symbol == symbol_scope => {
+                if let Err(error) = bitget_public_wss_instrument_id(&symbol, market) {
+                    if all_symbols_scope {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                row.symbol = symbol;
+                prepared.push(row);
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    Ok(prepared)
 }
 
 fn bootstrap_aster_wss_book_ticker(
@@ -18328,6 +18597,9 @@ fn apply_okx_wss_book_ticker_text(
         return Ok(None);
     };
     if !state.coordinators.contains_key(&raw.symbol) {
+        if state.all_symbols_scope {
+            return Ok(None);
+        }
         return Err(RuntimeError::LiveMarketData {
             message: format!(
                 "OKX WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
@@ -18376,6 +18648,9 @@ fn apply_bitget_wss_book_ticker_text(
         return Ok(None);
     };
     if !state.coordinators.contains_key(&raw.symbol) {
+        if state.all_symbols_scope {
+            return Ok(None);
+        }
         return Err(RuntimeError::LiveMarketData {
             message: format!(
                 "Bitget WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
@@ -18723,12 +18998,12 @@ fn parse_bitget_wss_book_ticker_runtime_raw(
             &["askPr", "askPx", "askPrice"],
             "bitget wss ticker",
         )?)?,
-        bid_size: Quantity::from_str(&required_first_json_value_string(
+        bid_size: Quantity::from_str(&required_first_bitget_ticker_value_string(
             &fields,
             &["bidSz", "bidSize", "bidQty"],
             "bitget wss ticker",
         )?)?,
-        ask_size: Quantity::from_str(&required_first_json_value_string(
+        ask_size: Quantity::from_str(&required_first_bitget_ticker_value_string(
             &fields,
             &["askSz", "askSize", "askQty"],
             "bitget wss ticker",
@@ -19295,6 +19570,7 @@ pub fn run_aster_basis_monitor(options: AsterBasisMonitorOptions) -> RuntimeResu
                 *state.write().expect("monitor state lock poisoned") = snapshot;
             }
             Err(error) => {
+                eprintln!("aster-basis-monitor cycle failed: {error}");
                 if options.once {
                     return Err(error);
                 }
@@ -19680,10 +19956,35 @@ fn build_binance_basis_monitor_snapshot_from_json(
 fn fetch_aster_basis_monitor_snapshot(
     options: &AsterBasisMonitorOptions,
 ) -> RuntimeResult<AsterBasisMonitorSnapshot> {
-    let spot_json = fetch_public_json_with_curl(&aster_spot_book_ticker_all_url())?;
+    let mut warnings = Vec::new();
+    let spot_json = match fetch_public_json_with_curl(&aster_spot_book_ticker_all_url()) {
+        Ok(json) => Some(json),
+        Err(error) => {
+            warnings.push(format!(
+                "Aster spot REST unavailable; continuing with perp-only funding data: {error}"
+            ));
+            None
+        }
+    };
     let perp_json = fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&aster_futures_premium_index_all_url())?;
-    build_aster_basis_monitor_snapshot_from_json(&spot_json, &perp_json, &premium_json, options)
+    if warnings.is_empty() {
+        if let Some(spot_json) = spot_json.as_deref() {
+            return build_aster_basis_monitor_snapshot_from_json(
+                spot_json,
+                &perp_json,
+                &premium_json,
+                options,
+            );
+        }
+    }
+    build_aster_basis_monitor_snapshot_from_optional_spot_json(
+        spot_json.as_deref(),
+        &perp_json,
+        &premium_json,
+        options,
+        warnings,
+    )
 }
 
 fn build_aster_basis_monitor_snapshot_from_json(
@@ -19692,34 +19993,60 @@ fn build_aster_basis_monitor_snapshot_from_json(
     premium_json: &str,
     options: &AsterBasisMonitorOptions,
 ) -> RuntimeResult<AsterBasisMonitorSnapshot> {
+    build_aster_basis_monitor_snapshot_from_optional_spot_json(
+        Some(spot_json),
+        perp_json,
+        premium_json,
+        options,
+        Vec::new(),
+    )
+}
+
+fn build_aster_basis_monitor_snapshot_from_optional_spot_json(
+    spot_json: Option<&str>,
+    perp_json: &str,
+    premium_json: &str,
+    options: &AsterBasisMonitorOptions,
+    mut warnings: Vec<String>,
+) -> RuntimeResult<AsterBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_book_ticker_rows(spot_json, "aster spot")?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
+    let spot_books = match spot_json {
+        Some(spot_json) => parse_book_ticker_rows(spot_json, "aster spot")?
+            .into_iter()
+            .map(|row| (row.symbol.clone(), row))
+            .collect::<BTreeMap<_, _>>(),
+        None => BTreeMap::new(),
+    };
     let perp_books = parse_book_ticker_rows(perp_json, "aster perp")?
         .into_iter()
         .map(|row| (row.symbol.clone(), row))
         .collect::<BTreeMap<_, _>>();
     let premiums = parse_premium_index_rows(premium_json)?;
-    let perp_wss_quotes = options
-        .perp_wss_monitor_url
-        .as_deref()
-        .map(|url| {
-            fetch_public_wss_monitor_quote_map_for_basis(
-                url,
-                "/api/aster-wss-book-ticker",
-                AsterPublicWssMarket::UsdtFutures.as_str(),
-            )
-        })
-        .transpose()?;
+    let perp_wss_quotes = match options.perp_wss_monitor_url.as_deref() {
+        Some(url) => match fetch_public_wss_monitor_quote_map_for_basis(
+            url,
+            "/api/aster-wss-book-ticker",
+            AsterPublicWssMarket::UsdtFutures.as_str(),
+        ) {
+            Ok(quotes) => Some(quotes),
+            Err(error) => {
+                warnings.push(format!(
+                    "Aster perp WSS monitor unavailable; using REST perp top-of-book fallback: {error}"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
 
     let mut rows = Vec::new();
     let mut filtered_funding_count = 0_usize;
     let mut missing_spot_count = 0_usize;
     let mut missing_perp_count = 0_usize;
+    let mut missing_wss_quote_count = 0_usize;
+    let mut unusable_wss_quote_count = 0_usize;
 
     for premium in premiums {
         if !premium.symbol.ends_with("USDT") || premium.symbol.starts_with("TEST") {
@@ -19733,24 +20060,28 @@ fn build_aster_basis_monitor_snapshot_from_json(
 
         let spot = spot_books.get(&premium.symbol);
         let perp_wss_row = match perp_wss_quotes.as_ref() {
-            Some(wss_quotes) => {
-                let quote = wss_quotes.quotes.get(&premium.symbol).ok_or_else(|| {
-                    RuntimeError::LiveMarketData {
-                        message: format!(
-                            "Aster WSS monitor `{}` lacks perp quote for `{}`",
-                            wss_quotes.monitor_ref, premium.symbol
-                        ),
+            Some(wss_quotes) => match wss_quotes.quotes.get(&premium.symbol) {
+                Some(quote) => {
+                    match public_wss_quote_to_monitor_book_ticker_row(
+                        quote,
+                        &wss_quotes.monitor_ref,
+                        &premium.symbol,
+                        AsterPublicWssMarket::UsdtFutures.venue_id(),
+                        &format!("inst:ASTER:{}:USDT-FUTURES", premium.symbol),
+                        wss_quotes.fetched_at,
+                    ) {
+                        Ok(row) => Some(row),
+                        Err(_) => {
+                            unusable_wss_quote_count += 1;
+                            None
+                        }
                     }
-                })?;
-                Some(public_wss_quote_to_monitor_book_ticker_row(
-                    quote,
-                    &wss_quotes.monitor_ref,
-                    &premium.symbol,
-                    AsterPublicWssMarket::UsdtFutures.venue_id(),
-                    &format!("inst:ASTER:{}:USDT-FUTURES", premium.symbol),
-                    wss_quotes.fetched_at,
-                )?)
-            }
+                }
+                None => {
+                    missing_wss_quote_count += 1;
+                    None
+                }
+            },
             None => None,
         };
         let perp = perp_wss_row
@@ -19836,6 +20167,16 @@ fn build_aster_basis_monitor_snapshot_from_json(
             .then_with(|| left.symbol.cmp(&right.symbol))
     });
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
+    if missing_wss_quote_count > 0 {
+        warnings.push(format!(
+            "Aster perp WSS monitor lacked quotes for {missing_wss_quote_count} symbols; used REST fallback where available"
+        ));
+    }
+    if unusable_wss_quote_count > 0 {
+        warnings.push(format!(
+            "Aster perp WSS monitor had {unusable_wss_quote_count} unusable quote rows; used REST fallback where available"
+        ));
+    }
 
     Ok(AsterBasisMonitorSnapshot {
         status: "healthy".to_owned(),
@@ -19847,7 +20188,7 @@ fn build_aster_basis_monitor_snapshot_from_json(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
-        last_error: None,
+        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
 }
@@ -20446,22 +20787,30 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
         .map(|row| (row.coin.clone(), row))
         .collect::<BTreeMap<_, _>>();
     let perp_contexts = parse_hyperliquid_perp_context_rows(perp_json)?;
-    let perp_wss_quotes = options
-        .perp_wss_monitor_url
-        .as_deref()
-        .map(|url| {
-            fetch_public_wss_monitor_quote_map_for_basis(
-                url,
-                "/api/hyperliquid-wss-book-ticker",
-                HyperliquidPublicWssMarket::Perp.as_str(),
-            )
-        })
-        .transpose()?;
+    let mut warnings = Vec::new();
+    let perp_wss_quotes = match options.perp_wss_monitor_url.as_deref() {
+        Some(url) => match fetch_public_wss_monitor_quote_map_for_basis(
+            url,
+            "/api/hyperliquid-wss-book-ticker",
+            HyperliquidPublicWssMarket::Perp.as_str(),
+        ) {
+            Ok(quotes) => Some(quotes),
+            Err(error) => {
+                warnings.push(format!(
+                    "Hyperliquid perp WSS monitor unavailable; using REST perp context fallback: {error}"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
 
     let mut rows = Vec::new();
     let mut filtered_funding_count = 0_usize;
     let mut missing_spot_count = 0_usize;
     let missing_perp_count = 0_usize;
+    let mut missing_wss_quote_count = 0_usize;
+    let mut unusable_wss_quote_count = 0_usize;
 
     for perp in perp_contexts {
         let funding_rate = MonitorDecimal::parse("funding", &perp.funding_rate)?;
@@ -20473,26 +20822,35 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
         let spot = spot_books.get(&perp.coin);
         let perp_wss_row = match perp_wss_quotes.as_ref() {
             Some(wss_quotes) => {
-                let quote = wss_quotes.quotes.get(&perp.coin).ok_or_else(|| {
-                    RuntimeError::LiveMarketData {
-                        message: format!(
-                            "Hyperliquid WSS monitor `{}` lacks perp quote for `{}`",
-                            wss_quotes.monitor_ref, perp.coin
-                        ),
+                let display_symbol = funding_display_symbol(&perp.coin);
+                match wss_quotes
+                    .quotes
+                    .get(&perp.coin)
+                    .or_else(|| wss_quotes.quotes.get(&display_symbol))
+                {
+                    Some(quote) => {
+                        let expected_instrument_id =
+                            format!("inst:HYPERLIQUID:{display_symbol}:PERP");
+                        match public_wss_quote_to_monitor_book_ticker_row(
+                            quote,
+                            &wss_quotes.monitor_ref,
+                            &quote.symbol,
+                            HyperliquidPublicWssMarket::Perp.venue_id(),
+                            &expected_instrument_id,
+                            wss_quotes.fetched_at,
+                        ) {
+                            Ok(row) => Some(row),
+                            Err(_) => {
+                                unusable_wss_quote_count += 1;
+                                None
+                            }
+                        }
                     }
-                })?;
-                let expected_instrument_id = format!(
-                    "inst:HYPERLIQUID:{}:PERP",
-                    funding_display_symbol(&perp.coin)
-                );
-                Some(public_wss_quote_to_monitor_book_ticker_row(
-                    quote,
-                    &wss_quotes.monitor_ref,
-                    &perp.coin,
-                    HyperliquidPublicWssMarket::Perp.venue_id(),
-                    &expected_instrument_id,
-                    wss_quotes.fetched_at,
-                )?)
+                    None => {
+                        missing_wss_quote_count += 1;
+                        None
+                    }
+                }
             }
             None => None,
         };
@@ -20569,6 +20927,16 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
             .then_with(|| left.symbol.cmp(&right.symbol))
     });
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
+    if missing_wss_quote_count > 0 {
+        warnings.push(format!(
+            "Hyperliquid perp WSS monitor lacked quotes for {missing_wss_quote_count} symbols; used REST fallback where available"
+        ));
+    }
+    if unusable_wss_quote_count > 0 {
+        warnings.push(format!(
+            "Hyperliquid perp WSS monitor had {unusable_wss_quote_count} unusable quote rows; used REST fallback where available"
+        ));
+    }
 
     Ok(HyperliquidBasisMonitorSnapshot {
         status: "healthy".to_owned(),
@@ -20580,7 +20948,7 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
-        last_error: None,
+        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
 }
@@ -21267,22 +21635,34 @@ fn is_bybit_wss_all_symbols_scope(symbol: &str) -> bool {
 
 fn normalize_okx_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
     let upper = symbol.trim().to_ascii_uppercase();
-    if matches!(upper.as_str(), "ALL" | "ALL_USDT" | "*") {
-        return Err(cli_arg_error(
-            "OKX WSS ticker monitor currently requires one symbol such as BTC-USDT",
-        ));
+    if is_okx_wss_all_symbols_scope(&upper) {
+        Ok(OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
+    } else {
+        normalize_okx_usdt_basis_symbol(symbol)
     }
-    normalize_okx_usdt_basis_symbol(symbol)
+}
+
+fn is_okx_wss_all_symbols_scope(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "ALL" | "ALL_USDT" | "*"
+    )
 }
 
 fn normalize_bitget_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
     let upper = symbol.trim().to_ascii_uppercase();
-    if matches!(upper.as_str(), "ALL" | "ALL_USDT" | "*") {
-        return Err(cli_arg_error(
-            "Bitget WSS ticker monitor currently requires one symbol such as BTCUSDT",
-        ));
+    if is_bitget_wss_all_symbols_scope(&upper) {
+        Ok(BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
+    } else {
+        normalize_cex_usdt_basis_symbol(symbol, "Bitget")
     }
-    normalize_cex_usdt_basis_symbol(symbol, "Bitget")
+}
+
+fn is_bitget_wss_all_symbols_scope(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "ALL" | "ALL_USDT" | "*"
+    )
 }
 
 fn normalize_aster_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
@@ -22342,22 +22722,22 @@ fn parse_bitget_spot_ticker_rows(input: &str) -> RuntimeResult<Vec<MonitorBookTi
             let fields = parse_json_object_value_slices(object)?;
             Ok(MonitorBookTickerRow {
                 symbol: required_json_value_string(&fields, "symbol", "bitget spot tickers")?,
-                bid_price: required_first_json_value_string(
+                bid_price: required_first_bitget_ticker_value_string(
                     &fields,
                     &["bidPr", "bidPx", "bidPrice"],
                     "bitget spot tickers",
                 )?,
-                bid_qty: required_first_json_value_string(
+                bid_qty: required_first_bitget_ticker_value_string(
                     &fields,
                     &["bidSz", "bidSize", "bidQty"],
                     "bitget spot tickers",
                 )?,
-                ask_price: required_first_json_value_string(
+                ask_price: required_first_bitget_ticker_value_string(
                     &fields,
                     &["askPr", "askPx", "askPrice"],
                     "bitget spot tickers",
                 )?,
-                ask_qty: required_first_json_value_string(
+                ask_qty: required_first_bitget_ticker_value_string(
                     &fields,
                     &["askSz", "askSize", "askQty"],
                     "bitget spot tickers",
@@ -22380,32 +22760,32 @@ fn parse_bitget_usdt_futures_ticker_rows(
                     "symbol",
                     "bitget usdt-futures tickers",
                 )?,
-                bid_price: required_first_json_value_string(
+                bid_price: required_first_bitget_ticker_value_string(
                     &fields,
                     &["bidPr", "bidPx", "bidPrice"],
                     "bitget usdt-futures tickers",
                 )?,
-                bid_qty: required_first_json_value_string(
+                bid_qty: required_first_bitget_ticker_value_string(
                     &fields,
                     &["bidSz", "bidSize", "bidQty"],
                     "bitget usdt-futures tickers",
                 )?,
-                ask_price: required_first_json_value_string(
+                ask_price: required_first_bitget_ticker_value_string(
                     &fields,
                     &["askPr", "askPx", "askPrice"],
                     "bitget usdt-futures tickers",
                 )?,
-                ask_qty: required_first_json_value_string(
+                ask_qty: required_first_bitget_ticker_value_string(
                     &fields,
                     &["askSz", "askSize", "askQty"],
                     "bitget usdt-futures tickers",
                 )?,
-                mark_price: required_first_json_value_string(
+                mark_price: required_first_bitget_ticker_value_string(
                     &fields,
                     &["markPrice", "markPr"],
                     "bitget usdt-futures tickers",
                 )?,
-                index_price: required_first_json_value_string(
+                index_price: required_first_bitget_ticker_value_string(
                     &fields,
                     &["indexPrice", "indexPr"],
                     "bitget usdt-futures tickers",
@@ -22449,6 +22829,52 @@ fn parse_bitget_funding_rate_rows(input: &str) -> RuntimeResult<Vec<BitgetFundin
             })
         })
         .collect()
+}
+
+fn required_first_bitget_ticker_value_string(
+    fields: &BTreeMap<String, &str>,
+    field_names: &[&'static str],
+    source: &'static str,
+) -> RuntimeResult<String> {
+    for field in field_names {
+        if let Some(value) = fields.get(*field) {
+            return bitget_ticker_value_to_string(value, field, source);
+        }
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "{source} object is missing all fields [{}]",
+            field_names.join(", ")
+        ),
+    })
+}
+
+fn bitget_ticker_value_to_string(
+    value: &str,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<String> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('[') {
+        return json_value_to_string(trimmed, field, source);
+    }
+    let values = json_array_value_slices(trimmed)?;
+    if values.is_empty() && is_bitget_size_field(field) {
+        return Ok("0".to_owned());
+    }
+    if values.len() == 1 {
+        return json_value_to_string(values[0], field, source);
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("{source} field `{field}` is an ambiguous JSON array"),
+    })
+}
+
+fn is_bitget_size_field(field: &str) -> bool {
+    matches!(
+        field,
+        "bidSz" | "bidSize" | "bidQty" | "askSz" | "askSize" | "askQty"
+    )
 }
 
 fn bitget_response_data_object_slices<'a>(
@@ -22698,7 +23124,8 @@ fn parse_hyperliquid_perp_context_rows(
         if optional_json_bool(&fields, "isDelisted", "hyperliquid perp meta")?.unwrap_or(false) {
             continue;
         }
-        let coin = required_json_value_string(&fields, "name", "hyperliquid perp meta")?;
+        let raw_coin = required_json_value_string(&fields, "name", "hyperliquid perp meta")?;
+        let coin = validate_hyperliquid_public_wss_coin(&raw_coin)?;
         let context_fields = parse_json_object_value_slices(context)?;
         let mark_price =
             required_json_value_string(&context_fields, "markPx", "hyperliquid perp ctx")?;
@@ -22721,6 +23148,55 @@ fn parse_hyperliquid_perp_context_rows(
         });
     }
     Ok(rows)
+}
+
+fn parse_hyperliquid_perp_asset_id_from_meta_and_contexts(
+    input: &str,
+    symbol: &str,
+) -> RuntimeResult<u32> {
+    let target = normalize_hyperliquid_perp_asset_symbol(symbol)?;
+    let items = hyperliquid_meta_and_context_items(input, "hyperliquid perp asset ids")?;
+    let meta_fields = parse_json_object_value_slices(items.meta)?;
+    let universe_value =
+        meta_fields
+            .get("universe")
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "hyperliquid perp asset id response is missing meta.universe".to_owned(),
+            })?;
+    for (index, universe_object) in json_object_slices(universe_value)?.iter().enumerate() {
+        let fields = parse_json_object_value_slices(universe_object)?;
+        if optional_json_bool(&fields, "isDelisted", "hyperliquid perp meta")?.unwrap_or(false) {
+            continue;
+        }
+        let coin = required_json_value_string(&fields, "name", "hyperliquid perp meta")?;
+        if coin.eq_ignore_ascii_case(&target) {
+            return u32::try_from(index).map_err(|_| RuntimeError::LiveMarketData {
+                message: format!("hyperliquid perp asset id index for `{coin}` exceeds u32"),
+            });
+        }
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "Hyperliquid public meta did not contain active USDC-settled perp asset `{target}` for `{symbol}`"
+        ),
+    })
+}
+
+fn normalize_hyperliquid_perp_asset_symbol(symbol: &str) -> RuntimeResult<String> {
+    let value = symbol.trim();
+    if value.is_empty() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Hyperliquid asset id symbol cannot be empty".to_owned(),
+        });
+    }
+    let upper = value.to_ascii_uppercase();
+    let base = upper.strip_suffix("USDT").unwrap_or(&upper).trim();
+    if base.is_empty() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("Hyperliquid asset id symbol `{symbol}` has an empty base asset"),
+        });
+    }
+    Ok(base.to_owned())
 }
 
 struct HyperliquidMetaAndContextItems<'a> {
@@ -28905,8 +29381,7 @@ fn build_funding_perp_live_adapter_for_exit(
             let user = resolve_required_hyperliquid_user(options.hyperliquid_user.as_deref())?;
             let signer_command = resolve_wallet_signer_command()?;
             let symbol = funding_arb_hyperliquid_symbol_from_instrument(&leg.instrument_id)?;
-            let asset_id =
-                resolve_hyperliquid_asset_id_from_map(&symbol, &options.hyperliquid_asset_ids)?;
+            let asset_id = resolve_hyperliquid_asset_id(&symbol, &options.hyperliquid_asset_ids)?;
             let mut config = live::HyperliquidExecConfig::perp(
                 venue_id,
                 account_id,
@@ -28971,32 +29446,6 @@ fn funding_private_order_market_for_venue_id(venue_id: &str) -> RuntimeResult<Pr
             message: format!("unsupported funding arb private order market venue `{other}`"),
         }),
     }
-}
-
-#[cfg(feature = "live-exec")]
-fn resolve_hyperliquid_asset_id_from_map(
-    symbol: &str,
-    asset_ids: &BTreeMap<String, u32>,
-) -> RuntimeResult<u32> {
-    if let Some(asset_id) = asset_ids.get(symbol).or_else(|| {
-        symbol
-            .strip_suffix("USDT")
-            .and_then(|base| asset_ids.get(base))
-    }) {
-        return Ok(*asset_id);
-    }
-    for key in hyperliquid_asset_id_env_names(symbol) {
-        if let Ok(value) = std::env::var(&key) {
-            return value
-                .parse::<u32>()
-                .map_err(|_| RuntimeError::UnsafeConfig {
-                    message: format!("{key} must be a non-negative u32 asset id"),
-                });
-        }
-    }
-    Err(RuntimeError::UnsafeConfig {
-        message: format!("Hyperliquid funding arb live requires asset-id mapping for `{symbol}`"),
-    })
 }
 
 #[cfg(feature = "live-exec")]
@@ -36406,8 +36855,9 @@ impl BinanceBasisMonitorSnapshot {
 
     fn opportunities_json(&self) -> String {
         format!(
-            "{{\"candidate_count\":{},\"rows\":[{}],\"status\":{},\"updated_at\":{}}}",
+            "{{\"candidate_count\":{},\"last_error\":{},\"rows\":[{}],\"status\":{},\"updated_at\":{}}}",
             self.candidate_count,
+            json_option_string(&self.last_error),
             self.rows
                 .iter()
                 .filter(|row| row.is_candidate)
@@ -39462,9 +39912,9 @@ fn legacy_help_text() -> String {
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
         "  bybit-wss-book-ticker [--bind 127.0.0.1:8802] [--symbol ALL_USDT|BTCUSDT] [--market spot|linear-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Bybit public WSS orderbook.1 all-market monitor and serve /dashboard",
-        "  okx-wss-book-ticker [--bind 127.0.0.1:8807] [--symbol BTC-USDT] [--market spot|swap] [--reconnect-delay-secs 2] [--once --updates 3]",
+        "  okx-wss-book-ticker [--bind 127.0.0.1:8807] [--symbol ALL_USDT|BTC-USDT] [--market spot|swap] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run OKX public WSS tickers monitor and serve /dashboard",
-        "  bitget-wss-book-ticker [--bind 127.0.0.1:8809] [--symbol BTCUSDT] [--market spot|usdt-futures] [--reconnect-delay-secs 2] [--once --updates 3]",
+        "  bitget-wss-book-ticker [--bind 127.0.0.1:8809] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdt-futures] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Bitget public WSS ticker monitor and serve /dashboard",
         "  aster-wss-book-ticker [--bind 127.0.0.1:8794] [--symbol ALL_USDT|BTCUSDT] [--market usdt-futures] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Aster public WSS bookTicker monitor and serve /dashboard",
@@ -39488,16 +39938,16 @@ fn legacy_help_text() -> String {
         "                                    Aggregate local basis monitor status snapshots into cross-exchange funding arb opportunities",
         "  portfolio-dashboard [--bind 127.0.0.1:8805] [--account-snapshot file | --account-raw-snapshot file] [--position-snapshot file | --position-raw-snapshot file | --resident-root dir] [--funding-snapshot file] [--once]",
         "                                    Serve a read-only Chinese dashboard for exchange balances and all positions from local snapshots; no signing, orders, cancels, or transfers",
-        "  wallet-signer-preflight [--aster-signer 0x...] [--aster-signer-cmd-env env] [--skip-aster] [--check-hyperliquid --hyperliquid-agent 0x... --hyperliquid-source a|b] [--out dir]",
+        "  wallet-signer-preflight [--aster-signer 0x...] [--aster-signer-cmd-env env] [--skip-aster] [--check-hyperliquid [--hyperliquid-agent 0x...] --hyperliquid-source a|b] [--out dir]",
         "                                    Run local signer and address-match checks before private read-only or live signing; no exchange requests and no mutable execution",
         "  funding-arb-private-readonly-snapshot-once --snapshot file --pair-id id [--config file] [--funding-settlement-raw-snapshot file] [--hyperliquid-user 0x...] [--aster-user 0x...] [--aster-signer 0x...] [--aster-signer-cmd-env env] [--out dir]",
         "                                    Fetch read-only private account/position/funding settlement raw snapshots for a funding arb pair; Aster auto-uses arb-wallet-signer unless the signer command env override is set; no orders, cancels, transfers, or mutable execution",
         "  funding-arb-guarded-dry-run-once --snapshot file --pair-id id [--config file] [--funding-settlement-raw-snapshot file] [--private-account-snapshot file | --private-account-raw-snapshot file] [--private-position-snapshot file | --private-position-raw-snapshot file] [--private-execution-snapshot file] [--out dir] [--min-net-funding-bps 5]",
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
         "  funding-arb-guarded-live-canary-once --snapshot file --pair-id id [dry-run snapshot options] [--private-order-events-dir dir] [--aster-user 0x...] [--aster-signer 0x...] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--execute-live --i-understand-funding-arb-live-orders]",
-        "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the two perp legs with cancel/unwind protection",
+        "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the Aster USDT-settled and Hyperliquid USDC-settled perp legs; Hyperliquid asset id auto-resolves unless overridden",
         "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders]",
-        "                                    Resident funding-arb scanner: refresh private read-only snapshots, run guarded entry cycles, register live positions, and supervise reduce-only exit/de-risk",
+        "                                    Resident funding-arb scanner: refresh private read-only snapshots, run guarded entry cycles, register live positions, and supervise reduce-only exit/de-risk; Aster defaults to USDT and Hyperliquid defaults to USDC",
     ]
     .join("\n")
 }
@@ -44993,6 +45443,16 @@ mod tests {
         assert_eq!(okx_options.symbol, "btc-usdt");
         assert_eq!(okx_options.market, OkxPublicWssMarket::Swap);
         assert!(okx_options.once);
+        assert_eq!(
+            parse_okx_wss_book_ticker_args(&[])
+                .expect("okx defaults")
+                .symbol,
+            OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        );
+        assert_eq!(
+            normalize_okx_wss_symbol_scope("all").expect("okx all"),
+            OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        );
 
         let bitget_args = vec![
             "--bind".to_owned(),
@@ -45007,6 +45467,16 @@ mod tests {
         assert_eq!(bitget_options.bind_addr, "127.0.0.1:9909");
         assert_eq!(bitget_options.symbol, "btcusdt");
         assert_eq!(bitget_options.market, BitgetPublicWssMarket::UsdtFutures);
+        assert_eq!(
+            parse_bitget_wss_book_ticker_args(&[])
+                .expect("bitget defaults")
+                .symbol,
+            BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        );
+        assert_eq!(
+            normalize_bitget_wss_symbol_scope("*").expect("bitget all"),
+            BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        );
 
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
         let okx_raw = r#"{"arg":{"channel":"tickers","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","bidPx":"101.00","bidSz":"1.2","askPx":"101.10","askSz":"1.3","ts":"1778630400000"}]}"#;
@@ -45025,6 +45495,93 @@ mod tests {
         assert_eq!(bitget_parsed.symbol, BITGET_BASIS_SYMBOL);
         assert_eq!(bitget_parsed.venue_symbol, "BTCUSDT");
         assert_eq!(bitget_parsed.ask_size.to_string(), "1.3");
+
+        let bitget_array_size_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":"101.00","bidSz":["1.2"],"askPr":"101.10","askSz":["1.3"],"ts":"1778630400000"}]}"#;
+        let bitget_array_size_parsed =
+            parse_bitget_wss_book_ticker_runtime_raw(bitget_array_size_raw, ingested_at)
+                .expect("bitget array size raw")
+                .expect("bitget array size update");
+        assert_eq!(bitget_array_size_parsed.bid_size.to_string(), "1.2");
+        assert_eq!(bitget_array_size_parsed.ask_size.to_string(), "1.3");
+    }
+
+    #[test]
+    fn okx_and_bitget_wss_rest_bootstrap_prepare_all_usdt_rows() {
+        let okx_rows = vec![
+            OkxTickerRow {
+                inst_id: "BTC-USDT-SWAP".to_owned(),
+                bid_price: "100".to_owned(),
+                bid_qty: "1".to_owned(),
+                ask_price: "101".to_owned(),
+                ask_qty: "1".to_owned(),
+            },
+            OkxTickerRow {
+                inst_id: "ETH-USDT-SWAP".to_owned(),
+                bid_price: "50".to_owned(),
+                bid_qty: "2".to_owned(),
+                ask_price: "51".to_owned(),
+                ask_qty: "2".to_owned(),
+            },
+            OkxTickerRow {
+                inst_id: "BTC-USDC-SWAP".to_owned(),
+                bid_price: "100".to_owned(),
+                bid_qty: "1".to_owned(),
+                ask_price: "101".to_owned(),
+                ask_qty: "1".to_owned(),
+            },
+        ];
+        let prepared_okx = prepare_okx_wss_book_ticker_rest_rows(
+            okx_rows,
+            OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+            OkxPublicWssMarket::Swap,
+            true,
+        )
+        .expect("okx all rows");
+        assert_eq!(
+            prepared_okx
+                .iter()
+                .map(|(symbol, _)| symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTC-USDT", "ETH-USDT"]
+        );
+
+        let bitget_rows = vec![
+            MonitorBookTickerRow {
+                symbol: "BTCUSDT".to_owned(),
+                bid_price: "100".to_owned(),
+                bid_qty: "1".to_owned(),
+                ask_price: "101".to_owned(),
+                ask_qty: "1".to_owned(),
+            },
+            MonitorBookTickerRow {
+                symbol: "ETHUSDT".to_owned(),
+                bid_price: "50".to_owned(),
+                bid_qty: "2".to_owned(),
+                ask_price: "51".to_owned(),
+                ask_qty: "2".to_owned(),
+            },
+            MonitorBookTickerRow {
+                symbol: "BTCUSDC".to_owned(),
+                bid_price: "100".to_owned(),
+                bid_qty: "1".to_owned(),
+                ask_price: "101".to_owned(),
+                ask_qty: "1".to_owned(),
+            },
+        ];
+        let prepared_bitget = prepare_bitget_wss_book_ticker_rest_rows(
+            bitget_rows,
+            BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+            BitgetPublicWssMarket::Spot,
+            true,
+        )
+        .expect("bitget all rows");
+        assert_eq!(
+            prepared_bitget
+                .iter()
+                .map(|row| row.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTCUSDT", "ETHUSDT"]
+        );
     }
 
     #[test]
@@ -45235,6 +45792,53 @@ mod tests {
         .expect("hyperliquid row");
         assert_eq!(hyperliquid_row.symbol, "BTC");
         assert_eq!(hyperliquid_row.bid_qty, "1.00000000");
+    }
+
+    #[test]
+    fn hyperliquid_wss_source_event_accepts_usdt_display_symbol_with_base_coin_event() {
+        let fetched_at = UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at");
+        let hyperliquid_raw = r#"{
+          "status":"streaming",
+          "market":"perp",
+          "fail_closed":false,
+          "wss_update_count":2,
+          "last_error":null,
+          "rows":[{
+            "symbol":"0GUSDT",
+            "venue_id":"venue:HYPERLIQUID-PERP",
+            "instrument_id":"inst:HYPERLIQUID:0GUSDT:PERP",
+            "best_bid":"1.001",
+            "best_ask":"1.002",
+            "bid_size":"10.0",
+            "ask_size":"12.0",
+            "source_sequence":"2",
+            "source_event_id":"hyperliquid:wss-book-ticker:perp:0G:1778630400000",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          }]
+        }"#;
+        let hyperliquid_quotes = parse_public_wss_monitor_quote_map_for_basis(
+            hyperliquid_raw,
+            "http://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status",
+            HyperliquidPublicWssMarket::Perp.as_str(),
+            fetched_at,
+        )
+        .expect("hyperliquid monitor quotes");
+        let hyperliquid_row = public_wss_quote_to_monitor_book_ticker_row(
+            hyperliquid_quotes
+                .get("0GUSDT")
+                .expect("hyperliquid display quote"),
+            "http://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status",
+            "0GUSDT",
+            HyperliquidPublicWssMarket::Perp.venue_id(),
+            "inst:HYPERLIQUID:0GUSDT:PERP",
+            fetched_at,
+        )
+        .expect("hyperliquid row");
+
+        assert_eq!(hyperliquid_row.bid_price, "1.001");
+        assert_eq!(hyperliquid_row.ask_qty, "12.0");
     }
 
     #[test]
@@ -45833,6 +46437,61 @@ mod tests {
             .open_close_condition
             .as_deref()
             .is_some_and(|value| value.contains("reduce-only")));
+    }
+
+    #[test]
+    fn portfolio_dashboard_reads_resident_account_raw_snapshots() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let resident_dir = root
+            .path()
+            .join("resident-live")
+            .join("cross-exchange-funding-arb")
+            .join("cycle-1")
+            .join("private-readonly");
+        fs::create_dir_all(&resident_dir).expect("resident dir");
+        write_utf8(
+            resident_dir.join("funding_arb_private_account_raw_snapshot.json"),
+            r#"{"status":"healthy","updated_at":"2026-05-19T00:00:04Z","statements":[{"account_id":"acct:binance","payload":{"asset":"USDT","available":"100.00","maintMargin":"5.00","walletBalance":"120.00"},"venue_family":"binance"},{"account_id":"acct:hyperliquid","payload":{"accountValue":"80.00","availableMargin":"70.00"},"venue_family":"hyperliquid"}]}"#,
+        )
+        .expect("account raw snapshot");
+
+        let options = PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            once: true,
+            ..PortfolioDashboardOptions::default()
+        };
+
+        let snapshot = build_portfolio_dashboard_snapshot(&options).expect("snapshot");
+
+        assert_eq!(snapshot.balances.len(), 2);
+        assert!(!snapshot
+            .source_errors
+            .iter()
+            .any(|error| error.contains("account snapshot source was not provided")));
+        assert_eq!(snapshot.updated_at, "2026-05-19T00:00:04Z");
+        assert!(snapshot
+            .balances
+            .iter()
+            .any(|row| row.venue_family == "binance" && row.asset == "USDT"));
+    }
+
+    #[test]
+    fn portfolio_dashboard_treats_empty_resident_root_as_pending_not_source_error() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let options = PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            once: true,
+            ..PortfolioDashboardOptions::default()
+        };
+
+        let snapshot = build_portfolio_dashboard_snapshot(&options).expect("snapshot");
+
+        assert_eq!(snapshot.status, "missing");
+        assert!(snapshot.balances.is_empty());
+        assert!(!snapshot
+            .source_errors
+            .iter()
+            .any(|error| error.contains("has no account raw snapshots yet")));
     }
 
     #[test]
@@ -47744,11 +48403,14 @@ mod tests {
             .any(|pair| pair[0] == "--market" && pair[1] == "swap"));
         assert!(okx_perp_args
             .windows(2)
-            .any(|pair| pair[0] == "--symbol" && pair[1] == OKX_BASIS_SYMBOL));
+            .any(|pair| pair[0] == "--symbol" && pair[1] == OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS));
         assert_eq!(bitget_spot_args[0], "bitget-wss-book-ticker");
         assert!(bitget_spot_args
             .windows(2)
             .any(|pair| pair[0] == "--market" && pair[1] == "spot"));
+        assert!(bitget_spot_args.windows(2).any(
+            |pair| pair[0] == "--symbol" && pair[1] == BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        ));
         assert_eq!(resident_args[0], "multi-venue-basis-resident-live");
         assert!(resident_args
             .windows(2)
@@ -50195,6 +50857,38 @@ mod tests {
     }
 
     #[test]
+    fn aster_basis_monitor_snapshot_accepts_missing_spot_source_with_warning() {
+        let perp = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let options = AsterBasisMonitorOptions {
+            once: true,
+            ..AsterBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_aster_basis_monitor_snapshot_from_optional_spot_json(
+            None,
+            perp,
+            premium,
+            &options,
+            vec!["Aster spot REST unavailable for test".to_owned()],
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.missing_spot_count, 1);
+        assert_eq!(snapshot.rows[0].source_status, "missing_spot");
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Aster spot REST unavailable")));
+    }
+
+    #[test]
     fn bybit_basis_monitor_snapshot_scans_all_symbols_and_filters_tiny_funding() {
         let spot = r#"{
           "retCode": 0,
@@ -50490,6 +51184,29 @@ mod tests {
     }
 
     #[test]
+    fn bitget_spot_ticker_parser_accepts_array_size_fields() {
+        let spot = r#"{
+          "code": "00000",
+          "msg": "success",
+          "requestTime": 1778584221117,
+          "data": [
+            {"symbol":"BTCUSDT","bidPr":"99.90","bidSz":["1.0"],"askPr":"100.00","askSz":["2.0"],"ts":"1778584221117"},
+            {"symbol":"ETHUSDT","bidPr":"49.90","bidSz":[],"askPr":"50.00","askSz":["4.0"],"ts":"1778584221117"}
+          ]
+        }"#;
+
+        let rows = parse_bitget_spot_ticker_rows(spot).expect("bitget spot rows");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].symbol, "BTCUSDT");
+        assert_eq!(rows[0].bid_qty, "1.0");
+        assert_eq!(rows[0].ask_qty, "2.0");
+        assert_eq!(rows[1].symbol, "ETHUSDT");
+        assert_eq!(rows[1].bid_qty, "0");
+        assert_eq!(rows[1].ask_qty, "4.0");
+    }
+
+    #[test]
     fn bitget_basis_monitor_snapshot_reports_missing_spot_without_failing_open() {
         let spot = r#"{
           "code": "00000",
@@ -50646,6 +51363,48 @@ mod tests {
     }
 
     #[test]
+    fn hyperliquid_perp_asset_id_uses_universe_index_and_usdt_display_symbol() {
+        let payload = r#"[
+          {
+            "universe": [
+              {"name":"BTC","szDecimals":5,"maxLeverage":50},
+              {"name":"ETH","szDecimals":4,"maxLeverage":50},
+              {"name":"OLD","szDecimals":4,"maxLeverage":3,"isDelisted":true}
+            ]
+          },
+          [{}, {}, {}]
+        ]"#;
+
+        assert_eq!(
+            parse_hyperliquid_perp_asset_id_from_meta_and_contexts(payload, "BTCUSDT")
+                .expect("BTC asset id"),
+            0
+        );
+        assert_eq!(
+            parse_hyperliquid_perp_asset_id_from_meta_and_contexts(payload, "ethusdt")
+                .expect("ETH asset id"),
+            1
+        );
+        assert!(
+            parse_hyperliquid_perp_asset_id_from_meta_and_contexts(payload, "OLDUSDT").is_err()
+        );
+    }
+
+    #[test]
+    fn hyperliquid_perp_asset_id_accepts_case_variant_coin_names() {
+        let payload = r#"[
+          {"universe":[{"name":"kPEPE","szDecimals":0,"maxLeverage":3}]},
+          [{}]
+        ]"#;
+
+        assert_eq!(
+            parse_hyperliquid_perp_asset_id_from_meta_and_contexts(payload, "KPEPEUSDT")
+                .expect("kPEPE asset id"),
+            0
+        );
+    }
+
+    #[test]
     fn hyperliquid_basis_monitor_snapshot_rejects_private_or_malformed_shape() {
         let spot = r#"{"balances":[{"coin":"USDC","total":"1"}]}"#;
         let perp = r#"[]"#;
@@ -50658,6 +51417,48 @@ mod tests {
             .expect_err("private account shaped payload must not be accepted");
 
         assert!(error.to_string().contains("expected JSON array"));
+    }
+
+    #[test]
+    fn hyperliquid_basis_monitor_snapshot_normalizes_usdt_perp_meta_names() {
+        let spot = r#"[
+          {
+            "tokens": [
+              {"name":"USDC","index":0},
+              {"name":"0G","index":1}
+            ],
+            "universe": [
+              {"name":"0G/USDC","tokens":[1,0],"index":1,"isCanonical":true}
+            ]
+          },
+          [
+            {"dayNtlVlm":"1000000.0","markPx":"1.00","midPx":"1.00","prevDayPx":"0.99"}
+          ]
+        ]"#;
+        let perp = r#"[
+          {
+            "universe": [
+              {"name":"0GUSDT","szDecimals":2,"maxLeverage":3}
+            ],
+            "marginTables": []
+          },
+          [
+            {"dayNtlVlm":"1000000.0","funding":"0.00010000","markPx":"1.01","midPx":"1.01","openInterest":"100.0","oraclePx":"1.00","premium":"0.0001","prevDayPx":"0.99"}
+          ]
+        ]"#;
+        let options = HyperliquidBasisMonitorOptions {
+            once: true,
+            ..HyperliquidBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_hyperliquid_basis_monitor_snapshot_from_json(spot, perp, &options)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.missing_spot_count, 0);
+        assert_eq!(snapshot.rows[0].symbol, "0G");
+        assert_eq!(snapshot.rows[0].spot_ask.as_deref(), Some("1.00"));
+        assert_eq!(snapshot.rows[0].perp_bid.as_deref(), Some("1.01"));
     }
 
     fn simulated_config_yaml() -> &'static str {
