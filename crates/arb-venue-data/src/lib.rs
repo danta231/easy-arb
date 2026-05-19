@@ -1468,6 +1468,17 @@ pub struct BybitPublicWssTextStreamClient {
     stream_url: String,
 }
 
+/// 通用公开 WSS 文本流客户端。
+///
+/// 中文说明：用于需要连接后发送公开订阅 JSON 的交易所行情流。它只处理公开
+/// 行情文本消息，不读取账户、不签名、不下单、不撤单、不转账。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicJsonWssTextStreamClient {
+    venue_id: VenueId,
+    stream_url: String,
+    label: &'static str,
+}
+
 impl BinancePublicWssTextStreamClient {
     pub fn new(venue_id: VenueId, stream_url: impl Into<String>) -> VenueDataResult<Self> {
         let stream_url = stream_url.into();
@@ -1645,6 +1656,128 @@ impl BybitPublicWssTextStreamClient {
                             ReadOnlySurface::MarketData,
                             ExternalErrorClass::Disconnected,
                             format!("Bybit public WSS heartbeat flush failed: {error}"),
+                        ))
+                    })?;
+                }
+                tungstenite::Message::Close(_) => break,
+                tungstenite::Message::Binary(_) | tungstenite::Message::Frame(_) => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PublicJsonWssTextStreamClient {
+    pub fn new(
+        venue_id: VenueId,
+        stream_url: impl Into<String>,
+        label: &'static str,
+    ) -> VenueDataResult<Self> {
+        let stream_url = stream_url.into();
+        if !stream_url.starts_with("wss://") {
+            return Err(VenueDataError::InvalidQuery {
+                field: "public_json.wss.stream_url",
+                reason: "public WSS stream URL must use wss://",
+            });
+        }
+        Ok(Self {
+            venue_id,
+            stream_url,
+            label,
+        })
+    }
+
+    pub fn stream_url(&self) -> &str {
+        &self.stream_url
+    }
+
+    /// 连接真实公开 WSS，发送订阅请求，并按文本消息回调。
+    pub fn read_live_text_messages_observed<F>(
+        &self,
+        subscribe_payload: &str,
+        max_text_messages: usize,
+        mut observer: F,
+    ) -> VenueDataResult<()>
+    where
+        F: FnMut(&str, UtcTimestamp) -> bool,
+    {
+        if subscribe_payload.trim().is_empty() {
+            return Err(VenueDataError::InvalidQuery {
+                field: "public_json.wss.subscribe_payload",
+                reason: "must contain a public subscribe payload",
+            });
+        }
+        if max_text_messages == 0 {
+            return Err(VenueDataError::InvalidQuery {
+                field: "public_json.wss.max_text_messages",
+                reason: "must be greater than zero",
+            });
+        }
+
+        let (mut socket, _response) =
+            tungstenite::connect(self.stream_url.as_str()).map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::Disconnected,
+                    format!(
+                        "cannot connect {} public WSS `{}`: {error}",
+                        self.label, self.stream_url
+                    ),
+                ))
+            })?;
+        socket
+            .send(tungstenite::Message::Text(subscribe_payload.to_owned()))
+            .map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::Disconnected,
+                    format!("{} public WSS subscribe send failed: {error}", self.label),
+                ))
+            })?;
+
+        let mut text_messages = 0_usize;
+        while text_messages < max_text_messages {
+            let message = socket.read().map_err(|error| {
+                VenueDataError::External(ClassifiedExternalError::new(
+                    self.venue_id.clone(),
+                    ReadOnlySurface::MarketData,
+                    ExternalErrorClass::Disconnected,
+                    format!("{} public WSS read failed: {error}", self.label),
+                ))
+            })?;
+            match message {
+                tungstenite::Message::Text(text) => {
+                    if text.trim().eq_ignore_ascii_case("ping") {
+                        socket
+                            .send(tungstenite::Message::Text("pong".to_owned()))
+                            .map_err(|error| {
+                                VenueDataError::External(ClassifiedExternalError::new(
+                                    self.venue_id.clone(),
+                                    ReadOnlySurface::MarketData,
+                                    ExternalErrorClass::Disconnected,
+                                    format!(
+                                        "{} public WSS heartbeat response failed: {error}",
+                                        self.label
+                                    ),
+                                ))
+                            })?;
+                        continue;
+                    }
+                    let ingested_at = current_utc_timestamp(&self.venue_id)?;
+                    text_messages += 1;
+                    if !observer(&text, ingested_at) {
+                        break;
+                    }
+                }
+                tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {
+                    socket.flush().map_err(|error| {
+                        VenueDataError::External(ClassifiedExternalError::new(
+                            self.venue_id.clone(),
+                            ReadOnlySurface::MarketData,
+                            ExternalErrorClass::Disconnected,
+                            format!("{} public WSS heartbeat flush failed: {error}", self.label),
                         ))
                     })?;
                 }

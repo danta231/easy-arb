@@ -87,8 +87,8 @@ use arb_venue_data::{
     BinanceUsdmPremiumIndexAdapter, BybitLinearPremiumIndexAdapter, BybitPublicInstrument,
     BybitPublicMarket, BybitPublicTickerAdapter, BybitPublicWssTextStreamClient, DataFreshness,
     HybridMarketDataInput, HybridMarketDataStatus, HybridMarketDataUpdate, MarketDataQuery,
-    MarketDataReader, MarketDataTransport, MarketQuote, RestWssMarketDataCoordinator,
-    WssQuoteUpdate,
+    MarketDataReader, MarketDataTransport, MarketQuote, PublicJsonWssTextStreamClient,
+    RestWssMarketDataCoordinator, WssQuoteUpdate,
 };
 
 #[cfg(feature = "live-exec")]
@@ -248,6 +248,8 @@ const FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS: i128 = 60_000;
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_PRIVATE_READONLY_SNAPSHOT_DEFAULT_OUT: &str =
     "target/funding-arb-private-readonly-snapshot";
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/funding-arb-resident-live";
 const FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS: i128 = 150;
 const FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS: i128 = 5;
 const BASIS_AUTO_PRICE_GUARD_MAX_BPS: i128 = 100;
@@ -277,15 +279,17 @@ const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 const BYBIT_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8802";
 const BYBIT_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 const BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+const OKX_PUBLIC_WSS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
+const BITGET_PUBLIC_WSS_URL: &str = "wss://ws.bitget.com/v2/ws/public";
+const OKX_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+const BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 #[cfg(feature = "live-exec")]
 const MULTI_VENUE_BYBIT_SPOT_WSS_BIND_ADDR: &str = "127.0.0.1:8805";
 #[cfg(feature = "live-exec")]
 const MULTI_VENUE_BYBIT_PERP_WSS_BIND_ADDR: &str = "127.0.0.1:8806";
-#[cfg(feature = "live-exec")]
 const MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR: &str = "127.0.0.1:8807";
 #[cfg(feature = "live-exec")]
 const MULTI_VENUE_OKX_PERP_WSS_BIND_ADDR: &str = "127.0.0.1:8808";
-#[cfg(feature = "live-exec")]
 const MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR: &str = "127.0.0.1:8809";
 #[cfg(feature = "live-exec")]
 const MULTI_VENUE_BITGET_PERP_WSS_BIND_ADDR: &str = "127.0.0.1:8810";
@@ -2160,6 +2164,107 @@ impl Default for BybitWssBookTickerMonitorOptions {
 
 pub type BybitWssBookTickerProbeOptions = BybitWssBookTickerMonitorOptions;
 
+/// OKX 公开 WSS ticker 支持的市场。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OkxPublicWssMarket {
+    Spot,
+    Swap,
+}
+
+impl OkxPublicWssMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "SPOT",
+            Self::Swap => "SWAP",
+        }
+    }
+
+    fn venue_id(self) -> &'static str {
+        match self {
+            Self::Spot => "venue:OKX-SPOT",
+            Self::Swap => "venue:OKX-SWAP",
+        }
+    }
+}
+
+/// Bitget 公开 WSS ticker 支持的市场。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BitgetPublicWssMarket {
+    Spot,
+    UsdtFutures,
+}
+
+impl BitgetPublicWssMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::UsdtFutures => "usdt-futures",
+        }
+    }
+
+    fn inst_type(self) -> &'static str {
+        match self {
+            Self::Spot => "SPOT",
+            Self::UsdtFutures => "USDT-FUTURES",
+        }
+    }
+
+    fn venue_id(self) -> &'static str {
+        match self {
+            Self::Spot => "venue:BITGET-SPOT",
+            Self::UsdtFutures => "venue:BITGET-USDT-FUTURES",
+        }
+    }
+}
+
+/// OKX `tickers` WSS 公开行情常驻任务选项。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxWssBookTickerMonitorOptions {
+    pub bind_addr: String,
+    pub symbol: String,
+    pub market: OkxPublicWssMarket,
+    pub updates: usize,
+    pub reconnect_delay_secs: u64,
+    pub once: bool,
+}
+
+impl Default for OkxWssBookTickerMonitorOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR.to_owned(),
+            symbol: OKX_BASIS_SYMBOL.to_owned(),
+            market: OkxPublicWssMarket::Spot,
+            updates: 3,
+            reconnect_delay_secs: OKX_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
+            once: false,
+        }
+    }
+}
+
+/// Bitget `ticker` WSS 公开行情常驻任务选项。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetWssBookTickerMonitorOptions {
+    pub bind_addr: String,
+    pub symbol: String,
+    pub market: BitgetPublicWssMarket,
+    pub updates: usize,
+    pub reconnect_delay_secs: u64,
+    pub once: bool,
+}
+
+impl Default for BitgetWssBookTickerMonitorOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR.to_owned(),
+            symbol: BITGET_BASIS_SYMBOL.to_owned(),
+            market: BitgetPublicWssMarket::Spot,
+            updates: 3,
+            reconnect_delay_secs: BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
+            once: false,
+        }
+    }
+}
+
 /// Binance `bookTicker` WSS 公开行情探测结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinanceWssBookTickerProbeReport {
@@ -2506,6 +2611,57 @@ pub struct FundingArbGuardedLiveCanaryOnceReport {
     pub residual_risk: Option<String>,
     pub execution_report_status: Option<String>,
     pub blocking_reasons: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+    pub mutable_execution_started: bool,
+}
+
+/// funding arb 常驻 guarded live 选项。
+///
+/// 中文说明：该入口常驻轮询 funding arb 候选，每轮刷新私有只读快照并调用
+/// `funding-arb-guarded-live-canary-once`。由于 funding arb 独立退出监督尚未接入，
+/// live 模式在第一次真实 dispatch 后会自动停住并要求人工接管后续退出。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbResidentLiveOptions {
+    pub config_path: PathBuf,
+    pub output_dir: Option<PathBuf>,
+    pub snapshot_path: Option<PathBuf>,
+    pub pair_id: Option<String>,
+    pub sources: Vec<FundingArbVenueSource>,
+    pub funding_settlement_ledger_path: Option<PathBuf>,
+    pub funding_settlement_raw_snapshot_path: Option<PathBuf>,
+    pub private_execution_snapshot_path: Option<PathBuf>,
+    pub private_order_events_dir: Option<PathBuf>,
+    pub poll_interval_secs: u64,
+    pub max_cycles: Option<u64>,
+    pub max_live_entries: u64,
+    pub notional_usd: String,
+    pub taker_fee_bps: i128,
+    pub slippage_buffer_bps: i128,
+    pub max_entry_price_divergence_bps: i128,
+    pub min_net_funding_bps: i128,
+    pub execute_live: bool,
+    pub acknowledge_funding_arb_live_orders: bool,
+    pub hyperliquid_user: Option<String>,
+    pub hyperliquid_source: String,
+    pub hyperliquid_vault_address: Option<String>,
+    pub hyperliquid_expires_after_ms: Option<u64>,
+    pub hyperliquid_asset_ids: BTreeMap<String, u32>,
+    pub aster_user: Option<String>,
+    pub aster_signer: Option<String>,
+    pub aster_signer_cmd_env: String,
+}
+
+/// funding arb 常驻 guarded live 报告。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbResidentLiveReport {
+    pub phase: String,
+    pub cycles: u64,
+    pub last_pair_id: Option<String>,
+    pub last_symbol: Option<String>,
+    pub last_net_funding_bps: Option<i128>,
+    pub dispatch_attempted: bool,
+    pub live_entry_count: u64,
+    pub halt_reason: Option<String>,
     pub output_dir: Option<PathBuf>,
     pub mutable_execution_started: bool,
 }
@@ -7466,7 +7622,12 @@ fn run_multi_venue_basis_live_stack_inner(
         )?;
     }
 
-    wait_for_multi_venue_basis_live_stack_monitors_ready(&options, &output_root, &mut children)?;
+    if let Err(error) =
+        wait_for_multi_venue_basis_live_stack_monitors_ready(&options, &output_root, &mut children)
+    {
+        let _ = children.shutdown_all();
+        return Err(error);
+    }
     let resident_args = multi_venue_basis_live_stack_resident_args(
         &options,
         &resident_dir,
@@ -7607,7 +7768,13 @@ fn validate_multi_venue_basis_live_stack_options(
 
 #[cfg(feature = "live-exec")]
 fn multi_venue_basis_live_stack_managed_wss_supported(venue: BasisLiveVenue) -> bool {
-    matches!(venue, BasisLiveVenue::Binance | BasisLiveVenue::Bybit)
+    matches!(
+        venue,
+        BasisLiveVenue::Binance
+            | BasisLiveVenue::Bybit
+            | BasisLiveVenue::Okx
+            | BasisLiveVenue::Bitget
+    )
 }
 
 #[cfg(feature = "live-exec")]
@@ -7677,14 +7844,22 @@ fn multi_venue_basis_live_stack_monitor_symbol(
     venue: BasisLiveVenue,
     options: &MultiVenueBasisLiveStackOptions,
 ) -> String {
-    options
-        .monitor_symbol
-        .clone()
-        .unwrap_or_else(|| match venue {
-            BasisLiveVenue::Binance => BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
-            BasisLiveVenue::Bybit => BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
-            BasisLiveVenue::Okx | BasisLiveVenue::Bitget => venue.default_symbol().to_owned(),
-        })
+    if let Some(symbol) = &options.monitor_symbol {
+        if matches!(venue, BasisLiveVenue::Okx | BasisLiveVenue::Bitget)
+            && matches!(
+                symbol.trim().to_ascii_uppercase().as_str(),
+                "ALL" | "ALL_USDT" | "*"
+            )
+        {
+            return venue.default_symbol().to_owned();
+        }
+        return symbol.clone();
+    }
+    match venue {
+        BasisLiveVenue::Binance => BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+        BasisLiveVenue::Bybit => BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+        BasisLiveVenue::Okx | BasisLiveVenue::Bitget => venue.default_symbol().to_owned(),
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -7700,6 +7875,10 @@ fn multi_venue_basis_live_stack_monitor_args(
         (BasisLiveVenue::Binance, "perp") => ("binance-wss-book-ticker", "usdm-perp"),
         (BasisLiveVenue::Bybit, "spot") => ("bybit-wss-book-ticker", "spot"),
         (BasisLiveVenue::Bybit, "perp") => ("bybit-wss-book-ticker", "linear-perp"),
+        (BasisLiveVenue::Okx, "spot") => ("okx-wss-book-ticker", "spot"),
+        (BasisLiveVenue::Okx, "perp") => ("okx-wss-book-ticker", "swap"),
+        (BasisLiveVenue::Bitget, "spot") => ("bitget-wss-book-ticker", "spot"),
+        (BasisLiveVenue::Bitget, "perp") => ("bitget-wss-book-ticker", "usdt-futures"),
         _ => {
             return Err(RuntimeError::UnsafeConfig {
                 message: format!(
@@ -8951,7 +9130,6 @@ fn ensure_timestamp_within_max_age(
     Ok(())
 }
 
-#[cfg(feature = "live-exec")]
 fn runtime_timestamp_millis(timestamp: UtcTimestamp) -> RuntimeResult<i128> {
     let seconds = i128::from(timestamp.unix_seconds())
         .checked_mul(1_000)
@@ -14779,6 +14957,326 @@ fn run_bybit_wss_book_ticker_monitor_cycle(
     }
 }
 
+/// 运行 OKX 公开 `tickers` WSS 常驻任务。
+pub fn run_okx_wss_book_ticker_monitor(
+    options: OkxWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    validate_okx_wss_probe_options(&options)?;
+    let symbol_scope = normalize_okx_wss_symbol_scope(&options.symbol)?;
+    let state = Arc::new(RwLock::new(
+        PublicTopOfBookMonitorSnapshot::empty_with_market(
+            &symbol_scope,
+            options.market.as_str(),
+            "pending-rest-bootstrap",
+        ),
+    ));
+    if !options.once {
+        start_okx_wss_book_ticker_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "okx-wss-book-ticker: api=http://{} symbol_scope={} market={} reconnect_delay_secs={} mutable_execution_started=false",
+            options.bind_addr,
+            symbol_scope,
+            options.market.as_str(),
+            options.reconnect_delay_secs,
+        );
+    }
+
+    let mut rebuild_from_rest = false;
+    loop {
+        let cycle = run_okx_wss_book_ticker_monitor_cycle(
+            &options,
+            state.clone(),
+            &symbol_scope,
+            rebuild_from_rest,
+        );
+        match cycle {
+            Ok(()) if options.once => return Ok(()),
+            Ok(()) => {}
+            Err(error) if options.once => return Err(error),
+            Err(error) => eprintln!("okx-wss-book-ticker cycle failed: {error}"),
+        }
+        rebuild_from_rest = true;
+        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+    }
+}
+
+fn run_okx_wss_book_ticker_monitor_cycle(
+    options: &OkxWssBookTickerMonitorOptions,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+    symbol_scope: &str,
+    rebuild_from_rest: bool,
+) -> RuntimeResult<()> {
+    if rebuild_from_rest {
+        state
+            .write()
+            .expect("OKX WSS monitor state lock poisoned")
+            .begin_rest_rebuild();
+    }
+    let mut market_state = match bootstrap_okx_wss_book_ticker(symbol_scope, options.market) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            state
+                .write()
+                .expect("OKX WSS monitor state lock poisoned")
+                .record_failure(
+                    format!("REST snapshot bootstrap/rebuild failed: {error}"),
+                    false,
+                );
+            return Err(error);
+        }
+    };
+    {
+        let mut snapshot = state.write().expect("OKX WSS monitor state lock poisoned");
+        snapshot.stream_url = market_state.stream_url.clone();
+        snapshot.symbol = symbol_scope.to_owned();
+        snapshot.market = options.market.as_str().to_owned();
+        snapshot.rows.clear();
+        snapshot.latest_quote = None;
+        snapshot.total_rows = 0;
+        for update in &market_state.rest_updates {
+            snapshot.record_update_with_symbol(update, Some(symbol_scope));
+        }
+    }
+
+    let connected_at = current_utc_timestamp()?;
+    for coordinator in market_state.coordinators.values_mut() {
+        let update = coordinator.apply(HybridMarketDataInput::WssConnected {
+            occurred_at: connected_at,
+            ingested_at: connected_at,
+        })?;
+        state
+            .write()
+            .expect("OKX WSS monitor state lock poisoned")
+            .record_update_with_symbol(&update, Some(symbol_scope));
+    }
+
+    let text_client = PublicJsonWssTextStreamClient::new(
+        VenueId::new(options.market.venue_id())?,
+        market_state.stream_url.clone(),
+        "OKX",
+    )?;
+    let subscribe_payload = market_state.subscribe_args.join("");
+    let max_text_messages = if options.once {
+        options.updates
+    } else {
+        usize::MAX
+    };
+    let mut observed_wss_event = false;
+    let mut observer_error = None;
+    let read_result = text_client.read_live_text_messages_observed(
+        &subscribe_payload,
+        max_text_messages,
+        |raw_json, ingested_at| match apply_okx_wss_book_ticker_text(
+            raw_json,
+            ingested_at,
+            options.market,
+            &mut market_state,
+        ) {
+            Ok(Some(update)) => {
+                observed_wss_event = true;
+                let keep_going = !update.fail_closed;
+                state
+                    .write()
+                    .expect("OKX WSS monitor state lock poisoned")
+                    .record_update_with_symbol(&update, Some(symbol_scope));
+                keep_going
+            }
+            Ok(None) => true,
+            Err(error) => {
+                observer_error = Some(error.to_string());
+                state
+                    .write()
+                    .expect("OKX WSS monitor state lock poisoned")
+                    .record_failure(error.to_string(), false);
+                false
+            }
+        },
+    );
+
+    if let Some(error) = observer_error {
+        return Err(RuntimeError::LiveMarketData { message: error });
+    }
+    match read_result {
+        Ok(()) => {
+            if !options.once {
+                state
+                    .write()
+                    .expect("OKX WSS monitor state lock poisoned")
+                    .record_stream_end_with_label("OKX public WSS");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state
+                .write()
+                .expect("OKX WSS monitor state lock poisoned")
+                .record_failure(error.to_string(), !observed_wss_event);
+            Err(error.into())
+        }
+    }
+}
+
+/// 运行 Bitget 公开 `ticker` WSS 常驻任务。
+pub fn run_bitget_wss_book_ticker_monitor(
+    options: BitgetWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    validate_bitget_wss_probe_options(&options)?;
+    let symbol_scope = normalize_bitget_wss_symbol_scope(&options.symbol)?;
+    let state = Arc::new(RwLock::new(
+        PublicTopOfBookMonitorSnapshot::empty_with_market(
+            &symbol_scope,
+            options.market.as_str(),
+            "pending-rest-bootstrap",
+        ),
+    ));
+    if !options.once {
+        start_bitget_wss_book_ticker_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "bitget-wss-book-ticker: api=http://{} symbol_scope={} market={} reconnect_delay_secs={} mutable_execution_started=false",
+            options.bind_addr,
+            symbol_scope,
+            options.market.as_str(),
+            options.reconnect_delay_secs,
+        );
+    }
+
+    let mut rebuild_from_rest = false;
+    loop {
+        let cycle = run_bitget_wss_book_ticker_monitor_cycle(
+            &options,
+            state.clone(),
+            &symbol_scope,
+            rebuild_from_rest,
+        );
+        match cycle {
+            Ok(()) if options.once => return Ok(()),
+            Ok(()) => {}
+            Err(error) if options.once => return Err(error),
+            Err(error) => eprintln!("bitget-wss-book-ticker cycle failed: {error}"),
+        }
+        rebuild_from_rest = true;
+        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+    }
+}
+
+fn run_bitget_wss_book_ticker_monitor_cycle(
+    options: &BitgetWssBookTickerMonitorOptions,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+    symbol_scope: &str,
+    rebuild_from_rest: bool,
+) -> RuntimeResult<()> {
+    if rebuild_from_rest {
+        state
+            .write()
+            .expect("Bitget WSS monitor state lock poisoned")
+            .begin_rest_rebuild();
+    }
+    let mut market_state = match bootstrap_bitget_wss_book_ticker(symbol_scope, options.market) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            state
+                .write()
+                .expect("Bitget WSS monitor state lock poisoned")
+                .record_failure(
+                    format!("REST snapshot bootstrap/rebuild failed: {error}"),
+                    false,
+                );
+            return Err(error);
+        }
+    };
+    {
+        let mut snapshot = state
+            .write()
+            .expect("Bitget WSS monitor state lock poisoned");
+        snapshot.stream_url = market_state.stream_url.clone();
+        snapshot.symbol = symbol_scope.to_owned();
+        snapshot.market = options.market.as_str().to_owned();
+        snapshot.rows.clear();
+        snapshot.latest_quote = None;
+        snapshot.total_rows = 0;
+        for update in &market_state.rest_updates {
+            snapshot.record_update(update);
+        }
+    }
+
+    let connected_at = current_utc_timestamp()?;
+    for coordinator in market_state.coordinators.values_mut() {
+        let update = coordinator.apply(HybridMarketDataInput::WssConnected {
+            occurred_at: connected_at,
+            ingested_at: connected_at,
+        })?;
+        state
+            .write()
+            .expect("Bitget WSS monitor state lock poisoned")
+            .record_update(&update);
+    }
+
+    let text_client = PublicJsonWssTextStreamClient::new(
+        VenueId::new(options.market.venue_id())?,
+        market_state.stream_url.clone(),
+        "Bitget",
+    )?;
+    let subscribe_payload = market_state.subscribe_args.join("");
+    let max_text_messages = if options.once {
+        options.updates
+    } else {
+        usize::MAX
+    };
+    let mut observed_wss_event = false;
+    let mut observer_error = None;
+    let read_result = text_client.read_live_text_messages_observed(
+        &subscribe_payload,
+        max_text_messages,
+        |raw_json, ingested_at| match apply_bitget_wss_book_ticker_text(
+            raw_json,
+            ingested_at,
+            options.market,
+            &mut market_state,
+        ) {
+            Ok(Some(update)) => {
+                observed_wss_event = true;
+                let keep_going = !update.fail_closed;
+                state
+                    .write()
+                    .expect("Bitget WSS monitor state lock poisoned")
+                    .record_update(&update);
+                keep_going
+            }
+            Ok(None) => true,
+            Err(error) => {
+                observer_error = Some(error.to_string());
+                state
+                    .write()
+                    .expect("Bitget WSS monitor state lock poisoned")
+                    .record_failure(error.to_string(), false);
+                false
+            }
+        },
+    );
+
+    if let Some(error) = observer_error {
+        return Err(RuntimeError::LiveMarketData { message: error });
+    }
+    match read_result {
+        Ok(()) => {
+            if !options.once {
+                state
+                    .write()
+                    .expect("Bitget WSS monitor state lock poisoned")
+                    .record_stream_end_with_label("Bitget public WSS");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state
+                .write()
+                .expect("Bitget WSS monitor state lock poisoned")
+                .record_failure(error.to_string(), !observed_wss_event);
+            Err(error.into())
+        }
+    }
+}
+
 struct PublicTopOfBookAllMarketState {
     venue_id: VenueId,
     stream_url: String,
@@ -14793,6 +15291,16 @@ struct PublicTopOfBookAllMarketState {
 struct PublicTopOfBookRuntimeRaw {
     symbol: String,
     update_id: u64,
+    best_bid: Price,
+    best_ask: Price,
+    bid_size: Quantity,
+    ask_size: Quantity,
+    observed_at: UtcTimestamp,
+}
+
+struct PublicWssTickerRuntimeRaw {
+    symbol: String,
+    venue_symbol: String,
     best_bid: Price,
     best_ask: Price,
     bid_size: Quantity,
@@ -14980,6 +15488,103 @@ fn prepare_bybit_wss_book_ticker_rest_rows(
     Ok(prepared)
 }
 
+fn bootstrap_okx_wss_book_ticker(
+    symbol_scope: &str,
+    market: OkxPublicWssMarket,
+) -> RuntimeResult<PublicTopOfBookAllMarketState> {
+    let symbol = normalize_okx_wss_symbol_scope(symbol_scope)?;
+    let venue_id = VenueId::new(market.venue_id())?;
+    let instrument_id = okx_public_wss_instrument_id(&symbol, market)?;
+    let inst_id = okx_public_wss_inst_id(&symbol, market);
+    let raw_rest_snapshot = fetch_public_json_with_curl(&okx_tickers_url(market.as_str()))?;
+    let row = parse_okx_ticker_rows(&raw_rest_snapshot, "okx wss bootstrap tickers")?
+        .into_iter()
+        .find(|row| row.inst_id == inst_id)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("OKX WSS REST bootstrap returned no ticker for `{inst_id}`"),
+        })?;
+    let observed_at = current_utc_timestamp()?;
+    let quote =
+        okx_wss_rest_quote_from_row(&row, &symbol, &venue_id, instrument_id.clone(), observed_at)?;
+    let mut coordinator = RestWssMarketDataCoordinator::new(
+        venue_id.clone(),
+        instrument_id,
+        observed_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+    Ok(PublicTopOfBookAllMarketState {
+        venue_id,
+        stream_url: OKX_PUBLIC_WSS_URL.to_owned(),
+        subscribe_args: vec![okx_wss_ticker_subscribe_payload(&symbol, market)],
+        all_symbols_scope: false,
+        coordinators: BTreeMap::from([(symbol.clone(), coordinator)]),
+        local_sequences: BTreeMap::from([(symbol, 1_u64)]),
+        last_exchange_update_ids: BTreeMap::new(),
+        rest_updates: vec![update],
+    })
+}
+
+fn bootstrap_bitget_wss_book_ticker(
+    symbol_scope: &str,
+    market: BitgetPublicWssMarket,
+) -> RuntimeResult<PublicTopOfBookAllMarketState> {
+    let symbol = normalize_bitget_wss_symbol_scope(symbol_scope)?;
+    let venue_id = VenueId::new(market.venue_id())?;
+    let instrument_id = bitget_public_wss_instrument_id(&symbol, market)?;
+    let raw_rest_snapshot = match market {
+        BitgetPublicWssMarket::Spot => fetch_public_json_with_curl(&bitget_spot_tickers_url())?,
+        BitgetPublicWssMarket::UsdtFutures => {
+            fetch_public_json_with_curl(&bitget_usdt_futures_tickers_url())?
+        }
+    };
+    let rest_row = match market {
+        BitgetPublicWssMarket::Spot => parse_bitget_spot_ticker_rows(&raw_rest_snapshot)?
+            .into_iter()
+            .find(|row| row.symbol.eq_ignore_ascii_case(&symbol)),
+        BitgetPublicWssMarket::UsdtFutures => {
+            parse_bitget_usdt_futures_ticker_rows(&raw_rest_snapshot)?
+                .into_iter()
+                .find(|row| row.symbol.eq_ignore_ascii_case(&symbol))
+                .map(|row| MonitorBookTickerRow {
+                    symbol: row.symbol,
+                    bid_price: row.bid_price,
+                    bid_qty: row.bid_qty,
+                    ask_price: row.ask_price,
+                    ask_qty: row.ask_qty,
+                })
+        }
+    }
+    .ok_or_else(|| RuntimeError::LiveMarketData {
+        message: format!("Bitget WSS REST bootstrap returned no ticker for `{symbol}`"),
+    })?;
+    let observed_at = current_utc_timestamp()?;
+    let quote = bitget_wss_rest_quote_from_row(
+        &rest_row,
+        &venue_id,
+        instrument_id.clone(),
+        market,
+        observed_at,
+    )?;
+    let mut coordinator = RestWssMarketDataCoordinator::new(
+        venue_id.clone(),
+        instrument_id,
+        observed_at,
+        MARKET_DATA_MAX_AGE_MS,
+    )?;
+    let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+    Ok(PublicTopOfBookAllMarketState {
+        venue_id,
+        stream_url: BITGET_PUBLIC_WSS_URL.to_owned(),
+        subscribe_args: vec![bitget_wss_ticker_subscribe_payload(&symbol, market)],
+        all_symbols_scope: false,
+        coordinators: BTreeMap::from([(symbol.clone(), coordinator)]),
+        local_sequences: BTreeMap::from([(symbol, 1_u64)]),
+        last_exchange_update_ids: BTreeMap::new(),
+        rest_updates: vec![update],
+    })
+}
+
 fn binance_wss_rest_quote_from_row(
     row: &MonitorBookTickerRow,
     venue_id: &VenueId,
@@ -15028,6 +15633,89 @@ fn bybit_wss_rest_quote_from_row(
             row.symbol
         )),
         freshness,
+    })
+}
+
+fn okx_wss_rest_quote_from_row(
+    row: &OkxTickerRow,
+    symbol: &str,
+    venue_id: &VenueId,
+    instrument_id: InstrumentId,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<MarketQuote> {
+    public_wss_top_of_book_quote(
+        symbol,
+        venue_id.clone(),
+        instrument_id,
+        PublicTopOfBookRuntimeRaw {
+            symbol: symbol.to_owned(),
+            update_id: 1,
+            best_bid: Price::from_str(&row.bid_price)?,
+            best_ask: Price::from_str(&row.ask_price)?,
+            bid_size: Quantity::from_str(&row.bid_qty)?,
+            ask_size: Quantity::from_str(&row.ask_qty)?,
+            observed_at,
+        },
+        format!("okx:rest-tickers:{}:{}", row.inst_id, observed_at),
+    )
+}
+
+fn bitget_wss_rest_quote_from_row(
+    row: &MonitorBookTickerRow,
+    venue_id: &VenueId,
+    instrument_id: InstrumentId,
+    market: BitgetPublicWssMarket,
+    observed_at: UtcTimestamp,
+) -> RuntimeResult<MarketQuote> {
+    public_wss_top_of_book_quote(
+        &row.symbol,
+        venue_id.clone(),
+        instrument_id,
+        PublicTopOfBookRuntimeRaw {
+            symbol: row.symbol.clone(),
+            update_id: 1,
+            best_bid: Price::from_str(&row.bid_price)?,
+            best_ask: Price::from_str(&row.ask_price)?,
+            bid_size: Quantity::from_str(&row.bid_qty)?,
+            ask_size: Quantity::from_str(&row.ask_qty)?,
+            observed_at,
+        },
+        format!(
+            "bitget:rest-tickers:{}:{}:{}",
+            market.as_str(),
+            row.symbol,
+            observed_at
+        ),
+    )
+}
+
+fn public_wss_top_of_book_quote(
+    symbol: &str,
+    venue_id: VenueId,
+    instrument_id: InstrumentId,
+    raw: PublicTopOfBookRuntimeRaw,
+    source_event_id: String,
+) -> RuntimeResult<MarketQuote> {
+    let freshness = DataFreshness::new(raw.observed_at, raw.observed_at, MARKET_DATA_MAX_AGE_MS)?;
+    Ok(MarketQuote {
+        venue_id,
+        instrument_id,
+        last_price: None,
+        best_bid: Some(raw.best_bid),
+        best_ask: Some(raw.best_ask),
+        mark_price: None,
+        index_price: None,
+        bid_size: Some(raw.bid_size),
+        ask_size: Some(raw.ask_size),
+        source_sequence: Some(raw.update_id.to_string()),
+        source_event_id: Some(source_event_id.replace(['\n', '\r'], " ")),
+        freshness,
+    })
+    .map(|mut quote| {
+        if quote.source_event_id.is_none() {
+            quote.source_event_id = Some(format!("public:wss-rest:{symbol}"));
+        }
+        quote
     })
 }
 
@@ -15179,6 +15867,102 @@ fn apply_bybit_wss_book_ticker_text(
     Ok(Some(update))
 }
 
+fn apply_okx_wss_book_ticker_text(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+    market: OkxPublicWssMarket,
+    state: &mut PublicTopOfBookAllMarketState,
+) -> RuntimeResult<Option<HybridMarketDataUpdate>> {
+    let Some(raw) = parse_okx_wss_book_ticker_runtime_raw(raw_json, ingested_at, market)? else {
+        return Ok(None);
+    };
+    if !state.coordinators.contains_key(&raw.symbol) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "OKX WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
+                raw.symbol
+            ),
+        });
+    }
+    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
+    let instrument_id = okx_public_wss_instrument_id(&raw.symbol, market)?;
+    let update = state
+        .coordinators
+        .get_mut(&raw.symbol)
+        .expect("coordinator exists")
+        .apply(HybridMarketDataInput::WssQuote {
+            update: WssQuoteUpdate {
+                venue_id: state.venue_id.clone(),
+                instrument_id,
+                last_price: None,
+                best_bid: Some(raw.best_bid),
+                best_ask: Some(raw.best_ask),
+                mark_price: None,
+                index_price: None,
+                bid_size: Some(raw.bid_size),
+                ask_size: Some(raw.ask_size),
+                source_sequence: local_sequence,
+                source_event_id: Some(format!(
+                    "event:venue-data:okx-public:wss-book-ticker:{}:{}:{}",
+                    okx_public_wss_market_event_scope(market),
+                    raw.venue_symbol,
+                    local_sequence
+                )),
+                observed_at: raw.observed_at,
+                ingested_at,
+            },
+        })?;
+    Ok(Some(update))
+}
+
+fn apply_bitget_wss_book_ticker_text(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+    market: BitgetPublicWssMarket,
+    state: &mut PublicTopOfBookAllMarketState,
+) -> RuntimeResult<Option<HybridMarketDataUpdate>> {
+    let Some(raw) = parse_bitget_wss_book_ticker_runtime_raw(raw_json, ingested_at)? else {
+        return Ok(None);
+    };
+    if !state.coordinators.contains_key(&raw.symbol) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Bitget WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
+                raw.symbol
+            ),
+        });
+    }
+    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
+    let instrument_id = bitget_public_wss_instrument_id(&raw.symbol, market)?;
+    let update = state
+        .coordinators
+        .get_mut(&raw.symbol)
+        .expect("coordinator exists")
+        .apply(HybridMarketDataInput::WssQuote {
+            update: WssQuoteUpdate {
+                venue_id: state.venue_id.clone(),
+                instrument_id,
+                last_price: None,
+                best_bid: Some(raw.best_bid),
+                best_ask: Some(raw.best_ask),
+                mark_price: None,
+                index_price: None,
+                bid_size: Some(raw.bid_size),
+                ask_size: Some(raw.ask_size),
+                source_sequence: local_sequence,
+                source_event_id: Some(format!(
+                    "event:venue-data:bitget-public:wss-book-ticker:{}:{}:{}",
+                    bitget_public_wss_market_event_scope(market),
+                    raw.venue_symbol,
+                    local_sequence
+                )),
+                observed_at: raw.observed_at,
+                ingested_at,
+            },
+        })?;
+    Ok(Some(update))
+}
+
 fn next_public_wss_local_sequence(
     state: &mut PublicTopOfBookAllMarketState,
     symbol: &str,
@@ -15264,6 +16048,7 @@ fn parse_bybit_wss_book_ticker_runtime_raw(
         .map(timestamp_from_unix_millis)
         .transpose()?
         .unwrap_or(ingested_at);
+    let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
     Ok(Some(PublicTopOfBookRuntimeRaw {
         symbol,
         update_id,
@@ -15273,6 +16058,120 @@ fn parse_bybit_wss_book_ticker_runtime_raw(
         ask_size,
         observed_at,
     }))
+}
+
+fn parse_okx_wss_book_ticker_runtime_raw(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+    market: OkxPublicWssMarket,
+) -> RuntimeResult<Option<PublicWssTickerRuntimeRaw>> {
+    let root = parse_json_object_value_slices(raw_json)?;
+    if let Some(event) = optional_json_value_string(&root, "event", "okx wss")? {
+        if event == "subscribe" || event == "error" {
+            return Ok(None);
+        }
+    }
+    let Some(data) = root.get("data") else {
+        return Ok(None);
+    };
+    let object = first_json_array_object(data, "okx wss tickers")?;
+    let fields = parse_json_object_value_slices(object)?;
+    let venue_symbol = required_json_value_string(&fields, "instId", "okx wss tickers")?;
+    let symbol = okx_public_wss_symbol_from_inst_id(&venue_symbol, market)?;
+    let observed_at = optional_json_scalar_u64(&fields, "ts", "okx wss tickers")?
+        .map(timestamp_from_unix_millis)
+        .transpose()?
+        .unwrap_or(ingested_at);
+    let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
+    Ok(Some(PublicWssTickerRuntimeRaw {
+        symbol,
+        venue_symbol,
+        best_bid: Price::from_str(&required_json_value_string(
+            &fields,
+            "bidPx",
+            "okx wss tickers",
+        )?)?,
+        best_ask: Price::from_str(&required_json_value_string(
+            &fields,
+            "askPx",
+            "okx wss tickers",
+        )?)?,
+        bid_size: Quantity::from_str(&required_json_value_string(
+            &fields,
+            "bidSz",
+            "okx wss tickers",
+        )?)?,
+        ask_size: Quantity::from_str(&required_json_value_string(
+            &fields,
+            "askSz",
+            "okx wss tickers",
+        )?)?,
+        observed_at,
+    }))
+}
+
+fn parse_bitget_wss_book_ticker_runtime_raw(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<Option<PublicWssTickerRuntimeRaw>> {
+    let root = parse_json_object_value_slices(raw_json)?;
+    if let Some(event) = optional_json_value_string(&root, "event", "bitget wss")? {
+        if event == "subscribe" || event == "error" {
+            return Ok(None);
+        }
+    }
+    let Some(data) = root.get("data") else {
+        return Ok(None);
+    };
+    let object = first_json_array_object(data, "bitget wss ticker")?;
+    let fields = parse_json_object_value_slices(object)?;
+    let venue_symbol =
+        required_first_json_value_string(&fields, &["instId", "symbol"], "bitget wss ticker")?;
+    let symbol = normalize_bitget_wss_symbol_scope(&venue_symbol)?;
+    let observed_at = optional_json_scalar_u64(&fields, "ts", "bitget wss ticker")?
+        .or(optional_json_scalar_u64(
+            &fields,
+            "systemTime",
+            "bitget wss ticker",
+        )?)
+        .map(timestamp_from_unix_millis)
+        .transpose()?
+        .unwrap_or(ingested_at);
+    let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
+    Ok(Some(PublicWssTickerRuntimeRaw {
+        symbol,
+        venue_symbol,
+        best_bid: Price::from_str(&required_first_json_value_string(
+            &fields,
+            &["bidPr", "bidPx", "bidPrice"],
+            "bitget wss ticker",
+        )?)?,
+        best_ask: Price::from_str(&required_first_json_value_string(
+            &fields,
+            &["askPr", "askPx", "askPrice"],
+            "bitget wss ticker",
+        )?)?,
+        bid_size: Quantity::from_str(&required_first_json_value_string(
+            &fields,
+            &["bidSz", "bidSize", "bidQty"],
+            "bitget wss ticker",
+        )?)?,
+        ask_size: Quantity::from_str(&required_first_json_value_string(
+            &fields,
+            &["askSz", "askSize", "askQty"],
+            "bitget wss ticker",
+        )?)?,
+        observed_at,
+    }))
+}
+
+fn first_json_array_object<'a>(value: &'a str, source: &'static str) -> RuntimeResult<&'a str> {
+    json_array_value_slices(value)?
+        .into_iter()
+        .find(|entry| entry.trim_start().starts_with('{'))
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} data array has no object"),
+        })
 }
 
 fn bybit_wss_first_price_size(value: &str, side: &'static str) -> RuntimeResult<(Price, Quantity)> {
@@ -15342,6 +16241,7 @@ fn parse_binance_wss_book_ticker_runtime_raw(
         .map(timestamp_from_unix_millis)
         .transpose()?
         .unwrap_or(ingested_at);
+    let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
     Ok(PublicTopOfBookRuntimeRaw {
         symbol: required_json_string(&fields, "s", "binance wss bookTicker")?,
         update_id: required_json_string(&fields, "u", "binance wss bookTicker")?
@@ -15409,6 +16309,17 @@ fn timestamp_from_unix_millis(value: u64) -> RuntimeResult<UtcTimestamp> {
         message: format!("Unix millis `{value}` does not fit nanoseconds"),
     })?;
     Ok(UtcTimestamp::from_unix_parts(seconds, nanos)?)
+}
+
+fn observed_at_not_after_ingested(
+    observed_at: UtcTimestamp,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<UtcTimestamp> {
+    if runtime_timestamp_millis(observed_at)? > runtime_timestamp_millis(ingested_at)? {
+        Ok(ingested_at)
+    } else {
+        Ok(observed_at)
+    }
 }
 
 fn binance_wss_book_ticker_all_market_stream_url(
@@ -17471,6 +18382,40 @@ fn validate_bybit_wss_probe_options(options: &BybitWssBookTickerProbeOptions) ->
     Ok(())
 }
 
+fn validate_okx_wss_probe_options(options: &OkxWssBookTickerMonitorOptions) -> RuntimeResult<()> {
+    if options.bind_addr.trim().is_empty() {
+        return Err(cli_arg_error("--bind must not be empty"));
+    }
+    if options.updates == 0 {
+        return Err(cli_arg_error("--updates must be greater than zero"));
+    }
+    if options.reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    normalize_okx_wss_symbol_scope(&options.symbol)?;
+    Ok(())
+}
+
+fn validate_bitget_wss_probe_options(
+    options: &BitgetWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    if options.bind_addr.trim().is_empty() {
+        return Err(cli_arg_error("--bind must not be empty"));
+    }
+    if options.updates == 0 {
+        return Err(cli_arg_error("--updates must be greater than zero"));
+    }
+    if options.reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    normalize_bitget_wss_symbol_scope(&options.symbol)?;
+    Ok(())
+}
+
 fn normalize_binance_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
     let symbol = symbol.trim().to_ascii_uppercase();
     if is_binance_wss_all_symbols_scope(&symbol) {
@@ -17501,6 +18446,26 @@ fn is_bybit_wss_all_symbols_scope(symbol: &str) -> bool {
         symbol.trim().to_ascii_uppercase().as_str(),
         "ALL" | "ALL_USDT" | "*"
     )
+}
+
+fn normalize_okx_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
+    let upper = symbol.trim().to_ascii_uppercase();
+    if matches!(upper.as_str(), "ALL" | "ALL_USDT" | "*") {
+        return Err(cli_arg_error(
+            "OKX WSS ticker monitor currently requires one symbol such as BTC-USDT",
+        ));
+    }
+    normalize_okx_usdt_basis_symbol(symbol)
+}
+
+fn normalize_bitget_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
+    let upper = symbol.trim().to_ascii_uppercase();
+    if matches!(upper.as_str(), "ALL" | "ALL_USDT" | "*") {
+        return Err(cli_arg_error(
+            "Bitget WSS ticker monitor currently requires one symbol such as BTCUSDT",
+        ));
+    }
+    normalize_cex_usdt_basis_symbol(symbol, "Bitget")
 }
 
 fn validate_binance_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {
@@ -17562,6 +18527,28 @@ fn parse_bybit_public_wss_market(value: &str) -> RuntimeResult<BybitPublicMarket
         "linear" | "linear-perp" | "linear_perp" | "perp" => Ok(BybitPublicMarket::LinearPerpetual),
         _ => Err(cli_arg_error(
             "--market must be `spot` or `linear-perp` for Bybit WSS bookTicker",
+        )),
+    }
+}
+
+fn parse_okx_public_wss_market(value: &str) -> RuntimeResult<OkxPublicWssMarket> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "spot" => Ok(OkxPublicWssMarket::Spot),
+        "swap" | "perp" | "linear" => Ok(OkxPublicWssMarket::Swap),
+        _ => Err(cli_arg_error(
+            "--market must be `spot` or `swap` for OKX WSS bookTicker",
+        )),
+    }
+}
+
+fn parse_bitget_public_wss_market(value: &str) -> RuntimeResult<BitgetPublicWssMarket> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "spot" => Ok(BitgetPublicWssMarket::Spot),
+        "usdt-futures" | "usdt_futures" | "linear" | "perp" => {
+            Ok(BitgetPublicWssMarket::UsdtFutures)
+        }
+        _ => Err(cli_arg_error(
+            "--market must be `spot` or `usdt-futures` for Bitget WSS bookTicker",
         )),
     }
 }
@@ -17636,6 +18623,30 @@ fn bybit_public_wss_instrument(
     .map_err(RuntimeError::from)
 }
 
+fn okx_public_wss_instrument_id(
+    symbol: &str,
+    market: OkxPublicWssMarket,
+) -> RuntimeResult<InstrumentId> {
+    let symbol = normalize_okx_wss_symbol_scope(symbol)?;
+    let value = match market {
+        OkxPublicWssMarket::Spot => format!("inst:OKX:{symbol}:SPOT"),
+        OkxPublicWssMarket::Swap => format!("inst:OKX:{symbol}-SWAP:SWAP"),
+    };
+    Ok(InstrumentId::new(value)?)
+}
+
+fn bitget_public_wss_instrument_id(
+    symbol: &str,
+    market: BitgetPublicWssMarket,
+) -> RuntimeResult<InstrumentId> {
+    let symbol = normalize_bitget_wss_symbol_scope(symbol)?;
+    let value = match market {
+        BitgetPublicWssMarket::Spot => format!("inst:BITGET:{symbol}:SPOT"),
+        BitgetPublicWssMarket::UsdtFutures => format!("inst:BITGET:{symbol}:USDT-FUTURES"),
+    };
+    Ok(InstrumentId::new(value)?)
+}
+
 fn bybit_public_market_event_scope(market: BybitPublicMarket) -> &'static str {
     match market {
         BybitPublicMarket::Spot => "spot",
@@ -17649,6 +18660,55 @@ fn bybit_public_market_category(market: BybitPublicMarket) -> &'static str {
         BybitPublicMarket::Spot => "spot",
         BybitPublicMarket::LinearPerpetual => "linear",
     }
+}
+
+fn okx_public_wss_market_event_scope(market: OkxPublicWssMarket) -> &'static str {
+    match market {
+        OkxPublicWssMarket::Spot => "spot",
+        OkxPublicWssMarket::Swap => "swap",
+    }
+}
+
+fn bitget_public_wss_market_event_scope(market: BitgetPublicWssMarket) -> &'static str {
+    match market {
+        BitgetPublicWssMarket::Spot => "spot",
+        BitgetPublicWssMarket::UsdtFutures => "usdt-futures",
+    }
+}
+
+fn okx_public_wss_inst_id(symbol: &str, market: OkxPublicWssMarket) -> String {
+    match market {
+        OkxPublicWssMarket::Spot => symbol.to_owned(),
+        OkxPublicWssMarket::Swap => format!("{symbol}-SWAP"),
+    }
+}
+
+fn okx_public_wss_symbol_from_inst_id(
+    inst_id: &str,
+    market: OkxPublicWssMarket,
+) -> RuntimeResult<String> {
+    match market {
+        OkxPublicWssMarket::Spot => normalize_okx_wss_symbol_scope(inst_id),
+        OkxPublicWssMarket::Swap => inst_id
+            .strip_suffix("-SWAP")
+            .ok_or_else(|| cli_arg_error("OKX swap WSS instId must end with -SWAP"))
+            .and_then(normalize_okx_wss_symbol_scope),
+    }
+}
+
+fn okx_wss_ticker_subscribe_payload(symbol: &str, market: OkxPublicWssMarket) -> String {
+    format!(
+        "{{\"op\":\"subscribe\",\"args\":[{{\"channel\":\"tickers\",\"instId\":{}}}]}}",
+        json_string(&okx_public_wss_inst_id(symbol, market))
+    )
+}
+
+fn bitget_wss_ticker_subscribe_payload(symbol: &str, market: BitgetPublicWssMarket) -> String {
+    format!(
+        "{{\"op\":\"subscribe\",\"args\":[{{\"instType\":{},\"channel\":\"ticker\",\"instId\":{}}}]}}",
+        json_string(market.inst_type()),
+        json_string(symbol)
+    )
 }
 
 fn bybit_wss_orderbook_topic(symbol: &str) -> String {
@@ -19065,6 +20125,7 @@ fn parse_json_string(input: &str, quote_start: usize) -> RuntimeResult<(String, 
                     message: "unterminated JSON escape".to_owned(),
                 }
             })?;
+            let mut next_index = escape_index + escaped.len_utf8();
             match escaped {
                 '"' => out.push('"'),
                 '\\' => out.push('\\'),
@@ -19075,10 +20136,10 @@ fn parse_json_string(input: &str, quote_start: usize) -> RuntimeResult<(String, 
                 'r' => out.push('\r'),
                 't' => out.push('\t'),
                 'u' => {
-                    return Err(RuntimeError::LiveMarketData {
-                        message: "unicode JSON escapes are not supported in monitor parser"
-                            .to_owned(),
-                    });
+                    let (decoded, consumed_until) =
+                        parse_json_unicode_escape_at(input, next_index)?;
+                    out.push(decoded);
+                    next_index = consumed_until;
                 }
                 _ => {
                     return Err(RuntimeError::LiveMarketData {
@@ -19086,7 +20147,7 @@ fn parse_json_string(input: &str, quote_start: usize) -> RuntimeResult<(String, 
                     });
                 }
             }
-            index = escape_index + escaped.len_utf8();
+            index = next_index;
         } else {
             out.push(ch);
             index += ch.len_utf8();
@@ -19095,6 +20156,63 @@ fn parse_json_string(input: &str, quote_start: usize) -> RuntimeResult<(String, 
     Err(RuntimeError::LiveMarketData {
         message: "unterminated JSON string".to_owned(),
     })
+}
+
+fn parse_json_unicode_escape_at(input: &str, hex_start: usize) -> RuntimeResult<(char, usize)> {
+    let (high, mut next_index) = parse_json_u16_escape_hex(input, hex_start)?;
+    let codepoint = if (0xD800..=0xDBFF).contains(&high) {
+        if !input
+            .get(next_index..)
+            .is_some_and(|tail| tail.starts_with("\\u"))
+        {
+            return Err(RuntimeError::LiveMarketData {
+                message: "JSON unicode high surrogate is not followed by a low surrogate"
+                    .to_owned(),
+            });
+        }
+        let (low, after_low) = parse_json_u16_escape_hex(input, next_index + 2)?;
+        if !(0xDC00..=0xDFFF).contains(&low) {
+            return Err(RuntimeError::LiveMarketData {
+                message: "JSON unicode low surrogate is invalid".to_owned(),
+            });
+        }
+        next_index = after_low;
+        0x10000 + (((u32::from(high) - 0xD800) << 10) | (u32::from(low) - 0xDC00))
+    } else if (0xDC00..=0xDFFF).contains(&high) {
+        return Err(RuntimeError::LiveMarketData {
+            message: "JSON unicode low surrogate appeared without a high surrogate".to_owned(),
+        });
+    } else {
+        u32::from(high)
+    };
+    let Some(decoded) = char::from_u32(codepoint) else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "JSON unicode escape is not a valid scalar value".to_owned(),
+        });
+    };
+    Ok((decoded, next_index))
+}
+
+fn parse_json_u16_escape_hex(input: &str, hex_start: usize) -> RuntimeResult<(u16, usize)> {
+    let hex_end = hex_start
+        .checked_add(4)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "JSON unicode escape index overflow".to_owned(),
+        })?;
+    let Some(hex) = input.get(hex_start..hex_end) else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "JSON unicode escape is incomplete".to_owned(),
+        });
+    };
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RuntimeError::LiveMarketData {
+            message: "JSON unicode escape is invalid".to_owned(),
+        });
+    }
+    let value = u16::from_str_radix(hex, 16).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("JSON unicode escape is invalid: {error}"),
+    })?;
+    Ok((value, hex_end))
 }
 
 fn skip_json_ws(bytes: &[u8], mut index: usize) -> usize {
@@ -22822,6 +23940,259 @@ pub fn run_funding_arb_guarded_live_canary_once(
     }
 }
 
+/// 运行 funding arb 常驻 guarded live。
+pub fn run_funding_arb_resident_live(
+    options: FundingArbResidentLiveOptions,
+) -> RuntimeResult<FundingArbResidentLiveReport> {
+    #[cfg(feature = "live-exec")]
+    {
+        run_funding_arb_resident_live_inner(options)
+    }
+    #[cfg(not(feature = "live-exec"))]
+    {
+        let _ = options;
+        Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live requires the live-exec feature".to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "live-exec")]
+struct FundingArbResidentLiveLock {
+    path: PathBuf,
+}
+
+#[cfg(feature = "live-exec")]
+impl Drop for FundingArbResidentLiveLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(feature = "live-exec")]
+struct FundingArbResidentCycleOutcome {
+    pair_id: String,
+    symbol: String,
+    net_funding_bps: Option<i128>,
+    snapshot_path: PathBuf,
+    private_account_raw_snapshot_path: PathBuf,
+    private_position_raw_snapshot_path: PathBuf,
+    canary: FundingArbGuardedLiveCanaryOnceReport,
+}
+
+#[cfg(feature = "live-exec")]
+enum FundingArbResidentCycleResult {
+    Candidate(Box<FundingArbResidentCycleOutcome>),
+    NoCandidate {
+        reason: String,
+        snapshot_path: PathBuf,
+    },
+}
+
+#[cfg(feature = "live-exec")]
+fn run_funding_arb_resident_live_inner(
+    options: FundingArbResidentLiveOptions,
+) -> RuntimeResult<FundingArbResidentLiveReport> {
+    validate_funding_arb_resident_live_options(&options)?;
+    let output_root = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(FUNDING_ARB_RESIDENT_LIVE_DEFAULT_OUT));
+    fs::create_dir_all(&output_root).map_err(|error| RuntimeError::Io {
+        path: output_root.clone(),
+        message: error.to_string(),
+    })?;
+    let _lock = acquire_funding_arb_resident_live_lock(&output_root)?;
+    write_funding_arb_resident_live_config(&output_root, &options)?;
+    write_funding_arb_resident_live_state(&output_root, "running", 0, None)?;
+
+    let mut cycles = 0_u64;
+    let mut last_pair_id = None;
+    let mut last_symbol = None;
+    let mut last_net_funding_bps = None;
+    let mut dispatch_attempted = false;
+    let mut live_entry_count = 0_u64;
+    let halt_reason = loop {
+        if output_root.join("STOP").exists() {
+            break Some(
+                "STOP file observed; funding arb resident live halted before next cycle".to_owned(),
+            );
+        }
+        if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
+            break Some("max cycles reached".to_owned());
+        }
+        if options.execute_live && live_entry_count >= options.max_live_entries {
+            break Some(format!(
+                "max live entries reached: {live_entry_count} >= {}",
+                options.max_live_entries
+            ));
+        }
+
+        cycles += 1;
+        write_funding_arb_resident_live_state(&output_root, "running", cycles, None)?;
+        let cycle_dir = output_root
+            .join("cycles")
+            .join(resident_cycle_dir_name(cycles)?);
+        match run_funding_arb_resident_cycle(&options, &cycle_dir) {
+            Ok(FundingArbResidentCycleResult::Candidate(outcome)) => {
+                last_pair_id = Some(outcome.pair_id.clone());
+                last_symbol = Some(outcome.symbol.clone());
+                last_net_funding_bps = outcome.net_funding_bps;
+                append_funding_arb_resident_candidate_event(
+                    &output_root,
+                    cycles,
+                    &cycle_dir,
+                    &outcome,
+                )?;
+                if outcome.canary.dispatch_attempted {
+                    dispatch_attempted = true;
+                    if options.execute_live {
+                        live_entry_count += 1;
+                        break Some(
+                            "funding arb live dispatch attempted; resident halted until exit/de-risk supervisor is attached"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            Ok(FundingArbResidentCycleResult::NoCandidate {
+                reason,
+                snapshot_path,
+            }) => {
+                append_funding_arb_resident_no_candidate_event(
+                    &output_root,
+                    cycles,
+                    &cycle_dir,
+                    &snapshot_path,
+                    &reason,
+                )?;
+            }
+            Err(error) => {
+                append_funding_arb_resident_error_event(
+                    &output_root,
+                    cycles,
+                    &cycle_dir,
+                    &error.to_string(),
+                )?;
+                if options.execute_live {
+                    break Some(format!(
+                        "funding arb resident cycle failed; resident live stopped: {error}"
+                    ));
+                }
+            }
+        }
+
+        if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
+            break Some("max cycles reached".to_owned());
+        }
+        thread::sleep(Duration::from_secs(options.poll_interval_secs));
+    };
+
+    let phase = if halt_reason.is_some() {
+        "halted".to_owned()
+    } else {
+        "completed".to_owned()
+    };
+    write_funding_arb_resident_live_state(&output_root, &phase, cycles, halt_reason.as_deref())?;
+    let report = FundingArbResidentLiveReport {
+        phase,
+        cycles,
+        last_pair_id,
+        last_symbol,
+        last_net_funding_bps,
+        dispatch_attempted,
+        live_entry_count,
+        halt_reason,
+        output_dir: Some(output_root.clone()),
+        mutable_execution_started: dispatch_attempted,
+    };
+    write_funding_arb_resident_live_summary(&output_root, &report)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn run_funding_arb_resident_cycle(
+    options: &FundingArbResidentLiveOptions,
+    cycle_dir: &Path,
+) -> RuntimeResult<FundingArbResidentCycleResult> {
+    fs::create_dir_all(cycle_dir).map_err(|error| RuntimeError::Io {
+        path: cycle_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let snapshot = load_funding_arb_resident_snapshot(options)?;
+    let snapshot_path = cycle_dir.join("funding_arb_monitor_snapshot.json");
+    write_utf8(snapshot_path.clone(), &snapshot.to_json())?;
+
+    let Some(row) = select_funding_arb_resident_candidate(&snapshot, options) else {
+        return Ok(FundingArbResidentCycleResult::NoCandidate {
+            reason: funding_arb_resident_no_candidate_reason(&snapshot, options),
+            snapshot_path,
+        });
+    };
+    let pair_id = row.pair_id.clone();
+    let symbol = row.symbol.clone();
+    let net_funding_bps = funding_arb_row_net_funding_bps(row);
+    let private = run_funding_arb_private_readonly_snapshot_once(
+        FundingArbPrivateReadonlySnapshotOnceOptions {
+            config_path: options.config_path.clone(),
+            snapshot_path: snapshot_path.clone(),
+            pair_id: pair_id.clone(),
+            output_dir: Some(cycle_dir.join("private-readonly")),
+            hyperliquid_user: options.hyperliquid_user.clone(),
+            aster_user: options.aster_user.clone(),
+            aster_signer: options.aster_signer.clone(),
+            aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
+        },
+    )?;
+    let canary =
+        run_funding_arb_guarded_live_canary_once(FundingArbGuardedLiveCanaryOnceOptions {
+            dry_run: FundingArbGuardedDryRunOnceOptions {
+                config_path: options.config_path.clone(),
+                snapshot_path: snapshot_path.clone(),
+                pair_id: pair_id.clone(),
+                funding_settlement_ledger_path: options.funding_settlement_ledger_path.clone(),
+                funding_settlement_raw_snapshot_path: options
+                    .funding_settlement_raw_snapshot_path
+                    .clone(),
+                private_account_snapshot_path: None,
+                private_account_raw_snapshot_path: Some(private.account_raw_snapshot_path.clone()),
+                private_position_snapshot_path: None,
+                private_position_raw_snapshot_path: Some(
+                    private.position_raw_snapshot_path.clone(),
+                ),
+                private_execution_snapshot_path: options.private_execution_snapshot_path.clone(),
+                output_dir: Some(cycle_dir.join("guarded-live-canary")),
+                notional_usd: options.notional_usd.clone(),
+                taker_fee_bps: options.taker_fee_bps,
+                slippage_buffer_bps: options.slippage_buffer_bps,
+                max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+                min_net_funding_bps: options.min_net_funding_bps,
+            },
+            execute_live: options.execute_live,
+            acknowledge_funding_arb_live_orders: options.acknowledge_funding_arb_live_orders,
+            private_order_events_dir: options.private_order_events_dir.clone(),
+            hyperliquid_user: options.hyperliquid_user.clone(),
+            hyperliquid_source: options.hyperliquid_source.clone(),
+            hyperliquid_vault_address: options.hyperliquid_vault_address.clone(),
+            hyperliquid_expires_after_ms: options.hyperliquid_expires_after_ms,
+            hyperliquid_asset_ids: options.hyperliquid_asset_ids.clone(),
+            aster_user: options.aster_user.clone(),
+            aster_signer: options.aster_signer.clone(),
+            aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
+        })?;
+    Ok(FundingArbResidentCycleResult::Candidate(Box::new(
+        FundingArbResidentCycleOutcome {
+            pair_id,
+            symbol,
+            net_funding_bps,
+            snapshot_path,
+            private_account_raw_snapshot_path: private.account_raw_snapshot_path,
+            private_position_raw_snapshot_path: private.position_raw_snapshot_path,
+            canary,
+        },
+    )))
+}
+
 #[cfg(feature = "live-exec")]
 fn run_funding_arb_guarded_live_canary_once_live(
     options: FundingArbGuardedLiveCanaryOnceOptions,
@@ -23115,6 +24486,467 @@ fn funding_arb_canary_allows_readiness_gap(check_id: &str) -> bool {
             | "private_execution_reconciliation"
             | "funding_arb_live_runner"
             | "funding_arb_exit_supervisor"
+    )
+}
+
+fn validate_funding_arb_resident_live_options(
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<()> {
+    if options.poll_interval_secs == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live poll interval must be greater than zero".to_owned(),
+        });
+    }
+    if matches!(options.max_cycles, Some(0)) {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live max cycles must be greater than zero".to_owned(),
+        });
+    }
+    if options.max_live_entries == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live max live entries must be greater than zero"
+                .to_owned(),
+        });
+    }
+    if options.execute_live && options.max_live_entries != 1 {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "funding-arb resident live currently allows exactly one live entry until exit/de-risk supervisor is attached"
+                    .to_owned(),
+        });
+    }
+    if options.execute_live && !options.acknowledge_funding_arb_live_orders {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "缺少 --i-understand-funding-arb-live-orders，拒绝启动 funding arb 常驻实盘"
+                .to_owned(),
+        });
+    }
+    if options.execute_live && options.poll_interval_secs < 10 {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "funding-arb resident live poll interval must be at least 10 seconds in live mode"
+                    .to_owned(),
+        });
+    }
+    if options.execute_live
+        && options.funding_settlement_ledger_path.is_none()
+        && options.funding_settlement_raw_snapshot_path.is_none()
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "funding-arb resident live requires funding settlement ledger or raw snapshot before live orders"
+                    .to_owned(),
+        });
+    }
+    if options.funding_settlement_ledger_path.is_some()
+        && options.funding_settlement_raw_snapshot_path.is_some()
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "funding-arb resident live cannot combine funding settlement ledger and raw snapshot"
+                    .to_owned(),
+        });
+    }
+    if options
+        .snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+        || options
+            .output_dir
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        || options
+            .private_order_events_dir
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        || options
+            .private_execution_snapshot_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        || options
+            .funding_settlement_ledger_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        || options
+            .funding_settlement_raw_snapshot_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live path options cannot be empty".to_owned(),
+        });
+    }
+    if options.snapshot_path.is_none() {
+        validate_funding_arb_monitor_options(&FundingArbMonitorOptions {
+            bind_addr: FUNDING_ARB_MONITOR_DEFAULT_BIND_ADDR.to_owned(),
+            poll_interval_secs: options.poll_interval_secs,
+            notional_usd: options.notional_usd.clone(),
+            taker_fee_bps: options.taker_fee_bps,
+            slippage_buffer_bps: options.slippage_buffer_bps,
+            max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+            min_net_funding_bps: options.min_net_funding_bps,
+            once: true,
+            output_dir: None,
+            sources: options.sources.clone(),
+        })?;
+    }
+    MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    if options.taker_fee_bps < 0
+        || options.slippage_buffer_bps < 0
+        || options.max_entry_price_divergence_bps < 0
+        || options.min_net_funding_bps < 0
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live bps values must be non-negative".to_owned(),
+        });
+    }
+    if !matches!(options.hyperliquid_source.as_str(), "a" | "b") {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live --hyperliquid-source must be `a` or `b`".to_owned(),
+        });
+    }
+    if let Some(user) = &options.hyperliquid_user {
+        validate_hyperliquid_user_address(user)?;
+    }
+    if let Some(vault_address) = &options.hyperliquid_vault_address {
+        validate_hyperliquid_user_address(vault_address).map_err(|_| {
+            RuntimeError::UnsafeConfig {
+                message:
+                    "funding-arb resident live --hyperliquid-vault-address must be a 42-character 0x-prefixed hex address"
+                        .to_owned(),
+            }
+        })?;
+    }
+    if matches!(options.hyperliquid_expires_after_ms, Some(0)) {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live --hyperliquid-expires-after-ms cannot be zero"
+                .to_owned(),
+        });
+    }
+    for symbol in options.hyperliquid_asset_ids.keys() {
+        if symbol.trim().is_empty()
+            || symbol
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'/')))
+        {
+            return Err(RuntimeError::UnsafeConfig {
+                message:
+                    "funding-arb resident live Hyperliquid asset-id symbol contains an unsupported byte"
+                        .to_owned(),
+            });
+        }
+    }
+    if let Some(user) = &options.aster_user {
+        validate_aster_v3_address(user, "--aster-user")?;
+    }
+    if let Some(signer) = &options.aster_signer {
+        validate_aster_v3_address(signer, "--aster-signer")?;
+    }
+    let signer_cmd_env = options.aster_signer_cmd_env.trim();
+    if signer_cmd_env.is_empty()
+        || signer_cmd_env
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "funding-arb resident live --aster-signer-cmd-env must be a non-empty env var name"
+                    .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn acquire_funding_arb_resident_live_lock(
+    output_root: &Path,
+) -> RuntimeResult<FundingArbResidentLiveLock> {
+    let path = output_root.join("funding_arb_resident_live.lock");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                RuntimeError::UnsafeConfig {
+                    message: format!(
+                        "funding-arb resident live lock already exists at {}; another runner may be active",
+                        path.display()
+                    ),
+                }
+            } else {
+                RuntimeError::Io {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            }
+        })?;
+    file.write_all(format!("created_at={}\n", current_utc_timestamp_string()).as_bytes())
+        .map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    Ok(FundingArbResidentLiveLock { path })
+}
+
+#[cfg(feature = "live-exec")]
+fn load_funding_arb_resident_snapshot(
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<FundingArbMonitorSnapshot> {
+    if let Some(path) = &options.snapshot_path {
+        return parse_funding_arb_monitor_snapshot_json(&read_utf8(path)?);
+    }
+    fetch_funding_arb_monitor_snapshot(&FundingArbMonitorOptions {
+        bind_addr: FUNDING_ARB_MONITOR_DEFAULT_BIND_ADDR.to_owned(),
+        poll_interval_secs: options.poll_interval_secs,
+        notional_usd: options.notional_usd.clone(),
+        taker_fee_bps: options.taker_fee_bps,
+        slippage_buffer_bps: options.slippage_buffer_bps,
+        max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+        min_net_funding_bps: options.min_net_funding_bps,
+        once: true,
+        output_dir: None,
+        sources: options.sources.clone(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn select_funding_arb_resident_candidate<'a>(
+    snapshot: &'a FundingArbMonitorSnapshot,
+    options: &FundingArbResidentLiveOptions,
+) -> Option<&'a FundingArbMarketRow> {
+    if let Some(pair_id) = &options.pair_id {
+        return snapshot
+            .rows
+            .iter()
+            .find(|row| row.pair_id == *pair_id && row.is_candidate);
+    }
+    snapshot
+        .rows
+        .iter()
+        .filter(|row| row.is_candidate)
+        .filter(|row| {
+            funding_arb_row_net_funding_bps(row)
+                .is_some_and(|net| net >= options.min_net_funding_bps)
+        })
+        .max_by_key(|row| funding_arb_row_net_funding_bps(row).unwrap_or(i128::MIN))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_net_funding_bps(row: &FundingArbMarketRow) -> Option<i128> {
+    row.net_funding_bps.as_deref()?.parse::<i128>().ok()
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_no_candidate_reason(
+    snapshot: &FundingArbMonitorSnapshot,
+    options: &FundingArbResidentLiveOptions,
+) -> String {
+    if let Some(pair_id) = &options.pair_id {
+        if snapshot.rows.iter().any(|row| row.pair_id == *pair_id) {
+            format!("configured pair_id `{pair_id}` is present but not a current candidate")
+        } else {
+            format!("configured pair_id `{pair_id}` is not present in current funding arb snapshot")
+        }
+    } else {
+        format!(
+            "no funding arb candidate met min_net_funding_bps={} in snapshot status={}",
+            options.min_net_funding_bps, snapshot.status
+        )
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_resident_live_config(
+    output_root: &Path,
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<()> {
+    let contents = format!(
+        "{{\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_live_entries\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
+        json_string(&options.aster_signer_cmd_env),
+        optional_json_string(options.aster_user.as_deref()),
+        json_string(&options.config_path.display().to_string()),
+        options.execute_live,
+        optional_json_string(options.funding_settlement_ledger_path.as_ref().map(|path| path.display().to_string()).as_deref()),
+        optional_json_string(options.funding_settlement_raw_snapshot_path.as_ref().map(|path| path.display().to_string()).as_deref()),
+        options.hyperliquid_asset_ids.len(),
+        options
+            .hyperliquid_expires_after_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&options.hyperliquid_source),
+        optional_json_string(options.hyperliquid_user.as_deref()),
+        optional_json_string(options.hyperliquid_vault_address.as_deref()),
+        options
+            .max_cycles
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        options.max_entry_price_divergence_bps,
+        options.max_live_entries,
+        options.min_net_funding_bps,
+        json_string(&options.notional_usd),
+        optional_json_string(options.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
+        optional_json_string(options.pair_id.as_deref()),
+        options.poll_interval_secs,
+        optional_json_string(options.private_execution_snapshot_path.as_ref().map(|path| path.display().to_string()).as_deref()),
+        optional_json_string(options.private_order_events_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
+        options.slippage_buffer_bps,
+        optional_json_string(options.snapshot_path.as_ref().map(|path| path.display().to_string()).as_deref()),
+        options.sources.len(),
+        funding_arb_sources_json(&options.sources),
+        options.taker_fee_bps,
+    );
+    write_utf8(
+        output_root.join("funding_arb_resident_live_config.json"),
+        &(contents + "\n"),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_sources_json(sources: &[FundingArbVenueSource]) -> String {
+    format!(
+        "[{}]",
+        sources
+            .iter()
+            .map(|source| {
+                format!(
+                    "{{\"status_url\":{},\"venue_family\":{}}}",
+                    json_string(&source.status_url),
+                    json_string(&source.venue_family)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_resident_live_state(
+    output_root: &Path,
+    phase: &str,
+    cycles: u64,
+    halt_reason: Option<&str>,
+) -> RuntimeResult<()> {
+    write_utf8(
+        output_root.join("funding_arb_resident_live_state.json"),
+        &format!(
+            "{{\"cycles\":{},\"halt_reason\":{},\"phase\":{},\"updated_at\":{}}}\n",
+            cycles,
+            optional_json_string(halt_reason),
+            json_string(phase),
+            json_string(&current_utc_timestamp_string())
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_candidate_event(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    outcome: &FundingArbResidentCycleOutcome,
+) -> RuntimeResult<()> {
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"event_type\":\"candidate_cycle\",\"execution_report_status\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_account_raw_snapshot_path\":{},\"private_confirmation_count\":{},\"private_position_raw_snapshot_path\":{},\"protection_attempted\":{},\"residual_risk\":{},\"snapshot_path\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+            outcome.canary.blocking_reasons.len(),
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            outcome.canary.dispatch_allowed,
+            outcome.canary.dispatch_attempted,
+            optional_json_string(outcome.canary.execution_report_status.as_deref()),
+            outcome
+                .net_funding_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_owned()),
+            json_string(&outcome.pair_id),
+            json_string(&outcome.private_account_raw_snapshot_path.display().to_string()),
+            outcome.canary.private_confirmation_count,
+            json_string(&outcome.private_position_raw_snapshot_path.display().to_string()),
+            outcome.canary.protection_attempted,
+            optional_json_string(outcome.canary.residual_risk.as_deref()),
+            json_string(&outcome.snapshot_path.display().to_string()),
+            outcome.canary.submitted_receipt_count,
+            json_string(&outcome.symbol),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_no_candidate_event(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    snapshot_path: &Path,
+    reason: &str,
+) -> RuntimeResult<()> {
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"no_candidate\",\"reason\":{},\"snapshot_path\":{}}}",
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(reason),
+            json_string(&snapshot_path.display().to_string()),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_error_event(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    error: &str,
+) -> RuntimeResult<()> {
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"event_type\":\"cycle_error\"}}",
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(error),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_event(output_root: &Path, line: &str) -> RuntimeResult<()> {
+    append_line_to_jsonl(
+        output_root.join("funding_arb_resident_live_events.jsonl"),
+        line,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_resident_live_summary(
+    output_root: &Path,
+    report: &FundingArbResidentLiveReport,
+) -> RuntimeResult<()> {
+    write_utf8(
+        output_root.join("funding_arb_resident_live_summary.json"),
+        &format!("{}\n", funding_arb_resident_live_report_json(report)),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_live_report_json(report: &FundingArbResidentLiveReport) -> String {
+    format!(
+        "{{\"cycles\":{},\"dispatch_attempted\":{},\"halt_reason\":{},\"last_net_funding_bps\":{},\"last_pair_id\":{},\"last_symbol\":{},\"live_entry_count\":{},\"mutable_execution_started\":{},\"output_dir\":{},\"phase\":{},\"schema_version\":\"1.0.0\"}}",
+        report.cycles,
+        report.dispatch_attempted,
+        optional_json_string(report.halt_reason.as_deref()),
+        report
+            .last_net_funding_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        optional_json_string(report.last_pair_id.as_deref()),
+        optional_json_string(report.last_symbol.as_deref()),
+        report.live_entry_count,
+        report.mutable_execution_started,
+        optional_json_string(report.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
+        json_string(&report.phase),
     )
 }
 
@@ -24093,7 +25925,6 @@ fn stable_symbol_hash(value: &str) -> u64 {
     hash
 }
 
-#[cfg(feature = "live-exec")]
 fn normalize_okx_usdt_basis_symbol(symbol: &str) -> RuntimeResult<String> {
     let symbol = symbol.trim().to_ascii_uppercase();
     let normalized = if symbol.contains('-') {
@@ -30718,15 +32549,20 @@ fn current_utc_timestamp_string() -> String {
 
 impl PublicTopOfBookQuoteSnapshot {
     fn from_quote(quote: &MarketQuote) -> Self {
-        let symbol = quote
-            .instrument_id
-            .as_str()
-            .split(':')
-            .nth(2)
-            .unwrap_or_else(|| quote.instrument_id.as_str())
-            .to_owned();
+        Self::from_quote_with_symbol(
+            quote,
+            quote
+                .instrument_id
+                .as_str()
+                .split(':')
+                .nth(2)
+                .unwrap_or_else(|| quote.instrument_id.as_str()),
+        )
+    }
+
+    fn from_quote_with_symbol(quote: &MarketQuote, symbol: &str) -> Self {
         Self {
-            symbol,
+            symbol: symbol.to_owned(),
             venue_id: quote.venue_id.as_str().to_owned(),
             instrument_id: quote.instrument_id.as_str().to_owned(),
             best_bid: quote.best_bid.map(|price| price.to_string()),
@@ -30794,6 +32630,14 @@ impl PublicTopOfBookMonitorSnapshot {
     }
 
     fn record_update(&mut self, update: &HybridMarketDataUpdate) {
+        self.record_update_with_symbol(update, None);
+    }
+
+    fn record_update_with_symbol(
+        &mut self,
+        update: &HybridMarketDataUpdate,
+        symbol_override: Option<&str>,
+    ) {
         self.updated_at = current_utc_timestamp_string();
         self.coordinator_status = update.status.as_str().to_owned();
         self.status = public_wss_monitor_status(update.status, update.fail_closed).to_owned();
@@ -30815,7 +32659,9 @@ impl PublicTopOfBookMonitorSnapshot {
             self.wss_update_count += 1;
         }
         if let Some(quote) = &update.quote {
-            let quote_snapshot = PublicTopOfBookQuoteSnapshot::from_quote(quote);
+            let quote_snapshot = symbol_override
+                .map(|symbol| PublicTopOfBookQuoteSnapshot::from_quote_with_symbol(quote, symbol))
+                .unwrap_or_else(|| PublicTopOfBookQuoteSnapshot::from_quote(quote));
             self.upsert_quote_row(quote_snapshot.clone());
             self.latest_quote = Some(quote_snapshot);
         }
@@ -31068,6 +32914,109 @@ fn handle_bybit_wss_book_ticker_http_connection(
         (
             404,
             "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/bybit-wss-book-ticker/status\",\"/api/bybit-wss-book-ticker/quote\",\"/api/bybit-wss-book-ticker/quotes\"]}".to_owned(),
+        )
+    };
+    let _ = write_http_json(&mut stream, status, &body);
+}
+
+fn start_okx_wss_book_ticker_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind OKX WSS bookTicker HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_okx_wss_book_ticker_http_connection(stream, &state),
+                Err(error) => eprintln!("okx-wss-book-ticker api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+fn handle_okx_wss_book_ticker_http_connection(
+    stream: TcpStream,
+    state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) {
+    handle_public_wss_book_ticker_http_connection(stream, state, "okx-wss-book-ticker");
+}
+
+fn start_bitget_wss_book_ticker_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind Bitget WSS bookTicker HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_bitget_wss_book_ticker_http_connection(stream, &state),
+                Err(error) => eprintln!("bitget-wss-book-ticker api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+fn handle_bitget_wss_book_ticker_http_connection(
+    stream: TcpStream,
+    state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) {
+    handle_public_wss_book_ticker_http_connection(stream, state, "bitget-wss-book-ticker");
+}
+
+fn handle_public_wss_book_ticker_http_connection(
+    mut stream: TcpStream,
+    state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+    api_name: &'static str,
+) {
+    let mut buffer = [0_u8; 8192];
+    let read = match stream.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+    let route = path.split('?').next().unwrap_or(path);
+    if method != "GET" {
+        let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
+        return;
+    }
+
+    let snapshot = state
+        .read()
+        .expect("Public WSS monitor state lock poisoned");
+    let status_path = format!("/api/{api_name}/status");
+    let quote_path = format!("/api/{api_name}/quote");
+    let quotes_path = format!("/api/{api_name}/quotes");
+    let (status, body) = if route == "/health" {
+        (
+            if snapshot.fail_closed { 503 } else { 200 },
+            snapshot.health_json(),
+        )
+    } else if route == status_path {
+        (200, snapshot.to_json())
+    } else if route == quote_path {
+        (200, snapshot.quote_json())
+    } else if route == quotes_path {
+        (200, snapshot.quotes_json())
+    } else if route == "/" || route == "/dashboard" {
+        let html = bybit_wss_book_ticker_dashboard_html();
+        let _ = write_http_html(&mut stream, 200, &html);
+        return;
+    } else {
+        (
+            404,
+            format!(
+                "{{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/{api_name}/status\",\"/api/{api_name}/quote\",\"/api/{api_name}/quotes\"]}}"
+            ),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -33389,6 +35338,38 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             "ok: Bybit public WSS orderbook.1 monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
+    if args[0] == "okx-wss-book-ticker" {
+        let options = parse_okx_wss_book_ticker_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        let market = options.market.as_str();
+        let symbol = normalize_okx_wss_symbol_scope(&options.symbol)?;
+        run_okx_wss_book_ticker_monitor(options)?;
+        if once {
+            return Ok(format!(
+                "ok: ran one OKX public WSS tickers monitor cycle; market={market}; symbol={symbol}; api_bind={bind_addr}; mutable_execution_started=false"
+            ));
+        }
+        return Ok(format!(
+            "ok: OKX public WSS tickers monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
+    if args[0] == "bitget-wss-book-ticker" {
+        let options = parse_bitget_wss_book_ticker_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        let market = options.market.as_str();
+        let symbol = normalize_bitget_wss_symbol_scope(&options.symbol)?;
+        run_bitget_wss_book_ticker_monitor(options)?;
+        if once {
+            return Ok(format!(
+                "ok: ran one Bitget public WSS ticker monitor cycle; market={market}; symbol={symbol}; api_bind={bind_addr}; mutable_execution_started=false"
+            ));
+        }
+        return Ok(format!(
+            "ok: Bitget public WSS ticker monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
     if args[0] == "binance-basis-monitor" {
         let options = parse_binance_basis_monitor_args(&args[1..])?;
         let once = options.once;
@@ -33632,6 +35613,32 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "funding-arb-resident-live" {
+        let options = parse_funding_arb_resident_live_args(&args[1..])?;
+        let output_dir = options.output_dir.clone();
+        let report = run_funding_arb_resident_live(options)?;
+        let output_note = output_dir
+            .or_else(|| report.output_dir.clone())
+            .as_ref()
+            .map(|path| format!("; wrote artifacts to {}", path.display()))
+            .unwrap_or_else(|| "; no artifacts written".to_owned());
+        return Ok(format!(
+            "ok: funding arb resident live completed; phase={}; cycles={}; last_pair_id={}; last_symbol={}; last_net_funding_bps={}; dispatch_attempted={}; live_entry_count={}; halt_reason={}; mutable_execution_started={}{}",
+            report.phase,
+            report.cycles,
+            report.last_pair_id.as_deref().unwrap_or("none"),
+            report.last_symbol.as_deref().unwrap_or("none"),
+            report
+                .last_net_funding_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            report.dispatch_attempted,
+            report.live_entry_count,
+            report.halt_reason.as_deref().unwrap_or("none"),
+            report.mutable_execution_started,
+            output_note
+        ));
+    }
     if args[0] == "health" {
         let fixture_root = args.get(1).map_or_else(
             || PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE),
@@ -33673,7 +35680,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live",
                 args[0]
             ),
         });
@@ -33737,7 +35744,7 @@ fn help_text() -> String {
         "  multi-venue-basis-resident-live [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--<venue>-spot-wss-monitor-url url --<venue>-perp-wss-monitor-url url] [--execute-live --i-understand-basis-live-orders]",
         "                                    Multi-venue resident runner: reuse guarded auto-once per venue, enforce global hard caps, and halt fail-closed on unknown live state",
         "  multi-venue-basis-live-stack [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--monitor-symbol ALL_USDT] [--readiness-timeout-secs 60] [--interval-secs 60] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
-        "                                    Supervisor: launch managed Binance/Bybit WSS monitors, require existing OKX/Bitget WSS monitors for live mode, run multi-venue resident, and record stack artifacts",
+        "                                    Supervisor: launch managed Binance/Bybit/OKX/Bitget WSS monitors, run multi-venue resident, and record stack artifacts",
         "  bybit-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
         "                                    Two-leg basis path: buy Bybit Spot and short Bybit Linear perp after guarded live gates; live mode requires WSS monitor quotes",
         "  okx-basis-guarded-live-auto-once [--symbol BTC-USDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
@@ -33748,6 +35755,10 @@ fn help_text() -> String {
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
         "  bybit-wss-book-ticker [--bind 127.0.0.1:8802] [--symbol ALL_USDT|BTCUSDT] [--market spot|linear-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Bybit public WSS orderbook.1 all-market monitor and serve /dashboard",
+        "  okx-wss-book-ticker [--bind 127.0.0.1:8807] [--symbol BTC-USDT] [--market spot|swap] [--reconnect-delay-secs 2] [--once --updates 3]",
+        "                                    Run OKX public WSS tickers monitor and serve /dashboard",
+        "  bitget-wss-book-ticker [--bind 127.0.0.1:8809] [--symbol BTCUSDT] [--market spot|usdt-futures] [--reconnect-delay-secs 2] [--once --updates 3]",
+        "                                    Run Bitget public WSS ticker monitor and serve /dashboard",
         "  binance-basis-monitor [--bind 127.0.0.1:8796] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
         "                                    Monitor all Binance public USDT spot/perp basis rows and serve /api/basis/status",
         "  basis-exit-supervisor --position-state file [--config file] [--spot-wss-monitor-url url] [--perp-wss-monitor-url url] [--adl-events-dir dir] [--once] [--execute-live --i-understand-basis-live-orders] [--out dir]",
@@ -33772,6 +35783,8 @@ fn help_text() -> String {
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
         "  funding-arb-guarded-live-canary-once --snapshot file --pair-id id [dry-run snapshot options] [--private-order-events-dir dir] [--aster-user 0x...] [--aster-signer 0x...] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--execute-live --i-understand-funding-arb-live-orders]",
         "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the two perp legs with cancel/unwind protection",
+        "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders]",
+        "                                    Resident funding-arb scanner: refresh private read-only snapshots and run guarded canary cycles; live mode halts after one dispatch until exit/de-risk supervisor is attached",
     ]
     .join("\n")
 }
@@ -33818,6 +35831,8 @@ type BasisExitSupervisorCliOptions = BasisExitSupervisorOptions;
 type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
 type BinanceWssBookTickerCliOptions = BinanceWssBookTickerMonitorOptions;
 type BybitWssBookTickerCliOptions = BybitWssBookTickerMonitorOptions;
+type OkxWssBookTickerCliOptions = OkxWssBookTickerMonitorOptions;
+type BitgetWssBookTickerCliOptions = BitgetWssBookTickerMonitorOptions;
 type BybitBasisMonitorCliOptions = BybitBasisMonitorOptions;
 type OkxBasisMonitorCliOptions = OkxBasisMonitorOptions;
 type BitgetBasisMonitorCliOptions = BitgetBasisMonitorOptions;
@@ -33827,6 +35842,7 @@ type FundingArbMonitorCliOptions = FundingArbMonitorOptions;
 type FundingArbPrivateReadonlySnapshotOnceCliOptions = FundingArbPrivateReadonlySnapshotOnceOptions;
 type FundingArbGuardedDryRunOnceCliOptions = FundingArbGuardedDryRunOnceOptions;
 type FundingArbGuardedLiveCanaryOnceCliOptions = FundingArbGuardedLiveCanaryOnceOptions;
+type FundingArbResidentLiveCliOptions = FundingArbResidentLiveOptions;
 
 fn parse_live_market_sim_args(args: &[String]) -> RuntimeResult<LiveMarketSimCliOptions> {
     let mut fixture_root = PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE);
@@ -36075,6 +38091,140 @@ fn parse_bybit_wss_book_ticker_args(
     Ok(options)
 }
 
+fn parse_okx_wss_book_ticker_args(args: &[String]) -> RuntimeResult<OkxWssBookTickerCliOptions> {
+    let mut options = OkxWssBookTickerMonitorOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires host:port"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                options.symbol = value.clone();
+            }
+            "--market" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--market requires spot or swap"));
+                };
+                options.market = parse_okx_public_wss_market(value)?;
+            }
+            "--updates" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--updates requires a value"));
+                };
+                options.updates = value
+                    .parse::<usize>()
+                    .map_err(|_| cli_arg_error("--updates must be an integer"))?;
+            }
+            "--reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reconnect-delay-secs requires a value"));
+                };
+                options.reconnect_delay_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--reconnect-delay-secs must be an integer"))?;
+            }
+            "--once" => {
+                options.once = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown okx-wss-book-ticker option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected okx-wss-book-ticker positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_okx_wss_probe_options(&options)?;
+    Ok(options)
+}
+
+fn parse_bitget_wss_book_ticker_args(
+    args: &[String],
+) -> RuntimeResult<BitgetWssBookTickerCliOptions> {
+    let mut options = BitgetWssBookTickerMonitorOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires host:port"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                options.symbol = value.clone();
+            }
+            "--market" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--market requires spot or usdt-futures"));
+                };
+                options.market = parse_bitget_public_wss_market(value)?;
+            }
+            "--updates" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--updates requires a value"));
+                };
+                options.updates = value
+                    .parse::<usize>()
+                    .map_err(|_| cli_arg_error("--updates must be an integer"))?;
+            }
+            "--reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reconnect-delay-secs requires a value"));
+                };
+                options.reconnect_delay_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--reconnect-delay-secs must be an integer"))?;
+            }
+            "--once" => {
+                options.once = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown bitget-wss-book-ticker option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected bitget-wss-book-ticker positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_bitget_wss_probe_options(&options)?;
+    Ok(options)
+}
+
 fn parse_binance_basis_monitor_args(
     args: &[String],
 ) -> RuntimeResult<BinanceBasisMonitorCliOptions> {
@@ -36828,15 +38978,22 @@ fn set_funding_arb_source_url(
     venue_family: &str,
     status_url: String,
 ) {
+    set_funding_arb_source_url_raw(&mut options.sources, venue_family, status_url);
+}
+
+fn set_funding_arb_source_url_raw(
+    sources: &mut Vec<FundingArbVenueSource>,
+    venue_family: &str,
+    status_url: String,
+) {
     let family = normalize_venue_family(venue_family);
-    if let Some(source) = options
-        .sources
+    if let Some(source) = sources
         .iter_mut()
         .find(|source| normalize_venue_family(&source.venue_family) == family)
     {
         source.status_url = status_url;
     } else {
-        options.sources.push(FundingArbVenueSource {
+        sources.push(FundingArbVenueSource {
             venue_family: family,
             status_url,
         });
@@ -37342,6 +39499,348 @@ fn parse_funding_arb_guarded_live_canary_once_args(
         aster_signer_cmd_env,
     };
     validate_funding_arb_guarded_live_canary_once_options(&options)?;
+    Ok(options)
+}
+
+fn parse_funding_arb_resident_live_args(
+    args: &[String],
+) -> RuntimeResult<FundingArbResidentLiveCliOptions> {
+    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
+    let mut output_dir = None;
+    let mut snapshot_path = None;
+    let mut pair_id = None;
+    let mut sources = default_funding_arb_venue_sources();
+    let mut funding_settlement_ledger_path = None;
+    let mut funding_settlement_raw_snapshot_path = None;
+    let mut private_execution_snapshot_path = None;
+    let mut private_order_events_dir = None;
+    let mut poll_interval_secs = 60_u64;
+    let mut max_cycles = None;
+    let mut max_live_entries = 1_u64;
+    let mut notional_usd = BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned();
+    let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS;
+    let mut slippage_buffer_bps = BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS;
+    let mut max_entry_price_divergence_bps = 20;
+    let mut min_net_funding_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut execute_live = false;
+    let mut acknowledge_funding_arb_live_orders = false;
+    let mut hyperliquid_user = None;
+    let mut hyperliquid_source =
+        std::env::var("HYPERLIQUID_SOURCE").unwrap_or_else(|_| "a".to_owned());
+    let mut hyperliquid_vault_address = None;
+    let mut hyperliquid_expires_after_ms = None;
+    let mut hyperliquid_asset_ids = BTreeMap::new();
+    let mut aster_user = None;
+    let mut aster_signer = None;
+    let mut aster_signer_cmd_env = ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--config requires a config path"));
+                };
+                config_path = PathBuf::from(value);
+            }
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--out requires a directory"));
+                };
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--snapshot requires a file path"));
+                };
+                snapshot_path = Some(PathBuf::from(value));
+            }
+            "--pair-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--pair-id requires a value"));
+                };
+                pair_id = Some(value.clone());
+            }
+            "--source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--source requires venue=url"));
+                };
+                let (venue, status_url) = parse_funding_arb_source_arg(value)?;
+                set_funding_arb_source_url_raw(&mut sources, &venue, status_url);
+            }
+            "--clear-sources" => sources.clear(),
+            "--binance-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--binance-status-url requires a URL"));
+                };
+                set_funding_arb_source_url_raw(&mut sources, "binance", value.clone());
+            }
+            "--bybit-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-status-url requires a URL"));
+                };
+                set_funding_arb_source_url_raw(&mut sources, "bybit", value.clone());
+            }
+            "--okx-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-status-url requires a URL"));
+                };
+                set_funding_arb_source_url_raw(&mut sources, "okx", value.clone());
+            }
+            "--bitget-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bitget-status-url requires a URL"));
+                };
+                set_funding_arb_source_url_raw(&mut sources, "bitget", value.clone());
+            }
+            "--aster-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-status-url requires a URL"));
+                };
+                set_funding_arb_source_url_raw(&mut sources, "aster", value.clone());
+            }
+            "--hyperliquid-status-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-status-url requires a URL"));
+                };
+                set_funding_arb_source_url_raw(&mut sources, "hyperliquid", value.clone());
+            }
+            "--funding-settlement-ledger" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--funding-settlement-ledger requires a file path",
+                    ));
+                };
+                funding_settlement_ledger_path = Some(PathBuf::from(value));
+            }
+            "--funding-settlement-raw-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--funding-settlement-raw-snapshot requires a file path",
+                    ));
+                };
+                funding_settlement_raw_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--private-execution-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-execution-snapshot requires a file path",
+                    ));
+                };
+                private_execution_snapshot_path = Some(PathBuf::from(value));
+            }
+            "--private-order-events-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--private-order-events-dir requires a directory",
+                    ));
+                };
+                private_order_events_dir = Some(PathBuf::from(value));
+            }
+            "--interval-secs" | "--poll-interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires an integer"));
+                };
+                poll_interval_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--interval-secs must be an integer"))?;
+            }
+            "--max-cycles" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-cycles requires an integer"));
+                };
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--max-cycles must be an integer"))?;
+                if parsed == 0 {
+                    return Err(cli_arg_error("--max-cycles must be greater than zero"));
+                }
+                max_cycles = Some(parsed);
+            }
+            "--max-live-entries" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--max-live-entries requires an integer"));
+                };
+                max_live_entries = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--max-live-entries must be an integer"))?;
+            }
+            "--notional-usd" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--notional-usd requires a decimal"));
+                };
+                notional_usd = value.clone();
+            }
+            "--taker-fee-bps" | "--perp-fee-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--taker-fee-bps requires a value"));
+                };
+                taker_fee_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--taker-fee-bps must be an integer"))?;
+            }
+            "--slippage-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--slippage-bps requires a value"));
+                };
+                slippage_buffer_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--slippage-bps must be an integer"))?;
+            }
+            "--max-entry-price-divergence-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-entry-price-divergence-bps requires a value",
+                    ));
+                };
+                max_entry_price_divergence_bps = value.parse::<i128>().map_err(|_| {
+                    cli_arg_error("--max-entry-price-divergence-bps must be an integer")
+                })?;
+            }
+            "--min-net-funding-bps" | "--min-net-bps" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--min-net-funding-bps requires a value"));
+                };
+                min_net_funding_bps = value
+                    .parse::<i128>()
+                    .map_err(|_| cli_arg_error("--min-net-funding-bps must be an integer"))?;
+            }
+            "--execute-live" => execute_live = true,
+            "--dry-run" => execute_live = false,
+            "--i-understand-funding-arb-live-orders" => acknowledge_funding_arb_live_orders = true,
+            "--hyperliquid-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-user requires an address"));
+                };
+                hyperliquid_user = Some(value.clone());
+            }
+            "--hyperliquid-source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-source requires a|b"));
+                };
+                hyperliquid_source = value.clone();
+            }
+            "--hyperliquid-vault-address" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--hyperliquid-vault-address requires an address",
+                    ));
+                };
+                hyperliquid_vault_address = Some(value.clone());
+            }
+            "--hyperliquid-expires-after-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--hyperliquid-expires-after-ms requires a millisecond timestamp",
+                    ));
+                };
+                hyperliquid_expires_after_ms =
+                    Some(value.parse::<u64>().map_err(|_| {
+                        cli_arg_error("--hyperliquid-expires-after-ms must be a u64")
+                    })?);
+            }
+            "--hyperliquid-asset-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--hyperliquid-asset-id requires SYMBOL=ID"));
+                };
+                let (symbol, asset_id) = parse_hyperliquid_asset_id_arg(value)?;
+                hyperliquid_asset_ids.insert(symbol, asset_id);
+            }
+            "--aster-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-user requires an address"));
+                };
+                aster_user = Some(value.clone());
+            }
+            "--aster-signer" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--aster-signer requires an address"));
+                };
+                aster_signer = Some(value.clone());
+            }
+            "--aster-signer-cmd-env" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--aster-signer-cmd-env requires an env var name",
+                    ));
+                };
+                aster_signer_cmd_env = value.clone();
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown funding-arb-resident-live option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected funding-arb-resident-live positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let options = FundingArbResidentLiveOptions {
+        config_path,
+        output_dir,
+        snapshot_path,
+        pair_id,
+        sources,
+        funding_settlement_ledger_path,
+        funding_settlement_raw_snapshot_path,
+        private_execution_snapshot_path,
+        private_order_events_dir,
+        poll_interval_secs,
+        max_cycles,
+        max_live_entries,
+        notional_usd,
+        taker_fee_bps,
+        slippage_buffer_bps,
+        max_entry_price_divergence_bps,
+        min_net_funding_bps,
+        execute_live,
+        acknowledge_funding_arb_live_orders,
+        hyperliquid_user,
+        hyperliquid_source,
+        hyperliquid_vault_address,
+        hyperliquid_expires_after_ms,
+        hyperliquid_asset_ids,
+        aster_user,
+        aster_signer,
+        aster_signer_cmd_env,
+    };
+    validate_funding_arb_resident_live_options(&options)?;
     Ok(options)
 }
 
@@ -38125,10 +40624,66 @@ mod tests {
     }
 
     #[test]
+    fn okx_and_bitget_wss_args_parse_market_and_messages() {
+        let okx_args = vec![
+            "--bind".to_owned(),
+            "127.0.0.1:9907".to_owned(),
+            "--symbol".to_owned(),
+            "btc-usdt".to_owned(),
+            "--market".to_owned(),
+            "swap".to_owned(),
+            "--updates".to_owned(),
+            "4".to_owned(),
+            "--once".to_owned(),
+        ];
+        let okx_options = parse_okx_wss_book_ticker_args(&okx_args).expect("okx options");
+        assert_eq!(okx_options.bind_addr, "127.0.0.1:9907");
+        assert_eq!(okx_options.symbol, "btc-usdt");
+        assert_eq!(okx_options.market, OkxPublicWssMarket::Swap);
+        assert!(okx_options.once);
+
+        let bitget_args = vec![
+            "--bind".to_owned(),
+            "127.0.0.1:9909".to_owned(),
+            "--symbol".to_owned(),
+            "btcusdt".to_owned(),
+            "--market".to_owned(),
+            "usdt-futures".to_owned(),
+        ];
+        let bitget_options =
+            parse_bitget_wss_book_ticker_args(&bitget_args).expect("bitget options");
+        assert_eq!(bitget_options.bind_addr, "127.0.0.1:9909");
+        assert_eq!(bitget_options.symbol, "btcusdt");
+        assert_eq!(bitget_options.market, BitgetPublicWssMarket::UsdtFutures);
+
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let okx_raw = r#"{"arg":{"channel":"tickers","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","bidPx":"101.00","bidSz":"1.2","askPx":"101.10","askSz":"1.3","ts":"1778630400000"}]}"#;
+        let okx_parsed =
+            parse_okx_wss_book_ticker_runtime_raw(okx_raw, ingested_at, OkxPublicWssMarket::Swap)
+                .expect("okx raw")
+                .expect("okx update");
+        assert_eq!(okx_parsed.symbol, OKX_BASIS_SYMBOL);
+        assert_eq!(okx_parsed.venue_symbol, "BTC-USDT-SWAP");
+        assert_eq!(okx_parsed.best_bid.to_string(), "101.00");
+
+        let bitget_raw = r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":"101.00","bidSz":"1.2","askPr":"101.10","askSz":"1.3","ts":"1778630400000"}]}"#;
+        let bitget_parsed = parse_bitget_wss_book_ticker_runtime_raw(bitget_raw, ingested_at)
+            .expect("bitget raw")
+            .expect("bitget update");
+        assert_eq!(bitget_parsed.symbol, BITGET_BASIS_SYMBOL);
+        assert_eq!(bitget_parsed.venue_symbol, "BTCUSDT");
+        assert_eq!(bitget_parsed.ask_size.to_string(), "1.3");
+    }
+
+    #[test]
     fn bybit_wss_orderbook_message_updates_quote() {
         let mut state = bybit_wss_test_market_state("BTCUSDT", false);
-        let raw = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1778630400123,"data":{"s":"BTCUSDT","b":[["43250.10","1.00000000"]],"a":[["43251.20","1.50000000"]],"u":400900301,"seq":9001}}"#;
+        let raw = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1778630401123,"data":{"s":"BTCUSDT","b":[["43250.10","1.00000000"]],"a":[["43251.20","1.50000000"]],"u":400900301,"seq":9001}}"#;
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        let subscribe_ack = r#"{"op":"subscribe","success":true,"ret_msg":"\u6210\u529f"}"#;
+        let no_update =
+            parse_bybit_wss_book_ticker_runtime_raw(subscribe_ack, ingested_at).expect("ack");
+        assert!(no_update.is_none());
 
         let update =
             apply_bybit_wss_book_ticker_text(raw, ingested_at, BybitPublicMarket::Spot, &mut state)
@@ -38143,6 +40698,7 @@ mod tests {
             quote.source_event_id.as_deref(),
             Some("bybit:wss-book-ticker:spot:BTCUSDT:400900301")
         );
+        assert_eq!(quote.freshness.observed_at, ingested_at);
     }
 
     #[cfg(feature = "live-exec")]
@@ -39727,6 +42283,77 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_resident_live_args_parse_live_controls() {
+        let args = vec![
+            "--snapshot".to_owned(),
+            "target/funding_arb_monitor_snapshot.json".to_owned(),
+            "--pair-id".to_owned(),
+            "aster:hyperliquid:BTCUSDT:BTCUSDT".to_owned(),
+            "--config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--out".to_owned(),
+            "target/funding-arb-resident-live".to_owned(),
+            "--funding-settlement-raw-snapshot".to_owned(),
+            "target/funding-settlement-raw.json".to_owned(),
+            "--private-order-events-dir".to_owned(),
+            "target/private-order-events".to_owned(),
+            "--interval-secs".to_owned(),
+            "30".to_owned(),
+            "--max-cycles".to_owned(),
+            "2".to_owned(),
+            "--max-live-entries".to_owned(),
+            "1".to_owned(),
+            "--notional-usd".to_owned(),
+            "11.25".to_owned(),
+            "--min-net-funding-bps".to_owned(),
+            "8".to_owned(),
+            "--execute-live".to_owned(),
+            "--i-understand-funding-arb-live-orders".to_owned(),
+            "--hyperliquid-user".to_owned(),
+            "0x0000000000000000000000000000000000000000".to_owned(),
+            "--hyperliquid-source".to_owned(),
+            "b".to_owned(),
+            "--hyperliquid-asset-id".to_owned(),
+            "BTCUSDT=0".to_owned(),
+            "--aster-user".to_owned(),
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            "--aster-signer".to_owned(),
+            "0x2222222222222222222222222222222222222222".to_owned(),
+            "--aster-signer-cmd-env".to_owned(),
+            "ASTER_RESIDENT_SIGNER_CMD".to_owned(),
+        ];
+
+        let options = parse_funding_arb_resident_live_args(&args).expect("options");
+
+        assert_eq!(
+            options.snapshot_path,
+            Some(PathBuf::from("target/funding_arb_monitor_snapshot.json"))
+        );
+        assert_eq!(
+            options.pair_id.as_deref(),
+            Some("aster:hyperliquid:BTCUSDT:BTCUSDT")
+        );
+        assert_eq!(
+            options.output_dir,
+            Some(PathBuf::from("target/funding-arb-resident-live"))
+        );
+        assert_eq!(
+            options.funding_settlement_raw_snapshot_path,
+            Some(PathBuf::from("target/funding-settlement-raw.json"))
+        );
+        assert_eq!(options.poll_interval_secs, 30);
+        assert_eq!(options.max_cycles, Some(2));
+        assert_eq!(options.max_live_entries, 1);
+        assert_eq!(options.notional_usd, "11.25");
+        assert_eq!(options.min_net_funding_bps, 8);
+        assert!(options.execute_live);
+        assert!(options.acknowledge_funding_arb_live_orders);
+        assert_eq!(options.hyperliquid_source, "b");
+        assert_eq!(options.hyperliquid_asset_ids.get("BTCUSDT"), Some(&0));
+        assert_eq!(options.aster_signer_cmd_env, "ASTER_RESIDENT_SIGNER_CMD");
+    }
+
+    #[test]
     fn funding_arb_private_readonly_snapshot_once_args_parse() {
         let args = vec![
             "--snapshot".to_owned(),
@@ -40090,7 +42717,12 @@ mod tests {
     #[test]
     fn multi_venue_basis_live_stack_builds_managed_monitor_and_resident_args() {
         let options = MultiVenueBasisLiveStackOptions {
-            venues: vec![BasisLiveVenue::Binance, BasisLiveVenue::Bybit],
+            venues: vec![
+                BasisLiveVenue::Binance,
+                BasisLiveVenue::Bybit,
+                BasisLiveVenue::Okx,
+                BasisLiveVenue::Bitget,
+            ],
             symbols: BTreeMap::new(),
             config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
             output_dir: Some(PathBuf::from("target/live-canary/multi-stack")),
@@ -40128,6 +42760,22 @@ mod tests {
             options.monitor_reconnect_delay_secs,
         )
         .expect("bybit args");
+        let okx_perp_args = multi_venue_basis_live_stack_monitor_args(
+            BasisLiveVenue::Okx,
+            multi_venue_basis_live_stack_perp_bind(&options, BasisLiveVenue::Okx),
+            &multi_venue_basis_live_stack_monitor_symbol(BasisLiveVenue::Okx, &options),
+            "perp",
+            options.monitor_reconnect_delay_secs,
+        )
+        .expect("okx args");
+        let bitget_spot_args = multi_venue_basis_live_stack_monitor_args(
+            BasisLiveVenue::Bitget,
+            multi_venue_basis_live_stack_spot_bind(&options, BasisLiveVenue::Bitget),
+            &multi_venue_basis_live_stack_monitor_symbol(BasisLiveVenue::Bitget, &options),
+            "spot",
+            options.monitor_reconnect_delay_secs,
+        )
+        .expect("bitget args");
         let resident_args = multi_venue_basis_live_stack_resident_args(
             &options,
             Path::new("target/live-canary/multi-stack/resident"),
@@ -40145,10 +42793,21 @@ mod tests {
                 .any(|pair| pair[0] == "--symbol"
                     && pair[1] == BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS)
         );
+        assert_eq!(okx_perp_args[0], "okx-wss-book-ticker");
+        assert!(okx_perp_args
+            .windows(2)
+            .any(|pair| pair[0] == "--market" && pair[1] == "swap"));
+        assert!(okx_perp_args
+            .windows(2)
+            .any(|pair| pair[0] == "--symbol" && pair[1] == OKX_BASIS_SYMBOL));
+        assert_eq!(bitget_spot_args[0], "bitget-wss-book-ticker");
+        assert!(bitget_spot_args
+            .windows(2)
+            .any(|pair| pair[0] == "--market" && pair[1] == "spot"));
         assert_eq!(resident_args[0], "multi-venue-basis-resident-live");
         assert!(resident_args
             .windows(2)
-            .any(|pair| pair[0] == "--venues" && pair[1] == "binance,bybit"));
+            .any(|pair| pair[0] == "--venues" && pair[1] == "binance,bybit,okx,bitget"));
         assert!(resident_args
             .windows(2)
             .any(|pair| pair[0] == "--bybit-perp-wss-monitor-url"
