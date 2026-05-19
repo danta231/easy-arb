@@ -5,8 +5,9 @@ set -euo pipefail
 # 默认运行测试盘：公开行情监控 + 模拟下单验证，不提交订单、不撤单、不转账。
 # 只有 BASIS_OBSERVER_EXECUTE_LIVE=1 且 BASIS_OBSERVER_LIVE_ACK=1 时才进入正式实盘，
 # 并向底层 guarded live 命令传递真实下单确认参数。
-# 当前会主动轮询 spot-perp-basis monitor，并启动专用 funding-arb-monitor
-# 聚合本机 basis status 快照，生成 cross-exchange-funding-arb 机会文件。
+# 当前会主动轮询 spot-perp-basis monitor，并默认启动 spot-perp-basis 常驻
+# live runner；同时启动专用 funding-arb-monitor 聚合本机 basis status 快照，
+# 生成 cross-exchange-funding-arb 机会文件。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -23,8 +24,8 @@ usage() {
 核心行为:
   1. 启动六条只读 basis monitor，持续刷新公开行情。
   2. 轮询 /opportunities，实时记录 candidate_count > 0 的 spot-perp-basis 机会。
-  3. 对支持 auto-once 的 /opportunities 候选 symbol 触发 guarded-live-auto-once，
-     生成候选、风险决策、人工门禁释放预览、分发计划等下单前 artifacts。
+  3. 默认启动 multi-venue-basis-resident-live 常驻 runner 管理
+     Binance/Bybit/OKX/Bitget 的 spot-perp-basis 开仓和平仓。
   4. 如果启用 cross-exchange-funding-arb，启动专用 funding-arb-monitor，
      聚合本机 basis /status 快照并记录真实候选，不伪造机会。
   5. 测试盘默认模拟下单；正式实盘必须显式设置 BASIS_OBSERVER_EXECUTE_LIVE=1 和 BASIS_OBSERVER_LIVE_ACK=1。
@@ -41,6 +42,18 @@ usage() {
   BASIS_OBSERVER_PERP_FEE_BPS=5
   BASIS_OBSERVER_SLIPPAGE_BPS=5
   BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml
+  BASIS_OBSERVER_SPOT_PERP_BASIS_MODE=resident
+  BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00
+  BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES=
+  BASIS_OBSERVER_FUNDING_ARB_MODE=resident
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES=
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER=
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=
   BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1
   BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60
   BASIS_OBSERVER_EXECUTE_LIVE=0
@@ -80,6 +93,8 @@ usage() {
   target/arb-opportunity-observer/dry-run/dry-run-reports.jsonl
   target/arb-opportunity-observer/live/live-reports.jsonl
   target/arb-opportunity-observer/dry-run/<run-id>/
+  target/arb-opportunity-observer/resident-live/spot-perp-basis/
+  target/arb-opportunity-observer/resident-live/cross-exchange-funding-arb/
 USAGE
 }
 
@@ -158,6 +173,28 @@ auto_once_command() {
   esac
 }
 
+supports_basis_resident_live() {
+  case "$1" in
+    binance|bybit|okx|bitget) return 0 ;;
+    aster|hyperliquid) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+basis_resident_venues_csv() {
+  local monitor
+  local joined=""
+  for monitor in "${MONITORS[@]}"; do
+    if supports_basis_resident_live "${monitor}"; then
+      if [[ -n "${joined}" ]]; then
+        joined+=","
+      fi
+      joined+="${monitor}"
+    fi
+  done
+  printf '%s\n' "${joined}"
+}
+
 wss_args_for_venue() {
   local venue="$1"
   local spot_var=""
@@ -190,6 +227,54 @@ wss_args_for_venue() {
       die "${venue} WSS URL must provide both spot and perp/swap monitor URLs"
     fi
     printf '%s\n%s\n' "${spot_var}" "${perp_var}"
+  fi
+}
+
+append_basis_resident_wss_args() {
+  local venue="$1"
+  local spot_url=""
+  local perp_url=""
+  local spot_option=""
+  local perp_option=""
+
+  case "${venue}" in
+    binance)
+      spot_url="${BINANCE_SPOT_WSS_MONITOR_URL:-}"
+      perp_url="${BINANCE_PERP_WSS_MONITOR_URL:-}"
+      spot_option="--binance-spot-wss-monitor-url"
+      perp_option="--binance-perp-wss-monitor-url"
+      ;;
+    bybit)
+      spot_url="${BYBIT_SPOT_WSS_MONITOR_URL:-}"
+      perp_url="${BYBIT_PERP_WSS_MONITOR_URL:-}"
+      spot_option="--bybit-spot-wss-monitor-url"
+      perp_option="--bybit-perp-wss-monitor-url"
+      ;;
+    okx)
+      spot_url="${OKX_SPOT_WSS_MONITOR_URL:-}"
+      perp_url="${OKX_PERP_WSS_MONITOR_URL:-}"
+      spot_option="--okx-spot-wss-monitor-url"
+      perp_option="--okx-perp-wss-monitor-url"
+      ;;
+    bitget)
+      spot_url="${BITGET_SPOT_WSS_MONITOR_URL:-}"
+      perp_url="${BITGET_PERP_WSS_MONITOR_URL:-}"
+      spot_option="--bitget-spot-wss-monitor-url"
+      perp_option="--bitget-perp-wss-monitor-url"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  if [[ "${EXECUTE_LIVE}" == "1" && ( -z "${spot_url}" || -z "${perp_url}" ) ]]; then
+    die "resident spot-perp-basis live requires ${venue} spot/perp WSS monitor URLs"
+  fi
+  if [[ -n "${spot_url}" || -n "${perp_url}" ]]; then
+    if [[ -z "${spot_url}" || -z "${perp_url}" ]]; then
+      die "${venue} resident WSS URL must provide both spot and perp/swap monitor URLs"
+    fi
+    BASIS_RESIDENT_ARGS+=("${spot_option}" "${spot_url}" "${perp_option}" "${perp_url}")
   fi
 }
 
@@ -264,7 +349,7 @@ is_validation_process_name() {
 
 is_core_process_name() {
   case "$1" in
-    *-basis-monitor|funding-arb-monitor|opportunity-recorder) return 0 ;;
+    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -350,7 +435,7 @@ supervise_started_processes() {
     failed=0
     while IFS=$'\t' read -r pid name log_file; do
       case "${name}" in
-        *-basis-monitor|funding-arb-monitor|opportunity-recorder)
+        *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live)
           if ! is_alive "${pid}"; then
             echo "error: supervised process exited: ${name} pid=${pid}" >&2
             if [[ -n "${log_file}" && -f "${log_file}" ]]; then
@@ -617,6 +702,9 @@ run_funding_arb_validation_job() {
       --max-entry-price-divergence-bps "${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}" \
       --min-net-funding-bps "${MIN_NET_BPS}"
     )
+
+    [[ -n "${FUNDING_SETTLEMENT_LEDGER:-}" ]] && args+=(--funding-settlement-ledger "${FUNDING_SETTLEMENT_LEDGER}")
+    [[ -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}" ]] && args+=(--funding-settlement-raw-snapshot "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}")
 
     if [[ "${EXECUTE_LIVE}" == "1" ]]; then
       args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-funding-arb-live-orders)
@@ -956,7 +1044,9 @@ poll_venue() {
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.symbol):net=\(.net_basis_bps // "null")bps profit=\(.expected_profit_usd // "null")"] | join(", ")')"
     echo "[${ts}] opportunity venue=${venue} candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
-    start_validations_for_candidates "${venue}" "${body}" "${ts}"
+    if [[ "${SPOT_PERP_BASIS_MODE}" == "auto-once" ]]; then
+      start_validations_for_candidates "${venue}" "${body}" "${ts}"
+    fi
   fi
 }
 
@@ -1024,7 +1114,9 @@ poll_funding_arb() {
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.pair_id):net=\(.net_funding_bps // "null")bps funding=\(.expected_funding_usd // "null")"] | join(", ")')"
     echo "[${ts}] opportunity strategy=cross-exchange-funding-arb candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
-    start_funding_arb_validations_for_candidates "${body}" "${ts}"
+    if [[ "${FUNDING_ARB_MODE}" == "auto-once" ]]; then
+      start_funding_arb_validations_for_candidates "${body}" "${ts}"
+    fi
   fi
 }
 
@@ -1035,12 +1127,14 @@ run_recorder() {
   touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
   touch "${VALIDATION_EVENTS_JSONL}" "${EXECUTION_REPORTS_JSONL}"
   IFS=' ' read -r -a RECORDER_MONITORS <<< "${EFFECTIVE_MONITORS}"
-  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_start mode=${EXECUTION_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}" >> "${FEEDBACK_LOG}"
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_start mode=${EXECUTION_MODE} spot_perp_basis_mode=${SPOT_PERP_BASIS_MODE} funding_arb_mode=${FUNDING_ARB_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}" >> "${FEEDBACK_LOG}"
   append_json_line "${HEALTH_EVENTS_JSONL}" \
     --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg strategies "${EFFECTIVE_STRATEGIES}" \
     --arg execution_mode "${EXECUTION_MODE}" \
-    '{recorded_at:$recorded_at,event:"observer_strategies_configured",execution_mode:$execution_mode,strategies:$strategies,mutable_execution_started:false}'
+    --arg spot_perp_basis_mode "${SPOT_PERP_BASIS_MODE}" \
+    --arg funding_arb_mode "${FUNDING_ARB_MODE}" \
+    '{recorded_at:$recorded_at,event:"observer_strategies_configured",execution_mode:$execution_mode,strategies:$strategies,spot_perp_basis_mode:$spot_perp_basis_mode,funding_arb_mode:$funding_arb_mode,mutable_execution_started:false}'
   while true; do
     if strategy_enabled "spot-perp-basis"; then
       for venue in "${RECORDER_MONITORS[@]}"; do
@@ -1088,6 +1182,8 @@ if [[ "${1:-}" == "--recorder" ]]; then
   PERP_FEE_BPS="${BASIS_OBSERVER_PERP_FEE_BPS:-5}"
   SLIPPAGE_BPS="${BASIS_OBSERVER_SLIPPAGE_BPS:-5}"
   FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS:-20}"
+  FUNDING_SETTLEMENT_LEDGER="${BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER:-${FUNDING_SETTLEMENT_LEDGER:-}}"
+  FUNDING_SETTLEMENT_RAW_SNAPSHOT="${BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT:-${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}}"
   AUTO_PRICE_GUARD_BPS="${BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS:-2}"
   PRIVATE_ORDER_EVENTS_DIR="${BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR:-${RUN_ROOT}/private-order-events}"
   HYPERLIQUID_USER="${BASIS_OBSERVER_HYPERLIQUID_USER:-${HYPERLIQUID_USER:-}}"
@@ -1100,6 +1196,11 @@ if [[ "${1:-}" == "--recorder" ]]; then
   ASTER_SIGNER_CMD_ENV="${BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV:-${ASTER_SIGNER_CMD_ENV:-}}"
   VALIDATE_AUTO_ONCE="${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}"
   AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
+  SPOT_PERP_BASIS_MODE="${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-resident}"
+  FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+  if [[ -n "${FUNDING_SETTLEMENT_LEDGER}" && -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" ]]; then
+    die "cannot combine BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER and BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT"
+  fi
   CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
   CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
   CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
@@ -1203,6 +1304,21 @@ FUNDING_ARB_BIND="${FUNDING_ARB_BIND:-127.0.0.1:8804}"
 FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS:-20}"
 AUTO_PRICE_GUARD_BPS="${BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS:-2}"
 PRIVATE_ORDER_EVENTS_DIR="${BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR:-${RUN_ROOT}/private-order-events}"
+SPOT_PERP_BASIS_MODE="${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-resident}"
+BASIS_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS:-60}"
+BASIS_RESIDENT_MAX_LIVE_ENTRIES="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES:-1}"
+BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS:-1}"
+BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT:-10.00}"
+BASIS_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES:-}"
+BASIS_RESIDENT_OUT_DIR="${BASIS_OBSERVER_BASIS_RESIDENT_OUT:-${RUN_ROOT}/resident-live/spot-perp-basis}"
+BASIS_RESIDENT_ADL_EVENTS_DIR="${BASIS_OBSERVER_BASIS_RESIDENT_ADL_EVENTS_DIR:-}"
+FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+FUNDING_ARB_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS:-60}"
+FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES:-1}"
+FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
+FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
+FUNDING_SETTLEMENT_LEDGER="${BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER:-${FUNDING_SETTLEMENT_LEDGER:-}}"
+FUNDING_SETTLEMENT_RAW_SNAPSHOT="${BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT:-${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}}"
 HYPERLIQUID_USER="${BASIS_OBSERVER_HYPERLIQUID_USER:-${HYPERLIQUID_USER:-}}"
 HYPERLIQUID_SOURCE="${BASIS_OBSERVER_HYPERLIQUID_SOURCE:-${HYPERLIQUID_SOURCE:-}}"
 HYPERLIQUID_VAULT_ADDRESS="${BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS:-${HYPERLIQUID_VAULT_ADDRESS:-}}"
@@ -1222,6 +1338,20 @@ STOP_DRAIN_SECS="${BASIS_OBSERVER_STOP_DRAIN_SECS:-15}"
 STOP_GRACE_SECS="${BASIS_OBSERVER_STOP_GRACE_SECS:-3}"
 FOREGROUND="${BASIS_OBSERVER_FOREGROUND:-0}"
 STRATEGIES="${CLI_STRATEGIES:-${BASIS_OBSERVER_STRATEGIES:-spot-perp-basis,cross-exchange-funding-arb}}"
+
+case "${SPOT_PERP_BASIS_MODE}" in
+  resident|auto-once) ;;
+  *) die "BASIS_OBSERVER_SPOT_PERP_BASIS_MODE must be resident or auto-once" ;;
+esac
+
+case "${FUNDING_ARB_MODE}" in
+  resident|auto-once) ;;
+  *) die "BASIS_OBSERVER_FUNDING_ARB_MODE must be resident or auto-once" ;;
+esac
+
+if [[ -n "${FUNDING_SETTLEMENT_LEDGER}" && -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" ]]; then
+  die "cannot combine BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER and BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT"
+fi
 
 if [[ "${#CLI_MONITORS[@]}" -eq 0 ]]; then
   if [[ -n "${BASIS_OBSERVER_MONITORS:-}" ]]; then
@@ -1325,6 +1455,124 @@ start_funding_arb_monitor() {
   echo "  pid=${pid} log=${log_file}"
 }
 
+start_funding_arb_resident_live() {
+  local log_file="${LOG_DIR}/funding-arb-resident-live.log"
+  local out_dir="${FUNDING_ARB_RESIDENT_OUT_DIR}"
+  local pid
+  local monitor
+  local source
+  local max_cycles="${FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
+  local asset_id_arg
+  local -a args
+  local -a source_args
+  local -a hyperliquid_asset_id_args
+
+  source_args=(--clear-sources)
+  for monitor in "${MONITORS[@]}"; do
+    source="$(status_url "${monitor}")"
+    source_args+=(--source "${monitor}=${source}")
+  done
+
+  args=(
+    "${RUNTIME_BIN}" funding-arb-resident-live
+    "${source_args[@]}"
+    --config "${CONFIG_PATH}"
+    --out "${out_dir}"
+    --interval-secs "${FUNDING_ARB_RESIDENT_INTERVAL_SECS}"
+    --max-live-entries "${FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES}"
+    --notional-usd "${NOTIONAL_USD}"
+    --taker-fee-bps "${PERP_FEE_BPS}"
+    --slippage-bps "${SLIPPAGE_BPS}"
+    --max-entry-price-divergence-bps "${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}"
+    --min-net-funding-bps "${MIN_NET_BPS}"
+  )
+
+  [[ -n "${max_cycles}" ]] && args+=(--max-cycles "${max_cycles}")
+  [[ -n "${FUNDING_SETTLEMENT_LEDGER:-}" ]] && args+=(--funding-settlement-ledger "${FUNDING_SETTLEMENT_LEDGER}")
+  [[ -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}" ]] && args+=(--funding-settlement-raw-snapshot "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}")
+
+  if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+    args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-funding-arb-live-orders)
+    [[ -n "${HYPERLIQUID_USER:-}" ]] && args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
+    [[ -n "${HYPERLIQUID_SOURCE:-}" ]] && args+=(--hyperliquid-source "${HYPERLIQUID_SOURCE}")
+    [[ -n "${HYPERLIQUID_VAULT_ADDRESS:-}" ]] && args+=(--hyperliquid-vault-address "${HYPERLIQUID_VAULT_ADDRESS}")
+    [[ -n "${HYPERLIQUID_EXPIRES_AFTER_MS:-}" ]] && args+=(--hyperliquid-expires-after-ms "${HYPERLIQUID_EXPIRES_AFTER_MS}")
+    if [[ -n "${HYPERLIQUID_ASSET_IDS:-}" ]]; then
+      IFS=',' read -r -a hyperliquid_asset_id_args <<< "${HYPERLIQUID_ASSET_IDS}"
+      for asset_id_arg in "${hyperliquid_asset_id_args[@]}"; do
+        asset_id_arg="${asset_id_arg//[[:space:]]/}"
+        [[ -n "${asset_id_arg}" ]] && args+=(--hyperliquid-asset-id "${asset_id_arg}")
+      done
+    fi
+    [[ -n "${ASTER_USER:-}" ]] && args+=(--aster-user "${ASTER_USER}")
+    [[ -n "${ASTER_SIGNER:-}" ]] && args+=(--aster-signer "${ASTER_SIGNER}")
+    [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && args+=(--aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
+  else
+    args+=(--dry-run)
+  fi
+
+  echo "starting cross-exchange-funding-arb resident live: out=${out_dir}"
+  nohup "${args[@]}" >> "${log_file}" 2>&1 &
+  pid="$!"
+  printf '%s\t%s\t%s\n' "${pid}" "funding-arb-resident-live" "${log_file}" >> "${PID_FILE}"
+  echo "  pid=${pid} log=${log_file}"
+}
+
+start_spot_perp_basis_resident_live() {
+  local venues_csv
+  local log_file="${LOG_DIR}/spot-perp-basis-resident-live.log"
+  local out_dir="${BASIS_RESIDENT_OUT_DIR}"
+  local pid
+  local monitor
+  local max_cycles="${BASIS_RESIDENT_MAX_CYCLES:-}"
+
+  venues_csv="$(basis_resident_venues_csv)"
+  if [[ -z "${venues_csv}" ]]; then
+    echo "spot-perp-basis resident live skipped: no selected resident-supported venues"
+    return 0
+  fi
+
+  BASIS_RESIDENT_ARGS=(
+    "${RUNTIME_BIN}" multi-venue-basis-resident-live
+    --venues "${venues_csv}"
+    --config "${CONFIG_PATH}"
+    --out "${out_dir}"
+    --interval-secs "${BASIS_RESIDENT_INTERVAL_SECS}"
+    --min-net-bps "${MIN_NET_BPS}"
+    --auto-price-guard-bps "${AUTO_PRICE_GUARD_BPS}"
+    --max-live-entries "${BASIS_RESIDENT_MAX_LIVE_ENTRIES}"
+    --max-concurrent-positions "${BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS}"
+    --max-total-notional-usdt "${BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT}"
+  )
+  if [[ -n "${max_cycles}" ]]; then
+    BASIS_RESIDENT_ARGS+=(--max-cycles "${max_cycles}")
+  fi
+  if [[ -n "${BASIS_RESIDENT_ADL_EVENTS_DIR:-}" ]]; then
+    BASIS_RESIDENT_ARGS+=(--adl-events-dir "${BASIS_RESIDENT_ADL_EVENTS_DIR}")
+  fi
+  if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+    BASIS_RESIDENT_ARGS+=(
+      --private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}"
+      --execute-live
+      --i-understand-basis-live-orders
+    )
+  else
+    BASIS_RESIDENT_ARGS+=(--dry-run)
+  fi
+
+  for monitor in "${MONITORS[@]}"; do
+    if supports_basis_resident_live "${monitor}"; then
+      append_basis_resident_wss_args "${monitor}"
+    fi
+  done
+
+  echo "starting spot-perp-basis resident live: venues=${venues_csv} out=${out_dir}"
+  nohup "${BASIS_RESIDENT_ARGS[@]}" >> "${log_file}" 2>&1 &
+  pid="$!"
+  printf '%s\t%s\t%s\n' "${pid}" "spot-perp-basis-resident-live" "${log_file}" >> "${PID_FILE}"
+  echo "  pid=${pid} log=${log_file}"
+}
+
 for monitor in "${MONITORS[@]}"; do
   case "${monitor}" in
     binance) start_monitor binance binance-basis-monitor "${BINANCE_BIND}" ;;
@@ -1358,6 +1606,14 @@ if [[ "${STARTUP_CHECK}" == "1" ]]; then
   fi
 fi
 
+if strategy_enabled "spot-perp-basis" && [[ "${SPOT_PERP_BASIS_MODE}" == "resident" ]]; then
+  start_spot_perp_basis_resident_live
+fi
+
+if strategy_enabled "cross-exchange-funding-arb" && [[ "${FUNDING_ARB_MODE}" == "resident" ]]; then
+  start_funding_arb_resident_live
+fi
+
 EFFECTIVE_MONITORS="${MONITORS[*]}"
 RECORDER_LOG="${LOG_DIR}/recorder.log"
 nohup env \
@@ -1372,6 +1628,10 @@ nohup env \
   FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}" \
   BASIS_OBSERVER_EXECUTE_LIVE="${EXECUTE_LIVE}" \
   BASIS_OBSERVER_LIVE_ACK="${LIVE_ACK}" \
+  BASIS_OBSERVER_SPOT_PERP_BASIS_MODE="${SPOT_PERP_BASIS_MODE}" \
+  BASIS_OBSERVER_FUNDING_ARB_MODE="${FUNDING_ARB_MODE}" \
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER="${FUNDING_SETTLEMENT_LEDGER}" \
+  BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT="${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" \
   BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS="${AUTO_PRICE_GUARD_BPS}" \
   BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR="${PRIVATE_ORDER_EVENTS_DIR}" \
   BASIS_OBSERVER_HYPERLIQUID_USER="${HYPERLIQUID_USER}" \
@@ -1404,6 +1664,8 @@ cat <<EOF
 
 started basis opportunity observer.
 mode: ${EXECUTION_MODE}
+spot-perp-basis mode: ${SPOT_PERP_BASIS_MODE}
+cross-exchange-funding-arb mode: ${FUNDING_ARB_MODE}
 pid file: ${PID_FILE}
 
 dashboards:
@@ -1432,7 +1694,13 @@ opportunity logs:
 validation reports:
   ${EXECUTION_REPORTS_JSONL}
 
-中文说明：paper 模式只模拟下单；live 模式会在机会满足门禁时传 --execute-live 并提交真实订单。
+spot-perp-basis resident artifacts:
+  ${BASIS_RESIDENT_OUT_DIR}
+
+cross-exchange-funding-arb resident artifacts:
+  ${FUNDING_ARB_RESIDENT_OUT_DIR}
+
+中文说明：paper 模式只模拟下单；live 模式会在常驻 runner 或 funding arb 候选满足门禁时传 --execute-live 并提交真实订单。
 EOF
 
 if [[ "${FOREGROUND}" == "1" ]]; then

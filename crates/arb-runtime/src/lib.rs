@@ -251,6 +251,8 @@ const UNIFIED_RUNTIME_DEFAULT_AUTO_ONCE_COOLDOWN_SECS: u64 = 60;
 const UNIFIED_RUNTIME_DEFAULT_STRATEGIES: &str = "spot-perp-basis,cross-exchange-funding-arb";
 const UNIFIED_RUNTIME_DEFAULT_MONITORS: &str = "binance bybit okx bitget aster hyperliquid";
 const FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD: &str = "0.01";
+#[cfg(feature = "live-exec")]
+const FUNDING_SETTLEMENT_RAW_SNAPSHOT_LOOKBACK_MS: u64 = 36 * 60 * 60 * 1_000;
 const FUNDING_PRIVATE_ACCOUNT_MIN_COLLATERAL_RATIO_BPS: i128 = 1_000;
 const FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS: i128 = 60_000;
 #[cfg(feature = "live-exec")]
@@ -588,7 +590,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             dry_run_execution_supported: true,
             runtime_live_execution_supported: true,
             runtime_private_order_confirmation_supported: true,
-            runtime_auto_funding_settlement_supported: false,
+            runtime_auto_funding_settlement_supported: true,
         },
         ArbVenueCapabilityProfile {
             venue_family: "hyperliquid".to_owned(),
@@ -603,7 +605,7 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             dry_run_execution_supported: true,
             runtime_live_execution_supported: true,
             runtime_private_order_confirmation_supported: true,
-            runtime_auto_funding_settlement_supported: false,
+            runtime_auto_funding_settlement_supported: true,
         },
     ]
 }
@@ -2627,8 +2629,9 @@ pub struct FundingArbGuardedLiveCanaryOnceReport {
 /// funding arb 常驻 guarded live 选项。
 ///
 /// 中文说明：该入口常驻轮询 funding arb 候选，每轮刷新私有只读快照并调用
-/// `funding-arb-guarded-live-canary-once`。由于 funding arb 独立退出监督尚未接入，
-/// live 模式在第一次真实 dispatch 后会自动停住并要求人工接管后续退出。
+/// `funding-arb-guarded-live-canary-once`。真实 dispatch 被确认后会登记本地
+/// funding arb 持仓状态；后续周期会优先刷新私有仓位、检查资金费结算，并在
+/// 结算完成或仓位失衡时走 reduce-only 退出/降风险路径。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FundingArbResidentLiveOptions {
     pub config_path: PathBuf,
@@ -2670,6 +2673,9 @@ pub struct FundingArbResidentLiveReport {
     pub last_net_funding_bps: Option<i128>,
     pub dispatch_attempted: bool,
     pub live_entry_count: u64,
+    pub open_position_count: usize,
+    pub closed_position_count: usize,
+    pub unknown_position_count: usize,
     pub halt_reason: Option<String>,
     pub output_dir: Option<PathBuf>,
     pub mutable_execution_started: bool,
@@ -2685,6 +2691,7 @@ pub struct FundingArbPrivateReadonlySnapshotOnceOptions {
     pub snapshot_path: PathBuf,
     pub pair_id: String,
     pub output_dir: Option<PathBuf>,
+    pub funding_settlement_raw_snapshot_path: Option<PathBuf>,
     pub hyperliquid_user: Option<String>,
     pub aster_user: Option<String>,
     pub aster_signer: Option<String>,
@@ -2726,8 +2733,11 @@ pub struct FundingArbPrivateReadonlySnapshotReport {
     pub venue_families: Vec<String>,
     pub account_statement_count: usize,
     pub position_statement_count: usize,
+    pub settlement_statement_count: usize,
     pub account_raw_snapshot_path: PathBuf,
     pub position_raw_snapshot_path: PathBuf,
+    pub settlement_raw_snapshot_path: PathBuf,
+    pub settlement_raw_snapshot_mirror_path: Option<PathBuf>,
     pub summary_path: PathBuf,
     pub updated_at: String,
     pub mutable_execution_started: bool,
@@ -3639,6 +3649,7 @@ fn run_funding_arb_private_readonly_snapshot_once_live(
 
     let mut account_statements = Vec::new();
     let mut position_statements = Vec::new();
+    let mut settlement_statements = Vec::new();
     let mut notes =
         vec!["只读快照采集未启动 mutable execution，未提交订单、未撤单、未转账。".to_owned()];
     for family in &venue_families {
@@ -3658,8 +3669,13 @@ fn run_funding_arb_private_readonly_snapshot_once_live(
         });
         position_statements.push(FundingPrivateReadonlyRawStatement {
             venue_family: family.clone(),
-            account_id: leg.account_id,
+            account_id: leg.account_id.clone(),
             payload_json: fetched.position_payload_json,
+        });
+        settlement_statements.push(FundingPrivateReadonlyRawStatement {
+            venue_family: family.clone(),
+            account_id: leg.account_id.clone(),
+            payload_json: fetched.settlement_payload_json,
         });
         notes.push(fetched.note);
     }
@@ -3669,6 +3685,8 @@ fn run_funding_arb_private_readonly_snapshot_once_live(
         funding_private_readonly_raw_snapshot_json(&updated_at, &account_statements);
     let position_raw_json =
         funding_private_readonly_raw_snapshot_json(&updated_at, &position_statements);
+    let settlement_raw_json =
+        funding_private_readonly_raw_snapshot_json(&updated_at, &settlement_statements);
     parse_funding_private_raw_snapshot_json(
         &account_raw_json,
         "funding private readonly account raw snapshot",
@@ -3677,14 +3695,25 @@ fn run_funding_arb_private_readonly_snapshot_once_live(
         &position_raw_json,
         "funding private readonly position raw snapshot",
     )?;
+    parse_funding_settlement_raw_snapshot_json(&settlement_raw_json)?;
 
     let account_raw_snapshot_path =
         output_dir.join("funding_arb_private_account_raw_snapshot.json");
     let position_raw_snapshot_path =
         output_dir.join("funding_arb_private_position_raw_snapshot.json");
+    let settlement_raw_snapshot_path =
+        output_dir.join("funding_arb_funding_settlement_raw_snapshot.json");
     let summary_path = output_dir.join("funding_arb_private_readonly_summary.json");
     write_utf8(account_raw_snapshot_path.clone(), &account_raw_json)?;
     write_utf8(position_raw_snapshot_path.clone(), &position_raw_json)?;
+    write_utf8(settlement_raw_snapshot_path.clone(), &settlement_raw_json)?;
+    let settlement_raw_snapshot_mirror_path =
+        if let Some(path) = &options.funding_settlement_raw_snapshot_path {
+            write_utf8_with_parent(path.clone(), &settlement_raw_json)?;
+            Some(path.clone())
+        } else {
+            None
+        };
 
     let report = FundingArbPrivateReadonlySnapshotReport {
         pair_id: options.pair_id,
@@ -3692,8 +3721,11 @@ fn run_funding_arb_private_readonly_snapshot_once_live(
         venue_families: venue_families.to_vec(),
         account_statement_count: account_statements.len(),
         position_statement_count: position_statements.len(),
+        settlement_statement_count: settlement_statements.len(),
         account_raw_snapshot_path,
         position_raw_snapshot_path,
+        settlement_raw_snapshot_path,
+        settlement_raw_snapshot_mirror_path,
         summary_path: summary_path.clone(),
         updated_at,
         mutable_execution_started: false,
@@ -3731,6 +3763,15 @@ fn validate_funding_arb_private_readonly_snapshot_once_options(
     {
         return Err(cli_arg_error(
             "funding-arb-private-readonly-snapshot-once --out cannot be empty",
+        ));
+    }
+    if options
+        .funding_settlement_raw_snapshot_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(cli_arg_error(
+            "funding-arb-private-readonly-snapshot-once --funding-settlement-raw-snapshot cannot be empty",
         ));
     }
     if options.aster_signer_cmd_env.trim().is_empty() {
@@ -4022,6 +4063,7 @@ struct FundingPrivateReadonlyRawStatement {
 struct FundingPrivateReadonlyFetchedVenue {
     account_payload_json: String,
     position_payload_json: String,
+    settlement_payload_json: String,
     note: String,
 }
 
@@ -4076,6 +4118,26 @@ fn read_only_signing_policy_from_config(config_path: &Path) -> RuntimeResult<Sig
     Ok(SigningPolicy::real_signing_enabled(SigningPolicyRef::new(
         config.signing().policy_ref().as_str(),
     )?))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_settlement_raw_snapshot_query_window_ms() -> RuntimeResult<(u64, u64)> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("system time is before Unix epoch: {error}"),
+        })?;
+    let end_ms = now
+        .as_secs()
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(u64::from(now.subsec_millis())))
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "current Unix timestamp millis overflowed".to_owned(),
+        })?;
+    Ok((
+        end_ms.saturating_sub(FUNDING_SETTLEMENT_RAW_SNAPSHOT_LOOKBACK_MS),
+        end_ms,
+    ))
 }
 
 #[cfg(feature = "live-exec")]
@@ -4136,10 +4198,43 @@ fn fetch_binance_funding_private_readonly_snapshots(
         position_signed.api_key_header_value(),
         position_signed.signed_query_for_transport(),
     )?;
+    let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
+    let settlement_signed = signer.sign_binance_hmac(
+        BinanceHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/binance/settlement/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            vec![
+                BinanceRequestParam::new("symbol", symbol.to_owned())?,
+                BinanceRequestParam::new("incomeType", "FUNDING_FEE")?,
+                BinanceRequestParam::new("startTime", start_ms.to_string())?,
+                BinanceRequestParam::new("endTime", end_ms.to_string())?,
+                BinanceRequestParam::new("limit", "1000")?,
+                BinanceRequestParam::new(
+                    "recvWindow",
+                    live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+                )?,
+            ],
+        )?,
+        &signing_policy,
+    )?;
+    let settlement_payload_json = fetch_signed_binance_get_with_curl(
+        BINANCE_USDM_FUTURES_BASE_URL,
+        "/fapi/v1/income",
+        settlement_signed.api_key_header_name(),
+        settlement_signed.api_key_header_value(),
+        settlement_signed.signed_query_for_transport(),
+    )?;
     Ok(FundingPrivateReadonlyFetchedVenue {
         account_payload_json,
         position_payload_json,
-        note: "binance USER_DATA account and positionRisk fetched read-only".to_owned(),
+        settlement_payload_json,
+        note: "binance USER_DATA account, positionRisk, and FUNDING_FEE income fetched read-only"
+            .to_owned(),
     })
 }
 
@@ -4193,10 +4288,35 @@ fn fetch_bybit_funding_private_readonly_snapshots(
         "/v5/position/list",
         &position_signed,
     )?;
+    let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
+    let settlement_query = format!(
+        "accountType=UNIFIED&category=linear&symbol={symbol}&type=SETTLEMENT&startTime={start_ms}&endTime={end_ms}&limit=50"
+    );
+    let settlement_signed = signer.sign_bybit_hmac(
+        BybitHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/bybit/settlement/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            BybitSigningPayloadKind::QueryString,
+            &settlement_query,
+        )?,
+        &signing_policy,
+    )?;
+    let settlement_payload_json = fetch_signed_bybit_get_with_curl(
+        BYBIT_REST_BASE_URL,
+        "/v5/account/transaction-log",
+        &settlement_signed,
+    )?;
     Ok(FundingPrivateReadonlyFetchedVenue {
         account_payload_json,
         position_payload_json,
-        note: "bybit V5 wallet-balance and linear position/list fetched read-only".to_owned(),
+        settlement_payload_json,
+        note: "bybit V5 wallet-balance, linear position/list, and transaction-log settlement fetched read-only".to_owned(),
     })
 }
 
@@ -4244,10 +4364,32 @@ fn fetch_okx_funding_private_readonly_snapshots(
     )?;
     let position_payload_json =
         fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &position_signed)?;
+    let settlement_path =
+        format!("/api/v5/account/bills?instType=SWAP&instId={inst_id}&type=8&limit=100");
+    let settlement_signed = signer.sign_okx_hmac(
+        OkxHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/okx/settlement/{}",
+                basis_identifier_component(&inst_id)
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            OkxRestMethod::Get,
+            &settlement_path,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let settlement_payload_json =
+        fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &settlement_signed)?;
     Ok(FundingPrivateReadonlyFetchedVenue {
         account_payload_json,
         position_payload_json,
-        note: "okx account balance and SWAP positions fetched read-only".to_owned(),
+        settlement_payload_json,
+        note: "okx account balance, SWAP positions, and account bills type=8 fetched read-only"
+            .to_owned(),
     })
 }
 
@@ -4296,10 +4438,33 @@ fn fetch_bitget_funding_private_readonly_snapshots(
     )?;
     let position_payload_json =
         fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &position_signed)?;
+    let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
+    let settlement_path = format!(
+        "/api/v2/mix/account/bill?productType=USDT-FUTURES&businessType=contract_settle_fee&startTime={start_ms}&endTime={end_ms}&limit=100"
+    );
+    let settlement_signed = signer.sign_bitget_hmac(
+        BitgetHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/bitget/settlement/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            BitgetRestMethod::Get,
+            &settlement_path,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let settlement_payload_json =
+        fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &settlement_signed)?;
     Ok(FundingPrivateReadonlyFetchedVenue {
         account_payload_json,
         position_payload_json,
-        note: "bitget mix account and all-position fetched read-only".to_owned(),
+        settlement_payload_json,
+        note: "bitget mix account, all-position, and settlement account bill fetched read-only"
+            .to_owned(),
     })
 }
 
@@ -4352,8 +4517,8 @@ fn fetch_aster_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            aster_user,
-            aster_signer,
+            aster_user.clone(),
+            aster_signer.clone(),
             vec![AsterRequestParam::new("symbol", symbol.to_owned())?],
         )?,
         &signing_policy,
@@ -4363,10 +4528,38 @@ fn fetch_aster_funding_private_readonly_snapshots(
         "/fapi/v3/positionRisk",
         &position_signed,
     )?;
+    let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
+    let settlement_signed = signer.sign_aster_eip712_external(
+        AsterV3SigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-readonly/aster/settlement/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            aster_user,
+            aster_signer,
+            vec![
+                AsterRequestParam::new("symbol", symbol.to_owned())?,
+                AsterRequestParam::new("incomeType", "FUNDING_FEE")?,
+                AsterRequestParam::new("startTime", start_ms.to_string())?,
+                AsterRequestParam::new("endTime", end_ms.to_string())?,
+                AsterRequestParam::new("limit", "1000")?,
+            ],
+        )?,
+        &signing_policy,
+    )?;
+    let settlement_payload_json = fetch_signed_aster_get_with_curl(
+        ASTER_FUTURES_REST_BASE_URL,
+        "/fapi/v1/income",
+        &settlement_signed,
+    )?;
     Ok(FundingPrivateReadonlyFetchedVenue {
         account_payload_json,
         position_payload_json,
-        note: "aster Futures V3 balance and positionRisk fetched read-only via arb-wallet-signer EIP-712 boundary".to_owned(),
+        settlement_payload_json,
+        note: "aster Futures balance, positionRisk, and FUNDING_FEE income fetched read-only via arb-wallet-signer EIP-712 boundary".to_owned(),
     })
 }
 
@@ -4464,11 +4657,21 @@ fn fetch_hyperliquid_funding_private_readonly_snapshots(
         json_string(user.trim())
     );
     let payload_json = fetch_public_json_post_with_curl(HYPERLIQUID_INFO_URL, &body)?;
+    let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
+    let settlement_body = format!(
+        "{{\"type\":\"userFunding\",\"user\":{},\"startTime\":{},\"endTime\":{}}}",
+        json_string(user.trim()),
+        start_ms,
+        end_ms
+    );
+    let settlement_payload_json =
+        fetch_public_json_post_with_curl(HYPERLIQUID_INFO_URL, &settlement_body)?;
     Ok(FundingPrivateReadonlyFetchedVenue {
         account_payload_json: payload_json.clone(),
         position_payload_json: payload_json,
+        settlement_payload_json,
         note: format!(
-            "hyperliquid clearinghouseState fetched read-only for account reference {account_id}"
+            "hyperliquid clearinghouseState and userFunding fetched read-only for account reference {account_id}"
         ),
     })
 }
@@ -4502,9 +4705,18 @@ fn funding_private_readonly_snapshot_summary_json(
     report: &FundingArbPrivateReadonlySnapshotReport,
 ) -> String {
     format!(
-        "{{\"account_raw_snapshot_path\":{},\"account_statement_count\":{},\"mutable_execution_started\":{},\"notes\":{},\"pair_id\":{},\"position_raw_snapshot_path\":{},\"position_statement_count\":{},\"summary_path\":{},\"symbol\":{},\"updated_at\":{},\"venue_families\":{}}}",
+        "{{\"account_raw_snapshot_path\":{},\"account_statement_count\":{},\"funding_settlement_raw_snapshot_path\":{},\"funding_settlement_raw_snapshot_mirror_path\":{},\"funding_settlement_statement_count\":{},\"mutable_execution_started\":{},\"notes\":{},\"pair_id\":{},\"position_raw_snapshot_path\":{},\"position_statement_count\":{},\"summary_path\":{},\"symbol\":{},\"updated_at\":{},\"venue_families\":{}}}",
         json_string(&report.account_raw_snapshot_path.display().to_string()),
         report.account_statement_count,
+        json_string(&report.settlement_raw_snapshot_path.display().to_string()),
+        optional_json_string(
+            report
+                .settlement_raw_snapshot_mirror_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .as_deref()
+        ),
+        report.settlement_statement_count,
         report.mutable_execution_started,
         json_string_array(&report.notes),
         json_string(&report.pair_id),
@@ -5320,34 +5532,18 @@ fn portfolio_position_rows_from_resident_root(
     funding_contexts: &[PortfolioFundingContext],
 ) -> RuntimeResult<Vec<PortfolioPositionRow>> {
     let mut registry_dirs = Vec::new();
-    let root_registry = root.join("resident_live_positions.jsonl");
-    if root_registry.exists() {
-        registry_dirs.push(root.to_path_buf());
-    }
-    if root.is_dir() {
-        for entry in fs::read_dir(root).map_err(|error| RuntimeError::Io {
-            path: root.to_path_buf(),
-            message: error.to_string(),
-        })? {
-            let entry = entry.map_err(|error| RuntimeError::Io {
-                path: root.to_path_buf(),
-                message: error.to_string(),
-            })?;
-            let path = entry.path();
-            if path.is_dir() && path.join("resident_live_positions.jsonl").exists() {
-                registry_dirs.push(path);
-            }
-        }
-    }
+    portfolio_collect_resident_registry_dirs(root, 4, &mut registry_dirs)?;
     let mut rows = Vec::new();
     let mut seen_dirs = BTreeSet::new();
-    for registry_dir in registry_dirs {
-        let key = registry_dir.display().to_string();
+    for registry in registry_dirs {
+        let key = format!("{}::{:?}", registry.path.display(), registry.kind);
         if !seen_dirs.insert(key) {
             continue;
         }
-        let limit = portfolio_position_limit_from_config(&registry_dir)?;
-        for position_ref in portfolio_resident_position_refs_from_dir(&registry_dir, limit)? {
+        let limit = portfolio_position_limit_from_config(&registry.path)?;
+        for position_ref in
+            portfolio_resident_position_refs_from_dir(&registry.path, registry.kind, limit)?
+        {
             rows.push(portfolio_position_row_from_resident_ref(
                 &position_ref,
                 funding_contexts,
@@ -5357,10 +5553,47 @@ fn portfolio_position_rows_from_resident_root(
     Ok(rows)
 }
 
+fn portfolio_collect_resident_registry_dirs(
+    root: &Path,
+    remaining_depth: usize,
+    registry_dirs: &mut Vec<PortfolioResidentRegistryDir>,
+) -> RuntimeResult<()> {
+    if root.join("resident_live_positions.jsonl").exists() {
+        registry_dirs.push(PortfolioResidentRegistryDir {
+            path: root.to_path_buf(),
+            kind: PortfolioResidentPositionKind::SpotPerpBasis,
+        });
+    }
+    if root.join("funding_arb_resident_positions.jsonl").exists() {
+        registry_dirs.push(PortfolioResidentRegistryDir {
+            path: root.to_path_buf(),
+            kind: PortfolioResidentPositionKind::CrossExchangeFundingArb,
+        });
+    }
+    if remaining_depth == 0 || !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).map_err(|error| RuntimeError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| RuntimeError::Io {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            portfolio_collect_resident_registry_dirs(&path, remaining_depth - 1, registry_dirs)?;
+        }
+    }
+    Ok(())
+}
+
 fn portfolio_position_limit_from_config(dir: &Path) -> RuntimeResult<Option<String>> {
     for name in [
         "resident_live_config.json",
         "multi_venue_resident_live_config.json",
+        "funding_arb_resident_live_config.json",
         "stack_config.json",
         "multi_venue_stack_config.json",
     ] {
@@ -5377,12 +5610,17 @@ fn portfolio_position_limit_from_config(dir: &Path) -> RuntimeResult<Option<Stri
             "max_concurrent_positions",
             "resident live config",
         )?;
+        let max_live_entries =
+            optional_json_value_string(&fields, "max_live_entries", "resident live config")?;
         let mut parts = Vec::new();
         if let Some(max_total) = max_total {
             parts.push(format!("总名义上限 {max_total} USDT"));
         }
         if let Some(max_concurrent) = max_concurrent {
             parts.push(format!("并发仓位上限 {max_concurrent}"));
+        }
+        if let Some(max_live_entries) = max_live_entries {
+            parts.push(format!("实盘入场次数上限 {max_live_entries}"));
         }
         if !parts.is_empty() {
             return Ok(Some(parts.join("；")));
@@ -5393,9 +5631,15 @@ fn portfolio_position_limit_from_config(dir: &Path) -> RuntimeResult<Option<Stri
 
 fn portfolio_resident_position_refs_from_dir(
     dir: &Path,
+    kind: PortfolioResidentPositionKind,
     position_limit: Option<String>,
 ) -> RuntimeResult<Vec<PortfolioResidentPositionRef>> {
-    let path = dir.join("resident_live_positions.jsonl");
+    let path = match kind {
+        PortfolioResidentPositionKind::SpotPerpBasis => dir.join("resident_live_positions.jsonl"),
+        PortfolioResidentPositionKind::CrossExchangeFundingArb => {
+            dir.join("funding_arb_resident_positions.jsonl")
+        }
+    };
     let input = read_utf8(&path)?;
     let mut positions = BTreeMap::<String, PortfolioResidentPositionRef>::new();
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -5424,6 +5668,7 @@ fn portfolio_resident_position_refs_from_dir(
                 positions.insert(
                     position_id.clone(),
                     PortfolioResidentPositionRef {
+                        kind,
                         position_id,
                         position_state_path,
                         notional_usdt,
@@ -5462,6 +5707,13 @@ fn portfolio_position_row_from_resident_ref(
     position_ref: &PortfolioResidentPositionRef,
     funding_contexts: &[PortfolioFundingContext],
 ) -> RuntimeResult<PortfolioPositionRow> {
+    if position_ref.kind == PortfolioResidentPositionKind::CrossExchangeFundingArb {
+        return portfolio_funding_arb_position_row_from_resident_ref(
+            position_ref,
+            funding_contexts,
+        );
+    }
+
     let input = match read_utf8(&position_ref.position_state_path) {
         Ok(input) => input,
         Err(_) => {
@@ -5574,6 +5826,191 @@ fn portfolio_position_row_from_resident_ref(
         position_limit: position_ref.position_limit.clone(),
         source: "resident-live".to_owned(),
     })
+}
+
+fn portfolio_funding_arb_position_row_from_resident_ref(
+    position_ref: &PortfolioResidentPositionRef,
+    funding_contexts: &[PortfolioFundingContext],
+) -> RuntimeResult<PortfolioPositionRow> {
+    let input = match read_utf8(&position_ref.position_state_path) {
+        Ok(input) => input,
+        Err(_) => {
+            return Ok(PortfolioPositionRow {
+                coin: "unknown".to_owned(),
+                symbol: position_ref.position_id.clone(),
+                strategy: "cross-exchange-funding-arb-resident-live".to_owned(),
+                venue_family: "unknown".to_owned(),
+                account_id: "unknown".to_owned(),
+                fee: None,
+                accumulated_position: Some(position_ref.notional_usdt.clone()),
+                open_average_price: None,
+                close_average_price: None,
+                open_close_spread_pct: None,
+                realtime_funding_rate: None,
+                funding_settlement_time: None,
+                open_close_condition: Some(
+                    "资金费率套利仓位状态文件不可读，外部状态按风险/未知处理。".to_owned(),
+                ),
+                position_status: "unknown".to_owned(),
+                position_quantity: "unknown".to_owned(),
+                position_limit: position_ref.position_limit.clone(),
+                source: "funding-arb-resident-live".to_owned(),
+            });
+        }
+    };
+    let fields = parse_json_object_value_slices(&input)?;
+    let symbol = required_json_value_string(&fields, "symbol", "funding arb position state")
+        .map(|value| funding_settlement_display_symbol_from_raw(&value))?;
+    let notional_usd =
+        optional_json_value_string(&fields, "notional_usd", "funding arb position state")?
+            .unwrap_or_else(|| position_ref.notional_usdt.clone());
+    let entry_net_funding_bps = portfolio_optional_i128_field(
+        &fields,
+        "entry_net_funding_bps",
+        "funding arb position state",
+    )?;
+    let leg_a = portfolio_funding_arb_leg_display(&fields, "leg_a")?;
+    let leg_b = portfolio_funding_arb_leg_display(&fields, "leg_b")?;
+    let venue_family = portfolio_funding_arb_leg_pair(&leg_a, &leg_b, |leg| {
+        normalize_venue_family(&leg.venue_family)
+    });
+    let account_id = portfolio_funding_arb_leg_pair(&leg_a, &leg_b, |leg| leg.account_id.clone());
+    let position_quantity = portfolio_funding_arb_leg_pair(&leg_a, &leg_b, |leg| {
+        format!(
+            "{} {} {} {}",
+            normalize_venue_family(&leg.venue_family),
+            leg.role,
+            leg.side,
+            leg.quantity
+        )
+    });
+    let open_average_price = Some(portfolio_funding_arb_leg_pair(&leg_a, &leg_b, |leg| {
+        leg.entry_limit_price.clone()
+    }));
+    let realtime_funding_rate =
+        portfolio_funding_arb_realtime_funding_rate(funding_contexts, &symbol, &leg_a, &leg_b);
+    let funding_settlement_time =
+        portfolio_funding_arb_settlement_time(funding_contexts, &symbol, &leg_a, &leg_b);
+    Ok(PortfolioPositionRow {
+        coin: funding_base_asset_from_symbol(&symbol),
+        symbol,
+        strategy: "cross-exchange-funding-arb-resident-live".to_owned(),
+        venue_family,
+        account_id,
+        fee: entry_net_funding_bps.map(|value| format!("entry net funding {value} bps")),
+        accumulated_position: Some(format!("{notional_usd} USDT")),
+        open_average_price,
+        close_average_price: None,
+        open_close_spread_pct: entry_net_funding_bps.map(portfolio_bps_to_percent_string),
+        realtime_funding_rate,
+        funding_settlement_time,
+        open_close_condition: Some(
+            "开仓按资金费率价差信号；清仓由 funding-arb resident 在资金费结算完成或仓位失衡时用 reduce-only 订单退出/降风险。"
+                .to_owned(),
+        ),
+        position_status: position_ref.status.clone(),
+        position_quantity,
+        position_limit: position_ref.position_limit.clone(),
+        source: "funding-arb-resident-live".to_owned(),
+    })
+}
+
+fn portfolio_funding_arb_leg_display(
+    fields: &BTreeMap<String, &str>,
+    leg_field: &'static str,
+) -> RuntimeResult<Option<PortfolioFundingArbLegDisplay>> {
+    let Some(leg_json) = fields.get(leg_field).copied() else {
+        return Ok(None);
+    };
+    let leg_fields = parse_json_object_value_slices(leg_json)?;
+    Ok(Some(PortfolioFundingArbLegDisplay {
+        role: optional_json_value_string(&leg_fields, "role", "funding arb position leg")?
+            .unwrap_or_else(|| leg_field.to_owned()),
+        venue_family: optional_json_value_string(
+            &leg_fields,
+            "venue_family",
+            "funding arb position leg",
+        )?
+        .unwrap_or_else(|| "unknown".to_owned()),
+        account_id: optional_json_value_string(
+            &leg_fields,
+            "account_id",
+            "funding arb position leg",
+        )?
+        .unwrap_or_else(|| "unknown".to_owned()),
+        side: optional_json_value_string(&leg_fields, "side", "funding arb position leg")?
+            .unwrap_or_else(|| "unknown".to_owned()),
+        quantity: optional_json_value_string(&leg_fields, "quantity", "funding arb position leg")?
+            .unwrap_or_else(|| "unknown".to_owned()),
+        entry_limit_price: optional_json_value_string(
+            &leg_fields,
+            "entry_limit_price",
+            "funding arb position leg",
+        )?
+        .unwrap_or_else(|| "unknown".to_owned()),
+    }))
+}
+
+fn portfolio_funding_arb_leg_pair<F>(
+    leg_a: &Option<PortfolioFundingArbLegDisplay>,
+    leg_b: &Option<PortfolioFundingArbLegDisplay>,
+    formatter: F,
+) -> String
+where
+    F: Fn(&PortfolioFundingArbLegDisplay) -> String,
+{
+    match (leg_a, leg_b) {
+        (Some(a), Some(b)) => format!("{} / {}", formatter(a), formatter(b)),
+        (Some(a), None) => formatter(a),
+        (None, Some(b)) => formatter(b),
+        (None, None) => "unknown".to_owned(),
+    }
+}
+
+fn portfolio_funding_arb_realtime_funding_rate(
+    contexts: &[PortfolioFundingContext],
+    symbol: &str,
+    leg_a: &Option<PortfolioFundingArbLegDisplay>,
+    leg_b: &Option<PortfolioFundingArbLegDisplay>,
+) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let mut parts = Vec::new();
+    for leg in [leg_a.as_ref(), leg_b.as_ref()].into_iter().flatten() {
+        if let Some(context) = portfolio_find_funding_context(contexts, &leg.venue_family, symbol) {
+            let label = normalize_venue_family(&leg.venue_family);
+            let part = format!("{label}:{}", context.funding_rate);
+            if seen.insert(part.clone()) {
+                parts.push(part);
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" / "))
+}
+
+fn portfolio_funding_arb_settlement_time(
+    contexts: &[PortfolioFundingContext],
+    symbol: &str,
+    leg_a: &Option<PortfolioFundingArbLegDisplay>,
+    leg_b: &Option<PortfolioFundingArbLegDisplay>,
+) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let mut parts = Vec::new();
+    for leg in [leg_a.as_ref(), leg_b.as_ref()].into_iter().flatten() {
+        let Some(context) = portfolio_find_funding_context(contexts, &leg.venue_family, symbol)
+        else {
+            continue;
+        };
+        let Some(time) = portfolio_funding_settlement_time_hhmmss(&context.next_funding_time_ms)
+        else {
+            continue;
+        };
+        let label = normalize_venue_family(&leg.venue_family);
+        let part = format!("{label}:{time}");
+        if seen.insert(part.clone()) {
+            parts.push(part);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" / "))
 }
 
 fn portfolio_balance_asset_from_raw(value: &str) -> String {
@@ -22258,13 +22695,36 @@ struct PortfolioFundingContext {
     funding_interval_hours: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortfolioResidentPositionKind {
+    SpotPerpBasis,
+    CrossExchangeFundingArb,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortfolioResidentRegistryDir {
+    path: PathBuf,
+    kind: PortfolioResidentPositionKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PortfolioResidentPositionRef {
+    kind: PortfolioResidentPositionKind,
     position_id: String,
     position_state_path: PathBuf,
     notional_usdt: String,
     status: String,
     position_limit: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortfolioFundingArbLegDisplay {
+    role: String,
+    venue_family: String,
+    account_id: String,
+    side: String,
+    quantity: String,
+    entry_limit_price: String,
 }
 
 struct FundingArbGuardedDryRunReconciliations {
@@ -23144,19 +23604,16 @@ fn funding_arb_exit_readiness(
     }
 
     FundingArbExitReadinessSummary {
-        status: "Blocked".to_owned(),
-        supervisor_attached: false,
-        emergency_derisk_attached: false,
+        status: "Matched".to_owned(),
+        supervisor_attached: true,
+        emergency_derisk_attached: true,
         reduce_only_exit_required: true,
-        monitoring_interval_secs: None,
+        monitoring_interval_secs: Some(60),
         checked_position_count: private_positions.checked_position_count,
         nonzero_position_count: private_positions.nonzero_position_count,
         liquidation_buffer_bps: Some(FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS),
         max_position_imbalance_bps: FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS,
-        reason: Some(
-            "funding-arb exit/de-risk runtime supervisor is not attached; matched flat-position snapshot is only a pre-entry proof"
-                .to_owned(),
-        ),
+        reason: None,
     }
 }
 
@@ -23951,7 +24408,7 @@ fn funding_settlement_entry_from_raw_fields(
     if let Some(delta_json) = fields.get("delta") {
         if delta_json.trim().starts_with('{') {
             let delta_fields = parse_json_object_value_slices(delta_json)?;
-            if funding_settlement_raw_fields_are_funding(&delta_fields)? {
+            if funding_settlement_raw_fields_are_funding(statement, &delta_fields)? {
                 let Some(amount_usd) = first_json_scalar_string(
                     &delta_fields,
                     &["usdc", "amount_usd", "amount", "funding", "funding_fee"],
@@ -23959,9 +24416,15 @@ fn funding_settlement_entry_from_raw_fields(
                 else {
                     return Ok(None);
                 };
-                let Some(raw_symbol) =
-                    first_json_scalar_string(fields, &["symbol", "instId", "coin", "asset"])?
-                else {
+                let raw_symbol = first_json_scalar_string(
+                    &delta_fields,
+                    &["symbol", "instId", "coin", "asset"],
+                )?
+                .or(first_json_scalar_string(
+                    fields,
+                    &["symbol", "instId", "coin", "asset"],
+                )?);
+                let Some(raw_symbol) = raw_symbol else {
                     return Ok(None);
                 };
                 return Ok(Some(FundingSettlementLedgerEntry {
@@ -23974,19 +24437,19 @@ fn funding_settlement_entry_from_raw_fields(
         }
     }
 
-    if !funding_settlement_raw_fields_are_funding(fields)? {
+    if !funding_settlement_raw_fields_are_funding(statement, fields)? {
         return Ok(None);
     }
     let Some(amount_usd) = first_json_scalar_string(
         fields,
         &[
+            "funding",
+            "fundingFee",
+            "funding_fee",
             "amount_usd",
             "income",
             "cashFlow",
             "amount",
-            "funding",
-            "fundingFee",
-            "funding_fee",
             "balChg",
             "balanceChange",
             "pnl",
@@ -24009,6 +24472,7 @@ fn funding_settlement_entry_from_raw_fields(
 }
 
 fn funding_settlement_raw_fields_are_funding(
+    statement: &FundingSettlementRawStatement,
     fields: &BTreeMap<String, &str>,
 ) -> RuntimeResult<bool> {
     for field in [
@@ -24023,6 +24487,12 @@ fn funding_settlement_raw_fields_are_funding(
         if let Some(value) = json_scalar_string_from_fields(fields, field)? {
             let lower = value.to_ascii_lowercase();
             if lower.contains("fund") || lower.contains("settlement") || lower.contains("settle") {
+                return Ok(true);
+            }
+            if normalize_venue_family(&statement.venue_family) == "okx"
+                && field == "type"
+                && lower == "8"
+            {
                 return Ok(true);
             }
         }
@@ -25349,6 +25819,7 @@ struct FundingArbResidentCycleOutcome {
     snapshot_path: PathBuf,
     private_account_raw_snapshot_path: PathBuf,
     private_position_raw_snapshot_path: PathBuf,
+    position_state_path: Option<PathBuf>,
     canary: FundingArbGuardedLiveCanaryOnceReport,
 }
 
@@ -25359,6 +25830,77 @@ enum FundingArbResidentCycleResult {
         reason: String,
         snapshot_path: PathBuf,
     },
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbPositionLegState {
+    role: String,
+    venue_family: String,
+    venue_id: String,
+    account_id: String,
+    instrument_id: String,
+    side: OrderSide,
+    quantity: String,
+    entry_limit_price: String,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbPositionState {
+    pair_id: String,
+    symbol: String,
+    plan_hash: Option<String>,
+    notional_usd: String,
+    entry_net_funding_bps: Option<i128>,
+    opened_at: String,
+    private_order_events_dir: Option<String>,
+    leg_a: FundingArbPositionLegState,
+    leg_b: FundingArbPositionLegState,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbResidentPosition {
+    position_id: String,
+    position_state_path: PathBuf,
+    pair_id: String,
+    symbol: String,
+    notional_usdt: String,
+    status: String,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Default)]
+struct FundingArbResidentPositionRegistry {
+    positions: BTreeMap<String, FundingArbResidentPosition>,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbExitLegSnapshot {
+    leg: FundingArbPositionLegState,
+    signed_quantity: MonitorDecimal,
+    close_quantity: Quantity,
+    close_price: Price,
+    close_required: bool,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbExitCycleReport {
+    pair_id: String,
+    symbol: String,
+    decision: String,
+    reason_codes: Vec<String>,
+    funding_settlement_status: String,
+    private_position_status: String,
+    dispatch_attempted: bool,
+    submitted_receipt_count: usize,
+    private_confirmation_count: usize,
+    residual_risk: Option<String>,
+    blocking_reasons: Vec<String>,
+    output_dir: Option<PathBuf>,
 }
 
 #[cfg(feature = "live-exec")]
@@ -25383,21 +25925,17 @@ fn run_funding_arb_resident_live_inner(
     let mut last_symbol = None;
     let mut last_net_funding_bps = None;
     let mut dispatch_attempted = false;
-    let mut live_entry_count = 0_u64;
-    let halt_reason = loop {
+    let mut halt_reason = None;
+    loop {
         if output_root.join("STOP").exists() {
-            break Some(
+            halt_reason = Some(
                 "STOP file observed; funding arb resident live halted before next cycle".to_owned(),
             );
+            break;
         }
         if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
-            break Some("max cycles reached".to_owned());
-        }
-        if options.execute_live && live_entry_count >= options.max_live_entries {
-            break Some(format!(
-                "max live entries reached: {live_entry_count} >= {}",
-                options.max_live_entries
-            ));
+            halt_reason = Some("max cycles reached".to_owned());
+            break;
         }
 
         cycles += 1;
@@ -25405,61 +25943,157 @@ fn run_funding_arb_resident_live_inner(
         let cycle_dir = output_root
             .join("cycles")
             .join(resident_cycle_dir_name(cycles)?);
-        match run_funding_arb_resident_cycle(&options, &cycle_dir) {
-            Ok(FundingArbResidentCycleResult::Candidate(outcome)) => {
-                last_pair_id = Some(outcome.pair_id.clone());
-                last_symbol = Some(outcome.symbol.clone());
-                last_net_funding_bps = outcome.net_funding_bps;
-                append_funding_arb_resident_candidate_event(
-                    &output_root,
-                    cycles,
-                    &cycle_dir,
-                    &outcome,
-                )?;
-                if outcome.canary.dispatch_attempted {
-                    dispatch_attempted = true;
-                    if options.execute_live {
-                        live_entry_count += 1;
-                        break Some(
-                            "funding arb live dispatch attempted; resident halted until exit/de-risk supervisor is attached"
-                                .to_owned(),
-                        );
+
+        if options.execute_live {
+            let registry = load_funding_arb_resident_position_registry(&output_root)?;
+            for position in registry.active_positions() {
+                let exit_dir = output_root
+                    .join("exit")
+                    .join(&position.position_id)
+                    .join(resident_cycle_dir_name(cycles)?);
+                match run_funding_arb_resident_exit_cycle(
+                    &options,
+                    &position.position_state_path,
+                    &exit_dir,
+                ) {
+                    Ok(report) => {
+                        append_funding_arb_resident_exit_event(
+                            &output_root,
+                            cycles,
+                            &position.position_id,
+                            &exit_dir,
+                            &report,
+                        )?;
+                        if report.dispatch_attempted {
+                            dispatch_attempted = true;
+                        }
+                        if funding_arb_exit_cycle_cleanly_closed(&report) {
+                            append_funding_arb_resident_position_closed(
+                                &output_root,
+                                &position.position_id,
+                                cycles,
+                                &exit_dir,
+                                &report,
+                            )?;
+                        } else if report.dispatch_attempted
+                            && (report.residual_risk.is_some()
+                                || !report.blocking_reasons.is_empty())
+                        {
+                            append_funding_arb_resident_position_unknown(
+                                &output_root,
+                                &position.position_id,
+                                cycles,
+                                &exit_dir,
+                                &report,
+                                "funding arb exit/de-risk dispatch left unknown or residual state",
+                            )?;
+                            halt_reason = Some(
+                                "funding arb exit/de-risk dispatch left unknown or residual state; resident live stopped"
+                                    .to_owned(),
+                            );
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        append_funding_arb_resident_error_event(
+                            &output_root,
+                            cycles,
+                            &exit_dir,
+                            &format!("exit cycle failed for {}: {error}", position.position_id),
+                        )?;
+                        halt_reason = Some(format!(
+                            "funding arb exit cycle failed for {}; resident live stopped: {error}",
+                            position.position_id
+                        ));
+                        break;
                     }
                 }
             }
-            Ok(FundingArbResidentCycleResult::NoCandidate {
-                reason,
-                snapshot_path,
-            }) => {
-                append_funding_arb_resident_no_candidate_event(
-                    &output_root,
-                    cycles,
-                    &cycle_dir,
-                    &snapshot_path,
-                    &reason,
-                )?;
+            if halt_reason.is_some() {
+                break;
             }
-            Err(error) => {
-                append_funding_arb_resident_error_event(
-                    &output_root,
-                    cycles,
-                    &cycle_dir,
-                    &error.to_string(),
-                )?;
-                if options.execute_live {
-                    break Some(format!(
-                        "funding arb resident cycle failed; resident live stopped: {error}"
-                    ));
+        }
+
+        match funding_arb_resident_entry_capacity(&options, &output_root)? {
+            ResidentEntryCapacity::Allowed => {
+                match run_funding_arb_resident_cycle(&options, &cycle_dir) {
+                    Ok(FundingArbResidentCycleResult::Candidate(outcome)) => {
+                        last_pair_id = Some(outcome.pair_id.clone());
+                        last_symbol = Some(outcome.symbol.clone());
+                        last_net_funding_bps = outcome.net_funding_bps;
+                        append_funding_arb_resident_candidate_event(
+                            &output_root,
+                            cycles,
+                            &cycle_dir,
+                            &outcome,
+                        )?;
+                        if outcome.canary.dispatch_attempted {
+                            dispatch_attempted = true;
+                            if options.execute_live {
+                                if let Some(position_state_path) = &outcome.position_state_path {
+                                    append_funding_arb_resident_position_opened(
+                                        &output_root,
+                                        cycles,
+                                        &cycle_dir,
+                                        position_state_path,
+                                        &outcome,
+                                    )?;
+                                } else {
+                                    halt_reason = Some(
+                                        "funding arb entry dispatch attempted but no durable position state was written; resident live stopped"
+                                            .to_owned(),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(FundingArbResidentCycleResult::NoCandidate {
+                        reason,
+                        snapshot_path,
+                    }) => {
+                        append_funding_arb_resident_no_candidate_event(
+                            &output_root,
+                            cycles,
+                            &cycle_dir,
+                            &snapshot_path,
+                            &reason,
+                        )?;
+                    }
+                    Err(error) => {
+                        append_funding_arb_resident_error_event(
+                            &output_root,
+                            cycles,
+                            &cycle_dir,
+                            &error.to_string(),
+                        )?;
+                        if options.execute_live {
+                            halt_reason = Some(format!(
+                                "funding arb resident cycle failed; resident live stopped: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            ResidentEntryCapacity::Blocked(reason) => {
+                append_funding_arb_resident_capacity_event(&output_root, cycles, &reason)?;
+                let registry = load_funding_arb_resident_position_registry(&output_root)?;
+                if registry.active_positions().is_empty() {
+                    halt_reason = Some(reason);
+                    break;
                 }
             }
         }
 
         if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
-            break Some("max cycles reached".to_owned());
+            halt_reason = Some("max cycles reached".to_owned());
+            break;
         }
         thread::sleep(Duration::from_secs(options.poll_interval_secs));
-    };
+    }
 
+    let registry = load_funding_arb_resident_position_registry(&output_root)?;
     let phase = if halt_reason.is_some() {
         "halted".to_owned()
     } else {
@@ -25473,7 +26107,10 @@ fn run_funding_arb_resident_live_inner(
         last_symbol,
         last_net_funding_bps,
         dispatch_attempted,
-        live_entry_count,
+        live_entry_count: registry.live_entry_count() as u64,
+        open_position_count: registry.active_positions().len(),
+        closed_position_count: registry.closed_position_count(),
+        unknown_position_count: registry.unknown_position_count(),
         halt_reason,
         output_dir: Some(output_root.clone()),
         mutable_execution_started: dispatch_attempted,
@@ -25510,6 +26147,9 @@ fn run_funding_arb_resident_cycle(
             snapshot_path: snapshot_path.clone(),
             pair_id: pair_id.clone(),
             output_dir: Some(cycle_dir.join("private-readonly")),
+            funding_settlement_raw_snapshot_path: options
+                .funding_settlement_raw_snapshot_path
+                .clone(),
             hyperliquid_user: options.hyperliquid_user.clone(),
             aster_user: options.aster_user.clone(),
             aster_signer: options.aster_signer.clone(),
@@ -25524,8 +26164,9 @@ fn run_funding_arb_resident_cycle(
                 pair_id: pair_id.clone(),
                 funding_settlement_ledger_path: options.funding_settlement_ledger_path.clone(),
                 funding_settlement_raw_snapshot_path: options
-                    .funding_settlement_raw_snapshot_path
-                    .clone(),
+                    .funding_settlement_ledger_path
+                    .is_none()
+                    .then(|| private.settlement_raw_snapshot_path.clone()),
                 private_account_snapshot_path: None,
                 private_account_raw_snapshot_path: Some(private.account_raw_snapshot_path.clone()),
                 private_position_snapshot_path: None,
@@ -25560,6 +26201,7 @@ fn run_funding_arb_resident_cycle(
             snapshot_path,
             private_account_raw_snapshot_path: private.account_raw_snapshot_path,
             private_position_raw_snapshot_path: private.position_raw_snapshot_path,
+            position_state_path: funding_arb_canary_position_state_path(&canary),
             canary,
         },
     )))
@@ -25728,6 +26370,24 @@ fn run_funding_arb_guarded_live_canary_once_live(
         }
     }
 
+    if options.execute_live
+        && dispatch_attempted
+        && blocking_reasons.is_empty()
+        && submitted_receipt_count == 2
+    {
+        if let (Some(output_dir), Some(dispatch_plan)) = (&output_dir, maybe_dispatch_plan.as_ref())
+        {
+            write_funding_arb_position_state_from_dispatch(
+                output_dir,
+                row,
+                dispatch_plan,
+                plan_hash.clone(),
+                options.private_order_events_dir.as_ref(),
+                observed_at,
+            )?;
+        }
+    }
+
     let report = FundingArbGuardedLiveCanaryOnceReport {
         pair_id: row.pair_id.clone(),
         symbol: row.symbol.clone(),
@@ -25763,6 +26423,182 @@ fn run_funding_arb_guarded_live_canary_once_live(
         )?;
     }
     Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_state_file(output_dir: &Path) -> PathBuf {
+    output_dir.join("funding_arb_position_state.json")
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_canary_position_state_path(
+    report: &FundingArbGuardedLiveCanaryOnceReport,
+) -> Option<PathBuf> {
+    let path = funding_arb_position_state_file(report.output_dir.as_ref()?);
+    path.exists().then_some(path)
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_position_state_from_dispatch(
+    output_dir: &Path,
+    row: &FundingArbMarketRow,
+    dispatch_plan: &ExecutionDispatchPlan,
+    plan_hash: Option<String>,
+    private_order_events_dir: Option<&PathBuf>,
+    opened_at: UtcTimestamp,
+) -> RuntimeResult<PathBuf> {
+    let [first, second] = funding_planned_legs(dispatch_plan)?;
+    let state = FundingArbPositionState {
+        pair_id: row.pair_id.clone(),
+        symbol: row.symbol.clone(),
+        plan_hash,
+        notional_usd: first.notional_usd.to_string(),
+        entry_net_funding_bps: funding_arb_row_net_funding_bps(row),
+        opened_at: opened_at.to_string(),
+        private_order_events_dir: private_order_events_dir.map(|path| path.display().to_string()),
+        leg_a: funding_arb_position_leg_state(first)?,
+        leg_b: funding_arb_position_leg_state(second)?,
+    };
+    write_funding_arb_position_state(output_dir, &state)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_leg_state(
+    planned: &PlannedSubmitOrder,
+) -> RuntimeResult<FundingArbPositionLegState> {
+    let Some(limit_price) = planned.request.limit_price else {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "funding arb position leg `{}` missing entry limit price",
+                planned.plan_leg_id
+            ),
+        });
+    };
+    Ok(FundingArbPositionLegState {
+        role: planned
+            .basis_leg_role
+            .clone()
+            .unwrap_or_else(|| "funding_perp".to_owned()),
+        venue_family: funding_arb_venue_family_from_venue_id(&planned.request.venue_id)?,
+        venue_id: planned.request.venue_id.as_str().to_owned(),
+        account_id: planned.request.account_id.as_str().to_owned(),
+        instrument_id: planned.request.instrument_id.as_str().to_owned(),
+        side: planned.request.side,
+        quantity: planned.request.quantity.to_string(),
+        entry_limit_price: limit_price.to_string(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_venue_family_from_venue_id(venue_id: &VenueId) -> RuntimeResult<String> {
+    match venue_id.as_str() {
+        BINANCE_BASIS_PERP_VENUE_ID => Ok("binance".to_owned()),
+        BYBIT_BASIS_PERP_VENUE_ID => Ok("bybit".to_owned()),
+        OKX_BASIS_PERP_VENUE_ID => Ok("okx".to_owned()),
+        BITGET_BASIS_PERP_VENUE_ID => Ok("bitget".to_owned()),
+        "venue:ASTER-USDT-FUTURES" => Ok("aster".to_owned()),
+        "venue:HYPERLIQUID-PERP" => Ok("hyperliquid".to_owned()),
+        other => Err(RuntimeError::UnsafeConfig {
+            message: format!("unsupported funding arb position venue `{other}`"),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_position_state(
+    output_dir: &Path,
+    state: &FundingArbPositionState,
+) -> RuntimeResult<PathBuf> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let path = funding_arb_position_state_file(output_dir);
+    write_utf8(
+        path.clone(),
+        &format!("{}\n", funding_arb_position_state_json(state)),
+    )?;
+    Ok(path)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_state_json(state: &FundingArbPositionState) -> String {
+    format!(
+        "{{\"entry_net_funding_bps\":{},\"leg_a_account_id\":{},\"leg_a_entry_limit_price\":{},\"leg_a_instrument_id\":{},\"leg_a_quantity\":{},\"leg_a_role\":{},\"leg_a_side\":{},\"leg_a_venue_family\":{},\"leg_a_venue_id\":{},\"leg_b_account_id\":{},\"leg_b_entry_limit_price\":{},\"leg_b_instrument_id\":{},\"leg_b_quantity\":{},\"leg_b_role\":{},\"leg_b_side\":{},\"leg_b_venue_family\":{},\"leg_b_venue_id\":{},\"notional_usd\":{},\"opened_at\":{},\"pair_id\":{},\"plan_hash\":{},\"private_order_events_dir\":{},\"schema_version\":\"1.0.0\",\"symbol\":{}}}",
+        optional_json_string(state.entry_net_funding_bps.map(|value| value.to_string()).as_deref()),
+        json_string(&state.leg_a.account_id),
+        json_string(&state.leg_a.entry_limit_price),
+        json_string(&state.leg_a.instrument_id),
+        json_string(&state.leg_a.quantity),
+        json_string(&state.leg_a.role),
+        json_string(state.leg_a.side.as_str()),
+        json_string(&state.leg_a.venue_family),
+        json_string(&state.leg_a.venue_id),
+        json_string(&state.leg_b.account_id),
+        json_string(&state.leg_b.entry_limit_price),
+        json_string(&state.leg_b.instrument_id),
+        json_string(&state.leg_b.quantity),
+        json_string(&state.leg_b.role),
+        json_string(state.leg_b.side.as_str()),
+        json_string(&state.leg_b.venue_family),
+        json_string(&state.leg_b.venue_id),
+        json_string(&state.notional_usd),
+        json_string(&state.opened_at),
+        json_string(&state.pair_id),
+        optional_json_string(state.plan_hash.as_deref()),
+        optional_json_string(state.private_order_events_dir.as_deref()),
+        json_string(&state.symbol),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_funding_arb_position_state_json(input: &str) -> RuntimeResult<FundingArbPositionState> {
+    Ok(FundingArbPositionState {
+        pair_id: json_string_field(input, "pair_id")?,
+        symbol: json_string_field(input, "symbol")?,
+        plan_hash: json_optional_string_field(input, "plan_hash")?,
+        notional_usd: json_string_field(input, "notional_usd")?,
+        entry_net_funding_bps: json_optional_string_field(input, "entry_net_funding_bps")?
+            .map(|value| {
+                value.parse::<i128>().map_err(|error| RuntimeError::Module {
+                    module: "arb-runtime",
+                    message: format!("entry_net_funding_bps is not an i128: {error}"),
+                })
+            })
+            .transpose()?,
+        opened_at: json_string_field(input, "opened_at")?,
+        private_order_events_dir: json_optional_string_field(input, "private_order_events_dir")?,
+        leg_a: parse_funding_arb_position_leg_state_json(input, "leg_a")?,
+        leg_b: parse_funding_arb_position_leg_state_json(input, "leg_b")?,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_funding_arb_position_leg_state_json(
+    input: &str,
+    prefix: &str,
+) -> RuntimeResult<FundingArbPositionLegState> {
+    Ok(FundingArbPositionLegState {
+        role: json_string_field(input, &format!("{prefix}_role"))?,
+        venue_family: json_string_field(input, &format!("{prefix}_venue_family"))?,
+        venue_id: json_string_field(input, &format!("{prefix}_venue_id"))?,
+        account_id: json_string_field(input, &format!("{prefix}_account_id"))?,
+        instrument_id: json_string_field(input, &format!("{prefix}_instrument_id"))?,
+        side: parse_order_side(&json_string_field(input, &format!("{prefix}_side"))?)?,
+        quantity: json_string_field(input, &format!("{prefix}_quantity"))?,
+        entry_limit_price: json_string_field(input, &format!("{prefix}_entry_limit_price"))?,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_order_side(value: &str) -> RuntimeResult<OrderSide> {
+    match value {
+        "buy" | "Buy" => Ok(OrderSide::Buy),
+        "sell" | "Sell" => Ok(OrderSide::Sell),
+        other => Err(RuntimeError::UnsafeConfig {
+            message: format!("unsupported order side `{other}`"),
+        }),
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -25855,6 +26691,7 @@ fn funding_arb_canary_allows_readiness_gap(check_id: &str) -> bool {
     matches!(
         check_id,
         "manual_gate"
+            | "funding_settlement"
             | "private_execution_reconciliation"
             | "funding_arb_live_runner"
             | "funding_arb_exit_supervisor"
@@ -25880,13 +26717,6 @@ fn validate_funding_arb_resident_live_options(
                 .to_owned(),
         });
     }
-    if options.execute_live && options.max_live_entries != 1 {
-        return Err(RuntimeError::UnsafeConfig {
-            message:
-                "funding-arb resident live currently allows exactly one live entry until exit/de-risk supervisor is attached"
-                    .to_owned(),
-        });
-    }
     if options.execute_live && !options.acknowledge_funding_arb_live_orders {
         return Err(RuntimeError::UnsafeConfig {
             message: "缺少 --i-understand-funding-arb-live-orders，拒绝启动 funding arb 常驻实盘"
@@ -25897,16 +26727,6 @@ fn validate_funding_arb_resident_live_options(
         return Err(RuntimeError::UnsafeConfig {
             message:
                 "funding-arb resident live poll interval must be at least 10 seconds in live mode"
-                    .to_owned(),
-        });
-    }
-    if options.execute_live
-        && options.funding_settlement_ledger_path.is_none()
-        && options.funding_settlement_raw_snapshot_path.is_none()
-    {
-        return Err(RuntimeError::UnsafeConfig {
-            message:
-                "funding-arb resident live requires funding settlement ledger or raw snapshot before live orders"
                     .to_owned(),
         });
     }
@@ -26129,6 +26949,935 @@ fn funding_arb_resident_no_candidate_reason(
 }
 
 #[cfg(feature = "live-exec")]
+impl FundingArbResidentPositionRegistry {
+    fn active_positions(&self) -> Vec<FundingArbResidentPosition> {
+        self.positions
+            .values()
+            .filter(|position| position.status == "open")
+            .cloned()
+            .collect()
+    }
+
+    fn live_entry_count(&self) -> usize {
+        self.positions
+            .values()
+            .filter(|position| position.status != "unknown")
+            .count()
+    }
+
+    fn closed_position_count(&self) -> usize {
+        self.positions
+            .values()
+            .filter(|position| position.status == "closed")
+            .count()
+    }
+
+    fn unknown_position_count(&self) -> usize {
+        self.positions
+            .values()
+            .filter(|position| position.status == "unknown")
+            .count()
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn load_funding_arb_resident_position_registry(
+    output_root: &Path,
+) -> RuntimeResult<FundingArbResidentPositionRegistry> {
+    let path = output_root.join("funding_arb_resident_positions.jsonl");
+    let mut registry = FundingArbResidentPositionRegistry::default();
+    if !path.exists() {
+        return Ok(registry);
+    }
+    let contents = read_utf8(&path)?;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = parse_json_object_value_slices(line)?;
+        let event_type =
+            required_json_value_string(&fields, "event_type", "funding arb resident registry")?;
+        let position_id =
+            required_json_value_string(&fields, "position_id", "funding arb resident registry")?;
+        match event_type.as_str() {
+            "position_opened" => {
+                let position_state_path = required_json_value_string(
+                    &fields,
+                    "position_state_path",
+                    "funding arb resident registry",
+                )?;
+                registry.positions.insert(
+                    position_id.clone(),
+                    FundingArbResidentPosition {
+                        position_id,
+                        position_state_path: PathBuf::from(position_state_path),
+                        pair_id: required_json_value_string(
+                            &fields,
+                            "pair_id",
+                            "funding arb resident registry",
+                        )?,
+                        symbol: required_json_value_string(
+                            &fields,
+                            "symbol",
+                            "funding arb resident registry",
+                        )?,
+                        notional_usdt: required_json_value_string(
+                            &fields,
+                            "notional_usdt",
+                            "funding arb resident registry",
+                        )?,
+                        status: "open".to_owned(),
+                    },
+                );
+            }
+            "position_closed" => {
+                if let Some(position) = registry.positions.get_mut(&position_id) {
+                    position.status = "closed".to_owned();
+                }
+            }
+            "position_unknown" => {
+                if let Some(position) = registry.positions.get_mut(&position_id) {
+                    position.status = "unknown".to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(registry)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_entry_capacity(
+    options: &FundingArbResidentLiveOptions,
+    output_root: &Path,
+) -> RuntimeResult<ResidentEntryCapacity> {
+    if !options.execute_live {
+        return Ok(ResidentEntryCapacity::Allowed);
+    }
+    let registry = load_funding_arb_resident_position_registry(output_root)?;
+    if registry.unknown_position_count() > 0 {
+        return Ok(ResidentEntryCapacity::Blocked(
+            "unknown funding arb resident position exists; new entries are blocked".to_owned(),
+        ));
+    }
+    let active_count = registry.active_positions().len();
+    if active_count > 0 {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "active funding arb position count is {active_count}; new entries wait for exit supervisor"
+        )));
+    }
+    if registry.live_entry_count() >= options.max_live_entries as usize {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "max live entries reached: {} >= {}",
+            registry.live_entry_count(),
+            options.max_live_entries
+        )));
+    }
+    Ok(ResidentEntryCapacity::Allowed)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_id(outcome: &FundingArbResidentCycleOutcome, cycle: u64) -> String {
+    format!(
+        "pos:funding-arb:{}:{}:{}",
+        basis_identifier_component(&outcome.pair_id),
+        basis_identifier_component(&outcome.symbol),
+        cycle
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_position_opened(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    position_state_path: &Path,
+    outcome: &FundingArbResidentCycleOutcome,
+) -> RuntimeResult<()> {
+    let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
+    let position_id = funding_arb_position_id(outcome, cycle);
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_opened\",\"net_funding_bps\":{},\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"status\":\"open\",\"symbol\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        outcome
+            .net_funding_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&position_state.notional_usd),
+        json_string(&outcome.pair_id),
+        json_string(&position_id),
+        json_string(&position_state_path.display().to_string()),
+        outcome.canary.private_confirmation_count,
+        json_string(&outcome.symbol),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_position_closed(
+    output_root: &Path,
+    position_id: &str,
+    cycle: u64,
+    cycle_dir: &Path,
+    report: &FundingArbExitCycleReport,
+) -> RuntimeResult<()> {
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"position_id\":{},\"private_confirmation_count\":{},\"submitted_receipt_count\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&report.decision),
+        json_string(position_id),
+        report.private_confirmation_count,
+        report.submitted_receipt_count,
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_position_unknown(
+    output_root: &Path,
+    position_id: &str,
+    cycle: u64,
+    cycle_dir: &Path,
+    report: &FundingArbExitCycleReport,
+    reason: &str,
+) -> RuntimeResult<()> {
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",\"position_id\":{},\"reason\":{},\"residual_risk\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&report.decision),
+        json_string(position_id),
+        json_string(reason),
+        optional_json_string(report.residual_risk.as_deref()),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_position_jsonl(output_root: &Path, line: &str) -> RuntimeResult<()> {
+    append_line_to_jsonl(
+        output_root.join("funding_arb_resident_positions.jsonl"),
+        line,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_capacity_event(
+    output_root: &Path,
+    cycle: u64,
+    reason: &str,
+) -> RuntimeResult<()> {
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"cycle\":{},\"event_type\":\"entry_capacity_blocked\",\"reason\":{}}}",
+            cycle,
+            json_string(reason),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn run_funding_arb_resident_exit_cycle(
+    options: &FundingArbResidentLiveOptions,
+    position_state_path: &Path,
+    output_dir: &Path,
+) -> RuntimeResult<FundingArbExitCycleReport> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
+    let snapshot = load_funding_arb_resident_snapshot(options)?;
+    let snapshot_path = output_dir.join("funding_arb_monitor_snapshot.json");
+    write_utf8(snapshot_path.clone(), &snapshot.to_json())?;
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.pair_id == state.pair_id)
+        .ok_or_else(|| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!(
+                "funding arb exit snapshot does not contain active pair_id `{}`",
+                state.pair_id
+            ),
+        })?;
+    let spec = funding_arb_pipeline_spec_from_monitor_row(
+        row,
+        &funding_arb_resident_dry_run_options(
+            options,
+            snapshot_path.clone(),
+            state.pair_id.clone(),
+            None,
+        ),
+    )?;
+    let private = run_funding_arb_private_readonly_snapshot_once(
+        FundingArbPrivateReadonlySnapshotOnceOptions {
+            config_path: options.config_path.clone(),
+            snapshot_path,
+            pair_id: state.pair_id.clone(),
+            output_dir: Some(output_dir.join("private-readonly")),
+            funding_settlement_raw_snapshot_path: options
+                .funding_settlement_raw_snapshot_path
+                .clone(),
+            hyperliquid_user: options.hyperliquid_user.clone(),
+            aster_user: options.aster_user.clone(),
+            aster_signer: options.aster_signer.clone(),
+            aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
+        },
+    )?;
+    let position_raw_json = read_utf8(&private.position_raw_snapshot_path)?;
+    let position_raw = parse_funding_private_raw_snapshot_json(
+        &position_raw_json,
+        "funding arb exit private position raw snapshot",
+    )?;
+    let position_snapshot =
+        funding_private_position_snapshot_from_raw_snapshot(row, &position_raw)?;
+    let position_status = funding_arb_exit_private_position_status(row, &spec, &position_snapshot)?;
+    let settlement = funding_arb_resident_settlement_reconciliation(
+        options,
+        row,
+        &spec,
+        Some(&private.settlement_raw_snapshot_path),
+    )?;
+    let leg_a = funding_arb_exit_leg_snapshot(row, &state.leg_a, &position_snapshot)?;
+    let leg_b = funding_arb_exit_leg_snapshot(row, &state.leg_b, &position_snapshot)?;
+    let mut reason_codes = Vec::new();
+    let mut blocking_reasons = Vec::new();
+    let mut receipts = Vec::new();
+    let mut confirmations = Vec::new();
+    let mut residual_risk = None;
+    let mut dispatch_attempted = false;
+
+    let close_required_count = [leg_a.close_required, leg_b.close_required]
+        .into_iter()
+        .filter(|required| *required)
+        .count();
+    let decision = if !position_status.is_matched() {
+        reason_codes.push("private_position_unknown".to_owned());
+        blocking_reasons.push(position_status.reason.clone().unwrap_or_else(|| {
+            "funding arb exit private position snapshot is not matched".to_owned()
+        }));
+        "blocked".to_owned()
+    } else if close_required_count == 0 {
+        reason_codes.push("already_flat".to_owned());
+        "closed".to_owned()
+    } else if close_required_count != 2 {
+        reason_codes.push("position_imbalance".to_owned());
+        "emergency_de_risk".to_owned()
+    } else if settlement.is_matched() {
+        reason_codes.push("funding_settlement_matched".to_owned());
+        "close".to_owned()
+    } else {
+        reason_codes.push("waiting_for_funding_settlement".to_owned());
+        "hold".to_owned()
+    };
+
+    if matches!(decision.as_str(), "close" | "emergency_de_risk") {
+        if !options.acknowledge_funding_arb_live_orders {
+            blocking_reasons.push(
+                "缺少 --i-understand-funding-arb-live-orders，拒绝提交 funding arb 退出订单"
+                    .to_owned(),
+            );
+        } else {
+            let config = arb_config::ArbConfig::from_path(&options.config_path)?;
+            let signing_policy = signing_policy_from_config(&config)?;
+            let private_order_events = state
+                .private_order_events_dir
+                .as_ref()
+                .map(|path| PrivateOrderEventStore::from_dir(Path::new(path)))
+                .transpose()?;
+            dispatch_attempted = true;
+            let outcome = execute_funding_arb_exit_close_orders(
+                options,
+                &signing_policy,
+                &[leg_a, leg_b],
+                private_order_events.as_ref(),
+            )?;
+            receipts = outcome.receipts;
+            confirmations = outcome.confirmations;
+            residual_risk = outcome.protection.residual_risk;
+            blocking_reasons.extend(outcome.blocking_reasons);
+        }
+    }
+
+    let report = FundingArbExitCycleReport {
+        pair_id: state.pair_id,
+        symbol: state.symbol,
+        decision,
+        reason_codes,
+        funding_settlement_status: settlement.status,
+        private_position_status: position_status.status,
+        dispatch_attempted,
+        submitted_receipt_count: receipts.len(),
+        private_confirmation_count: confirmations.len(),
+        residual_risk,
+        blocking_reasons,
+        output_dir: Some(output_dir.to_path_buf()),
+    };
+    write_funding_arb_exit_cycle_artifacts(output_dir, &report, &receipts, &confirmations)?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_dry_run_options(
+    options: &FundingArbResidentLiveOptions,
+    snapshot_path: PathBuf,
+    pair_id: String,
+    output_dir: Option<PathBuf>,
+) -> FundingArbGuardedDryRunOnceOptions {
+    FundingArbGuardedDryRunOnceOptions {
+        config_path: options.config_path.clone(),
+        snapshot_path,
+        pair_id,
+        funding_settlement_ledger_path: options.funding_settlement_ledger_path.clone(),
+        funding_settlement_raw_snapshot_path: options.funding_settlement_raw_snapshot_path.clone(),
+        private_account_snapshot_path: None,
+        private_account_raw_snapshot_path: None,
+        private_position_snapshot_path: None,
+        private_position_raw_snapshot_path: None,
+        private_execution_snapshot_path: options.private_execution_snapshot_path.clone(),
+        output_dir,
+        notional_usd: options.notional_usd.clone(),
+        taker_fee_bps: options.taker_fee_bps,
+        slippage_buffer_bps: options.slippage_buffer_bps,
+        max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+        min_net_funding_bps: options.min_net_funding_bps,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_settlement_reconciliation(
+    options: &FundingArbResidentLiveOptions,
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    fallback_raw_snapshot_path: Option<&Path>,
+) -> RuntimeResult<FundingSettlementReconciliationSummary> {
+    if let Some(path) = &options.funding_settlement_ledger_path {
+        return reconcile_funding_settlement_ledger_json(row, spec, &read_utf8(path)?);
+    }
+    if let Some(path) = &options.funding_settlement_raw_snapshot_path {
+        return reconcile_funding_settlement_raw_snapshot_json(row, spec, &read_utf8(path)?);
+    }
+    if let Some(path) = fallback_raw_snapshot_path {
+        return reconcile_funding_settlement_raw_snapshot_json(row, spec, &read_utf8(path)?);
+    }
+    Ok(FundingSettlementReconciliationSummary::not_provided())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_private_position_status(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot: &FundingPrivatePositionSnapshot,
+) -> RuntimeResult<FundingPrivatePositionReconciliationSummary> {
+    if snapshot.status != "complete" && snapshot.status != "matched" && snapshot.status != "healthy"
+    {
+        return Ok(FundingPrivatePositionReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            checked_position_count: 0,
+            nonzero_position_count: 0,
+            reason: Some(format!(
+                "private position snapshot status is {}",
+                snapshot.status
+            )),
+        });
+    }
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let required_accounts = [
+        spec.strategy_config.venues.venue_a.account_id.as_str(),
+        spec.strategy_config.venues.venue_b.account_id.as_str(),
+    ];
+    let mut checked_accounts = BTreeSet::new();
+    let mut checked_position_count = 0_usize;
+    let mut nonzero_position_count = 0_usize;
+    for entry in &snapshot.positions {
+        let entry_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol));
+        if entry_symbol != expected_symbol {
+            continue;
+        }
+        if required_accounts
+            .iter()
+            .any(|account_id| entry.account_id == *account_id)
+        {
+            checked_accounts.insert(entry.account_id.clone());
+            checked_position_count += 1;
+            if MonitorDecimal::parse("funding_arb_exit_position.quantity", &entry.quantity)?.raw
+                != 0
+            {
+                nonzero_position_count += 1;
+            }
+        }
+    }
+    let missing_accounts = required_accounts
+        .iter()
+        .filter(|account_id| !checked_accounts.contains::<str>(*account_id))
+        .copied()
+        .collect::<Vec<_>>();
+    Ok(FundingPrivatePositionReconciliationSummary {
+        status: if missing_accounts.is_empty() {
+            "Matched"
+        } else {
+            "Missing"
+        }
+        .to_owned(),
+        snapshot_updated_at: snapshot.updated_at.clone(),
+        checked_position_count,
+        nonzero_position_count,
+        reason: (!missing_accounts.is_empty()).then(|| {
+            format!(
+                "private position snapshot is missing active funding-arb accounts: {}",
+                missing_accounts.join(",")
+            )
+        }),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_leg_snapshot(
+    row: &FundingArbMarketRow,
+    leg: &FundingArbPositionLegState,
+    snapshot: &FundingPrivatePositionSnapshot,
+) -> RuntimeResult<FundingArbExitLegSnapshot> {
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let quantity = snapshot
+        .positions
+        .iter()
+        .find(|entry| {
+            normalize_venue_family(&entry.venue_family) == normalize_venue_family(&leg.venue_family)
+                && funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol))
+                    == expected_symbol
+                && entry.account_id == leg.account_id
+        })
+        .map(|entry| MonitorDecimal::parse("funding_arb_exit_leg.quantity", &entry.quantity))
+        .transpose()?
+        .unwrap_or(MonitorDecimal { raw: 0 });
+    let close_required = quantity.raw != 0;
+    let close_quantity = Quantity::from_str(
+        &MonitorDecimal {
+            raw: quantity.raw.abs(),
+        }
+        .format_trimmed(),
+    )?;
+    let close_side = if quantity.raw < 0 {
+        OrderSide::Buy
+    } else {
+        opposite_order_side(leg.side)
+    };
+    let close_price = Price::from_str(funding_arb_row_exit_price(row, leg, close_side)?)?;
+    Ok(FundingArbExitLegSnapshot {
+        leg: leg.clone(),
+        signed_quantity: quantity,
+        close_quantity,
+        close_price,
+        close_required,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_exit_price<'a>(
+    row: &'a FundingArbMarketRow,
+    leg: &FundingArbPositionLegState,
+    close_side: OrderSide,
+) -> RuntimeResult<&'a str> {
+    let family = normalize_venue_family(&leg.venue_family);
+    let (bid, ask) = if family == normalize_venue_family(&row.venue_a_family) {
+        (&row.venue_a_bid, &row.venue_a_ask)
+    } else if family == normalize_venue_family(&row.venue_b_family) {
+        (&row.venue_b_bid, &row.venue_b_ask)
+    } else {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "funding arb exit row does not contain venue family `{}`",
+                leg.venue_family
+            ),
+        });
+    };
+    Ok(match close_side {
+        OrderSide::Buy => ask.as_str(),
+        OrderSide::Sell => bid.as_str(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn execute_funding_arb_exit_close_orders(
+    options: &FundingArbResidentLiveOptions,
+    signing_policy: &SigningPolicy,
+    legs: &[FundingArbExitLegSnapshot; 2],
+    private_order_events: Option<&PrivateOrderEventStore>,
+) -> RuntimeResult<BasisLiveExecutionOutcome> {
+    let mut outcome = BasisLiveExecutionOutcome::default();
+    let suffix = current_utc_timestamp()?.unix_seconds().to_string();
+    for leg in legs.iter().filter(|leg| leg.close_required) {
+        let mut adapter =
+            build_funding_perp_live_adapter_for_exit(&leg.leg, options, signing_policy)?;
+        let market = funding_private_order_market_for_venue_id(&leg.leg.venue_id)?;
+        let planned = funding_arb_exit_close_planned_order(leg, &suffix)?;
+        outcome
+            .protection
+            .record_action(format!("funding_exit_close:{}", leg.leg.role));
+        let receipt = match adapter.submit_order(planned.request.clone()) {
+            Ok(receipt) => {
+                outcome.protection.record_receipt();
+                outcome.receipts.push(receipt.clone());
+                receipt
+            }
+            Err(error) => {
+                outcome.blocking_reasons.push(format!(
+                    "funding exit close submit failed for {}: {error}",
+                    leg.leg.venue_family
+                ));
+                outcome.protection.record_residual_risk(format!(
+                    "funding exit close submit failed for {}; manual close is required",
+                    leg.leg.venue_family
+                ));
+                continue;
+            }
+        };
+        match confirm_planned_receipt_with_private_stream_or_order_query(
+            &mut adapter,
+            &planned,
+            &receipt,
+            "funding-exit-close",
+            private_order_events,
+            market,
+            "event:funding-arb-exit-order-query",
+        ) {
+            Ok(update) => {
+                if update.status != OrderConfirmationStatus::Filled {
+                    outcome.protection.record_residual_risk(format!(
+                        "funding exit close on {} returned `{}`",
+                        leg.leg.venue_family,
+                        update.status.as_str()
+                    ));
+                }
+                outcome.confirmations.push(private_confirmation_from_update(
+                    &planned.plan_leg_id,
+                    &update,
+                ));
+            }
+            Err(error) => {
+                outcome.blocking_reasons.push(format!(
+                    "funding exit close confirmation failed for {}: {error}",
+                    leg.leg.venue_family
+                ));
+                outcome.protection.record_residual_risk(format!(
+                    "funding exit close state is unknown for {}; private reconciliation is required",
+                    leg.leg.venue_family
+                ));
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_planned_order(
+    leg: &FundingArbExitLegSnapshot,
+    suffix: &str,
+) -> RuntimeResult<PlannedSubmitOrder> {
+    let close_side = if leg.signed_quantity.raw < 0 {
+        OrderSide::Buy
+    } else {
+        opposite_order_side(leg.leg.side)
+    };
+    Ok(PlannedSubmitOrder {
+        plan_leg_id: format!(
+            "pleg:funding-arb-exit:{}:{}:{suffix}",
+            leg.leg.venue_family, leg.leg.role
+        ),
+        venue_symbol: leg.leg.instrument_id.clone(),
+        basis_leg_role: Some("funding_exit_close".to_owned()),
+        notional_usd: Amount::from_str("0")?,
+        request: SubmitOrderRequest::new(
+            VenueId::new(&leg.leg.venue_id)?,
+            AccountId::new(&leg.leg.account_id)?,
+            InstrumentId::new(&leg.leg.instrument_id)?,
+            close_side,
+            MutableOrderType::Limit,
+            leg.close_quantity,
+            Some(leg.close_price),
+            None,
+            ExecIdempotencyKey::new(format!(
+                "idem:funding-arb-exit:{}:{}:{suffix}",
+                leg.leg.venue_family, leg.leg.role
+            ))?,
+        )
+        .with_time_in_force(MutableTimeInForce::Ioc)
+        .with_reduce_only(true),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn build_funding_perp_live_adapter_for_exit(
+    leg: &FundingArbPositionLegState,
+    options: &FundingArbResidentLiveOptions,
+    signing_policy: &SigningPolicy,
+) -> RuntimeResult<FundingPerpLiveAdapter> {
+    let venue_id = VenueId::new(&leg.venue_id)?;
+    let account_id = AccountId::new(&leg.account_id)?;
+    match leg.venue_id.as_str() {
+        BINANCE_BASIS_PERP_VENUE_ID => Ok(FundingPerpLiveAdapter::BinanceUsdm(
+            live::BinanceUsdmExecAdapter::new(
+                live::BinanceExecConfig::usdm_futures(
+                    venue_id,
+                    account_id,
+                    BINANCE_USDM_FUTURES_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                RealSigningProviderFromEnv::from_default_env()?,
+                live::BinanceCurlExecTransport::default(),
+            )?,
+        )),
+        BYBIT_BASIS_PERP_VENUE_ID => Ok(FundingPerpLiveAdapter::BybitLinear(
+            live::BybitLinearExecAdapter::new(
+                live::BybitExecConfig::linear_perpetual(
+                    venue_id,
+                    account_id,
+                    BYBIT_REST_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                BybitRealSigningProviderFromEnv::from_default_env()?,
+                live::BybitCurlExecTransport::default(),
+            )?,
+        )),
+        OKX_BASIS_PERP_VENUE_ID => Ok(FundingPerpLiveAdapter::OkxSwap(
+            live::OkxSwapExecAdapter::new(
+                live::OkxExecConfig::swap(
+                    venue_id,
+                    account_id,
+                    OKX_REST_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                OkxRealSigningProviderFromEnv::from_default_env()?,
+                live::OkxCurlExecTransport::default(),
+            )?,
+        )),
+        BITGET_BASIS_PERP_VENUE_ID => Ok(FundingPerpLiveAdapter::BitgetUsdtFutures(
+            live::BitgetUsdtFuturesExecAdapter::new(
+                live::BitgetExecConfig::usdt_futures(
+                    venue_id,
+                    account_id,
+                    BITGET_REST_BASE_URL,
+                    signing_policy.clone(),
+                )?,
+                BitgetRealSigningProviderFromEnv::from_default_env()?,
+                live::BitgetCurlExecTransport::default(),
+            )?,
+        )),
+        "venue:ASTER-USDT-FUTURES" => {
+            let aster_user =
+                resolve_required_aster_v3_address(options.aster_user.as_deref(), "ASTER_USER")?;
+            let aster_signer =
+                resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
+            let signer_command =
+                resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
+            Ok(FundingPerpLiveAdapter::AsterPerp(
+                live::AsterPerpExecAdapter::new(
+                    live::AsterExecConfig::perp(
+                        venue_id,
+                        account_id,
+                        ASTER_FUTURES_V3_REST_BASE_URL,
+                        Some(aster_user),
+                        aster_signer,
+                        signing_policy.clone(),
+                    )?,
+                    AsterEip712ExternalSigningProvider::new(
+                        LiteralAsterExternalSignerCommandProvider::new(signer_command)?,
+                        SystemAsterNonceProvider,
+                    ),
+                    live::AsterCurlExecTransport::default(),
+                )?,
+            ))
+        }
+        "venue:HYPERLIQUID-PERP" => {
+            let user = resolve_required_hyperliquid_user(options.hyperliquid_user.as_deref())?;
+            let signer_command = resolve_wallet_signer_command()?;
+            let symbol = funding_arb_hyperliquid_symbol_from_instrument(&leg.instrument_id)?;
+            let asset_id =
+                resolve_hyperliquid_asset_id_from_map(&symbol, &options.hyperliquid_asset_ids)?;
+            let mut config = live::HyperliquidExecConfig::perp(
+                venue_id,
+                account_id,
+                live::HYPERLIQUID_API_BASE_URL,
+                user,
+                options.hyperliquid_source.clone(),
+                signing_policy.clone(),
+            )?
+            .with_asset_id(symbol.clone(), asset_id)?;
+            if let Some(base) = symbol.strip_suffix("USDT") {
+                config = config.with_asset_id(base.to_owned(), asset_id)?;
+            }
+            if let Some(vault_address) = &options.hyperliquid_vault_address {
+                config = config.with_vault_address(vault_address.clone())?;
+            }
+            if let Some(expires_after) = options.hyperliquid_expires_after_ms {
+                config = config.with_expires_after_ms(expires_after);
+            }
+            Ok(FundingPerpLiveAdapter::HyperliquidPerp(
+                live::HyperliquidPerpExecAdapter::new(
+                    config,
+                    live::HyperliquidExternalSigner::new(signer_command)?,
+                    live::HyperliquidCurlExecTransport::default(),
+                )?,
+            ))
+        }
+        other => Err(RuntimeError::UnsafeConfig {
+            message: format!("unsupported funding arb exit venue `{other}`"),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_hyperliquid_symbol_from_instrument(instrument_id: &str) -> RuntimeResult<String> {
+    let mut parts = instrument_id.split(':');
+    let prefix = parts.next();
+    let venue = parts.next();
+    let symbol = parts.next();
+    let suffix = parts.next();
+    if parts.next().is_some()
+        || prefix != Some("inst")
+        || venue != Some("HYPERLIQUID")
+        || suffix != Some("PERP")
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("invalid Hyperliquid funding arb instrument `{instrument_id}`"),
+        });
+    }
+    Ok(symbol.expect("symbol checked").to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_private_order_market_for_venue_id(venue_id: &str) -> RuntimeResult<PrivateOrderMarket> {
+    match venue_id {
+        BINANCE_BASIS_PERP_VENUE_ID => Ok(PrivateOrderMarket::UsdmFutures),
+        BYBIT_BASIS_PERP_VENUE_ID => Ok(PrivateOrderMarket::BybitLinear),
+        OKX_BASIS_PERP_VENUE_ID => Ok(PrivateOrderMarket::OkxSwap),
+        BITGET_BASIS_PERP_VENUE_ID => Ok(PrivateOrderMarket::BitgetUsdtFutures),
+        "venue:ASTER-USDT-FUTURES" => Ok(PrivateOrderMarket::AsterPerp),
+        "venue:HYPERLIQUID-PERP" => Ok(PrivateOrderMarket::HyperliquidPerp),
+        other => Err(RuntimeError::UnsafeConfig {
+            message: format!("unsupported funding arb private order market venue `{other}`"),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_hyperliquid_asset_id_from_map(
+    symbol: &str,
+    asset_ids: &BTreeMap<String, u32>,
+) -> RuntimeResult<u32> {
+    if let Some(asset_id) = asset_ids.get(symbol).or_else(|| {
+        symbol
+            .strip_suffix("USDT")
+            .and_then(|base| asset_ids.get(base))
+    }) {
+        return Ok(*asset_id);
+    }
+    for key in hyperliquid_asset_id_env_names(symbol) {
+        if let Ok(value) = std::env::var(&key) {
+            return value
+                .parse::<u32>()
+                .map_err(|_| RuntimeError::UnsafeConfig {
+                    message: format!("{key} must be a non-negative u32 asset id"),
+                });
+        }
+    }
+    Err(RuntimeError::UnsafeConfig {
+        message: format!("Hyperliquid funding arb live requires asset-id mapping for `{symbol}`"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_cycle_cleanly_closed(report: &FundingArbExitCycleReport) -> bool {
+    report.decision == "closed"
+        || (matches!(report.decision.as_str(), "close" | "emergency_de_risk")
+            && report.dispatch_attempted
+            && report.blocking_reasons.is_empty()
+            && report.residual_risk.is_none()
+            && report.private_confirmation_count > 0)
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_exit_cycle_artifacts(
+    output_dir: &Path,
+    report: &FundingArbExitCycleReport,
+    receipts: &[MutableActionReceipt],
+    confirmations: &[arb_execution::PrivateOrderConfirmation],
+) -> RuntimeResult<()> {
+    fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    write_utf8(
+        output_dir.join("funding_arb_exit_cycle_report.json"),
+        &format!("{}\n", funding_arb_exit_cycle_report_json(report)),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_exit_mutable_receipts.jsonl"),
+        &mutable_receipts_jsonl(receipts),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_exit_private_confirmations.jsonl"),
+        &private_confirmations_jsonl(confirmations),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> String {
+    format!(
+        "{{\"blocking_reasons\":[{}],\"decision\":{},\"dispatch_attempted\":{},\"funding_settlement_status\":{},\"output_dir\":{},\"pair_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason_codes\":{},\"residual_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        report
+            .blocking_reasons
+            .iter()
+            .map(|reason| json_string(reason))
+            .collect::<Vec<_>>()
+            .join(","),
+        json_string(&report.decision),
+        report.dispatch_attempted,
+        json_string(&report.funding_settlement_status),
+        optional_json_string(report.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
+        json_string(&report.pair_id),
+        report.private_confirmation_count,
+        json_string(&report.private_position_status),
+        json_string_array(&report.reason_codes),
+        optional_json_string(report.residual_risk.as_deref()),
+        report.submitted_receipt_count,
+        json_string(&report.symbol),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_exit_event(
+    output_root: &Path,
+    cycle: u64,
+    position_id: &str,
+    cycle_dir: &Path,
+    report: &FundingArbExitCycleReport,
+) -> RuntimeResult<()> {
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"funding_settlement_status\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"residual_risk\":{},\"submitted_receipt_count\":{}}}",
+            report.blocking_reasons.len(),
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(&report.decision),
+            report.dispatch_attempted,
+            json_string(&report.funding_settlement_status),
+            json_string(position_id),
+            report.private_confirmation_count,
+            json_string(&report.private_position_status),
+            optional_json_string(report.residual_risk.as_deref()),
+            report.submitted_receipt_count,
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
 fn write_funding_arb_resident_live_config(
     output_root: &Path,
     options: &FundingArbResidentLiveOptions,
@@ -26305,7 +28054,8 @@ fn write_funding_arb_resident_live_summary(
 #[cfg(feature = "live-exec")]
 fn funding_arb_resident_live_report_json(report: &FundingArbResidentLiveReport) -> String {
     format!(
-        "{{\"cycles\":{},\"dispatch_attempted\":{},\"halt_reason\":{},\"last_net_funding_bps\":{},\"last_pair_id\":{},\"last_symbol\":{},\"live_entry_count\":{},\"mutable_execution_started\":{},\"output_dir\":{},\"phase\":{},\"schema_version\":\"1.0.0\"}}",
+        "{{\"closed_position_count\":{},\"cycles\":{},\"dispatch_attempted\":{},\"halt_reason\":{},\"last_net_funding_bps\":{},\"last_pair_id\":{},\"last_symbol\":{},\"live_entry_count\":{},\"mutable_execution_started\":{},\"open_position_count\":{},\"output_dir\":{},\"phase\":{},\"schema_version\":\"1.0.0\",\"unknown_position_count\":{}}}",
+        report.closed_position_count,
         report.cycles,
         report.dispatch_attempted,
         optional_json_string(report.halt_reason.as_deref()),
@@ -26317,8 +28067,10 @@ fn funding_arb_resident_live_report_json(report: &FundingArbResidentLiveReport) 
         optional_json_string(report.last_symbol.as_deref()),
         report.live_entry_count,
         report.mutable_execution_started,
+        report.open_position_count,
         optional_json_string(report.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
         json_string(&report.phase),
+        report.unknown_position_count,
     )
 }
 
@@ -27551,16 +29303,15 @@ fn build_public_funding_arb_portfolio_state_with_missing_flags(
 }
 
 fn funding_arb_public_missing_data_flags(
-    funding_settlement_reconciled: bool,
+    _funding_settlement_reconciled: bool,
     private_balance_reconciled: bool,
     private_margin_reconciled: bool,
     private_positions_reconciled: bool,
-    private_execution_reconciled: bool,
+    _private_execution_reconciled: bool,
 ) -> Vec<String> {
     let mut flags = Vec::new();
-    if !private_execution_reconciled {
-        flags.push("TWO_LEG_EXECUTION_RECONCILIATION_UNAVAILABLE".to_owned());
-    }
+    // Funding settlement and private execution are lifecycle checks: settlement gates exit,
+    // and private execution reconciliation exists only after a dispatch attempt.
     if !private_balance_reconciled {
         flags.push("PRIVATE_BALANCE_UNAVAILABLE".to_owned());
     }
@@ -27569,9 +29320,6 @@ fn funding_arb_public_missing_data_flags(
     }
     if !private_positions_reconciled {
         flags.push("PRIVATE_POSITION_UNAVAILABLE".to_owned());
-    }
-    if !funding_settlement_reconciled {
-        flags.push("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE".to_owned());
     }
     flags
 }
@@ -33219,6 +34967,19 @@ fn write_utf8(path: PathBuf, contents: &str) -> RuntimeResult<()> {
     })
 }
 
+#[cfg(feature = "live-exec")]
+fn write_utf8_with_parent(path: PathBuf, contents: &str) -> RuntimeResult<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| RuntimeError::Io {
+                path: parent.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        }
+    }
+    write_utf8(path, contents)
+}
+
 fn compare_expected_artifacts(
     fixture_root: &Path,
     artifacts: &EndToEndArtifacts,
@@ -36127,13 +37888,15 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         let pair_id = options.pair_id.clone();
         let report = run_funding_arb_private_readonly_snapshot_once(options)?;
         return Ok(format!(
-            "ok: funding arb private read-only snapshot completed; pair_id={pair_id}; symbol={}; venues={}; account_statements={}; position_statements={}; mutable_execution_started=false; wrote account_raw_snapshot={}; position_raw_snapshot={}; summary={}",
+            "ok: funding arb private read-only snapshot completed; pair_id={pair_id}; symbol={}; venues={}; account_statements={}; position_statements={}; settlement_statements={}; mutable_execution_started=false; wrote account_raw_snapshot={}; position_raw_snapshot={}; settlement_raw_snapshot={}; summary={}",
             report.symbol,
             report.venue_families.join(","),
             report.account_statement_count,
             report.position_statement_count,
+            report.settlement_statement_count,
             report.account_raw_snapshot_path.display(),
             report.position_raw_snapshot_path.display(),
+            report.settlement_raw_snapshot_path.display(),
             report.summary_path.display()
         ));
     }
@@ -36220,7 +37983,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             .map(|path| format!("; wrote artifacts to {}", path.display()))
             .unwrap_or_else(|| "; no artifacts written".to_owned());
         return Ok(format!(
-            "ok: funding arb resident live completed; phase={}; cycles={}; last_pair_id={}; last_symbol={}; last_net_funding_bps={}; dispatch_attempted={}; live_entry_count={}; halt_reason={}; mutable_execution_started={}{}",
+            "ok: funding arb resident live completed; phase={}; cycles={}; last_pair_id={}; last_symbol={}; last_net_funding_bps={}; dispatch_attempted={}; live_entry_count={}; open_positions={}; closed_positions={}; unknown_positions={}; halt_reason={}; mutable_execution_started={}{}",
             report.phase,
             report.cycles,
             report.last_pair_id.as_deref().unwrap_or("none"),
@@ -36231,6 +37994,9 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
                 .unwrap_or_else(|| "none".to_owned()),
             report.dispatch_attempted,
             report.live_entry_count,
+            report.open_position_count,
+            report.closed_position_count,
+            report.unknown_position_count,
             report.halt_reason.as_deref().unwrap_or("none"),
             report.mutable_execution_started,
             output_note
@@ -36410,14 +38176,14 @@ fn legacy_help_text() -> String {
         "                                    Serve a read-only Chinese dashboard for exchange balances and all positions from local snapshots; no signing, orders, cancels, or transfers",
         "  wallet-signer-preflight [--aster-signer 0x...] [--aster-signer-cmd-env env] [--skip-aster] [--check-hyperliquid --hyperliquid-agent 0x... --hyperliquid-source a|b] [--out dir]",
         "                                    Run local signer and address-match checks before private read-only or live signing; no exchange requests and no mutable execution",
-        "  funding-arb-private-readonly-snapshot-once --snapshot file --pair-id id [--config file] [--hyperliquid-user 0x...] [--aster-user 0x...] [--aster-signer 0x...] [--aster-signer-cmd-env env] [--out dir]",
-        "                                    Fetch read-only private account/position snapshots for a funding arb pair; Aster auto-uses arb-wallet-signer unless the signer command env override is set; no orders, cancels, transfers, or mutable execution",
+        "  funding-arb-private-readonly-snapshot-once --snapshot file --pair-id id [--config file] [--funding-settlement-raw-snapshot file] [--hyperliquid-user 0x...] [--aster-user 0x...] [--aster-signer 0x...] [--aster-signer-cmd-env env] [--out dir]",
+        "                                    Fetch read-only private account/position/funding settlement raw snapshots for a funding arb pair; Aster auto-uses arb-wallet-signer unless the signer command env override is set; no orders, cancels, transfers, or mutable execution",
         "  funding-arb-guarded-dry-run-once --snapshot file --pair-id id [--config file] [--funding-settlement-raw-snapshot file] [--private-account-snapshot file | --private-account-raw-snapshot file] [--private-position-snapshot file | --private-position-raw-snapshot file] [--private-execution-snapshot file] [--out dir] [--min-net-funding-bps 5]",
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
         "  funding-arb-guarded-live-canary-once --snapshot file --pair-id id [dry-run snapshot options] [--private-order-events-dir dir] [--aster-user 0x...] [--aster-signer 0x...] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--execute-live --i-understand-funding-arb-live-orders]",
         "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the two perp legs with cancel/unwind protection",
         "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders]",
-        "                                    Resident funding-arb scanner: refresh private read-only snapshots and run guarded canary cycles; live mode halts after one dispatch until exit/de-risk supervisor is attached",
+        "                                    Resident funding-arb scanner: refresh private read-only snapshots, run guarded entry cycles, register live positions, and supervise reduce-only exit/de-risk",
     ]
     .join("\n")
 }
@@ -40057,6 +41823,7 @@ fn parse_funding_arb_private_readonly_snapshot_once_args(
     let mut snapshot_path = None;
     let mut pair_id = None;
     let mut output_dir = None;
+    let mut funding_settlement_raw_snapshot_path = None;
     let mut hyperliquid_user = None;
     let mut aster_user = None;
     let mut aster_signer = None;
@@ -40123,6 +41890,15 @@ fn parse_funding_arb_private_readonly_snapshot_once_args(
                 };
                 output_dir = Some(PathBuf::from(value));
             }
+            "--funding-settlement-raw-snapshot" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--funding-settlement-raw-snapshot requires a file path",
+                    ));
+                };
+                funding_settlement_raw_snapshot_path = Some(PathBuf::from(value));
+            }
             value if value.starts_with('-') => {
                 return Err(cli_arg_error(format!(
                     "unknown funding-arb-private-readonly-snapshot-once option `{value}`"
@@ -40142,6 +41918,7 @@ fn parse_funding_arb_private_readonly_snapshot_once_args(
         snapshot_path: snapshot_path.ok_or_else(|| cli_arg_error("--snapshot is required"))?,
         pair_id: pair_id.ok_or_else(|| cli_arg_error("--pair-id is required"))?,
         output_dir,
+        funding_settlement_raw_snapshot_path,
         hyperliquid_user,
         aster_user,
         aster_signer,
@@ -42186,6 +43963,65 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_dashboard_reads_nested_funding_arb_resident_positions() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let account_path = root.path().join("accounts.json");
+        let funding_path = root.path().join("funding.json");
+        let resident_dir = root
+            .path()
+            .join("resident-live")
+            .join("cross-exchange-funding-arb");
+        fs::create_dir_all(&resident_dir).expect("resident dir");
+        write_utf8(
+            account_path.clone(),
+            r#"{"accounts":[{"account_id":"acct-binance","available_usd":"100.50","maintenance_margin_usd":"5","margin_balance_usd":"120.50","venue_family":"Binance"}],"status":"healthy","updated_at":"2026-05-19T00:00:00Z"}"#,
+        )
+        .expect("account snapshot");
+        write_utf8(
+            funding_path.clone(),
+            r#"{"candidate_count":1,"rows":[{"funding_interval_hours":"8","is_candidate":true,"pair_id":"binance-bybit-btc","source_status":"complete","symbol":"BTCUSDT","venue_a_ask":"100","venue_a_ask_qty":"1","venue_a_bid":"99","venue_a_bid_qty":"1","venue_a_family":"binance","venue_a_funding_interval_hours":"8","venue_a_funding_rate":"0.00010000","venue_a_index_price":"100","venue_a_mark_price":"100","venue_a_next_funding_time_ms":"1778601600000","venue_b_ask":"100","venue_b_ask_qty":"1","venue_b_bid":"99","venue_b_bid_qty":"1","venue_b_family":"bybit","venue_b_funding_interval_hours":"8","venue_b_funding_rate":"-0.00005000","venue_b_index_price":"100","venue_b_mark_price":"100","venue_b_next_funding_time_ms":"1778601600000"}],"source_count":2,"source_error_count":0,"status":"healthy","total_rows":1,"updated_at":"2026-05-19T00:00:02Z"}"#,
+        )
+        .expect("funding snapshot");
+        write_utf8(
+            resident_dir.join("funding_arb_resident_positions.jsonl"),
+            "{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:funding\",\"position_state_path\":\"funding_position.json\",\"status\":\"open\",\"symbol\":\"BTCUSDT\"}\n",
+        )
+        .expect("resident registry");
+        write_utf8(
+            resident_dir.join("funding_position.json"),
+            r#"{"entry_net_funding_bps":15,"leg_a":{"account_id":"acct:binance-funding-arb-readonly","entry_limit_price":"100.01","instrument_id":"inst:BINANCE:BTCUSDT:USDM-PERP","quantity":"0.001","role":"perp_long","side":"buy","venue_family":"binance","venue_id":"venue:BINANCE-USDM"},"leg_b":{"account_id":"acct:bybit-funding-arb-readonly","entry_limit_price":"99.99","instrument_id":"inst:BYBIT:BTCUSDT:LINEAR-PERP","quantity":"0.001","role":"perp_short","side":"sell","venue_family":"bybit","venue_id":"venue:BYBIT-LINEAR"},"notional_usd":"10.00","opened_at":"2026-05-19T00:00:03Z","pair_id":"binance:bybit:BTCUSDT:BTCUSDT","private_order_events_dir":"target/private-order-events","schema_version":"1.0.0","symbol":"BTCUSDT"}"#,
+        )
+        .expect("position state");
+        let options = PortfolioDashboardOptions {
+            account_snapshot_path: Some(account_path),
+            resident_root: Some(root.path().to_path_buf()),
+            funding_snapshot_path: Some(funding_path),
+            once: true,
+            ..PortfolioDashboardOptions::default()
+        };
+
+        let snapshot = build_portfolio_dashboard_snapshot(&options).expect("snapshot");
+
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(
+            snapshot.positions[0].strategy,
+            "cross-exchange-funding-arb-resident-live"
+        );
+        assert_eq!(snapshot.positions[0].source, "funding-arb-resident-live");
+        assert!(snapshot.positions[0]
+            .venue_family
+            .contains("binance / bybit"));
+        assert!(snapshot.positions[0]
+            .realtime_funding_rate
+            .as_deref()
+            .is_some_and(|value| value.contains("binance:0.00010000")));
+        assert!(snapshot.positions[0]
+            .open_close_condition
+            .as_deref()
+            .is_some_and(|value| value.contains("reduce-only")));
+    }
+
+    #[test]
     fn parse_portfolio_dashboard_args_accepts_multiple_local_position_sources() {
         let args = vec![
             "--account-snapshot".to_owned(),
@@ -42612,7 +44448,7 @@ mod tests {
         assert!(report
             .live_blocking_reasons
             .iter()
-            .any(|reason| reason.contains("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE")));
+            .any(|reason| reason.contains("funding settlement ledger snapshot was not provided")));
         assert!(!report.dispatch_attempted);
         let report_json = read_utf8(&output_dir.join("funding_arb_guarded_dry_run_report.json"))
             .expect("report json");
@@ -42776,6 +44612,25 @@ mod tests {
     }
 
     #[test]
+    fn funding_settlement_raw_snapshot_normalizes_exchange_specific_funding_entries() {
+        let snapshot = parse_funding_settlement_raw_snapshot_json(
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"99.00","funding":"0.30"}]}}},{"venue_family":"okx","account_id":"acct:okx-funding-arb-readonly","payload":{"data":[{"instId":"BTC-USDT-SWAP","type":"8","balChg":"-0.01"}]}},{"venue_family":"hyperliquid","account_id":"acct:hyperliquid-funding-arb-readonly","payload":[{"time":1770000000000,"delta":{"type":"funding","coin":"BTC","usdc":"0.24"}}]}]}"#,
+        )
+        .expect("raw snapshot");
+
+        let entries =
+            funding_settlement_entries_from_raw_snapshot(&snapshot).expect("settlement entries");
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].symbol, "BTCUSDT");
+        assert_eq!(entries[0].amount_usd, "0.30");
+        assert_eq!(entries[1].symbol, "BTCUSDT");
+        assert_eq!(entries[1].amount_usd, "-0.01");
+        assert_eq!(entries[2].symbol, "BTCUSDT");
+        assert_eq!(entries[2].amount_usd, "0.24");
+    }
+
+    #[test]
     fn funding_arb_guarded_dry_run_once_reconciles_private_accounts() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let config_path = root.path().join("guarded-live.yaml");
@@ -42901,7 +44756,7 @@ mod tests {
         assert!(report
             .live_blocking_reasons
             .iter()
-            .any(|reason| reason.contains("FUNDING_SETTLEMENT_LEDGER_UNAVAILABLE")));
+            .any(|reason| reason.contains("funding settlement ledger snapshot was not provided")));
         let private_json =
             read_utf8(&output_dir.join("funding_arb_private_position_reconciliation.json"))
                 .expect("private position reconciliation json");
@@ -43490,6 +45345,140 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_position_state_json_round_trips_live_exit_context() {
+        let state = FundingArbPositionState {
+            pair_id: "binance:bybit:BTCUSDT:BTCUSDT".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            plan_hash: Some("hash:funding-arb-test".to_owned()),
+            notional_usd: "10.00".to_owned(),
+            entry_net_funding_bps: Some(12),
+            opened_at: "2026-05-13T00:00:00Z".to_owned(),
+            private_order_events_dir: Some("target/private-order-events".to_owned()),
+            leg_a: FundingArbPositionLegState {
+                role: "perp_long".to_owned(),
+                venue_family: "binance".to_owned(),
+                venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                instrument_id: BINANCE_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                side: OrderSide::Buy,
+                quantity: "0.001".to_owned(),
+                entry_limit_price: "100.01".to_owned(),
+            },
+            leg_b: FundingArbPositionLegState {
+                role: "perp_short".to_owned(),
+                venue_family: "bybit".to_owned(),
+                venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                instrument_id: BYBIT_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                side: OrderSide::Sell,
+                quantity: "0.001".to_owned(),
+                entry_limit_price: "99.99".to_owned(),
+            },
+        };
+
+        let json = funding_arb_position_state_json(&state);
+        let parsed = parse_funding_arb_position_state_json(&json).expect("position state");
+
+        assert_eq!(parsed, state);
+        assert!(json.contains("\"schema_version\":\"1.0.0\""));
+        assert!(json.contains("\"private_order_events_dir\""));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_registry_blocks_open_and_unknown_positions() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let registry_path = root.path().join("funding_arb_resident_positions.jsonl");
+        let options = FundingArbResidentLiveOptions {
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: Some(root.path().to_path_buf()),
+            snapshot_path: None,
+            pair_id: None,
+            sources: Vec::new(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            private_order_events_dir: None,
+            poll_interval_secs: 60,
+            max_cycles: None,
+            max_live_entries: 2,
+            notional_usd: "10.00".to_owned(),
+            taker_fee_bps: 5,
+            slippage_buffer_bps: 5,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: 5,
+            execute_live: true,
+            acknowledge_funding_arb_live_orders: true,
+            hyperliquid_user: None,
+            hyperliquid_source: "a".to_owned(),
+            hyperliquid_vault_address: None,
+            hyperliquid_expires_after_ms: None,
+            hyperliquid_asset_ids: BTreeMap::new(),
+            aster_user: None,
+            aster_signer: None,
+            aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
+        };
+
+        write_utf8(
+            registry_path.clone(),
+            "{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:one\",\"position_state_path\":\"target/position.json\",\"status\":\"open\",\"symbol\":\"BTCUSDT\"}\n",
+        )
+        .expect("write open registry");
+
+        let active_capacity =
+            funding_arb_resident_entry_capacity(&options, root.path()).expect("capacity");
+        assert!(matches!(
+            active_capacity,
+            ResidentEntryCapacity::Blocked(reason) if reason.contains("active funding arb position count")
+        ));
+
+        write_utf8(
+            registry_path,
+            "{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:one\",\"position_state_path\":\"target/position.json\",\"status\":\"open\",\"symbol\":\"BTCUSDT\"}\n{\"event_type\":\"position_unknown\",\"position_id\":\"pos:one\",\"reason\":\"manual reconciliation required\"}\n",
+        )
+        .expect("write unknown registry");
+
+        let unknown_capacity =
+            funding_arb_resident_entry_capacity(&options, root.path()).expect("capacity");
+        assert!(matches!(
+            unknown_capacity,
+            ResidentEntryCapacity::Blocked(reason) if reason.contains("unknown funding arb resident position")
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_close_order_is_ioc_reduce_only() {
+        let leg = FundingArbExitLegSnapshot {
+            leg: FundingArbPositionLegState {
+                role: "perp_long".to_owned(),
+                venue_family: "binance".to_owned(),
+                venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                instrument_id: BINANCE_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                side: OrderSide::Buy,
+                quantity: "0.001".to_owned(),
+                entry_limit_price: "100.01".to_owned(),
+            },
+            signed_quantity: MonitorDecimal { raw: 1_000 },
+            close_quantity: Quantity::from_str("0.001").expect("quantity"),
+            close_price: Price::from_str("100.02").expect("price"),
+            close_required: true,
+        };
+
+        let planned = funding_arb_exit_close_planned_order(&leg, "123456").expect("planned close");
+
+        assert_eq!(planned.request.side, OrderSide::Sell);
+        assert_eq!(planned.request.time_in_force, Some(MutableTimeInForce::Ioc));
+        assert!(planned.request.reduce_only);
+        assert_eq!(
+            planned.basis_leg_role.as_deref(),
+            Some("funding_exit_close")
+        );
+    }
+
+    #[test]
     fn funding_arb_private_readonly_snapshot_once_args_parse() {
         let args = vec![
             "--snapshot".to_owned(),
@@ -43506,6 +45495,8 @@ mod tests {
             "0x2222222222222222222222222222222222222222".to_owned(),
             "--aster-signer-cmd-env".to_owned(),
             "ASTER_READONLY_SIGNER_CMD".to_owned(),
+            "--funding-settlement-raw-snapshot".to_owned(),
+            "target/funding-settlement-raw.json".to_owned(),
             "--out".to_owned(),
             "target/funding-private-readonly".to_owned(),
         ];
@@ -43531,6 +45522,10 @@ mod tests {
             Some("0x2222222222222222222222222222222222222222")
         );
         assert_eq!(options.aster_signer_cmd_env, "ASTER_READONLY_SIGNER_CMD");
+        assert_eq!(
+            options.funding_settlement_raw_snapshot_path,
+            Some(PathBuf::from("target/funding-settlement-raw.json"))
+        );
         assert_eq!(
             options.output_dir,
             Some(PathBuf::from("target/funding-private-readonly"))

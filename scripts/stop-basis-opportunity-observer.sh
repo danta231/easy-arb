@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # 中文说明：停止 start-basis-opportunity-observer.sh 启动的只读观察链路。
-# 该脚本只根据 pid 文件停止本地 monitor、机会记录器和 dry-run 验证进程。
+# 该脚本只根据 pid 文件停止本地 monitor、spot-perp-basis 常驻 runner、
+# cross-exchange-funding-arb 常驻 runner、机会记录器和 dry-run/实盘验证进程。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -24,8 +25,9 @@ usage() {
 
 行为:
   读取 state/basis-observer.pids，先停止 recorder，等待已启动的 validation
-  子任务 flush report，再停止 monitor；超时后对仍存活的相关 pid 发送 KILL，
-  然后归档 pid 文件。
+  子任务 flush report，再停止 monitor、spot-perp-basis 常驻 runner 和
+  cross-exchange-funding-arb 常驻 runner；
+  超时后对仍存活的相关 pid 发送 KILL，然后归档 pid 文件。
 USAGE
 }
 
@@ -40,7 +42,7 @@ is_validation_process_name() {
 
 is_core_process_name() {
   case "$1" in
-    *-basis-monitor|funding-arb-monitor|opportunity-recorder) return 0 ;;
+    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live) return 0 ;;
     *) return 1 ;;
   esac
 }
