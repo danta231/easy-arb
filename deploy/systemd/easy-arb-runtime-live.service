@@ -1,0 +1,36 @@
+[Unit]
+Description=easy-arb runtime live stack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=easyarb
+Group=easyarb
+WorkingDirectory=/opt/easy-arb/current
+EnvironmentFile=/etc/easy-arb/easy-arb-live.env
+EnvironmentFile=-/etc/easy-arb/easy-arb-secrets.env
+ExecStartPre=/usr/bin/test -x /opt/easy-arb/current/target/release/arb-runtime
+ExecStartPre=/usr/bin/test -x /opt/easy-arb/current/target/release/arb-wallet-signer
+ExecStart=/opt/easy-arb/current/scripts/start-arb-runtime-live.sh --no-build
+ExecStop=/opt/easy-arb/current/scripts/stop-arb-runtime-live.sh
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=3
+TimeoutStartSec=240
+TimeoutStopSec=45
+KillSignal=SIGTERM
+KillMode=control-group
+SyslogIdentifier=easy-arb-runtime-live
+LimitNOFILE=65535
+
+# 基础加固。中文：代码目录只运行，状态写入 /var/lib/easy-arb。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/easy-arb /tmp
+
+[Install]
+WantedBy=multi-user.target

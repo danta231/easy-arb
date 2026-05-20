@@ -19,12 +19,8 @@ const HYPERLIQUID_KEY_ENV_ALIASES: &[&str] = &[
     "HYPERLIQUID_PRIVATE_KEY",
 ];
 const ASTER_EXPECT_ADDRESS_ENV_DEFAULT: &str = "ASTER_SIGNER";
-const ASTER_EXPECT_ADDRESS_ENV_ALIASES: &[&str] = &[
-    "ASTER_SIGNER_ADDRESS",
-    "ASTER_API_ADDRESS",
-    "ASTER_ADDRESS",
-    "ASTER_USER",
-];
+const ASTER_EXPECT_ADDRESS_ENV_ALIASES: &[&str] =
+    &["ASTER_SIGNER_ADDRESS", "ASTER_API_ADDRESS", "ASTER_ADDRESS"];
 const HYPERLIQUID_EXPECT_ADDRESS_ENV_DEFAULT: &str = "HYPERLIQUID_AGENT";
 const HYPERLIQUID_EXPECT_ADDRESS_ENV_ALIASES: &[&str] = &[
     "HYPERLIQUID_SIGNER",
@@ -1185,6 +1181,23 @@ mod tests {
             _ => None,
         })
         .expect("cli output");
+        assert_eq!(output.len(), 132);
+    }
+
+    #[test]
+    fn cli_aster_expected_signer_does_not_fall_back_to_user_address() {
+        let key = test_key();
+        let payload = concat!(
+            "nonce=1748310859508867&signer=",
+            "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+        );
+        let output = run_cli(Vec::<String>::new(), payload, |name| match name {
+            "ASTER_SIGNER_PRIVATE" => Some(key.clone()),
+            "ASTER_USER" => Some("0x0000000000000000000000000000000000000001".to_owned()),
+            _ => None,
+        })
+        .expect("cli output");
+
         assert_eq!(output.len(), 132);
     }
 

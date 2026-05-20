@@ -2401,13 +2401,13 @@ pub mod real {
                 param.push_encoded_pair(&mut rendered);
                 pairs.push(rendered);
             }
+            pairs.push(format!("nonce={nonce_micros}"));
             if let Some(user) = &self.user {
                 pairs.push(format!(
                     "user={}",
                     percent_encode_component(user.expose_for_transport())
                 ));
             }
-            pairs.push(format!("nonce={nonce_micros}"));
             pairs.push(format!(
                 "signer={}",
                 percent_encode_component(self.signer.expose_for_transport())
@@ -4969,7 +4969,7 @@ mod tests {
         assert_eq!(signed.nonce_micros(), 1_748_310_859_508_867);
         assert!(signed
             .signed_query_for_transport()
-            .contains("symbol=BTCUSDT&user=0x1111111111111111111111111111111111111111&nonce=1748310859508867&signer=0x2222222222222222222222222222222222222222&signature=0x"));
+            .contains("symbol=BTCUSDT&nonce=1748310859508867&user=0x1111111111111111111111111111111111111111&signer=0x2222222222222222222222222222222222222222&signature=0x"));
         assert_eq!(signed.signature().as_str(), signature);
 
         let raw_query = signed.signed_query_for_transport().to_owned();
@@ -4984,6 +4984,50 @@ mod tests {
         assert_eq!(
             signed.redacted_log_entry().status(),
             SigningAttemptStatus::Signed
+        );
+    }
+
+    #[cfg(feature = "real-signing")]
+    #[test]
+    fn aster_external_eip712_provider_omits_user_when_not_required() {
+        use crate::real::{
+            AsterEip712ExternalSigningProvider, AsterRealSigningProvider, AsterRequestParam,
+            AsterV3SigningInput,
+        };
+
+        let signature = format!("0x{}", "b".repeat(130));
+        let script_path = write_aster_signer_script(&signature);
+        let policy_ref =
+            SigningPolicyRef::new("kms-policy/aster-readonly-unit").expect("policy ref");
+        let policy = SigningPolicy::real_signing_enabled(policy_ref.clone());
+        let input = AsterV3SigningInput::new(
+            SigningRequestId::new("signing-request/aster-readonly-unit").expect("request id"),
+            policy_ref,
+            SigningPurpose::QueryAccount,
+            VenueId::new("venue:ASTER-USDT-FUTURES").expect("venue id"),
+            AccountId::new("account/aster-readonly").expect("account id"),
+            None,
+            "0x2222222222222222222222222222222222222222".to_owned(),
+            [AsterRequestParam::new("symbol", "BTCUSDT").expect("param")],
+        )
+        .expect("aster input");
+        let signer = AsterEip712ExternalSigningProvider::new(
+            StaticAsterCommandProvider {
+                command: script_path.display().to_string(),
+            },
+            FixedNonce(1_748_310_859_508_867),
+        );
+
+        let signed = signer
+            .sign_aster_eip712_external(input, &policy)
+            .expect("external signer should sign Aster payload");
+
+        assert_eq!(
+            signed.signed_query_for_transport(),
+            format!(
+                "symbol=BTCUSDT&nonce=1748310859508867&signer=0x2222222222222222222222222222222222222222&signature={}",
+                signature
+            )
         );
     }
 
@@ -5394,10 +5438,16 @@ mod tests {
     fn write_aster_signer_script(signature: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
+        let signature_tag = signature
+            .chars()
+            .filter(|ch| ch.is_ascii_hexdigit())
+            .take(16)
+            .collect::<String>();
         let dir = std::env::temp_dir().join(format!(
-            "arb-signing-aster-test-{}-{}",
+            "arb-signing-aster-test-{}-{}-{}",
             std::process::id(),
-            signature.len()
+            signature.len(),
+            signature_tag
         ));
         let _ = std::fs::create_dir_all(&dir);
         let script_path = dir.join("signer.sh");

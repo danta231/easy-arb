@@ -94,15 +94,19 @@ use arb_venue_data::{
 #[cfg(feature = "live-exec")]
 use arb_signing::real::{
     AsterEip712ExternalSigningProvider, AsterRealSigningProvider, AsterRequestParam,
-    AsterV3SigningInput, BinanceHmacSigningInput, BinanceRequestParam, BitgetHmacSigningInput,
+    AsterV3SigningInput, BinanceHmacSha256SigningProvider, BinanceHmacSigningInput,
+    BinanceRequestParam, BinanceTimestampProvider, BitgetHmacSigningInput,
     BitgetRealSigningProvider, BitgetRealSigningProviderFromEnv, BitgetRestMethod,
     BybitHmacSigningInput, BybitRealSigningProvider, BybitRealSigningProviderFromEnv,
-    BybitSigningPayloadKind, LiteralAsterExternalSignerCommandProvider, OkxHmacSigningInput,
-    OkxRealSigningProvider, OkxRealSigningProviderFromEnv, OkxRestMethod, RealSigningProvider,
-    RealSigningProviderFromEnv, SystemAsterNonceProvider,
+    BybitSigningPayloadKind, EnvBinanceCredentialProvider,
+    LiteralAsterExternalSignerCommandProvider, OkxHmacSigningInput, OkxRealSigningProvider,
+    OkxRealSigningProviderFromEnv, OkxRestMethod, RealSigningProvider, SystemAsterNonceProvider,
 };
 #[cfg(feature = "live-exec")]
-use arb_signing::{SigningPolicy, SigningPolicyRef, SigningPurpose, SigningRequestId};
+use arb_signing::{
+    SigningAuditRef, SigningError, SigningPolicy, SigningPolicyRef, SigningPurpose,
+    SigningRequestId, SigningResult,
+};
 #[cfg(feature = "live-exec")]
 use arb_venue_data::{
     BalanceQuery, BalanceReader, BinancePrivateAccountAdapter, BinancePrivateAccountMarket,
@@ -136,7 +140,7 @@ const ASTER_SPOT_REST_BASE_URL: &str = "https://sapi.asterdex.com";
 const ASTER_FUTURES_REST_BASE_URL: &str = "https://fapi.asterdex.com";
 const ASTER_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.asterdex.com";
 #[cfg(feature = "live-exec")]
-const ASTER_FUTURES_V3_REST_BASE_URL: &str = "https://fapi3.asterdex.com";
+const ASTER_FUTURES_V3_REST_BASE_URL: &str = ASTER_FUTURES_REST_BASE_URL;
 #[cfg(feature = "live-exec")]
 const ASTER_SIGNED_REST_USER_AGENT: &str = "easy-arb-runtime/aster-signed-rest";
 const ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT: &str = "ASTER_EIP712_SIGNER_CMD";
@@ -153,7 +157,6 @@ const ASTER_SIGNER_ENV_NAMES: &[&str] = &[
     "ASTER_SIGNER_ADDRESS",
     "ASTER_API_ADDRESS",
     "ASTER_ADDRESS",
-    "ASTER_ACCOUNT_ADDRESS",
 ];
 #[cfg(feature = "live-exec")]
 const HYPERLIQUID_USER_ENV_NAMES: &[&str] = &[
@@ -172,6 +175,20 @@ const HYPERLIQUID_AGENT_ENV_NAMES: &[&str] = &[
 ];
 #[cfg(feature = "live-exec")]
 const ARB_WALLET_SIGNER_PATH_ENV_DEFAULT: &str = "ARB_WALLET_SIGNER_PATH";
+#[cfg(feature = "live-exec")]
+const BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS: u64 = 10_000;
+#[cfg(feature = "live-exec")]
+const BINANCE_SERVER_TIME_CURL_MAX_TIME_SECS: u64 = 5;
+#[cfg(feature = "live-exec")]
+const PRIVATE_CURL_MAX_ATTEMPTS_ENV: &str = "ARB_RUNTIME_PRIVATE_CURL_MAX_ATTEMPTS";
+#[cfg(feature = "live-exec")]
+const PRIVATE_CURL_IP_VERSION_ENV: &str = "ARB_RUNTIME_PRIVATE_CURL_IP_VERSION";
+#[cfg(feature = "live-exec")]
+const PRIVATE_CURL_DEFAULT_MAX_ATTEMPTS: u32 = 3;
+#[cfg(feature = "live-exec")]
+const PRIVATE_CURL_MAX_ATTEMPTS_LIMIT: u32 = 8;
+#[cfg(feature = "live-exec")]
+const PRIVATE_CURL_RETRY_BASE_DELAY_MS: u64 = 750;
 const FUNDING_ARB_MAX_MARK_INDEX_DIVERGENCE_BPS: i128 = 100;
 const RAW_TICKER_FILE: &str = "raw/binance_ticker_24hr.redacted.json";
 const RAW_TICKER_REF: &str = "raw/binance_ticker_24hr.redacted.json";
@@ -4307,6 +4324,121 @@ fn funding_settlement_raw_snapshot_query_window_ms() -> RuntimeResult<(u64, u64)
 }
 
 #[cfg(feature = "live-exec")]
+type RuntimeBinanceSigningProvider = BinanceHmacSha256SigningProvider<
+    EnvBinanceCredentialProvider,
+    BinanceServerTimeOffsetTimestampProvider,
+>;
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BinanceServerTimeOffsetTimestampProvider {
+    offset_ms: i128,
+}
+
+#[cfg(feature = "live-exec")]
+impl BinanceTimestampProvider for BinanceServerTimeOffsetTimestampProvider {
+    fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+        let local_ms = system_unix_millis_for_binance_signing(audit_ref)?;
+        let timestamp = i128::from(local_ms)
+            .checked_add(self.offset_ms)
+            .ok_or_else(|| SigningError::ClockUnavailable {
+                audit_ref: audit_ref.clone(),
+            })?;
+        u64::try_from(timestamp).map_err(|_| SigningError::ClockUnavailable {
+            audit_ref: audit_ref.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn runtime_binance_signing_provider(
+    base_url: &str,
+    time_endpoint: &str,
+) -> RuntimeResult<RuntimeBinanceSigningProvider> {
+    let offset_ms = binance_server_time_offset_millis(base_url, time_endpoint)?;
+    Ok(BinanceHmacSha256SigningProvider::new(
+        EnvBinanceCredentialProvider::from_default_env()?,
+        BinanceServerTimeOffsetTimestampProvider { offset_ms },
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_server_time_endpoint_for_private_endpoint(endpoint: &str) -> &'static str {
+    if endpoint.starts_with("/api/") {
+        "/api/v3/time"
+    } else {
+        "/fapi/v1/time"
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_server_time_offset_millis(base_url: &str, time_endpoint: &str) -> RuntimeResult<i128> {
+    let local_before_ms = system_unix_millis_runtime()?;
+    let server_time_ms = fetch_binance_server_time_millis_with_curl(base_url, time_endpoint)?;
+    let local_after_ms = system_unix_millis_runtime()?;
+    binance_server_time_offset_millis_from_sample(local_before_ms, server_time_ms, local_after_ms)
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_server_time_offset_millis_from_sample(
+    local_before_ms: u64,
+    server_time_ms: u64,
+    local_after_ms: u64,
+) -> RuntimeResult<i128> {
+    if local_after_ms < local_before_ms {
+        return Err(RuntimeError::LiveMarketData {
+            message: "system time moved backwards while sampling Binance server time".to_owned(),
+        });
+    }
+    let local_midpoint_ms = (i128::from(local_before_ms) + i128::from(local_after_ms)) / 2;
+    Ok(i128::from(server_time_ms) - local_midpoint_ms)
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_binance_server_time_millis_with_curl(
+    base_url: &str,
+    time_endpoint: &str,
+) -> RuntimeResult<u64> {
+    let url = format!("{base_url}{time_endpoint}");
+    let body = fetch_public_json_with_curl_max_time(&url, BINANCE_SERVER_TIME_CURL_MAX_TIME_SECS)?;
+    parse_binance_server_time_millis(&body)
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_binance_server_time_millis(body: &str) -> RuntimeResult<u64> {
+    let fields = parse_json_object_value_slices(body)?;
+    optional_json_value_u64(&fields, "serverTime", "Binance server time")?.ok_or_else(|| {
+        RuntimeError::LiveMarketData {
+            message: "Binance server time response is missing `serverTime`".to_owned(),
+        }
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn system_unix_millis_runtime() -> RuntimeResult<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("system time is before Unix epoch: {error}"),
+        })?;
+    u64::try_from(duration.as_millis()).map_err(|_| RuntimeError::LiveMarketData {
+        message: "current Unix timestamp millis overflowed".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn system_unix_millis_for_binance_signing(audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        SigningError::ClockUnavailable {
+            audit_ref: audit_ref.clone(),
+        }
+    })?;
+    u64::try_from(duration.as_millis()).map_err(|_| SigningError::ClockUnavailable {
+        audit_ref: audit_ref.clone(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
 fn fetch_binance_funding_private_readonly_snapshots(
     symbol: &str,
     account_id: &str,
@@ -4314,7 +4446,7 @@ fn fetch_binance_funding_private_readonly_snapshots(
     options: &FundingArbPrivateReadonlySnapshotOnceOptions,
 ) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
     let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
-    let signer = RealSigningProviderFromEnv::from_default_env()?;
+    let signer = runtime_binance_signing_provider(BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/time")?;
     let account_signed = signer.sign_binance_hmac(
         BinanceHmacSigningInput::new(
             SigningRequestId::new(format!(
@@ -4326,7 +4458,7 @@ fn fetch_binance_funding_private_readonly_snapshots(
             AccountId::new(account_id)?,
             vec![BinanceRequestParam::new(
                 "recvWindow",
-                live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+                BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS.to_string(),
             )?],
         )?,
         &signing_policy,
@@ -4351,7 +4483,7 @@ fn fetch_binance_funding_private_readonly_snapshots(
                 BinanceRequestParam::new("symbol", symbol.to_owned())?,
                 BinanceRequestParam::new(
                     "recvWindow",
-                    live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+                    BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS.to_string(),
                 )?,
             ],
         )?,
@@ -4382,7 +4514,7 @@ fn fetch_binance_funding_private_readonly_snapshots(
                 BinanceRequestParam::new("limit", "1000")?,
                 BinanceRequestParam::new(
                     "recvWindow",
-                    live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+                    BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS.to_string(),
                 )?,
             ],
         )?,
@@ -4642,8 +4774,6 @@ fn fetch_aster_funding_private_readonly_snapshots(
     options: &FundingArbPrivateReadonlySnapshotOnceOptions,
 ) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
     let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
-    let aster_user =
-        resolve_required_aster_v3_address(options.aster_user.as_deref(), "ASTER_USER")?;
     let aster_signer =
         resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
     let signer_command = resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
@@ -4660,7 +4790,7 @@ fn fetch_aster_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            Some(aster_user.clone()),
+            None,
             aster_signer.clone(),
             Vec::<AsterRequestParam>::new(),
         )?,
@@ -4680,7 +4810,7 @@ fn fetch_aster_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            Some(aster_user.clone()),
+            None,
             aster_signer.clone(),
             vec![AsterRequestParam::new("symbol", symbol.to_owned())?],
         )?,
@@ -4701,7 +4831,7 @@ fn fetch_aster_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            Some(aster_user),
+            None,
             aster_signer,
             vec![
                 AsterRequestParam::new("symbol", symbol.to_owned())?,
@@ -4714,8 +4844,8 @@ fn fetch_aster_funding_private_readonly_snapshots(
         &signing_policy,
     )?;
     let settlement_payload_json = fetch_signed_aster_get_with_curl(
-        ASTER_FUTURES_REST_BASE_URL,
-        "/fapi/v1/income",
+        ASTER_FUTURES_V3_REST_BASE_URL,
+        "/fapi/v3/income",
         &settlement_signed,
     )?;
     Ok(FundingPrivateReadonlyFetchedVenue {
@@ -11392,33 +11522,54 @@ fn parse_public_wss_monitor_quote_map_for_basis(
     let fields = parse_json_object_value_slices(raw_json)?;
     validate_public_wss_monitor_snapshot_for_basis(&fields, monitor_ref, expected_market)?;
     let mut quotes = BTreeMap::new();
+    let mut seen_rows = 0_usize;
+    let mut skipped_unusable_rows = 0_usize;
     if let Some(rows_value) = fields.get("rows") {
         for row in json_array_value_slices(rows_value)? {
+            seen_rows += 1;
             let quote = parse_public_wss_monitor_quote_snapshot(row)?;
-            ensure_public_wss_monitor_quote_runtime_usable(
+            match ensure_public_wss_monitor_quote_runtime_usable(
                 &quote,
                 monitor_ref,
                 &quote.symbol,
                 fetched_at,
-            )?;
-            quotes.insert(quote.symbol.clone(), quote);
+            ) {
+                Ok(()) => {
+                    quotes.insert(quote.symbol.clone(), quote);
+                }
+                Err(_) => {
+                    skipped_unusable_rows += 1;
+                }
+            }
         }
     }
     if quotes.is_empty() {
         if let Some(value) = fields.get("latest_quote") {
             if value.trim() != "null" {
                 let quote = parse_public_wss_monitor_quote_snapshot(value)?;
-                ensure_public_wss_monitor_quote_runtime_usable(
+                match ensure_public_wss_monitor_quote_runtime_usable(
                     &quote,
                     monitor_ref,
                     &quote.symbol,
                     fetched_at,
-                )?;
-                quotes.insert(quote.symbol.clone(), quote);
+                ) {
+                    Ok(()) => {
+                        quotes.insert(quote.symbol.clone(), quote);
+                    }
+                    Err(error) if seen_rows == 0 => return Err(error),
+                    Err(_) => {}
+                }
             }
         }
     }
     if quotes.is_empty() {
+        if skipped_unusable_rows > 0 {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!(
+                    "Public WSS monitor `{monitor_ref}` has no currently usable WSS quote rows; skipped {skipped_unusable_rows} unusable rows"
+                ),
+            });
+        }
         return Err(RuntimeError::LiveMarketData {
             message: format!("Public WSS monitor `{monitor_ref}` has no quote rows"),
         });
@@ -13802,7 +13953,7 @@ impl<'a> FundingLiveCanaryContext<'a> {
 #[cfg(feature = "live-exec")]
 enum FundingPerpLiveAdapter {
     BinanceUsdm(
-        live::BinanceUsdmExecAdapter<RealSigningProviderFromEnv, live::BinanceCurlExecTransport>,
+        live::BinanceUsdmExecAdapter<RuntimeBinanceSigningProvider, live::BinanceCurlExecTransport>,
     ),
     BybitLinear(
         live::BybitLinearExecAdapter<BybitRealSigningProviderFromEnv, live::BybitCurlExecTransport>,
@@ -14562,7 +14713,7 @@ fn build_funding_perp_live_adapter(
                     BINANCE_USDM_FUTURES_BASE_URL,
                     signing_policy.clone(),
                 )?,
-                RealSigningProviderFromEnv::from_default_env()?,
+                runtime_binance_signing_provider(BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/time")?,
                 live::BinanceCurlExecTransport::default(),
             )?),
             PrivateOrderMarket::UsdmFutures,
@@ -16373,7 +16524,7 @@ fn fetch_binance_usdm_private_position_snapshot(
     ingested_at: &UtcTimestamp,
     state: &BasisExitSupervisorPositionState,
 ) -> RuntimeResult<Vec<VenuePosition>> {
-    let signer = RealSigningProviderFromEnv::from_default_env()?;
+    let signer = runtime_binance_signing_provider(BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/time")?;
     let signed = signer.sign_binance_hmac(
         BinanceHmacSigningInput::new(
             SigningRequestId::new(format!(
@@ -16388,7 +16539,7 @@ fn fetch_binance_usdm_private_position_snapshot(
                 BinanceRequestParam::new("symbol", state.symbol.clone())?,
                 BinanceRequestParam::new(
                     "recvWindow",
-                    live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+                    BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS.to_string(),
                 )?,
             ],
         )?,
@@ -23569,16 +23720,33 @@ fn bitget_ticker_value_to_string(
     field: &'static str,
     source: &'static str,
 ) -> RuntimeResult<String> {
+    bitget_ticker_value_to_string_at_depth(value, field, source, 0)
+}
+
+fn bitget_ticker_value_to_string_at_depth(
+    value: &str,
+    field: &'static str,
+    source: &'static str,
+    depth: usize,
+) -> RuntimeResult<String> {
     let trimmed = value.trim();
     if !trimmed.starts_with('[') {
+        if trimmed == "null" && is_bitget_size_field(field) {
+            return Ok("0".to_owned());
+        }
         return json_value_to_string(trimmed, field, source);
+    }
+    if depth >= 4 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{source} field `{field}` JSON array nesting is too deep"),
+        });
     }
     let values = json_array_value_slices(trimmed)?;
     if values.is_empty() && is_bitget_size_field(field) {
         return Ok("0".to_owned());
     }
     if values.len() == 1 {
-        return json_value_to_string(values[0], field, source);
+        return bitget_ticker_value_to_string_at_depth(values[0], field, source, depth + 1);
     }
     Err(RuntimeError::LiveMarketData {
         message: format!("{source} field `{field}` is an ambiguous JSON array"),
@@ -27246,10 +27414,11 @@ fn generic_private_account_entry_from_raw_statement(
 ) -> RuntimeResult<Option<FundingPrivateAccountEntry>> {
     let mut object_slices = Vec::new();
     collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+    let mut fallback_entry: Option<FundingPrivateAccountEntry> = None;
     for object in object_slices {
         let fields = parse_json_object_value_slices(object)?;
         if let Some(asset) =
-            first_json_scalar_string(&fields, &["asset", "marginCoin", "coin", "currency"])?
+            first_json_scalar_string(&fields, &["asset", "marginCoin", "coin", "currency", "ccy"])?
         {
             if !funding_private_margin_asset_is_usd(&asset) {
                 continue;
@@ -27264,6 +27433,8 @@ fn generic_private_account_entry_from_raw_statement(
                 "available_balance",
                 "available",
                 "availableToWithdraw",
+                "availBal",
+                "availEq",
                 "crossedMaxAvailable",
                 "isolatedMaxAvailable",
                 "maxWithdrawAmount",
@@ -27284,7 +27455,11 @@ fn generic_private_account_entry_from_raw_statement(
                 "walletBalance",
                 "balance",
                 "equity",
+                "eq",
+                "eqUsd",
+                "cashBal",
                 "accountEquity",
+                "adjEq",
                 "totalEq",
                 "usdtEquity",
                 "usdValue",
@@ -27311,6 +27486,8 @@ fn generic_private_account_entry_from_raw_statement(
                 "totalAvailableBalance",
                 "availableBalance",
                 "available",
+                "availBal",
+                "availEq",
                 "crossedMaxAvailable",
                 "isolatedMaxAvailable",
                 "maxWithdrawAmount",
@@ -27318,22 +27495,37 @@ fn generic_private_account_entry_from_raw_statement(
                 "unionAvailable",
             ],
         )?;
-        if available_usd.is_some()
-            || margin_balance_usd.is_some()
-            || maintenance_margin_usd.is_some()
-            || margin_buffer_usd.is_some()
+        let entry = FundingPrivateAccountEntry {
+            venue_family: statement.venue_family.clone(),
+            account_id: statement.account_id.clone(),
+            available_usd,
+            margin_balance_usd,
+            maintenance_margin_usd,
+            margin_buffer_usd,
+        };
+        if funding_private_account_entry_has_reconciliation_fields(&entry) {
+            return Ok(Some(entry));
+        }
+        if fallback_entry.is_none()
+            && (entry.available_usd.is_some()
+                || entry.margin_balance_usd.is_some()
+                || entry.maintenance_margin_usd.is_some()
+                || entry.margin_buffer_usd.is_some())
         {
-            return Ok(Some(FundingPrivateAccountEntry {
-                venue_family: statement.venue_family.clone(),
-                account_id: statement.account_id.clone(),
-                available_usd,
-                margin_balance_usd,
-                maintenance_margin_usd,
-                margin_buffer_usd,
-            }));
+            fallback_entry = Some(entry);
         }
     }
-    Ok(None)
+    Ok(fallback_entry)
+}
+
+fn funding_private_account_entry_has_reconciliation_fields(
+    entry: &FundingPrivateAccountEntry,
+) -> bool {
+    non_empty_private_account_decimal(entry.available_usd.as_deref()).is_some()
+        && (non_empty_private_account_decimal(entry.margin_buffer_usd.as_deref()).is_some()
+            || (non_empty_private_account_decimal(entry.margin_balance_usd.as_deref()).is_some()
+                && non_empty_private_account_decimal(entry.maintenance_margin_usd.as_deref())
+                    .is_some()))
 }
 
 fn funding_private_margin_asset_is_usd(asset: &str) -> bool {
@@ -27598,6 +27790,7 @@ fn funding_private_position_snapshot_from_raw_snapshot(
             }
             _ => positions.extend(generic_private_position_entries_from_raw_statement(
                 statement,
+                &expected_symbol,
             )?),
         }
     }
@@ -27610,6 +27803,7 @@ fn funding_private_position_snapshot_from_raw_snapshot(
 
 fn generic_private_position_entries_from_raw_statement(
     statement: &FundingPrivateRawStatement,
+    expected_symbol: &str,
 ) -> RuntimeResult<Vec<FundingPrivatePositionEntry>> {
     let mut object_slices = Vec::new();
     collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
@@ -27645,7 +27839,70 @@ fn generic_private_position_entries_from_raw_statement(
             quantity,
         });
     }
+    if private_position_statement_can_imply_missing_symbol_is_flat(statement)?
+        && !positions.iter().any(|entry| {
+            entry.symbol == expected_symbol && entry.account_id == statement.account_id
+        })
+    {
+        positions.push(FundingPrivatePositionEntry {
+            venue_family: statement.venue_family.clone(),
+            symbol: expected_symbol.to_owned(),
+            account_id: statement.account_id.clone(),
+            quantity: "0".to_owned(),
+        });
+    }
     Ok(positions)
+}
+
+fn private_position_statement_can_imply_missing_symbol_is_flat(
+    statement: &FundingPrivateRawStatement,
+) -> RuntimeResult<bool> {
+    let payload = statement.payload_json.trim();
+    if payload.starts_with('[') {
+        return Ok(true);
+    }
+    if !payload.starts_with('{') {
+        return Ok(false);
+    }
+    let fields = parse_json_object_value_slices(payload)?;
+    let family = normalize_venue_family(&statement.venue_family);
+    let success = match family.as_str() {
+        "bybit" => {
+            first_json_scalar_string(&fields, &["retCode"])?.is_some_and(|value| value == "0")
+                && object_field_contains_array(&fields, "result", "list")?
+        }
+        "bitget" => {
+            first_json_scalar_string(&fields, &["code"])?.is_some_and(|value| value == "00000")
+                && fields
+                    .get("data")
+                    .is_some_and(|value| value.trim().starts_with('['))
+        }
+        "okx" => {
+            first_json_scalar_string(&fields, &["code"])?.is_some_and(|value| value == "0")
+                && fields
+                    .get("data")
+                    .is_some_and(|value| value.trim().starts_with('['))
+        }
+        _ => false,
+    };
+    Ok(success)
+}
+
+fn object_field_contains_array(
+    fields: &BTreeMap<String, &str>,
+    object_field: &'static str,
+    array_field: &'static str,
+) -> RuntimeResult<bool> {
+    let Some(value) = fields.get(object_field) else {
+        return Ok(false);
+    };
+    if !value.trim().starts_with('{') {
+        return Ok(false);
+    }
+    let nested = parse_json_object_value_slices(value)?;
+    Ok(nested
+        .get(array_field)
+        .is_some_and(|value| value.trim().starts_with('[')))
 }
 
 fn hyperliquid_private_position_entries_from_raw_statement(
@@ -30096,7 +30353,7 @@ fn build_funding_perp_live_adapter_for_exit(
                     BINANCE_USDM_FUTURES_BASE_URL,
                     signing_policy.clone(),
                 )?,
-                RealSigningProviderFromEnv::from_default_env()?,
+                runtime_binance_signing_provider(BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/time")?,
                 live::BinanceCurlExecTransport::default(),
             )?,
         )),
@@ -34898,7 +35155,7 @@ fn signing_policy_from_config(config: &arb_config::ArbConfig) -> RuntimeResult<S
 fn build_binance_spot_live_adapter(
     signing_policy: &SigningPolicy,
 ) -> RuntimeResult<
-    live::BinanceSpotExecAdapter<RealSigningProviderFromEnv, live::BinanceCurlExecTransport>,
+    live::BinanceSpotExecAdapter<RuntimeBinanceSigningProvider, live::BinanceCurlExecTransport>,
 > {
     Ok(live::BinanceSpotExecAdapter::new(
         live::BinanceExecConfig::spot(
@@ -34907,7 +35164,7 @@ fn build_binance_spot_live_adapter(
             "https://api.binance.com",
             signing_policy.clone(),
         )?,
-        RealSigningProviderFromEnv::from_default_env()?,
+        runtime_binance_signing_provider("https://api.binance.com", "/api/v3/time")?,
         live::BinanceCurlExecTransport::default(),
     )?)
 }
@@ -34916,7 +35173,7 @@ fn build_binance_spot_live_adapter(
 fn build_binance_usdm_live_adapter(
     signing_policy: &SigningPolicy,
 ) -> RuntimeResult<
-    live::BinanceUsdmExecAdapter<RealSigningProviderFromEnv, live::BinanceCurlExecTransport>,
+    live::BinanceUsdmExecAdapter<RuntimeBinanceSigningProvider, live::BinanceCurlExecTransport>,
 > {
     Ok(live::BinanceUsdmExecAdapter::new(
         live::BinanceExecConfig::usdm_futures(
@@ -34925,7 +35182,7 @@ fn build_binance_usdm_live_adapter(
             BINANCE_USDM_FUTURES_BASE_URL,
             signing_policy.clone(),
         )?,
-        RealSigningProviderFromEnv::from_default_env()?,
+        runtime_binance_signing_provider(BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/time")?,
         live::BinanceCurlExecTransport::default(),
     )?)
 }
@@ -35074,7 +35331,10 @@ fn fetch_binance_private_account_snapshot(
     base_url: &str,
     endpoint: &str,
 ) -> RuntimeResult<BinancePrivateAccountSnapshot> {
-    let signer = RealSigningProviderFromEnv::from_default_env()?;
+    let signer = runtime_binance_signing_provider(
+        base_url,
+        binance_server_time_endpoint_for_private_endpoint(endpoint),
+    )?;
     let signed = signer.sign_binance_hmac(
         BinanceHmacSigningInput::new(
             SigningRequestId::new(format!("signing-request/binance-live/account/{scope}"))?,
@@ -35084,7 +35344,7 @@ fn fetch_binance_private_account_snapshot(
             AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
             vec![BinanceRequestParam::new(
                 "recvWindow",
-                live::DEFAULT_BINANCE_RECV_WINDOW_MS.to_string(),
+                BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS.to_string(),
             )?],
         )?,
         signing_policy,
@@ -35329,7 +35589,7 @@ fn ensure_asset_balance_covers_amount(
 #[cfg(feature = "live-exec")]
 fn confirm_live_receipt_with_order_query(
     adapter: &mut live::BinanceSpotExecAdapter<
-        RealSigningProviderFromEnv,
+        RuntimeBinanceSigningProvider,
         live::BinanceCurlExecTransport,
     >,
     planned: &arb_venue_exec::PlannedSubmitOrder,
@@ -35472,54 +35732,13 @@ fn fetch_signed_binance_get_with_curl(
     signed_query: &str,
 ) -> RuntimeResult<String> {
     let url = format!("{base_url}{endpoint}?{signed_query}");
-    let header = format!("{header_name}: {header_value}");
-    let config = format!(
-        "url = \"{}\"\nheader = \"{}\"\n",
-        curl_config_quote_runtime(&url)?,
-        curl_config_quote_runtime(&header)?
-    );
-    let mut child = Command::new("curl")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--request")
-        .arg("GET")
-        .arg("--connect-timeout")
-        .arg("10")
-        .arg("--max-time")
-        .arg("30")
-        .arg("--write-out")
-        .arg("\n__ARB_BINANCE_HTTP_STATUS__:%{http_code}")
-        .arg("--config")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot start curl for Binance private signed GET: {error}"),
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: "curl stdin unavailable for Binance private signed GET".to_owned(),
-        })?
-        .write_all(config.as_bytes())
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot write curl config for Binance private signed GET: {error}"),
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("curl failed for Binance private signed GET: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(RuntimeError::LiveMarketData {
-            message: "curl failed before a reliable Binance private HTTP response was available"
-                .to_owned(),
-        });
-    }
-    let rendered = String::from_utf8_lossy(&output.stdout);
+    let headers = [(header_name, header_value.to_owned())];
+    let rendered = run_private_signed_get_with_curl(
+        "Binance",
+        "\n__ARB_BINANCE_HTTP_STATUS__:",
+        &url,
+        &headers,
+    )?;
     let Some((body, status)) = rendered.rsplit_once("\n__ARB_BINANCE_HTTP_STATUS__:") else {
         return Err(RuntimeError::LiveMarketData {
             message: "Binance private signed GET lacked HTTP status marker".to_owned(),
@@ -35552,58 +35771,16 @@ fn fetch_signed_aster_get_with_curl(
         "{base_url}{endpoint}?{}",
         signed.signed_query_for_transport()
     );
-    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(&url)?);
-    append_runtime_curl_header_config(
-        &mut config,
-        "Content-Type: application/x-www-form-urlencoded",
-    )?;
-    append_runtime_curl_header_config(&mut config, "Accept: application/json")?;
-    append_runtime_curl_header_config(
-        &mut config,
-        &format!("User-Agent: {ASTER_SIGNED_REST_USER_AGENT}"),
-    )?;
-    let mut child = Command::new("curl")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--request")
-        .arg("GET")
-        .arg("--connect-timeout")
-        .arg("10")
-        .arg("--max-time")
-        .arg("30")
-        .arg("--write-out")
-        .arg("\n__ARB_ASTER_HTTP_STATUS__:%{http_code}")
-        .arg("--config")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot start curl for Aster private signed GET: {error}"),
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: "curl stdin unavailable for Aster private signed GET".to_owned(),
-        })?
-        .write_all(config.as_bytes())
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot write curl config for Aster private signed GET: {error}"),
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("curl failed for Aster private signed GET: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(RuntimeError::LiveMarketData {
-            message: "curl failed before a reliable Aster private HTTP response was available"
-                .to_owned(),
-        });
-    }
-    let rendered = String::from_utf8_lossy(&output.stdout);
+    let headers = [
+        (
+            "Content-Type",
+            "application/x-www-form-urlencoded".to_owned(),
+        ),
+        ("Accept", "application/json".to_owned()),
+        ("User-Agent", ASTER_SIGNED_REST_USER_AGENT.to_owned()),
+    ];
+    let rendered =
+        run_private_signed_get_with_curl("Aster", "\n__ARB_ASTER_HTTP_STATUS__:", &url, &headers)?;
     let Some((body, status)) = rendered.rsplit_once("\n__ARB_ASTER_HTTP_STATUS__:") else {
         return Err(RuntimeError::LiveMarketData {
             message: "Aster private signed GET lacked HTTP status marker".to_owned(),
@@ -35616,9 +35793,14 @@ fn fetch_signed_aster_get_with_curl(
             message: "Aster private signed GET returned malformed HTTP status".to_owned(),
         })?;
     if !(200..=299).contains(&status_code) {
+        let diagnostic = if status_code == 403 && looks_like_aster_waf_html(body) {
+            " (Aster WAF/IP access layer rejected the request; check outbound IP allowlist, agent IP whitelist, and rate-limit state)"
+        } else {
+            ""
+        };
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Aster private signed GET returned HTTP {status_code}: {}",
+                "Aster private signed GET {endpoint} returned HTTP {status_code}{diagnostic}: {}",
                 response_snippet(body)
             ),
         });
@@ -35656,55 +35838,8 @@ fn fetch_signed_bybit_get_with_curl(
             signed.recv_window_ms().to_string(),
         ),
     ];
-    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(&url)?);
-    for (name, value) in headers {
-        let header = format!("{name}: {value}");
-        config.push_str("header = \"");
-        config.push_str(&curl_config_quote_runtime(&header)?);
-        config.push_str("\"\n");
-    }
-    let mut child = Command::new("curl")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--request")
-        .arg("GET")
-        .arg("--connect-timeout")
-        .arg("10")
-        .arg("--max-time")
-        .arg("30")
-        .arg("--write-out")
-        .arg("\n__ARB_BYBIT_HTTP_STATUS__:%{http_code}")
-        .arg("--config")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot start curl for Bybit private signed GET: {error}"),
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: "curl stdin unavailable for Bybit private signed GET".to_owned(),
-        })?
-        .write_all(config.as_bytes())
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot write curl config for Bybit private signed GET: {error}"),
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("curl failed for Bybit private signed GET: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(RuntimeError::LiveMarketData {
-            message: "curl failed before a reliable Bybit private HTTP response was available"
-                .to_owned(),
-        });
-    }
-    let rendered = String::from_utf8_lossy(&output.stdout);
+    let rendered =
+        run_private_signed_get_with_curl("Bybit", "\n__ARB_BYBIT_HTTP_STATUS__:", &url, &headers)?;
     let Some((body, status)) = rendered.rsplit_once("\n__ARB_BYBIT_HTTP_STATUS__:") else {
         return Err(RuntimeError::LiveMarketData {
             message: "Bybit private signed GET lacked HTTP status marker".to_owned(),
@@ -35751,55 +35886,8 @@ fn fetch_signed_okx_get_with_curl(
             signed.passphrase_header_value().to_owned(),
         ),
     ];
-    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(&url)?);
-    for (name, value) in headers {
-        let header = format!("{name}: {value}");
-        config.push_str("header = \"");
-        config.push_str(&curl_config_quote_runtime(&header)?);
-        config.push_str("\"\n");
-    }
-    let mut child = Command::new("curl")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--request")
-        .arg("GET")
-        .arg("--connect-timeout")
-        .arg("10")
-        .arg("--max-time")
-        .arg("30")
-        .arg("--write-out")
-        .arg("\n__ARB_OKX_HTTP_STATUS__:%{http_code}")
-        .arg("--config")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot start curl for OKX private signed GET: {error}"),
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: "curl stdin unavailable for OKX private signed GET".to_owned(),
-        })?
-        .write_all(config.as_bytes())
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot write curl config for OKX private signed GET: {error}"),
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("curl failed for OKX private signed GET: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(RuntimeError::LiveMarketData {
-            message: "curl failed before a reliable OKX private HTTP response was available"
-                .to_owned(),
-        });
-    }
-    let rendered = String::from_utf8_lossy(&output.stdout);
+    let rendered =
+        run_private_signed_get_with_curl("OKX", "\n__ARB_OKX_HTTP_STATUS__:", &url, &headers)?;
     let Some((body, status)) = rendered.rsplit_once("\n__ARB_OKX_HTTP_STATUS__:") else {
         return Err(RuntimeError::LiveMarketData {
             message: "OKX private signed GET lacked HTTP status marker".to_owned(),
@@ -35847,55 +35935,12 @@ fn fetch_signed_bitget_get_with_curl(
         ),
         ("locale", "en-US".to_owned()),
     ];
-    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(&url)?);
-    for (name, value) in headers {
-        let header = format!("{name}: {value}");
-        config.push_str("header = \"");
-        config.push_str(&curl_config_quote_runtime(&header)?);
-        config.push_str("\"\n");
-    }
-    let mut child = Command::new("curl")
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--request")
-        .arg("GET")
-        .arg("--connect-timeout")
-        .arg("10")
-        .arg("--max-time")
-        .arg("30")
-        .arg("--write-out")
-        .arg("\n__ARB_BITGET_HTTP_STATUS__:%{http_code}")
-        .arg("--config")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot start curl for Bitget private signed GET: {error}"),
-        })?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: "curl stdin unavailable for Bitget private signed GET".to_owned(),
-        })?
-        .write_all(config.as_bytes())
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("cannot write curl config for Bitget private signed GET: {error}"),
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| RuntimeError::LiveMarketData {
-            message: format!("curl failed for Bitget private signed GET: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(RuntimeError::LiveMarketData {
-            message: "curl failed before a reliable Bitget private HTTP response was available"
-                .to_owned(),
-        });
-    }
-    let rendered = String::from_utf8_lossy(&output.stdout);
+    let rendered = run_private_signed_get_with_curl(
+        "Bitget",
+        "\n__ARB_BITGET_HTTP_STATUS__:",
+        &url,
+        &headers,
+    )?;
     let Some((body, status)) = rendered.rsplit_once("\n__ARB_BITGET_HTTP_STATUS__:") else {
         return Err(RuntimeError::LiveMarketData {
             message: "Bitget private signed GET lacked HTTP status marker".to_owned(),
@@ -35916,6 +35961,163 @@ fn fetch_signed_bitget_get_with_curl(
         });
     }
     Ok(body.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn run_private_signed_get_with_curl(
+    venue: &str,
+    http_status_marker: &str,
+    url: &str,
+    headers: &[(&str, String)],
+) -> RuntimeResult<String> {
+    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(url)?);
+    for (name, value) in headers {
+        let header = format!("{name}: {value}");
+        append_runtime_curl_header_config(&mut config, &header)?;
+    }
+    let max_attempts = private_curl_max_attempts()?;
+    let ip_version_arg = private_curl_ip_version_arg()?;
+    for attempt in 1..=max_attempts {
+        let output = run_private_signed_get_curl_attempt(
+            venue,
+            http_status_marker,
+            &config,
+            ip_version_arg,
+        )?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        if attempt < max_attempts && private_curl_output_can_retry(&output) {
+            thread::sleep(private_curl_retry_delay(attempt));
+            continue;
+        }
+        let mut message = private_curl_failure_message(venue, http_status_marker, &output);
+        if attempt > 1 {
+            message.push_str(", attempts=");
+            message.push_str(&attempt.to_string());
+        }
+        return Err(RuntimeError::LiveMarketData { message });
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("curl failed before {venue} private signed GET could be attempted"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn run_private_signed_get_curl_attempt(
+    venue: &str,
+    http_status_marker: &str,
+    config: &str,
+    ip_version_arg: Option<&'static str>,
+) -> RuntimeResult<std::process::Output> {
+    let mut command = Command::new("curl");
+    command
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--request")
+        .arg("GET")
+        .arg("--connect-timeout")
+        .arg("10")
+        .arg("--max-time")
+        .arg("30");
+    if let Some(arg) = ip_version_arg {
+        command.arg(arg);
+    }
+    let mut child = command
+        .arg("--write-out")
+        .arg(format!("{http_status_marker}%{{http_code}}"))
+        .arg("--config")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot start curl for {venue} private signed GET: {error}"),
+        })?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("curl stdin unavailable for {venue} private signed GET"),
+        })?
+        .write_all(config.as_bytes())
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("cannot write curl config for {venue} private signed GET: {error}"),
+        })?;
+    child
+        .wait_with_output()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("curl failed for {venue} private signed GET: {error}"),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn private_curl_max_attempts() -> RuntimeResult<u32> {
+    let value = match std::env::var(PRIVATE_CURL_MAX_ATTEMPTS_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => {
+            return Ok(PRIVATE_CURL_DEFAULT_MAX_ATTEMPTS);
+        }
+        Err(error) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!("{PRIVATE_CURL_MAX_ATTEMPTS_ENV} is not readable: {error}"),
+            });
+        }
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(PRIVATE_CURL_DEFAULT_MAX_ATTEMPTS);
+    }
+    let attempts = trimmed
+        .parse::<u32>()
+        .map_err(|_| RuntimeError::UnsafeConfig {
+            message: format!("{PRIVATE_CURL_MAX_ATTEMPTS_ENV} must be an integer between 1 and {PRIVATE_CURL_MAX_ATTEMPTS_LIMIT}"),
+        })?;
+    if attempts == 0 || attempts > PRIVATE_CURL_MAX_ATTEMPTS_LIMIT {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("{PRIVATE_CURL_MAX_ATTEMPTS_ENV} must be between 1 and {PRIVATE_CURL_MAX_ATTEMPTS_LIMIT}"),
+        });
+    }
+    Ok(attempts)
+}
+
+#[cfg(feature = "live-exec")]
+fn private_curl_ip_version_arg() -> RuntimeResult<Option<&'static str>> {
+    let value = match std::env::var(PRIVATE_CURL_IP_VERSION_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!("{PRIVATE_CURL_IP_VERSION_ENV} is not readable: {error}"),
+            });
+        }
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "4" | "ipv4" => Ok(Some("--ipv4")),
+        "6" | "ipv6" => Ok(Some("--ipv6")),
+        _ => Err(RuntimeError::UnsafeConfig {
+            message: format!("{PRIVATE_CURL_IP_VERSION_ENV} must be one of ipv4, 4, ipv6, or 6"),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn private_curl_output_can_retry(output: &std::process::Output) -> bool {
+    match output.status.code() {
+        Some(5 | 6 | 7 | 16 | 18 | 28 | 35 | 52 | 55 | 56 | 92) => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn private_curl_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(PRIVATE_CURL_RETRY_BASE_DELAY_MS.saturating_mul(u64::from(attempt)))
 }
 
 #[cfg(feature = "live-exec")]
@@ -35950,12 +36152,53 @@ fn append_runtime_curl_header_config(config: &mut String, header: &str) -> Runti
 }
 
 #[cfg(feature = "live-exec")]
+fn private_curl_failure_message(
+    venue: &str,
+    http_status_marker: &str,
+    output: &std::process::Output,
+) -> String {
+    let mut message = format!(
+        "curl failed before a reliable {venue} private HTTP response was available: curl_status={}",
+        output.status
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    if let Some((_, status)) = rendered.rsplit_once(http_status_marker) {
+        let status = status.trim();
+        if !status.is_empty() {
+            message.push_str(", http_code=");
+            message.push_str(status);
+        }
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = response_snippet(stderr.trim());
+    if !stderr.is_empty() {
+        message.push_str(", stderr=");
+        message.push_str(&stderr);
+    }
+    message
+}
+
+#[cfg(feature = "live-exec")]
+fn looks_like_aster_waf_html(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<html") && lower.contains("403 forbidden")
+}
+
+#[cfg(feature = "live-exec")]
 fn response_snippet(body: &str) -> String {
     const MAX_LEN: usize = 256;
     if body.len() <= MAX_LEN {
         body.to_owned()
     } else {
-        format!("{}...", &body[..MAX_LEN])
+        let mut end = 0;
+        for (index, char) in body.char_indices() {
+            let next = index + char.len_utf8();
+            if next > MAX_LEN {
+                break;
+            }
+            end = next;
+        }
+        format!("{}...", &body[..end])
     }
 }
 
@@ -47381,6 +47624,75 @@ mod tests {
     }
 
     #[test]
+    fn public_wss_quote_map_keeps_fresh_wss_rows_when_other_rows_are_unusable() {
+        let fetched_at = UtcTimestamp::from_str("2026-05-13T00:00:10Z").expect("fetched at");
+        let raw = r#"{
+          "status":"streaming",
+          "market":"usdt-futures",
+          "fail_closed":false,
+          "wss_update_count":3,
+          "last_error":null,
+          "rows":[
+            {
+              "symbol":"BTCUSDT",
+              "venue_id":"venue:ASTER-USDT-FUTURES",
+              "instrument_id":"inst:ASTER:BTCUSDT:USDT-FUTURES",
+              "best_bid":"43250.10",
+              "best_ask":"43251.20",
+              "bid_size":"1.00000000",
+              "ask_size":"1.50000000",
+              "source_sequence":"3",
+              "source_event_id":"aster:wss-book-ticker:usdt-futures:BTCUSDT:400900303",
+              "observed_at":"2026-05-13T00:00:09Z",
+              "ingested_at":"2026-05-13T00:00:09Z",
+              "freshness_status":"Fresh"
+            },
+            {
+              "symbol":"OLDUSDT",
+              "venue_id":"venue:ASTER-USDT-FUTURES",
+              "instrument_id":"inst:ASTER:OLDUSDT:USDT-FUTURES",
+              "best_bid":"1.00",
+              "best_ask":"1.01",
+              "bid_size":"1.0",
+              "ask_size":"1.0",
+              "source_sequence":"2",
+              "source_event_id":"aster:wss-book-ticker:usdt-futures:OLDUSDT:400900302",
+              "observed_at":"2026-05-13T00:00:01Z",
+              "ingested_at":"2026-05-13T00:00:01Z",
+              "freshness_status":"Fresh"
+            },
+            {
+              "symbol":"RESTUSDT",
+              "venue_id":"venue:ASTER-USDT-FUTURES",
+              "instrument_id":"inst:ASTER:RESTUSDT:USDT-FUTURES",
+              "best_bid":"2.00",
+              "best_ask":"2.01",
+              "bid_size":"2.0",
+              "ask_size":"2.0",
+              "source_sequence":"1",
+              "source_event_id":"aster:rest-bookTicker:RESTUSDT:2026-05-13T00:00:09Z",
+              "observed_at":"2026-05-13T00:00:09Z",
+              "ingested_at":"2026-05-13T00:00:09Z",
+              "freshness_status":"Fresh"
+            }
+          ]
+        }"#;
+
+        let quotes = parse_public_wss_monitor_quote_map_for_basis(
+            raw,
+            "http://127.0.0.1:8794/api/aster-wss-book-ticker/status",
+            AsterPublicWssMarket::UsdtFutures.as_str(),
+            fetched_at,
+        )
+        .expect("fresh WSS subset should remain usable");
+
+        assert_eq!(quotes.len(), 1);
+        assert!(quotes.contains_key("BTCUSDT"));
+        assert!(!quotes.contains_key("OLDUSDT"));
+        assert!(!quotes.contains_key("RESTUSDT"));
+    }
+
+    #[test]
     fn aster_and_hyperliquid_basis_monitor_args_accept_perp_wss_url() {
         let hyperliquid_args = vec![
             "--perp-wss-monitor-url".to_owned(),
@@ -48882,6 +49194,37 @@ mod tests {
     }
 
     #[test]
+    fn funding_private_account_raw_snapshot_reads_okx_detail_balances() {
+        let mut config = CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt();
+        config.venues.venue_b = funding_arb_leg_config("okx", "BTCUSDT").expect("okx leg");
+        let mut venue_capabilities =
+            arb_venue_capability_descriptors("binance").expect("binance capabilities");
+        venue_capabilities
+            .extend(arb_venue_capability_descriptors("okx").expect("okx capabilities"));
+        let spec = CrossExchangeFundingArbPipelineSpec::new(
+            config,
+            venue_capabilities,
+            "state:test:funding-arb-binance-okx",
+            "hash:test:funding-arb-binance-okx",
+        )
+        .expect("spec");
+
+        let summary = reconcile_funding_private_account_raw_snapshot_json(
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","statements":[
+                {"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":{"availableBalance":"25","totalMarginBalance":"25","totalMaintMargin":"1"}},
+                {"venue_family":"okx","account_id":"acct:okx-funding-arb-readonly","payload":{"code":"0","data":[{"totalEq":"100","availEq":"","mmr":"0","details":[{"ccy":"USDT","availBal":"99","availEq":"","cashBal":"100","eq":"100","eqUsd":"100","frozenBal":"1","ordFrozen":"0","liab":"0","upl":"0"}]}],"msg":""}}
+            ]}"#,
+        )
+        .expect("summary");
+
+        assert_eq!(summary.status, "Matched");
+        assert_eq!(summary.checked_account_count, 2);
+        assert_eq!(summary.min_available_usd.as_deref(), Some("25"));
+        assert!(summary.reason.is_none());
+    }
+
+    #[test]
     fn funding_private_account_reconciliation_treats_empty_amounts_as_missing() {
         let spec = CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("spec");
         let snapshot = FundingPrivateAccountSnapshot {
@@ -49327,6 +49670,71 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_private_position_raw_snapshot_treats_successful_missing_symbol_as_flat() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let mut row = funding_arb_test_row("0.00010000", "0.00400000");
+        row.pair_id = "bitget:aster:BTCUSDT:BTCUSDT".to_owned();
+        row.venue_a_family = "bitget".to_owned();
+        row.venue_b_family = "aster".to_owned();
+        row.long_venue_family = Some("bitget".to_owned());
+        row.short_venue_family = Some("aster".to_owned());
+        row.gross_funding_spread_bps = Some("24".to_owned());
+        row.net_funding_bps = Some("14".to_owned());
+        row.expected_funding_usd = Some("0.24".to_owned());
+        let pair_id = row.pair_id.clone();
+        let snapshot = funding_arb_test_snapshot(vec![row], "2026-05-13T00:00:00Z".to_owned());
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_accounts_path = root.path().join("funding-private-accounts-raw.json");
+        write_utf8(
+            private_accounts_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","statements":[{"venue_family":"bitget","account_id":"acct:bitget-funding-arb-readonly","payload":{"code":"00000","msg":"success","data":[{"marginCoin":"USDT","available":"40.00","equity":"50.00","maintenanceMargin":"1.00"}]}},{"venue_family":"aster","account_id":"acct:aster-funding-arb-readonly","payload":[{"asset":"USDT","balance":"50.00","availableBalance":"40.00","maintMargin":"1.00","marginAvailable":true}]}]}"#,
+        )
+        .expect("write raw private accounts");
+        let private_positions_path = root.path().join("funding-private-positions-raw.json");
+        write_utf8(
+            private_positions_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","statements":[{"venue_family":"bitget","account_id":"acct:bitget-funding-arb-readonly","payload":{"code":"00000","msg":"success","data":[]}},{"venue_family":"aster","account_id":"acct:aster-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0","entryPrice":"0","markPrice":"100.00","unRealizedProfit":"0","liquidationPrice":"0"}]}]}"#,
+        )
+        .expect("write raw private positions");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: Some(private_accounts_path),
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: Some(private_positions_path),
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert_eq!(report.private_accounts.status, "Matched");
+        assert_eq!(report.private_positions.status, "Matched");
+        assert_eq!(report.private_positions.checked_position_count, 2);
+        assert_eq!(report.private_positions.nonzero_position_count, 0);
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_POSITION_UNAVAILABLE")));
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("private account runtime reconciliation")));
+    }
+
+    #[test]
     fn funding_arb_guarded_dry_run_once_args_parse_snapshot_and_pair() {
         let args = vec![
             "--snapshot".to_owned(),
@@ -49747,6 +50155,14 @@ mod tests {
             options.output_dir,
             Some(PathBuf::from("target/funding-private-readonly"))
         );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn aster_signer_env_aliases_do_not_accept_account_address() {
+        assert!(ASTER_USER_ENV_NAMES.contains(&"ASTER_ACCOUNT_ADDRESS"));
+        assert!(!ASTER_SIGNER_ENV_NAMES.contains(&"ASTER_ACCOUNT_ADDRESS"));
+        assert!(!ASTER_SIGNER_ENV_NAMES.contains(&"ASTER_USER"));
     }
 
     #[test]
@@ -50194,6 +50610,90 @@ mod tests {
         assert!(resident_entry_cycle_error_can_retry(&invalid_top_of_book));
         assert!(!resident_entry_cycle_error_can_retry(&private_http));
         assert!(!resident_entry_cycle_error_can_retry(&unsafe_config));
+    }
+
+    #[cfg(all(feature = "live-exec", unix))]
+    #[test]
+    fn private_curl_failure_message_reports_status_code_and_stderr() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(28 << 8),
+            stdout: b"\n__ARB_BITGET_HTTP_STATUS__:000".to_vec(),
+            stderr: b"curl: (28) Operation timed out after 30000 milliseconds".to_vec(),
+        };
+
+        let message =
+            private_curl_failure_message("Bitget", "\n__ARB_BITGET_HTTP_STATUS__:", &output);
+
+        assert!(message.starts_with(
+            "curl failed before a reliable Bitget private HTTP response was available"
+        ));
+        assert!(message.contains("curl_status="));
+        assert!(message.contains("http_code=000"));
+        assert!(message.contains("stderr=curl: (28) Operation timed out"));
+    }
+
+    #[cfg(all(feature = "live-exec", unix))]
+    #[test]
+    fn private_curl_retry_classification_includes_tls_transport_failures() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let tls_failure = std::process::Output {
+            status: std::process::ExitStatus::from_raw(35 << 8),
+            stdout: b"\n__ARB_BYBIT_HTTP_STATUS__:000".to_vec(),
+            stderr: b"curl: (35) LibreSSL SSL_connect: SSL_ERROR_SYSCALL".to_vec(),
+        };
+        let config_failure = std::process::Output {
+            status: std::process::ExitStatus::from_raw(3 << 8),
+            stdout: Vec::new(),
+            stderr: b"curl: (3) URL rejected".to_vec(),
+        };
+
+        assert!(private_curl_output_can_retry(&tls_failure));
+        assert!(!private_curl_output_can_retry(&config_failure));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_server_time_parser_reads_millis() {
+        let body = r#"{"serverTime":1779274612345}"#;
+
+        let server_time = parse_binance_server_time_millis(body).expect("server time");
+
+        assert_eq!(server_time, 1_779_274_612_345);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_server_time_offset_uses_local_midpoint() {
+        let offset =
+            binance_server_time_offset_millis_from_sample(1_000, 1_300, 1_100).expect("offset");
+
+        assert_eq!(offset, 250);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_time_endpoint_matches_private_api_family() {
+        assert_eq!(
+            binance_server_time_endpoint_for_private_endpoint("/api/v3/account"),
+            "/api/v3/time"
+        );
+        assert_eq!(
+            binance_server_time_endpoint_for_private_endpoint("/fapi/v3/account"),
+            "/fapi/v1/time"
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn response_snippet_truncates_on_utf8_boundary() {
+        let body = format!("{}中", "a".repeat(255));
+
+        let snippet = response_snippet(&body);
+
+        assert_eq!(snippet, format!("{}...", "a".repeat(255)));
     }
 
     #[cfg(feature = "live-exec")]
@@ -53031,6 +53531,50 @@ mod tests {
         assert_eq!(rows[1].symbol, "ETHUSDT");
         assert_eq!(rows[1].bid_qty, "0");
         assert_eq!(rows[1].ask_qty, "4.0");
+    }
+
+    #[test]
+    fn bitget_spot_ticker_parser_accepts_nested_single_size_fields() {
+        let spot = r#"{
+          "code": "00000",
+          "msg": "success",
+          "requestTime": 1778584221117,
+          "data": [
+            {"symbol":"BTCUSDT","bidPr":"99.90","bidSz":[["1.0"]],"askPr":"100.00","askSz":[[["2.0"]]],"ts":"1778584221117"},
+            {"symbol":"ETHUSDT","bidPr":"49.90","bidSz":[[]],"askPr":"50.00","askSz":["4.0"],"ts":"1778584221117"}
+          ]
+        }"#;
+
+        let rows = parse_bitget_spot_ticker_rows(spot).expect("bitget spot rows");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].symbol, "BTCUSDT");
+        assert_eq!(rows[0].bid_qty, "1.0");
+        assert_eq!(rows[0].ask_qty, "2.0");
+        assert_eq!(rows[1].symbol, "ETHUSDT");
+        assert_eq!(rows[1].bid_qty, "0");
+        assert_eq!(rows[1].ask_qty, "4.0");
+    }
+
+    #[test]
+    fn bitget_spot_ticker_parser_treats_null_size_as_zero() {
+        let spot = r#"{
+          "code": "00000",
+          "msg": "success",
+          "requestTime": 1778584221117,
+          "data": [
+            {"symbol":"NEXUSDT","bidPr":"0","bidSz":null,"askPr":"0.00000251","askSz":"100000000","ts":"1778584221117"}
+          ]
+        }"#;
+
+        let rows = parse_bitget_spot_ticker_rows(spot).expect("bitget spot rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "NEXUSDT");
+        assert_eq!(rows[0].bid_price, "0");
+        assert_eq!(rows[0].bid_qty, "0");
+        assert_eq!(rows[0].ask_price, "0.00000251");
+        assert_eq!(rows[0].ask_qty, "100000000");
     }
 
     #[test]

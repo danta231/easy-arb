@@ -4946,7 +4946,10 @@ pub mod live {
     /// Aster Futures V3 下单、撤单和查单 endpoint。
     pub const ASTER_FUTURES_V3_ORDER_ENDPOINT: &str = "/fapi/v3/order";
     /// 默认 Aster Futures V3 REST base URL。
-    pub const ASTER_FUTURES_V3_BASE_URL: &str = "https://fapi3.asterdex.com";
+    ///
+    /// 中文说明：V3 path 当前可通过 `fapi.asterdex.com` 访问；部分出网 IP 访问
+    /// `fapi3.asterdex.com` 会先被负载均衡/WAF 拒绝，无法进入 Aster 应用层。
+    pub const ASTER_FUTURES_V3_BASE_URL: &str = "https://fapi.asterdex.com";
     const CURL_ASTER_STATUS_MARKER: &str = "\n__ARB_ASTER_HTTP_STATUS__:";
     const ASTER_SIGNED_REST_USER_AGENT: &str = "easy-arb-runtime/aster-signed-rest";
 
