@@ -4900,6 +4900,13 @@ pub mod live {
         Ok(escaped)
     }
 
+    fn append_curl_header_config(config: &mut String, header: &str) -> VenueExecResult<()> {
+        config.push_str("header = \"");
+        config.push_str(&curl_config_quote(header)?);
+        config.push_str("\"\n");
+        Ok(())
+    }
+
     fn parse_curl_http_response(
         stdout: &[u8],
         market: BinanceExecMarket,
@@ -4941,6 +4948,7 @@ pub mod live {
     /// 默认 Aster Futures V3 REST base URL。
     pub const ASTER_FUTURES_V3_BASE_URL: &str = "https://fapi3.asterdex.com";
     const CURL_ASTER_STATUS_MARKER: &str = "\n__ARB_ASTER_HTTP_STATUS__:";
+    const ASTER_SIGNED_REST_USER_AGENT: &str = "easy-arb-runtime/aster-signed-rest";
 
     /// Aster signed REST HTTP 方法。
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5134,7 +5142,16 @@ pub mod live {
             request: AsterSignedRequest<'_>,
         ) -> VenueExecResult<AsterExecHttpResponse> {
             let url = aster_signed_request_url(&request)?;
-            let config = format!("url = \"{}\"\n", curl_config_quote(&url)?);
+            let mut config = format!("url = \"{}\"\n", curl_config_quote(&url)?);
+            append_curl_header_config(
+                &mut config,
+                "Content-Type: application/x-www-form-urlencoded",
+            )?;
+            append_curl_header_config(&mut config, "Accept: application/json")?;
+            append_curl_header_config(
+                &mut config,
+                &format!("User-Agent: {ASTER_SIGNED_REST_USER_AGENT}"),
+            )?;
             let mut child = Command::new("curl")
                 .arg("--silent")
                 .arg("--show-error")

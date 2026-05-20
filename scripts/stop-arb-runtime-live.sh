@@ -56,7 +56,9 @@ stop_wss_monitors() {
   local name
   local log_file
   local status_url
-  while IFS=$'\t' read -r pid name log_file status_url; do
+  local ready_symbol
+  local required
+  while IFS=$'\t' read -r pid name log_file status_url ready_symbol required; do
     if is_alive "${pid}"; then
       echo "TERM WSS pid=${pid} name=${name} log=${log_file}"
       kill -TERM "${pid}" 2>/dev/null || true
@@ -65,7 +67,7 @@ stop_wss_monitors() {
 
   sleep "${STOP_GRACE_SECS}"
 
-  while IFS=$'\t' read -r pid name log_file status_url; do
+  while IFS=$'\t' read -r pid name log_file status_url ready_symbol required; do
     if is_alive "${pid}"; then
       echo "KILL WSS pid=${pid} name=${name} log=${log_file}"
       kill -KILL "${pid}" 2>/dev/null || true

@@ -54,6 +54,11 @@ usage() {
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；启用 raw snapshot 时必须留空。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT= # 资金费率结算原始只读快照输出路径。
+  BASIS_OBSERVER_DYNAMIC_TARGET_WSS=0 # candidate 触发 auto-once 验证时，是否按 symbol 动态启动专用 target WSS。
+  BASIS_OBSERVER_TARGET_WSS_ROOT=target/arb-opportunity-observer/target-wss # 动态 target WSS 的日志和状态目录。
+  BASIS_OBSERVER_TARGET_WSS_BASE_PORT=8830 # 动态 target WSS 从该本地端口开始分配。
+  BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS=60 # 动态 target WSS 等待真实 WSS quote 就绪的最长秒数。
+  BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS=2 # 动态 target WSS 断线重连间隔秒数。
   BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1 # auto-once 模式是否执行候选验证。
   BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60 # auto-once 两次触发之间的冷却秒数。
   BASIS_OBSERVER_EXECUTE_LIVE=0 # 是否允许正式实盘下单；1 表示允许。
@@ -138,8 +143,6 @@ apply_simplified_wallet_env_aliases() {
   local aster_signer_private="${ASTER_SIGNER_PRIVATE_KEY:-${ASTER_SIGNER_PRIVATE:-${ASTER_PRIVATE_KEY:-}}}"
   set_default_env ASTER_USER "${BASIS_OBSERVER_ASTER_USER:-${aster_user_address}}"
   set_default_env ASTER_SIGNER "${BASIS_OBSERVER_ASTER_SIGNER:-${aster_signer_address}}"
-  set_default_env ASTER_USER "${ASTER_SIGNER:-}"
-  set_default_env ASTER_SIGNER "${ASTER_USER:-}"
   set_default_env BASIS_OBSERVER_ASTER_USER "${ASTER_USER:-}"
   set_default_env BASIS_OBSERVER_ASTER_SIGNER "${ASTER_SIGNER:-}"
   set_default_env ASTER_SIGNER_PRIVATE_KEY "${aster_signer_private}"
@@ -349,6 +352,334 @@ symbol_slug() {
   jq -rn --arg symbol "$1" '$symbol | @uri'
 }
 
+target_wss_api_prefix() {
+  case "$1" in
+    binance) printf '/api/binance-wss-book-ticker' ;;
+    bybit) printf '/api/bybit-wss-book-ticker' ;;
+    okx) printf '/api/okx-wss-book-ticker' ;;
+    bitget) printf '/api/bitget-wss-book-ticker' ;;
+    *) return 1 ;;
+  esac
+}
+
+target_wss_command_market() {
+  local venue="$1"
+  local leg="$2"
+  case "${venue}:${leg}" in
+    binance:spot) printf '%s\t%s\n' "binance-wss-book-ticker" "spot" ;;
+    binance:perp) printf '%s\t%s\n' "binance-wss-book-ticker" "usdm-perp" ;;
+    bybit:spot) printf '%s\t%s\n' "bybit-wss-book-ticker" "spot" ;;
+    bybit:perp) printf '%s\t%s\n' "bybit-wss-book-ticker" "linear-perp" ;;
+    okx:spot) printf '%s\t%s\n' "okx-wss-book-ticker" "spot" ;;
+    okx:perp) printf '%s\t%s\n' "okx-wss-book-ticker" "swap" ;;
+    bitget:spot) printf '%s\t%s\n' "bitget-wss-book-ticker" "spot" ;;
+    bitget:perp) printf '%s\t%s\n' "bitget-wss-book-ticker" "usdt-futures" ;;
+    *) return 1 ;;
+  esac
+}
+
+target_wss_quote_ready_for_symbol() {
+  local body="$1"
+  local symbol="$2"
+
+  [[ -z "${symbol}" ]] && return 0
+  printf '%s\n' "${body}" | jq -e --arg symbol "${symbol}" '
+    def non_empty_string: type == "string" and length > 0;
+    any((.rows // [])[]?;
+      .symbol == $symbol
+      and .freshness_status == "Fresh"
+      and ((.source_event_id // "") | test(":wss-book(-ticker|Ticker):"))
+      and ((.source_sequence // "") | tostring | test("^[0-9]+$"))
+      and ((.best_bid // "") | non_empty_string)
+      and ((.best_ask // "") | non_empty_string)
+      and ((.bid_size // "") | non_empty_string)
+      and ((.ask_size // "") | non_empty_string)
+    )
+  ' >/dev/null 2>> "${LOG_DIR}/jq-errors.log"
+}
+
+allocate_target_wss_port() {
+  mkdir -p "${TARGET_WSS_STATE_DIR}"
+  local lock_dir="${TARGET_WSS_STATE_DIR}/port.lock"
+  local next_file="${TARGET_WSS_STATE_DIR}/next-port"
+  local next_port="${TARGET_WSS_BASE_PORT}"
+  local waited=0
+
+  while ! mkdir "${lock_dir}" 2>/dev/null; do
+    sleep 0.1
+    waited="$((waited + 1))"
+    if (( waited > 300 )); then
+      echo "target WSS port allocation lock timed out: ${lock_dir}" >&2
+      return 1
+    fi
+  done
+
+  if [[ -s "${next_file}" ]]; then
+    next_port="$(sed -n '1p' "${next_file}")"
+  fi
+  if ! [[ "${next_port}" =~ ^[0-9]+$ ]]; then
+    next_port="${TARGET_WSS_BASE_PORT}"
+  fi
+  printf '%s\n' "$((next_port + 1))" > "${next_file}"
+  rmdir "${lock_dir}" 2>/dev/null || true
+  printf '%s\n' "${next_port}"
+}
+
+wait_target_wss_monitor_ready() {
+  local name="$1"
+  local pid="$2"
+  local log_file="$3"
+  local status_url="$4"
+  local ready_symbol="$5"
+  local deadline="$((SECONDS + TARGET_WSS_READY_TIMEOUT_SECS))"
+  local body
+  local status
+  local total_rows
+  local wss_update_count
+
+  while (( SECONDS <= deadline )); do
+    if ! is_alive "${pid}"; then
+      echo "target_wss_exited_before_ready name=${name} pid=${pid}" >&2
+      [[ -f "${log_file}" ]] && tail -n 40 "${log_file}" >&2 || true
+      return 1
+    fi
+    if body="$(curl -fsS --max-time 2 "${status_url}" 2>> "${LOG_DIR}/curl-errors.log")"; then
+      status="$(printf '%s\n' "${body}" | jq -r '.status // "unknown"' 2>> "${LOG_DIR}/jq-errors.log" || printf 'unknown')"
+      total_rows="$(printf '%s\n' "${body}" | jq -r '.total_rows // 0' 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+      wss_update_count="$(printf '%s\n' "${body}" | jq -r '.wss_update_count // 0' 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+      if [[ "${status}" == "streaming" && "${total_rows}" =~ ^[0-9]+$ && "${total_rows}" -gt 0 && "${wss_update_count}" =~ ^[0-9]+$ && "${wss_update_count}" -gt 0 ]]; then
+        if target_wss_quote_ready_for_symbol "${body}" "${ready_symbol}"; then
+          echo "target_wss_ready name=${name} status_url=${status_url} symbol=${ready_symbol} rows=${total_rows} wss_updates=${wss_update_count}" >&2
+          return 0
+        fi
+      fi
+    fi
+    sleep 1
+  done
+
+  echo "target_wss_ready_timeout name=${name} status_url=${status_url} symbol=${ready_symbol} timeout_secs=${TARGET_WSS_READY_TIMEOUT_SECS}" >&2
+  [[ -f "${log_file}" ]] && tail -n 40 "${log_file}" >&2 || true
+  return 1
+}
+
+ensure_target_wss_monitor() {
+  local venue="$1"
+  local symbol="$2"
+  local leg="$3"
+  local slug
+  local key
+  local name
+  local meta_file
+  local pid=""
+  local meta_name=""
+  local log_file=""
+  local status_url=""
+  local ready_symbol=""
+  local command_market
+  local command_name
+  local market
+  local api_prefix
+  local port
+  local bind_addr
+
+  [[ "${DYNAMIC_TARGET_WSS}" == "1" ]] || return 1
+  mkdir -p "${TARGET_WSS_LOG_DIR}" "${TARGET_WSS_STATE_DIR}"
+
+  slug="$(symbol_slug "${symbol}")"
+  key="${venue}-${leg}-${slug}"
+  name="target-wss-${key}"
+  meta_file="${TARGET_WSS_STATE_DIR}/${key}.tsv"
+
+  if [[ -s "${meta_file}" ]]; then
+    while IFS=$'\t' read -r pid meta_name log_file status_url ready_symbol; do
+      if [[ "${meta_name}" == "${name}" && "${ready_symbol}" == "${symbol}" ]] && is_alive "${pid}"; then
+        if ! wait_target_wss_monitor_ready "${name}" "${pid}" "${log_file}" "${status_url}" "${symbol}"; then
+          kill -TERM "${pid}" 2>/dev/null || true
+          rm -f "${meta_file}" 2>/dev/null || true
+          return 1
+        fi
+        printf '%s\n' "${status_url}"
+        return 0
+      fi
+    done < "${meta_file}"
+  fi
+
+  if ! command_market="$(target_wss_command_market "${venue}" "${leg}")"; then
+    echo "target_wss_unsupported venue=${venue} leg=${leg}" >&2
+    return 1
+  fi
+  command_name="$(printf '%s\n' "${command_market}" | cut -f1)"
+  market="$(printf '%s\n' "${command_market}" | cut -f2)"
+  api_prefix="$(target_wss_api_prefix "${venue}")" || return 1
+  port="$(allocate_target_wss_port)" || return 1
+  bind_addr="127.0.0.1:${port}"
+  status_url="http://${bind_addr}${api_prefix}/status"
+  log_file="${TARGET_WSS_LOG_DIR}/${name}.log"
+
+  echo "starting ${name}: symbol=${symbol} leg=${leg} status_url=${status_url}" >&2
+  nohup env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${RUNTIME_BIN}" "${command_name}" \
+    --bind "${bind_addr}" \
+    --symbol "${symbol}" \
+    --market "${market}" \
+    --reconnect-delay-secs "${TARGET_WSS_RECONNECT_DELAY_SECS}" \
+    >> "${log_file}" 2>&1 &
+  pid="$!"
+  printf '%s\t%s\t%s\t%s\t%s\n' "${pid}" "${name}" "${log_file}" "${status_url}" "${symbol}" > "${meta_file}"
+  printf '%s\t%s\t%s\n' "${pid}" "${name}" "${log_file}" >> "${PID_FILE}"
+  append_json_line "${VALIDATION_EVENTS_JSONL}" \
+    --arg venue "${venue}" \
+    --arg symbol "${symbol}" \
+    --arg leg "${leg}" \
+    --arg status_url "${status_url}" \
+    --arg log_file "${log_file}" \
+    --argjson pid "${pid}" \
+    --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,leg:$leg,event:"target_wss_started",pid:$pid,status_url:$status_url,log_file:$log_file,mutable_execution_started:false}'
+
+  if ! wait_target_wss_monitor_ready "${name}" "${pid}" "${log_file}" "${status_url}" "${symbol}"; then
+    kill -TERM "${pid}" 2>/dev/null || true
+    rm -f "${meta_file}" 2>/dev/null || true
+    append_json_line "${VALIDATION_EVENTS_JSONL}" \
+      --arg venue "${venue}" \
+      --arg symbol "${symbol}" \
+      --arg leg "${leg}" \
+      --arg status_url "${status_url}" \
+      --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,leg:$leg,event:"target_wss_failed",status_url:$status_url,mutable_execution_started:false}'
+    return 1
+  fi
+
+  printf '%s\n' "${status_url}"
+}
+
+target_wss_args_for_venue_symbol() {
+  local venue="$1"
+  local symbol="$2"
+  local spot_url
+  local perp_url
+
+  if [[ "${DYNAMIC_TARGET_WSS}" != "1" ]]; then
+    wss_args_for_venue "${venue}"
+    return $?
+  fi
+
+  case "${venue}" in
+    binance|bybit|okx|bitget) ;;
+    *) wss_args_for_venue "${venue}"; return $? ;;
+  esac
+
+  spot_url="$(ensure_target_wss_monitor "${venue}" "${symbol}" spot)" || return 1
+  perp_url="$(ensure_target_wss_monitor "${venue}" "${symbol}" perp)" || return 1
+  printf '%s\n%s\n' "${spot_url}" "${perp_url}"
+}
+
+target_wss_monitor_alive() {
+  local venue="$1"
+  local symbol="$2"
+  local leg="$3"
+  local slug
+  local key
+  local name
+  local meta_file
+  local pid
+  local meta_name
+  local log_file
+  local status_url
+  local ready_symbol
+
+  slug="$(symbol_slug "${symbol}")"
+  key="${venue}-${leg}-${slug}"
+  name="target-wss-${key}"
+  meta_file="${TARGET_WSS_STATE_DIR}/${key}.tsv"
+  [[ -s "${meta_file}" ]] || return 1
+  while IFS=$'\t' read -r pid meta_name log_file status_url ready_symbol; do
+    if [[ "${meta_name}" == "${name}" && "${ready_symbol}" == "${symbol}" ]] && is_alive "${pid}"; then
+      return 0
+    fi
+  done < "${meta_file}"
+  return 1
+}
+
+run_target_wss_warmup_job() {
+  set +e
+  local venue="$1"
+  local symbol="$2"
+  local recorded_at="$3"
+  local status=0
+  local finished_at
+
+  if ! ensure_target_wss_monitor "${venue}" "${symbol}" spot >/dev/null; then
+    status=1
+  fi
+  if ! ensure_target_wss_monitor "${venue}" "${symbol}" perp >/dev/null; then
+    status=1
+  fi
+  finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  append_json_line "${VALIDATION_EVENTS_JSONL}" \
+    --arg venue "${venue}" \
+    --arg symbol "${symbol}" \
+    --arg recorded_at "${recorded_at}" \
+    --arg finished_at "${finished_at}" \
+    --argjson exit_status "${status}" \
+    '{recorded_at:$recorded_at,finished_at:$finished_at,venue:$venue,symbol:$symbol,event:(if $exit_status == 0 then "target_wss_warmup_ready" else "target_wss_warmup_failed" end),exit_status:$exit_status,mutable_execution_started:false}'
+  return 0
+}
+
+maybe_start_target_wss_warmup() {
+  local venue="$1"
+  local symbol="$2"
+  local ts="$3"
+  local slug
+  local inflight_file
+  local inflight_pid
+  local log_file
+  local pid
+
+  [[ "${DYNAMIC_TARGET_WSS}" == "1" ]] || return 0
+  case "${venue}" in
+    binance|bybit|okx|bitget) ;;
+    *) return 0 ;;
+  esac
+  [[ -n "${symbol}" ]] || return 0
+
+  slug="$(symbol_slug "${symbol}")"
+  if target_wss_monitor_alive "${venue}" "${symbol}" spot && target_wss_monitor_alive "${venue}" "${symbol}" perp; then
+    return 0
+  fi
+  inflight_file="${STATE_DIR}/target-wss-warmup-${venue}-${slug}.pid"
+  if [[ -s "${inflight_file}" ]]; then
+    inflight_pid="$(sed -n '1p' "${inflight_file}")"
+    if is_alive "${inflight_pid}"; then
+      return 0
+    fi
+  fi
+
+  log_file="${LOG_DIR}/target-wss-warmup-${venue}-${slug}.log"
+  run_target_wss_warmup_job "${venue}" "${symbol}" "${ts}" >> "${log_file}" 2>&1 &
+  pid="$!"
+  printf '%s\n' "${pid}" > "${inflight_file}"
+  printf '%s\t%s\t%s\n' "${pid}" "target-wss-warmup-${venue}-${slug}" "${log_file}" >> "${PID_FILE}"
+  append_json_line "${VALIDATION_EVENTS_JSONL}" \
+    --arg venue "${venue}" \
+    --arg symbol "${symbol}" \
+    --arg recorded_at "${ts}" \
+    --arg log_file "${log_file}" \
+    --argjson pid "${pid}" \
+    '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,event:"target_wss_warmup_started",pid:$pid,log_file:$log_file,mutable_execution_started:false}'
+}
+
+start_target_wss_warmups_for_candidates() {
+  local venue="$1"
+  local body="$2"
+  local ts="$3"
+  local symbol
+
+  printf '%s\n' "${body}" | jq -r '.rows[]? | select(.is_candidate == true) | .symbol' |
+    while IFS= read -r symbol; do
+      maybe_start_target_wss_warmup "${venue}" "${symbol}" "${ts}"
+    done
+}
+
 fetch_url_with_retries() {
   local url="$1"
   local attempt=1
@@ -410,7 +741,7 @@ is_validation_process_name() {
 
 is_core_process_name() {
   case "$1" in
-    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live) return 0 ;;
+    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-binance-*|target-wss-bybit-*|target-wss-okx-*|target-wss-bitget-*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -496,7 +827,7 @@ supervise_started_processes() {
     failed=0
     while IFS=$'\t' read -r pid name log_file; do
       case "${name}" in
-        *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live)
+        *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-binance-*|target-wss-bybit-*|target-wss-okx-*|target-wss-bitget-*)
           if ! is_alive "${pid}"; then
             echo "error: supervised process exited: ${name} pid=${pid}" >&2
             if [[ -n "${log_file}" && -f "${log_file}" ]]; then
@@ -653,7 +984,23 @@ run_validation_job() {
       args+=(--dry-run)
     fi
 
-    wss_values="$(wss_args_for_venue "${venue}")"
+    if ! wss_values="$(target_wss_args_for_venue_symbol "${venue}" "${symbol}")"; then
+      status=1
+      finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      append_json_line "${EXECUTION_REPORTS_JSONL}" \
+        --arg venue "${venue}" \
+        --arg symbol "${symbol}" \
+        --arg run_id "${run_id}" \
+        --arg started_at "${started_at}" \
+        --arg finished_at "${finished_at}" \
+        --arg out_dir "${out_dir}" \
+        --arg execution_mode "${EXECUTION_MODE}" \
+        --argjson exit_status "${status}" \
+        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
+        '{execution_mode:$execution_mode,venue:$venue,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"target_wss_setup_failed",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,target_wss_setup_failed:true}'
+      echo "[${finished_at}] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} result=target_wss_setup_failed out=${out_dir}"
+      return 0
+    fi
     if [[ -n "${wss_values}" ]]; then
       spot_wss="$(printf '%s\n' "${wss_values}" | sed -n '1p')"
       perp_wss="$(printf '%s\n' "${wss_values}" | sed -n '2p')"
@@ -1105,6 +1452,7 @@ poll_venue() {
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.symbol):net=\(.net_basis_bps // "null")bps profit=\(.expected_profit_usd // "null")"] | join(", ")')"
     echo "[${ts}] opportunity venue=${venue} candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
+    start_target_wss_warmups_for_candidates "${venue}" "${body}" "${ts}"
     if [[ "${SPOT_PERP_BASIS_MODE}" == "auto-once" ]]; then
       start_validations_for_candidates "${venue}" "${body}" "${ts}"
     fi
@@ -1184,7 +1532,7 @@ poll_funding_arb() {
 run_recorder() {
   cd "${REPO_ROOT}"
   trap 'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_stop" >> "${FEEDBACK_LOG}"; exit 0' INT TERM
-  mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${SNAPSHOT_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}"
+  mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${SNAPSHOT_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}" "${TARGET_WSS_LOG_DIR}" "${TARGET_WSS_STATE_DIR}"
   touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
   touch "${VALIDATION_EVENTS_JSONL}" "${EXECUTION_REPORTS_JSONL}"
   IFS=' ' read -r -a RECORDER_MONITORS <<< "${EFFECTIVE_MONITORS}"
@@ -1247,6 +1595,13 @@ if [[ "${1:-}" == "--recorder" ]]; then
   FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS:-20}"
   FUNDING_SETTLEMENT_LEDGER="${BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER:-${FUNDING_SETTLEMENT_LEDGER:-}}"
   FUNDING_SETTLEMENT_RAW_SNAPSHOT="${BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT:-${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}}"
+  DYNAMIC_TARGET_WSS="${BASIS_OBSERVER_DYNAMIC_TARGET_WSS:-0}"
+  TARGET_WSS_ROOT="${BASIS_OBSERVER_TARGET_WSS_ROOT:-${RUN_ROOT}/target-wss}"
+  TARGET_WSS_LOG_DIR="${TARGET_WSS_ROOT}/logs"
+  TARGET_WSS_STATE_DIR="${TARGET_WSS_ROOT}/state"
+  TARGET_WSS_BASE_PORT="${BASIS_OBSERVER_TARGET_WSS_BASE_PORT:-8830}"
+  TARGET_WSS_READY_TIMEOUT_SECS="${BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS:-60}"
+  TARGET_WSS_RECONNECT_DELAY_SECS="${BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS:-2}"
   AUTO_PRICE_GUARD_BPS="${BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS:-2}"
   PRIVATE_ORDER_EVENTS_DIR="${BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR:-${RUN_ROOT}/private-order-events}"
   HYPERLIQUID_USER="${BASIS_OBSERVER_HYPERLIQUID_USER:-${HYPERLIQUID_USER:-}}"
@@ -1264,6 +1619,13 @@ if [[ "${1:-}" == "--recorder" ]]; then
   if [[ -n "${FUNDING_SETTLEMENT_LEDGER}" && -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" ]]; then
     die "cannot combine BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER and BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT"
   fi
+  case "${DYNAMIC_TARGET_WSS}" in
+    0|1) ;;
+    *) die "BASIS_OBSERVER_DYNAMIC_TARGET_WSS must be 0 or 1" ;;
+  esac
+  [[ "${TARGET_WSS_BASE_PORT}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_BASE_PORT must be numeric"
+  [[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
+  [[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
   CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
   CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
   CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
@@ -1382,6 +1744,13 @@ FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLE
 FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
 FUNDING_SETTLEMENT_LEDGER="${BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER:-${FUNDING_SETTLEMENT_LEDGER:-}}"
 FUNDING_SETTLEMENT_RAW_SNAPSHOT="${BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT:-${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}}"
+DYNAMIC_TARGET_WSS="${BASIS_OBSERVER_DYNAMIC_TARGET_WSS:-0}"
+TARGET_WSS_ROOT="${BASIS_OBSERVER_TARGET_WSS_ROOT:-${RUN_ROOT}/target-wss}"
+TARGET_WSS_LOG_DIR="${TARGET_WSS_ROOT}/logs"
+TARGET_WSS_STATE_DIR="${TARGET_WSS_ROOT}/state"
+TARGET_WSS_BASE_PORT="${BASIS_OBSERVER_TARGET_WSS_BASE_PORT:-8830}"
+TARGET_WSS_READY_TIMEOUT_SECS="${BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS:-60}"
+TARGET_WSS_RECONNECT_DELAY_SECS="${BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS:-2}"
 HYPERLIQUID_USER="${BASIS_OBSERVER_HYPERLIQUID_USER:-${HYPERLIQUID_USER:-}}"
 HYPERLIQUID_SOURCE="${BASIS_OBSERVER_HYPERLIQUID_SOURCE:-${HYPERLIQUID_SOURCE:-}}"
 HYPERLIQUID_VAULT_ADDRESS="${BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS:-${HYPERLIQUID_VAULT_ADDRESS:-}}"
@@ -1416,6 +1785,14 @@ if [[ -n "${FUNDING_SETTLEMENT_LEDGER}" && -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT
   die "cannot combine BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER and BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT"
 fi
 
+case "${DYNAMIC_TARGET_WSS}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_DYNAMIC_TARGET_WSS must be 0 or 1" ;;
+esac
+[[ "${TARGET_WSS_BASE_PORT}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_BASE_PORT must be numeric"
+[[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
+[[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
+
 if [[ "${#CLI_MONITORS[@]}" -eq 0 ]]; then
   if [[ -n "${BASIS_OBSERVER_MONITORS:-}" ]]; then
     IFS=' ' read -r -a MONITORS <<< "${BASIS_OBSERVER_MONITORS}"
@@ -1442,7 +1819,7 @@ for strategy in "${STRATEGY_LIST[@]}"; do
   esac
 done
 
-mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${SNAPSHOT_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}"
+mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${SNAPSHOT_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}" "${TARGET_WSS_LOG_DIR}" "${TARGET_WSS_STATE_DIR}"
 touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
 
 if [[ -s "${PID_FILE}" ]]; then
@@ -1701,6 +2078,11 @@ nohup env \
   BASIS_OBSERVER_FUNDING_ARB_MODE="${FUNDING_ARB_MODE}" \
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER="${FUNDING_SETTLEMENT_LEDGER}" \
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT="${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" \
+  BASIS_OBSERVER_DYNAMIC_TARGET_WSS="${DYNAMIC_TARGET_WSS}" \
+  BASIS_OBSERVER_TARGET_WSS_ROOT="${TARGET_WSS_ROOT}" \
+  BASIS_OBSERVER_TARGET_WSS_BASE_PORT="${TARGET_WSS_BASE_PORT}" \
+  BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS="${TARGET_WSS_READY_TIMEOUT_SECS}" \
+  BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS="${TARGET_WSS_RECONNECT_DELAY_SECS}" \
   BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS="${AUTO_PRICE_GUARD_BPS}" \
   BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR="${PRIVATE_ORDER_EVENTS_DIR}" \
   BASIS_OBSERVER_HYPERLIQUID_USER="${HYPERLIQUID_USER}" \

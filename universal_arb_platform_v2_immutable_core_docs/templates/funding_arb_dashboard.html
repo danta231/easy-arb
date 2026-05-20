@@ -5,57 +5,871 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>跨所资金费率套利 observer</title>
   <style>
-    body { margin: 0; background: #101112; color: #f0eadc; font-family: "IBM Plex Mono", "SFMono-Regular", monospace; }
-    header { display: flex; justify-content: space-between; gap: 18px; padding: 20px 24px; background: #191b1e; border-bottom: 1px solid #353941; }
-    main { padding: 18px 24px 28px; }
-    h1 { margin: 0; font-size: 22px; }
-    button { min-height: 34px; border: 1px solid #353941; border-radius: 6px; background: #23262a; color: #f0eadc; padding: 7px 11px; }
-    .grid { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
-    .metric { border: 1px solid #353941; background: #1b1d20; border-radius: 6px; padding: 12px; }
-    .metric span { display: block; color: #a5a8aa; font-size: 12px; }
-    .metric strong { display: block; margin-top: 8px; font-size: 22px; }
-    pre { margin: 0; max-height: 72vh; overflow: auto; padding: 12px; background: #0c0d0e; border: 1px solid #353941; line-height: 1.45; }
+    :root {
+      color-scheme: dark;
+      --bg: #0f1113;
+      --band: #15181b;
+      --panel: #1b1f23;
+      --panel-strong: #242932;
+      --line: #37404a;
+      --line-soft: #2a3139;
+      --text: #f1eadc;
+      --muted: #aab1b9;
+      --accent: #d8b65f;
+      --green: #5dc48a;
+      --red: #e16d6d;
+      --blue: #76a7d8;
+      --violet: #b498d4;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 22px;
+      padding: 20px 28px;
+      background: var(--band);
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .kicker {
+      margin: 0 0 6px;
+      color: var(--accent);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .pill.healthy,
+    .candidate,
+    .positive {
+      color: var(--green);
+    }
+
+    .pill.healthy,
+    .candidate-badge {
+      border-color: rgba(93, 196, 138, 0.48);
+    }
+
+    .pill.error,
+    .negative {
+      color: var(--red);
+    }
+
+    .pill.error {
+      border-color: rgba(225, 109, 109, 0.55);
+    }
+
+    main {
+      padding: 18px 28px 32px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      min-height: 74px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 22px;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+
+    .focus-grid {
+      display: grid;
+      grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr);
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .focus-panel {
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 42px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line-soft);
+      color: var(--muted);
+    }
+
+    .direction-body {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+    }
+
+    .direction-line {
+      display: grid;
+      grid-template-columns: minmax(72px, 100px) minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+    }
+
+    .direction-line span:first-child {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .direction-value {
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+
+    .spread-meter {
+      display: grid;
+      grid-template-columns: minmax(86px, 0.8fr) minmax(0, 1fr) minmax(86px, 0.8fr);
+      gap: 10px;
+      padding: 12px;
+      align-items: center;
+    }
+
+    .venue-box {
+      min-height: 86px;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      padding: 10px;
+      background: #151a1e;
+    }
+
+    .venue-box strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 15px;
+    }
+
+    .venue-box span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+
+    .meter-mid {
+      min-height: 86px;
+      display: grid;
+      place-items: center;
+      gap: 6px;
+      border-top: 1px solid var(--line-soft);
+      border-bottom: 1px solid var(--line-soft);
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .meter-mid strong {
+      color: var(--green);
+      font-size: 24px;
+      line-height: 1.1;
+    }
+
+    .control-bar {
+      display: grid;
+      grid-template-columns: minmax(150px, 210px) minmax(140px, 180px) minmax(130px, max-content) minmax(124px, max-content) minmax(180px, 240px) minmax(96px, max-content) minmax(124px, max-content);
+      gap: 10px;
+      align-items: end;
+      padding: 12px;
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    label span,
+    .field-label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input[type="search"],
+    select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101417;
+      color: var(--text);
+      padding: 7px 9px;
+    }
+
+    input[type="search"]:focus,
+    select:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 36px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: var(--panel);
+      white-space: nowrap;
+    }
+
+    .toggle input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-strong);
+      color: var(--text);
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--accent);
+    }
+
+    .table-wrap,
+    .api-wrap {
+      border: 1px solid var(--line);
+      background: var(--band);
+    }
+
+    .table-head,
+    .api-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    #api-state {
+      max-width: min(58vw, 720px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: right;
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+      max-height: 54vh;
+    }
+
+    table {
+      width: 100%;
+      min-width: 1500px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      height: 38px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(55, 64, 74, 0.68);
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #20252b;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    th:first-child,
+    td:first-child,
+    th:nth-child(2),
+    td:nth-child(2),
+    th:last-child,
+    td:last-child {
+      text-align: left;
+    }
+
+    tbody tr:hover {
+      background: rgba(216, 182, 95, 0.08);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--muted);
+      background: #15191d;
+    }
+
+    .candidate-badge {
+      color: var(--green);
+      background: rgba(93, 196, 138, 0.08);
+    }
+
+    .direction-badge {
+      color: var(--blue);
+      border-color: rgba(118, 167, 216, 0.45);
+    }
+
+    .api-wrap {
+      margin-top: 14px;
+    }
+
+    .endpoint-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    pre {
+      margin: 0;
+      max-height: 260px;
+      overflow: auto;
+      padding: 12px;
+      background: #0c0f11;
+      color: #d7d1c2;
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .empty-row {
+      height: 88px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 1120px) {
+      .summary-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .focus-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .control-bar {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 720px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status-strip {
+        justify-content: flex-start;
+        text-align: left;
+      }
+
+      main,
+      .topbar {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .summary-grid,
+      .control-bar,
+      .spread-meter {
+        grid-template-columns: 1fr;
+      }
+
+      .meter-mid {
+        border: 1px solid var(--line-soft);
+        border-radius: 6px;
+      }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <h1>跨所资金费率套利 observer</h1>
-    <button id="refresh" type="button">刷新</button>
+  <header class="topbar">
+    <div>
+      <p class="kicker">cross-exchange funding arb</p>
+      <h1>跨所资金费率套利 observer</h1>
+    </div>
+    <div class="status-strip">
+      <span id="runtime-status" class="pill">加载中</span>
+      <span id="updated-at">尚未更新</span>
+    </div>
   </header>
+
   <main>
-    <section class="grid">
-      <article class="metric"><span>状态</span><strong id="status">加载中</strong></article>
-      <article class="metric"><span>机会</span><strong id="candidates">0</strong></article>
-      <article class="metric"><span>组合</span><strong id="total">0</strong></article>
-      <article class="metric"><span>来源错误</span><strong id="source-errors">0</strong></article>
+    <section class="summary-grid" aria-label="summary">
+      <article class="metric"><span>候选机会</span><strong id="metric-candidates">0</strong></article>
+      <article class="metric"><span>配对市场</span><strong id="metric-total">0</strong></article>
+      <article class="metric"><span>报价来源</span><strong id="metric-sources">0</strong></article>
+      <article class="metric"><span>来源错误</span><strong id="metric-source-errors">0</strong></article>
+      <article class="metric"><span>最小净 Funding</span><strong id="metric-min-net">0</strong></article>
+      <article class="metric"><span>展示行数</span><strong id="metric-visible">0</strong></article>
     </section>
-    <section>
-      <button type="button" data-endpoint="/api/funding-arb/status">状态接口</button>
-      <button type="button" data-endpoint="/api/funding-arb/opportunities">机会接口</button>
+
+    <section class="focus-grid" aria-label="top opportunity">
+      <article class="focus-panel">
+        <div class="panel-head">
+          <strong>首选候选</strong>
+          <span id="top-pair">-</span>
+        </div>
+        <div class="direction-body">
+          <div class="direction-line"><span>方向</span><strong id="top-direction" class="direction-value">-</strong></div>
+          <div class="direction-line"><span>净收益</span><strong id="top-net" class="direction-value positive">-</strong></div>
+          <div class="direction-line"><span>预期资金费</span><strong id="top-expected" class="direction-value positive">-</strong></div>
+          <div class="direction-line"><span>下次结算</span><strong id="top-next" class="direction-value">-</strong></div>
+        </div>
+      </article>
+
+      <article class="focus-panel">
+        <div class="panel-head">
+          <strong>资金费率差</strong>
+          <span id="top-status">等待中</span>
+        </div>
+        <div class="spread-meter">
+          <div class="venue-box">
+            <strong id="top-venue-a">-</strong>
+            <span id="top-venue-a-funding">Funding -</span>
+            <span id="top-venue-a-book">Bid/Ask -</span>
+          </div>
+          <div class="meter-mid">
+            <strong id="top-spread">-</strong>
+            <span id="top-cost">成本 -</span>
+          </div>
+          <div class="venue-box">
+            <strong id="top-venue-b">-</strong>
+            <span id="top-venue-b-funding">Funding -</span>
+            <span id="top-venue-b-book">Bid/Ask -</span>
+          </div>
+        </div>
+      </article>
     </section>
-    <pre id="funding-rows">{}</pre>
+
+    <section class="control-bar" aria-label="controls">
+      <label>
+        <span>交易对</span>
+        <input id="symbol-filter" type="search" autocomplete="off" placeholder="BTCUSDT">
+      </label>
+      <label>
+        <span>交易所</span>
+        <select id="venue-filter">
+          <option value="">全部</option>
+        </select>
+      </label>
+      <label class="toggle"><input id="only-candidates" type="checkbox" checked>只看机会</label>
+      <label class="toggle"><input id="only-complete" type="checkbox" checked>只看完整报价</label>
+      <label>
+        <span>排序</span>
+        <select id="sort-mode">
+          <option value="net-desc">净 Funding 降序</option>
+          <option value="spread-desc">毛 Funding 差</option>
+          <option value="expected-desc">预期资金费</option>
+          <option value="next-asc">下次结算</option>
+          <option value="symbol-asc">交易对</option>
+        </select>
+      </label>
+      <button id="refresh-button" type="button">刷新</button>
+      <label class="toggle"><input id="auto-refresh" type="checkbox" checked>自动刷新</label>
+    </section>
+
+    <section class="table-wrap" aria-label="funding table">
+      <div class="table-head">
+        <strong>跨所资金费率机会</strong>
+        <span id="api-state">等待中</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>配对</th>
+              <th>方向</th>
+              <th>交易对</th>
+              <th>Venue A Bid</th>
+              <th>Venue A Ask</th>
+              <th>Venue A Funding</th>
+              <th>Venue A Interval</th>
+              <th>Venue B Bid</th>
+              <th>Venue B Ask</th>
+              <th>Venue B Funding</th>
+              <th>Venue B Interval</th>
+              <th>毛差 bps</th>
+              <th>成本 bps</th>
+              <th>净收益 bps</th>
+              <th>预期 USD</th>
+              <th>下次结算</th>
+              <th>状态</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody id="funding-rows">
+            <tr><td class="empty-row" colspan="18">加载中</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="api-wrap" aria-label="realtime api">
+      <div class="api-head">
+        <strong>实时 API</strong>
+        <div class="endpoint-grid">
+          <button type="button" data-endpoint="/api/funding-arb/status">状态接口</button>
+          <button type="button" data-endpoint="/api/funding-arb/opportunities">机会接口</button>
+        </div>
+      </div>
+      <pre id="api-preview">{}</pre>
+    </section>
   </main>
+
   <script>
-    async function refresh() {
-      const response = await fetch("/api/funding-arb/status", { cache: "no-store" });
-      const data = await response.json();
-      document.getElementById("status").textContent = data.status || "未知";
-      document.getElementById("candidates").textContent = data.candidate_count ?? 0;
-      document.getElementById("total").textContent = data.total_rows ?? 0;
-      document.getElementById("source-errors").textContent = data.source_error_count ?? 0;
-      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
+    const statusUrl = "/api/funding-arb/status";
+    const opportunitiesUrl = "/api/funding-arb/opportunities";
+    const state = { snapshot: null, timer: null };
+    const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(value) {
+      return String(value ?? "-").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[ch]));
     }
-    async function preview(url) {
+
+    function numeric(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function signedClass(value) {
+      const number = numeric(value);
+      if (number === null || number === 0) return "";
+      return number > 0 ? "positive" : "negative";
+    }
+
+    function bps(value) {
+      const number = numeric(value);
+      return number === null ? "-" : `${number.toFixed(2).replace(/\.00$/, "")} bps`;
+    }
+
+    function usd(value) {
+      const number = numeric(value);
+      return number === null ? "-" : `$${number.toFixed(4).replace(/\.?0+$/, "")}`;
+    }
+
+    function rate(value) {
+      const number = numeric(value);
+      if (number === null) return "-";
+      return `${(number * 100).toFixed(5).replace(/\.?0+$/, "")}%`;
+    }
+
+    function venueLabel(value) {
+      return String(value ?? "-").replace(/(^|-)([a-z])/g, (_, dash, char) => `${dash}${char.toUpperCase()}`);
+    }
+
+    function pairLabel(row) {
+      return `${venueLabel(row.venue_a_family)} / ${venueLabel(row.venue_b_family)}`;
+    }
+
+    function directionLabel(row) {
+      const longVenue = row.long_venue_family ? venueLabel(row.long_venue_family) : "-";
+      const shortVenue = row.short_venue_family ? venueLabel(row.short_venue_family) : "-";
+      return `${longVenue} long / ${shortVenue} short`;
+    }
+
+    function nextFunding(row) {
+      const values = [row.venue_a_next_funding_time_ms, row.venue_b_next_funding_time_ms]
+        .map((value) => Number(value))
+        .filter(Number.isFinite);
+      if (!values.length) return "-";
+      return new Date(Math.min(...values)).toLocaleString("zh-CN", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+      });
+    }
+
+    function nextFundingMs(row) {
+      const values = [row.venue_a_next_funding_time_ms, row.venue_b_next_funding_time_ms]
+        .map((value) => Number(value))
+        .filter(Number.isFinite);
+      return values.length ? Math.min(...values) : Infinity;
+    }
+
+    async function requestJson(url) {
       const response = await fetch(url, { cache: "no-store" });
-      const data = await response.json();
-      document.getElementById("funding-rows").textContent = JSON.stringify(data, null, 2);
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        throw new Error(`invalid json from ${url}: ${error.message}`);
+      }
+      if (!response.ok) {
+        throw new Error(data.error || `http ${response.status}`);
+      }
+      return data;
     }
-    document.getElementById("refresh").addEventListener("click", refresh);
-    document.querySelectorAll("[data-endpoint]").forEach((button) => {
-      button.addEventListener("click", () => preview(button.dataset.endpoint || "/api/funding-arb/status"));
+
+    function updateVenueFilter(rows) {
+      const select = $("venue-filter");
+      const current = select.value;
+      const venues = Array.from(new Set(rows.flatMap((row) => [row.venue_a_family, row.venue_b_family]).filter(Boolean))).sort();
+      select.innerHTML = `<option value="">全部</option>${venues.map((venue) => (
+        `<option value="${escapeHtml(venue)}">${escapeHtml(venueLabel(venue))}</option>`
+      )).join("")}`;
+      select.value = venues.includes(current) ? current : "";
+    }
+
+    function filteredRows(rows) {
+      const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
+      const venueFilter = $("venue-filter").value;
+      const onlyCandidates = $("only-candidates").checked;
+      const onlyComplete = $("only-complete").checked;
+      const sortMode = $("sort-mode").value;
+      const result = rows.filter((row) => {
+        if (symbolFilter && !String(row.symbol || "").toUpperCase().includes(symbolFilter)) return false;
+        if (venueFilter && row.venue_a_family !== venueFilter && row.venue_b_family !== venueFilter) return false;
+        if (onlyCandidates && !row.is_candidate) return false;
+        if (onlyComplete && row.source_status !== "complete") return false;
+        return true;
+      });
+      result.sort((left, right) => {
+        if (sortMode === "symbol-asc") return String(left.symbol || "").localeCompare(String(right.symbol || ""));
+        if (sortMode === "spread-desc") {
+          return (numeric(right.gross_funding_spread_bps) ?? -Infinity) - (numeric(left.gross_funding_spread_bps) ?? -Infinity);
+        }
+        if (sortMode === "expected-desc") {
+          return (numeric(right.expected_funding_usd) ?? -Infinity) - (numeric(left.expected_funding_usd) ?? -Infinity);
+        }
+        if (sortMode === "next-asc") return nextFundingMs(left) - nextFundingMs(right);
+        return (numeric(right.net_funding_bps) ?? -Infinity) - (numeric(left.net_funding_bps) ?? -Infinity);
+      });
+      return result;
+    }
+
+    function bestCandidate(rows) {
+      return [...rows]
+        .filter((row) => row.is_candidate && row.source_status === "complete")
+        .sort((left, right) => (numeric(right.net_funding_bps) ?? -Infinity) - (numeric(left.net_funding_bps) ?? -Infinity))[0]
+        || null;
+    }
+
+    function renderTopOpportunity(rows) {
+      const row = bestCandidate(rows);
+      if (!row) {
+        $("top-pair").textContent = "-";
+        $("top-direction").textContent = "-";
+        $("top-net").textContent = "-";
+        $("top-expected").textContent = "-";
+        $("top-next").textContent = "-";
+        $("top-status").textContent = "无候选";
+        $("top-venue-a").textContent = "-";
+        $("top-venue-a-funding").textContent = "Funding -";
+        $("top-venue-a-book").textContent = "Bid/Ask -";
+        $("top-spread").textContent = "-";
+        $("top-cost").textContent = "成本 -";
+        $("top-venue-b").textContent = "-";
+        $("top-venue-b-funding").textContent = "Funding -";
+        $("top-venue-b-book").textContent = "Bid/Ask -";
+        return;
+      }
+      $("top-pair").textContent = row.pair_id || pairLabel(row);
+      $("top-direction").textContent = directionLabel(row);
+      $("top-net").textContent = bps(row.net_funding_bps);
+      $("top-expected").textContent = usd(row.expected_funding_usd);
+      $("top-next").textContent = nextFunding(row);
+      $("top-status").textContent = row.source_status || "complete";
+      $("top-venue-a").textContent = venueLabel(row.venue_a_family);
+      $("top-venue-a-funding").textContent = `Funding ${rate(row.venue_a_funding_rate)} / ${row.venue_a_funding_interval_hours || "-"}h`;
+      $("top-venue-a-book").textContent = `Bid ${row.venue_a_bid || "-"} / Ask ${row.venue_a_ask || "-"}`;
+      $("top-spread").textContent = bps(row.gross_funding_spread_bps);
+      $("top-cost").textContent = `成本 ${bps(row.total_cost_bps)}`;
+      $("top-venue-b").textContent = venueLabel(row.venue_b_family);
+      $("top-venue-b-funding").textContent = `Funding ${rate(row.venue_b_funding_rate)} / ${row.venue_b_funding_interval_hours || "-"}h`;
+      $("top-venue-b-book").textContent = `Bid ${row.venue_b_bid || "-"} / Ask ${row.venue_b_ask || "-"}`;
+    }
+
+    function renderRows(rows) {
+      const body = $("funding-rows");
+      const view = filteredRows(rows);
+      $("metric-visible").textContent = view.length;
+      if (!view.length) {
+        body.innerHTML = `<tr><td class="empty-row" colspan="18">无数据</td></tr>`;
+        return;
+      }
+      body.innerHTML = view.map((row) => {
+        const candidate = row.is_candidate ? `<span class="badge candidate-badge">候选</span>` : `<span class="badge">观察</span>`;
+        return `<tr>
+          <td class="${row.is_candidate ? "candidate" : ""}">${escapeHtml(pairLabel(row))}</td>
+          <td><span class="badge direction-badge">${escapeHtml(directionLabel(row))}</span></td>
+          <td>${escapeHtml(row.symbol)}</td>
+          <td>${escapeHtml(row.venue_a_bid)}</td>
+          <td>${escapeHtml(row.venue_a_ask)}</td>
+          <td class="${signedClass(row.venue_a_funding_rate)}">${escapeHtml(rate(row.venue_a_funding_rate))}</td>
+          <td>${escapeHtml(row.venue_a_funding_interval_hours)}h</td>
+          <td>${escapeHtml(row.venue_b_bid)}</td>
+          <td>${escapeHtml(row.venue_b_ask)}</td>
+          <td class="${signedClass(row.venue_b_funding_rate)}">${escapeHtml(rate(row.venue_b_funding_rate))}</td>
+          <td>${escapeHtml(row.venue_b_funding_interval_hours)}h</td>
+          <td class="${signedClass(row.gross_funding_spread_bps)}">${escapeHtml(bps(row.gross_funding_spread_bps))}</td>
+          <td>${escapeHtml(bps(row.total_cost_bps))}</td>
+          <td class="${signedClass(row.net_funding_bps)}">${escapeHtml(bps(row.net_funding_bps))}</td>
+          <td class="${signedClass(row.expected_funding_usd)}">${escapeHtml(usd(row.expected_funding_usd))}</td>
+          <td>${escapeHtml(nextFunding(row))}</td>
+          <td>${candidate}</td>
+          <td>${escapeHtml(row.reason || row.source_status)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function render(snapshot) {
+      const rows = snapshot.rows || [];
+      $("runtime-status").textContent = snapshot.status || "未知";
+      $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : snapshot.last_error ? "error" : ""}`;
+      $("updated-at").textContent = snapshot.updated_at || "尚未更新";
+      $("metric-candidates").textContent = snapshot.candidate_count ?? 0;
+      $("metric-total").textContent = snapshot.total_rows ?? 0;
+      $("metric-sources").textContent = snapshot.source_count ?? 0;
+      $("metric-source-errors").textContent = snapshot.source_error_count ?? 0;
+      $("metric-min-net").textContent = bps(snapshot.min_net_funding_bps);
+      $("api-state").textContent = snapshot.last_error ? "上游错误" : "正常";
+      $("api-state").title = snapshot.last_error || "正常";
+      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
+      updateVenueFilter(rows);
+      renderTopOpportunity(rows);
+      renderRows(rows);
+    }
+
+    async function refreshStatus() {
+      $("api-state").textContent = "加载中";
+      try {
+        const snapshot = await requestJson(statusUrl);
+        state.snapshot = snapshot;
+        render(snapshot);
+      } catch (error) {
+        $("runtime-status").textContent = "错误";
+        $("runtime-status").className = "pill error";
+        $("api-state").textContent = "请求失败";
+        $("api-state").title = error.message;
+      }
+    }
+
+    async function previewEndpoint(url) {
+      $("api-preview").textContent = "加载中";
+      try {
+        const data = await requestJson(url);
+        $("api-preview").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        $("api-preview").textContent = error.message;
+      }
+    }
+
+    function schedule() {
+      if (state.timer) clearInterval(state.timer);
+      if ($("auto-refresh").checked) {
+        state.timer = setInterval(refreshStatus, 2000);
+      }
+    }
+
+    ["symbol-filter", "venue-filter", "only-candidates", "only-complete", "sort-mode"].forEach((id) => {
+      $(id).addEventListener("input", () => {
+        if (state.snapshot) renderRows(state.snapshot.rows || []);
+      });
+      $(id).addEventListener("change", () => {
+        if (state.snapshot) renderRows(state.snapshot.rows || []);
+      });
     });
-    setInterval(refresh, 2000);
-    refresh();
+    $("refresh-button").addEventListener("click", refreshStatus);
+    $("auto-refresh").addEventListener("change", schedule);
+    document.querySelectorAll("[data-endpoint]").forEach((button) => {
+      button.addEventListener("click", () => previewEndpoint(button.dataset.endpoint || opportunitiesUrl));
+    });
+
+    schedule();
+    refreshStatus();
   </script>
 </body>
 </html>

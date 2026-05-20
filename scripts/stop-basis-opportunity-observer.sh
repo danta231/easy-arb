@@ -42,7 +42,7 @@ is_validation_process_name() {
 
 is_core_process_name() {
   case "$1" in
-    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live) return 0 ;;
+    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-binance-*|target-wss-bybit-*|target-wss-okx-*|target-wss-bitget-*) return 0 ;;
     *) return 1 ;;
   esac
 }

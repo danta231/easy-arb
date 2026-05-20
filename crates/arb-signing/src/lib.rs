@@ -302,17 +302,34 @@ fn validate_token(
 
 fn looks_like_secret_label(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    [
-        "api_key",
-        "apikey",
-        "mnemonic",
-        "password",
-        "private",
-        "secret",
-        "sensitive",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    let parts = lower
+        .split(['_', '-', '.', ':', '/'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    for (index, part) in parts.iter().enumerate() {
+        if *part == "apikey" {
+            return true;
+        }
+        if *part == "api" && parts.get(index + 1).is_some_and(|next| *next == "key") {
+            return true;
+        }
+        if matches!(
+            *part,
+            "mnemonic" | "password" | "private" | "secret" | "sensitive"
+        ) && !is_negated_sensitive_label(&parts, index)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_negated_sensitive_label(parts: &[&str], index: usize) -> bool {
+    index > 0
+        && parts
+            .get(index - 1)
+            .is_some_and(|previous| matches!(*previous, "no" | "non" | "without"))
 }
 
 /// 签名 payload 摘要。
@@ -4767,6 +4784,14 @@ mod tests {
 
         assert!(!rendered.contains(secret_like));
         assert!(rendered.contains("key material"));
+    }
+
+    #[test]
+    fn no_secret_policy_label_is_not_treated_as_key_material() {
+        let policy = SigningPolicyRef::new("signing-policy/preflight-no-secret-v1")
+            .expect("policy label should be accepted");
+
+        assert_eq!(policy.as_str(), "signing-policy/preflight-no-secret-v1");
     }
 
     #[test]

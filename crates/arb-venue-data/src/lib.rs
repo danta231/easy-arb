@@ -1619,17 +1619,18 @@ impl BybitPublicWssTextStreamClient {
                     ),
                 ))
             })?;
-        let subscribe = bybit_public_wss_subscribe_payload(subscribe_args);
-        socket
-            .send(tungstenite::Message::Text(subscribe))
-            .map_err(|error| {
-                VenueDataError::External(ClassifiedExternalError::new(
-                    self.venue_id.clone(),
-                    ReadOnlySurface::MarketData,
-                    ExternalErrorClass::Disconnected,
-                    format!("Bybit public WSS subscribe send failed: {error}"),
-                ))
-            })?;
+        for subscribe in bybit_public_wss_subscribe_payloads(subscribe_args) {
+            socket
+                .send(tungstenite::Message::Text(subscribe))
+                .map_err(|error| {
+                    VenueDataError::External(ClassifiedExternalError::new(
+                        self.venue_id.clone(),
+                        ReadOnlySurface::MarketData,
+                        ExternalErrorClass::Disconnected,
+                        format!("Bybit public WSS subscribe send failed: {error}"),
+                    ))
+                })?;
+        }
 
         let mut text_messages = 0_usize;
         while text_messages < max_text_messages {
@@ -9554,6 +9555,14 @@ fn bybit_public_correlation_id(
     )
 }
 
+const BYBIT_PUBLIC_WSS_SUBSCRIBE_BATCH_SIZE: usize = 10;
+
+fn bybit_public_wss_subscribe_payloads(args: &[String]) -> Vec<String> {
+    args.chunks(BYBIT_PUBLIC_WSS_SUBSCRIBE_BATCH_SIZE)
+        .map(bybit_public_wss_subscribe_payload)
+        .collect()
+}
+
 fn bybit_public_wss_subscribe_payload(args: &[String]) -> String {
     format!(
         "{{\"args\":[{}],\"op\":\"subscribe\"}}",
@@ -10093,6 +10102,24 @@ mod tests {
                 })
             }
         }
+    }
+
+    #[test]
+    fn bybit_public_wss_subscribe_payloads_are_chunked() {
+        let args = (0..25)
+            .map(|index| format!("orderbook.1.TEST{index}USDT"))
+            .collect::<Vec<_>>();
+
+        let payloads = bybit_public_wss_subscribe_payloads(&args);
+
+        assert_eq!(payloads.len(), 3);
+        assert!(payloads[0].contains("orderbook.1.TEST0USDT"));
+        assert!(payloads[0].contains("orderbook.1.TEST9USDT"));
+        assert!(!payloads[0].contains("orderbook.1.TEST10USDT"));
+        assert!(payloads[1].contains("orderbook.1.TEST10USDT"));
+        assert!(payloads[1].contains("orderbook.1.TEST19USDT"));
+        assert!(payloads[2].contains("orderbook.1.TEST20USDT"));
+        assert!(payloads[2].contains("orderbook.1.TEST24USDT"));
     }
 
     #[test]

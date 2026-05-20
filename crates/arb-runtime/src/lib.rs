@@ -137,6 +137,8 @@ const ASTER_FUTURES_REST_BASE_URL: &str = "https://fapi.asterdex.com";
 const ASTER_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.asterdex.com";
 #[cfg(feature = "live-exec")]
 const ASTER_FUTURES_V3_REST_BASE_URL: &str = "https://fapi3.asterdex.com";
+#[cfg(feature = "live-exec")]
+const ASTER_SIGNED_REST_USER_AGENT: &str = "easy-arb-runtime/aster-signed-rest";
 const ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT: &str = "ASTER_EIP712_SIGNER_CMD";
 #[cfg(feature = "live-exec")]
 const ASTER_USER_ENV_NAMES: &[&str] = &[
@@ -144,7 +146,6 @@ const ASTER_USER_ENV_NAMES: &[&str] = &[
     "ASTER_USER_ADDRESS",
     "ASTER_ACCOUNT_ADDRESS",
     "ASTER_ADDRESS",
-    "ASTER_SIGNER",
 ];
 #[cfg(feature = "live-exec")]
 const ASTER_SIGNER_ENV_NAMES: &[&str] = &[
@@ -153,7 +154,6 @@ const ASTER_SIGNER_ENV_NAMES: &[&str] = &[
     "ASTER_API_ADDRESS",
     "ASTER_ADDRESS",
     "ASTER_ACCOUNT_ADDRESS",
-    "ASTER_USER",
 ];
 #[cfg(feature = "live-exec")]
 const HYPERLIQUID_USER_ENV_NAMES: &[&str] = &[
@@ -4638,11 +4638,8 @@ fn fetch_aster_funding_private_readonly_snapshots(
     options: &FundingArbPrivateReadonlySnapshotOnceOptions,
 ) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
     let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
-    let aster_user = resolve_optional_aster_v3_address(
-        options.aster_user.as_deref(),
-        "ASTER_USER",
-        "--aster-user",
-    )?;
+    let aster_user =
+        resolve_required_aster_v3_address(options.aster_user.as_deref(), "ASTER_USER")?;
     let aster_signer =
         resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
     let signer_command = resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
@@ -4659,7 +4656,7 @@ fn fetch_aster_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            aster_user.clone(),
+            Some(aster_user.clone()),
             aster_signer.clone(),
             Vec::<AsterRequestParam>::new(),
         )?,
@@ -4679,7 +4676,7 @@ fn fetch_aster_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            aster_user.clone(),
+            Some(aster_user.clone()),
             aster_signer.clone(),
             vec![AsterRequestParam::new("symbol", symbol.to_owned())?],
         )?,
@@ -4700,7 +4697,7 @@ fn fetch_aster_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            aster_user,
+            Some(aster_user),
             aster_signer,
             vec![
                 AsterRequestParam::new("symbol", symbol.to_owned())?,
@@ -4808,24 +4805,6 @@ fn resolve_required_aster_v3_address(
         })?;
     validate_aster_v3_address(&value, field)?;
     Ok(value.trim().to_owned())
-}
-
-#[cfg(feature = "live-exec")]
-fn resolve_optional_aster_v3_address(
-    option_value: Option<&str>,
-    env_name: &str,
-    field: &str,
-) -> RuntimeResult<Option<String>> {
-    let env_names = aster_address_env_names(env_name);
-    let value = option_value
-        .map(str::to_owned)
-        .or_else(|| first_non_empty_env(env_names));
-    if let Some(value) = value {
-        validate_aster_v3_address(&value, field)?;
-        Ok(Some(value.trim().to_owned()))
-    } else {
-        Ok(None)
-    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -5377,25 +5356,29 @@ fn portfolio_balance_rows_from_raw_statement(
     statement: &FundingPrivateRawStatement,
     source_status: &str,
 ) -> RuntimeResult<Vec<PortfolioBalanceRow>> {
+    let normalized_venue_family = normalize_venue_family(&statement.venue_family);
+    let venue_specific_rows = match normalized_venue_family.as_str() {
+        "binance" => portfolio_binance_balance_rows_from_raw_statement(statement, source_status)?,
+        "bybit" => portfolio_bybit_balance_rows_from_raw_statement(statement, source_status)?,
+        "bitget" => portfolio_bitget_balance_rows_from_raw_statement(statement, source_status)?,
+        "okx" => portfolio_okx_balance_rows_from_raw_statement(statement, source_status)?,
+        "aster" => portfolio_aster_balance_rows_from_raw_statement(statement, source_status)?,
+        "hyperliquid" => {
+            portfolio_hyperliquid_balance_rows_from_raw_statement(statement, source_status)?
+        }
+        _ => None,
+    };
+    if let Some(rows) = venue_specific_rows {
+        return Ok(rows);
+    }
+
     let mut object_slices = Vec::new();
     collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     for object in object_slices {
         let fields = parse_json_object_value_slices(object)?;
-        let asset = first_json_scalar_string(
-            &fields,
-            &[
-                "asset",
-                "marginCoin",
-                "coin",
-                "ccy",
-                "currency",
-                "token",
-                "symbol",
-            ],
-        )?
-        .map(|value| portfolio_balance_asset_from_raw(&value));
+        let asset = first_portfolio_balance_asset_from_raw_fields(&fields)?;
         let available = first_json_scalar_string(
             &fields,
             &[
@@ -5472,11 +5455,122 @@ fn portfolio_balance_rows_from_raw_statement(
         let asset = asset.unwrap_or_else(|| "USD".to_owned());
         let key = format!(
             "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}",
-            normalize_venue_family(&statement.venue_family),
-            statement.account_id,
+            normalized_venue_family, statement.account_id, asset, available, margin_balance,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        rows.push(PortfolioBalanceRow {
+            venue_family: normalized_venue_family.clone(),
+            account_id: statement.account_id.clone(),
             asset,
             available,
             margin_balance,
+            maintenance_margin,
+            margin_buffer,
+            free,
+            locked,
+            reserved,
+            pending,
+            borrowed,
+            lent,
+            unsettled,
+            source_status: source_status.to_owned(),
+        });
+    }
+    Ok(rows)
+}
+
+fn portfolio_binance_balance_rows_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+) -> RuntimeResult<Option<Vec<PortfolioBalanceRow>>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('{') {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(payload)?;
+    if let Some(assets) = fields.get("assets") {
+        return portfolio_binance_balance_rows_from_raw_array(
+            statement,
+            source_status,
+            assets,
+            PortfolioBinanceBalanceArrayKind::UsdmAssets,
+        )
+        .map(Some);
+    }
+    if let Some(balances) = fields.get("balances") {
+        return portfolio_binance_balance_rows_from_raw_array(
+            statement,
+            source_status,
+            balances,
+            PortfolioBinanceBalanceArrayKind::SpotBalances,
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortfolioBinanceBalanceArrayKind {
+    SpotBalances,
+    UsdmAssets,
+}
+
+fn portfolio_binance_balance_rows_from_raw_array(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+    array_json: &str,
+    kind: PortfolioBinanceBalanceArrayKind,
+) -> RuntimeResult<Vec<PortfolioBalanceRow>> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in json_array_value_slices(array_json)? {
+        let fields = parse_json_object_value_slices(value)?;
+        let Some(asset) = json_scalar_string_from_fields(&fields, "asset")?
+            .map(|value| portfolio_balance_asset_from_raw_field("asset", &value))
+        else {
+            continue;
+        };
+        if !portfolio_binance_raw_balance_has_owned_amount(&fields, kind)? {
+            continue;
+        }
+
+        let available = first_json_scalar_string(
+            &fields,
+            &["available", "availableBalance", "maxWithdrawAmount"],
+        )?;
+        let free = first_json_scalar_string(&fields, &["free"])?;
+        let locked = first_json_scalar_string(&fields, &["locked", "initialMargin"])?;
+        let reserved = first_json_scalar_string(&fields, &["reserved", "openOrderInitialMargin"])?;
+        let pending = first_json_scalar_string(&fields, &["pending", "pendingBalance"])?;
+        let borrowed = first_json_scalar_string(&fields, &["borrowed", "debt", "liability"])?;
+        let lent = first_json_scalar_string(&fields, &["lent", "loaned"])?;
+        let unsettled =
+            first_json_scalar_string(&fields, &["unsettled", "unsettledBalance", "crossUnPnl"])?;
+        let margin_balance = first_json_scalar_string(
+            &fields,
+            &[
+                "marginBalance",
+                "crossWalletBalance",
+                "walletBalance",
+                "balance",
+            ],
+        )?;
+        let maintenance_margin = first_json_scalar_string(
+            &fields,
+            &["maintMargin", "maintenanceMargin", "totalPositionMM"],
+        )?;
+        let margin_buffer = first_json_scalar_string(&fields, &["availableMargin", "availEq"])?
+            .or_else(|| {
+                portfolio_margin_buffer(margin_balance.as_deref(), maintenance_margin.as_deref())
+            });
+
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            normalize_venue_family(&statement.venue_family),
+            statement.account_id,
+            asset
         );
         if !seen.insert(key) {
             continue;
@@ -5500,6 +5594,395 @@ fn portfolio_balance_rows_from_raw_statement(
         });
     }
     Ok(rows)
+}
+
+fn portfolio_binance_raw_balance_has_owned_amount(
+    fields: &BTreeMap<String, &str>,
+    kind: PortfolioBinanceBalanceArrayKind,
+) -> RuntimeResult<bool> {
+    match kind {
+        PortfolioBinanceBalanceArrayKind::SpotBalances => {
+            portfolio_any_nonzero_json_scalar(fields, &["free", "locked"])
+        }
+        PortfolioBinanceBalanceArrayKind::UsdmAssets => portfolio_any_nonzero_json_scalar(
+            fields,
+            &[
+                "walletBalance",
+                "crossWalletBalance",
+                "marginBalance",
+                "balance",
+                "initialMargin",
+                "positionInitialMargin",
+                "openOrderInitialMargin",
+                "maintMargin",
+                "unrealizedProfit",
+                "crossUnPnl",
+            ],
+        ),
+    }
+}
+
+fn portfolio_bybit_balance_rows_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+) -> RuntimeResult<Option<Vec<PortfolioBalanceRow>>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('{') {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(payload)?;
+    let Some(result) = fields.get("result") else {
+        return Ok(None);
+    };
+    let result_fields = parse_json_object_value_slices(result)?;
+    let Some(accounts) = result_fields.get("list") else {
+        return Ok(None);
+    };
+
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for account_value in json_array_value_slices(accounts)? {
+        let account_fields = parse_json_object_value_slices(account_value)?;
+        let Some(coins) = account_fields.get("coin") else {
+            continue;
+        };
+        for coin_value in json_array_value_slices(coins)? {
+            let fields = parse_json_object_value_slices(coin_value)?;
+            let Some(asset) = json_scalar_string_from_fields(&fields, "coin")?
+                .map(|value| portfolio_balance_asset_from_raw_field("coin", &value))
+            else {
+                continue;
+            };
+            if !portfolio_any_nonzero_json_scalar(
+                &fields,
+                &[
+                    "walletBalance",
+                    "equity",
+                    "usdValue",
+                    "locked",
+                    "borrowAmount",
+                    "totalOrderIM",
+                    "totalPositionIM",
+                    "totalPositionMM",
+                    "spotHedgingQty",
+                ],
+            )? {
+                continue;
+            }
+            let key = format!("{}\u{1f}{}", statement.account_id, asset);
+            if !seen.insert(key) {
+                continue;
+            }
+            rows.push(PortfolioBalanceRow {
+                venue_family: normalize_venue_family(&statement.venue_family),
+                account_id: statement.account_id.clone(),
+                asset,
+                available: first_json_scalar_string(&fields, &["availableToWithdraw"])?,
+                margin_balance: first_json_scalar_string(
+                    &fields,
+                    &["walletBalance", "equity", "usdValue"],
+                )?,
+                maintenance_margin: first_json_scalar_string(&fields, &["totalPositionMM"])?,
+                margin_buffer: None,
+                free: None,
+                locked: first_json_scalar_string(&fields, &["locked"])?,
+                reserved: first_json_scalar_string(&fields, &["totalOrderIM"])?,
+                pending: None,
+                borrowed: first_json_scalar_string(&fields, &["borrowAmount"])?,
+                lent: None,
+                unsettled: first_json_scalar_string(&fields, &["spotHedgingQty"])?,
+                source_status: source_status.to_owned(),
+            });
+        }
+    }
+    Ok(Some(rows))
+}
+
+fn portfolio_bitget_balance_rows_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+) -> RuntimeResult<Option<Vec<PortfolioBalanceRow>>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('{') {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(payload)?;
+    let Some(data) = fields.get("data") else {
+        return Ok(None);
+    };
+
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in json_array_value_slices(data)? {
+        let fields = parse_json_object_value_slices(value)?;
+        let asset = if let Some(value) = json_scalar_string_from_fields(&fields, "marginCoin")? {
+            portfolio_balance_asset_from_raw_field("marginCoin", &value)
+        } else if let Some(value) = json_scalar_string_from_fields(&fields, "coin")? {
+            portfolio_balance_asset_from_raw_field("coin", &value)
+        } else {
+            continue;
+        };
+        let has_owned_amount = if fields.contains_key("marginCoin") {
+            portfolio_any_nonzero_json_scalar(
+                &fields,
+                &[
+                    "accountEquity",
+                    "usdtEquity",
+                    "equity",
+                    "locked",
+                    "unrealizedPL",
+                    "unrealizedPnl",
+                    "crossedRiskRate",
+                ],
+            )?
+        } else {
+            portfolio_any_nonzero_json_scalar(&fields, &["available", "frozen", "locked"])?
+        };
+        if !has_owned_amount {
+            continue;
+        }
+        let key = format!("{}\u{1f}{}", statement.account_id, asset);
+        if !seen.insert(key) {
+            continue;
+        }
+        rows.push(PortfolioBalanceRow {
+            venue_family: normalize_venue_family(&statement.venue_family),
+            account_id: statement.account_id.clone(),
+            asset,
+            available: first_json_scalar_string(
+                &fields,
+                &[
+                    "available",
+                    "crossedMaxAvailable",
+                    "isolatedMaxAvailable",
+                    "maxTransferOut",
+                ],
+            )?,
+            margin_balance: first_json_scalar_string(
+                &fields,
+                &["accountEquity", "usdtEquity", "equity"],
+            )?,
+            maintenance_margin: None,
+            margin_buffer: None,
+            free: None,
+            locked: first_json_scalar_string(&fields, &["locked", "frozen"])?,
+            reserved: None,
+            pending: None,
+            borrowed: None,
+            lent: None,
+            unsettled: first_json_scalar_string(&fields, &["unrealizedPL", "unrealizedPnl"])?,
+            source_status: source_status.to_owned(),
+        });
+    }
+    Ok(Some(rows))
+}
+
+fn portfolio_okx_balance_rows_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+) -> RuntimeResult<Option<Vec<PortfolioBalanceRow>>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('{') {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(payload)?;
+    let Some(data) = fields.get("data") else {
+        return Ok(None);
+    };
+
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for account_value in json_array_value_slices(data)? {
+        let account_fields = parse_json_object_value_slices(account_value)?;
+        let Some(details) = account_fields.get("details") else {
+            continue;
+        };
+        for detail_value in json_array_value_slices(details)? {
+            let fields = parse_json_object_value_slices(detail_value)?;
+            let Some(asset) = json_scalar_string_from_fields(&fields, "ccy")?
+                .map(|value| portfolio_balance_asset_from_raw_field("ccy", &value))
+            else {
+                continue;
+            };
+            if !portfolio_any_nonzero_json_scalar(
+                &fields,
+                &[
+                    "cashBal",
+                    "eq",
+                    "availBal",
+                    "availEq",
+                    "frozenBal",
+                    "ordFrozen",
+                    "liab",
+                    "upl",
+                ],
+            )? {
+                continue;
+            }
+            let key = format!("{}\u{1f}{}", statement.account_id, asset);
+            if !seen.insert(key) {
+                continue;
+            }
+            rows.push(PortfolioBalanceRow {
+                venue_family: normalize_venue_family(&statement.venue_family),
+                account_id: statement.account_id.clone(),
+                asset,
+                available: first_json_scalar_string(&fields, &["availBal", "availEq"])?,
+                margin_balance: first_json_scalar_string(&fields, &["eq", "cashBal"])?,
+                maintenance_margin: None,
+                margin_buffer: None,
+                free: first_json_scalar_string(&fields, &["cashBal"])?,
+                locked: first_json_scalar_string(&fields, &["frozenBal"])?,
+                reserved: first_json_scalar_string(&fields, &["ordFrozen"])?,
+                pending: None,
+                borrowed: first_json_scalar_string(&fields, &["liab"])?,
+                lent: None,
+                unsettled: first_json_scalar_string(&fields, &["upl"])?,
+                source_status: source_status.to_owned(),
+            });
+        }
+    }
+    Ok(Some(rows))
+}
+
+fn portfolio_aster_balance_rows_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+) -> RuntimeResult<Option<Vec<PortfolioBalanceRow>>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('[') {
+        return Ok(None);
+    }
+
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in json_array_value_slices(payload)? {
+        let fields = parse_json_object_value_slices(value)?;
+        let Some(asset) = json_scalar_string_from_fields(&fields, "asset")?
+            .map(|value| portfolio_balance_asset_from_raw_field("asset", &value))
+        else {
+            continue;
+        };
+        if !portfolio_any_nonzero_json_scalar(
+            &fields,
+            &[
+                "balance",
+                "crossWalletBalance",
+                "initialMargin",
+                "positionInitialMargin",
+                "openOrderInitialMargin",
+                "maintMargin",
+                "crossUnPnl",
+            ],
+        )? {
+            continue;
+        }
+        let key = format!("{}\u{1f}{}", statement.account_id, asset);
+        if !seen.insert(key) {
+            continue;
+        }
+        let margin_balance = first_json_scalar_string(&fields, &["balance", "crossWalletBalance"])?;
+        let maintenance_margin = first_json_scalar_string(&fields, &["maintMargin"])?;
+        rows.push(PortfolioBalanceRow {
+            venue_family: normalize_venue_family(&statement.venue_family),
+            account_id: statement.account_id.clone(),
+            asset,
+            available: first_json_scalar_string(
+                &fields,
+                &["availableBalance", "maxWithdrawAmount"],
+            )?,
+            margin_balance: margin_balance.clone(),
+            maintenance_margin: maintenance_margin.clone(),
+            margin_buffer: portfolio_margin_buffer(
+                margin_balance.as_deref(),
+                maintenance_margin.as_deref(),
+            ),
+            free: None,
+            locked: first_json_scalar_string(&fields, &["initialMargin"])?,
+            reserved: first_json_scalar_string(&fields, &["openOrderInitialMargin"])?,
+            pending: None,
+            borrowed: None,
+            lent: None,
+            unsettled: first_json_scalar_string(&fields, &["crossUnPnl"])?,
+            source_status: source_status.to_owned(),
+        });
+    }
+    Ok(Some(rows))
+}
+
+fn portfolio_hyperliquid_balance_rows_from_raw_statement(
+    statement: &FundingPrivateRawStatement,
+    source_status: &str,
+) -> RuntimeResult<Option<Vec<PortfolioBalanceRow>>> {
+    let payload = statement.payload_json.trim();
+    if !payload.starts_with('{') {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(payload)?;
+    let available = first_json_scalar_string(&fields, &["withdrawable", "available"])?;
+    let mut margin_balance = first_json_scalar_string(&fields, &["accountValue", "totalRawUsd"])?;
+    if margin_balance.is_none() {
+        margin_balance = first_json_scalar_string_from_object_field(
+            &fields,
+            "marginSummary",
+            &["accountValue", "totalRawUsd"],
+        )?;
+    }
+    if margin_balance.is_none() {
+        margin_balance = first_json_scalar_string_from_object_field(
+            &fields,
+            "crossMarginSummary",
+            &["accountValue", "totalRawUsd"],
+        )?;
+    }
+    let maintenance_margin = first_json_scalar_string(
+        &fields,
+        &["crossMaintenanceMarginUsed", "maintenanceMargin"],
+    )?;
+    let explicit_margin_buffer =
+        first_json_scalar_string(&fields, &["available_margin_usd", "availableMargin"])?;
+    if available.is_none()
+        && margin_balance.is_none()
+        && maintenance_margin.is_none()
+        && explicit_margin_buffer.is_none()
+    {
+        return Ok(None);
+    }
+    let margin_buffer = explicit_margin_buffer.or_else(|| {
+        portfolio_margin_buffer(margin_balance.as_deref(), maintenance_margin.as_deref())
+    });
+    Ok(Some(vec![PortfolioBalanceRow {
+        venue_family: normalize_venue_family(&statement.venue_family),
+        account_id: statement.account_id.clone(),
+        asset: "USDC".to_owned(),
+        available,
+        margin_balance,
+        maintenance_margin,
+        margin_buffer,
+        free: None,
+        locked: None,
+        reserved: None,
+        pending: None,
+        borrowed: None,
+        lent: None,
+        unsettled: None,
+        source_status: source_status.to_owned(),
+    }]))
+}
+
+fn portfolio_any_nonzero_json_scalar(
+    fields: &BTreeMap<String, &str>,
+    field_names: &[&'static str],
+) -> RuntimeResult<bool> {
+    for field in field_names {
+        let Some(value) = json_scalar_string_from_fields(fields, field)? else {
+            continue;
+        };
+        if MonitorDecimal::parse(field, &value)?.raw != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn portfolio_funding_contexts_from_snapshot_json(
@@ -6293,9 +6776,28 @@ fn portfolio_funding_arb_settlement_time(
     (!parts.is_empty()).then(|| parts.join(" / "))
 }
 
-fn portfolio_balance_asset_from_raw(value: &str) -> String {
+fn first_portfolio_balance_asset_from_raw_fields(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<String>> {
+    for field in [
+        "asset",
+        "marginCoin",
+        "coin",
+        "ccy",
+        "currency",
+        "token",
+        "symbol",
+    ] {
+        if let Some(value) = json_scalar_string_from_fields(fields, field)? {
+            return Ok(Some(portfolio_balance_asset_from_raw_field(field, &value)));
+        }
+    }
+    Ok(None)
+}
+
+fn portfolio_balance_asset_from_raw_field(field: &str, value: &str) -> String {
     let value = value.trim().to_ascii_uppercase();
-    if value.ends_with("USDT") && value.len() > 4 {
+    if field == "symbol" && value.ends_with("USDT") && value.len() > 4 {
         funding_base_asset_from_symbol(&value)
     } else {
         value.replace('-', "")
@@ -8415,7 +8917,8 @@ fn run_multi_venue_basis_resident_live_inner(
                                 &cycle_dir,
                                 &error.to_string(),
                             )?;
-                            if options.execute_live {
+                            if options.execute_live && !resident_entry_cycle_error_can_retry(&error)
+                            {
                                 halt_reason = Some(format!(
                                     "{} entry cycle failed; multi-venue resident live stopped: {error}",
                                     venue.label()
@@ -8492,6 +8995,18 @@ fn run_multi_venue_basis_resident_live_inner(
     };
     write_multi_venue_basis_resident_live_summary(&output_root, &report)?;
     Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn resident_entry_cycle_error_can_retry(error: &RuntimeError) -> bool {
+    match error {
+        RuntimeError::LiveMarketData { message } => {
+            message.starts_with("Public WSS monitor ")
+                || message.starts_with("public market data GET failed")
+                || message.starts_with("public market data POST failed")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -17182,7 +17697,7 @@ fn run_okx_wss_book_ticker_monitor_cycle(
         snapshot.latest_quote = None;
         snapshot.total_rows = 0;
         for update in &market_state.rest_updates {
-            snapshot.record_update_with_symbol(update, Some(symbol_scope));
+            snapshot.record_update(update);
         }
     }
 
@@ -17195,7 +17710,7 @@ fn run_okx_wss_book_ticker_monitor_cycle(
         state
             .write()
             .expect("OKX WSS monitor state lock poisoned")
-            .record_update_with_symbol(&update, Some(symbol_scope));
+            .record_update(&update);
     }
 
     let text_client = PublicJsonWssTextStreamClient::new(
@@ -17226,7 +17741,7 @@ fn run_okx_wss_book_ticker_monitor_cycle(
                 state
                     .write()
                     .expect("OKX WSS monitor state lock poisoned")
-                    .record_update_with_symbol(&update, Some(symbol_scope));
+                    .record_update(&update);
                 keep_going
             }
             Ok(None) => true,
@@ -17364,16 +17879,16 @@ fn run_bitget_wss_book_ticker_monitor_cycle(
         market_state.stream_url.clone(),
         "Bitget",
     )?;
-    let subscribe_payload = market_state.subscribe_args.join("");
     let max_text_messages = if options.once {
         options.updates
     } else {
         usize::MAX
     };
+    let subscribe_payloads = market_state.subscribe_args.clone();
     let mut observed_wss_event = false;
     let mut observer_error = None;
-    let read_result = text_client.read_live_text_messages_observed(
-        &subscribe_payload,
+    let read_result = text_client.read_live_text_messages_observed_many(
+        &subscribe_payloads,
         max_text_messages,
         |raw_json, ingested_at| match apply_bitget_wss_book_ticker_text(
             raw_json,
@@ -17861,6 +18376,12 @@ fn prepare_binance_wss_book_ticker_rest_rows(
     }
     prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
     prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    if all_symbols_scope {
+        if let Some(index) = prepared.iter().position(|row| row.symbol == BASIS_SYMBOL) {
+            let row = prepared.remove(index);
+            prepared.insert(0, row);
+        }
+    }
     Ok(prepared)
 }
 
@@ -17940,16 +18461,22 @@ fn prepare_bybit_wss_book_ticker_rest_rows(
     symbol_scope: &str,
     all_symbols_scope: bool,
 ) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    let target_symbol = if all_symbols_scope {
+        None
+    } else {
+        Some(validate_bybit_public_wss_symbol(symbol_scope)?)
+    };
     let mut prepared = Vec::with_capacity(rows.len());
     for mut row in rows {
         match validate_bybit_public_wss_symbol(&row.symbol) {
-            Ok(symbol) if all_symbols_scope || symbol == symbol_scope => {
+            Ok(symbol)
+                if all_symbols_scope || target_symbol.as_deref() == Some(symbol.as_str()) =>
+            {
                 row.symbol = symbol;
                 prepared.push(row);
             }
             Ok(_) => {}
-            Err(_) if all_symbols_scope => {}
-            Err(error) => return Err(error),
+            Err(_) => {}
         }
     }
     prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
@@ -18108,6 +18635,15 @@ fn prepare_okx_wss_book_ticker_rest_rows(
     }
     prepared.sort_by(|left, right| left.0.cmp(&right.0));
     prepared.dedup_by(|left, right| left.0 == right.0);
+    if all_symbols_scope {
+        if let Some(index) = prepared
+            .iter()
+            .position(|(symbol, _)| symbol == OKX_BASIS_SYMBOL)
+        {
+            let row = prepared.remove(index);
+            prepared.insert(0, row);
+        }
+    }
     Ok(prepared)
 }
 
@@ -18136,6 +18672,15 @@ fn prepare_bitget_wss_book_ticker_rest_rows(
     }
     prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
     prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    if all_symbols_scope {
+        if let Some(index) = prepared
+            .iter()
+            .position(|row| row.symbol == BITGET_BASIS_SYMBOL)
+        {
+            let row = prepared.remove(index);
+            prepared.insert(0, row);
+        }
+    }
     Ok(prepared)
 }
 
@@ -18930,29 +19475,28 @@ fn parse_okx_wss_book_ticker_runtime_raw(
         .transpose()?
         .unwrap_or(ingested_at);
     let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
+    let bid_price = required_json_value_string(&fields, "bidPx", "okx wss tickers")?;
+    let ask_price = required_json_value_string(&fields, "askPx", "okx wss tickers")?;
+    let bid_qty = required_json_value_string(&fields, "bidSz", "okx wss tickers")?;
+    let ask_qty = required_json_value_string(&fields, "askSz", "okx wss tickers")?;
+    if [
+        bid_price.as_str(),
+        ask_price.as_str(),
+        bid_qty.as_str(),
+        ask_qty.as_str(),
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
+    {
+        return Ok(None);
+    }
     Ok(Some(PublicWssTickerRuntimeRaw {
         symbol,
         venue_symbol,
-        best_bid: Price::from_str(&required_json_value_string(
-            &fields,
-            "bidPx",
-            "okx wss tickers",
-        )?)?,
-        best_ask: Price::from_str(&required_json_value_string(
-            &fields,
-            "askPx",
-            "okx wss tickers",
-        )?)?,
-        bid_size: Quantity::from_str(&required_json_value_string(
-            &fields,
-            "bidSz",
-            "okx wss tickers",
-        )?)?,
-        ask_size: Quantity::from_str(&required_json_value_string(
-            &fields,
-            "askSz",
-            "okx wss tickers",
-        )?)?,
+        best_bid: Price::from_str(&bid_price)?,
+        best_ask: Price::from_str(&ask_price)?,
+        bid_size: Quantity::from_str(&bid_qty)?,
+        ask_size: Quantity::from_str(&ask_qty)?,
         observed_at,
     }))
 }
@@ -18985,29 +19529,44 @@ fn parse_bitget_wss_book_ticker_runtime_raw(
         .transpose()?
         .unwrap_or(ingested_at);
     let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
+    let bid_price = required_first_json_value_string(
+        &fields,
+        &["bidPr", "bidPx", "bidPrice"],
+        "bitget wss ticker",
+    )?;
+    let ask_price = required_first_json_value_string(
+        &fields,
+        &["askPr", "askPx", "askPrice"],
+        "bitget wss ticker",
+    )?;
+    let bid_qty = required_first_bitget_ticker_value_string(
+        &fields,
+        &["bidSz", "bidSize", "bidQty"],
+        "bitget wss ticker",
+    )?;
+    let ask_qty = required_first_bitget_ticker_value_string(
+        &fields,
+        &["askSz", "askSize", "askQty"],
+        "bitget wss ticker",
+    )?;
+    if [
+        bid_price.as_str(),
+        ask_price.as_str(),
+        bid_qty.as_str(),
+        ask_qty.as_str(),
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
+    {
+        return Ok(None);
+    }
     Ok(Some(PublicWssTickerRuntimeRaw {
         symbol,
         venue_symbol,
-        best_bid: Price::from_str(&required_first_json_value_string(
-            &fields,
-            &["bidPr", "bidPx", "bidPrice"],
-            "bitget wss ticker",
-        )?)?,
-        best_ask: Price::from_str(&required_first_json_value_string(
-            &fields,
-            &["askPr", "askPx", "askPrice"],
-            "bitget wss ticker",
-        )?)?,
-        bid_size: Quantity::from_str(&required_first_bitget_ticker_value_string(
-            &fields,
-            &["bidSz", "bidSize", "bidQty"],
-            "bitget wss ticker",
-        )?)?,
-        ask_size: Quantity::from_str(&required_first_bitget_ticker_value_string(
-            &fields,
-            &["askSz", "askSize", "askQty"],
-            "bitget wss ticker",
-        )?)?,
+        best_bid: Price::from_str(&bid_price)?,
+        best_ask: Price::from_str(&ask_price)?,
+        bid_size: Quantity::from_str(&bid_qty)?,
+        ask_size: Quantity::from_str(&ask_qty)?,
         observed_at,
     }))
 }
@@ -21205,6 +21764,20 @@ fn funding_arb_pair_row(
         ));
     }
 
+    if let Some(reason) = funding_arb_top_of_book_rejection(venue_a, venue_b) {
+        return Ok(base_row(
+            false,
+            Some(reason),
+            "invalid_perp_top_of_book".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
     if let Some(reason) = funding_arb_mark_index_rejection(venue_a, venue_b)? {
         return Ok(base_row(
             false,
@@ -21353,6 +21926,53 @@ fn funding_arb_missing_market_fields(
         }
     }
     missing
+}
+
+fn funding_arb_top_of_book_rejection(
+    venue_a: &FundingArbVenueMarket,
+    venue_b: &FundingArbVenueMarket,
+) -> Option<String> {
+    for (field, value) in [
+        (
+            "venue_a.perp_bid",
+            venue_a.perp_bid.as_deref().unwrap_or_default(),
+        ),
+        (
+            "venue_a.perp_ask",
+            venue_a.perp_ask.as_deref().unwrap_or_default(),
+        ),
+        (
+            "venue_a.perp_bid_qty",
+            venue_a.perp_bid_qty.as_deref().unwrap_or_default(),
+        ),
+        (
+            "venue_a.perp_ask_qty",
+            venue_a.perp_ask_qty.as_deref().unwrap_or_default(),
+        ),
+        (
+            "venue_b.perp_bid",
+            venue_b.perp_bid.as_deref().unwrap_or_default(),
+        ),
+        (
+            "venue_b.perp_ask",
+            venue_b.perp_ask.as_deref().unwrap_or_default(),
+        ),
+        (
+            "venue_b.perp_bid_qty",
+            venue_b.perp_bid_qty.as_deref().unwrap_or_default(),
+        ),
+        (
+            "venue_b.perp_ask_qty",
+            venue_b.perp_ask_qty.as_deref().unwrap_or_default(),
+        ),
+    ] {
+        match MonitorDecimal::parse(field, value) {
+            Ok(decimal) if decimal.raw > 0 => {}
+            Ok(_) => return Some(format!("{field} must be greater than zero")),
+            Err(error) => return Some(format!("{field} is invalid: {error}")),
+        }
+    }
+    None
 }
 
 fn funding_arb_mark_index_rejection(
@@ -23747,7 +24367,11 @@ fn optional_json_value_string(
     if value.trim() == "null" {
         return Ok(None);
     }
-    json_value_to_string(value, field, source).map(Some)
+    let value = json_value_to_string(value, field, source)?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
 }
 
 fn required_json_usize_array(
@@ -26239,7 +26863,11 @@ fn json_value_to_optional_scalar_string(
     if value.starts_with('{') || value.starts_with('[') {
         return Ok(None);
     }
-    json_value_to_string(value, field, source).map(Some)
+    let value = json_value_to_string(value, field, source)?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
 }
 
 fn reconcile_funding_private_account_snapshot_json(
@@ -26517,11 +27145,16 @@ fn generic_private_account_entry_from_raw_statement(
             &fields,
             &[
                 "available_usd",
+                "totalAvailableBalance",
                 "availableBalance",
                 "available_balance",
                 "available",
                 "availableToWithdraw",
+                "crossedMaxAvailable",
+                "isolatedMaxAvailable",
                 "maxWithdrawAmount",
+                "maxTransferOut",
+                "unionAvailable",
                 "free",
             ],
         )?;
@@ -26529,6 +27162,9 @@ fn generic_private_account_entry_from_raw_statement(
             &fields,
             &[
                 "margin_balance_usd",
+                "totalMarginBalance",
+                "totalWalletBalance",
+                "totalEquity",
                 "marginBalance",
                 "crossWalletBalance",
                 "walletBalance",
@@ -26536,14 +27172,19 @@ fn generic_private_account_entry_from_raw_statement(
                 "equity",
                 "accountEquity",
                 "totalEq",
+                "usdtEquity",
+                "usdValue",
             ],
         )?;
         let maintenance_margin_usd = first_json_scalar_string(
             &fields,
             &[
                 "maintenance_margin_usd",
+                "totalMaintenanceMargin",
                 "maintMargin",
                 "maintenanceMargin",
+                "totalPositionMM",
+                "unionMm",
                 "mmr",
             ],
         )?;
@@ -26553,8 +27194,14 @@ fn generic_private_account_entry_from_raw_statement(
                 "margin_buffer_usd",
                 "available_margin_usd",
                 "availableMargin",
+                "totalAvailableBalance",
                 "availableBalance",
                 "available",
+                "crossedMaxAvailable",
+                "isolatedMaxAvailable",
+                "maxWithdrawAmount",
+                "maxTransferOut",
+                "unionAvailable",
             ],
         )?;
         if available_usd.is_some()
@@ -27751,7 +28398,7 @@ fn run_funding_arb_resident_live_inner(
                             &cycle_dir,
                             &error.to_string(),
                         )?;
-                        if options.execute_live {
+                        if options.execute_live && !resident_entry_cycle_error_can_retry(&error) {
                             halt_reason = Some(format!(
                                 "funding arb resident cycle failed; resident live stopped: {error}"
                             ));
@@ -27825,7 +28472,7 @@ fn run_funding_arb_resident_cycle(
     let pair_id = row.pair_id.clone();
     let symbol = row.symbol.clone();
     let net_funding_bps = funding_arb_row_net_funding_bps(row);
-    let private = run_funding_arb_private_readonly_snapshot_once(
+    let private = match run_funding_arb_private_readonly_snapshot_once(
         FundingArbPrivateReadonlySnapshotOnceOptions {
             config_path: options.config_path.clone(),
             snapshot_path: snapshot_path.clone(),
@@ -27839,7 +28486,16 @@ fn run_funding_arb_resident_cycle(
             aster_signer: options.aster_signer.clone(),
             aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
         },
-    )?;
+    ) {
+        Ok(private) => private,
+        Err(error) if matches!(error, RuntimeError::LiveMarketData { .. }) => {
+            return Ok(FundingArbResidentCycleResult::NoCandidate {
+                reason: format!("private read-only snapshot unavailable: {error}"),
+                snapshot_path,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let canary =
         run_funding_arb_guarded_live_canary_once(FundingArbGuardedLiveCanaryOnceOptions {
             dry_run: FundingArbGuardedDryRunOnceOptions {
@@ -34754,11 +35410,16 @@ fn fetch_signed_aster_get_with_curl(
         "{base_url}{endpoint}?{}",
         signed.signed_query_for_transport()
     );
-    let config = format!(
-        "url = \"{}\"\nheader = \"{}\"\n",
-        curl_config_quote_runtime(&url)?,
-        curl_config_quote_runtime("Content-Type: application/x-www-form-urlencoded")?
-    );
+    let mut config = format!("url = \"{}\"\n", curl_config_quote_runtime(&url)?);
+    append_runtime_curl_header_config(
+        &mut config,
+        "Content-Type: application/x-www-form-urlencoded",
+    )?;
+    append_runtime_curl_header_config(&mut config, "Accept: application/json")?;
+    append_runtime_curl_header_config(
+        &mut config,
+        &format!("User-Agent: {ASTER_SIGNED_REST_USER_AGENT}"),
+    )?;
     let mut child = Command::new("curl")
         .arg("--silent")
         .arg("--show-error")
@@ -35136,6 +35797,14 @@ fn curl_config_quote_runtime(value: &str) -> RuntimeResult<String> {
         }
     }
     Ok(escaped)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_runtime_curl_header_config(config: &mut String, header: &str) -> RuntimeResult<()> {
+    config.push_str("header = \"");
+    config.push_str(&curl_config_quote_runtime(header)?);
+    config.push_str("\"\n");
+    Ok(())
 }
 
 #[cfg(feature = "live-exec")]
@@ -37340,15 +38009,7 @@ fn current_utc_timestamp_string() -> String {
 
 impl PublicTopOfBookQuoteSnapshot {
     fn from_quote(quote: &MarketQuote) -> Self {
-        Self::from_quote_with_symbol(
-            quote,
-            quote
-                .instrument_id
-                .as_str()
-                .split(':')
-                .nth(2)
-                .unwrap_or_else(|| quote.instrument_id.as_str()),
-        )
+        Self::from_quote_with_symbol(quote, public_top_of_book_snapshot_symbol(quote))
     }
 
     fn from_quote_with_symbol(quote: &MarketQuote, symbol: &str) -> Self {
@@ -37384,6 +38045,20 @@ impl PublicTopOfBookQuoteSnapshot {
             json_string(&self.symbol),
             json_string(&self.venue_id),
         )
+    }
+}
+
+fn public_top_of_book_snapshot_symbol(quote: &MarketQuote) -> &str {
+    let symbol = quote
+        .instrument_id
+        .as_str()
+        .split(':')
+        .nth(2)
+        .unwrap_or_else(|| quote.instrument_id.as_str());
+    if quote.venue_id.as_str() == "venue:OKX-SWAP" {
+        symbol.strip_suffix("-SWAP").unwrap_or(symbol)
+    } else {
+        symbol
     }
 }
 
@@ -45426,6 +46101,32 @@ mod tests {
     }
 
     #[test]
+    fn bybit_wss_scoped_rest_bootstrap_skips_non_usdt_rows() {
+        let rows = vec![
+            MonitorBookTickerRow {
+                symbol: "BTCUSDC".to_owned(),
+                bid_price: "100".to_owned(),
+                bid_qty: "1".to_owned(),
+                ask_price: "101".to_owned(),
+                ask_qty: "1".to_owned(),
+            },
+            MonitorBookTickerRow {
+                symbol: "BTCUSDT".to_owned(),
+                bid_price: "100".to_owned(),
+                bid_qty: "1".to_owned(),
+                ask_price: "101".to_owned(),
+                ask_qty: "1".to_owned(),
+            },
+        ];
+
+        let prepared =
+            prepare_bybit_wss_book_ticker_rest_rows(rows, "BTCUSDT", false).expect("prepared rows");
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].symbol, "BTCUSDT");
+    }
+
+    #[test]
     fn okx_and_bitget_wss_args_parse_market_and_messages() {
         let okx_args = vec![
             "--bind".to_owned(),
@@ -45487,6 +46188,14 @@ mod tests {
         assert_eq!(okx_parsed.symbol, OKX_BASIS_SYMBOL);
         assert_eq!(okx_parsed.venue_symbol, "BTC-USDT-SWAP");
         assert_eq!(okx_parsed.best_bid.to_string(), "101.00");
+        let okx_empty_quote_raw = r#"{"arg":{"channel":"tickers","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","bidPx":"","bidSz":"","askPx":"","askSz":"","ts":"1778630400000"}]}"#;
+        assert!(parse_okx_wss_book_ticker_runtime_raw(
+            okx_empty_quote_raw,
+            ingested_at,
+            OkxPublicWssMarket::Spot
+        )
+        .expect("okx empty quote raw")
+        .is_none());
 
         let bitget_raw = r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":"101.00","bidSz":"1.2","askPr":"101.10","askSz":"1.3","ts":"1778630400000"}]}"#;
         let bitget_parsed = parse_bitget_wss_book_ticker_runtime_raw(bitget_raw, ingested_at)
@@ -45503,11 +46212,24 @@ mod tests {
                 .expect("bitget array size update");
         assert_eq!(bitget_array_size_parsed.bid_size.to_string(), "1.2");
         assert_eq!(bitget_array_size_parsed.ask_size.to_string(), "1.3");
+        let bitget_empty_quote_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":"","bidSz":"","askPr":"","askSz":"","ts":"1778630400000"}]}"#;
+        assert!(
+            parse_bitget_wss_book_ticker_runtime_raw(bitget_empty_quote_raw, ingested_at)
+                .expect("bitget empty quote raw")
+                .is_none()
+        );
     }
 
     #[test]
     fn okx_and_bitget_wss_rest_bootstrap_prepare_all_usdt_rows() {
         let okx_rows = vec![
+            OkxTickerRow {
+                inst_id: "1INCH-USDT-SWAP".to_owned(),
+                bid_price: "10".to_owned(),
+                bid_qty: "3".to_owned(),
+                ask_price: "11".to_owned(),
+                ask_qty: "3".to_owned(),
+            },
             OkxTickerRow {
                 inst_id: "BTC-USDT-SWAP".to_owned(),
                 bid_price: "100".to_owned(),
@@ -45542,10 +46264,47 @@ mod tests {
                 .iter()
                 .map(|(symbol, _)| symbol.as_str())
                 .collect::<Vec<_>>(),
-            vec!["BTC-USDT", "ETH-USDT"]
+            vec!["BTC-USDT", "1INCH-USDT", "ETH-USDT"]
         );
+        let (okx_symbol, okx_row) = prepared_okx.first().expect("prepared okx row");
+        let okx_venue_id = VenueId::new(OkxPublicWssMarket::Swap.venue_id()).expect("venue id");
+        let okx_observed_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("observed at");
+        let okx_quote = okx_wss_rest_quote_from_row(
+            okx_row,
+            okx_symbol,
+            &okx_venue_id,
+            okx_public_wss_instrument_id(okx_symbol, OkxPublicWssMarket::Swap)
+                .expect("instrument id"),
+            okx_observed_at,
+        )
+        .expect("okx quote");
+        let mut okx_coordinator = RestWssMarketDataCoordinator::new(
+            okx_venue_id,
+            okx_public_wss_instrument_id(okx_symbol, OkxPublicWssMarket::Swap)
+                .expect("instrument id"),
+            okx_observed_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )
+        .expect("coordinator");
+        let okx_update = okx_coordinator
+            .apply(HybridMarketDataInput::RestSnapshot { quote: okx_quote })
+            .expect("rest update");
+        let mut okx_snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+            OkxPublicWssMarket::Swap.as_str(),
+            OKX_PUBLIC_WSS_URL,
+        );
+        okx_snapshot.record_update(&okx_update);
+        assert_eq!(okx_snapshot.rows[0].symbol, "BTC-USDT");
 
         let bitget_rows = vec![
+            MonitorBookTickerRow {
+                symbol: "1INCHUSDT".to_owned(),
+                bid_price: "10".to_owned(),
+                bid_qty: "3".to_owned(),
+                ask_price: "11".to_owned(),
+                ask_qty: "3".to_owned(),
+            },
             MonitorBookTickerRow {
                 symbol: "BTCUSDT".to_owned(),
                 bid_price: "100".to_owned(),
@@ -45580,7 +46339,7 @@ mod tests {
                 .iter()
                 .map(|row| row.symbol.as_str())
                 .collect::<Vec<_>>(),
-            vec!["BTCUSDT", "ETHUSDT"]
+            vec!["BTCUSDT", "1INCHUSDT", "ETHUSDT"]
         );
     }
 
@@ -46476,6 +47235,60 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_dashboard_filters_binance_usdm_available_only_assets() {
+        let (_updated_at, rows) = portfolio_balance_rows_from_raw_snapshot_json(
+            r#"{"status":"healthy","updated_at":"2026-05-19T00:00:04Z","statements":[{"account_id":"acct:binance","payload":{"totalWalletBalance":"101.00000000","availableBalance":"100.97980219","assets":[{"asset":"BFUSD","walletBalance":"0.00000000","crossWalletBalance":"0.00000000","marginBalance":"0.00000000","availableBalance":"100.88901146","maintMargin":"0.00000000","initialMargin":"0.00000000","positionInitialMargin":"0.00000000","openOrderInitialMargin":"0.00000000","crossUnPnl":"0.00000000"},{"asset":"LDUSDT","walletBalance":"0.00000000","crossWalletBalance":"0.00000000","marginBalance":"0.00000000","availableBalance":"89.28092600","maintMargin":"0.00000000","initialMargin":"0.00000000","positionInitialMargin":"0.00000000","openOrderInitialMargin":"0.00000000","crossUnPnl":"0.00000000"},{"asset":"USDT","walletBalance":"101.00000000","crossWalletBalance":"101.00000000","marginBalance":"101.00000000","availableBalance":"100.97980219","maintMargin":"0.00000000","initialMargin":"0.00000000","positionInitialMargin":"0.00000000","openOrderInitialMargin":"0.00000000","crossUnPnl":"0.00000000"}]},"venue_family":"binance"}]}"#,
+        )
+        .expect("binance raw balances");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].venue_family, "binance");
+        assert_eq!(rows[0].asset, "USDT");
+        assert_eq!(rows[0].available.as_deref(), Some("100.97980219"));
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row.asset.as_str(), "BFUSD" | "LD" | "LDUSDT")));
+    }
+
+    #[test]
+    fn portfolio_dashboard_uses_venue_specific_raw_balance_shapes() {
+        let (_updated_at, rows) = portfolio_balance_rows_from_raw_snapshot_json(
+            r#"{"status":"healthy","updated_at":"2026-05-19T00:00:04Z","statements":[
+                {"account_id":"acct:bybit","payload":{"retCode":0,"result":{"list":[{"accountType":"UNIFIED","totalEquity":"200","coin":[{"coin":"USDT","walletBalance":"200.15907924","availableToWithdraw":"","locked":"0","borrowAmount":"0","totalOrderIM":"0","totalPositionMM":"0","usdValue":"199.98"},{"coin":"USDC","walletBalance":"0.0067","locked":"0","borrowAmount":"0","totalOrderIM":"0","totalPositionMM":"0","usdValue":"0.0067"}]}]}},"venue_family":"bybit"},
+                {"account_id":"acct:bitget","payload":{"code":"00000","requestTime":1779207774633,"data":[{"marginCoin":"USDT","available":"100","crossedMaxAvailable":"100","locked":"0","accountEquity":"100","usdtEquity":"100","unrealizedPL":"0"}]},"venue_family":"bitget"},
+                {"account_id":"acct:okx","payload":{"code":"0","data":[{"totalEq":"100","uTime":"1779207774633","details":[{"ccy":"USDT","availBal":"99","cashBal":"100","frozenBal":"1","ordFrozen":"0","eq":"100","liab":"0","upl":"0"}]}]},"venue_family":"okx"},
+                {"account_id":"acct:aster","payload":[{"asset":"USDT","balance":"50","crossWalletBalance":"50","availableBalance":"45","maintMargin":"1","initialMargin":"4","openOrderInitialMargin":"0","crossUnPnl":"0","updateTime":1779207774633},{"asset":"BFUSD","balance":"0","crossWalletBalance":"0","availableBalance":"100","maintMargin":"0","initialMargin":"0","openOrderInitialMargin":"0","crossUnPnl":"0","updateTime":1779207774633}],"venue_family":"aster"},
+                {"account_id":"acct:hyperliquid","payload":{"marginSummary":{"accountValue":"80","totalRawUsd":"80"},"crossMaintenanceMarginUsed":"5","withdrawable":"70","assetPositions":[],"time":1779207774633},"venue_family":"hyperliquid"}
+            ]}"#,
+        )
+        .expect("venue-specific raw balances");
+
+        assert_eq!(rows.len(), 6);
+        assert!(rows
+            .iter()
+            .any(|row| row.venue_family == "bybit" && row.asset == "USDT"));
+        assert!(rows
+            .iter()
+            .any(|row| row.venue_family == "bybit" && row.asset == "USDC"));
+        assert!(rows
+            .iter()
+            .any(|row| row.venue_family == "bitget" && row.asset == "USDT"));
+        assert!(rows
+            .iter()
+            .any(|row| row.venue_family == "okx" && row.asset == "USDT"));
+        assert!(rows
+            .iter()
+            .any(|row| row.venue_family == "aster" && row.asset == "USDT"));
+        assert!(rows
+            .iter()
+            .any(|row| row.venue_family == "hyperliquid" && row.asset == "USDC"));
+        assert!(!rows.iter().any(|row| row.asset == "USD"));
+        assert!(!rows
+            .iter()
+            .any(|row| row.venue_family == "aster" && row.asset == "BFUSD"));
+    }
+
+    #[test]
     fn portfolio_dashboard_treats_empty_resident_root_as_pending_not_source_error() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let options = PortfolioDashboardOptions {
@@ -46822,6 +47635,37 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("venue_b.perp_bid_qty")));
+    }
+
+    #[test]
+    fn funding_arb_monitor_rejects_zero_top_of_book_without_failing_snapshot() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"0","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00300000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
+        let bybit = funding_arb_test_venue_snapshot("bybit", bybit_status);
+
+        let snapshot = build_funding_arb_monitor_snapshot_from_sources(
+            vec![binance, bybit],
+            vec![],
+            &FundingArbMonitorOptions::default(),
+        )
+        .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.candidate_count, 0);
+        assert_eq!(snapshot.rows[0].source_status, "invalid_perp_top_of_book");
+        assert!(snapshot.rows[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("venue_b.perp_bid must be greater than zero")));
     }
 
     #[test]
@@ -47174,6 +48018,25 @@ mod tests {
         let report_json = read_utf8(&output_dir.join("funding_arb_guarded_dry_run_report.json"))
             .expect("report json");
         assert!(report_json.contains("\"private_accounts\""));
+    }
+
+    #[test]
+    fn funding_private_account_raw_snapshot_treats_empty_optional_amounts_as_missing() {
+        let spec = CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("spec");
+        let summary = reconcile_funding_private_account_raw_snapshot_json(
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"asset":"USDT","availableBalance":"25","walletBalance":"25","maintMargin":"1"}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"accountType":"UNIFIED","totalAvailableBalance":"","totalEquity":"50","totalMaintenanceMargin":"","coin":[{"coin":"USDT","availableToWithdraw":"","walletBalance":"50","totalPositionMM":"1"}]}]}}}]}"#,
+        )
+        .expect("summary");
+
+        assert_eq!(summary.status, "Missing");
+        assert_eq!(summary.checked_account_count, 2);
+        assert_eq!(summary.min_available_usd.as_deref(), Some("25"));
+        assert!(summary
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason
+                .contains("missing available balance: acct:bybit-funding-arb-readonly")));
     }
 
     #[test]
@@ -48421,6 +49284,31 @@ mod tests {
                 && pair[1] == "http://127.0.0.1:8814"));
         assert!(resident_args.contains(&"--execute-live".to_owned()));
         assert!(resident_args.contains(&"--i-understand-basis-live-orders".to_owned()));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn resident_entry_cycle_retries_readonly_market_data_errors() {
+        let market_data = RuntimeError::LiveMarketData {
+            message: "Public WSS monitor status is fail_closed, not streaming".to_owned(),
+        };
+        let public_rest = RuntimeError::LiveMarketData {
+            message:
+                "public market data GET failed after 3 attempts: curl returned exit status: 28"
+                    .to_owned(),
+        };
+        let private_http = RuntimeError::LiveMarketData {
+            message: "curl failed before a reliable Bitget private HTTP response was available"
+                .to_owned(),
+        };
+        let unsafe_config = RuntimeError::UnsafeConfig {
+            message: "invalid live signing config".to_owned(),
+        };
+
+        assert!(resident_entry_cycle_error_can_retry(&market_data));
+        assert!(resident_entry_cycle_error_can_retry(&public_rest));
+        assert!(!resident_entry_cycle_error_can_retry(&private_http));
+        assert!(!resident_entry_cycle_error_can_retry(&unsafe_config));
     }
 
     #[cfg(feature = "live-exec")]
