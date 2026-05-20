@@ -114,7 +114,7 @@
 
     .summary-grid {
       display: grid;
-      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      grid-template-columns: repeat(7, minmax(130px, 1fr));
       gap: 10px;
       margin-bottom: 14px;
     }
@@ -337,7 +337,7 @@
 
     table {
       width: 100%;
-      min-width: 1500px;
+      min-width: 1780px;
       border-collapse: collapse;
     }
 
@@ -373,6 +373,15 @@
       background: rgba(216, 182, 95, 0.08);
     }
 
+    td.gate-cell,
+    td.reason-cell {
+      min-width: 280px;
+      max-width: 420px;
+      white-space: normal;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
     .badge {
       display: inline-flex;
       align-items: center;
@@ -392,6 +401,33 @@
     .direction-badge {
       color: var(--blue);
       border-color: rgba(118, 167, 216, 0.45);
+    }
+
+    .blocked-badge {
+      color: var(--red);
+      border-color: rgba(225, 109, 109, 0.55);
+      background: rgba(225, 109, 109, 0.08);
+    }
+
+    .pending-badge {
+      color: var(--accent);
+      border-color: rgba(216, 182, 95, 0.5);
+      background: rgba(216, 182, 95, 0.08);
+    }
+
+    .attempted-badge {
+      color: var(--green);
+      border-color: rgba(93, 196, 138, 0.48);
+      background: rgba(93, 196, 138, 0.08);
+    }
+
+    .gate-list {
+      display: grid;
+      gap: 4px;
+    }
+
+    .gate-list span {
+      color: var(--muted);
     }
 
     .api-wrap {
@@ -485,6 +521,7 @@
       <article class="metric"><span>报价来源</span><strong id="metric-sources">0</strong></article>
       <article class="metric"><span>来源错误</span><strong id="metric-source-errors">0</strong></article>
       <article class="metric"><span>最小净 Funding</span><strong id="metric-min-net">0</strong></article>
+      <article class="metric"><span>下单阻断</span><strong id="metric-gate-blocked">0</strong></article>
       <article class="metric"><span>展示行数</span><strong id="metric-visible">0</strong></article>
     </section>
 
@@ -499,6 +536,7 @@
           <div class="direction-line"><span>净收益</span><strong id="top-net" class="direction-value positive">-</strong></div>
           <div class="direction-line"><span>预期资金费</span><strong id="top-expected" class="direction-value positive">-</strong></div>
           <div class="direction-line"><span>下次结算</span><strong id="top-next" class="direction-value">-</strong></div>
+          <div class="direction-line"><span>下单门禁</span><strong id="top-gate" class="direction-value">-</strong></div>
         </div>
       </article>
 
@@ -580,10 +618,11 @@
               <th>下次结算</th>
               <th>状态</th>
               <th>原因</th>
+              <th>下单门禁</th>
             </tr>
           </thead>
           <tbody id="funding-rows">
-            <tr><td class="empty-row" colspan="18">加载中</td></tr>
+            <tr><td class="empty-row" colspan="19">加载中</td></tr>
           </tbody>
         </table>
       </div>
@@ -595,6 +634,7 @@
         <div class="endpoint-grid">
           <button type="button" data-endpoint="/api/funding-arb/status">状态接口</button>
           <button type="button" data-endpoint="/api/funding-arb/opportunities">机会接口</button>
+          <button type="button" data-endpoint="/api/funding-arb/execution-status">下单门禁接口</button>
         </div>
       </div>
       <pre id="api-preview">{}</pre>
@@ -604,7 +644,8 @@
   <script>
     const statusUrl = "/api/funding-arb/status";
     const opportunitiesUrl = "/api/funding-arb/opportunities";
-    const state = { snapshot: null, timer: null };
+    const executionStatusUrl = "/api/funding-arb/execution-status";
+    const state = { snapshot: null, execution: null, timer: null };
     const $ = (id) => document.getElementById(id);
 
     function escapeHtml(value) {
@@ -656,6 +697,41 @@
       const longVenue = row.long_venue_family ? venueLabel(row.long_venue_family) : "-";
       const shortVenue = row.short_venue_family ? venueLabel(row.short_venue_family) : "-";
       return `${longVenue} long / ${shortVenue} short`;
+    }
+
+    function executionRowsByPair(execution) {
+      return new Map((execution?.rows || []).map((row) => [row.pair_id, row]));
+    }
+
+    function gateStatus(row, executionByPair) {
+      if (!row.is_candidate) {
+        return { label: "非候选", className: "badge", reasons: [row.reason || row.source_status || "未满足公开候选条件"] };
+      }
+      const execution = executionByPair.get(row.pair_id);
+      if (!execution) {
+        return {
+          label: "未校验",
+          className: "badge pending-badge",
+          reasons: ["尚未看到该候选的下单校验报告；observer 只负责发现机会，真实下单需要 auto-once 或 resident live runner 继续通过门禁。"]
+        };
+      }
+      if (execution.dispatch_attempted) {
+        return { label: "已触发", className: "badge attempted-badge", reasons: ["已进入下单链路。"] };
+      }
+      const reasons = execution.no_dispatch_reasons?.length
+        ? execution.no_dispatch_reasons
+        : ["校验报告未给出阻断明细；查看下单门禁接口或输出目录。"];
+      return {
+        label: execution.dispatch_status === "pending_validation" ? "待校验" : "阻断",
+        className: execution.dispatch_status === "pending_validation" ? "badge pending-badge" : "badge blocked-badge",
+        reasons
+      };
+    }
+
+    function gateHtml(status) {
+      return `<div class="gate-list"><span class="${status.className}">${escapeHtml(status.label)}</span>${status.reasons.slice(0, 3).map((reason) => (
+        `<span>${escapeHtml(reason)}</span>`
+      )).join("")}</div>`;
     }
 
     function nextFunding(row) {
@@ -737,7 +813,7 @@
         || null;
     }
 
-    function renderTopOpportunity(rows) {
+    function renderTopOpportunity(rows, executionByPair) {
       const row = bestCandidate(rows);
       if (!row) {
         $("top-pair").textContent = "-";
@@ -745,6 +821,7 @@
         $("top-net").textContent = "-";
         $("top-expected").textContent = "-";
         $("top-next").textContent = "-";
+        $("top-gate").textContent = "-";
         $("top-status").textContent = "无候选";
         $("top-venue-a").textContent = "-";
         $("top-venue-a-funding").textContent = "Funding -";
@@ -761,6 +838,8 @@
       $("top-net").textContent = bps(row.net_funding_bps);
       $("top-expected").textContent = usd(row.expected_funding_usd);
       $("top-next").textContent = nextFunding(row);
+      const gate = gateStatus(row, executionByPair);
+      $("top-gate").textContent = `${gate.label}: ${gate.reasons[0] || "-"}`;
       $("top-status").textContent = row.source_status || "complete";
       $("top-venue-a").textContent = venueLabel(row.venue_a_family);
       $("top-venue-a-funding").textContent = `Funding ${rate(row.venue_a_funding_rate)} / ${row.venue_a_funding_interval_hours || "-"}h`;
@@ -772,16 +851,17 @@
       $("top-venue-b-book").textContent = `Bid ${row.venue_b_bid || "-"} / Ask ${row.venue_b_ask || "-"}`;
     }
 
-    function renderRows(rows) {
+    function renderRows(rows, executionByPair) {
       const body = $("funding-rows");
       const view = filteredRows(rows);
       $("metric-visible").textContent = view.length;
       if (!view.length) {
-        body.innerHTML = `<tr><td class="empty-row" colspan="18">无数据</td></tr>`;
+        body.innerHTML = `<tr><td class="empty-row" colspan="19">无数据</td></tr>`;
         return;
       }
       body.innerHTML = view.map((row) => {
         const candidate = row.is_candidate ? `<span class="badge candidate-badge">候选</span>` : `<span class="badge">观察</span>`;
+        const gate = gateStatus(row, executionByPair);
         return `<tr>
           <td class="${row.is_candidate ? "candidate" : ""}">${escapeHtml(pairLabel(row))}</td>
           <td><span class="badge direction-badge">${escapeHtml(directionLabel(row))}</span></td>
@@ -800,13 +880,15 @@
           <td class="${signedClass(row.expected_funding_usd)}">${escapeHtml(usd(row.expected_funding_usd))}</td>
           <td>${escapeHtml(nextFunding(row))}</td>
           <td>${candidate}</td>
-          <td>${escapeHtml(row.reason || row.source_status)}</td>
+          <td class="reason-cell">${escapeHtml(row.reason || row.source_status)}</td>
+          <td class="gate-cell">${gateHtml(gate)}</td>
         </tr>`;
       }).join("");
     }
 
-    function render(snapshot) {
+    function render(snapshot, execution) {
       const rows = snapshot.rows || [];
+      const executionByPair = executionRowsByPair(execution);
       $("runtime-status").textContent = snapshot.status || "未知";
       $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : snapshot.last_error ? "error" : ""}`;
       $("updated-at").textContent = snapshot.updated_at || "尚未更新";
@@ -815,20 +897,32 @@
       $("metric-sources").textContent = snapshot.source_count ?? 0;
       $("metric-source-errors").textContent = snapshot.source_error_count ?? 0;
       $("metric-min-net").textContent = bps(snapshot.min_net_funding_bps);
-      $("api-state").textContent = snapshot.last_error ? "上游错误" : "正常";
-      $("api-state").title = snapshot.last_error || "正常";
-      $("api-preview").textContent = JSON.stringify(snapshot, null, 2);
+      $("metric-gate-blocked").textContent = rows.filter((row) => {
+        const gate = gateStatus(row, executionByPair);
+        return row.is_candidate && gate.label !== "已触发";
+      }).length;
+      $("api-state").textContent = snapshot.last_error ? "上游错误" : execution?.status === "degraded" ? "门禁报告异常" : "正常";
+      $("api-state").title = snapshot.last_error || execution?.last_error || "正常";
+      $("api-preview").textContent = JSON.stringify({ snapshot, execution }, null, 2);
       updateVenueFilter(rows);
-      renderTopOpportunity(rows);
-      renderRows(rows);
+      renderTopOpportunity(rows, executionByPair);
+      renderRows(rows, executionByPair);
     }
 
     async function refreshStatus() {
       $("api-state").textContent = "加载中";
       try {
-        const snapshot = await requestJson(statusUrl);
+        const [snapshot, execution] = await Promise.all([
+          requestJson(statusUrl),
+          requestJson(executionStatusUrl).catch((error) => ({
+            status: "unavailable",
+            last_error: error.message,
+            rows: []
+          }))
+        ]);
         state.snapshot = snapshot;
-        render(snapshot);
+        state.execution = execution;
+        render(snapshot, execution);
       } catch (error) {
         $("runtime-status").textContent = "错误";
         $("runtime-status").className = "pill error";
@@ -856,10 +950,10 @@
 
     ["symbol-filter", "venue-filter", "only-candidates", "only-complete", "sort-mode"].forEach((id) => {
       $(id).addEventListener("input", () => {
-        if (state.snapshot) renderRows(state.snapshot.rows || []);
+        if (state.snapshot) renderRows(state.snapshot.rows || [], executionRowsByPair(state.execution));
       });
       $(id).addEventListener("change", () => {
-        if (state.snapshot) renderRows(state.snapshot.rows || []);
+        if (state.snapshot) renderRows(state.snapshot.rows || [], executionRowsByPair(state.execution));
       });
     });
     $("refresh-button").addEventListener("click", refreshStatus);

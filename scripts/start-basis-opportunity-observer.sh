@@ -1894,6 +1894,8 @@ start_funding_arb_monitor() {
     --max-entry-price-divergence-bps "${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}" \
     --min-net-funding-bps "${MIN_NET_BPS}" \
     --out "${out_dir}" \
+    --execution-reports "${EXECUTION_REPORTS_JSONL}" \
+    --resident-events "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_events.jsonl" \
     "${source_args[@]}" \
     >> "${log_file}" 2>&1 &
   pid="$!"
