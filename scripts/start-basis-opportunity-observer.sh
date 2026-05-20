@@ -47,6 +47,13 @@ usage() {
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00 # spot-perp-basis 总名义本金上限，单位 USDT。
+  BASIS_OBSERVER_PERP_TARGET_LEVERAGE=1 # 所有永续交易所默认目标杠杆；实盘非 reduce-only 下单前会先设置该杠杆。
+  BASIS_OBSERVER_BINANCE_USDM_LEVERAGE=1 # 可选覆盖 Binance USD-M 永续目标杠杆。
+  BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE=1 # 可选覆盖 Bybit linear 永续目标杠杆。
+  BASIS_OBSERVER_OKX_SWAP_LEVERAGE=1 # 可选覆盖 OKX swap 永续目标杠杆。
+  BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE=1 # 可选覆盖 Bitget USDT-FUTURES 目标杠杆。
+  BASIS_OBSERVER_ASTER_PERP_LEVERAGE=1 # 可选覆盖 Aster USDT perp 目标杠杆。
+  BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE=1 # 可选覆盖 Hyperliquid perp 目标杠杆。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES= # spot-perp-basis 最大循环次数；留空表示长期运行。
   BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻运行。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
@@ -741,7 +748,7 @@ is_validation_process_name() {
 
 is_core_process_name() {
   case "$1" in
-    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-binance-*|target-wss-bybit-*|target-wss-okx-*|target-wss-bitget-*) return 0 ;;
+    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -801,12 +808,98 @@ kill_remaining_started_processes() {
   done < "${PID_FILE}"
 }
 
+refresh_funding_arb_summary_position_counts() {
+  local summary_path="$1"
+  local positions_path
+  local counts_json
+  local tmp
+
+  [[ "${summary_path}" == */funding_arb_resident_live_summary.json ]] || return 0
+  positions_path="${summary_path%/funding_arb_resident_live_summary.json}/funding_arb_resident_positions.jsonl"
+  [[ -s "${positions_path}" && -s "${summary_path}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  counts_json="$(
+    jq -s -c '
+      (
+      reduce .[] as $event ({};
+        ($event.position_id // "") as $position_id
+        | if $position_id == "" then .
+          elif ($event.event_type // "") == "position_opened" then .[$position_id] = "open"
+          elif ($event.event_type // "") == "position_unknown" then .[$position_id] = "unknown"
+          elif ($event.event_type // "") == "position_closed" then .[$position_id] = "closed"
+          else .
+          end
+      )
+      ) as $positions
+      | {
+          open_position_count: ([$positions[] | select(. == "open")] | length),
+          closed_position_count: ([$positions[] | select(. == "closed")] | length),
+          unknown_position_count: ([$positions[] | select(. == "unknown")] | length),
+          live_entry_count: ([$positions[] | select(. != "unknown")] | length)
+        }
+    ' "${positions_path}"
+  )" || return 0
+
+  tmp="${summary_path}.tmp.$$"
+  jq --argjson counts "${counts_json}" '
+    .open_position_count = $counts.open_position_count
+    | .closed_position_count = $counts.closed_position_count
+    | .unknown_position_count = $counts.unknown_position_count
+    | .live_entry_count = $counts.live_entry_count
+  ' "${summary_path}" > "${tmp}" && mv "${tmp}" "${summary_path}"
+}
+
+mark_running_resident_artifacts_stopped() {
+  local state_path="$1"
+  local summary_path="$2"
+  local label="$3"
+  local reason="stopped by start-basis-opportunity-observer.sh"
+  local updated_at
+  local cycles
+  local tmp
+
+  [[ -s "${state_path}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  if ! jq -e '(.phase // "") == "running"' "${state_path}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  cycles="$(jq -r '(.cycles // 0) | tonumber' "${state_path}" 2>/dev/null || printf '0')"
+  tmp="${state_path}.tmp.$$"
+  jq --arg reason "${reason}" --arg updated_at "${updated_at}" \
+    '.phase = "stopped" | .halt_reason = $reason | .updated_at = $updated_at' \
+    "${state_path}" > "${tmp}" && mv "${tmp}" "${state_path}"
+
+  if [[ -s "${summary_path}" ]]; then
+    tmp="${summary_path}.tmp.$$"
+    jq --arg reason "${reason}" --argjson cycles "${cycles}" \
+      '.phase = "stopped" | .cycles = $cycles | .halt_reason = $reason' \
+      "${summary_path}" > "${tmp}" && mv "${tmp}" "${summary_path}"
+    refresh_funding_arb_summary_position_counts "${summary_path}"
+  fi
+  echo "resident_state_marked_stopped label=${label} state=${state_path}"
+}
+
+mark_resident_artifacts_stopped() {
+  mark_running_resident_artifacts_stopped \
+    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_state.json" \
+    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_summary.json" \
+    "spot-perp-basis"
+  mark_running_resident_artifacts_stopped \
+    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_state.json" \
+    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_summary.json" \
+    "cross-exchange-funding-arb"
+}
+
 graceful_stop_started_processes() {
   stop_core_processes
   if ! wait_for_validation_processes; then
     echo "validation drain timed out after ${STOP_DRAIN_SECS:-15}s; terminating remaining validation process(es)."
   fi
   kill_remaining_started_processes
+  mark_resident_artifacts_stopped
 }
 
 supervise_started_processes() {
@@ -827,7 +920,7 @@ supervise_started_processes() {
     failed=0
     while IFS=$'\t' read -r pid name log_file; do
       case "${name}" in
-        *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-binance-*|target-wss-bybit-*|target-wss-okx-*|target-wss-bitget-*)
+        *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-*)
           if ! is_alive "${pid}"; then
             echo "error: supervised process exited: ${name} pid=${pid}" >&2
             if [[ -n "${log_file}" && -f "${log_file}" ]]; then
@@ -1559,6 +1652,19 @@ run_recorder() {
 
 apply_simplified_wallet_env_aliases
 
+apply_default_perp_leverage_env() {
+  set_default_env BASIS_OBSERVER_PERP_TARGET_LEVERAGE "1"
+  set_default_env ARB_RUNTIME_PERP_TARGET_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_BINANCE_USDM_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_OKX_SWAP_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_ASTER_PERP_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+}
+
+apply_default_perp_leverage_env
+
 if [[ "${1:-}" == "--recorder" ]]; then
   RUN_ROOT="${BASIS_OBSERVER_ROOT:-${REPO_ROOT}/target/arb-opportunity-observer}"
   LOG_DIR="${RUN_ROOT}/logs"
@@ -1694,8 +1800,12 @@ STATE_DIR="${RUN_ROOT}/state"
 SNAPSHOT_DIR="${RUN_ROOT}/snapshots"
 OPPORTUNITY_DIR="${RUN_ROOT}/opportunities"
 EXECUTE_LIVE="${CLI_EXECUTE_LIVE:-${BASIS_OBSERVER_EXECUTE_LIVE:-0}}"
+LIVE_PAUSE_FILE="${BASIS_OBSERVER_LIVE_PAUSE_FILE:-${RUN_ROOT}/LIVE_TRADING_PAUSED}"
 LIVE_ACK="${BASIS_OBSERVER_LIVE_ACK:-0}"
 if [[ "${EXECUTE_LIVE}" == "1" ]]; then
+  if [[ -e "${LIVE_PAUSE_FILE}" && "${BASIS_OBSERVER_IGNORE_LIVE_PAUSE:-0}" != "1" ]]; then
+    die "live trading is paused by ${LIVE_PAUSE_FILE}; remove the file only after exchange-side risk is flat"
+  fi
   [[ "${LIVE_ACK}" == "1" ]] || die "正式实盘需要设置 BASIS_OBSERVER_LIVE_ACK=1，或改用测试盘 paper"
   EXECUTION_MODE="live"
   MUTABLE_EXECUTION_STARTED_JSON="true"

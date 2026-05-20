@@ -30,6 +30,12 @@ usage() {
   ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED=1 # 是否把启动脚本自身输出写入 live-prereq/logs/arb-runtime-live-precheck.log。
   ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120 # 等待 WSS monitor 就绪的最长秒数。
   ARB_RUNTIME_LIVE_BUILD=1 # 启动前是否构建 arb-runtime 和 arb-wallet-signer。
+  ARB_RUNTIME_LIVE_CONFIG=templates/personal_guarded_live.preflight.yaml # arb-runtime live 使用的风控和执行配置。
+  ARB_RUNTIME_LIVE_INTERVAL_SECS=5 # observer 公开 monitor 轮询间隔秒数。
+  ARB_RUNTIME_LIVE_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps。
+  ARB_RUNTIME_LIVE_AUTO_ONCE_COOLDOWN_SECS=60 # 同一候选 auto-once 验证冷却秒数。
+  ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE=1 # 是否运行候选 auto-once 验证。
+  ARB_RUNTIME_LIVE_DERISK_ONLY=0 # 事故处理模式；1 表示只启动 funding arb resident 一轮恢复/减仓，不启动 spot-perp 实盘 resident。
   ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=all # Binance/Bybit/OKX/Bitget 全市场 WSS 覆盖范围；all 表示全部 USDT，target 表示只订阅 resident 实盘目标 symbol，custom 表示使用下面各交易所自定义值。
   ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=1 # 是否额外启动实盘 guard 专用 target WSS；启动不阻塞，真实下单前仍强制校验 Fresh quote。
   ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance WSS monitor 订阅 symbol。
@@ -43,6 +49,13 @@ usage() {
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00 # spot-perp-basis 总名义本金上限，单位 USDT。
+  BASIS_OBSERVER_PERP_TARGET_LEVERAGE=1 # 所有永续交易所默认目标杠杆；实盘非 reduce-only 下单前会先设置该杠杆。
+  BASIS_OBSERVER_BINANCE_USDM_LEVERAGE=1 # 可选覆盖 Binance USD-M 永续目标杠杆。
+  BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE=1 # 可选覆盖 Bybit linear 永续目标杠杆。
+  BASIS_OBSERVER_OKX_SWAP_LEVERAGE=1 # 可选覆盖 OKX swap 永续目标杠杆。
+  BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE=1 # 可选覆盖 Bitget USDT-FUTURES 目标杠杆。
+  BASIS_OBSERVER_ASTER_PERP_LEVERAGE=1 # 可选覆盖 Aster USDT perp 目标杠杆。
+  BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE=1 # 可选覆盖 Hyperliquid perp 目标杠杆。
   BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻运行。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
@@ -173,12 +186,26 @@ apply_simplified_wallet_env_aliases() {
 
 apply_simplified_wallet_env_aliases
 
+apply_default_perp_leverage_env() {
+  set_default_env BASIS_OBSERVER_PERP_TARGET_LEVERAGE "1"
+  set_default_env ARB_RUNTIME_PERP_TARGET_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_BINANCE_USDM_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_OKX_SWAP_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_ASTER_PERP_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  set_default_env BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE "${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+}
+
+apply_default_perp_leverage_env
+
 require_command cargo
 require_command curl
 require_command jq
 
 RUN_ROOT="${ARB_RUNTIME_LIVE_ROOT:-${REPO_ROOT}/target/arb-runtime/live}"
 PREREQ_ROOT="${ARB_RUNTIME_LIVE_PREREQ_ROOT:-${REPO_ROOT}/target/arb-runtime/live-prereq}"
+LIVE_PAUSE_FILE="${ARB_RUNTIME_LIVE_PAUSE_FILE:-${RUN_ROOT}/LIVE_TRADING_PAUSED}"
 LOG_DIR="${PREREQ_ROOT}/logs"
 STATE_DIR="${PREREQ_ROOT}/state"
 WSS_PID_FILE="${STATE_DIR}/wss-book-ticker.pids"
@@ -189,6 +216,31 @@ RUNTIME_BIN="${ARB_RUNTIME_LIVE_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
 WSS_READY_TIMEOUT_SECS="${ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS:-120}"
 WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_WSS_RECONNECT_DELAY_SECS:-2}"
 PORTFOLIO_BIND="${ARB_RUNTIME_LIVE_PORTFOLIO_BIND:-127.0.0.1:8805}"
+LIVE_CONFIG="${ARB_RUNTIME_LIVE_CONFIG:-${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}}"
+LIVE_INTERVAL_SECS="${ARB_RUNTIME_LIVE_INTERVAL_SECS:-${BASIS_OBSERVER_INTERVAL_SECS:-5}}"
+LIVE_MIN_NET_BPS="${ARB_RUNTIME_LIVE_MIN_NET_BPS:-${BASIS_OBSERVER_MIN_NET_BPS:-5}}"
+LIVE_AUTO_ONCE_COOLDOWN_SECS="${ARB_RUNTIME_LIVE_AUTO_ONCE_COOLDOWN_SECS:-${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}}"
+LIVE_VALIDATE_AUTO_ONCE="${ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE:-${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}}"
+LIVE_DERISK_ONLY="${ARB_RUNTIME_LIVE_DERISK_ONLY:-0}"
+LIVE_STRATEGIES="${BASIS_OBSERVER_STRATEGIES:-spot-perp-basis,cross-exchange-funding-arb}"
+LIVE_SPOT_PERP_BASIS_MODE="${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-resident}"
+LIVE_FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+LIVE_FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
+
+case "${LIVE_DERISK_ONLY}" in
+  0|1) ;;
+  *) die "ARB_RUNTIME_LIVE_DERISK_ONLY must be 0 or 1" ;;
+esac
+if [[ "${LIVE_DERISK_ONLY}" == "1" ]]; then
+  LIVE_STRATEGIES="cross-exchange-funding-arb"
+  LIVE_SPOT_PERP_BASIS_MODE="auto-once"
+  LIVE_FUNDING_ARB_MODE="resident"
+  LIVE_FUNDING_ARB_RESIDENT_MAX_CYCLES="1"
+fi
+
+if [[ -e "${LIVE_PAUSE_FILE}" && "${ARB_RUNTIME_LIVE_IGNORE_PAUSE:-0}" != "1" ]]; then
+  die "live trading is paused by ${LIVE_PAUSE_FILE}; remove the file only after exchange-side risk is flat"
+fi
 
 BINANCE_SPOT_WSS_BIND="${ARB_RUNTIME_LIVE_BINANCE_SPOT_WSS_BIND:-127.0.0.1:8786}"
 BINANCE_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_BINANCE_PERP_WSS_BIND:-127.0.0.1:8787}"
@@ -243,6 +295,10 @@ case "${TARGET_WSS_ENABLED}" in
   0|1) ;;
   *) die "ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED must be 0 or 1" ;;
 esac
+case "${LIVE_VALIDATE_AUTO_ONCE}" in
+  0|1) ;;
+  *) die "ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE must be 0 or 1" ;;
+esac
 ASTER_WSS_SYMBOL="${ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL:-ALL_USDT}"
 HYPERLIQUID_WSS_SYMBOL="${ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL:-ALL_USDT}"
 
@@ -255,7 +311,7 @@ if [[ "${ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED:-1}" != "0" ]]; then
     echo "repo_root=${REPO_ROOT}"
     echo "run_root=${RUN_ROOT}"
     echo "prereq_root=${PREREQ_ROOT}"
-    echo "detach=${DETACH} build=${BUILD} cex_wss_scope=${CEX_WSS_SCOPE} target_wss_enabled=${TARGET_WSS_ENABLED}"
+    echo "detach=${DETACH} build=${BUILD} config=${LIVE_CONFIG} interval_secs=${LIVE_INTERVAL_SECS} min_net_bps=${LIVE_MIN_NET_BPS} strategies=${LIVE_STRATEGIES} derisk_only=${LIVE_DERISK_ONLY} cex_wss_scope=${CEX_WSS_SCOPE} target_wss_enabled=${TARGET_WSS_ENABLED}"
   } >> "${PRECHECK_LOG}"
   exec > >(tee -a "${PRECHECK_LOG}") 2>&1
 fi
@@ -454,20 +510,32 @@ safe_resident_lock_artifacts() {
   \) -size +0c -print -quit 2>/dev/null || true)"
   [[ -n "${non_empty_private_artifact}" ]] && return 1
 
-  if [[ -s "${events_path}" ]] && grep -Eq \
-    '"dispatch_attempted":true|"entry_dispatch_attempted":true|"exit_dispatch_attempted":true|"private_confirmation_count":[1-9]|"submitted_receipt_count":[1-9]|"residual_risk":"|"residual_risk":\{' \
-    "${events_path}"; then
+  if [[ -s "${events_path}" ]] && jq -s -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+    any(.[]; (
+      (((.submitted_receipt_count // .submitted_receipts // 0) | as_count) > 0)
+      or (((.private_confirmation_count // .private_confirmations // 0) | as_count) > 0)
+      or ((.residual_risk // null) != null)
+      or ((.event_type // "") == "position_opened")
+      or ((.event_type // "") == "position_unknown")
+    ))
+  ' "${events_path}" >/dev/null 2>&1; then
     return 1
   fi
 
   if [[ -s "${summary_path}" ]] && jq -e '
-    ((.mutable_execution_started // false) == true)
-    or ((.dispatch_attempted // false) == true)
-    or ((.entry_dispatch_attempted // false) == true)
-    or ((.exit_dispatch_attempted // false) == true)
-    or ((.open_position_count // 0) != 0)
-    or ((.unknown_position_count // 0) != 0)
-    or ((.live_entry_count // 0) != 0)
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+    (((.open_position_count // 0) | as_count) != 0)
+    or (((.unknown_position_count // 0) | as_count) != 0)
+    or (((.live_entry_count // 0) | as_count) != 0)
   ' "${summary_path}" >/dev/null 2>&1; then
     return 1
   fi
@@ -481,18 +549,21 @@ cleanup_safe_stale_resident_lock() {
   local events_path="$3"
   local process_name="$4"
   local label="$5"
+  local archived_lock
 
   [[ -e "${lock_path}" ]] || return 0
   if resident_process_alive "${process_name}"; then
     echo "resident_lock_kept label=${label} reason=process_alive lock=${lock_path}"
     return 0
   fi
+  archived_lock="${lock_path}.stale.$(date -u +%Y%m%dT%H%M%SZ).$$"
   if safe_resident_lock_artifacts "${summary_path}" "${events_path}"; then
-    echo "resident_lock_cleanup label=${label} lock=${lock_path}"
-    rm -f "${lock_path}"
+    echo "resident_lock_archived label=${label} reason=stale_safe_state lock=${lock_path} archived=${archived_lock}"
+    mv "${lock_path}" "${archived_lock}"
     return 0
   fi
-  echo "resident_lock_kept label=${label} reason=summary_not_safe lock=${lock_path}"
+  echo "resident_lock_archived label=${label} reason=stale_state_requires_resident_recovery lock=${lock_path} archived=${archived_lock}"
+  mv "${lock_path}" "${archived_lock}"
 }
 
 cleanup_safe_stale_resident_locks() {
@@ -621,12 +692,22 @@ fi
 LIVE_ENV=(
   BASIS_OBSERVER_ROOT="${RUN_ROOT}"
   BASIS_OBSERVER_LIVE_ACK=1
-  BASIS_OBSERVER_FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+  BASIS_OBSERVER_STRATEGIES="${LIVE_STRATEGIES}"
+  BASIS_OBSERVER_SPOT_PERP_BASIS_MODE="${LIVE_SPOT_PERP_BASIS_MODE}"
+  BASIS_OBSERVER_FUNDING_ARB_MODE="${LIVE_FUNDING_ARB_MODE}"
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS:-60}"
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES:-1}"
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES="${LIVE_FUNDING_ARB_RESIDENT_MAX_CYCLES}"
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER="${BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER:-${FUNDING_SETTLEMENT_LEDGER:-}}"
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT="${BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT:-${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}}"
+  BASIS_OBSERVER_PERP_TARGET_LEVERAGE="${BASIS_OBSERVER_PERP_TARGET_LEVERAGE}"
+  ARB_RUNTIME_PERP_TARGET_LEVERAGE="${ARB_RUNTIME_PERP_TARGET_LEVERAGE}"
+  BASIS_OBSERVER_BINANCE_USDM_LEVERAGE="${BASIS_OBSERVER_BINANCE_USDM_LEVERAGE}"
+  BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE="${BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE}"
+  BASIS_OBSERVER_OKX_SWAP_LEVERAGE="${BASIS_OBSERVER_OKX_SWAP_LEVERAGE}"
+  BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE="${BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE}"
+  BASIS_OBSERVER_ASTER_PERP_LEVERAGE="${BASIS_OBSERVER_ASTER_PERP_LEVERAGE}"
+  BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE="${BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE}"
   BASIS_OBSERVER_DYNAMIC_TARGET_WSS=1
   BASIS_OBSERVER_TARGET_WSS_ROOT="${RUN_ROOT}/target-wss"
   BASIS_OBSERVER_TARGET_WSS_BASE_PORT="${BASIS_OBSERVER_TARGET_WSS_BASE_PORT:-8830}"
@@ -644,9 +725,22 @@ LIVE_ENV=(
   HYPERLIQUID_PERP_WSS_MONITOR_URL="http://${HYPERLIQUID_PERP_WSS_BIND}/api/hyperliquid-wss-book-ticker/status"
 )
 
+LIVE_ARGS=(
+  live
+  --config "${LIVE_CONFIG}"
+  --out "${RUN_ROOT}"
+  --interval-secs "${LIVE_INTERVAL_SECS}"
+  --min-net-bps "${LIVE_MIN_NET_BPS}"
+  --auto-once-cooldown-secs "${LIVE_AUTO_ONCE_COOLDOWN_SECS}"
+  --i-understand-live-orders
+)
+if [[ "${LIVE_VALIDATE_AUTO_ONCE}" == "0" ]]; then
+  LIVE_ARGS+=(--no-auto-validate)
+fi
+
 if [[ "${DETACH}" == "1" ]]; then
   live_log="${LOG_DIR}/arb-runtime-live.log"
-  nohup env "${LIVE_ENV[@]}" "${RUNTIME_BIN}" live --i-understand-live-orders >> "${live_log}" 2>&1 &
+  nohup env "${LIVE_ENV[@]}" "${RUNTIME_BIN}" "${LIVE_ARGS[@]}" >> "${live_log}" 2>&1 &
   live_pid="$!"
   printf '%s\n' "${live_pid}" > "${LIVE_PID_FILE}"
   echo
@@ -656,4 +750,4 @@ fi
 
 echo
 echo "starting arb-runtime live in foreground; press Ctrl-C to stop."
-env "${LIVE_ENV[@]}" "${RUNTIME_BIN}" live --i-understand-live-orders
+env "${LIVE_ENV[@]}" "${RUNTIME_BIN}" "${LIVE_ARGS[@]}"

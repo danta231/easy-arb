@@ -42,17 +42,66 @@ is_validation_process_name() {
 
 is_core_process_name() {
   case "$1" in
-    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-binance-*|target-wss-bybit-*|target-wss-okx-*|target-wss-bitget-*) return 0 ;;
+    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+append_pid_file_lines() {
+  local file="$1"
+  [[ -s "${file}" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && PID_LINES+=("${line}")
+  done < "${file}"
+}
+
 read_pid_lines() {
   PID_LINES=()
-  [[ -s "${PID_FILE}" ]] || return 0
-  while IFS= read -r line; do
-    PID_LINES+=("${line}")
-  done < "${PID_FILE}"
+  append_pid_file_lines "${PID_FILE}"
+}
+
+read_rescue_pid_lines() {
+  local file
+  local pid
+  local name
+  local log_file
+
+  PID_LINES=()
+  append_pid_file_lines "${PID_FILE}"
+
+  for file in "${STATE_DIR}"/basis-observer.pids.stopped.* "${STATE_DIR}"/basis-observer.pids.stale-*; do
+    [[ -e "${file}" ]] || continue
+    append_pid_file_lines "${file}"
+  done
+
+  for file in "${STATE_DIR}"/target-wss-warmup-*.pid; do
+    [[ -s "${file}" ]] || continue
+    pid="$(sed -n '1p' "${file}")"
+    name="$(basename "${file}" .pid)"
+    log_file="${RUN_ROOT}/logs/${name}.log"
+    PID_LINES+=("${pid}"$'\t'"${name}"$'\t'"${log_file}")
+  done
+}
+
+managed_process_matches_name() {
+  local pid="$1"
+  local name="$2"
+  local command_line
+
+  command_line="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+  [[ -n "${command_line}" ]] || return 1
+
+  case "${name}" in
+    opportunity-recorder)
+      [[ "${command_line}" == *"start-basis-opportunity-observer.sh --recorder"* ]]
+      ;;
+    validation-*)
+      [[ "${command_line}" == *"${REPO_ROOT}"* || "${command_line}" == *"arb-runtime"* ]]
+      ;;
+    *)
+      [[ "${command_line}" == *"${REPO_ROOT}/target/"*"arb-runtime"* || "${command_line}" == *"/target/debug/arb-runtime"* || "${command_line}" == *"/target/release/arb-runtime"* ]]
+      ;;
+  esac
 }
 
 term_processes_by_name() {
@@ -124,6 +173,113 @@ terminate_remaining_processes() {
   done
 }
 
+terminate_rescue_processes() {
+  local signal="$1"
+  local line
+  local pid
+  local name
+  local log_file
+  local seen=" "
+
+  read_rescue_pid_lines
+  for line in "${PID_LINES[@]}"; do
+    IFS=$'\t' read -r pid name log_file <<< "${line}"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    [[ "${seen}" == *" ${pid} "* ]] && continue
+    seen+="${pid} "
+    is_core_process_name "${name}" || continue
+    if is_alive "${pid}" && managed_process_matches_name "${pid}" "${name}"; then
+      echo "${signal#-} rescue pid=${pid} name=${name} log=${log_file}"
+      kill "${signal}" "${pid}" 2>/dev/null || true
+    fi
+  done
+}
+
+refresh_funding_arb_summary_position_counts() {
+  local summary_path="$1"
+  local positions_path
+  local counts_json
+  local tmp
+
+  [[ "${summary_path}" == */funding_arb_resident_live_summary.json ]] || return 0
+  positions_path="${summary_path%/funding_arb_resident_live_summary.json}/funding_arb_resident_positions.jsonl"
+  [[ -s "${positions_path}" && -s "${summary_path}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  counts_json="$(
+    jq -s -c '
+      (
+      reduce .[] as $event ({};
+        ($event.position_id // "") as $position_id
+        | if $position_id == "" then .
+          elif ($event.event_type // "") == "position_opened" then .[$position_id] = "open"
+          elif ($event.event_type // "") == "position_unknown" then .[$position_id] = "unknown"
+          elif ($event.event_type // "") == "position_closed" then .[$position_id] = "closed"
+          else .
+          end
+      )
+      ) as $positions
+      | {
+          open_position_count: ([$positions[] | select(. == "open")] | length),
+          closed_position_count: ([$positions[] | select(. == "closed")] | length),
+          unknown_position_count: ([$positions[] | select(. == "unknown")] | length),
+          live_entry_count: ([$positions[] | select(. != "unknown")] | length)
+        }
+    ' "${positions_path}"
+  )" || return 0
+
+  tmp="${summary_path}.tmp.$$"
+  jq --argjson counts "${counts_json}" '
+    .open_position_count = $counts.open_position_count
+    | .closed_position_count = $counts.closed_position_count
+    | .unknown_position_count = $counts.unknown_position_count
+    | .live_entry_count = $counts.live_entry_count
+  ' "${summary_path}" > "${tmp}" && mv "${tmp}" "${summary_path}"
+}
+
+mark_running_resident_artifacts_stopped() {
+  local state_path="$1"
+  local summary_path="$2"
+  local label="$3"
+  local reason="stopped by stop-basis-opportunity-observer.sh"
+  local updated_at
+  local cycles
+  local tmp
+
+  [[ -s "${state_path}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  if ! jq -e '(.phase // "") == "running"' "${state_path}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  cycles="$(jq -r '(.cycles // 0) | tonumber' "${state_path}" 2>/dev/null || printf '0')"
+  tmp="${state_path}.tmp.$$"
+  jq --arg reason "${reason}" --arg updated_at "${updated_at}" \
+    '.phase = "stopped" | .halt_reason = $reason | .updated_at = $updated_at' \
+    "${state_path}" > "${tmp}" && mv "${tmp}" "${state_path}"
+
+  if [[ -s "${summary_path}" ]]; then
+    tmp="${summary_path}.tmp.$$"
+    jq --arg reason "${reason}" --argjson cycles "${cycles}" \
+      '.phase = "stopped" | .cycles = $cycles | .halt_reason = $reason' \
+      "${summary_path}" > "${tmp}" && mv "${tmp}" "${summary_path}"
+    refresh_funding_arb_summary_position_counts "${summary_path}"
+  fi
+  echo "resident_state_marked_stopped label=${label} state=${state_path}"
+}
+
+mark_resident_artifacts_stopped() {
+  mark_running_resident_artifacts_stopped \
+    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_state.json" \
+    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_summary.json" \
+    "spot-perp-basis"
+  mark_running_resident_artifacts_stopped \
+    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_state.json" \
+    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_summary.json" \
+    "cross-exchange-funding-arb"
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -131,6 +287,10 @@ fi
 
 if [[ ! -s "${PID_FILE}" ]]; then
   echo "no running basis opportunity observer found: ${PID_FILE}"
+  terminate_rescue_processes "-TERM"
+  sleep "${STOP_GRACE_SECS}"
+  terminate_rescue_processes "-KILL"
+  mark_resident_artifacts_stopped
   exit 0
 fi
 
@@ -157,9 +317,12 @@ if ! wait_for_validation_processes; then
 fi
 
 terminate_remaining_processes "-TERM"
+terminate_rescue_processes "-TERM"
 
 sleep "${STOP_GRACE_SECS}"
 
 terminate_remaining_processes "-KILL"
+terminate_rescue_processes "-KILL"
+mark_resident_artifacts_stopped
 
 echo "stopped. archived pid file: ${STOPPED_FILE}"

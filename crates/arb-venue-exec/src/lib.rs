@@ -3478,7 +3478,7 @@ pub mod live {
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use arb_domain::{AccountId, InstrumentId, OrderId, VenueId};
+    use arb_domain::{AccountId, InstrumentId, OrderId, Quantity, VenueId};
     use arb_signing::real::{
         AsterRealSigningProvider, AsterRequestParam, AsterSignedEndpoint, AsterV3SigningInput,
         BinanceHmacSigningInput, BinanceRequestParam, BinanceSignedEndpoint,
@@ -3506,13 +3506,155 @@ pub mod live {
     pub const BINANCE_SPOT_ORDER_ENDPOINT: &str = "/api/v3/order";
     /// Binance USD-M Futures 下单、撤单和查单 endpoint。
     pub const BINANCE_USDM_ORDER_ENDPOINT: &str = "/fapi/v1/order";
+    /// Binance USD-M Futures 调整初始杠杆 endpoint。
+    pub const BINANCE_USDM_LEVERAGE_ENDPOINT: &str = "/fapi/v1/leverage";
     /// 默认 Binance signed endpoint 接收窗口。
     pub const DEFAULT_BINANCE_RECV_WINDOW_MS: u64 = 5_000;
+    /// 默认所有 live perp 适配器使用的目标杠杆。
+    pub const DEFAULT_PERP_TARGET_LEVERAGE: u32 = 1;
     const MAX_BINANCE_RECV_WINDOW_MS: u64 = 60_000;
+    const MAX_PERP_TARGET_LEVERAGE: u32 = 125;
     const CURL_STATUS_MARKER: &str = "\n__ARB_BINANCE_HTTP_STATUS__:";
 
     fn limit_time_in_force(request: &SubmitOrderRequest) -> MutableTimeInForce {
         request.time_in_force.unwrap_or(MutableTimeInForce::Gtc)
+    }
+
+    fn validate_venue_quantity_step(step: Quantity) -> VenueExecResult<()> {
+        if step.atoms() <= 0 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "quantity_step",
+                reason: "venue quantity step must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_perp_target_leverage(field: &'static str, leverage: u32) -> VenueExecResult<()> {
+        if (1..=MAX_PERP_TARGET_LEVERAGE).contains(&leverage) {
+            Ok(())
+        } else {
+            Err(VenueExecError::InvalidRequest {
+                field,
+                reason: "perp target leverage must be between 1 and 125",
+            })
+        }
+    }
+
+    fn leverage_signing_request_id(
+        adapter: &'static str,
+        symbol: &str,
+        leverage: u32,
+    ) -> VenueExecResult<SigningRequestId> {
+        SigningRequestId::new(format!(
+            "signing-request/{adapter}/set-leverage/{symbol}/{leverage}"
+        ))
+        .map_err(signing_error)
+    }
+
+    fn order_query_signing_request_id(
+        adapter: &'static str,
+        source_event_id: &str,
+    ) -> VenueExecResult<SigningRequestId> {
+        let full = format!("signing-request/{adapter}/query-order/{source_event_id}");
+        if full.len() <= 160 {
+            return SigningRequestId::new(full).map_err(signing_error);
+        }
+        SigningRequestId::new(format!(
+            "signing-request/{adapter}/query-order/h{:016x}",
+            stable_boundary_ref_hash(source_event_id)
+        ))
+        .map_err(signing_error)
+    }
+
+    fn stable_boundary_ref_hash(value: &str) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    fn format_quantity_at_venue_step(
+        quantity: Quantity,
+        step: Quantity,
+    ) -> VenueExecResult<String> {
+        validate_venue_quantity_step(step)?;
+        let scale = quantity.scale().max(step.scale());
+        let raw = rescale_quantity_atoms(quantity, scale)?;
+        let step_raw = rescale_quantity_atoms(step, scale)?;
+        if step_raw <= 0 {
+            return Err(VenueExecError::InvalidRequest {
+                field: "quantity_step",
+                reason: "venue quantity step must be greater than zero",
+            });
+        }
+        let floored = raw
+            .checked_div(step_raw)
+            .and_then(|multiple| multiple.checked_mul(step_raw))
+            .ok_or_else(|| VenueExecError::DispatchBlocked {
+                reason: "quantity overflowed while applying venue quantity step".to_owned(),
+            })?;
+        if floored <= 0 {
+            return Err(VenueExecError::DispatchBlocked {
+                reason: format!("order quantity {quantity} is below venue quantity step {step}"),
+            });
+        }
+        Ok(format_scaled_atoms_trimmed(floored, scale))
+    }
+
+    fn rescale_quantity_atoms(quantity: Quantity, target_scale: u32) -> VenueExecResult<i128> {
+        if target_scale < quantity.scale() {
+            return Err(VenueExecError::DispatchBlocked {
+                reason: "quantity target scale is lower than current scale".to_owned(),
+            });
+        }
+        let scale_delta = target_scale - quantity.scale();
+        let multiplier =
+            checked_pow10_i128(scale_delta).ok_or_else(|| VenueExecError::DispatchBlocked {
+                reason: "quantity scale overflowed while applying venue quantity step".to_owned(),
+            })?;
+        quantity
+            .atoms()
+            .checked_mul(multiplier)
+            .ok_or_else(|| VenueExecError::DispatchBlocked {
+                reason: "quantity overflowed while applying venue quantity step".to_owned(),
+            })
+    }
+
+    fn checked_pow10_i128(exponent: u32) -> Option<i128> {
+        let mut value = 1_i128;
+        for _ in 0..exponent {
+            value = value.checked_mul(10)?;
+        }
+        Some(value)
+    }
+
+    fn format_scaled_atoms_trimmed(atoms: i128, scale: u32) -> String {
+        let digits = atoms.unsigned_abs().to_string();
+        if scale == 0 {
+            return digits;
+        }
+        let scale = scale as usize;
+        let mut value = if digits.len() > scale {
+            let split = digits.len() - scale;
+            format!("{}.{}", &digits[..split], &digits[split..])
+        } else {
+            let mut value = String::from("0.");
+            for _ in 0..(scale - digits.len()) {
+                value.push('0');
+            }
+            value.push_str(&digits);
+            value
+        };
+        while value.contains('.') && value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+        value
     }
 
     /// Binance 可变执行市场。
@@ -3572,6 +3714,8 @@ pub mod live {
         account_id: AccountId,
         base_url: String,
         recv_window_ms: u64,
+        target_leverage: Option<u32>,
+        quantity_step_by_symbol: BTreeMap<String, Quantity>,
         signing_policy: SigningPolicy,
     }
 
@@ -3623,6 +3767,8 @@ pub mod live {
                 account_id,
                 base_url: normalize_base_url(base_url.into())?,
                 recv_window_ms,
+                target_leverage: None,
+                quantity_step_by_symbol: BTreeMap::new(),
                 signing_policy,
             })
         }
@@ -3630,6 +3776,30 @@ pub mod live {
         pub fn with_recv_window_ms(mut self, recv_window_ms: u64) -> VenueExecResult<Self> {
             validate_recv_window(recv_window_ms)?;
             self.recv_window_ms = recv_window_ms;
+            Ok(self)
+        }
+
+        pub fn with_quantity_step(
+            mut self,
+            symbol: impl Into<String>,
+            step: Quantity,
+        ) -> VenueExecResult<Self> {
+            let symbol = symbol.into();
+            validate_binance_symbol(&symbol)?;
+            validate_venue_quantity_step(step)?;
+            self.quantity_step_by_symbol.insert(symbol, step);
+            Ok(self)
+        }
+
+        pub fn with_target_leverage(mut self, leverage: u32) -> VenueExecResult<Self> {
+            if self.market != BinanceExecMarket::UsdmFutures {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "target_leverage",
+                    reason: "Binance target leverage can only be configured for USD-M futures",
+                });
+            }
+            validate_perp_target_leverage("target_leverage", leverage)?;
+            self.target_leverage = Some(leverage);
             Ok(self)
         }
 
@@ -3651,6 +3821,14 @@ pub mod live {
 
         pub fn recv_window_ms(&self) -> u64 {
             self.recv_window_ms
+        }
+
+        pub fn quantity_step(&self, symbol: &str) -> Option<Quantity> {
+            self.quantity_step_by_symbol.get(symbol).copied()
+        }
+
+        pub fn target_leverage(&self) -> Option<u32> {
+            self.target_leverage
         }
 
         pub fn signing_policy(&self) -> &SigningPolicy {
@@ -4217,6 +4395,7 @@ pub mod live {
 
             let symbol =
                 binance_symbol_from_instrument(self.config.market, &request.instrument_id)?;
+            self.ensure_target_leverage(&symbol, request.reduce_only)?;
             let params = submit_order_params(&self.config, &symbol, &request)?;
             let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
             let signed = self.sign(SigningPurpose::SubmitOrder, &action_id, params)?;
@@ -4302,11 +4481,8 @@ pub mod live {
             let symbol =
                 binance_symbol_from_instrument(self.config.market, &request.instrument_id)?;
             let params = query_order_params(&self.config, &symbol, &request.order_ref)?;
-            let signing_request_id = SigningRequestId::new(format!(
-                "signing-request/binance-exec/query-order/{}",
-                request.source_event_id
-            ))
-            .map_err(signing_error)?;
+            let signing_request_id =
+                order_query_signing_request_id("binance-exec", &request.source_event_id)?;
             let signed =
                 self.sign_with_request_id(SigningPurpose::QueryOrder, signing_request_id, params)?;
             let response = self.dispatch_signed(
@@ -4322,6 +4498,29 @@ pub mod live {
                 request.source_event_id,
                 response.body(),
             )
+        }
+
+        fn ensure_target_leverage(
+            &mut self,
+            symbol: &str,
+            reduce_only: bool,
+        ) -> VenueExecResult<()> {
+            if reduce_only || self.config.market != BinanceExecMarket::UsdmFutures {
+                return Ok(());
+            }
+            let Some(leverage) = self.config.target_leverage else {
+                return Ok(());
+            };
+            let params = binance_usdm_leverage_params(&self.config, symbol, leverage)?;
+            let signing_request_id = leverage_signing_request_id("binance-exec", symbol, leverage)?;
+            let signed =
+                self.sign_with_request_id(SigningPurpose::SubmitOrder, signing_request_id, params)?;
+            let response = self.dispatch_signed(
+                BinanceExecHttpMethod::Post,
+                BINANCE_USDM_LEVERAGE_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_success(BINANCE_USDM_LEVERAGE_ENDPOINT, &response)
         }
 
         fn duplicate_receipt(
@@ -4463,6 +4662,19 @@ pub mod live {
         }
     }
 
+    fn binance_usdm_leverage_params(
+        config: &BinanceExecConfig,
+        symbol: &str,
+        leverage: u32,
+    ) -> VenueExecResult<Vec<BinanceRequestParam>> {
+        validate_perp_target_leverage("target_leverage", leverage)?;
+        Ok(vec![
+            binance_param("symbol", symbol)?,
+            binance_param("leverage", leverage.to_string())?,
+            binance_param("recvWindow", config.recv_window_ms.to_string())?,
+        ])
+    }
+
     #[derive(Clone, Debug)]
     struct LiveActionRecord {
         fingerprint: RequestFingerprint,
@@ -4533,6 +4745,7 @@ pub mod live {
         symbol: &str,
         request: &SubmitOrderRequest,
     ) -> VenueExecResult<Vec<BinanceRequestParam>> {
+        let quantity = binance_order_quantity(config, symbol, request.quantity)?;
         let mut params = vec![
             binance_param("symbol", symbol)?,
             binance_param("side", binance_side(request.side))?,
@@ -4540,7 +4753,7 @@ pub mod live {
         match (config.market, request.order_type) {
             (_, MutableOrderType::Market) => {
                 params.push(binance_param("type", "MARKET")?);
-                params.push(binance_param("quantity", request.quantity.to_string())?);
+                params.push(binance_param("quantity", &quantity)?);
             }
             (BinanceExecMarket::Spot, MutableOrderType::Limit) => {
                 params.push(binance_param("type", "LIMIT")?);
@@ -4548,7 +4761,7 @@ pub mod live {
                     "timeInForce",
                     binance_time_in_force(limit_time_in_force(request)),
                 )?);
-                params.push(binance_param("quantity", request.quantity.to_string())?);
+                params.push(binance_param("quantity", &quantity)?);
                 params.push(binance_param(
                     "price",
                     request
@@ -4559,7 +4772,7 @@ pub mod live {
             }
             (BinanceExecMarket::Spot, MutableOrderType::PostOnly) => {
                 params.push(binance_param("type", "LIMIT_MAKER")?);
-                params.push(binance_param("quantity", request.quantity.to_string())?);
+                params.push(binance_param("quantity", &quantity)?);
                 params.push(binance_param(
                     "price",
                     request
@@ -4574,7 +4787,7 @@ pub mod live {
                     "timeInForce",
                     binance_time_in_force(limit_time_in_force(request)),
                 )?);
-                params.push(binance_param("quantity", request.quantity.to_string())?);
+                params.push(binance_param("quantity", &quantity)?);
                 params.push(binance_param(
                     "price",
                     request
@@ -4586,7 +4799,7 @@ pub mod live {
             (BinanceExecMarket::UsdmFutures, MutableOrderType::PostOnly) => {
                 params.push(binance_param("type", "LIMIT")?);
                 params.push(binance_param("timeInForce", "GTX")?);
-                params.push(binance_param("quantity", request.quantity.to_string())?);
+                params.push(binance_param("quantity", &quantity)?);
                 params.push(binance_param(
                     "price",
                     request
@@ -4618,6 +4831,17 @@ pub mod live {
             config.recv_window_ms.to_string(),
         )?);
         Ok(params)
+    }
+
+    fn binance_order_quantity(
+        config: &BinanceExecConfig,
+        symbol: &str,
+        quantity: Quantity,
+    ) -> VenueExecResult<String> {
+        match config.quantity_step(symbol) {
+            Some(step) => format_quantity_at_venue_step(quantity, step),
+            None => Ok(quantity.to_string()),
+        }
     }
 
     fn cancel_order_params(
@@ -4945,6 +5169,8 @@ pub mod live {
 
     /// Aster Futures V3 下单、撤单和查单 endpoint。
     pub const ASTER_FUTURES_V3_ORDER_ENDPOINT: &str = "/fapi/v3/order";
+    /// Aster Futures 调整初始杠杆 endpoint。
+    pub const ASTER_FUTURES_V3_LEVERAGE_ENDPOINT: &str = "/fapi/v1/leverage";
     /// 默认 Aster Futures V3 REST base URL。
     ///
     /// 中文说明：V3 path 当前可通过 `fapi.asterdex.com` 访问；部分出网 IP 访问
@@ -4985,6 +5211,7 @@ pub mod live {
         base_url: String,
         user: Option<String>,
         signer: String,
+        target_leverage: Option<u32>,
         signing_policy: SigningPolicy,
     }
 
@@ -5008,8 +5235,15 @@ pub mod live {
                 base_url: normalize_aster_base_url(base_url.into())?,
                 user,
                 signer,
+                target_leverage: None,
                 signing_policy,
             })
+        }
+
+        pub fn with_target_leverage(mut self, leverage: u32) -> VenueExecResult<Self> {
+            validate_perp_target_leverage("target_leverage", leverage)?;
+            self.target_leverage = Some(leverage);
+            Ok(self)
         }
 
         pub fn venue_id(&self) -> &VenueId {
@@ -5030,6 +5264,10 @@ pub mod live {
 
         pub fn signer(&self) -> &str {
             &self.signer
+        }
+
+        pub fn target_leverage(&self) -> Option<u32> {
+            self.target_leverage
         }
 
         pub fn signing_policy(&self) -> &SigningPolicy {
@@ -5420,6 +5658,7 @@ pub mod live {
                 return Ok(receipt);
             }
             let symbol = aster_symbol_from_instrument(&request.instrument_id)?;
+            self.ensure_target_leverage(&symbol, request.reduce_only)?;
             let params = aster_submit_order_params(&symbol, &request)?;
             let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
             let signed = self.sign(SigningPurpose::SubmitOrder, &action_id, params)?;
@@ -5499,11 +5738,8 @@ pub mod live {
             self.ensure_request_scope(&request.venue_id, &request.account_id)?;
             let symbol = aster_symbol_from_instrument(&request.instrument_id)?;
             let params = aster_query_order_params(&symbol, &request.order_ref)?;
-            let signing_request_id = SigningRequestId::new(format!(
-                "signing-request/aster-exec/query-order/{}",
-                request.source_event_id
-            ))
-            .map_err(signing_error)?;
+            let signing_request_id =
+                order_query_signing_request_id("aster-exec", &request.source_event_id)?;
             let signed =
                 self.sign_with_request_id(SigningPurpose::QueryOrder, signing_request_id, params)?;
             let response = self.dispatch_signed(
@@ -5518,6 +5754,29 @@ pub mod live {
                 request.source_event_id,
                 response.body(),
             )
+        }
+
+        fn ensure_target_leverage(
+            &mut self,
+            symbol: &str,
+            reduce_only: bool,
+        ) -> VenueExecResult<()> {
+            if reduce_only {
+                return Ok(());
+            }
+            let Some(leverage) = self.config.target_leverage else {
+                return Ok(());
+            };
+            let params = aster_leverage_params(symbol, leverage)?;
+            let signing_request_id = leverage_signing_request_id("aster-exec", symbol, leverage)?;
+            let signed =
+                self.sign_with_request_id(SigningPurpose::SubmitOrder, signing_request_id, params)?;
+            let response = self.dispatch_signed(
+                AsterExecHttpMethod::Post,
+                ASTER_FUTURES_V3_LEVERAGE_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_success(ASTER_FUTURES_V3_LEVERAGE_ENDPOINT, &response)
         }
 
         fn duplicate_receipt(
@@ -5652,6 +5911,17 @@ pub mod live {
                 OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
             }
         }
+    }
+
+    fn aster_leverage_params(
+        symbol: &str,
+        leverage: u32,
+    ) -> VenueExecResult<Vec<AsterRequestParam>> {
+        validate_perp_target_leverage("target_leverage", leverage)?;
+        Ok(vec![
+            aster_param("symbol", symbol)?,
+            aster_param("leverage", leverage.to_string())?,
+        ])
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6166,6 +6436,7 @@ pub mod live {
         source: String,
         vault_address: Option<String>,
         expires_after_ms: Option<u64>,
+        target_leverage: Option<u32>,
         signing_policy: SigningPolicy,
         asset_ids_by_symbol: BTreeMap<String, u32>,
     }
@@ -6191,6 +6462,7 @@ pub mod live {
                 source,
                 vault_address: None,
                 expires_after_ms: None,
+                target_leverage: None,
                 signing_policy,
                 asset_ids_by_symbol: BTreeMap::new(),
             })
@@ -6222,12 +6494,22 @@ pub mod live {
             Ok(self)
         }
 
+        pub fn with_target_leverage(mut self, leverage: u32) -> VenueExecResult<Self> {
+            validate_perp_target_leverage("target_leverage", leverage)?;
+            self.target_leverage = Some(leverage);
+            Ok(self)
+        }
+
         pub fn venue_id(&self) -> &VenueId {
             &self.venue_id
         }
 
         pub fn account_id(&self) -> &AccountId {
             &self.account_id
+        }
+
+        pub fn target_leverage(&self) -> Option<u32> {
+            self.target_leverage
         }
     }
 
@@ -6347,6 +6629,7 @@ pub mod live {
         orders_by_client_id: BTreeMap<OrderId, HyperliquidKnownOrder>,
         orders_by_external_id: BTreeMap<ExternalOrderId, HyperliquidKnownOrder>,
         next_sequence: u64,
+        last_nonce_millis: Option<u64>,
     }
 
     impl<S, T> HyperliquidExecAdapterCore<S, T> {
@@ -6360,6 +6643,7 @@ pub mod live {
                 orders_by_client_id: BTreeMap::new(),
                 orders_by_external_id: BTreeMap::new(),
                 next_sequence: 0,
+                last_nonce_millis: None,
             }
         }
 
@@ -6448,6 +6732,7 @@ pub mod live {
             ensure_hyperliquid_real_signing_policy(&self.config.signing_policy)?;
             let symbol = hyperliquid_symbol_from_instrument(&request.instrument_id)?;
             let asset_id = self.hyperliquid_asset_id(&symbol)?;
+            self.ensure_target_leverage(asset_id, request.reduce_only)?;
             let action_json = hyperliquid_submit_order_action_json(asset_id, &request)?;
             let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
             let body = self.sign_exchange_body(action_json)?;
@@ -6570,12 +6855,55 @@ pub mod live {
                 .copied()
                 .ok_or(VenueExecError::InvalidRequest {
                     field: "asset_id",
-                    reason: "Hyperliquid perp asset id mapping is required before live order submission",
-                })
+                reason: "Hyperliquid perp asset id mapping is required before live order submission",
+            })
         }
 
-        fn sign_exchange_body(&self, action_json: String) -> VenueExecResult<String> {
-            let nonce = current_unix_millis()?;
+        fn ensure_target_leverage(
+            &mut self,
+            asset_id: u32,
+            reduce_only: bool,
+        ) -> VenueExecResult<()> {
+            if reduce_only {
+                return Ok(());
+            }
+            let Some(leverage) = self.config.target_leverage else {
+                return Ok(());
+            };
+            validate_perp_target_leverage("target_leverage", leverage)?;
+            let action_json = hyperliquid_update_leverage_action_json(asset_id, leverage);
+            let body = self.sign_exchange_body(action_json)?;
+            let response = self.transport.post_json(
+                &self.config.base_url,
+                HYPERLIQUID_EXCHANGE_ENDPOINT,
+                &body,
+            )?;
+            self.ensure_success(HYPERLIQUID_EXCHANGE_ENDPOINT, &response)?;
+            ensure_hyperliquid_exchange_ok(
+                &self.config.venue_id,
+                HYPERLIQUID_EXCHANGE_ENDPOINT,
+                &response,
+            )
+        }
+
+        fn next_hyperliquid_nonce(&mut self) -> VenueExecResult<u64> {
+            let now = current_unix_millis()?;
+            let nonce = match self.last_nonce_millis {
+                Some(last) if now <= last => {
+                    last.checked_add(1)
+                        .ok_or_else(|| VenueExecError::UnknownExternalState {
+                            venue_id: self.config.venue_id.clone(),
+                            detail: "Hyperliquid nonce milliseconds overflowed".to_owned(),
+                        })?
+                }
+                _ => now,
+            };
+            self.last_nonce_millis = Some(nonce);
+            Ok(nonce)
+        }
+
+        fn sign_exchange_body(&mut self, action_json: String) -> VenueExecResult<String> {
+            let nonce = self.next_hyperliquid_nonce()?;
             let signature = self.signer.sign_l1_action(HyperliquidSigningInput {
                 source: self.config.source.clone(),
                 nonce,
@@ -6683,6 +7011,12 @@ pub mod live {
                 OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
             }
         }
+    }
+
+    fn hyperliquid_update_leverage_action_json(asset_id: u32, leverage: u32) -> String {
+        format!(
+            "{{\"type\":\"updateLeverage\",\"asset\":{asset_id},\"isCross\":true,\"leverage\":{leverage}}}"
+        )
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7095,6 +7429,8 @@ pub mod live {
 
     /// Bybit V5 下单 endpoint。
     pub const BYBIT_ORDER_CREATE_ENDPOINT: &str = "/v5/order/create";
+    /// Bybit V5 设置杠杆 endpoint。
+    pub const BYBIT_SET_LEVERAGE_ENDPOINT: &str = "/v5/position/set-leverage";
     /// Bybit V5 撤单 endpoint。
     pub const BYBIT_ORDER_CANCEL_ENDPOINT: &str = "/v5/order/cancel";
     /// Bybit V5 查单 endpoint。
@@ -7160,6 +7496,8 @@ pub mod live {
         account_id: AccountId,
         base_url: String,
         recv_window_ms: u64,
+        target_leverage: Option<u32>,
+        quantity_step_by_symbol: BTreeMap<String, Quantity>,
         signing_policy: SigningPolicy,
     }
 
@@ -7211,6 +7549,8 @@ pub mod live {
                 account_id,
                 base_url: normalize_bybit_base_url(base_url.into())?,
                 recv_window_ms,
+                target_leverage: None,
+                quantity_step_by_symbol: BTreeMap::new(),
                 signing_policy,
             })
         }
@@ -7218,6 +7558,30 @@ pub mod live {
         pub fn with_recv_window_ms(mut self, recv_window_ms: u64) -> VenueExecResult<Self> {
             validate_bybit_recv_window(recv_window_ms)?;
             self.recv_window_ms = recv_window_ms;
+            Ok(self)
+        }
+
+        pub fn with_quantity_step(
+            mut self,
+            symbol: impl Into<String>,
+            step: Quantity,
+        ) -> VenueExecResult<Self> {
+            let symbol = symbol.into();
+            validate_bybit_symbol(&symbol)?;
+            validate_venue_quantity_step(step)?;
+            self.quantity_step_by_symbol.insert(symbol, step);
+            Ok(self)
+        }
+
+        pub fn with_target_leverage(mut self, leverage: u32) -> VenueExecResult<Self> {
+            if self.market != BybitExecMarket::LinearPerpetual {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "target_leverage",
+                    reason: "Bybit target leverage can only be configured for linear perpetuals",
+                });
+            }
+            validate_perp_target_leverage("target_leverage", leverage)?;
+            self.target_leverage = Some(leverage);
             Ok(self)
         }
 
@@ -7239,6 +7603,14 @@ pub mod live {
 
         pub fn recv_window_ms(&self) -> u64 {
             self.recv_window_ms
+        }
+
+        pub fn quantity_step(&self, symbol: &str) -> Option<Quantity> {
+            self.quantity_step_by_symbol.get(symbol).copied()
+        }
+
+        pub fn target_leverage(&self) -> Option<u32> {
+            self.target_leverage
         }
 
         pub fn signing_policy(&self) -> &SigningPolicy {
@@ -7821,6 +8193,7 @@ pub mod live {
             }
 
             let symbol = bybit_symbol_from_instrument(self.config.market, &request.instrument_id)?;
+            self.ensure_target_leverage(&symbol, request.reduce_only)?;
             let body = bybit_order_create_body(&self.config, &symbol, &request)?;
             let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
             let signed = self.sign(
@@ -7915,11 +8288,8 @@ pub mod live {
             self.ensure_request_scope(&request.venue_id, &request.account_id)?;
             let symbol = bybit_symbol_from_instrument(self.config.market, &request.instrument_id)?;
             let query = bybit_query_order_payload(&self.config, &symbol, &request.order_ref)?;
-            let signing_request_id = SigningRequestId::new(format!(
-                "signing-request/bybit-exec/query-order/{}",
-                request.source_event_id
-            ))
-            .map_err(signing_error)?;
+            let signing_request_id =
+                order_query_signing_request_id("bybit-exec", &request.source_event_id)?;
             let signed = self.sign_with_request_id(
                 SigningPurpose::QueryOrder,
                 signing_request_id,
@@ -7939,6 +8309,33 @@ pub mod live {
                 request.source_event_id,
                 response.body(),
             )
+        }
+
+        fn ensure_target_leverage(
+            &mut self,
+            symbol: &str,
+            reduce_only: bool,
+        ) -> VenueExecResult<()> {
+            if reduce_only || self.config.market != BybitExecMarket::LinearPerpetual {
+                return Ok(());
+            }
+            let Some(leverage) = self.config.target_leverage else {
+                return Ok(());
+            };
+            let body = bybit_set_leverage_body(&self.config, symbol, leverage)?;
+            let signing_request_id = leverage_signing_request_id("bybit-exec", symbol, leverage)?;
+            let signed = self.sign_with_request_id(
+                SigningPurpose::SubmitOrder,
+                signing_request_id,
+                BybitSigningPayloadKind::JsonBody,
+                body,
+            )?;
+            let response = self.dispatch_signed(
+                BybitExecHttpMethod::Post,
+                BYBIT_SET_LEVERAGE_ENDPOINT,
+                &signed,
+            )?;
+            self.ensure_bybit_set_leverage_success(&response)
         }
 
         fn duplicate_receipt(
@@ -8071,6 +8468,32 @@ pub mod live {
             }
         }
 
+        fn ensure_bybit_set_leverage_success(
+            &self,
+            response: &BybitExecHttpResponse,
+        ) -> VenueExecResult<()> {
+            self.ensure_http_success(BYBIT_SET_LEVERAGE_ENDPOINT, response)?;
+            match json_field_value(response.body(), "retCode").as_deref() {
+                Some("0" | "110043") => Ok(()),
+                Some(ret_code) => Err(VenueExecError::ExternalRejected {
+                    venue_id: self.config.venue_id.clone(),
+                    endpoint: BYBIT_SET_LEVERAGE_ENDPOINT.to_owned(),
+                    status_code: response.status_code(),
+                    reason: format!(
+                        "Bybit retCode={ret_code}: {}",
+                        json_field_value(response.body(), "retMsg")
+                            .unwrap_or_else(|| "missing retMsg".to_owned())
+                    ),
+                }),
+                None => Err(VenueExecError::UnknownExternalState {
+                    venue_id: self.config.venue_id.clone(),
+                    detail: format!(
+                        "Bybit response from {BYBIT_SET_LEVERAGE_ENDPOINT} lacks retCode"
+                    ),
+                }),
+            }
+        }
+
         fn record_action(
             &mut self,
             idempotency_key: IdempotencyKey,
@@ -8105,6 +8528,23 @@ pub mod live {
                 OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
             }
         }
+    }
+
+    fn bybit_set_leverage_body(
+        config: &BybitExecConfig,
+        symbol: &str,
+        leverage: u32,
+    ) -> VenueExecResult<String> {
+        validate_perp_target_leverage("target_leverage", leverage)?;
+        let leverage = leverage.to_string();
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "category", config.market.category())?;
+        push_json_string_field(&mut body, &mut first, "symbol", symbol)?;
+        push_json_string_field(&mut body, &mut first, "buyLeverage", &leverage)?;
+        push_json_string_field(&mut body, &mut first, "sellLeverage", &leverage)?;
+        body.push('}');
+        Ok(body)
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8171,6 +8611,7 @@ pub mod live {
         symbol: &str,
         request: &SubmitOrderRequest,
     ) -> VenueExecResult<String> {
+        let quantity = bybit_order_quantity(config, symbol, request.quantity)?;
         let mut body = String::from("{");
         let mut first = true;
         push_json_string_field(&mut body, &mut first, "category", config.market.category())?;
@@ -8179,24 +8620,14 @@ pub mod live {
         match request.order_type {
             MutableOrderType::Market => {
                 push_json_string_field(&mut body, &mut first, "orderType", "Market")?;
-                push_json_string_field(
-                    &mut body,
-                    &mut first,
-                    "qty",
-                    &request.quantity.to_string(),
-                )?;
+                push_json_string_field(&mut body, &mut first, "qty", &quantity)?;
                 if config.market == BybitExecMarket::Spot {
                     push_json_string_field(&mut body, &mut first, "marketUnit", "baseCoin")?;
                 }
             }
             MutableOrderType::Limit => {
                 push_json_string_field(&mut body, &mut first, "orderType", "Limit")?;
-                push_json_string_field(
-                    &mut body,
-                    &mut first,
-                    "qty",
-                    &request.quantity.to_string(),
-                )?;
+                push_json_string_field(&mut body, &mut first, "qty", &quantity)?;
                 push_json_string_field(
                     &mut body,
                     &mut first,
@@ -8215,12 +8646,7 @@ pub mod live {
             }
             MutableOrderType::PostOnly => {
                 push_json_string_field(&mut body, &mut first, "orderType", "Limit")?;
-                push_json_string_field(
-                    &mut body,
-                    &mut first,
-                    "qty",
-                    &request.quantity.to_string(),
-                )?;
+                push_json_string_field(&mut body, &mut first, "qty", &quantity)?;
                 push_json_string_field(
                     &mut body,
                     &mut first,
@@ -8257,6 +8683,17 @@ pub mod live {
         }
         body.push('}');
         Ok(body)
+    }
+
+    fn bybit_order_quantity(
+        config: &BybitExecConfig,
+        symbol: &str,
+        quantity: Quantity,
+    ) -> VenueExecResult<String> {
+        match config.quantity_step(symbol) {
+            Some(step) => format_quantity_at_venue_step(quantity, step),
+            None => Ok(quantity.to_string()),
+        }
     }
 
     fn bybit_cancel_order_body(
@@ -8660,6 +9097,8 @@ pub mod live {
 
     /// OKX V5 下单和查单 endpoint。
     pub const OKX_ORDER_ENDPOINT: &str = "/api/v5/trade/order";
+    /// OKX V5 设置杠杆 endpoint。
+    pub const OKX_SET_LEVERAGE_ENDPOINT: &str = "/api/v5/account/set-leverage";
     /// OKX V5 撤单 endpoint。
     pub const OKX_CANCEL_ORDER_ENDPOINT: &str = "/api/v5/trade/cancel-order";
     const CURL_OKX_STATUS_MARKER: &str = "\n__ARB_OKX_HTTP_STATUS__:";
@@ -8723,6 +9162,8 @@ pub mod live {
         base_url: String,
         td_mode: String,
         pos_side: Option<String>,
+        target_leverage: Option<u32>,
+        quantity_step_by_inst_id: BTreeMap<String, Quantity>,
         signing_policy: SigningPolicy,
     }
 
@@ -8776,6 +9217,8 @@ pub mod live {
                 base_url: normalize_okx_base_url(base_url.into())?,
                 td_mode,
                 pos_side: None,
+                target_leverage: None,
+                quantity_step_by_inst_id: BTreeMap::new(),
                 signing_policy,
             })
         }
@@ -8784,6 +9227,30 @@ pub mod live {
             let pos_side = pos_side.into();
             validate_okx_pos_side(&pos_side)?;
             self.pos_side = Some(pos_side);
+            Ok(self)
+        }
+
+        pub fn with_quantity_step(
+            mut self,
+            inst_id: impl Into<String>,
+            step: Quantity,
+        ) -> VenueExecResult<Self> {
+            let inst_id = inst_id.into();
+            validate_okx_exec_inst_id(self.market, &inst_id)?;
+            validate_venue_quantity_step(step)?;
+            self.quantity_step_by_inst_id.insert(inst_id, step);
+            Ok(self)
+        }
+
+        pub fn with_target_leverage(mut self, leverage: u32) -> VenueExecResult<Self> {
+            if self.market != OkxExecMarket::Swap {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "target_leverage",
+                    reason: "OKX target leverage can only be configured for swap",
+                });
+            }
+            validate_perp_target_leverage("target_leverage", leverage)?;
+            self.target_leverage = Some(leverage);
             Ok(self)
         }
 
@@ -8809,6 +9276,14 @@ pub mod live {
 
         pub fn pos_side(&self) -> Option<&str> {
             self.pos_side.as_deref()
+        }
+
+        pub fn quantity_step(&self, inst_id: &str) -> Option<Quantity> {
+            self.quantity_step_by_inst_id.get(inst_id).copied()
+        }
+
+        pub fn target_leverage(&self) -> Option<u32> {
+            self.target_leverage
         }
 
         pub fn signing_policy(&self) -> &SigningPolicy {
@@ -9287,6 +9762,7 @@ pub mod live {
             }
 
             let inst_id = okx_inst_id_from_instrument(self.config.market, &request.instrument_id)?;
+            self.ensure_target_leverage(&inst_id, request.reduce_only)?;
             let body = okx_order_create_body(&self.config, &inst_id, &request)?;
             let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
             let signed = self.sign(
@@ -9375,11 +9851,8 @@ pub mod live {
             self.ensure_request_scope(&request.venue_id, &request.account_id)?;
             let inst_id = okx_inst_id_from_instrument(self.config.market, &request.instrument_id)?;
             let request_path = okx_query_order_request_path(&inst_id, &request.order_ref)?;
-            let signing_request_id = SigningRequestId::new(format!(
-                "signing-request/okx-exec/query-order/{}",
-                request.source_event_id
-            ))
-            .map_err(signing_error)?;
+            let signing_request_id =
+                order_query_signing_request_id("okx-exec", &request.source_event_id)?;
             let signed = self.sign_with_request_id(
                 SigningPurpose::QueryOrder,
                 signing_request_id,
@@ -9396,6 +9869,30 @@ pub mod live {
                 request.source_event_id,
                 response.body(),
             )
+        }
+
+        fn ensure_target_leverage(
+            &mut self,
+            inst_id: &str,
+            reduce_only: bool,
+        ) -> VenueExecResult<()> {
+            if reduce_only || self.config.market != OkxExecMarket::Swap {
+                return Ok(());
+            }
+            let Some(leverage) = self.config.target_leverage else {
+                return Ok(());
+            };
+            let body = okx_set_leverage_body(&self.config, inst_id, leverage)?;
+            let signing_request_id = leverage_signing_request_id("okx-exec", inst_id, leverage)?;
+            let signed = self.sign_with_request_id(
+                SigningPurpose::SubmitOrder,
+                signing_request_id,
+                OkxRestMethod::Post,
+                OKX_SET_LEVERAGE_ENDPOINT.to_owned(),
+                body,
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_business_success(OKX_SET_LEVERAGE_ENDPOINT, &response)
         }
 
         fn duplicate_receipt(
@@ -9515,11 +10012,7 @@ pub mod live {
                         venue_id: self.config.venue_id.clone(),
                         endpoint: endpoint.to_owned(),
                         status_code: response.status_code(),
-                        reason: format!(
-                            "OKX code={code}: {}",
-                            json_field_value(response.body(), "msg")
-                                .unwrap_or_else(|| "missing msg".to_owned())
-                        ),
+                        reason: okx_business_rejection_reason(response.body(), code),
                     });
                 }
                 None => {
@@ -9578,6 +10071,36 @@ pub mod live {
                 OrderReference::VenueOrderId(order_id) => self.orders_by_external_id.get(order_id),
             }
         }
+    }
+
+    fn okx_set_leverage_body(
+        config: &OkxExecConfig,
+        inst_id: &str,
+        leverage: u32,
+    ) -> VenueExecResult<String> {
+        validate_perp_target_leverage("target_leverage", leverage)?;
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "instId", inst_id)?;
+        push_json_string_field(&mut body, &mut first, "lever", &leverage.to_string())?;
+        push_json_string_field(&mut body, &mut first, "mgnMode", config.td_mode())?;
+        if let Some(pos_side) = config.pos_side() {
+            push_json_string_field(&mut body, &mut first, "posSide", pos_side)?;
+        }
+        body.push('}');
+        Ok(body)
+    }
+
+    fn okx_business_rejection_reason(body: &str, code: &str) -> String {
+        let mut reason = format!(
+            "OKX code={code}: {}",
+            json_field_value(body, "msg").unwrap_or_else(|| "missing msg".to_owned())
+        );
+        if let Some(s_code) = json_field_value(body, "sCode") {
+            let s_msg = json_field_value(body, "sMsg").unwrap_or_else(|| "missing sMsg".to_owned());
+            reason.push_str(&format!("; OKX sCode={s_code}: {s_msg}"));
+        }
+        reason
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9658,6 +10181,7 @@ pub mod live {
         inst_id: &str,
         request: &SubmitOrderRequest,
     ) -> VenueExecResult<String> {
+        let quantity = okx_order_quantity(config, inst_id, request.quantity)?;
         let mut body = String::from("{");
         let mut first = true;
         push_json_string_field(&mut body, &mut first, "instId", inst_id)?;
@@ -9669,7 +10193,7 @@ pub mod live {
         match request.order_type {
             MutableOrderType::Market => {
                 push_json_string_field(&mut body, &mut first, "ordType", "market")?;
-                push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
+                push_json_string_field(&mut body, &mut first, "sz", &quantity)?;
             }
             MutableOrderType::Limit => {
                 push_json_string_field(
@@ -9678,7 +10202,7 @@ pub mod live {
                     "ordType",
                     okx_limit_ord_type(limit_time_in_force(request)),
                 )?;
-                push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
+                push_json_string_field(&mut body, &mut first, "sz", &quantity)?;
                 push_json_string_field(
                     &mut body,
                     &mut first,
@@ -9691,7 +10215,7 @@ pub mod live {
             }
             MutableOrderType::PostOnly => {
                 push_json_string_field(&mut body, &mut first, "ordType", "post_only")?;
-                push_json_string_field(&mut body, &mut first, "sz", &request.quantity.to_string())?;
+                push_json_string_field(&mut body, &mut first, "sz", &quantity)?;
                 push_json_string_field(
                     &mut body,
                     &mut first,
@@ -9722,6 +10246,17 @@ pub mod live {
         }
         body.push('}');
         Ok(body)
+    }
+
+    fn okx_order_quantity(
+        config: &OkxExecConfig,
+        inst_id: &str,
+        quantity: Quantity,
+    ) -> VenueExecResult<String> {
+        match config.quantity_step(inst_id) {
+            Some(step) => format_quantity_at_venue_step(quantity, step),
+            None => Ok(quantity.to_string()),
+        }
     }
 
     fn okx_cancel_order_body(
@@ -10032,6 +10567,8 @@ pub mod live {
     pub const BITGET_SPOT_ORDER_INFO_ENDPOINT: &str = "/api/v2/spot/trade/orderInfo";
     /// Bitget USDT-FUTURES 下单 endpoint。
     pub const BITGET_MIX_PLACE_ORDER_ENDPOINT: &str = "/api/v2/mix/order/place-order";
+    /// Bitget USDT-FUTURES 设置杠杆 endpoint。
+    pub const BITGET_MIX_SET_LEVERAGE_ENDPOINT: &str = "/api/v2/mix/account/set-leverage";
     /// Bitget USDT-FUTURES 撤单 endpoint。
     pub const BITGET_MIX_CANCEL_ORDER_ENDPOINT: &str = "/api/v2/mix/order/cancel-order";
     /// Bitget USDT-FUTURES 查单 endpoint。
@@ -10118,6 +10655,8 @@ pub mod live {
         margin_mode: String,
         margin_coin: String,
         trade_side: Option<String>,
+        target_leverage: Option<u32>,
+        quantity_step_by_symbol: BTreeMap<String, Quantity>,
         signing_policy: SigningPolicy,
     }
 
@@ -10177,6 +10716,8 @@ pub mod live {
                 margin_mode,
                 margin_coin,
                 trade_side: None,
+                target_leverage: None,
+                quantity_step_by_symbol: BTreeMap::new(),
                 signing_policy,
             })
         }
@@ -10185,6 +10726,30 @@ pub mod live {
             let trade_side = trade_side.into();
             validate_bitget_trade_side(&trade_side)?;
             self.trade_side = Some(trade_side);
+            Ok(self)
+        }
+
+        pub fn with_quantity_step(
+            mut self,
+            symbol: impl Into<String>,
+            step: Quantity,
+        ) -> VenueExecResult<Self> {
+            let symbol = symbol.into();
+            validate_bitget_symbol(&symbol)?;
+            validate_venue_quantity_step(step)?;
+            self.quantity_step_by_symbol.insert(symbol, step);
+            Ok(self)
+        }
+
+        pub fn with_target_leverage(mut self, leverage: u32) -> VenueExecResult<Self> {
+            if self.market != BitgetExecMarket::UsdtFutures {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "target_leverage",
+                    reason: "Bitget target leverage can only be configured for USDT-FUTURES",
+                });
+            }
+            validate_perp_target_leverage("target_leverage", leverage)?;
+            self.target_leverage = Some(leverage);
             Ok(self)
         }
 
@@ -10214,6 +10779,14 @@ pub mod live {
 
         pub fn trade_side(&self) -> Option<&str> {
             self.trade_side.as_deref()
+        }
+
+        pub fn quantity_step(&self, symbol: &str) -> Option<Quantity> {
+            self.quantity_step_by_symbol.get(symbol).copied()
+        }
+
+        pub fn target_leverage(&self) -> Option<u32> {
+            self.target_leverage
         }
 
         pub fn signing_policy(&self) -> &SigningPolicy {
@@ -10692,6 +11265,7 @@ pub mod live {
             }
 
             let symbol = bitget_symbol_from_instrument(self.config.market, &request.instrument_id)?;
+            self.ensure_target_leverage(&symbol, request.reduce_only)?;
             let body = bitget_order_create_body(&self.config, &symbol, &request)?;
             let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
             let endpoint = self.config.market.place_order_endpoint();
@@ -10783,11 +11357,8 @@ pub mod live {
             let symbol = bitget_symbol_from_instrument(self.config.market, &request.instrument_id)?;
             let request_path =
                 bitget_query_order_request_path(&self.config, &symbol, &request.order_ref)?;
-            let signing_request_id = SigningRequestId::new(format!(
-                "signing-request/bitget-exec/query-order/{}",
-                request.source_event_id
-            ))
-            .map_err(signing_error)?;
+            let signing_request_id =
+                order_query_signing_request_id("bitget-exec", &request.source_event_id)?;
             let signed = self.sign_with_request_id(
                 SigningPurpose::QueryOrder,
                 signing_request_id,
@@ -10804,6 +11375,33 @@ pub mod live {
                 request.source_event_id,
                 response.body(),
             )
+        }
+
+        fn ensure_target_leverage(
+            &mut self,
+            symbol: &str,
+            reduce_only: bool,
+        ) -> VenueExecResult<()> {
+            if reduce_only
+                || self.config.market != BitgetExecMarket::UsdtFutures
+                || self.config.trade_side.as_deref() == Some("close")
+            {
+                return Ok(());
+            }
+            let Some(leverage) = self.config.target_leverage else {
+                return Ok(());
+            };
+            let body = bitget_set_leverage_body(&self.config, symbol, leverage)?;
+            let signing_request_id = leverage_signing_request_id("bitget-exec", symbol, leverage)?;
+            let signed = self.sign_with_request_id(
+                SigningPurpose::SubmitOrder,
+                signing_request_id,
+                BitgetRestMethod::Post,
+                BITGET_MIX_SET_LEVERAGE_ENDPOINT.to_owned(),
+                body,
+            )?;
+            let response = self.dispatch_signed(&signed)?;
+            self.ensure_business_success(BITGET_MIX_SET_LEVERAGE_ENDPOINT, &response)
         }
 
         fn duplicate_receipt(
@@ -10975,6 +11573,22 @@ pub mod live {
         }
     }
 
+    fn bitget_set_leverage_body(
+        config: &BitgetExecConfig,
+        symbol: &str,
+        leverage: u32,
+    ) -> VenueExecResult<String> {
+        validate_perp_target_leverage("target_leverage", leverage)?;
+        let mut body = String::from("{");
+        let mut first = true;
+        push_json_string_field(&mut body, &mut first, "symbol", symbol)?;
+        push_json_string_field(&mut body, &mut first, "productType", "USDT-FUTURES")?;
+        push_json_string_field(&mut body, &mut first, "marginCoin", config.margin_coin())?;
+        push_json_string_field(&mut body, &mut first, "leverage", &leverage.to_string())?;
+        body.push('}');
+        Ok(body)
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct BitgetKnownOrder {
         symbol: String,
@@ -11066,6 +11680,7 @@ pub mod live {
         symbol: &str,
         request: &SubmitOrderRequest,
     ) -> VenueExecResult<String> {
+        let quantity = bitget_order_quantity(config, symbol, request.quantity)?;
         let mut body = String::from("{");
         let mut first = true;
         push_json_string_field(&mut body, &mut first, "symbol", symbol)?;
@@ -11081,12 +11696,7 @@ pub mod live {
         match request.order_type {
             MutableOrderType::Market => {
                 push_json_string_field(&mut body, &mut first, "orderType", "market")?;
-                push_json_string_field(
-                    &mut body,
-                    &mut first,
-                    "size",
-                    &request.quantity.to_string(),
-                )?;
+                push_json_string_field(&mut body, &mut first, "size", &quantity)?;
             }
             MutableOrderType::Limit => {
                 push_json_string_field(&mut body, &mut first, "orderType", "limit")?;
@@ -11096,12 +11706,7 @@ pub mod live {
                     "force",
                     bitget_force(limit_time_in_force(request)),
                 )?;
-                push_json_string_field(
-                    &mut body,
-                    &mut first,
-                    "size",
-                    &request.quantity.to_string(),
-                )?;
+                push_json_string_field(&mut body, &mut first, "size", &quantity)?;
                 push_json_string_field(
                     &mut body,
                     &mut first,
@@ -11115,12 +11720,7 @@ pub mod live {
             MutableOrderType::PostOnly => {
                 push_json_string_field(&mut body, &mut first, "orderType", "limit")?;
                 push_json_string_field(&mut body, &mut first, "force", "post_only")?;
-                push_json_string_field(
-                    &mut body,
-                    &mut first,
-                    "size",
-                    &request.quantity.to_string(),
-                )?;
+                push_json_string_field(&mut body, &mut first, "size", &quantity)?;
                 push_json_string_field(
                     &mut body,
                     &mut first,
@@ -11151,6 +11751,17 @@ pub mod live {
         }
         body.push('}');
         Ok(body)
+    }
+
+    fn bitget_order_quantity(
+        config: &BitgetExecConfig,
+        symbol: &str,
+        quantity: Quantity,
+    ) -> VenueExecResult<String> {
+        match config.quantity_step(symbol) {
+            Some(step) => format_quantity_at_venue_step(quantity, step),
+            None => Ok(quantity.to_string()),
+        }
     }
 
     fn bitget_cancel_order_body(
@@ -12566,6 +13177,50 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn binance_usdm_adapter_applies_symbol_quantity_step() {
+        let mut adapter = live::BinanceUsdmExecAdapter::new(
+            live::BinanceExecConfig::usdm_futures(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                "https://fapi.binance.com",
+                binance_signing_policy("kms-policy/binance-usdm-step-unit"),
+            )
+            .unwrap()
+            .with_quantity_step("USARUSDT", quantity("0.1").unwrap())
+            .unwrap(),
+            binance_test_signer(1_700_000_000_790),
+            RecordingTransport::ok(
+                200,
+                r#"{"symbol":"USARUSDT","orderId":993,"clientOrderId":"client:usdm:usar","status":"NEW"}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BINANCE-USDM"),
+                    account("account:binance-usdm-unit"),
+                    instrument("inst:BINANCE:USARUSDT:USDM-PERP"),
+                    OrderSide::Sell,
+                    MutableOrderType::Limit,
+                    quantity("4.786").unwrap(),
+                    Some(price("20.86").unwrap()),
+                    Some(OrderId::new("client:usdm:usar").unwrap()),
+                    IdempotencyKey::new("idem:binance:usdm:usar").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect("signed USD-M order dispatches with quantity step");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.signed_query.contains("symbol=USARUSDT"));
+        assert!(call.signed_query.contains("quantity=4.7"));
+        assert!(!call.signed_query.contains("quantity=4.786"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_order_query_uses_signed_get_confirmation_path() {
         let mut adapter = live::BinanceSpotExecAdapter::new(
             live::BinanceExecConfig::spot(
@@ -12891,6 +13546,50 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bybit_linear_adapter_applies_symbol_quantity_step() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-submit-unit"),
+            )
+            .unwrap()
+            .with_quantity_step("CHIPUSDT", quantity("10").unwrap())
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffc","orderLinkId":"bybitChipIoc"},"retExtInfo":{},"time":1700000000124}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BYBIT-LINEAR"),
+                    account("account:bybit-unit"),
+                    instrument("inst:BYBIT:CHIPUSDT:LINEAR-PERP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("1872.6591").unwrap(),
+                    Some(price("0.05340").unwrap()),
+                    Some(OrderId::new("bybitChipIoc").unwrap()),
+                    IdempotencyKey::new("idem:bybit:linear:chip:ioc").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect("signed Bybit order dispatches with quantity step");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.payload.contains(r#""symbol":"CHIPUSDT""#));
+        assert!(call.payload.contains(r#""qty":"1870""#));
+        assert!(!call.payload.contains(r#""qty":"1872.6591""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn bybit_spot_market_order_sets_base_coin_market_unit() {
         let mut adapter = live::BybitSpotExecAdapter::new(
             live::BybitExecConfig::spot(
@@ -13036,6 +13735,92 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bybit_order_query_compacts_long_source_event_for_signing_boundary() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-query-long-source-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"CHIPUSDT","orderId":"2d8fc08c-0f64-4fa5-8340-2583892bcbd8","orderLinkId":"bybitChipQuery","side":"Buy","orderStatus":"Filled","cumExecQty":"10","avgPrice":"0.053","cumExecFee":"0.01","feeCurrency":"USDT","updatedTime":"1700000001500"}]},"retExtInfo":{},"time":1700000002000}"#,
+            ),
+        )
+        .unwrap();
+        let long_source_event_id = format!(
+            "event:funding-arb-live-canary-order-query:first:{}:{}",
+            "pleg:plan:risk:trans:cross-exchange-funding-arb-binance-bybit-chipusdt-observer:0001",
+            "x".repeat(80)
+        );
+        assert!(long_source_event_id.len() > 160);
+
+        let update = adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                instrument("inst:BYBIT:CHIPUSDT:LINEAR-PERP"),
+                OrderReference::VenueOrderId(
+                    ExternalOrderId::new("bybit-linear:order:2d8fc08c-0f64-4fa5-8340-2583892bcbd8")
+                        .unwrap(),
+                ),
+                long_source_event_id.clone(),
+            ))
+            .expect("long source event ID must not overflow signing request ID");
+
+        assert_eq!(update.source_event_id, long_source_event_id);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+        assert_eq!(adapter.transport().calls.len(), 1);
+        let call = &adapter.transport().calls[0];
+        assert_eq!(call.method, live::BybitExecHttpMethod::Get);
+        assert!(call.payload.contains("symbol=CHIPUSDT"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_order_query_medium_source_event_does_not_overflow_audit_ref() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-query-medium-source-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"CHIPUSDT","orderId":"49049529-7e25-4c97-b21c-419f69986a39","orderLinkId":"bybitChipExit","side":"Sell","orderStatus":"Filled","cumExecQty":"1890","avgPrice":"0.0528","cumExecFee":"0.01","feeCurrency":"USDT","updatedTime":"1700000001500"}]},"retExtInfo":{},"time":1700000002000}"#,
+            ),
+        )
+        .unwrap();
+        let source_event_id = format!("event:funding-arb-exit-order-query:{}", "x".repeat(70));
+        let full_request_id = format!("signing-request/bybit-exec/query-order/{source_event_id}");
+        assert!(full_request_id.len() <= 160);
+        assert!(format!("signing-audit/{full_request_id}/pending").len() > 160);
+
+        let update = adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                instrument("inst:BYBIT:CHIPUSDT:LINEAR-PERP"),
+                OrderReference::VenueOrderId(
+                    ExternalOrderId::new("bybit-linear:order:49049529-7e25-4c97-b21c-419f69986a39")
+                        .unwrap(),
+                ),
+                source_event_id.clone(),
+            ))
+            .expect("medium source event ID must not overflow signing audit ref");
+
+        assert_eq!(update.source_event_id, source_event_id);
+        assert_eq!(update.status, OrderConfirmationStatus::Filled);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn okx_spot_adapter_signs_submits_and_cancels_known_order() {
         let mut adapter = live::OkxSpotExecAdapter::new(
             live::OkxExecConfig::spot(
@@ -13160,6 +13945,91 @@ mod tests {
         let call = &adapter.transport().calls[0];
         assert!(call.body.contains(r#""ordType":"ioc""#));
         assert!(call.body.contains(r#""reduceOnly":"true""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn okx_swap_adapter_applies_inst_id_quantity_step() {
+        let mut adapter = live::OkxSwapExecAdapter::new(
+            live::OkxExecConfig::swap(
+                venue("venue:OKX-SWAP"),
+                account("account:okx-unit"),
+                "https://www.okx.com",
+                okx_signing_policy("kms-policy/okx-swap-step-unit"),
+            )
+            .unwrap()
+            .with_quantity_step("USAR-USDT-SWAP", quantity("0.1").unwrap())
+            .unwrap(),
+            okx_test_signer("2026-05-17T12:34:56.789Z"),
+            RecordingOkxTransport::ok(
+                200,
+                r#"{"code":"0","msg":"","data":[{"ordId":"612269865356374017","clOrdId":"rvoP4","sCode":"0","sMsg":""}]}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:OKX-SWAP"),
+                    account("account:okx-unit"),
+                    instrument("inst:OKX:USAR-USDT-SWAP:SWAP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("4.786").unwrap(),
+                    Some(price("20.89").unwrap()),
+                    Some(OrderId::new("rvoP4").unwrap()),
+                    IdempotencyKey::new("idem:okx:swap:usar").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect("signed OKX swap order dispatches with quantity step");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""instId":"USAR-USDT-SWAP""#));
+        assert!(call.body.contains(r#""sz":"4.7""#));
+        assert!(!call.body.contains(r#""sz":"4.786""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn okx_business_rejection_reports_nested_s_code() {
+        let mut adapter = live::OkxSwapExecAdapter::new(
+            live::OkxExecConfig::swap(
+                venue("venue:OKX-SWAP"),
+                account("account:okx-unit"),
+                "https://www.okx.com",
+                okx_signing_policy("kms-policy/okx-swap-reject-unit"),
+            )
+            .unwrap(),
+            okx_test_signer("2026-05-17T12:34:56.789Z"),
+            RecordingOkxTransport::ok(
+                200,
+                r#"{"code":"1","msg":"All operations failed","data":[{"ordId":"","clOrdId":"rvoP3","sCode":"51000","sMsg":"Parameter posSide error"}]}"#,
+            ),
+        )
+        .unwrap();
+
+        let error = adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:OKX-SWAP"),
+                    account("account:okx-unit"),
+                    instrument("inst:OKX:BTC-USDT-SWAP:SWAP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("rvoP3").unwrap()),
+                    IdempotencyKey::new("idem:okx:swap:reject").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect_err("OKX business rejection must fail closed");
+        let message = error.to_string();
+
+        assert!(message.contains("OKX code=1: All operations failed"));
+        assert!(message.contains("OKX sCode=51000: Parameter posSide error"));
     }
 
     #[cfg(feature = "live-exec")]
@@ -13353,6 +14223,51 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bitget_usdt_futures_adapter_applies_symbol_quantity_step_without_trade_side() {
+        let mut adapter = live::BitgetUsdtFuturesExecAdapter::new(
+            live::BitgetExecConfig::usdt_futures(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-usdt-futures-submit-unit"),
+            )
+            .unwrap()
+            .with_quantity_step("CHIPUSDT", quantity("1").unwrap())
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000000124,"data":{"orderId":"1234567892","clientOid":"bitgetChipIoc"}}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BITGET-USDT-FUTURES"),
+                    account("account:bitget-unit"),
+                    instrument("inst:BITGET:CHIPUSDT:USDT-FUTURES"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("1869.8588").unwrap(),
+                    Some(price("0.05348").unwrap()),
+                    Some(OrderId::new("bitgetChipIoc").unwrap()),
+                    IdempotencyKey::new("idem:bitget:usdt-futures:chip:ioc").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect("signed Bitget order dispatches with quantity step");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""symbol":"CHIPUSDT""#));
+        assert!(call.body.contains(r#""size":"1869""#));
+        assert!(!call.body.contains(r#""size":"1869.8588""#));
+        assert!(!call.body.contains(r#""tradeSide":"#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn bitget_spot_market_order_uses_real_submit_body_without_price() {
         let mut adapter = live::BitgetSpotExecAdapter::new(
             live::BitgetExecConfig::spot(
@@ -13437,6 +14352,291 @@ mod tests {
             "/api/v2/mix/order/detail?symbol=BTCUSDT&productType=USDT-FUTURES&orderId=1234567890"
         );
         assert!(call.body.is_empty());
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn cex_perp_adapters_set_target_leverage_before_open_order() {
+        let mut binance = live::BinanceUsdmExecAdapter::new(
+            live::BinanceExecConfig::usdm_futures(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                "https://fapi.binance.com",
+                binance_signing_policy("kms-policy/binance-usdm-leverage-unit"),
+            )
+            .unwrap()
+            .with_target_leverage(1)
+            .unwrap(),
+            binance_test_signer(1_700_000_000_123),
+            RecordingTransport::ok(
+                200,
+                r#"{"symbol":"BTCUSDT","orderId":991,"clientOrderId":"clientUsdmLev1","status":"NEW"}"#,
+            ),
+        )
+        .unwrap();
+        binance
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                instrument("inst:BINANCE:BTCUSDT:USDM-PERP"),
+                OrderSide::Sell,
+                MutableOrderType::Limit,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("clientUsdmLev1").unwrap()),
+                IdempotencyKey::new("idem:binance:usdm:leverage:1").unwrap(),
+            ))
+            .expect("Binance leverage then order dispatches");
+        assert_eq!(binance.transport().calls.len(), 2);
+        assert_eq!(
+            binance.transport().calls[0].endpoint,
+            live::BINANCE_USDM_LEVERAGE_ENDPOINT
+        );
+        assert!(binance.transport().calls[0]
+            .signed_query
+            .contains("leverage=1"));
+        assert_eq!(
+            binance.transport().calls[1].endpoint,
+            live::BINANCE_USDM_ORDER_ENDPOINT
+        );
+
+        let mut bybit = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-leverage-unit"),
+            )
+            .unwrap()
+            .with_target_leverage(1)
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffa","orderLinkId":"bybitLev1"},"retExtInfo":{},"time":1700000000124}"#,
+            ),
+        )
+        .unwrap();
+        bybit
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                instrument("inst:BYBIT:BTCUSDT:LINEAR-PERP"),
+                OrderSide::Sell,
+                MutableOrderType::PostOnly,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("bybitLev1").unwrap()),
+                IdempotencyKey::new("idem:bybit:linear:leverage:1").unwrap(),
+            ))
+            .expect("Bybit leverage then order dispatches");
+        assert_eq!(bybit.transport().calls.len(), 2);
+        assert_eq!(
+            bybit.transport().calls[0].endpoint,
+            live::BYBIT_SET_LEVERAGE_ENDPOINT
+        );
+        assert!(bybit.transport().calls[0]
+            .payload
+            .contains(r#""buyLeverage":"1""#));
+        assert!(bybit.transport().calls[0]
+            .payload
+            .contains(r#""sellLeverage":"1""#));
+        assert_eq!(
+            bybit.transport().calls[1].endpoint,
+            live::BYBIT_ORDER_CREATE_ENDPOINT
+        );
+
+        let mut okx = live::OkxSwapExecAdapter::new(
+            live::OkxExecConfig::swap(
+                venue("venue:OKX-SWAP"),
+                account("account:okx-unit"),
+                "https://www.okx.com",
+                okx_signing_policy("kms-policy/okx-swap-leverage-unit"),
+            )
+            .unwrap()
+            .with_target_leverage(1)
+            .unwrap(),
+            okx_test_signer("2026-05-17T12:34:56.789Z"),
+            RecordingOkxTransport::ok(
+                200,
+                r#"{"code":"0","msg":"","data":[{"ordId":"612269865356374016","clOrdId":"okxLev1","sCode":"0","sMsg":""}]}"#,
+            ),
+        )
+        .unwrap();
+        okx.submit_order(SubmitOrderRequest::new(
+            venue("venue:OKX-SWAP"),
+            account("account:okx-unit"),
+            instrument("inst:OKX:BTC-USDT-SWAP:SWAP"),
+            OrderSide::Buy,
+            MutableOrderType::Limit,
+            quantity("0.001").unwrap(),
+            Some(price("43100.50").unwrap()),
+            Some(OrderId::new("okxLev1").unwrap()),
+            IdempotencyKey::new("idem:okx:swap:leverage:1").unwrap(),
+        ))
+        .expect("OKX leverage then order dispatches");
+        assert_eq!(okx.transport().calls.len(), 2);
+        assert_eq!(
+            okx.transport().calls[0].request_path,
+            live::OKX_SET_LEVERAGE_ENDPOINT
+        );
+        assert!(okx.transport().calls[0]
+            .body
+            .contains(r#""instId":"BTC-USDT-SWAP""#));
+        assert!(okx.transport().calls[0].body.contains(r#""lever":"1""#));
+        assert_eq!(
+            okx.transport().calls[1].request_path,
+            live::OKX_ORDER_ENDPOINT
+        );
+
+        let mut bitget = live::BitgetUsdtFuturesExecAdapter::new(
+            live::BitgetExecConfig::usdt_futures(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-usdt-futures-leverage-unit"),
+            )
+            .unwrap()
+            .with_target_leverage(1)
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000000124,"data":{"orderId":"1234567890","clientOid":"bitgetLev1"}}"#,
+            ),
+        )
+        .unwrap();
+        bitget
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                instrument("inst:BITGET:BTCUSDT:USDT-FUTURES"),
+                OrderSide::Sell,
+                MutableOrderType::Limit,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("bitgetLev1").unwrap()),
+                IdempotencyKey::new("idem:bitget:usdt-futures:leverage:1").unwrap(),
+            ))
+            .expect("Bitget leverage then order dispatches");
+        assert_eq!(bitget.transport().calls.len(), 2);
+        assert_eq!(
+            bitget.transport().calls[0].request_path,
+            live::BITGET_MIX_SET_LEVERAGE_ENDPOINT
+        );
+        assert!(bitget.transport().calls[0]
+            .body
+            .contains(r#""leverage":"1""#));
+        assert_eq!(
+            bitget.transport().calls[1].request_path,
+            live::BITGET_MIX_PLACE_ORDER_ENDPOINT
+        );
+    }
+
+    #[cfg(all(feature = "live-exec", unix))]
+    #[test]
+    fn aster_perp_adapter_sets_target_leverage_before_open_order() {
+        let mut adapter = live::AsterPerpExecAdapter::new(
+            live::AsterExecConfig::perp(
+                venue("venue:ASTER-USDT-FUTURES"),
+                account("account:aster-unit"),
+                live::ASTER_FUTURES_V3_BASE_URL,
+                Some("0x1111111111111111111111111111111111111111".to_owned()),
+                "0x2222222222222222222222222222222222222222",
+                aster_signing_policy("kms-policy/aster-perp-leverage-unit"),
+            )
+            .unwrap()
+            .with_target_leverage(1)
+            .unwrap(),
+            aster_test_signer(1_748_310_859_508_867),
+            RecordingAsterTransport::ok([
+                r#"{"symbol":"BTCUSDT","leverage":1,"maxNotionalValue":"1000000"}"#,
+                r#"{"symbol":"BTCUSDT","orderId":22542179,"clientOrderId":"asterLev1","side":"BUY","status":"NEW","executedQty":"0","updateTime":1700000000123}"#,
+            ]),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:ASTER-USDT-FUTURES"),
+                account("account:aster-unit"),
+                instrument("inst:ASTER:BTCUSDT:USDT-FUTURES"),
+                OrderSide::Buy,
+                MutableOrderType::PostOnly,
+                quantity("0.001").unwrap(),
+                Some(price("43100.50").unwrap()),
+                Some(OrderId::new("asterLev1").unwrap()),
+                IdempotencyKey::new("idem:aster:perp:leverage:1").unwrap(),
+            ))
+            .expect("Aster leverage then order dispatches");
+        assert_eq!(adapter.transport().calls.len(), 2);
+        assert_eq!(
+            adapter.transport().calls[0].endpoint,
+            live::ASTER_FUTURES_V3_LEVERAGE_ENDPOINT
+        );
+        assert!(adapter.transport().calls[0]
+            .signed_query
+            .contains("leverage=1"));
+        assert_eq!(
+            adapter.transport().calls[1].endpoint,
+            live::ASTER_FUTURES_V3_ORDER_ENDPOINT
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn hyperliquid_perp_adapter_sets_target_leverage_before_open_order() {
+        let mut adapter = live::HyperliquidPerpExecAdapter::new(
+            live::HyperliquidExecConfig::perp(
+                venue("venue:HYPERLIQUID-PERP"),
+                account("account:hyperliquid-unit"),
+                live::HYPERLIQUID_API_BASE_URL,
+                "0x3333333333333333333333333333333333333333",
+                "a",
+                hyperliquid_signing_policy("kms-policy/hyperliquid-perp-leverage-unit"),
+            )
+            .unwrap()
+            .with_target_leverage(1)
+            .unwrap()
+            .with_asset_id("BTCUSDT", 0)
+            .unwrap(),
+            StaticHyperliquidSigner,
+            RecordingHyperliquidTransport::ok([
+                r#"{"status":"ok","response":{"type":"default"}}"#,
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77747314}}]}}}"#,
+            ]),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:HYPERLIQUID-PERP"),
+                    account("account:hyperliquid-unit"),
+                    instrument("inst:HYPERLIQUID:BTCUSDT:PERP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("0x1234567890abcdef1234567890abcdef").unwrap()),
+                    IdempotencyKey::new("idem:hyperliquid:perp:leverage:1").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect("Hyperliquid leverage then order dispatches");
+        assert_eq!(adapter.transport().calls.len(), 2);
+        assert!(adapter.transport().calls[0]
+            .body
+            .contains(r#""type":"updateLeverage""#));
+        assert!(adapter.transport().calls[0]
+            .body
+            .contains(r#""isCross":true"#));
+        assert!(adapter.transport().calls[0]
+            .body
+            .contains(r#""leverage":1"#));
+        assert!(adapter.transport().calls[1]
+            .body
+            .contains(r#""type":"order""#));
     }
 
     #[cfg(feature = "live-exec")]

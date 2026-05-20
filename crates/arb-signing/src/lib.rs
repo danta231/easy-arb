@@ -594,12 +594,36 @@ impl SigningRequest {
 
 impl SigningAuditRef {
     pub fn for_request(request: &SigningRequest) -> Self {
-        Self(format!(
-            "signing-audit/{}/{}",
+        Self(compact_signing_audit_ref(
             request.request_id.as_str(),
-            ascii_suffix(request.payload_digest.as_str(), 8)
+            ascii_suffix(request.payload_digest.as_str(), 8),
         ))
     }
+
+    #[cfg(any(test, feature = "real-signing"))]
+    fn pending_for_request_id(request_id: &SigningRequestId) -> SigningResult<Self> {
+        Self::new(compact_signing_audit_ref(request_id.as_str(), "pending"))
+    }
+}
+
+fn compact_signing_audit_ref(request_id: &str, suffix: &str) -> String {
+    let full = format!("signing-audit/{request_id}/{suffix}");
+    if full.len() <= 160 {
+        return full;
+    }
+    format!(
+        "signing-audit/h{:016x}/{suffix}",
+        stable_signing_boundary_ref_hash(request_id)
+    )
+}
+
+fn stable_signing_boundary_ref_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// 签名策略。
@@ -2264,10 +2288,7 @@ pub mod real {
         }
 
         fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
-            SigningAuditRef::new(format!(
-                "signing-audit/{}/pending",
-                self.request_id.as_str()
-            ))
+            SigningAuditRef::pending_for_request_id(&self.request_id)
         }
 
         fn canonical_payload(&self, timestamp_millis: u64) -> String {
@@ -2388,10 +2409,7 @@ pub mod real {
         }
 
         fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
-            SigningAuditRef::new(format!(
-                "signing-audit/{}/pending",
-                self.request_id.as_str()
-            ))
+            SigningAuditRef::pending_for_request_id(&self.request_id)
         }
 
         fn canonical_payload(&self, nonce_micros: u64) -> String {
@@ -2536,10 +2554,7 @@ pub mod real {
         }
 
         fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
-            SigningAuditRef::new(format!(
-                "signing-audit/{}/pending",
-                self.request_id.as_str()
-            ))
+            SigningAuditRef::pending_for_request_id(&self.request_id)
         }
 
         fn public_payload(&self, timestamp_millis: u64) -> String {
@@ -2701,10 +2716,7 @@ pub mod real {
         }
 
         fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
-            SigningAuditRef::new(format!(
-                "signing-audit/{}/pending",
-                self.request_id.as_str()
-            ))
+            SigningAuditRef::pending_for_request_id(&self.request_id)
         }
 
         fn public_payload(&self, timestamp_rfc3339: &str) -> String {
@@ -2838,10 +2850,7 @@ pub mod real {
         }
 
         fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
-            SigningAuditRef::new(format!(
-                "signing-audit/{}/pending",
-                self.request_id.as_str()
-            ))
+            SigningAuditRef::pending_for_request_id(&self.request_id)
         }
 
         fn public_payload(&self, timestamp_millis: u64) -> String {
@@ -4804,6 +4813,34 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.as_str().starts_with("signing-audit/signing-request/"));
         assert!(first.as_str().ends_with("abcdef12"));
+    }
+
+    #[test]
+    fn long_request_id_audit_refs_are_compacted_before_boundary_validation() {
+        let request_id = SigningRequestId::new(format!("signing-request/{}", "a".repeat(138)))
+            .expect("long but valid request id");
+        let request = SigningRequest::new(
+            request_id.clone(),
+            SigningPolicyRef::new("mock-policy/null-signer").expect("policy ref"),
+            SigningPurpose::QueryOrder,
+            VenueId::new("venue:BYBIT-LINEAR").expect("venue id"),
+            AccountId::new("account:bybit-unit").expect("account id"),
+            SigningPayloadDigest::new(
+                "sha256:00000000000000000000000000000000000000000000000000000000abcdef12",
+            )
+            .expect("digest"),
+        );
+
+        let audit_ref = request.audit_ref();
+        let pending = SigningAuditRef::pending_for_request_id(&request_id)
+            .expect("pending audit ref compacts");
+
+        assert!(audit_ref.as_str().len() <= 160);
+        assert!(pending.as_str().len() <= 160);
+        assert!(audit_ref.as_str().starts_with("signing-audit/h"));
+        assert!(pending.as_str().starts_with("signing-audit/h"));
+        assert!(audit_ref.as_str().ends_with("abcdef12"));
+        assert!(pending.as_str().ends_with("pending"));
     }
 
     #[test]

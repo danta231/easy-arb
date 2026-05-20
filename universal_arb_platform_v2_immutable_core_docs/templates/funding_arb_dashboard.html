@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>跨所资金费率套利 observer</title>
+  <title>跨所资金费率套利观察器</title>
   <style>
     :root {
       color-scheme: dark;
@@ -505,8 +505,8 @@
 <body>
   <header class="topbar">
     <div>
-      <p class="kicker">cross-exchange funding arb</p>
-      <h1>跨所资金费率套利 observer</h1>
+      <p class="kicker">跨所资金费率套利 / funding arb</p>
+      <h1>跨所资金费率套利观察器</h1>
     </div>
     <div class="status-strip">
       <span id="runtime-status" class="pill">加载中</span>
@@ -520,7 +520,7 @@
       <article class="metric"><span>配对市场</span><strong id="metric-total">0</strong></article>
       <article class="metric"><span>报价来源</span><strong id="metric-sources">0</strong></article>
       <article class="metric"><span>来源错误</span><strong id="metric-source-errors">0</strong></article>
-      <article class="metric"><span>最小净 Funding</span><strong id="metric-min-net">0</strong></article>
+      <article class="metric"><span>最小净资金费率</span><strong id="metric-min-net">0</strong></article>
       <article class="metric"><span>下单阻断</span><strong id="metric-gate-blocked">0</strong></article>
       <article class="metric"><span>展示行数</span><strong id="metric-visible">0</strong></article>
     </section>
@@ -548,8 +548,8 @@
         <div class="spread-meter">
           <div class="venue-box">
             <strong id="top-venue-a">-</strong>
-            <span id="top-venue-a-funding">Funding -</span>
-            <span id="top-venue-a-book">Bid/Ask -</span>
+            <span id="top-venue-a-funding">资金费率 -</span>
+            <span id="top-venue-a-book">买一/卖一 -</span>
           </div>
           <div class="meter-mid">
             <strong id="top-spread">-</strong>
@@ -557,8 +557,8 @@
           </div>
           <div class="venue-box">
             <strong id="top-venue-b">-</strong>
-            <span id="top-venue-b-funding">Funding -</span>
-            <span id="top-venue-b-book">Bid/Ask -</span>
+            <span id="top-venue-b-funding">资金费率 -</span>
+            <span id="top-venue-b-book">买一/卖一 -</span>
           </div>
         </div>
       </article>
@@ -580,8 +580,8 @@
       <label>
         <span>排序</span>
         <select id="sort-mode">
-          <option value="net-desc">净 Funding 降序</option>
-          <option value="spread-desc">毛 Funding 差</option>
+          <option value="net-desc">净资金费率降序</option>
+          <option value="spread-desc">毛资金费率差</option>
           <option value="expected-desc">预期资金费</option>
           <option value="next-asc">下次结算</option>
           <option value="symbol-asc">交易对</option>
@@ -603,14 +603,14 @@
               <th>配对</th>
               <th>方向</th>
               <th>交易对</th>
-              <th>Venue A Bid</th>
-              <th>Venue A Ask</th>
-              <th>Venue A Funding</th>
-              <th>Venue A Interval</th>
-              <th>Venue B Bid</th>
-              <th>Venue B Ask</th>
-              <th>Venue B Funding</th>
-              <th>Venue B Interval</th>
+              <th>A 交易所买一</th>
+              <th>A 交易所卖一</th>
+              <th>A 资金费率</th>
+              <th>A 结算间隔</th>
+              <th>B 交易所买一</th>
+              <th>B 交易所卖一</th>
+              <th>B 资金费率</th>
+              <th>B 结算间隔</th>
               <th>毛差 bps</th>
               <th>成本 bps</th>
               <th>净收益 bps</th>
@@ -689,6 +689,165 @@
       return String(value ?? "-").replace(/(^|-)([a-z])/g, (_, dash, char) => `${dash}${char.toUpperCase()}`);
     }
 
+    const statusLabels = {
+      blocked: "阻断",
+      complete: "完整",
+      degraded: "降级",
+      "dispatch_attempted": "已触发下单",
+      "dry-run": "只演练",
+      command_failed: "命令失败",
+      healthy: "健康",
+      "guarded-live": "有门禁实盘",
+      insufficient: "不足",
+      live: "实盘",
+      matched: "匹配",
+      missing: "缺失",
+      no_candidate: "无候选",
+      notattempted: "未尝试",
+      notprovided: "未提供",
+      "pending_validation": "待校验",
+      pre_trade_flow_complete: "预交易流程完整",
+      rejected: "拒绝",
+      "ready_not_dispatched": "就绪但未下单",
+      report_missing: "报告缺失",
+      resident_event: "resident 事件",
+      unconfigured: "未配置",
+      unavailable: "不可用",
+      unknown: "未知",
+      validation_report: "校验报告"
+    };
+
+    const reasonCodeLabels = {
+      PRIVATE_BALANCE_UNAVAILABLE: "私有余额不可用",
+      PRIVATE_MARGIN_UNAVAILABLE: "私有保证金不可用",
+      PRIVATE_POSITION_UNAVAILABLE: "私有仓位不可用",
+      PRIVATE_EXECUTION_UNAVAILABLE: "私有执行回报不可用",
+      PRIVATE_RECONCILIATION_UNAVAILABLE: "私有对账不可用",
+      PRIVATE_SNAPSHOT_STALE: "私有快照过期",
+      RISK_DECISION_UNAVAILABLE: "风控决策不可用",
+      RISK_REJECTED: "风控拒绝",
+      SIGNAL_NOT_ALLOWED: "公开信号未通过",
+      FUNDING_SETTLEMENT_UNAVAILABLE: "资金费结算不可用",
+      SNAPSHOT_LINEAGE_UNAVAILABLE: "快照血缘不可用",
+      VENUE_EXECUTION_UNAVAILABLE: "交易所执行能力不可用"
+    };
+
+    const exactReasonLabels = new Map([
+      ["strategy did not emit a funding-arb candidate", "策略未产出资金费率套利候选"],
+      ["risk decision is unavailable; no funding-arb dispatch may be built", "风控决策不可用，不能构建资金费率套利下单分发"],
+      ["risk decision is Rejected; no funding-arb dispatch may be built", "风控决策为拒绝，不能构建资金费率套利下单分发"],
+      ["portfolio state missing data flag blocks live funding arb", "组合状态缺少数据，阻断实盘资金费率套利"],
+      ["private account balance snapshot missing", "私有账户余额快照缺失"],
+      ["private account snapshot is incomplete for funding-arb accounts", "资金费率套利账户的私有账户快照不完整"],
+      ["private position snapshot has no checked flat-position entries", "私有仓位快照没有已检查的空仓记录"],
+      ["private execution fill/order reconciliation snapshot was not provided", "未提供私有执行成交/订单对账快照"],
+      ["funding settlement ledger has no entries", "资金费结算账本没有记录"],
+      ["funding-arb guarded dry-run never releases the manual approval gate", "资金费率套利受保护演练（guarded dry-run）不会释放人工审批门禁"],
+      ["funding-arb manual approval plan preview status is NotAttempted", "资金费率套利人工审批计划预览尚未尝试"],
+      ["funding-arb execution constraints cannot be checked without a candidate", "没有候选，无法检查资金费率套利执行约束"],
+      ["funding-arb execution preflight cannot run because no candidate was emitted", "没有候选，资金费率套利执行预检不能运行"],
+      ["funding arb canary could not build a manual approval plan from the current candidate", "资金费率套利 canary 检查无法基于当前候选构建人工审批计划"],
+      ["missing available balance", "缺少可用余额"]
+    ]);
+
+    const reasonPhraseLabels = [
+      ["private read-only snapshot unavailable", "私有只读快照不可用"],
+      ["live market data failed", "实时市场/私有数据获取失败"],
+      ["private account balance snapshot missing", "私有账户余额快照缺失"],
+      ["private account snapshot is incomplete for funding-arb accounts", "资金费率套利账户的私有账户快照不完整"],
+      ["private position snapshot has no checked flat-position entries", "私有仓位快照没有已检查的空仓记录"],
+      ["private execution fill/order reconciliation snapshot was not provided", "未提供私有执行成交/订单对账快照"],
+      ["funding settlement ledger has no entries", "资金费结算账本没有记录"],
+      ["strategy did not emit a funding-arb candidate", "策略未产出资金费率套利候选"],
+      ["risk decision is unavailable; no funding-arb dispatch may be built", "风控决策不可用，不能构建资金费率套利下单分发"],
+      ["risk decision is Rejected; no funding-arb dispatch may be built", "风控决策为拒绝，不能构建资金费率套利下单分发"],
+      ["portfolio state missing data flag blocks live funding arb", "组合状态缺少数据，阻断实盘资金费率套利"],
+      ["signing secret source is unavailable", "签名密钥来源不可用"],
+      ["manual gate release preview is not Ready", "人工门禁释放预览未就绪"],
+      ["kill switch is triggered for the preflight config", "预检配置触发了停机开关（kill switch）"],
+      ["mutable execution task is not started", "可变执行任务未启动"],
+      ["funding-arb guarded dry-run never releases the manual approval gate", "资金费率套利受保护演练（guarded dry-run）不会释放人工审批门禁"],
+      ["funding-arb manual approval plan preview status is NotAttempted", "资金费率套利人工审批计划预览尚未尝试"],
+      ["funding-arb execution constraints cannot be checked without a candidate", "没有候选，无法检查资金费率套利执行约束"],
+      ["funding-arb execution preflight cannot run because no candidate was emitted", "没有候选，资金费率套利执行预检不能运行"],
+      ["funding arb canary could not build a manual approval plan from the current candidate", "资金费率套利 canary 检查无法基于当前候选构建人工审批计划"],
+      ["Aster private signed GET", "Aster 私有签名 GET"],
+      ["Binance private signed GET", "Binance 私有签名 GET"],
+      ["Bybit private signed GET", "Bybit 私有签名 GET"],
+      ["Bitget private signed GET", "Bitget 私有签名 GET"],
+      ["Hyperliquid private signed GET", "Hyperliquid 私有签名 GET"],
+      ["returned HTTP", "返回 HTTP"],
+      ["Signature check failed", "签名校验失败"],
+      ["Timestamp for this request was 1000ms ahead of the server's time.", "请求时间戳比服务器时间快 1000ms"],
+      ["Timestamp for this request", "请求时间戳"],
+      ["ahead of the server's time", "快于服务器时间"],
+      ["server's time", "服务器时间"],
+      ["was", "为"],
+      ["missing available balance", "缺少可用余额"]
+    ];
+
+    function labelWithRaw(label, raw) {
+      return raw && label !== raw ? `${label}（${raw}）` : label;
+    }
+
+    function statusLabel(value) {
+      const raw = String(value ?? "").trim();
+      if (!raw || raw === "-") return "-";
+      const label = statusLabels[raw] || statusLabels[raw.toLowerCase()];
+      return label ? labelWithRaw(label, raw) : `未本地化状态：${raw}`;
+    }
+
+    function hasChineseText(value) {
+      return /[\u3400-\u9fff]/.test(value);
+    }
+
+    function translateReasonDetail(raw) {
+      const exact = exactReasonLabels.get(raw);
+      if (exact) return exact;
+      if (hasChineseText(raw)) return raw;
+      let translated = raw;
+      for (const [needle, label] of reasonPhraseLabels) {
+        translated = translated.split(needle).join(label);
+      }
+      const status = statusLabels[raw] || statusLabels[raw.toLowerCase()];
+      if (status) return labelWithRaw(status, raw);
+      return translated !== raw ? translated : `未本地化原因：${raw}`;
+    }
+
+    function formatFundingReason(value) {
+      const raw = String(value ?? "").trim();
+      if (!raw || raw === "-") return "-";
+      const codeMatch = raw.match(/^([A-Z][A-Z0-9_]+)(?::\s*(.*))?$/);
+      if (codeMatch && reasonCodeLabels[codeMatch[1]]) {
+        const detail = codeMatch[2] ? translateReasonDetail(codeMatch[2]) : "";
+        return detail
+          ? `${reasonCodeLabels[codeMatch[1]]}（${codeMatch[1]}）：${detail}`
+          : `${reasonCodeLabels[codeMatch[1]]}（${codeMatch[1]}）`;
+      }
+      return translateReasonDetail(raw);
+    }
+
+    function localizedPreview(value, key = "") {
+      if (Array.isArray(value)) return value.map((item) => localizedPreview(item, key));
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => (
+          [childKey, localizedPreview(childValue, childKey)]
+        )));
+      }
+      if (typeof value !== "string") return value;
+      if (key === "reason" || key.endsWith("_reason") || key.endsWith("_reasons") || key.endsWith("_codes") || key.endsWith("_error") || key === "error" || key === "last_error") {
+        return formatFundingReason(value);
+      }
+      if (key === "status" || key.endsWith("_status") || key === "source" || key === "source_status" || key === "dispatch_status" || key === "execution_mode" || key === "validation_result_class") {
+        return statusLabel(value);
+      }
+      return value;
+    }
+
+    function renderPreview(value) {
+      $("api-preview").textContent = JSON.stringify(localizedPreview(value), null, 2);
+    }
+
     function pairLabel(row) {
       return `${venueLabel(row.venue_a_family)} / ${venueLabel(row.venue_b_family)}`;
     }
@@ -696,7 +855,7 @@
     function directionLabel(row) {
       const longVenue = row.long_venue_family ? venueLabel(row.long_venue_family) : "-";
       const shortVenue = row.short_venue_family ? venueLabel(row.short_venue_family) : "-";
-      return `${longVenue} long / ${shortVenue} short`;
+      return `做多 ${longVenue} / 做空 ${shortVenue}`;
     }
 
     function executionRowsByPair(execution) {
@@ -712,7 +871,7 @@
         return {
           label: "未校验",
           className: "badge pending-badge",
-          reasons: ["尚未看到该候选的下单校验报告；observer 只负责发现机会，真实下单需要 auto-once 或 resident live runner 继续通过门禁。"]
+          reasons: ["尚未看到该候选的下单校验报告；观察器只负责发现机会，真实下单需要 auto-once 单次执行或 resident live 常驻执行器继续通过门禁。"]
         };
       }
       if (execution.dispatch_attempted) {
@@ -730,7 +889,7 @@
 
     function gateHtml(status) {
       return `<div class="gate-list"><span class="${status.className}">${escapeHtml(status.label)}</span>${status.reasons.slice(0, 3).map((reason) => (
-        `<span>${escapeHtml(reason)}</span>`
+        `<span>${escapeHtml(formatFundingReason(reason))}</span>`
       )).join("")}</div>`;
     }
 
@@ -824,13 +983,13 @@
         $("top-gate").textContent = "-";
         $("top-status").textContent = "无候选";
         $("top-venue-a").textContent = "-";
-        $("top-venue-a-funding").textContent = "Funding -";
-        $("top-venue-a-book").textContent = "Bid/Ask -";
+        $("top-venue-a-funding").textContent = "资金费率 -";
+        $("top-venue-a-book").textContent = "买一/卖一 -";
         $("top-spread").textContent = "-";
         $("top-cost").textContent = "成本 -";
         $("top-venue-b").textContent = "-";
-        $("top-venue-b-funding").textContent = "Funding -";
-        $("top-venue-b-book").textContent = "Bid/Ask -";
+        $("top-venue-b-funding").textContent = "资金费率 -";
+        $("top-venue-b-book").textContent = "买一/卖一 -";
         return;
       }
       $("top-pair").textContent = row.pair_id || pairLabel(row);
@@ -839,16 +998,16 @@
       $("top-expected").textContent = usd(row.expected_funding_usd);
       $("top-next").textContent = nextFunding(row);
       const gate = gateStatus(row, executionByPair);
-      $("top-gate").textContent = `${gate.label}: ${gate.reasons[0] || "-"}`;
-      $("top-status").textContent = row.source_status || "complete";
+      $("top-gate").textContent = `${gate.label}: ${formatFundingReason(gate.reasons[0] || "-")}`;
+      $("top-status").textContent = statusLabel(row.source_status || "complete");
       $("top-venue-a").textContent = venueLabel(row.venue_a_family);
-      $("top-venue-a-funding").textContent = `Funding ${rate(row.venue_a_funding_rate)} / ${row.venue_a_funding_interval_hours || "-"}h`;
-      $("top-venue-a-book").textContent = `Bid ${row.venue_a_bid || "-"} / Ask ${row.venue_a_ask || "-"}`;
+      $("top-venue-a-funding").textContent = `资金费率 ${rate(row.venue_a_funding_rate)} / ${row.venue_a_funding_interval_hours || "-"}h`;
+      $("top-venue-a-book").textContent = `买一 ${row.venue_a_bid || "-"} / 卖一 ${row.venue_a_ask || "-"}`;
       $("top-spread").textContent = bps(row.gross_funding_spread_bps);
       $("top-cost").textContent = `成本 ${bps(row.total_cost_bps)}`;
       $("top-venue-b").textContent = venueLabel(row.venue_b_family);
-      $("top-venue-b-funding").textContent = `Funding ${rate(row.venue_b_funding_rate)} / ${row.venue_b_funding_interval_hours || "-"}h`;
-      $("top-venue-b-book").textContent = `Bid ${row.venue_b_bid || "-"} / Ask ${row.venue_b_ask || "-"}`;
+      $("top-venue-b-funding").textContent = `资金费率 ${rate(row.venue_b_funding_rate)} / ${row.venue_b_funding_interval_hours || "-"}h`;
+      $("top-venue-b-book").textContent = `买一 ${row.venue_b_bid || "-"} / 卖一 ${row.venue_b_ask || "-"}`;
     }
 
     function renderRows(rows, executionByPair) {
@@ -880,7 +1039,7 @@
           <td class="${signedClass(row.expected_funding_usd)}">${escapeHtml(usd(row.expected_funding_usd))}</td>
           <td>${escapeHtml(nextFunding(row))}</td>
           <td>${candidate}</td>
-          <td class="reason-cell">${escapeHtml(row.reason || row.source_status)}</td>
+          <td class="reason-cell">${escapeHtml(formatFundingReason(row.reason || row.source_status))}</td>
           <td class="gate-cell">${gateHtml(gate)}</td>
         </tr>`;
       }).join("");
@@ -889,7 +1048,7 @@
     function render(snapshot, execution) {
       const rows = snapshot.rows || [];
       const executionByPair = executionRowsByPair(execution);
-      $("runtime-status").textContent = snapshot.status || "未知";
+      $("runtime-status").textContent = statusLabel(snapshot.status || "unknown");
       $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : snapshot.last_error ? "error" : ""}`;
       $("updated-at").textContent = snapshot.updated_at || "尚未更新";
       $("metric-candidates").textContent = snapshot.candidate_count ?? 0;
@@ -902,8 +1061,8 @@
         return row.is_candidate && gate.label !== "已触发";
       }).length;
       $("api-state").textContent = snapshot.last_error ? "上游错误" : execution?.status === "degraded" ? "门禁报告异常" : "正常";
-      $("api-state").title = snapshot.last_error || execution?.last_error || "正常";
-      $("api-preview").textContent = JSON.stringify({ snapshot, execution }, null, 2);
+      $("api-state").title = snapshot.last_error || execution?.last_error ? formatFundingReason(snapshot.last_error || execution?.last_error) : "正常";
+      renderPreview({ snapshot, execution });
       updateVenueFilter(rows);
       renderTopOpportunity(rows, executionByPair);
       renderRows(rows, executionByPair);
@@ -935,9 +1094,9 @@
       $("api-preview").textContent = "加载中";
       try {
         const data = await requestJson(url);
-        $("api-preview").textContent = JSON.stringify(data, null, 2);
+        renderPreview(data);
       } catch (error) {
-        $("api-preview").textContent = error.message;
+        $("api-preview").textContent = formatFundingReason(error.message);
       }
     }
 
