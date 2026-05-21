@@ -193,7 +193,26 @@ const BINANCE_SIGNING_TIMESTAMP_SAFETY_MARGIN_MS: i128 = 500;
 #[cfg(feature = "live-exec")]
 const BINANCE_PRIVATE_RECV_WINDOW_ENV: &str = "ARB_RUNTIME_BINANCE_RECV_WINDOW_MS";
 #[cfg(feature = "live-exec")]
+const BINANCE_POSITION_MODE_ENV: &str = "BASIS_OBSERVER_BINANCE_POSITION_MODE";
+#[cfg(feature = "live-exec")]
 const BYBIT_POSITION_MODE_ENV: &str = "BASIS_OBSERVER_BYBIT_POSITION_MODE";
+const FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT_ENV: &str =
+    "BASIS_OBSERVER_FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT";
+const FUNDING_ARB_TRADFI_PERP_SYMBOLS_ENV: &str = "BASIS_OBSERVER_TRADFI_PERP_SYMBOLS";
+const FUNDING_ARB_STOCK_PERP_SYMBOLS_ENV: &str = "BASIS_OBSERVER_STOCK_PERP_SYMBOLS";
+const FUNDING_ARB_COMMODITY_PERP_SYMBOLS_ENV: &str = "BASIS_OBSERVER_COMMODITY_PERP_SYMBOLS";
+const FUNDING_ARB_PRE_MARKET_PERP_SYMBOLS_ENV: &str = "BASIS_OBSERVER_PRE_MARKET_PERP_SYMBOLS";
+const FUNDING_ARB_TRADFI_PERP_TAG: &str = "tradfi_perp";
+const FUNDING_ARB_STOCK_PERP_TAG: &str = "stock_perp";
+const FUNDING_ARB_COMMODITY_PERP_TAG: &str = "commodity_perp";
+const FUNDING_ARB_PRE_MARKET_PERP_TAG: &str = "pre_market_perp";
+const FUNDING_ARB_DEFAULT_STOCK_PERP_BASES: &[&str] = &[
+    "AAPL", "AMD", "AMZN", "AVGO", "BABA", "COIN", "CSCO", "GOOGL", "HOOD", "META", "MSFT", "MSTR",
+    "NFLX", "NVDA", "ORCL", "PAYP", "PLTR", "TSLA",
+];
+const FUNDING_ARB_DEFAULT_COMMODITY_PERP_BASES: &[&str] =
+    &["BRENT", "GOLD", "OIL", "SILVER", "WTI", "XAG", "XAU"];
+const FUNDING_ARB_DEFAULT_PRE_MARKET_PERP_BASES: &[&str] = &["OPENAI", "SPACEX"];
 #[cfg(feature = "live-exec")]
 const PRIVATE_CURL_MAX_ATTEMPTS_ENV: &str = "ARB_RUNTIME_PRIVATE_CURL_MAX_ATTEMPTS";
 #[cfg(feature = "live-exec")]
@@ -15786,6 +15805,11 @@ fn execute_funding_arb_live_canary(
                 "first funding perp leg reached terminal non-filled status `{}`; second leg skipped",
                 first_update.status.as_str()
             ));
+            if cancel_update_confirms_flat_without_fill(&first_update)
+                && outcome.protection.residual_risk.is_none()
+            {
+                outcome.flat_after_cancel = true;
+            }
             return Ok(outcome);
         }
         OrderConfirmationStatus::Unknown => {
@@ -16024,7 +16048,29 @@ fn apply_funding_arb_entry_time_in_force_ioc(
 #[cfg(feature = "live-exec")]
 fn apply_funding_arb_binance_position_side(
     dispatch_plan: &mut ExecutionDispatchPlan,
+    symbol: &str,
+    private_position_raw_snapshot_path: Option<&Path>,
 ) -> RuntimeResult<()> {
+    let mode =
+        resolve_funding_arb_binance_position_mode(symbol, private_position_raw_snapshot_path)?;
+    apply_funding_arb_binance_position_side_for_mode(dispatch_plan, mode)
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FundingArbBinancePositionMode {
+    OneWay,
+    Hedge,
+}
+
+#[cfg(feature = "live-exec")]
+fn apply_funding_arb_binance_position_side_for_mode(
+    dispatch_plan: &mut ExecutionDispatchPlan,
+    mode: FundingArbBinancePositionMode,
+) -> RuntimeResult<()> {
+    if mode != FundingArbBinancePositionMode::Hedge {
+        return Ok(());
+    }
     for planned in &mut dispatch_plan.requests {
         if planned.request.venue_id.as_str() != BINANCE_BASIS_PERP_VENUE_ID {
             continue;
@@ -16044,6 +16090,76 @@ fn apply_funding_arb_binance_position_side(
         planned.request = planned.request.clone().with_position_side(position_side);
     }
     Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_funding_arb_binance_position_mode(
+    symbol: &str,
+    private_position_raw_snapshot_path: Option<&Path>,
+) -> RuntimeResult<FundingArbBinancePositionMode> {
+    if let Ok(raw) = std::env::var(BINANCE_POSITION_MODE_ENV) {
+        return parse_funding_arb_binance_position_mode(&raw);
+    }
+    if let Some(path) = private_position_raw_snapshot_path {
+        if let Some(mode) = infer_binance_position_mode_from_raw_snapshot(path, symbol)? {
+            return Ok(mode);
+        }
+    }
+    Ok(FundingArbBinancePositionMode::OneWay)
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_funding_arb_binance_position_mode(
+    raw: &str,
+) -> RuntimeResult<FundingArbBinancePositionMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "one-way" | "oneway" | "one_way" | "single" | "0" => {
+            Ok(FundingArbBinancePositionMode::OneWay)
+        }
+        "hedge" | "dual" | "two-way" | "twoway" | "two_way" | "1" => {
+            Ok(FundingArbBinancePositionMode::Hedge)
+        }
+        value => Err(RuntimeError::UnsafeConfig {
+            message: format!("{BINANCE_POSITION_MODE_ENV} must be one-way or hedge, got `{value}`"),
+        }),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn infer_binance_position_mode_from_raw_snapshot(
+    path: &Path,
+    symbol: &str,
+) -> RuntimeResult<Option<FundingArbBinancePositionMode>> {
+    let input = read_utf8(path)?;
+    let snapshot =
+        parse_funding_private_raw_snapshot_json(&input, "funding private position raw snapshot")?;
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(symbol));
+    let mut saw_one_way = false;
+    for statement in snapshot
+        .statements
+        .iter()
+        .filter(|statement| normalize_venue_family(&statement.venue_family) == "binance")
+    {
+        let mut object_slices = Vec::new();
+        collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+        for object in object_slices {
+            let fields = parse_json_object_value_slices(object)?;
+            let Some(raw_symbol) = first_json_scalar_string(&fields, &["symbol"])? else {
+                continue;
+            };
+            if funding_display_symbol(&funding_base_asset_from_symbol(&raw_symbol))
+                != expected_symbol
+            {
+                continue;
+            }
+            match first_json_scalar_string(&fields, &["positionSide"])?.as_deref() {
+                Some("LONG" | "SHORT") => return Ok(Some(FundingArbBinancePositionMode::Hedge)),
+                Some("BOTH") => saw_one_way = true,
+                _ => {}
+            }
+        }
+    }
+    Ok(saw_one_way.then_some(FundingArbBinancePositionMode::OneWay))
 }
 
 #[cfg(feature = "live-exec")]
@@ -23721,6 +23837,7 @@ fn funding_arb_pair_row(
         is_candidate,
         reason,
         source_status,
+        product_tags: funding_arb_product_tags_for_symbol(&symbol),
     };
 
     if !funding_arb_source_status_allows_perp(&venue_a.source_status)
@@ -27097,6 +27214,7 @@ pub struct FundingArbMarketRow {
     pub is_candidate: bool,
     pub reason: Option<String>,
     pub source_status: String,
+    pub product_tags: Vec<String>,
 }
 
 /// funding arb monitor 快照。
@@ -27781,6 +27899,7 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
                 .collect::<Vec<_>>(),
             funding_arb_live_readiness(FundingArbLiveReadinessInput {
                 spec,
+                observed_at: ingested_at,
                 portfolio_state: &portfolio_state,
                 signal_allowed: true,
                 risk_decision: Some(&decision),
@@ -27823,6 +27942,7 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
             Vec::new(),
             funding_arb_live_readiness(FundingArbLiveReadinessInput {
                 spec,
+                observed_at: ingested_at,
                 portfolio_state: &portfolio_state,
                 signal_allowed: false,
                 risk_decision: None,
@@ -28473,8 +28593,287 @@ fn utc_timestamp_abs_delta_ms(left: UtcTimestamp, right: UtcTimestamp) -> i128 {
     left_ns.saturating_sub(right_ns).abs() / 1_000_000
 }
 
+fn funding_arb_product_tags_for_symbol(symbol: &str) -> Vec<String> {
+    let base = normalize_funding_arb_product_symbol(symbol);
+    let mut tags = BTreeSet::new();
+    if funding_arb_product_symbol_is_tagged(
+        &base,
+        FUNDING_ARB_DEFAULT_STOCK_PERP_BASES,
+        FUNDING_ARB_STOCK_PERP_SYMBOLS_ENV,
+    ) {
+        tags.insert(FUNDING_ARB_TRADFI_PERP_TAG.to_owned());
+        tags.insert(FUNDING_ARB_STOCK_PERP_TAG.to_owned());
+    }
+    if funding_arb_product_symbol_is_tagged(
+        &base,
+        FUNDING_ARB_DEFAULT_COMMODITY_PERP_BASES,
+        FUNDING_ARB_COMMODITY_PERP_SYMBOLS_ENV,
+    ) {
+        tags.insert(FUNDING_ARB_TRADFI_PERP_TAG.to_owned());
+        tags.insert(FUNDING_ARB_COMMODITY_PERP_TAG.to_owned());
+    }
+    if funding_arb_product_symbol_is_tagged(
+        &base,
+        FUNDING_ARB_DEFAULT_PRE_MARKET_PERP_BASES,
+        FUNDING_ARB_PRE_MARKET_PERP_SYMBOLS_ENV,
+    ) {
+        tags.insert(FUNDING_ARB_TRADFI_PERP_TAG.to_owned());
+        tags.insert(FUNDING_ARB_PRE_MARKET_PERP_TAG.to_owned());
+    }
+    if funding_arb_env_symbol_set_contains(FUNDING_ARB_TRADFI_PERP_SYMBOLS_ENV, &base) {
+        tags.insert(FUNDING_ARB_TRADFI_PERP_TAG.to_owned());
+    }
+    tags.into_iter().collect()
+}
+
+fn funding_arb_product_tags_for_spec(spec: &CrossExchangeFundingArbPipelineSpec) -> Vec<String> {
+    funding_arb_product_tags_for_symbol(&spec.strategy_config.symbol.symbol)
+}
+
+fn normalize_funding_arb_product_tag(raw: &str) -> Option<String> {
+    let tag = raw.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        tag.as_str(),
+        FUNDING_ARB_TRADFI_PERP_TAG
+            | FUNDING_ARB_STOCK_PERP_TAG
+            | FUNDING_ARB_COMMODITY_PERP_TAG
+            | FUNDING_ARB_PRE_MARKET_PERP_TAG
+    )
+    .then_some(tag)
+}
+
+fn funding_arb_product_symbol_is_tagged(
+    base: &str,
+    default_bases: &[&str],
+    env_name: &str,
+) -> bool {
+    default_bases.iter().any(|candidate| *candidate == base)
+        || funding_arb_env_symbol_set_contains(env_name, base)
+}
+
+fn funding_arb_env_symbol_set_contains(env_name: &str, base: &str) -> bool {
+    let Ok(raw) = std::env::var(env_name) else {
+        return false;
+    };
+    raw.split(',')
+        .map(normalize_funding_arb_product_symbol)
+        .any(|candidate| candidate == base)
+}
+
+fn normalize_funding_arb_product_symbol(symbol: &str) -> String {
+    basis_identifier_component(&funding_base_asset_from_symbol(symbol)).to_ascii_uppercase()
+}
+
+fn funding_arb_restricted_product_preflight_readiness_check(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    observed_at: UtcTimestamp,
+    product_tags: &[String],
+) -> FundingArbLiveReadinessCheck {
+    let path = std::env::var_os(FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT_ENV).map(PathBuf::from);
+    funding_arb_restricted_product_preflight_readiness_check_with_path(
+        spec,
+        observed_at,
+        product_tags,
+        path.as_deref(),
+    )
+}
+
+fn funding_arb_restricted_product_preflight_readiness_check_with_path(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    observed_at: UtcTimestamp,
+    product_tags: &[String],
+    preflight_path: Option<&Path>,
+) -> FundingArbLiveReadinessCheck {
+    if product_tags.is_empty() {
+        return funding_arb_live_readiness_observation_check_owned(
+            "restricted_product_preflight",
+            "NotRequired",
+            Some("RESTRICTED_PRODUCT_NOT_DETECTED".to_owned()),
+            Some("funding-arb candidate has no restricted product tags".to_owned()),
+        );
+    }
+    let Some(path) = preflight_path else {
+        return funding_arb_live_readiness_check_owned(
+            "restricted_product_preflight",
+            false,
+            Some("RESTRICTED_PRODUCT_PREFLIGHT_REQUIRED".to_owned()),
+            Some(format!(
+                "restricted funding-arb product tags {} require account preflight evidence in {FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT_ENV}; confirm account_enabled, agreement_accepted, jurisdiction_allowed, and symbol_tradable before live dispatch",
+                product_tags.join(",")
+            )),
+        );
+    };
+    match validate_funding_arb_restricted_product_preflight(spec, observed_at, product_tags, path) {
+        Ok(()) => funding_arb_live_readiness_check_owned(
+            "restricted_product_preflight",
+            true,
+            Some("RESTRICTED_PRODUCT_PREFLIGHT_NOT_CONFIRMED".to_owned()),
+            None,
+        ),
+        Err(reason) => funding_arb_live_readiness_check_owned(
+            "restricted_product_preflight",
+            false,
+            Some("RESTRICTED_PRODUCT_PREFLIGHT_NOT_CONFIRMED".to_owned()),
+            Some(reason),
+        ),
+    }
+}
+
+fn validate_funding_arb_restricted_product_preflight(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    observed_at: UtcTimestamp,
+    product_tags: &[String],
+    path: &Path,
+) -> Result<(), String> {
+    let input = read_utf8(path).map_err(|error| {
+        format!(
+            "restricted product preflight file `{}` could not be read: {error}",
+            path.display()
+        )
+    })?;
+    let records = json_object_slices(&input).map_err(|error| {
+        format!(
+            "restricted product preflight file `{}` is not a JSON object or object array: {error}",
+            path.display()
+        )
+    })?;
+    let mut errors = Vec::new();
+    for record in records {
+        let fields = match parse_json_object_value_slices(record) {
+            Ok(fields) => fields,
+            Err(error) => {
+                errors.push(error.to_string());
+                continue;
+            }
+        };
+        match validate_funding_arb_restricted_product_preflight_fields(
+            spec,
+            observed_at,
+            product_tags,
+            &fields,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(format!(
+        "restricted product preflight did not contain a confirmed record for symbol {} venues {} tags {}; checked {} record(s); {}",
+        spec.strategy_config.symbol.symbol,
+        funding_arb_spec_venue_families(spec).join(","),
+        product_tags.join(","),
+        errors.len(),
+        errors.last().cloned().unwrap_or_else(|| "no record matched".to_owned())
+    ))
+}
+
+fn validate_funding_arb_restricted_product_preflight_fields(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    observed_at: UtcTimestamp,
+    product_tags: &[String],
+    fields: &BTreeMap<String, &str>,
+) -> Result<(), String> {
+    let source = "restricted product preflight";
+    let status =
+        required_json_value_string(fields, "status", source).map_err(|error| error.to_string())?;
+    if status != "confirmed" {
+        return Err(format!("status is `{status}`, expected `confirmed`"));
+    }
+    let symbol =
+        required_json_value_string(fields, "symbol", source).map_err(|error| error.to_string())?;
+    if !funding_arb_preflight_symbol_matches(&spec.strategy_config.symbol.symbol, &symbol) {
+        return Err(format!(
+            "symbol `{symbol}` does not match candidate `{}`",
+            spec.strategy_config.symbol.symbol
+        ));
+    }
+    let venues = optional_json_value_string_array(fields, "venues", source)
+        .map_err(|error| error.to_string())?;
+    if !funding_arb_preflight_venues_match(spec, &venues) {
+        return Err(format!(
+            "venues [{}] do not cover candidate venues {}",
+            venues.join(","),
+            funding_arb_spec_venue_families(spec).join(",")
+        ));
+    }
+    let confirmed_tags = optional_json_value_string_array(fields, "product_tags", source)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|tag| normalize_funding_arb_product_tag(&tag))
+        .collect::<BTreeSet<_>>();
+    for tag in product_tags {
+        if !confirmed_tags.contains(tag) {
+            return Err(format!("product_tags do not include required tag `{tag}`"));
+        }
+    }
+    for field in [
+        "account_enabled",
+        "agreement_accepted",
+        "jurisdiction_allowed",
+        "symbol_tradable",
+    ] {
+        let value = optional_json_bool(fields, field, source)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{field} is missing"))?;
+        if !value {
+            return Err(format!("{field} is false"));
+        }
+    }
+    let checked_at = required_json_value_string(fields, "checked_at", source)
+        .map_err(|error| error.to_string())?;
+    UtcTimestamp::from_str(&checked_at)
+        .map_err(|error| format!("checked_at is not strict UTC: {error}"))?;
+    let expires_at = required_json_value_string(fields, "expires_at", source)
+        .map_err(|error| error.to_string())?;
+    let expires_at = UtcTimestamp::from_str(&expires_at)
+        .map_err(|error| format!("expires_at is not strict UTC: {error}"))?;
+    if !utc_timestamp_after(expires_at, observed_at) {
+        return Err("expires_at is not after the observed candidate timestamp".to_owned());
+    }
+    Ok(())
+}
+
+fn funding_arb_preflight_symbol_matches(candidate_symbol: &str, preflight_symbol: &str) -> bool {
+    preflight_symbol.trim() == "*"
+        || normalize_funding_arb_product_symbol(candidate_symbol)
+            == normalize_funding_arb_product_symbol(preflight_symbol)
+}
+
+fn funding_arb_preflight_venues_match(
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    venues: &[String],
+) -> bool {
+    if venues.iter().any(|venue| venue.trim() == "*") {
+        return true;
+    }
+    let confirmed = venues
+        .iter()
+        .map(|venue| normalize_venue_family(venue))
+        .collect::<BTreeSet<_>>();
+    funding_arb_spec_venue_families(spec)
+        .iter()
+        .all(|venue| confirmed.contains(venue))
+}
+
+fn funding_arb_spec_venue_families(spec: &CrossExchangeFundingArbPipelineSpec) -> Vec<String> {
+    [
+        &spec.strategy_config.venues.venue_a.venue_label,
+        &spec.strategy_config.venues.venue_b.venue_label,
+    ]
+    .into_iter()
+    .map(|venue| normalize_venue_family(venue))
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect()
+}
+
+fn utc_timestamp_after(left: UtcTimestamp, right: UtcTimestamp) -> bool {
+    left.unix_seconds() > right.unix_seconds()
+        || (left.unix_seconds() == right.unix_seconds() && left.nanoseconds() > right.nanoseconds())
+}
+
 struct FundingArbLiveReadinessInput<'a> {
     spec: &'a CrossExchangeFundingArbPipelineSpec,
+    observed_at: UtcTimestamp,
     portfolio_state: &'a PortfolioState,
     signal_allowed: bool,
     risk_decision: Option<&'a RiskDecision>,
@@ -28526,6 +28925,12 @@ fn funding_arb_live_readiness(
         risk_allowed,
         Some("RISK_DECISION_BLOCKED".to_owned()),
         Some(risk_detail),
+    ));
+    let product_tags = funding_arb_product_tags_for_spec(input.spec);
+    checks.push(funding_arb_restricted_product_preflight_readiness_check(
+        input.spec,
+        input.observed_at,
+        &product_tags,
     ));
     if input.execution_preflight.plan_preview_built() {
         checks.push(funding_arb_live_readiness_observation_check_owned(
@@ -31219,11 +31624,12 @@ fn run_funding_arb_resident_live_inner(
                                         &outcome,
                                     )?;
                                 } else if outcome.canary.flat_after_cancel {
-                                    halt_reason = Some(
-                                        "funding arb entry order was cancelled without fill; resident live stopped without position registration"
-                                            .to_owned(),
-                                    );
-                                    break;
+                                    append_funding_arb_resident_entry_flat_cancelled(
+                                        &output_root,
+                                        cycles,
+                                        &cycle_dir,
+                                        &outcome,
+                                    )?;
                                 } else if funding_arb_entry_dispatch_missing_position_state_requires_halt(
                                     outcome.canary.submitted_receipt_count,
                                     outcome.canary.private_confirmation_count,
@@ -31601,7 +32007,14 @@ fn run_funding_arb_guarded_live_canary_once_live(
                     message: "funding arb canary dispatch plan is missing".to_owned(),
                 })?;
         align_funding_arb_dispatch_plan_quantities(dispatch_plan)?;
-        apply_funding_arb_binance_position_side(dispatch_plan)?;
+        apply_funding_arb_binance_position_side(
+            dispatch_plan,
+            &row.symbol,
+            options
+                .dry_run
+                .private_position_raw_snapshot_path
+                .as_deref(),
+        )?;
         apply_funding_arb_bybit_position_side(
             dispatch_plan,
             &row.symbol,
@@ -32364,6 +32777,32 @@ fn load_funding_arb_resident_position_registry(
                     position.status = "closed".to_owned();
                 }
             }
+            "position_flat_cancelled" => {
+                registry.positions.insert(
+                    position_id.clone(),
+                    FundingArbResidentPosition {
+                        position_id,
+                        position_state_path: PathBuf::new(),
+                        pair_id: required_json_value_string(
+                            &fields,
+                            "pair_id",
+                            "funding arb resident registry",
+                        )?,
+                        symbol: required_json_value_string(
+                            &fields,
+                            "symbol",
+                            "funding arb resident registry",
+                        )?,
+                        notional_usdt: optional_json_value_string(
+                            &fields,
+                            "notional_usdt",
+                            "funding arb resident registry",
+                        )?
+                        .unwrap_or_else(|| "0".to_owned()),
+                        status: "flat_cancelled".to_owned(),
+                    },
+                );
+            }
             "position_unknown" => {
                 if let Some(position) = registry.positions.get_mut(&position_id) {
                     position.status = "unknown".to_owned();
@@ -32777,6 +33216,33 @@ fn append_funding_arb_resident_entry_position_unknown(
         outcome.canary.private_confirmation_count,
         json_string(reason),
         optional_json_string(outcome.canary.residual_risk.as_deref()),
+        outcome.canary.submitted_receipt_count,
+        json_string(&outcome.symbol),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_entry_flat_cancelled(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    outcome: &FundingArbResidentCycleOutcome,
+) -> RuntimeResult<()> {
+    let position_id = funding_arb_position_id(outcome, cycle);
+    let line = format!(
+        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"net_funding_bps\":{},\"notional_usdt\":\"0\",\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":{},\"reason\":\"funding arb entry order reached terminal non-filled status without fill\",\"status\":\"flat_cancelled\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        json_string_array(&outcome.canary.blocking_reasons),
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        outcome
+            .net_funding_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        json_string(&outcome.pair_id),
+        json_string(&position_id),
+        outcome.canary.private_confirmation_count,
         outcome.canary.submitted_receipt_count,
         json_string(&outcome.symbol),
     );
@@ -33529,16 +33995,32 @@ fn funding_arb_symbol_from_instrument_id(
         });
     }
     let symbol = symbol.expect("symbol checked above");
-    if symbol.is_empty()
-        || symbol
-            .bytes()
-            .any(|byte| !(byte.is_ascii_uppercase() || byte.is_ascii_digit()))
-    {
+    if !funding_arb_instrument_symbol_is_valid(expected_venue, expected_suffix, symbol) {
         return Err(RuntimeError::UnsafeConfig {
             message: format!("{context} has invalid symbol `{symbol}`"),
         });
     }
     Ok(symbol.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_instrument_symbol_is_valid(
+    expected_venue: &str,
+    expected_suffix: &str,
+    symbol: &str,
+) -> bool {
+    if symbol.is_empty() {
+        return false;
+    }
+    if expected_venue == "OKX" && expected_suffix == "SWAP" {
+        return symbol.ends_with("-SWAP")
+            && symbol
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-');
+    }
+    symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 #[cfg(feature = "live-exec")]
@@ -40660,9 +41142,20 @@ fn parse_funding_arb_monitor_snapshot_json(
 fn parse_funding_arb_market_row_json_fields(
     fields: &BTreeMap<String, &str>,
 ) -> RuntimeResult<FundingArbMarketRow> {
+    let symbol = required_json_value_string(fields, "symbol", "funding arb monitor row")?;
+    let mut product_tags =
+        optional_json_value_string_array(fields, "product_tags", "funding arb monitor row")?
+            .into_iter()
+            .filter_map(|tag| normalize_funding_arb_product_tag(&tag))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+    if product_tags.is_empty() {
+        product_tags = funding_arb_product_tags_for_symbol(&symbol);
+    }
     Ok(FundingArbMarketRow {
         pair_id: required_json_value_string(fields, "pair_id", "funding arb monitor row")?,
-        symbol: required_json_value_string(fields, "symbol", "funding arb monitor row")?,
+        symbol,
         venue_a_family: required_json_value_string(
             fields,
             "venue_a_family",
@@ -40792,6 +41285,7 @@ fn parse_funding_arb_market_row_json_fields(
             "source_status",
             "funding arb monitor row",
         )?,
+        product_tags,
     })
 }
 
@@ -41055,11 +41549,46 @@ fn basis_candidate_count_zero_reason(snapshot: &BinanceBasisMonitorSnapshot) -> 
     if snapshot.total_rows == 0 {
         return "阻断点：candidate_count=0；阻断原因：没有可评估的 spot-perp-basis 行".to_owned();
     }
-    if snapshot.missing_spot_count + snapshot.missing_perp_count == snapshot.total_rows {
+    if snapshot
+        .rows
+        .iter()
+        .all(basis_row_has_incomplete_top_of_book)
+    {
+        if basis_snapshot_has_reason(snapshot, "MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT") {
+            if basis_snapshot_has_reason(snapshot, "MISSING_HYPERLIQUID_TOP_OF_BOOK_SIZE") {
+                return "阻断点：candidate_count=0；阻断原因：Hyperliquid 多数永续合约没有 USDC 现货 context（现货上下文）；已有现货 context 的行缺少 perp WSS top-of-book 数量"
+                    .to_owned();
+            }
+            return "阻断点：candidate_count=0；阻断原因：Hyperliquid 永续合约缺少 USDC 现货 context（现货上下文）"
+                .to_owned();
+        }
         return "阻断点：candidate_count=0；阻断原因：所有 spot-perp-basis 行的现货或永续 top-of-book 不完整"
             .to_owned();
     }
+    if basis_snapshot_has_disabled_execution_profile(snapshot) {
+        return "阻断点：candidate_count=0；阻断原因：该 venue 的 spot-perp-basis dry-run/execution profile 未启用；完整行情行按 fail closed，缺失行情行继续报告 top-of-book 缺失"
+            .to_owned();
+    }
     "阻断点：candidate_count=0；阻断原因：所有 spot-perp-basis 行均未通过候选门槛".to_owned()
+}
+
+fn basis_row_has_incomplete_top_of_book(row: &BinanceBasisMarketRow) -> bool {
+    matches!(
+        row.source_status.as_str(),
+        "missing_spot" | "missing_perp" | "missing_spot_and_perp" | "missing_top_of_book_size"
+    )
+}
+
+fn basis_snapshot_has_disabled_execution_profile(snapshot: &BinanceBasisMonitorSnapshot) -> bool {
+    basis_snapshot_has_reason(snapshot, "DRY_RUN_NOT_SUPPORTED")
+}
+
+fn basis_snapshot_has_reason(snapshot: &BinanceBasisMonitorSnapshot, needle: &str) -> bool {
+    snapshot.rows.iter().any(|row| {
+        row.reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(needle))
+    })
 }
 
 fn basis_monitor_row_blocking_path_entry(
@@ -41664,7 +42193,7 @@ fn funding_arb_history_json(context: &FundingArbDashboardContext) -> String {
 impl FundingArbMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
+            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
             json_option_string(&self.expected_funding_usd),
             json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_funding_spread_bps),
@@ -41672,6 +42201,7 @@ impl FundingArbMarketRow {
             json_option_string(&self.long_venue_family),
             json_option_string(&self.net_funding_bps),
             json_string(&self.pair_id),
+            json_string_array(&self.product_tags),
             json_option_string(&self.reason),
             json_option_string(&self.short_venue_family),
             json_string(&self.source_status),
@@ -42570,7 +43100,7 @@ fn funding_arb_guarded_dry_run_report_json(
             dispatch_attempted: report.dispatch_attempted,
         });
     format!(
-        "{{\"blocking_path\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_constraints\":{},\"execution_preflight\":{},\"exit_readiness\":{},\"expected_funding_usd\":{},\"funding_settlement\":{},\"funding_settlement_ingestion\":{},\"live_blocking_reasons\":{},\"live_readiness\":{},\"live_ready\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_accounts\":{},\"private_execution\":{},\"private_positions\":{},\"risk_decision\":{},\"risk_reason_codes\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"snapshot_lineage\":{},\"strategy_id\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{},\"venue_execution_capability\":{}}}",
+        "{{\"blocking_path\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_constraints\":{},\"execution_preflight\":{},\"exit_readiness\":{},\"expected_funding_usd\":{},\"funding_settlement\":{},\"funding_settlement_ingestion\":{},\"live_blocking_reasons\":{},\"live_readiness\":{},\"live_ready\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_accounts\":{},\"private_execution\":{},\"private_positions\":{},\"product_tags\":{},\"risk_decision\":{},\"risk_reason_codes\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"snapshot_lineage\":{},\"strategy_id\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{},\"venue_execution_capability\":{}}}",
         blocking_path_json,
         report.dispatch_attempted,
         report.dispatch_plan_built,
@@ -42591,6 +43121,7 @@ fn funding_arb_guarded_dry_run_report_json(
         funding_private_account_reconciliation_json(&report.private_accounts),
         funding_private_execution_reconciliation_json(&report.private_execution),
         funding_private_position_reconciliation_json(&report.private_positions),
+        json_string_array(&row.product_tags),
         json_string(&report.risk_decision),
         json_string_array(&report.risk_reason_codes),
         report.signal_allowed,
@@ -42816,11 +43347,12 @@ fn funding_arb_guarded_dry_run_report_markdown(
             .collect::<String>()
     };
     format!(
-        "# Funding Arb Guarded Dry-run\n\n中文说明：本报告由 funding arb observer 候选生成，只验证公开信号和风险门禁，不真实下单、不撤单、不转账、不签名；`live_ready=false` 时不得把候选转换为真实订单。\n\n- strategy_id: `{}`\n- transition_id: `{}`\n- pair_id: `{}`\n- symbol: `{}`\n- venues: `{}` / `{}`\n- signal_allowed: `{}`\n- risk_decision: `{}`\n- risk_reason_codes: `{}`\n- funding_settlement_status: `{}`\n- funding_settlement_expected_usd: `{}`\n- funding_settlement_actual_usd: `{}`\n- funding_settlement_difference_usd: `{}`\n- funding_settlement_ingestion_status: `{}`\n- funding_settlement_ingestion_source: `{}`\n- private_account_status: `{}`\n- private_account_checked_count: `{}`\n- private_account_min_required_usd: `{}`\n- private_account_min_available_usd: `{}`\n- private_account_min_margin_buffer_usd: `{}`\n- private_position_status: `{}`\n- private_position_checked_count: `{}`\n- private_position_nonzero_count: `{}`\n- private_execution_status: `{}`\n- private_execution_checked_orders: `{}`\n- snapshot_lineage_status: `{}`\n- snapshot_lineage_checked_timestamps: `{}`\n- snapshot_lineage_stale_private_snapshots: `{}`\n- venue_execution_capability_status: `{}`\n- execution_constraints_status: `{}`\n- exit_readiness_status: `{}`\n- execution_preflight_status: `{}`\n- execution_preflight_plan_preview_status: `{}`\n- execution_preflight_dispatch_shape_status: `{}`\n- execution_preflight_private_reconciliation_status: `{}`\n- live_readiness_status: `{}`\n- live_readiness_checks: `{}`\n- live_readiness_blocking_checks: `{}`\n- manual_gate_released: `{}`\n- dispatch_plan_built: `{}`\n- dispatch_request_count: `{}`\n- live_ready: `{}`\n- dispatch_attempted: `{}`\n- mutable_execution_started: `{}`\n\n## Live blocking reasons\n\n{}",
+        "# Funding Arb Guarded Dry-run\n\n中文说明：本报告由 funding arb observer 候选生成，只验证公开信号和风险门禁，不真实下单、不撤单、不转账、不签名；`live_ready=false` 时不得把候选转换为真实订单。\n\n- strategy_id: `{}`\n- transition_id: `{}`\n- pair_id: `{}`\n- symbol: `{}`\n- product_tags: `{}`\n- venues: `{}` / `{}`\n- signal_allowed: `{}`\n- risk_decision: `{}`\n- risk_reason_codes: `{}`\n- funding_settlement_status: `{}`\n- funding_settlement_expected_usd: `{}`\n- funding_settlement_actual_usd: `{}`\n- funding_settlement_difference_usd: `{}`\n- funding_settlement_ingestion_status: `{}`\n- funding_settlement_ingestion_source: `{}`\n- private_account_status: `{}`\n- private_account_checked_count: `{}`\n- private_account_min_required_usd: `{}`\n- private_account_min_available_usd: `{}`\n- private_account_min_margin_buffer_usd: `{}`\n- private_position_status: `{}`\n- private_position_checked_count: `{}`\n- private_position_nonzero_count: `{}`\n- private_execution_status: `{}`\n- private_execution_checked_orders: `{}`\n- snapshot_lineage_status: `{}`\n- snapshot_lineage_checked_timestamps: `{}`\n- snapshot_lineage_stale_private_snapshots: `{}`\n- venue_execution_capability_status: `{}`\n- execution_constraints_status: `{}`\n- exit_readiness_status: `{}`\n- execution_preflight_status: `{}`\n- execution_preflight_plan_preview_status: `{}`\n- execution_preflight_dispatch_shape_status: `{}`\n- execution_preflight_private_reconciliation_status: `{}`\n- live_readiness_status: `{}`\n- live_readiness_checks: `{}`\n- live_readiness_blocking_checks: `{}`\n- manual_gate_released: `{}`\n- dispatch_plan_built: `{}`\n- dispatch_request_count: `{}`\n- live_ready: `{}`\n- dispatch_attempted: `{}`\n- mutable_execution_started: `{}`\n\n## Live blocking reasons\n\n{}",
         spec.strategy_config.instance.strategy_id,
         spec.strategy_config.output.transition_id,
         row.pair_id,
         row.symbol,
+        row.product_tags.join(","),
         row.venue_a_family,
         row.venue_b_family,
         report.signal_allowed,
@@ -50381,6 +50913,7 @@ mod tests {
             is_candidate: true,
             reason: None,
             source_status: "complete".to_owned(),
+            product_tags: funding_arb_product_tags_for_symbol("BTCUSDT"),
         }
     }
 
@@ -53000,6 +53533,75 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_product_tags_mark_restricted_perp_products() {
+        assert_eq!(
+            funding_arb_product_tags_for_symbol("PAYPUSDT"),
+            vec!["stock_perp".to_owned(), "tradfi_perp".to_owned()]
+        );
+        assert_eq!(
+            funding_arb_product_tags_for_symbol("XAUUSDT"),
+            vec!["commodity_perp".to_owned(), "tradfi_perp".to_owned()]
+        );
+        assert_eq!(
+            funding_arb_product_tags_for_symbol("SPACEXUSDT"),
+            vec!["pre_market_perp".to_owned(), "tradfi_perp".to_owned()]
+        );
+        assert!(funding_arb_product_tags_for_symbol("BTCUSDT").is_empty());
+    }
+
+    #[test]
+    fn funding_arb_restricted_product_preflight_blocks_by_default_and_accepts_evidence() {
+        let observed_at = UtcTimestamp::from_str("2026-05-21T14:03:12Z").expect("time");
+        let mut strategy_config = CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt();
+        strategy_config.symbol.symbol = "PAYPUSDT".to_owned();
+        strategy_config.venues.venue_a =
+            funding_arb_leg_config("binance", "PAYPUSDT").expect("binance leg");
+        strategy_config.venues.venue_b =
+            funding_arb_leg_config("aster", "PAYPUSDT").expect("aster leg");
+        let mut venue_capabilities =
+            arb_venue_capability_descriptors("binance").expect("binance capabilities");
+        venue_capabilities
+            .extend(arb_venue_capability_descriptors("aster").expect("aster capabilities"));
+        let spec = CrossExchangeFundingArbPipelineSpec::new(
+            strategy_config,
+            venue_capabilities,
+            "state:funding-arb-binance-aster-paypusdt-readonly",
+            "hash:funding-arb-binance-aster-paypusdt-readonly",
+        )
+        .expect("funding spec");
+        let product_tags = funding_arb_product_tags_for_spec(&spec);
+
+        let blocked = funding_arb_restricted_product_preflight_readiness_check_with_path(
+            &spec,
+            observed_at,
+            &product_tags,
+            None,
+        );
+        assert!(blocked.blocking);
+        assert_eq!(
+            blocked.reason_code.as_deref(),
+            Some("RESTRICTED_PRODUCT_PREFLIGHT_REQUIRED")
+        );
+
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let preflight_path = root.path().join("restricted-product-preflight.json");
+        write_utf8(
+            preflight_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"confirmed","symbol":"PAYPUSDT","venues":["binance","aster"],"product_tags":["tradfi_perp","stock_perp"],"account_enabled":true,"agreement_accepted":true,"jurisdiction_allowed":true,"symbol_tradable":true,"checked_at":"2026-05-21T14:03:00Z","expires_at":"2026-05-21T14:08:00Z"}"#,
+        )
+        .expect("write preflight");
+
+        let passed = funding_arb_restricted_product_preflight_readiness_check_with_path(
+            &spec,
+            observed_at,
+            &product_tags,
+            Some(&preflight_path),
+        );
+        assert!(!passed.blocking);
+        assert_eq!(passed.status, "Passed");
+    }
+
+    #[test]
     fn funding_arb_monitor_rejects_mark_index_divergence() {
         let binance = funding_arb_test_venue_snapshot(
             "binance",
@@ -54612,7 +55214,7 @@ mod tests {
         ));
 
         write_utf8(
-            registry_path,
+            registry_path.clone(),
             "{\"event_type\":\"position_unknown\",\"notional_usdt\":\"unknown\",\"pair_id\":\"binance:bybit:CHIPUSDT:CHIPUSDT\",\"position_id\":\"pos:partial\",\"reason\":\"accepted receipt requires manual reconciliation\",\"residual_risk\":\"first leg state is unknown\",\"status\":\"unknown\",\"symbol\":\"CHIPUSDT\"}\n",
         )
         .expect("write standalone unknown registry");
@@ -54623,6 +55225,22 @@ mod tests {
             standalone_unknown_capacity,
             ResidentEntryCapacity::Blocked(reason) if reason.contains("unknown funding arb resident position")
         ));
+
+        write_utf8(
+            registry_path,
+            "{\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0\",\"pair_id\":\"bybit:okx:PROVEUSDT:PROVE-USDT\",\"position_id\":\"pos:flat-cancelled\",\"private_confirmation_count\":1,\"status\":\"flat_cancelled\",\"submitted_receipt_count\":1,\"symbol\":\"PROVEUSDT\"}\n",
+        )
+        .expect("write flat cancelled registry");
+
+        let flat_registry =
+            load_funding_arb_resident_position_registry(root.path()).expect("flat registry");
+        assert_eq!(flat_registry.active_positions().len(), 0);
+        assert_eq!(flat_registry.unknown_position_count(), 0);
+        assert_eq!(flat_registry.closed_position_count(), 0);
+        assert_eq!(flat_registry.live_entry_count(), 1);
+        let flat_capacity =
+            funding_arb_resident_entry_capacity(&options, root.path()).expect("flat capacity");
+        assert!(matches!(flat_capacity, ResidentEntryCapacity::Allowed));
     }
 
     #[test]
@@ -54955,6 +55573,79 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_binance_position_mode_controls_position_side() {
+        let mut one_way_plan = ExecutionDispatchPlan {
+            plan_id: "plan:funding-arb:binance-one-way-position-side-test".to_owned(),
+            requests: vec![test_basis_planned_order_for_account(
+                "perp_short",
+                BINANCE_BASIS_PERP_VENUE_ID,
+                "inst:BINANCE:PAYPUSDT:USDM-PERP",
+                "acct:binance-funding-arb-readonly",
+                OrderSide::Sell,
+                "1",
+                "1.00",
+                "binancePayShortOneWay",
+                "idem:funding:binance:pay:one-way",
+            )],
+        };
+
+        apply_funding_arb_binance_position_side_for_mode(
+            &mut one_way_plan,
+            FundingArbBinancePositionMode::OneWay,
+        )
+        .expect("omit Binance positionSide in one-way mode");
+
+        assert_eq!(one_way_plan.requests[0].request.position_side, None);
+
+        let mut hedge_plan = ExecutionDispatchPlan {
+            plan_id: "plan:funding-arb:binance-hedge-position-side-test".to_owned(),
+            requests: vec![test_basis_planned_order_for_account(
+                "perp_short",
+                BINANCE_BASIS_PERP_VENUE_ID,
+                "inst:BINANCE:PAYPUSDT:USDM-PERP",
+                "acct:binance-funding-arb-readonly",
+                OrderSide::Sell,
+                "1",
+                "1.00",
+                "binancePayShortHedge",
+                "idem:funding:binance:pay:hedge",
+            )],
+        };
+
+        apply_funding_arb_binance_position_side_for_mode(
+            &mut hedge_plan,
+            FundingArbBinancePositionMode::Hedge,
+        )
+        .expect("assign Binance positionSide in hedge mode");
+
+        assert_eq!(
+            hedge_plan.requests[0].request.position_side,
+            Some(PerpPositionSide::Short)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_binance_position_mode_infers_from_raw_snapshot() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let path = root.path().join("binance-position-raw.json");
+        write_utf8(
+            path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-21T00:00:00Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"PAYPUSDT","positionSide":"BOTH","positionAmt":"0","entryPrice":"0","markPrice":"1.00","unRealizedProfit":"0","liquidationPrice":"0"},{"symbol":"BTCUSDT","positionSide":"LONG","positionAmt":"0","entryPrice":"0","markPrice":"100000.00","unRealizedProfit":"0","liquidationPrice":"0"}]}]}"#,
+        )
+        .expect("write raw snapshot");
+
+        let pay_mode = infer_binance_position_mode_from_raw_snapshot(&path, "PAYPUSDT")
+            .expect("infer Binance one-way mode");
+        let btc_mode = infer_binance_position_mode_from_raw_snapshot(&path, "BTCUSDT")
+            .expect("infer Binance hedge mode");
+
+        assert_eq!(pay_mode, Some(FundingArbBinancePositionMode::OneWay));
+        assert_eq!(btc_mode, Some(FundingArbBinancePositionMode::Hedge));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_bybit_position_mode_infers_hedge_from_raw_snapshot() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let path = root.path().join("bybit-position-raw.json");
@@ -55033,6 +55724,40 @@ mod tests {
         assert_eq!(
             dispatch_plan.requests[1].request.quantity.to_string(),
             "4.7"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_okx_instrument_accepts_native_swap_inst_id() {
+        let inst_id = funding_arb_symbol_from_instrument_id(
+            "inst:OKX:PROVE-USDT-SWAP:SWAP",
+            "OKX",
+            "SWAP",
+            "OKX funding arb instrument",
+        )
+        .expect("OKX native swap instId");
+
+        assert_eq!(inst_id, "PROVE-USDT-SWAP");
+        assert!(
+            funding_arb_symbol_from_instrument_id(
+                "inst:OKX:PROVE-USDT:SWAP",
+                "OKX",
+                "SWAP",
+                "OKX funding arb instrument",
+            )
+            .is_err(),
+            "OKX swap instId must keep the -SWAP suffix"
+        );
+        assert!(
+            funding_arb_symbol_from_instrument_id(
+                "inst:BINANCE:PROVE-USDT-SWAP:USDM-PERP",
+                "BINANCE",
+                "USDM-PERP",
+                "Binance funding arb instrument",
+            )
+            .is_err(),
+            "non-OKX perp symbols remain strict uppercase/digit IDs"
         );
     }
 
@@ -58265,6 +58990,9 @@ mod tests {
         );
         assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), None);
         assert!(!snapshot.rows[0].is_candidate);
+        let status_json = snapshot.to_json();
+        assert!(status_json.contains("dry-run/execution profile 未启用"));
+        assert!(status_json.contains("完整行情行按 fail closed"));
     }
 
     #[test]
@@ -58328,6 +59056,51 @@ mod tests {
         assert!(!status_json.contains("status!=healthy"));
         assert!(!status_json.contains("spot-perp-basis 上游状态不完整"));
         assert!(status_json.contains("所有 spot-perp-basis 行的现货或永续 top-of-book 不完整"));
+    }
+
+    #[test]
+    fn hyperliquid_basis_monitor_snapshot_explains_missing_usdc_spot_context() {
+        let spot = r#"[
+          {
+            "tokens": [
+              {"name":"USDC","szDecimals":8,"weiDecimals":8,"index":0,"tokenId":"0x0","isCanonical":true},
+              {"name":"HYPE","szDecimals":2,"weiDecimals":8,"index":150,"tokenId":"0x1","isCanonical":true}
+            ],
+            "universe": [
+              {"name":"HYPE/USDC","tokens":[150,0],"index":107,"isCanonical":true}
+            ]
+          },
+          [
+            {"dayNtlVlm":"1000000.0","markPx":"100.00","midPx":"100.00","prevDayPx":"99.00"}
+          ]
+        ]"#;
+        let perp = r#"[
+          {
+            "universe": [
+              {"name":"HYPE","szDecimals":2,"maxLeverage":3},
+              {"name":"BTC","szDecimals":5,"maxLeverage":50}
+            ],
+            "marginTables": []
+          },
+          [
+            {"dayNtlVlm":"1000000.0","funding":"0.00010000","markPx":"101.00","midPx":"101.00","openInterest":"100.0","oraclePx":"100.00","premium":"0.0001","prevDayPx":"99.00"},
+            {"dayNtlVlm":"1000000.0","funding":"0.00010000","markPx":"201.00","midPx":"201.00","openInterest":"100.0","oraclePx":"200.00","premium":"0.0001","prevDayPx":"199.00"}
+          ]
+        ]"#;
+        let options = HyperliquidBasisMonitorOptions {
+            min_abs_funding_rate: "0.00000100".to_owned(),
+            once: true,
+            ..HyperliquidBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_hyperliquid_basis_monitor_snapshot_from_json(spot, perp, &options)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.candidate_count, 0);
+        assert_eq!(snapshot.missing_spot_count, 1);
+        let status_json = snapshot.to_json();
+        assert!(status_json.contains("Hyperliquid 多数永续合约没有 USDC 现货 context"));
+        assert!(status_json.contains("缺少 perp WSS top-of-book 数量"));
     }
 
     #[test]

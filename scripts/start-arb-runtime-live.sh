@@ -590,6 +590,7 @@ refresh_funding_arb_summary_position_counts() {
           elif ($event.event_type // "") == "position_opened" then .[$position_id] = "open"
           elif ($event.event_type // "") == "position_unknown" then .[$position_id] = "unknown"
           elif ($event.event_type // "") == "position_closed" then .[$position_id] = "closed"
+          elif ($event.event_type // "") == "position_flat_cancelled" then .[$position_id] = "flat_cancelled"
           else .
           end
       )
