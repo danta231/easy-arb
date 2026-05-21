@@ -280,6 +280,26 @@ mark_resident_artifacts_stopped() {
     "cross-exchange-funding-arb"
 }
 
+archive_stopped_resident_lock() {
+  local lock_path="$1"
+  local label="$2"
+  local archived_lock
+
+  [[ -e "${lock_path}" ]] || return 0
+  archived_lock="${lock_path}.stopped.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  mv "${lock_path}" "${archived_lock}"
+  echo "resident_lock_archived label=${label} reason=observer_stop lock=${lock_path} archived=${archived_lock}"
+}
+
+archive_stopped_resident_locks() {
+  archive_stopped_resident_lock \
+    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live.lock" \
+    "spot-perp-basis"
+  archive_stopped_resident_lock \
+    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live.lock" \
+    "cross-exchange-funding-arb"
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -291,6 +311,7 @@ if [[ ! -s "${PID_FILE}" ]]; then
   sleep "${STOP_GRACE_SECS}"
   terminate_rescue_processes "-KILL"
   mark_resident_artifacts_stopped
+  archive_stopped_resident_locks
   exit 0
 fi
 
@@ -324,5 +345,6 @@ sleep "${STOP_GRACE_SECS}"
 terminate_remaining_processes "-KILL"
 terminate_rescue_processes "-KILL"
 mark_resident_artifacts_stopped
+archive_stopped_resident_locks
 
 echo "stopped. archived pid file: ${STOPPED_FILE}"

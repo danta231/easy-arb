@@ -75,6 +75,7 @@ usage() {
   BASIS_OBSERVER_CURL_RETRIES=3 # 拉取本地/公开 HTTP 端点的重试次数。
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1 # HTTP 重试间隔秒数。
   BASIS_OBSERVER_CURL_TIMEOUT_SECS=10 # 单次 HTTP 请求超时秒数。
+  BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT=12 # health-events.jsonl 中保留的 blocking_path 前 N 条，取值 1-100，避免大快照触发系统参数长度限制。
   BASIS_OBSERVER_STARTUP_CHECK=1 # 启动后是否等待 monitor 健康检查通过。
   BASIS_OBSERVER_STARTUP_WAIT_SECS=180 # 启动健康检查最长等待秒数。
   BASIS_OBSERVER_STOP_DRAIN_SECS=15 # 停止时等待子进程自然收尾的秒数。
@@ -126,6 +127,11 @@ USAGE
 die() {
   echo "error: $*" >&2
   exit 1
+}
+
+validate_blocking_path_event_limit() {
+  local value="$1"
+  [[ "${value}" =~ ^([1-9]|[1-9][0-9]|100)$ ]] || die "BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT must be an integer between 1 and 100"
 }
 
 local_log_timestamp() {
@@ -434,6 +440,13 @@ append_json_line() {
   local file="$1"
   shift
   jq -cn "$@" >> "${file}"
+}
+
+append_json_line_from_body() {
+  local file="$1"
+  local body="$2"
+  shift 2
+  printf '%s\n' "${body}" | jq -c --argjson blocking_path_limit "${BLOCKING_PATH_EVENT_LIMIT:-12}" "$@" >> "${file}"
 }
 
 symbol_slug() {
@@ -1063,9 +1076,10 @@ safe_resident_lock_artifacts() {
 cleanup_safe_stale_resident_lock() {
   local lock_path="$1"
   local summary_path="$2"
-  local events_path="$3"
-  local process_name="$4"
-  local label="$5"
+  local state_path="$3"
+  local events_path="$4"
+  local process_name="$5"
+  local label="$6"
   local archived_lock
 
   [[ -e "${lock_path}" ]] || return 0
@@ -1075,10 +1089,12 @@ cleanup_safe_stale_resident_lock() {
   fi
   archived_lock="${lock_path}.stale.$(date -u +%Y%m%dT%H%M%SZ).$$"
   if safe_resident_lock_artifacts "${summary_path}" "${events_path}"; then
+    mark_running_resident_artifacts_stopped "${state_path}" "${summary_path}" "${label}"
     echo "resident_lock_archived label=${label} reason=stale_safe_state lock=${lock_path} archived=${archived_lock}"
     mv "${lock_path}" "${archived_lock}"
     return 0
   fi
+  mark_running_resident_artifacts_stopped "${state_path}" "${summary_path}" "${label}"
   echo "resident_lock_archived label=${label} reason=stale_state_requires_resident_recovery lock=${lock_path} archived=${archived_lock}"
   mv "${lock_path}" "${archived_lock}"
 }
@@ -1087,12 +1103,14 @@ cleanup_safe_stale_resident_locks() {
   cleanup_safe_stale_resident_lock \
     "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live.lock" \
     "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_summary.json" \
+    "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_state.json" \
     "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_events.jsonl" \
     "spot-perp-basis-resident-live" \
     "spot-perp-basis"
   cleanup_safe_stale_resident_lock \
     "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live.lock" \
     "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json" \
+    "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_state.json" \
     "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_events.jsonl" \
     "funding-arb-resident-live" \
     "cross-exchange-funding-arb"
@@ -1159,6 +1177,7 @@ graceful_stop_started_processes() {
   fi
   kill_remaining_started_processes
   mark_resident_artifacts_stopped
+  cleanup_safe_stale_resident_locks
 }
 
 supervise_started_processes() {
@@ -1192,7 +1211,7 @@ supervise_started_processes() {
     done < "${PID_FILE}"
 
     if (( failed != 0 )); then
-      stop_started_processes
+      graceful_stop_started_processes
       rm -f "${PID_FILE}"
       exit 1
     fi
@@ -1772,7 +1791,7 @@ poll_venue() {
   if ! [[ "${total_rows}" =~ ^[0-9]+$ ]]; then
     total_rows="0"
   fi
-  append_json_line "${HEALTH_EVENTS_JSONL}" \
+  append_json_line_from_body "${HEALTH_EVENTS_JSONL}" "${body}" \
     --arg recorded_at "${ts}" \
     --arg venue "${venue}" \
     --arg endpoint "${url}" \
@@ -1780,7 +1799,24 @@ poll_venue() {
     --arg updated_at "${updated_at}" \
     --argjson candidate_count "${count}" \
     --argjson total_rows "${total_rows}" \
-    '{recorded_at:$recorded_at,venue:$venue,event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,mutable_execution_started:false}'
+    '
+    def bounded_string:
+      if type == "string" and length > 500 then .[0:500] + "...<truncated>" else . end;
+    def bounded_value:
+      if type == "object" then with_entries(.value |= bounded_string)
+      elif type == "string" then bounded_string
+      else .
+      end;
+    def blocking_path_metadata:
+      (.blocking_path // []) as $raw
+      | (if ($raw | type) == "array" then $raw else [] end) as $path
+      | {
+          entries: ($path[0:$blocking_path_limit] | map(bounded_value)),
+          total_count: ($path | length),
+          truncated: (($path | length) > $blocking_path_limit)
+        };
+    (blocking_path_metadata) as $blocking_path_metadata
+    | {recorded_at:$recorded_at,venue:$venue,strategy:"spot-perp-basis",event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,blocking_path:$blocking_path_metadata.entries,blocking_path_total_count:$blocking_path_metadata.total_count,blocking_path_truncated:$blocking_path_metadata.truncated,mutable_execution_started:false}'
 
   if (( count > 0 )); then
     printf '%s\n' "${body}" | jq -c \
@@ -1808,6 +1844,12 @@ poll_venue() {
     if [[ "${SPOT_PERP_BASIS_MODE}" == "auto-once" ]]; then
       start_validations_for_candidates "${venue}" "${body}" "${ts}"
     fi
+  else
+    summary="$(printf '%s\n' "${body}" | jq -r '(.blocking_path // []) | .[0:6] | map("\(.blocker):\(.reason)") | join(" | ")' 2>> "${LOG_DIR}/jq-errors.log" || true)"
+    if [[ -z "${summary}" ]]; then
+      summary="blocking_path=[]"
+    fi
+    echo "[$(local_log_timestamp)] opportunity venue=${venue} strategy=spot-perp-basis candidate_count=0 ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
   fi
 }
 
@@ -1849,7 +1891,7 @@ poll_funding_arb() {
   if ! [[ "${total_rows}" =~ ^[0-9]+$ ]]; then
     total_rows="0"
   fi
-  append_json_line "${HEALTH_EVENTS_JSONL}" \
+  append_json_line_from_body "${HEALTH_EVENTS_JSONL}" "${body}" \
     --arg recorded_at "${ts}" \
     --arg strategy "cross-exchange-funding-arb" \
     --arg endpoint "${url}" \
@@ -1857,7 +1899,24 @@ poll_funding_arb() {
     --arg updated_at "${updated_at}" \
     --argjson candidate_count "${count}" \
     --argjson total_rows "${total_rows}" \
-    '{recorded_at:$recorded_at,strategy:$strategy,event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,mutable_execution_started:false}'
+    '
+    def bounded_string:
+      if type == "string" and length > 500 then .[0:500] + "...<truncated>" else . end;
+    def bounded_value:
+      if type == "object" then with_entries(.value |= bounded_string)
+      elif type == "string" then bounded_string
+      else .
+      end;
+    def blocking_path_metadata:
+      (.blocking_path // []) as $raw
+      | (if ($raw | type) == "array" then $raw else [] end) as $path
+      | {
+          entries: ($path[0:$blocking_path_limit] | map(bounded_value)),
+          total_count: ($path | length),
+          truncated: (($path | length) > $blocking_path_limit)
+        };
+    (blocking_path_metadata) as $blocking_path_metadata
+    | {recorded_at:$recorded_at,strategy:$strategy,event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,blocking_path:$blocking_path_metadata.entries,blocking_path_total_count:$blocking_path_metadata.total_count,blocking_path_truncated:$blocking_path_metadata.truncated,mutable_execution_started:false}'
 
   if (( count > 0 )); then
     printf '%s\n' "${body}" | jq -c \
@@ -1878,6 +1937,12 @@ poll_funding_arb() {
     if [[ "${FUNDING_ARB_MODE}" == "auto-once" ]]; then
       start_funding_arb_validations_for_candidates "${body}" "${ts}"
     fi
+  else
+    summary="$(printf '%s\n' "${body}" | jq -r '(.blocking_path // []) | .[0:6] | map("\(.blocker):\(.reason)") | join(" | ")' 2>> "${LOG_DIR}/jq-errors.log" || true)"
+    if [[ -z "${summary}" ]]; then
+      summary="blocking_path=[]"
+    fi
+    echo "[$(local_log_timestamp)] opportunity strategy=cross-exchange-funding-arb candidate_count=0 ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
   fi
 }
 
@@ -1967,6 +2032,7 @@ if [[ "${1:-}" == "--recorder" ]]; then
   TARGET_WSS_BASE_PORT="${BASIS_OBSERVER_TARGET_WSS_BASE_PORT:-8830}"
   TARGET_WSS_READY_TIMEOUT_SECS="${BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS:-60}"
   TARGET_WSS_RECONNECT_DELAY_SECS="${BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS:-2}"
+  BLOCKING_PATH_EVENT_LIMIT="${BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT:-12}"
   AUTO_PRICE_GUARD_BPS="${BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS:-2}"
   PRIVATE_ORDER_EVENTS_DIR="${BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR:-${RUN_ROOT}/private-order-events}"
   HYPERLIQUID_USER="${BASIS_OBSERVER_HYPERLIQUID_USER:-${HYPERLIQUID_USER:-}}"
@@ -1991,6 +2057,7 @@ if [[ "${1:-}" == "--recorder" ]]; then
   [[ "${TARGET_WSS_BASE_PORT}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_BASE_PORT must be numeric"
   [[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
   [[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
+  validate_blocking_path_event_limit "${BLOCKING_PATH_EVENT_LIMIT}"
   CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
   CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
   CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
@@ -2133,6 +2200,7 @@ AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
 CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
 CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
 CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
+BLOCKING_PATH_EVENT_LIMIT="${BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT:-12}"
 STARTUP_CHECK="${BASIS_OBSERVER_STARTUP_CHECK:-1}"
 STARTUP_WAIT_SECS="${BASIS_OBSERVER_STARTUP_WAIT_SECS:-180}"
 STOP_DRAIN_SECS="${BASIS_OBSERVER_STOP_DRAIN_SECS:-15}"
@@ -2162,6 +2230,7 @@ esac
 [[ "${TARGET_WSS_BASE_PORT}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_BASE_PORT must be numeric"
 [[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
 [[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
+validate_blocking_path_event_limit "${BLOCKING_PATH_EVENT_LIMIT}"
 
 if [[ "${#CLI_MONITORS[@]}" -eq 0 ]]; then
   if [[ -n "${BASIS_OBSERVER_MONITORS:-}" ]]; then
@@ -2474,6 +2543,7 @@ nohup env \
   BASIS_OBSERVER_CURL_TIMEOUT_SECS="${CURL_TIMEOUT_SECS}" \
   BASIS_OBSERVER_CURL_RETRIES="${CURL_RETRIES}" \
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS="${CURL_RETRY_SLEEP_SECS}" \
+  BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT="${BLOCKING_PATH_EVENT_LIMIT}" \
   BASIS_OBSERVER_EFFECTIVE_MONITORS="${EFFECTIVE_MONITORS}" \
   BASIS_OBSERVER_EFFECTIVE_STRATEGIES="${STRATEGIES}" \
   BINANCE_BASIS_BIND="${BINANCE_BIND}" \

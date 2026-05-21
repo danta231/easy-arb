@@ -112,7 +112,7 @@
 
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(220px, 1fr) 160px 180px auto;
+      grid-template-columns: minmax(220px, 1fr) 160px auto;
       gap: 8px;
       margin-bottom: 12px;
       align-items: center;
@@ -129,7 +129,7 @@
       width: 100%;
       border-collapse: collapse;
       table-layout: fixed;
-      min-width: 1180px;
+      min-width: 980px;
     }
 
     th,
@@ -156,10 +156,7 @@
 
     .time { width: 176px; }
     .severity { width: 92px; }
-    .category { width: 150px; }
-    .source { width: 180px; }
-    .pair { width: 220px; }
-    .line { width: 76px; }
+    .pair { width: 260px; }
     .message { width: auto; }
 
     .badge {
@@ -215,6 +212,12 @@
       overflow-wrap: anywhere;
     }
 
+    .notices {
+      margin: 0 0 12px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
     @media (max-width: 900px) {
       header { align-items: flex-start; flex-direction: column; }
       .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -244,17 +247,15 @@
     </section>
 
     <div id="source-errors" class="errors"></div>
+    <div id="source-notices" class="notices"></div>
 
     <section class="toolbar" aria-label="过滤">
-      <input id="search" type="search" placeholder="搜索交易对、来源或错误内容">
+      <input id="search" type="search" placeholder="搜索交易对或错误内容">
       <select id="severity-filter" aria-label="严重程度">
         <option value="">全部严重程度</option>
         <option value="critical">critical</option>
         <option value="error">error</option>
         <option value="warning">warning</option>
-      </select>
-      <select id="category-filter" aria-label="类别">
-        <option value="">全部类别</option>
       </select>
       <button id="clear" type="button">清空过滤</button>
     </section>
@@ -265,15 +266,12 @@
           <tr>
             <th class="time">本地时间 (UTC+8)</th>
             <th class="severity">级别</th>
-            <th class="category">类别</th>
-            <th class="source">来源</th>
             <th class="pair">交易对</th>
             <th class="message">错误内容</th>
-            <th class="line">行号</th>
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="7" class="muted">加载中</td></tr>
+          <tr><td colspan="4" class="muted">加载中</td></tr>
         </tbody>
       </table>
     </section>
@@ -332,28 +330,17 @@
     }
 
     function pairText(row) {
-      const pair = row.pair_id || "-";
-      const symbol = row.symbol ? ` / ${row.symbol}` : "";
-      return `${pair}${symbol}`;
-    }
-
-    function fillCategories(entries) {
-      const select = $("category-filter");
-      const current = select.value;
-      const categories = [...new Set(entries.map((entry) => entry.category).filter(Boolean))].sort();
-      select.innerHTML = `<option value="">全部类别</option>${categories.map((category) => (
-        `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`
-      )).join("")}`;
-      if (categories.includes(current)) select.value = current;
+      const pair = row.pair_id || "";
+      const symbol = row.symbol || "";
+      if (pair && symbol && pair !== symbol && !pair.includes(symbol)) return `${pair} / ${symbol}`;
+      return pair || symbol || "-";
     }
 
     function filteredEntries() {
       const query = $("search").value.trim().toLowerCase();
       const severity = $("severity-filter").value;
-      const category = $("category-filter").value;
       return state.entries.filter((entry) => {
         if (severity && entry.severity !== severity) return false;
-        if (category && entry.category !== category) return false;
         if (!query) return true;
         const haystack = [
           entry.observed_at,
@@ -373,15 +360,13 @@
     function renderRows() {
       const rows = filteredEntries();
       if (!rows.length) {
-        $("rows").innerHTML = `<tr><td colspan="7" class="muted">没有匹配的错误日志</td></tr>`;
+        $("rows").innerHTML = `<tr><td colspan="4" class="muted">没有匹配的错误日志</td></tr>`;
         return;
       }
       $("rows").innerHTML = rows.map((row) => (
         `<tr>
           <td>${escapeHtml(compactTime(row.observed_at))}</td>
           <td>${severityBadge(row.severity)}</td>
-          <td>${escapeHtml(row.category || "-")}</td>
-          <td>${escapeHtml(row.source || "-")}</td>
           <td>${escapeHtml(pairText(row))}</td>
           <td>
             <div class="msg">${escapeHtml(row.message || "-")}</div>
@@ -390,7 +375,6 @@
               <pre>${escapeHtml(row.raw || "")}</pre>
             </details>
           </td>
-          <td>${escapeHtml(row.line_number ?? "-")}</td>
         </tr>`
       )).join("");
     }
@@ -404,7 +388,7 @@
       $("skipped-count").textContent = snapshot.skipped_line_count ?? 0;
       $("updated-at").textContent = compactTime(snapshot.updated_at);
       $("source-errors").textContent = (snapshot.source_errors || []).join("；");
-      fillCategories(state.entries);
+      $("source-notices").textContent = (snapshot.source_notices || []).join("；");
       renderRows();
     }
 
@@ -425,16 +409,15 @@
     $("clear").addEventListener("click", () => {
       $("search").value = "";
       $("severity-filter").value = "";
-      $("category-filter").value = "";
       renderRows();
     });
-    ["search", "severity-filter", "category-filter"].forEach((id) => {
+    ["search", "severity-filter"].forEach((id) => {
       $(id).addEventListener("input", renderRows);
       $(id).addEventListener("change", renderRows);
     });
 
     refresh().catch((error) => {
-      $("rows").innerHTML = `<tr><td colspan="7" class="muted">${escapeHtml(error.message)}</td></tr>`;
+      $("rows").innerHTML = `<tr><td colspan="4" class="muted">${escapeHtml(error.message)}</td></tr>`;
     });
     setInterval(() => refresh().catch(() => {}), 5000);
   </script>

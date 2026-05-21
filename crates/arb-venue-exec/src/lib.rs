@@ -5229,8 +5229,8 @@ pub mod live {
 
     /// Aster Futures V3 下单、撤单和查单 endpoint。
     pub const ASTER_FUTURES_V3_ORDER_ENDPOINT: &str = "/fapi/v3/order";
-    /// Aster Futures 调整初始杠杆 endpoint。
-    pub const ASTER_FUTURES_V3_LEVERAGE_ENDPOINT: &str = "/fapi/v1/leverage";
+    /// Aster Futures V3 调整初始杠杆 endpoint。
+    pub const ASTER_FUTURES_V3_LEVERAGE_ENDPOINT: &str = "/fapi/v3/leverage";
     /// 默认 Aster Futures V3 REST base URL。
     ///
     /// 中文说明：V3 path 当前可通过 `fapi.asterdex.com` 访问；部分出网 IP 访问
@@ -6275,6 +6275,7 @@ pub mod live {
     impl HyperliquidSignatureJson {
         pub fn new(json: impl Into<String>) -> VenueExecResult<Self> {
             let json = json.into();
+            let json = json.trim().to_owned();
             validate_hyperliquid_signature_json(&json)?;
             Ok(Self { json })
         }
@@ -6502,6 +6503,7 @@ pub mod live {
         target_leverage: Option<u32>,
         signing_policy: SigningPolicy,
         asset_ids_by_symbol: BTreeMap<String, u32>,
+        quantity_step_by_symbol: BTreeMap<String, Quantity>,
     }
 
     impl HyperliquidExecConfig {
@@ -6528,6 +6530,7 @@ pub mod live {
                 target_leverage: None,
                 signing_policy,
                 asset_ids_by_symbol: BTreeMap::new(),
+                quantity_step_by_symbol: BTreeMap::new(),
             })
         }
 
@@ -6557,6 +6560,18 @@ pub mod live {
             Ok(self)
         }
 
+        pub fn with_quantity_step(
+            mut self,
+            symbol: impl Into<String>,
+            step: Quantity,
+        ) -> VenueExecResult<Self> {
+            let symbol = symbol.into();
+            validate_hyperliquid_symbol(&symbol)?;
+            validate_venue_quantity_step(step)?;
+            self.quantity_step_by_symbol.insert(symbol, step);
+            Ok(self)
+        }
+
         pub fn with_target_leverage(mut self, leverage: u32) -> VenueExecResult<Self> {
             validate_perp_target_leverage("target_leverage", leverage)?;
             self.target_leverage = Some(leverage);
@@ -6573,6 +6588,10 @@ pub mod live {
 
         pub fn target_leverage(&self) -> Option<u32> {
             self.target_leverage
+        }
+
+        pub fn quantity_step(&self, symbol: &str) -> Option<Quantity> {
+            self.quantity_step_by_symbol.get(symbol).copied()
         }
     }
 
@@ -6796,7 +6815,8 @@ pub mod live {
             let symbol = hyperliquid_symbol_from_instrument(&request.instrument_id)?;
             let asset_id = self.hyperliquid_asset_id(&symbol)?;
             self.ensure_target_leverage(asset_id, request.reduce_only)?;
-            let action_json = hyperliquid_submit_order_action_json(asset_id, &request)?;
+            let quantity = hyperliquid_order_quantity(&self.config, &symbol, request.quantity)?;
+            let action_json = hyperliquid_submit_order_action_json(asset_id, &request, &quantity)?;
             let action_id = self.next_action_id(MutableActionKind::SubmitOrder)?;
             let body = self.sign_exchange_body(action_json)?;
             let response = self.transport.post_json(
@@ -7120,6 +7140,7 @@ pub mod live {
     fn hyperliquid_submit_order_action_json(
         asset_id: u32,
         request: &SubmitOrderRequest,
+        quantity: &str,
     ) -> VenueExecResult<String> {
         if request.order_type == MutableOrderType::Market {
             return Err(VenueExecError::InvalidRequest {
@@ -7151,7 +7172,7 @@ pub mod live {
                     .expect("validated Hyperliquid limit price")
                     .to_string()
             )?,
-            json_string_literal(&request.quantity.to_string())?,
+            json_string_literal(quantity)?,
             request.reduce_only,
             json_string_literal(tif)?
         );
@@ -7165,6 +7186,17 @@ pub mod live {
             "{{\"type\":\"order\",\"orders\":[{}],\"grouping\":\"na\"}}",
             order
         ))
+    }
+
+    fn hyperliquid_order_quantity(
+        config: &HyperliquidExecConfig,
+        symbol: &str,
+        quantity: Quantity,
+    ) -> VenueExecResult<String> {
+        match config.quantity_step(symbol) {
+            Some(step) => format_quantity_at_venue_step(quantity, step),
+            None => Ok(quantity.to_string()),
+        }
     }
 
     fn hyperliquid_cancel_order_action_json(
@@ -8735,6 +8767,24 @@ pub mod live {
                 }
             }
         }
+        if let Some(position_side) = request.position_side {
+            match config.market {
+                BybitExecMarket::Spot => {
+                    return Err(VenueExecError::InvalidRequest {
+                        field: "position_side",
+                        reason: "Bybit spot orders do not support position_side",
+                    });
+                }
+                BybitExecMarket::LinearPerpetual => {
+                    push_json_u64_field(
+                        &mut body,
+                        &mut first,
+                        "positionIdx",
+                        bybit_position_idx(position_side),
+                    );
+                }
+            }
+        }
         if let Some(client_order_id) = &request.client_order_id {
             validate_bybit_client_order_id(client_order_id.as_str())?;
             push_json_string_field(
@@ -8746,6 +8796,14 @@ pub mod live {
         }
         body.push('}');
         Ok(body)
+    }
+
+    fn bybit_position_idx(position_side: super::PerpPositionSide) -> u64 {
+        match position_side {
+            super::PerpPositionSide::Both => 0,
+            super::PerpPositionSide::Long => 1,
+            super::PerpPositionSide::Short => 2,
+        }
     }
 
     fn bybit_order_quantity(
@@ -9010,6 +9068,17 @@ pub mod live {
         body.push_str(name);
         body.push_str("\":");
         body.push_str(if value { "true" } else { "false" });
+    }
+
+    fn push_json_u64_field(body: &mut String, first: &mut bool, name: &str, value: u64) {
+        if !*first {
+            body.push(',');
+        }
+        *first = false;
+        body.push('"');
+        body.push_str(name);
+        body.push_str("\":");
+        body.push_str(&value.to_string());
     }
 
     fn push_json_escaped(body: &mut String, value: &str) -> VenueExecResult<()> {
@@ -13649,6 +13718,46 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bybit_linear_adapter_maps_position_side_to_position_idx() {
+        let mut adapter = live::BybitLinearExecAdapter::new(
+            live::BybitExecConfig::linear_perpetual(
+                venue("venue:BYBIT-LINEAR"),
+                account("account:bybit-unit"),
+                "https://api.bybit.com",
+                bybit_signing_policy("kms-policy/bybit-linear-position-idx-unit"),
+            )
+            .unwrap(),
+            bybit_test_signer(1_700_000_000_123),
+            RecordingBybitTransport::ok(
+                200,
+                r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"c6f055d9-7f21-4079-913d-e6523a9cfffd","orderLinkId":"bybitHedgeShort"},"retExtInfo":{},"time":1700000000124}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BYBIT-LINEAR"),
+                    account("account:bybit-unit"),
+                    instrument("inst:BYBIT:BTCUSDT:LINEAR-PERP"),
+                    OrderSide::Sell,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("bybitHedgeShort").unwrap()),
+                    IdempotencyKey::new("idem:bybit:linear:position-idx").unwrap(),
+                )
+                .with_position_side(PerpPositionSide::Short),
+            )
+            .expect("signed Bybit hedge-mode order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.payload.contains(r#""positionIdx":2"#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn bybit_linear_adapter_applies_symbol_quantity_step() {
         let mut adapter = live::BybitLinearExecAdapter::new(
             live::BybitExecConfig::linear_perpetual(
@@ -14744,6 +14853,53 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn hyperliquid_perp_adapter_applies_symbol_quantity_step() {
+        let mut adapter = live::HyperliquidPerpExecAdapter::new(
+            live::HyperliquidExecConfig::perp(
+                venue("venue:HYPERLIQUID-PERP"),
+                account("account:hyperliquid-unit"),
+                live::HYPERLIQUID_API_BASE_URL,
+                "0x3333333333333333333333333333333333333333",
+                "a",
+                hyperliquid_signing_policy("kms-policy/hyperliquid-perp-step-unit"),
+            )
+            .unwrap()
+            .with_asset_id("CHIPUSDT", 42)
+            .unwrap()
+            .with_quantity_step("CHIPUSDT", quantity("1").unwrap())
+            .unwrap(),
+            StaticHyperliquidSigner,
+            RecordingHyperliquidTransport::ok([
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77747315}}]}}}"#,
+            ]),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:HYPERLIQUID-PERP"),
+                    account("account:hyperliquid-unit"),
+                    instrument("inst:HYPERLIQUID:CHIPUSDT:PERP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("2062.6591").unwrap(),
+                    Some(price("0.04848").unwrap()),
+                    Some(OrderId::new("0x1234567890abcdef1234567890abcdef").unwrap()),
+                    IdempotencyKey::new("idem:hyperliquid:perp:chip").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc),
+            )
+            .expect("Hyperliquid order dispatches with quantity step");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""a":42"#));
+        assert!(call.body.contains(r#""s":"2062""#));
+        assert!(!call.body.contains(r#""s":"2062.6591""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn external_hyperliquid_signer_failure_reports_stderr() {
         let reason = live::external_command_failure_reason(
             "external Hyperliquid signer exited unsuccessfully",
@@ -15643,6 +15799,30 @@ mod tests {
                 "2".repeat(64)
             ))
         }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn hyperliquid_signature_json_trims_external_signer_newline() {
+        let signature = live::HyperliquidSignatureJson::new(format!(
+            "{{\"r\":\"0x{}\",\"s\":\"0x{}\",\"v\":27}}\n",
+            "1".repeat(64),
+            "2".repeat(64)
+        ))
+        .expect("signature with trailing newline is normalized");
+
+        assert!(!signature.as_json().contains('\n'));
+        assert!(signature.as_json().ends_with("\"v\":27}"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn aster_mutable_execution_endpoints_are_v3() {
+        assert_eq!(live::ASTER_FUTURES_V3_ORDER_ENDPOINT, "/fapi/v3/order");
+        assert_eq!(
+            live::ASTER_FUTURES_V3_LEVERAGE_ENDPOINT,
+            "/fapi/v3/leverage"
+        );
     }
 
     #[cfg(feature = "live-exec")]

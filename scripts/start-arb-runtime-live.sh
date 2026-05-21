@@ -570,6 +570,80 @@ stop_portfolio_dashboard() {
   fi
 }
 
+refresh_funding_arb_summary_position_counts() {
+  local summary_path="$1"
+  local positions_path
+  local counts_json
+  local tmp
+
+  [[ "${summary_path}" == */funding_arb_resident_live_summary.json ]] || return 0
+  positions_path="${summary_path%/funding_arb_resident_live_summary.json}/funding_arb_resident_positions.jsonl"
+  [[ -s "${positions_path}" && -s "${summary_path}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  counts_json="$(
+    jq -s -c '
+      (
+      reduce .[] as $event ({};
+        ($event.position_id // "") as $position_id
+        | if $position_id == "" then .
+          elif ($event.event_type // "") == "position_opened" then .[$position_id] = "open"
+          elif ($event.event_type // "") == "position_unknown" then .[$position_id] = "unknown"
+          elif ($event.event_type // "") == "position_closed" then .[$position_id] = "closed"
+          else .
+          end
+      )
+      ) as $positions
+      | {
+          open_position_count: ([$positions[] | select(. == "open")] | length),
+          closed_position_count: ([$positions[] | select(. == "closed")] | length),
+          unknown_position_count: ([$positions[] | select(. == "unknown")] | length),
+          live_entry_count: ([$positions[] | select(. != "unknown")] | length)
+        }
+    ' "${positions_path}"
+  )" || return 0
+
+  tmp="${summary_path}.tmp.$$"
+  jq --argjson counts "${counts_json}" '
+    .open_position_count = $counts.open_position_count
+    | .closed_position_count = $counts.closed_position_count
+    | .unknown_position_count = $counts.unknown_position_count
+    | .live_entry_count = $counts.live_entry_count
+  ' "${summary_path}" > "${tmp}" && mv "${tmp}" "${summary_path}"
+}
+
+mark_running_resident_artifacts_stopped() {
+  local state_path="$1"
+  local summary_path="$2"
+  local label="$3"
+  local reason="stopped by start-arb-runtime-live.sh"
+  local updated_at
+  local cycles
+  local tmp
+
+  [[ -s "${state_path}" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  if ! jq -e '(.phase // "") == "running"' "${state_path}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  cycles="$(jq -r '(.cycles // 0) | tonumber' "${state_path}" 2>/dev/null || printf '0')"
+  tmp="${state_path}.tmp.$$"
+  jq --arg reason "${reason}" --arg updated_at "${updated_at}" \
+    '.phase = "stopped" | .halt_reason = $reason | .updated_at = $updated_at' \
+    "${state_path}" > "${tmp}" && mv "${tmp}" "${state_path}"
+
+  if [[ -s "${summary_path}" ]]; then
+    tmp="${summary_path}.tmp.$$"
+    jq --arg reason "${reason}" --argjson cycles "${cycles}" \
+      '.phase = "stopped" | .cycles = $cycles | .halt_reason = $reason' \
+      "${summary_path}" > "${tmp}" && mv "${tmp}" "${summary_path}"
+    refresh_funding_arb_summary_position_counts "${summary_path}"
+  fi
+  echo "resident_state_marked_stopped label=${label} state=${state_path}"
+}
+
 resident_process_alive() {
   local expected_name="$1"
   local basis_pid_file="${RUN_ROOT}/state/basis-observer.pids"
@@ -638,9 +712,10 @@ safe_resident_lock_artifacts() {
 cleanup_safe_stale_resident_lock() {
   local lock_path="$1"
   local summary_path="$2"
-  local events_path="$3"
-  local process_name="$4"
-  local label="$5"
+  local state_path="$3"
+  local events_path="$4"
+  local process_name="$5"
+  local label="$6"
   local archived_lock
 
   [[ -e "${lock_path}" ]] || return 0
@@ -650,10 +725,12 @@ cleanup_safe_stale_resident_lock() {
   fi
   archived_lock="${lock_path}.stale.$(date -u +%Y%m%dT%H%M%SZ).$$"
   if safe_resident_lock_artifacts "${summary_path}" "${events_path}"; then
+    mark_running_resident_artifacts_stopped "${state_path}" "${summary_path}" "${label}"
     echo "resident_lock_archived label=${label} reason=stale_safe_state lock=${lock_path} archived=${archived_lock}"
     mv "${lock_path}" "${archived_lock}"
     return 0
   fi
+  mark_running_resident_artifacts_stopped "${state_path}" "${summary_path}" "${label}"
   echo "resident_lock_archived label=${label} reason=stale_state_requires_resident_recovery lock=${lock_path} archived=${archived_lock}"
   mv "${lock_path}" "${archived_lock}"
 }
@@ -662,12 +739,14 @@ cleanup_safe_stale_resident_locks() {
   cleanup_safe_stale_resident_lock \
     "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live.lock" \
     "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_summary.json" \
+    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_state.json" \
     "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_events.jsonl" \
     "spot-perp-basis-resident-live" \
     "spot-perp-basis"
   cleanup_safe_stale_resident_lock \
     "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live.lock" \
     "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_summary.json" \
+    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_state.json" \
     "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_events.jsonl" \
     "funding-arb-resident-live" \
     "cross-exchange-funding-arb"
