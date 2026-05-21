@@ -123,8 +123,9 @@ use arb_venue_exec::{
     ExecutionDispatchPlan, ExecutionDispatchPolicy, ExternalActionRef,
     IdempotencyKey as ExecIdempotencyKey, MutableActionKind, MutableActionReceipt,
     MutableActionStatus, MutableOrderType, MutableTimeInForce, OrderConfirmationSource,
-    OrderConfirmationStatus, OrderReference, OrderSide, PlannedSubmitOrder, PrivateOrderFillUpdate,
-    PrivateOrderMarket, PrivateOrderUpdate, SubmitOrder, SubmitOrderRequest, VenueExecError,
+    OrderConfirmationStatus, OrderReference, OrderSide, PerpPositionSide, PlannedSubmitOrder,
+    PrivateOrderFillUpdate, PrivateOrderMarket, PrivateOrderUpdate, SubmitOrder,
+    SubmitOrderRequest, VenueExecError,
 };
 
 const DEFAULT_FULL_PIPELINE_FIXTURE: &str = "fixtures/replay/full_pipeline_simulated";
@@ -14960,6 +14961,31 @@ fn align_funding_arb_dispatch_plan_quantities(
         .filter_map(funding_arb_quantity_step_for_planned)
         .collect::<RuntimeResult<Vec<_>>>()?;
     align_funding_arb_dispatch_plan_quantities_with_steps(dispatch_plan, &steps)
+}
+
+#[cfg(feature = "live-exec")]
+fn apply_funding_arb_binance_position_side(
+    dispatch_plan: &mut ExecutionDispatchPlan,
+) -> RuntimeResult<()> {
+    for planned in &mut dispatch_plan.requests {
+        if planned.request.venue_id.as_str() != BINANCE_BASIS_PERP_VENUE_ID {
+            continue;
+        }
+        let position_side = match planned.basis_leg_role.as_deref() {
+            Some("perp_long") => PerpPositionSide::Long,
+            Some("perp_short") => PerpPositionSide::Short,
+            other => {
+                return Err(RuntimeError::UnsafeConfig {
+                    message: format!(
+                        "funding arb Binance USD-M request `{}` has unsupported basis leg role {:?}; cannot assign positionSide",
+                        planned.plan_leg_id, other
+                    ),
+                })
+            }
+        };
+        planned.request = planned.request.clone().with_position_side(position_side);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "live-exec")]
@@ -30036,6 +30062,7 @@ fn run_funding_arb_guarded_live_canary_once_live(
                     message: "funding arb canary dispatch plan is missing".to_owned(),
                 })?;
         align_funding_arb_dispatch_plan_quantities(dispatch_plan)?;
+        apply_funding_arb_binance_position_side(dispatch_plan)?;
         let signing_policy = signing_policy_from_config(&config)?;
         let private_order_events = options
             .private_order_events_dir

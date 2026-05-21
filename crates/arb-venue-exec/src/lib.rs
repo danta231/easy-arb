@@ -436,6 +436,27 @@ impl OrderSide {
     }
 }
 
+/// 永续合约持仓方向。
+///
+/// 中文说明：部分交易所的双向持仓模式要求下单时显式携带持仓方向，例如
+/// Binance USD-M 的 `positionSide`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PerpPositionSide {
+    Both,
+    Long,
+    Short,
+}
+
+impl PerpPositionSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "BOTH",
+            Self::Long => "LONG",
+            Self::Short => "SHORT",
+        }
+    }
+}
+
 /// 订单类型。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutableOrderType {
@@ -509,6 +530,7 @@ pub struct SubmitOrderRequest {
     pub order_type: MutableOrderType,
     pub time_in_force: Option<MutableTimeInForce>,
     pub reduce_only: bool,
+    pub position_side: Option<PerpPositionSide>,
     pub quantity: Quantity,
     pub limit_price: Option<Price>,
     pub client_order_id: Option<OrderId>,
@@ -536,6 +558,7 @@ impl SubmitOrderRequest {
             order_type,
             time_in_force: None,
             reduce_only: false,
+            position_side: None,
             quantity,
             limit_price,
             client_order_id,
@@ -550,6 +573,11 @@ impl SubmitOrderRequest {
 
     pub fn with_reduce_only(mut self, reduce_only: bool) -> Self {
         self.reduce_only = reduce_only;
+        self
+    }
+
+    pub fn with_position_side(mut self, position_side: PerpPositionSide) -> Self {
+        self.position_side = Some(position_side);
         self
     }
 
@@ -582,7 +610,7 @@ impl SubmitOrderRequest {
 
     fn fingerprint(&self) -> RequestFingerprint {
         RequestFingerprint(format!(
-            "kind={};venue={};account={};instrument={};side={};order_type={};time_in_force={};reduce_only={};quantity={};limit_price={};client_order_id={}",
+            "kind={};venue={};account={};instrument={};side={};order_type={};time_in_force={};reduce_only={};position_side={};quantity={};limit_price={};client_order_id={}",
             MutableActionKind::SubmitOrder,
             self.venue_id,
             self.account_id,
@@ -591,6 +619,7 @@ impl SubmitOrderRequest {
             self.order_type.as_str(),
             self.time_in_force.map(MutableTimeInForce::as_str).unwrap_or(""),
             self.reduce_only,
+            self.position_side.map(PerpPositionSide::as_str).unwrap_or(""),
             self.quantity,
             optional_display(self.limit_price),
             optional_display(self.client_order_id.as_ref())
@@ -4807,6 +4836,11 @@ pub mod live {
                         .expect("validated post-only order price")
                         .to_string(),
                 )?);
+            }
+        }
+        if config.market == BinanceExecMarket::UsdmFutures {
+            if let Some(position_side) = request.position_side {
+                params.push(binance_param("positionSide", position_side.as_str())?);
             }
         }
         if request.reduce_only {
@@ -13130,6 +13164,46 @@ mod tests {
         assert!(call.signed_query.contains("side=SELL"));
         assert!(call.signed_query.contains("type=LIMIT"));
         assert!(call.signed_query.contains("timeInForce=GTX"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn binance_usdm_adapter_maps_explicit_position_side() {
+        let mut adapter = live::BinanceUsdmExecAdapter::new(
+            live::BinanceExecConfig::usdm_futures(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                "https://fapi.binance.com",
+                binance_signing_policy("kms-policy/binance-usdm-exec-unit"),
+            )
+            .unwrap(),
+            binance_test_signer(1_700_000_000_457),
+            RecordingTransport::ok(
+                200,
+                r#"{"symbol":"BTCUSDT","orderId":991,"clientOrderId":"client:usdm:2","status":"NEW"}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BINANCE-USDM"),
+                    account("account:binance-usdm-unit"),
+                    instrument("inst:BINANCE:BTCUSDT:USDM-PERP"),
+                    OrderSide::Sell,
+                    MutableOrderType::Limit,
+                    quantity("0.002").unwrap(),
+                    Some(price("43200.00").unwrap()),
+                    Some(OrderId::new("client:usdm:2").unwrap()),
+                    IdempotencyKey::new("idem:binance:usdm:2").unwrap(),
+                )
+                .with_position_side(PerpPositionSide::Short),
+            )
+            .expect("signed usdm order dispatches with position side");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.signed_query.contains("positionSide=SHORT"));
     }
 
     #[cfg(feature = "live-exec")]

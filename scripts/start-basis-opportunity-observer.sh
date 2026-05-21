@@ -659,12 +659,20 @@ maybe_start_target_wss_warmup() {
     if is_alive "${inflight_pid}"; then
       return 0
     fi
+    rm -f "${inflight_file}" 2>/dev/null || true
   fi
 
   log_file="${LOG_DIR}/target-wss-warmup-${venue}-${slug}.log"
-  run_target_wss_warmup_job "${venue}" "${symbol}" "${ts}" >> "${log_file}" 2>&1 &
+  (
+    run_target_wss_warmup_job "${venue}" "${symbol}" "${ts}"
+    warmup_status="$?"
+    rm -f "${inflight_file}" 2>/dev/null || true
+    exit "${warmup_status}"
+  ) >> "${log_file}" 2>&1 &
   pid="$!"
   printf '%s\n' "${pid}" > "${inflight_file}"
+  # target WSS warmup 只负责拉起 spot/perp monitor 并在 ready 后退出。
+  # 它仍记录在 PID 文件中用于停止清理，但前台 supervisor 不把它视为核心常驻进程。
   printf '%s\t%s\t%s\n' "${pid}" "target-wss-warmup-${venue}-${slug}" "${log_file}" >> "${PID_FILE}"
   append_json_line "${VALIDATION_EVENTS_JSONL}" \
     --arg venue "${venue}" \
@@ -746,7 +754,14 @@ is_validation_process_name() {
   [[ "$1" == validation-* ]]
 }
 
+is_target_wss_warmup_process_name() {
+  [[ "$1" == target-wss-warmup-* ]]
+}
+
 is_core_process_name() {
+  if is_target_wss_warmup_process_name "$1"; then
+    return 1
+  fi
   case "$1" in
     *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-*) return 0 ;;
     *) return 1 ;;
@@ -884,13 +899,158 @@ mark_running_resident_artifacts_stopped() {
 
 mark_resident_artifacts_stopped() {
   mark_running_resident_artifacts_stopped \
-    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_state.json" \
-    "${RUN_ROOT}/resident-live/spot-perp-basis/multi_venue_resident_live_summary.json" \
+    "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_state.json" \
+    "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_summary.json" \
     "spot-perp-basis"
   mark_running_resident_artifacts_stopped \
-    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_state.json" \
-    "${RUN_ROOT}/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_summary.json" \
+    "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_state.json" \
+    "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json" \
     "cross-exchange-funding-arb"
+}
+
+resident_process_alive() {
+  local expected_name="$1"
+  local pid
+  local name
+  local _log_file
+
+  [[ -s "${PID_FILE}" ]] || return 1
+  while IFS=$'\t' read -r pid name _log_file; do
+    if [[ "${name}" == "${expected_name}" ]] && is_alive "${pid}"; then
+      return 0
+    fi
+  done < "${PID_FILE}"
+  return 1
+}
+
+safe_resident_lock_artifacts() {
+  local summary_path="$1"
+  local events_path="$2"
+  local output_root
+  local non_empty_private_artifact
+
+  output_root="$(dirname "${events_path}")"
+  non_empty_private_artifact="$(find "${output_root}" -type f \( \
+    -name 'mutable_receipts.jsonl' -o \
+    -name 'private_confirmations.jsonl' -o \
+    -name 'execution_reports.jsonl' -o \
+    -name '*position_state*.json' -o \
+    -name '*positions.jsonl' \
+  \) -size +0c -print -quit 2>/dev/null || true)"
+  [[ -n "${non_empty_private_artifact}" ]] && return 1
+
+  if [[ -s "${events_path}" ]] && jq -s -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+    any(.[]; (
+      (((.submitted_receipt_count // .submitted_receipts // 0) | as_count) > 0)
+      or (((.private_confirmation_count // .private_confirmations // 0) | as_count) > 0)
+      or ((.residual_risk // null) != null)
+      or ((.event_type // "") == "position_opened")
+      or ((.event_type // "") == "position_unknown")
+    ))
+  ' "${events_path}" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if [[ -s "${summary_path}" ]] && jq -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+    (((.open_position_count // 0) | as_count) != 0)
+    or (((.unknown_position_count // 0) | as_count) != 0)
+    or (((.live_entry_count // 0) | as_count) != 0)
+  ' "${summary_path}" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  [[ -s "${summary_path}" || -s "${events_path}" ]]
+}
+
+cleanup_safe_stale_resident_lock() {
+  local lock_path="$1"
+  local summary_path="$2"
+  local events_path="$3"
+  local process_name="$4"
+  local label="$5"
+  local archived_lock
+
+  [[ -e "${lock_path}" ]] || return 0
+  if resident_process_alive "${process_name}"; then
+    echo "resident_lock_kept label=${label} reason=process_alive lock=${lock_path}"
+    return 0
+  fi
+  archived_lock="${lock_path}.stale.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  if safe_resident_lock_artifacts "${summary_path}" "${events_path}"; then
+    echo "resident_lock_archived label=${label} reason=stale_safe_state lock=${lock_path} archived=${archived_lock}"
+    mv "${lock_path}" "${archived_lock}"
+    return 0
+  fi
+  echo "resident_lock_archived label=${label} reason=stale_state_requires_resident_recovery lock=${lock_path} archived=${archived_lock}"
+  mv "${lock_path}" "${archived_lock}"
+}
+
+cleanup_safe_stale_resident_locks() {
+  cleanup_safe_stale_resident_lock \
+    "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live.lock" \
+    "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_summary.json" \
+    "${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_events.jsonl" \
+    "spot-perp-basis-resident-live" \
+    "spot-perp-basis"
+  cleanup_safe_stale_resident_lock \
+    "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live.lock" \
+    "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json" \
+    "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_events.jsonl" \
+    "funding-arb-resident-live" \
+    "cross-exchange-funding-arb"
+}
+
+accepted_exit_marker_path() {
+  local pid="$1"
+  local name="$2"
+  local safe_name="${name//[^A-Za-z0-9_.-]/_}"
+  printf '%s/accepted-exits/%s.%s' "${STATE_DIR}" "${safe_name}" "${pid}"
+}
+
+funding_arb_resident_exit_is_accepted() {
+  local summary_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json"
+
+  [[ -s "${summary_path}" ]] || return 1
+  jq -e '
+    (.phase // "") == "halted"
+    and (.halt_reason // "") == "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
+    and ((.open_position_count // 0) | tonumber) == 0
+    and ((.unknown_position_count // 0) | tonumber) == 0
+  ' "${summary_path}" >/dev/null 2>&1
+}
+
+resident_exit_is_accepted() {
+  local name="$1"
+
+  case "${name}" in
+    funding-arb-resident-live) funding_arb_resident_exit_is_accepted ;;
+    *) return 1 ;;
+  esac
+}
+
+record_accepted_resident_exit_once() {
+  local pid="$1"
+  local name="$2"
+  local log_file="$3"
+  local marker
+
+  marker="$(accepted_exit_marker_path "${pid}" "${name}")"
+  if [[ -e "${marker}" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "${marker}")"
+  printf '%s\t%s\t%s\n' "${pid}" "${name}" "${log_file}" > "${marker}"
+  echo "supervised process completed acceptably: ${name} pid=${pid}"
 }
 
 graceful_stop_started_processes() {
@@ -919,17 +1079,17 @@ supervise_started_processes() {
 
     failed=0
     while IFS=$'\t' read -r pid name log_file; do
-      case "${name}" in
-        *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live|target-wss-*)
-          if ! is_alive "${pid}"; then
-            echo "error: supervised process exited: ${name} pid=${pid}" >&2
-            if [[ -n "${log_file}" && -f "${log_file}" ]]; then
-              tail -n 40 "${log_file}" >&2 || true
-            fi
-            failed=1
-          fi
-          ;;
-      esac
+      if is_core_process_name "${name}" && ! is_alive "${pid}"; then
+        if resident_exit_is_accepted "${name}"; then
+          record_accepted_resident_exit_once "${pid}" "${name}" "${log_file}"
+          continue
+        fi
+        echo "error: supervised process exited: ${name} pid=${pid}" >&2
+        if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+          tail -n 40 "${log_file}" >&2 || true
+        fi
+        failed=1
+      fi
     done < "${PID_FILE}"
 
     if (( failed != 0 )); then
@@ -1939,6 +2099,7 @@ if [[ -s "${PID_FILE}" ]]; then
     fi
   done < "${PID_FILE}"
 fi
+cleanup_safe_stale_resident_locks
 : > "${PID_FILE}"
 
 cd "${REPO_ROOT}"
