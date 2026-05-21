@@ -29,10 +29,12 @@ usage() {
   ARB_RUNTIME_LIVE_DETACH=0 # 是否后台运行 arb-runtime live；1 表示 detach。
   ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED=1 # 是否把启动脚本自身输出写入 live-prereq/logs/arb-runtime-live-precheck.log。
   ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120 # 等待 WSS monitor 就绪的最长秒数。
+  ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS=1 # 启动前是否回收本仓库 arb-runtime 残留 dashboard/WSS 端口；0 表示只报错。
   ARB_RUNTIME_LIVE_BUILD=1 # 启动前是否构建 arb-runtime 和 arb-wallet-signer。
   ARB_RUNTIME_LIVE_CONFIG=templates/personal_guarded_live.preflight.yaml # arb-runtime live 使用的风控和执行配置。
   ARB_RUNTIME_LIVE_INTERVAL_SECS=5 # observer 公开 monitor 轮询间隔秒数。
   ARB_RUNTIME_LIVE_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps。
+  ARB_RUNTIME_LOCAL_TZ=Asia/Shanghai # 面向人读的日志展示时区；默认 UTC+8。
   ARB_RUNTIME_LIVE_AUTO_ONCE_COOLDOWN_SECS=60 # 同一候选 auto-once 验证冷却秒数。
   ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE=1 # 是否运行候选 auto-once 验证。
   ARB_RUNTIME_LIVE_DERISK_ONLY=0 # 事故处理模式；1 表示只启动 funding arb resident 一轮恢复/减仓，不启动 spot-perp 实盘 resident。
@@ -83,6 +85,12 @@ die() {
   exit 1
 }
 
+local_log_timestamp() {
+  local timestamp
+  timestamp="$(TZ="${ARB_RUNTIME_LOCAL_TZ:-Asia/Shanghai}" date +%Y-%m-%dT%H:%M:%S%z)"
+  printf '%s:%s\n' "${timestamp%??}" "${timestamp: -2}"
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
@@ -90,6 +98,86 @@ require_command() {
 is_alive() {
   local pid="$1"
   [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+bind_port() {
+  local bind_addr="$1"
+  local port="${bind_addr##*:}"
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${port}"
+}
+
+pid_is_recorded_by_live_prereq() {
+  local needle="$1"
+  local pid
+  local _name
+  local _log_file
+  local _status_url
+  local _ready_symbol
+  local _required
+
+  if [[ -s "${PORTFOLIO_PID_FILE:-}" ]]; then
+    pid="$(sed -n '1p' "${PORTFOLIO_PID_FILE}" 2>/dev/null || true)"
+    [[ "${pid}" == "${needle}" ]] && return 0
+  fi
+  [[ -s "${WSS_PID_FILE:-}" ]] || return 1
+  while IFS=$'\t' read -r pid _name _log_file _status_url _ready_symbol _required; do
+    [[ "${pid}" == "${needle}" ]] && return 0
+  done < "${WSS_PID_FILE}"
+  return 1
+}
+
+pid_looks_like_repo_arb_runtime() {
+  local pid="$1"
+  local open_files
+
+  command -v lsof >/dev/null 2>&1 || return 1
+  open_files="$(lsof -nP -p "${pid}" 2>/dev/null || true)"
+  [[ -n "${open_files}" ]] || return 1
+  if [[ "${open_files}" == *"${REPO_ROOT}/target/"*"arb-runtime"* ]]; then
+    return 0
+  fi
+  [[ -n "${RUNTIME_BIN:-}" && "${open_files}" == *"${RUNTIME_BIN}"* ]]
+}
+
+wait_for_pid_exit() {
+  local pid="$1"
+  local timeout_secs="$2"
+  local deadline="$((SECONDS + timeout_secs))"
+
+  while (( SECONDS <= deadline )); do
+    if ! is_alive "${pid}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+reclaim_stale_runtime_port() {
+  local label="$1"
+  local bind_addr="$2"
+  local port
+  local pid
+
+  [[ "${RECLAIM_STALE_MONITOR_PORTS:-1}" == "1" ]] || return 0
+  command -v lsof >/dev/null 2>&1 || return 0
+  port="$(bind_port "${bind_addr}")" || return 0
+
+  while IFS= read -r pid; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    pid_is_recorded_by_live_prereq "${pid}" && continue
+    if pid_looks_like_repo_arb_runtime "${pid}"; then
+      echo "reclaiming stale runtime port: label=${label} bind=${bind_addr} pid=${pid}"
+      kill -TERM "${pid}" 2>/dev/null || true
+      if ! wait_for_pid_exit "${pid}" 3; then
+        echo "stale runtime process did not exit after TERM; sending KILL: label=${label} bind=${bind_addr} pid=${pid}"
+        kill -KILL "${pid}" 2>/dev/null || true
+      fi
+    else
+      die "cannot bind ${label} on ${bind_addr}: address already in use by pid=${pid}; not a managed ${REPO_ROOT}/target arb-runtime process"
+    fi
+  done < <(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true)
 }
 
 tail_log_on_error() {
@@ -215,6 +303,7 @@ PRECHECK_LOG="${LOG_DIR}/arb-runtime-live-precheck.log"
 RUNTIME_BIN="${ARB_RUNTIME_LIVE_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
 WSS_READY_TIMEOUT_SECS="${ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS:-120}"
 WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_WSS_RECONNECT_DELAY_SECS:-2}"
+RECLAIM_STALE_MONITOR_PORTS="${ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS:-1}"
 PORTFOLIO_BIND="${ARB_RUNTIME_LIVE_PORTFOLIO_BIND:-127.0.0.1:8805}"
 LIVE_CONFIG="${ARB_RUNTIME_LIVE_CONFIG:-${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}}"
 LIVE_INTERVAL_SECS="${ARB_RUNTIME_LIVE_INTERVAL_SECS:-${BASIS_OBSERVER_INTERVAL_SECS:-5}}"
@@ -307,7 +396,7 @@ mkdir -p "${LOG_DIR}" "${STATE_DIR}"
 if [[ "${ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED:-1}" != "0" ]]; then
   {
     echo
-    echo "=== arb-runtime live precheck $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    echo "=== arb-runtime live precheck $(local_log_timestamp) ==="
     echo "repo_root=${REPO_ROOT}"
     echo "run_root=${RUN_ROOT}"
     echo "prereq_root=${PREREQ_ROOT}"
@@ -353,6 +442,7 @@ start_wss_monitor() {
   local status_url="http://${bind_addr}${api_prefix}/status"
   local pid
 
+  reclaim_stale_runtime_port "${name}" "${bind_addr}"
   echo "starting ${name}: http://${bind_addr}/dashboard"
   nohup env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${RUNTIME_BIN}" "${command_name}" \
     --bind "${bind_addr}" \
@@ -461,7 +551,9 @@ start_portfolio_dashboard() {
   [[ -n "${ARB_RUNTIME_PORTFOLIO_POSITION_RAW_SNAPSHOT:-}" ]] && args+=(--position-raw-snapshot "${ARB_RUNTIME_PORTFOLIO_POSITION_RAW_SNAPSHOT}")
   [[ -n "${ARB_RUNTIME_PORTFOLIO_FUNDING_SNAPSHOT:-}" ]] && args+=(--funding-snapshot "${ARB_RUNTIME_PORTFOLIO_FUNDING_SNAPSHOT}")
 
+  reclaim_stale_runtime_port "portfolio-dashboard" "${PORTFOLIO_BIND}"
   echo "starting portfolio dashboard: http://${PORTFOLIO_BIND}/dashboard"
+  echo "starting error logs dashboard: http://${PORTFOLIO_BIND}/errors"
   nohup env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${args[@]}" >> "${log_file}" 2>&1 &
   pid="$!"
   printf '%s\n' "${pid}" > "${PORTFOLIO_PID_FILE}"
@@ -622,6 +714,7 @@ print_dashboards() {
 正式实盘 dashboard:
   系统导航:          http://${PORTFOLIO_BIND}/nav
   总组合看板:        http://${PORTFOLIO_BIND}/dashboard
+  错误日志:          http://${PORTFOLIO_BIND}/errors
   Binance basis:      http://127.0.0.1:8796/dashboard
   Bybit basis:        http://127.0.0.1:8797/dashboard
   OKX basis:          http://127.0.0.1:8798/dashboard
@@ -655,7 +748,6 @@ print_dashboards() {
 实时日志:
   tail -f ${PREREQ_ROOT}/logs/arb-runtime-live-precheck.log
   tail -f ${RUN_ROOT}/logs/realtime-feedback.log
-  tail -f ${PREREQ_ROOT}/logs/arb-runtime-live.log
 
 spot-perp-basis 常驻产物:
   ${RUN_ROOT}/resident-live/spot-perp-basis
@@ -745,6 +837,8 @@ if [[ "${DETACH}" == "1" ]]; then
   printf '%s\n' "${live_pid}" > "${LIVE_PID_FILE}"
   echo
   echo "arb-runtime live started in background: pid=${live_pid} log=${live_log}"
+  echo "实时 live 日志:"
+  echo "  tail -f ${live_log}"
   exit 0
 fi
 

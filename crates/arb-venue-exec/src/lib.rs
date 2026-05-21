@@ -5119,6 +5119,32 @@ pub mod live {
         }
     }
 
+    pub(crate) fn external_command_failure_reason(base: &str, stderr: &[u8]) -> String {
+        let stderr = String::from_utf8_lossy(stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            base.to_owned()
+        } else {
+            format!("{base}: stderr={}", utf8_snippet(stderr))
+        }
+    }
+
+    fn utf8_snippet(value: &str) -> String {
+        const MAX_LEN: usize = 256;
+        if value.len() <= MAX_LEN {
+            return value.to_owned();
+        }
+        let mut end = 0;
+        for (index, ch) in value.char_indices() {
+            let next = index + ch.len_utf8();
+            if next > MAX_LEN {
+                break;
+            }
+            end = next;
+        }
+        format!("{}...", &value[..end])
+    }
+
     fn signed_request_url(request: &BinanceSignedRequest<'_>) -> VenueExecResult<String> {
         let base = request.base_url();
         let endpoint = request.endpoint();
@@ -6295,7 +6321,7 @@ pub mod live {
             let mut child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|_| VenueExecError::SigningFailed {
                     reason: "cannot start external Hyperliquid signer command".to_owned(),
@@ -6318,7 +6344,10 @@ pub mod live {
                 })?;
             if !output.status.success() {
                 return Err(VenueExecError::SigningFailed {
-                    reason: "external Hyperliquid signer exited unsuccessfully".to_owned(),
+                    reason: external_command_failure_reason(
+                        "external Hyperliquid signer exited unsuccessfully",
+                        &output.stderr,
+                    ),
                 });
             }
             let rendered =
@@ -14711,6 +14740,18 @@ mod tests {
         assert!(adapter.transport().calls[1]
             .body
             .contains(r#""type":"order""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn external_hyperliquid_signer_failure_reports_stderr() {
+        let reason = live::external_command_failure_reason(
+            "external Hyperliquid signer exited unsuccessfully",
+            b"Hyperliquid action signer only supports order, cancel and cancelByCloid\n",
+        );
+
+        assert!(reason.contains("external Hyperliquid signer exited unsuccessfully"));
+        assert!(reason.contains("stderr=Hyperliquid action signer only supports"));
     }
 
     #[cfg(feature = "live-exec")]

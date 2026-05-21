@@ -343,7 +343,7 @@
               <th>卖量</th>
               <th>序列</th>
               <th>新鲜度</th>
-              <th>观测时间</th>
+              <th>本地观测时间 (UTC+8)</th>
             </tr>
           </thead>
           <tbody id="quote-rows">
@@ -378,6 +378,8 @@
   <script>
     const statusUrl = "{{API_PREFIX}}/status";
     const state = { timer: null };
+    const LOCAL_TIME_ZONE = "Asia/Shanghai";
+    const LOCAL_TIME_ZONE_LABEL = "UTC+8";
     const $ = (id) => document.getElementById(id);
 
     async function requestJson(url) {
@@ -409,6 +411,29 @@
       }[ch]));
     }
 
+    function parsedTimestampMs(value) {
+      const text = String(value ?? "").trim();
+      if (!text || text === "not-yet-updated" || text === "timestamp-unavailable") return null;
+      const normalized = text.replace(/\.(\d{3})\d+(Z|[+-]\d{2}:?\d{2})$/, ".$1$2");
+      const parsed = Date.parse(normalized);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function localTimestamp(value) {
+      const parsed = parsedTimestampMs(value);
+      if (parsed === null) return valueOrDash(value);
+      const rendered = new Date(parsed).toLocaleString("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+      return `${rendered} ${LOCAL_TIME_ZONE_LABEL}`;
+    }
+
     function filteredRows(rows) {
       const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
       return (rows || [])
@@ -432,7 +457,7 @@
         <td>${escapeHtml(row.ask_size)}</td>
         <td>${escapeHtml(row.source_sequence)}</td>
         <td>${escapeHtml(row.freshness_status)}</td>
-        <td>${escapeHtml(row.observed_at)}</td>
+        <td>${escapeHtml(localTimestamp(row.observed_at))}</td>
       </tr>`).join("");
     }
 
@@ -441,7 +466,7 @@
       const healthy = snapshot.status === "streaming" && snapshot.fail_closed === false;
       $("runtime-status").textContent = snapshot.status || "未知";
       $("runtime-status").className = `pill ${healthy ? "healthy" : "error"}`;
-      $("updated-at").textContent = snapshot.updated_at || "尚未更新";
+      $("updated-at").textContent = localTimestamp(snapshot.updated_at);
       $("metric-symbol").textContent = valueOrDash(snapshot.symbol);
       $("metric-market").textContent = valueOrDash(snapshot.market);
       $("metric-fail-closed").textContent = String(snapshot.fail_closed ?? false);

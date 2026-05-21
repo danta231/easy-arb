@@ -135,6 +135,8 @@
   </main>
   <script>
     const state = { pages: [], category: "全部", query: "" };
+    const LOCAL_TIME_ZONE = "Asia/Shanghai";
+    const LOCAL_TIME_ZONE_LABEL = "UTC+8";
     const grid = document.getElementById("grid");
     const tabs = document.getElementById("tabs");
     const empty = document.getElementById("empty");
@@ -145,6 +147,29 @@
       return String(value ?? "").replace(/[&<>"']/g, ch => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
       }[ch]));
+    }
+
+    function parsedTimestampMs(value) {
+      const text = String(value ?? "").trim();
+      if (!text || text === "not-yet-updated" || text === "timestamp-unavailable") return null;
+      const normalized = text.replace(/\.(\d{3})\d+(Z|[+-]\d{2}:?\d{2})$/, ".$1$2");
+      const parsed = Date.parse(normalized);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function localTimestamp(value) {
+      const parsed = parsedTimestampMs(value);
+      if (parsed === null) return value || "-";
+      const rendered = new Date(parsed).toLocaleString("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+      return `${rendered} ${LOCAL_TIME_ZONE_LABEL}`;
     }
 
     function categories() {
@@ -203,7 +228,7 @@
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       state.pages = data.pages || [];
-      updated.textContent = `页面 ${state.pages.length} 个，更新时间 ${data.updated_at || "-"}`;
+      updated.textContent = `页面 ${state.pages.length} 个，更新时间 ${localTimestamp(data.updated_at)}`;
       render();
     }
 

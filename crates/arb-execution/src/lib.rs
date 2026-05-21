@@ -1932,7 +1932,7 @@ fn build_plan_contract(
     let mut edges = Vec::new();
     let mut previous_plan_leg_id: Option<String> = None;
     let manual_gate_id = if pending_manual_approval {
-        let gate_id = format!("pleg:{plan_id}:manual-gate");
+        let gate_id = bounded_identifier("pleg", &format!("{plan_id}:manual-gate"));
         leg_json.push(render_manual_gate_leg(input, &gate_id));
         Some(gate_id)
     } else {
@@ -1940,7 +1940,7 @@ fn build_plan_contract(
     };
 
     for (index, leg) in input.candidate.legs.iter().enumerate() {
-        let plan_leg_id = format!("pleg:{plan_id}:{:04}", index + 1);
+        let plan_leg_id = bounded_identifier("pleg", &format!("{plan_id}:{:04}", index + 1));
         let mut dependencies = Vec::new();
         let mut initial_state = if index == 0 {
             ExecutionLegState::Ready
@@ -2001,7 +2001,7 @@ fn build_plan_contract(
         json_string(input.risk_decision.decision_id.as_str()),
         json_string(input.created_at),
         json_string(mode),
-        json_string(&format!("idem:{plan_id}")),
+        json_string(&bounded_identifier("idem", &plan_id)),
         leg_json.join(","),
         edges.join(","),
         constraints,
@@ -2067,7 +2067,7 @@ fn render_manual_gate_leg(input: &ExecutionPlanBuildInput<'_>, gate_id: &str) ->
         )),
         json_string(ExecutionActionType::ManualApprovalGate.as_str()),
         json_string(account_id),
-        json_string(&format!("idem:{gate_id}")),
+        json_string(&bounded_identifier("idem", gate_id)),
         json_string(ExecutionLegState::Prepared.as_str()),
         json_string(FailureMode::ManualInterventionRequired.as_str()),
     )
@@ -2149,7 +2149,10 @@ fn render_execution_leg(input: ExecutionLegRenderInput<'_>) -> ExecutionResult<S
     }
     fields.push(render_pair(
         "idempotency_key",
-        json_string(&format!("idem:{}:{}", input.plan_id, leg.leg_id.as_str())),
+        json_string(&bounded_identifier(
+            "idem",
+            &format!("{}:{}", input.plan_id, leg.leg_id.as_str()),
+        )),
     ));
     if !input.dependencies.is_empty() {
         fields.push(render_pair(
@@ -2571,7 +2574,16 @@ fn data_freshness_ms(risk_decision: &RiskDecision) -> Option<String> {
 }
 
 fn plan_id(risk_decision: &RiskDecision) -> String {
-    format!("plan:{}", risk_decision.decision_id.as_str())
+    bounded_identifier("plan", risk_decision.decision_id.as_str())
+}
+
+fn bounded_identifier(prefix: &str, source: &str) -> String {
+    let candidate = format!("{prefix}:{source}");
+    if candidate.len() <= 128 {
+        candidate
+    } else {
+        format!("{prefix}:sha256:{}", sha256_hex(source.as_bytes()))
+    }
 }
 
 fn render_pair(key: &str, value: String) -> String {
@@ -4260,6 +4272,47 @@ mod tests {
         );
         assert_eq!(long.quantity.as_ref().expect("long qty").as_str(), "1");
         assert_eq!(short.quantity.as_ref().expect("short qty").as_str(), "1");
+    }
+
+    #[test]
+    fn funding_arb_preview_bounds_long_leg_idempotency_keys() {
+        let transition_id =
+            "trans:cross-exchange-funding-arb-binance-hyperliquid-pharosusdt-live-observer";
+        let candidate_json = FUNDING_ARB_CANDIDATE
+            .replace(
+                "\"transition_id\": \"trans:01\"",
+                &format!("\"transition_id\": \"{transition_id}\""),
+            )
+            .replace(
+                "candleg:funding:long",
+                "candleg:funding-arb-binance-usdm-pharosusdt",
+            )
+            .replace(
+                "candleg:funding:short",
+                "candleg:funding-arb-hyperliquid-perp-pharosusdt",
+            );
+        let risk_decision = decision(&manual_decision_json().replace("trans:01", transition_id));
+        let candidate = candidate(&candidate_json);
+        let outcome = build_execution_plan_preview(ExecutionPlanBuildInput::new(
+            &risk_decision,
+            &candidate,
+            ExecutionMode::ReadOnly,
+            "2026-01-01T00:00:04Z",
+        ))
+        .expect("long funding arb identifiers should still produce a valid preview");
+
+        let pending = match outcome {
+            PlanBuildOutcome::PendingManualApproval(pending) => pending,
+            PlanBuildOutcome::Schedulable(_) => panic!("manual approval must not be dispatchable"),
+        };
+
+        for leg in &pending.plan_preview.legs {
+            assert!(leg.idempotency_key.as_str().len() <= 128);
+        }
+        assert!(pending.plan_preview.legs[2]
+            .idempotency_key
+            .as_str()
+            .starts_with("idem:sha256:"));
     }
 
     #[test]

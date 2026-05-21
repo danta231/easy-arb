@@ -239,6 +239,8 @@
   </main>
   <script>
     const state = { balances: [], positions: [] };
+    const LOCAL_TIME_ZONE = "Asia/Shanghai";
+    const LOCAL_TIME_ZONE_LABEL = "UTC+8";
     const fields = {
       balances: ["venue_family", "account_id", "asset", "available", "margin_balance", "maintenance_margin", "margin_buffer", "free", "locked", "reserved", "unsettled", "source_status"],
       positions: ["coin", "strategy", "venue_family", "fee", "accumulated_position", "open_average_price", "close_average_price", "open_close_spread_pct", "realtime_funding_rate", "funding_settlement_time", "open_close_condition", "position_status", "position_quantity", "position_limit", "account_id", "source"]
@@ -249,6 +251,27 @@
     }
     function escapeHtml(value) {
       return text(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    }
+    function parsedTimestampMs(value) {
+      const raw = String(value ?? "").trim();
+      if (!raw || raw === "not-yet-updated" || raw === "timestamp-unavailable") return null;
+      const normalized = raw.replace(/\.(\d{3})\d+(Z|[+-]\d{2}:?\d{2})$/, ".$1$2");
+      const parsed = Date.parse(normalized);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    function localTimestamp(value) {
+      const parsed = parsedTimestampMs(value);
+      if (parsed === null) return text(value);
+      const rendered = new Date(parsed).toLocaleString("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+      return `${rendered} ${LOCAL_TIME_ZONE_LABEL}`;
     }
     function rowMatches(row) {
       const venue = document.getElementById("venue-filter").value;
@@ -305,7 +328,7 @@
       document.getElementById("balance-count").textContent = data.balance_count ?? state.balances.length;
       document.getElementById("position-count").textContent = data.position_count ?? state.positions.length;
       document.getElementById("source-error-count").textContent = data.source_error_count ?? 0;
-      document.getElementById("updated-at").textContent = data.updated_at || "-";
+      document.getElementById("updated-at").textContent = localTimestamp(data.updated_at);
       const errors = document.getElementById("errors");
       if (data.source_errors && data.source_errors.length) {
         errors.style.display = "block";

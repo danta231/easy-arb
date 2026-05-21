@@ -2710,6 +2710,7 @@ pub struct FundingArbMonitorOptions {
     pub output_dir: Option<PathBuf>,
     pub execution_reports_path: Option<PathBuf>,
     pub resident_events_path: Option<PathBuf>,
+    pub opportunity_history_path: Option<PathBuf>,
     pub sources: Vec<FundingArbVenueSource>,
 }
 
@@ -2727,6 +2728,7 @@ impl Default for FundingArbMonitorOptions {
             output_dir: None,
             execution_reports_path: None,
             resident_events_path: None,
+            opportunity_history_path: None,
             sources: default_funding_arb_venue_sources(),
         }
     }
@@ -4149,14 +4151,17 @@ fn run_hyperliquid_wallet_signer_preflight(
     let output = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
         .map_err(|error| RuntimeError::UnsafeConfig {
             message: format!("cannot start arb-wallet-signer for Hyperliquid preflight: {error}"),
         })?;
     if !output.status.success() {
         return Err(RuntimeError::UnsafeConfig {
-            message: "arb-wallet-signer Hyperliquid preflight exited unsuccessfully".to_owned(),
+            message: wallet_signer_preflight_failure_message(
+                "arb-wallet-signer Hyperliquid preflight exited unsuccessfully",
+                &output.stderr,
+            ),
         });
     }
     let rendered = String::from_utf8(output.stdout).map_err(|_| RuntimeError::UnsafeConfig {
@@ -4164,6 +4169,17 @@ fn run_hyperliquid_wallet_signer_preflight(
     })?;
     validate_hyperliquid_signature_json(rendered.trim())?;
     Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn wallet_signer_preflight_failure_message(base: &str, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = response_snippet(stderr.trim());
+    if stderr.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}: stderr={stderr}")
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -5370,6 +5386,596 @@ fn portfolio_positions_json(snapshot: &PortfolioDashboardSnapshot) -> String {
             .join(","),
         json_string(&snapshot.status),
         json_string(&snapshot.updated_at),
+    )
+}
+
+const ERROR_LOG_RAW_CHAR_LIMIT: usize = 1_200;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ErrorLogSourceKind {
+    Jsonl,
+    Text,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ErrorLogSource {
+    source: String,
+    path: PathBuf,
+    kind: ErrorLogSourceKind,
+}
+
+fn build_error_logs_snapshot(options: &PortfolioDashboardOptions) -> ErrorLogsSnapshot {
+    let mut source_errors = Vec::new();
+    let sources = portfolio_error_log_sources(options, &mut source_errors);
+    let source_count = sources.len();
+    let mut entries = Vec::new();
+    let mut skipped_line_count = 0usize;
+
+    for source in sources {
+        let result = match source.kind {
+            ErrorLogSourceKind::Jsonl => {
+                append_jsonl_error_log_entries(&source, &mut entries, &mut skipped_line_count)
+            }
+            ErrorLogSourceKind::Text => append_text_error_log_entries(&source, &mut entries),
+        };
+        if let Err(error) = result {
+            source_errors.push(format!("{}: {error}", source.path.display()));
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        right
+            .observed_at
+            .as_deref()
+            .unwrap_or("")
+            .cmp(left.observed_at.as_deref().unwrap_or(""))
+            .then_with(|| right.path.cmp(&left.path))
+            .then_with(|| right.line_number.cmp(&left.line_number))
+    });
+    let status = if source_count == 0 {
+        "missing"
+    } else if !source_errors.is_empty() {
+        "degraded"
+    } else if entries.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    }
+    .to_owned();
+
+    ErrorLogsSnapshot {
+        status,
+        updated_at: current_utc_timestamp_string(),
+        entries,
+        source_errors,
+        source_count,
+        skipped_line_count,
+    }
+}
+
+fn portfolio_error_log_sources(
+    options: &PortfolioDashboardOptions,
+    source_errors: &mut Vec<String>,
+) -> Vec<ErrorLogSource> {
+    let mut sources = Vec::new();
+    let mut seen = BTreeSet::new();
+    let Some(run_root) = portfolio_error_log_run_root(options) else {
+        return sources;
+    };
+
+    let logs_dir = run_root.join("logs");
+    if logs_dir.is_dir() {
+        match fs::read_dir(&logs_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let Some(file_name) = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let kind = if file_name.ends_with(".jsonl") {
+                        Some(ErrorLogSourceKind::Jsonl)
+                    } else if file_name.ends_with(".log") {
+                        Some(ErrorLogSourceKind::Text)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        push_error_log_source(
+                            &mut sources,
+                            &mut seen,
+                            file_name
+                                .trim_end_matches(".jsonl")
+                                .trim_end_matches(".log"),
+                            path,
+                            kind,
+                        );
+                    }
+                }
+            }
+            Err(error) => source_errors.push(format!("{}: {error}", logs_dir.display())),
+        }
+    }
+
+    for (source, path) in [
+        (
+            "live-reports",
+            run_root.join("live").join("live-reports.jsonl"),
+        ),
+        (
+            "validation-events",
+            run_root.join("live").join("validation-events.jsonl"),
+        ),
+        (
+            "funding-arb-resident-live",
+            run_root
+                .join("resident-live")
+                .join("cross-exchange-funding-arb")
+                .join("funding_arb_resident_live_events.jsonl"),
+        ),
+        (
+            "spot-perp-basis-resident-live",
+            run_root
+                .join("resident-live")
+                .join("spot-perp-basis")
+                .join("multi_venue_resident_live_events.jsonl"),
+        ),
+    ] {
+        if path.exists() {
+            push_error_log_source(
+                &mut sources,
+                &mut seen,
+                source,
+                path,
+                ErrorLogSourceKind::Jsonl,
+            );
+        }
+    }
+
+    let resident_root = run_root.join("resident-live");
+    if resident_root.is_dir() {
+        collect_resident_error_event_sources(
+            &resident_root,
+            5,
+            &mut sources,
+            &mut seen,
+            source_errors,
+        );
+    }
+
+    sources
+}
+
+fn portfolio_error_log_run_root(options: &PortfolioDashboardOptions) -> Option<PathBuf> {
+    let root = options.resident_root.as_ref()?;
+    if root.join("logs").is_dir() || root.join("resident-live").is_dir() {
+        return Some(root.clone());
+    }
+    if root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name == "resident-live")
+    {
+        if let Some(parent) = root.parent() {
+            return Some(parent.to_path_buf());
+        }
+    }
+    Some(root.clone())
+}
+
+fn collect_resident_error_event_sources(
+    root: &Path,
+    remaining_depth: usize,
+    sources: &mut Vec<ErrorLogSource>,
+    seen: &mut BTreeSet<String>,
+    source_errors: &mut Vec<String>,
+) {
+    if remaining_depth == 0 {
+        return;
+    }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            source_errors.push(format!("{}: {error}", root.display()));
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_resident_error_event_sources(
+                &path,
+                remaining_depth - 1,
+                sources,
+                seen,
+                source_errors,
+            );
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.ends_with("_events.jsonl") || file_name == "resident_live_events.jsonl" {
+            let source = resident_error_source_label(&path);
+            push_error_log_source(sources, seen, &source, path, ErrorLogSourceKind::Jsonl);
+        }
+    }
+}
+
+fn resident_error_source_label(path: &Path) -> String {
+    let path_text = path.display().to_string();
+    if path_text.contains("cross-exchange-funding-arb") {
+        "funding-arb-resident-live".to_owned()
+    } else if path_text.contains("spot-perp-basis") {
+        "spot-perp-basis-resident-live".to_owned()
+    } else {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("resident-events")
+            .to_owned()
+    }
+}
+
+fn push_error_log_source(
+    sources: &mut Vec<ErrorLogSource>,
+    seen: &mut BTreeSet<String>,
+    source: &str,
+    path: PathBuf,
+    kind: ErrorLogSourceKind,
+) {
+    let key = path.display().to_string();
+    if seen.insert(key) {
+        sources.push(ErrorLogSource {
+            source: source.to_owned(),
+            path,
+            kind,
+        });
+    }
+}
+
+fn append_jsonl_error_log_entries(
+    source: &ErrorLogSource,
+    entries: &mut Vec<ErrorLogEntry>,
+    skipped_line_count: &mut usize,
+) -> RuntimeResult<()> {
+    let input = read_utf8(&source.path)?;
+    for (line_index, line) in input.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fields = match parse_json_object_value_slices(trimmed) {
+            Ok(fields) => fields,
+            Err(_) => {
+                *skipped_line_count += 1;
+                continue;
+            }
+        };
+        if let Some(entry) =
+            error_log_entry_from_json_fields(source, line_index + 1, trimmed, &fields)?
+        {
+            entries.push(entry);
+        }
+    }
+    Ok(())
+}
+
+fn append_text_error_log_entries(
+    source: &ErrorLogSource,
+    entries: &mut Vec<ErrorLogEntry>,
+) -> RuntimeResult<()> {
+    let input = read_utf8(&source.path)?;
+    for (line_index, line) in input.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !text_log_line_is_error(trimmed) {
+            continue;
+        }
+        entries.push(ErrorLogEntry {
+            observed_at: timestamp_from_text_log_line(trimmed),
+            severity: severity_from_message(trimmed).to_owned(),
+            category: "文本日志".to_owned(),
+            source: source.source.clone(),
+            strategy: None,
+            pair_id: None,
+            symbol: None,
+            message: trimmed.to_owned(),
+            path: source.path.display().to_string(),
+            line_number: line_index + 1,
+            raw: truncate_for_json(trimmed, ERROR_LOG_RAW_CHAR_LIMIT),
+        });
+    }
+    Ok(())
+}
+
+fn error_log_entry_from_json_fields(
+    source: &ErrorLogSource,
+    line_number: usize,
+    raw: &str,
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<ErrorLogEntry>> {
+    let mut reasons = Vec::new();
+    for field in [
+        "blocking_reason_details",
+        "blocking_reasons",
+        "dry_run_live_blocking_reasons",
+        "live_blocking_reasons",
+        "no_dispatch_reasons",
+        "risk_reason_codes",
+    ] {
+        extend_unique(
+            &mut reasons,
+            optional_json_value_string_array_if_array(fields, field, "error log")?,
+        );
+    }
+    for field in [
+        "error",
+        "last_error",
+        "reason",
+        "halt_reason",
+        "residual_risk",
+        "detail",
+    ] {
+        if let Some(value) = optional_json_value_string(fields, field, "error log")? {
+            push_unique_reason(&mut reasons, value);
+        }
+    }
+
+    let event_type =
+        optional_first_json_value_string(fields, &["event_type", "event"], "error log")?;
+    let status = optional_json_value_string(fields, "status", "error log")?;
+    let dispatch_allowed = optional_json_bool(fields, "dispatch_allowed", "error log")
+        .ok()
+        .flatten();
+    let dispatch_attempted = optional_json_bool(fields, "dispatch_attempted", "error log")
+        .ok()
+        .flatten();
+    let mutable_execution_started =
+        optional_json_bool(fields, "mutable_execution_started", "error log")
+            .ok()
+            .flatten();
+    let dry_run_live_ready = optional_json_bool(fields, "dry_run_live_ready", "error log")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            optional_json_bool(fields, "live_ready", "error log")
+                .ok()
+                .flatten()
+        });
+    let manual_gate_released = optional_json_bool(fields, "manual_gate_released", "error log")
+        .ok()
+        .flatten();
+    let dispatch_plan_built = optional_json_bool(fields, "dispatch_plan_built", "error log")
+        .ok()
+        .flatten();
+
+    let event_is_error = event_type.as_deref().is_some_and(event_type_is_error_like);
+    let status_is_bad = status.as_deref().is_some_and(error_log_status_is_bad);
+    if status_is_bad {
+        if let Some(status) = &status {
+            push_unique_reason(&mut reasons, format!("status={status}"));
+        }
+    }
+    if event_is_error && reasons.is_empty() {
+        if let Some(event_type) = &event_type {
+            push_unique_reason(&mut reasons, event_type.clone());
+        }
+    }
+    if dispatch_allowed == Some(false) && reasons.is_empty() {
+        push_unique_reason(&mut reasons, "dispatch_allowed=false");
+    }
+
+    if reasons.is_empty() && !event_is_error && !status_is_bad {
+        return Ok(None);
+    }
+
+    let gate_passed_then_failed = dry_run_live_ready == Some(true)
+        && manual_gate_released == Some(true)
+        && dispatch_plan_built == Some(true)
+        && (dispatch_attempted == Some(true) || mutable_execution_started == Some(true))
+        && (!reasons.is_empty() || dispatch_allowed == Some(false));
+    let category = if gate_passed_then_failed {
+        "门禁通过后下单失败"
+    } else if event_type
+        .as_deref()
+        .is_some_and(|event| event.contains("no_candidate"))
+    {
+        "候选不可用"
+    } else if dispatch_allowed == Some(false)
+        || event_type
+            .as_deref()
+            .is_some_and(|event| event.contains("blocked"))
+    {
+        "下单门禁阻断"
+    } else if event_type
+        .as_deref()
+        .is_some_and(|event| event.contains("unknown"))
+    {
+        "未知状态"
+    } else if status_is_bad {
+        "状态异常"
+    } else {
+        "运行错误"
+    };
+
+    Ok(Some(ErrorLogEntry {
+        observed_at: optional_first_json_value_string(
+            fields,
+            &[
+                "recorded_at",
+                "observed_at",
+                "updated_at",
+                "validation_finished_at",
+                "opened_at",
+            ],
+            "error log",
+        )?,
+        severity: if gate_passed_then_failed {
+            "error".to_owned()
+        } else {
+            severity_from_message(&reasons.join(" | ")).to_owned()
+        },
+        category: category.to_owned(),
+        source: source.source.clone(),
+        strategy: optional_json_value_string(fields, "strategy", "error log")?,
+        pair_id: optional_json_value_string(fields, "pair_id", "error log")?,
+        symbol: optional_json_value_string(fields, "symbol", "error log")?,
+        message: reasons.join(" | "),
+        path: source.path.display().to_string(),
+        line_number,
+        raw: truncate_for_json(raw, ERROR_LOG_RAW_CHAR_LIMIT),
+    }))
+}
+
+fn optional_json_value_string_array_if_array(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<Vec<String>> {
+    let Some(value) = fields.get(field) else {
+        return Ok(Vec::new());
+    };
+    if !value.trim().starts_with('[') {
+        return Ok(Vec::new());
+    }
+    optional_json_value_string_array(fields, field, source)
+}
+
+fn event_type_is_error_like(event_type: &str) -> bool {
+    let lower = event_type.to_ascii_lowercase();
+    [
+        "error", "fail", "failed", "blocked", "halt", "halted", "unknown", "reject", "rejected",
+        "incident", "capacity",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn error_log_status_is_bad(status: &str) -> bool {
+    let lower = status.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "ok" | "healthy" | "complete" | "completed" | "streaming" | "starting" | "matched"
+    )
+}
+
+fn text_log_line_is_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        " error",
+        "error:",
+        "failed",
+        " fail",
+        "rejected",
+        "blocked",
+        "unknown",
+        "unsafe",
+        "halted",
+        "panic",
+        "denied",
+        "refused",
+        "unavailable",
+        "invalid",
+        "mismatch",
+        "cannot",
+        "失败",
+        "错误",
+        "阻断",
+        "拒绝",
+        "未知",
+        "不可用",
+        "无法",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn severity_from_message(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unknown")
+        || lower.contains("residual")
+        || lower.contains("panic")
+        || lower.contains("unsafe")
+        || message.contains("未知")
+    {
+        "critical"
+    } else if lower.contains("blocked")
+        || lower.contains("rejected")
+        || lower.contains("failed")
+        || lower.contains("error")
+        || lower.contains("invalid")
+        || message.contains("阻断")
+        || message.contains("拒绝")
+        || message.contains("失败")
+        || message.contains("错误")
+    {
+        "error"
+    } else {
+        "warning"
+    }
+}
+
+fn timestamp_from_text_log_line(line: &str) -> Option<String> {
+    if let Some(close) = line.find(']') {
+        if line.starts_with('[') && close > 1 {
+            return Some(line[1..close].to_owned());
+        }
+    }
+    line.split_whitespace()
+        .next()
+        .filter(|value| value.contains('T') && value.contains(':'))
+        .map(str::to_owned)
+}
+
+fn truncate_for_json(value: &str, max_chars: usize) -> String {
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn error_logs_json(snapshot: &ErrorLogsSnapshot) -> String {
+    format!(
+        "{{\"entries\":[{}],\"entry_count\":{},\"schema_version\":\"1.0.0\",\"skipped_line_count\":{},\"source_count\":{},\"source_error_count\":{},\"source_errors\":{},\"status\":{},\"updated_at\":{}}}",
+        snapshot
+            .entries
+            .iter()
+            .map(error_log_entry_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        snapshot.entries.len(),
+        snapshot.skipped_line_count,
+        snapshot.source_count,
+        snapshot.source_errors.len(),
+        json_string_array(&snapshot.source_errors),
+        json_string(&snapshot.status),
+        json_string(&snapshot.updated_at),
+    )
+}
+
+fn error_log_entry_json(entry: &ErrorLogEntry) -> String {
+    format!(
+        "{{\"category\":{},\"line_number\":{},\"message\":{},\"observed_at\":{},\"pair_id\":{},\"path\":{},\"raw\":{},\"severity\":{},\"source\":{},\"strategy\":{},\"symbol\":{}}}",
+        json_string(&entry.category),
+        entry.line_number,
+        json_string(&entry.message),
+        json_option_string(&entry.observed_at),
+        json_option_string(&entry.pair_id),
+        json_string(&entry.path),
+        json_string(&entry.raw),
+        json_string(&entry.severity),
+        json_string(&entry.source),
+        json_option_string(&entry.strategy),
+        json_option_string(&entry.symbol),
     )
 }
 
@@ -20872,6 +21478,7 @@ pub fn run_funding_arb_monitor(options: FundingArbMonitorOptions) -> RuntimeResu
         let context = Arc::new(FundingArbDashboardContext {
             execution_reports_path: options.execution_reports_path.clone(),
             resident_events_path: options.resident_events_path.clone(),
+            opportunity_history_path: options.opportunity_history_path.clone(),
         });
         start_funding_arb_http_api(&options.bind_addr, state.clone(), context)?;
         println!(
@@ -21039,6 +21646,10 @@ fn validate_funding_arb_monitor_options(options: &FundingArbMonitorOptions) -> R
         .is_some_and(|path| path.as_os_str().is_empty())
         || options
             .resident_events_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        || options
+            .opportunity_history_path
             .as_ref()
             .is_some_and(|path| path.as_os_str().is_empty())
     {
@@ -25810,6 +26421,7 @@ pub struct FundingArbMonitorSnapshot {
 struct FundingArbDashboardContext {
     execution_reports_path: Option<PathBuf>,
     resident_events_path: Option<PathBuf>,
+    opportunity_history_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25939,6 +26551,31 @@ struct PortfolioDashboardSnapshot {
     balances: Vec<PortfolioBalanceRow>,
     positions: Vec<PortfolioPositionRow>,
     source_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ErrorLogsSnapshot {
+    status: String,
+    updated_at: String,
+    entries: Vec<ErrorLogEntry>,
+    source_errors: Vec<String>,
+    source_count: usize,
+    skipped_line_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ErrorLogEntry {
+    observed_at: Option<String>,
+    severity: String,
+    category: String,
+    source: String,
+    strategy: Option<String>,
+    pair_id: Option<String>,
+    symbol: Option<String>,
+    message: String,
+    path: String,
+    line_number: usize,
+    raw: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28203,9 +28840,32 @@ fn hyperliquid_private_account_entry_from_raw_statement(
         return Ok(None);
     }
     let root_fields = parse_json_object_value_slices(payload)?;
-    let Some(payload) = hyperliquid_clearinghouse_state_payload(payload, &root_fields) else {
-        return Ok(None);
+    let unified_spot_entry = hyperliquid_unified_private_account_entry_from_spot_state(
+        statement,
+        payload,
+        &root_fields,
+    )?;
+    let clearinghouse_entry = match hyperliquid_clearinghouse_state_payload(payload, &root_fields) {
+        Some(payload) => {
+            hyperliquid_private_account_entry_from_clearinghouse_state(statement, payload)?
+        }
+        None => return Ok(unified_spot_entry),
     };
+    let Some(clearinghouse_entry) = clearinghouse_entry else {
+        return Ok(unified_spot_entry);
+    };
+    if unified_spot_entry.is_some()
+        && !hyperliquid_private_account_entry_has_nonzero_amount(&clearinghouse_entry)?
+    {
+        return Ok(unified_spot_entry);
+    }
+    Ok(Some(clearinghouse_entry))
+}
+
+fn hyperliquid_private_account_entry_from_clearinghouse_state(
+    statement: &FundingPrivateRawStatement,
+    payload: &str,
+) -> RuntimeResult<Option<FundingPrivateAccountEntry>> {
     let fields = parse_json_object_value_slices(payload)?;
     let available_usd = first_json_scalar_string(&fields, &["withdrawable", "available"])?;
     let margin_balance_usd = hyperliquid_margin_balance_from_clearinghouse_fields(&fields)?;
@@ -28229,6 +28889,127 @@ fn hyperliquid_private_account_entry_from_raw_statement(
         maintenance_margin_usd,
         margin_buffer_usd,
     }))
+}
+
+fn hyperliquid_unified_private_account_entry_from_spot_state(
+    statement: &FundingPrivateRawStatement,
+    payload: &str,
+    root_fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<FundingPrivateAccountEntry>> {
+    let Some(spot_payload) = hyperliquid_spot_state_payload(payload, root_fields) else {
+        return Ok(None);
+    };
+    let Some(collateral) = hyperliquid_usdc_spot_collateral_from_state(spot_payload)? else {
+        return Ok(None);
+    };
+    let Some(available_after_maintenance) = collateral.available_after_maintenance else {
+        return Ok(None);
+    };
+    Ok(Some(FundingPrivateAccountEntry {
+        venue_family: statement.venue_family.clone(),
+        account_id: statement.account_id.clone(),
+        available_usd: Some(available_after_maintenance.clone()),
+        margin_balance_usd: collateral.total,
+        maintenance_margin_usd: None,
+        margin_buffer_usd: Some(available_after_maintenance),
+    }))
+}
+
+struct HyperliquidSpotCollateral {
+    total: Option<String>,
+    available_after_maintenance: Option<String>,
+}
+
+fn hyperliquid_usdc_spot_collateral_from_state(
+    payload: &str,
+) -> RuntimeResult<Option<HyperliquidSpotCollateral>> {
+    let fields = parse_json_object_value_slices(payload)?;
+    let Some(balances) = fields.get("balances") else {
+        return Ok(None);
+    };
+    let mut usdc_token_id = None;
+    let mut usdc_total = None;
+    for value in json_array_value_slices(balances)? {
+        let balance_fields = parse_json_object_value_slices(value)?;
+        let Some(asset) = json_scalar_string_from_fields(&balance_fields, "coin")? else {
+            continue;
+        };
+        if asset.trim().eq_ignore_ascii_case("USDC") {
+            usdc_token_id = first_non_empty_json_scalar_string(&balance_fields, &["token"])?;
+            usdc_total = first_non_empty_json_scalar_string(&balance_fields, &["total"])?;
+            break;
+        }
+    }
+    let Some(usdc_token_id) = usdc_token_id else {
+        return Ok(None);
+    };
+    Ok(Some(HyperliquidSpotCollateral {
+        total: usdc_total,
+        available_after_maintenance: hyperliquid_spot_available_after_maintenance(
+            &fields,
+            &usdc_token_id,
+        )?,
+    }))
+}
+
+fn hyperliquid_spot_available_after_maintenance(
+    fields: &BTreeMap<String, &str>,
+    token_id: &str,
+) -> RuntimeResult<Option<String>> {
+    let Some(values) = fields.get("tokenToAvailableAfterMaintenance") else {
+        return Ok(None);
+    };
+    for value in json_array_value_slices(values)? {
+        let tuple = json_array_value_slices(value)?;
+        if tuple.len() < 2 {
+            continue;
+        }
+        let tuple_token = json_value_to_string(
+            tuple[0],
+            "tokenToAvailableAfterMaintenance",
+            "hyperliquid spot state",
+        )?;
+        if tuple_token.trim() != token_id.trim() {
+            continue;
+        }
+        return Ok(Some(json_value_to_string(
+            tuple[1],
+            "tokenToAvailableAfterMaintenance",
+            "hyperliquid spot state",
+        )?));
+    }
+    Ok(None)
+}
+
+fn hyperliquid_private_account_entry_has_nonzero_amount(
+    entry: &FundingPrivateAccountEntry,
+) -> RuntimeResult<bool> {
+    for (field, value) in [
+        (
+            "funding_private_account.available_usd",
+            entry.available_usd.as_deref(),
+        ),
+        (
+            "funding_private_account.margin_balance_usd",
+            entry.margin_balance_usd.as_deref(),
+        ),
+        (
+            "funding_private_account.maintenance_margin_usd",
+            entry.maintenance_margin_usd.as_deref(),
+        ),
+        (
+            "funding_private_account.margin_buffer_usd",
+            entry.margin_buffer_usd.as_deref(),
+        ),
+    ] {
+        let Some(value) = non_empty_private_account_decimal(value) else {
+            continue;
+        };
+        if MonitorDecimal::parse(field, value)?.raw != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn hyperliquid_clearinghouse_state_payload<'a>(
@@ -30529,6 +31310,7 @@ fn validate_funding_arb_resident_live_options(
             output_dir: None,
             execution_reports_path: None,
             resident_events_path: None,
+            opportunity_history_path: None,
             sources: options.sources.clone(),
         })?;
     }
@@ -30650,6 +31432,7 @@ fn load_funding_arb_resident_snapshot(
         output_dir: None,
         execution_reports_path: None,
         resident_events_path: None,
+        opportunity_history_path: None,
         sources: options.sources.clone(),
     })
 }
@@ -39606,6 +40389,83 @@ impl FundingArbMonitorSnapshot {
     }
 }
 
+const FUNDING_ARB_HISTORY_MAX_RECORDS: usize = 120;
+
+fn funding_arb_history_json(context: &FundingArbDashboardContext) -> String {
+    let Some(path) = &context.opportunity_history_path else {
+        return "{\"configured\":false,\"last_error\":\"opportunity history path is not configured\",\"path\":null,\"record_count\":0,\"records\":[],\"skipped_line_count\":0,\"status\":\"unconfigured\"}".to_owned();
+    };
+
+    let input = match read_utf8(path) {
+        Ok(input) => input,
+        Err(error) => {
+            return format!(
+                "{{\"configured\":true,\"last_error\":{},\"path\":{},\"record_count\":0,\"records\":[],\"skipped_line_count\":0,\"status\":\"unavailable\"}}",
+                json_string(&error.to_string()),
+                json_string(&path.display().to_string()),
+            );
+        }
+    };
+
+    let mut records = Vec::new();
+    let mut skipped_line_count = 0usize;
+    for line in input.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fields = match parse_json_object_value_slices(trimmed) {
+            Ok(fields) => fields,
+            Err(_) => {
+                skipped_line_count += 1;
+                continue;
+            }
+        };
+        match optional_json_value_string(&fields, "strategy", "funding arb opportunity history") {
+            Ok(Some(strategy)) if strategy != CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY => {
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                skipped_line_count += 1;
+                continue;
+            }
+        }
+        if !fields.contains_key("rows") {
+            skipped_line_count += 1;
+            continue;
+        }
+        records.push(trimmed.to_owned());
+        if records.len() >= FUNDING_ARB_HISTORY_MAX_RECORDS {
+            break;
+        }
+    }
+    records.reverse();
+
+    let status = if skipped_line_count == 0 {
+        "healthy"
+    } else {
+        "degraded"
+    };
+    let last_error = if skipped_line_count == 0 {
+        "null".to_owned()
+    } else {
+        json_string(&format!(
+            "skipped {skipped_line_count} malformed funding-arb history lines"
+        ))
+    };
+
+    format!(
+        "{{\"configured\":true,\"last_error\":{},\"path\":{},\"record_count\":{},\"records\":[{}],\"skipped_line_count\":{},\"status\":{}}}",
+        last_error,
+        json_string(&path.display().to_string()),
+        records.len(),
+        records.join(","),
+        skipped_line_count,
+        json_string(status),
+    )
+}
+
 impl FundingArbMarketRow {
     fn to_json(&self) -> String {
         format!(
@@ -41677,10 +42537,12 @@ fn handle_funding_arb_http_connection(
         (200, snapshot.opportunities_json())
     } else if route == "/api/funding-arb/execution-status" {
         (200, funding_arb_execution_status_json(context.as_ref()))
+    } else if route == "/api/funding-arb/history" {
+        (200, funding_arb_history_json(context.as_ref()))
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/funding-arb/status\",\"/api/funding-arb/opportunities\",\"/api/funding-arb/execution-status\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/funding-arb/status\",\"/api/funding-arb/opportunities\",\"/api/funding-arb/execution-status\",\"/api/funding-arb/history\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -41713,8 +42575,17 @@ fn handle_portfolio_dashboard_http_connection(
         let _ = write_http_html(&mut stream, 200, portfolio_dashboard_html());
         return;
     }
+    if route == "/errors" || route == "/error-logs" {
+        let _ = write_http_html(&mut stream, 200, error_logs_dashboard_html());
+        return;
+    }
     if route == "/api/navigation/pages" {
         let _ = write_http_json(&mut stream, 200, &system_navigation_pages_json());
+        return;
+    }
+    if route == "/api/errors/logs" {
+        let snapshot = build_error_logs_snapshot(state.as_ref());
+        let _ = write_http_json(&mut stream, 200, &error_logs_json(&snapshot));
         return;
     }
 
@@ -41755,7 +42626,7 @@ fn handle_portfolio_dashboard_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/nav\",\"/dashboard\",\"/health\",\"/api/navigation/pages\",\"/api/portfolio/status\",\"/api/portfolio/balances\",\"/api/portfolio/positions\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/nav\",\"/dashboard\",\"/errors\",\"/health\",\"/api/navigation/pages\",\"/api/errors/logs\",\"/api/portfolio/status\",\"/api/portfolio/balances\",\"/api/portfolio/positions\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -41937,6 +42808,12 @@ fn portfolio_dashboard_html() -> &'static str {
     )
 }
 
+fn error_logs_dashboard_html() -> &'static str {
+    include_str!(
+        "../../../universal_arb_platform_v2_immutable_core_docs/templates/error_logs_dashboard.html"
+    )
+}
+
 fn navigation_dashboard_html() -> &'static str {
     include_str!(
         "../../../universal_arb_platform_v2_immutable_core_docs/templates/navigation_dashboard.html"
@@ -41967,6 +42844,13 @@ fn system_navigation_entries() -> &'static [SystemNavigationEntry] {
             title: "组合余额与仓位",
             description: "账户余额、开仓仓位、来源错误和资金费率上下文。",
             url: "http://127.0.0.1:8805/dashboard",
+            health_url: "http://127.0.0.1:8805/health",
+        },
+        SystemNavigationEntry {
+            category: "总览",
+            title: "错误日志",
+            description: "聚合本次运行的健康事件、resident 事件、live report 和本地日志错误。",
+            url: "http://127.0.0.1:8805/errors",
             health_url: "http://127.0.0.1:8805/health",
         },
         SystemNavigationEntry {
@@ -43212,7 +44096,7 @@ fn legacy_help_text() -> String {
         "                                    Monitor all Hyperliquid public USDC spot/perp basis rows, optionally overriding perp top-of-book from WSS, and serve /api/hyperliquid-basis/status",
         "  aster-basis-monitor [--bind 127.0.0.1:8800] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--perp-wss-monitor-url url] [--once] [--out dir]",
         "                                    Monitor all Aster public USDT spot/perp basis rows, optionally overriding perp top-of-book from WSS, and serve /api/aster-basis/status",
-        "  funding-arb-monitor [--bind 127.0.0.1:8804] [--interval-secs 5] [--clear-sources --source venue=url] [--min-net-funding-bps 5] [--execution-reports file] [--resident-events file] [--once] [--out dir]",
+        "  funding-arb-monitor [--bind 127.0.0.1:8804] [--interval-secs 5] [--clear-sources --source venue=url] [--min-net-funding-bps 5] [--execution-reports file] [--resident-events file] [--opportunity-history file] [--once] [--out dir]",
         "                                    Aggregate local basis monitor status snapshots into cross-exchange funding arb opportunities and optionally expose guarded dispatch gate reports",
         "  portfolio-dashboard [--bind 127.0.0.1:8805] [--account-snapshot file | --account-raw-snapshot file] [--position-snapshot file | --position-raw-snapshot file | --resident-root dir] [--funding-snapshot file] [--once]",
         "                                    Serve a read-only Chinese dashboard for exchange balances and all positions from local snapshots; no signing, orders, cancels, or transfers",
@@ -46808,6 +47692,13 @@ fn parse_funding_arb_monitor_args(args: &[String]) -> RuntimeResult<FundingArbMo
                 };
                 options.resident_events_path = Some(PathBuf::from(value));
             }
+            "--opportunity-history" | "--history" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--opportunity-history requires a file path"));
+                };
+                options.opportunity_history_path = Some(PathBuf::from(value));
+            }
             value if value.starts_with('-') => {
                 return Err(cli_arg_error(format!(
                     "unknown funding-arb-monitor option `{value}`"
@@ -49747,12 +50638,18 @@ mod tests {
         assert!(html.contains("/api/funding-arb/status"));
         assert!(html.contains("/api/funding-arb/opportunities"));
         assert!(html.contains("/api/funding-arb/execution-status"));
+        assert!(html.contains("/api/funding-arb/history"));
         assert!(html.contains("id=\"funding-rows\""));
+        assert!(html.contains("id=\"funding-history-rows\""));
         assert!(html.contains("id=\"metric-gate-blocked\""));
         assert!(html.contains("下单门禁"));
+        assert!(html.contains("历史记录"));
+        assert!(html.contains("validFundingTimeMs"));
         assert!(html.contains("formatFundingReason"));
         assert!(html.contains("私有余额不可用"));
         assert!(html.contains("策略未产出资金费率套利候选"));
+        assert!(html.contains("私有账户可用余额和保证金缓冲不足"));
+        assert!(html.contains("最近门禁报告早于当前机会快照"));
         assert!(html.contains("请求时间戳比服务器时间快 1000ms"));
     }
 
@@ -49772,6 +50669,7 @@ mod tests {
         let json = funding_arb_execution_status_json(&FundingArbDashboardContext {
             execution_reports_path: Some(report_path),
             resident_events_path: None,
+            opportunity_history_path: None,
         });
 
         assert!(json.contains("\"dispatch_status\":\"blocked\""));
@@ -49796,11 +50694,45 @@ mod tests {
         let json = funding_arb_execution_status_json(&FundingArbDashboardContext {
             execution_reports_path: None,
             resident_events_path: Some(resident_events_path),
+            opportunity_history_path: None,
         });
 
         assert!(json.contains("\"dispatch_status\":\"blocked\""));
         assert!(json.contains("aster:hyperliquid:BTCUSDT:BTC"));
         assert!(json.contains("private read-only snapshot unavailable"));
+    }
+
+    #[test]
+    fn funding_arb_history_json_reads_cross_exchange_opportunity_jsonl() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let history_path = root
+            .path()
+            .join("opportunities")
+            .join("cross-exchange-funding-arb.jsonl");
+        fs::create_dir_all(history_path.parent().expect("parent")).expect("history dir");
+        write_utf8(
+            history_path.clone(),
+            concat!(
+                r#"{"candidate_count":1,"rows":[{"expected_funding_usd":"0.17","funding_interval_hours":"8","gross_funding_spread_bps":"32","is_candidate":true,"long_venue_family":"hyperliquid","net_funding_bps":"17","pair_id":"aster:hyperliquid:CHIPUSDT:CHIP","reason":null,"short_venue_family":"aster","source_status":"complete","symbol":"CHIPUSDT","total_cost_bps":"15","venue_a_ask":"0.0508300","venue_a_ask_qty":"12122","venue_a_bid":"0.0507700","venue_a_bid_qty":"8559","venue_a_family":"aster","venue_a_funding_interval_hours":"8","venue_a_funding_rate":"-0.00036227","venue_a_index_price":"0.05100070","venue_a_mark_price":"0.05088000","venue_a_next_funding_time_ms":"1779346800000","venue_b_ask":"0.050799","venue_b_ask_qty":"15011.0","venue_b_bid":"0.050778","venue_b_bid_qty":"12196.0","venue_b_family":"hyperliquid","venue_b_funding_interval_hours":"8","venue_b_funding_rate":"-0.003580096","venue_b_index_price":"0.051005","venue_b_mark_price":"0.050789","venue_b_next_funding_time_ms":""}],"status":"healthy","updated_at":"2026-05-21T06:32:37.840753Z","recorded_at":"2026-05-21T06:32:41Z","strategy":"cross-exchange-funding-arb"}"#,
+                "\n",
+                r#"{"candidate_count":0,"rows":[],"status":"healthy","updated_at":"2026-05-21T06:32:42Z","recorded_at":"2026-05-21T06:32:46Z","strategy":"spot-perp-basis"}"#,
+                "\n",
+                "not-json\n"
+            ),
+        )
+        .expect("write history");
+
+        let json = funding_arb_history_json(&FundingArbDashboardContext {
+            execution_reports_path: None,
+            resident_events_path: None,
+            opportunity_history_path: Some(history_path),
+        });
+
+        assert!(json.contains("\"record_count\":1"));
+        assert!(json.contains("\"skipped_line_count\":1"));
+        assert!(json.contains("\"pair_id\":\"aster:hyperliquid:CHIPUSDT:CHIP\""));
+        assert!(json.contains("\"venue_b_next_funding_time_ms\":\"\""));
+        assert!(!json.contains("spot-perp-basis"));
     }
 
     #[test]
@@ -49817,6 +50749,47 @@ mod tests {
     }
 
     #[test]
+    fn error_logs_dashboard_html_requests_error_api_path() {
+        let html = error_logs_dashboard_html();
+
+        assert!(html.contains("错误日志"));
+        assert!(html.contains("/api/errors/logs"));
+        assert!(html.contains("id=\"rows\""));
+    }
+
+    #[test]
+    fn error_logs_json_collects_gate_passed_dispatch_failures() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let events_path = root
+            .path()
+            .join("resident-live")
+            .join("cross-exchange-funding-arb")
+            .join("funding_arb_resident_live_events.jsonl");
+        fs::create_dir_all(events_path.parent().expect("parent")).expect("events dir");
+        write_utf8(
+            events_path,
+            concat!(
+                r#"{"blocking_reason_details":["first funding perp leg submit failed before second leg; no hedge leg was sent: mutable execution signing failed: external signer exited unsuccessfully"],"cycle":7,"dispatch_allowed":false,"dispatch_attempted":true,"dispatch_plan_built":true,"dry_run_live_ready":true,"event_type":"candidate_cycle","manual_gate_released":true,"mutable_execution_started":true,"pair_id":"aster:hyperliquid:CHIPUSDT:CHIP","recorded_at":"2026-05-21T06:35:33.774696Z","symbol":"CHIPUSDT"}"#,
+                "\n",
+                r#"{"event_type":"candidate_cycle","pair_id":"binance:bybit:BTCUSDT:BTCUSDT","recorded_at":"2026-05-21T06:36:00Z","symbol":"BTCUSDT"}"#,
+                "\n"
+            ),
+        )
+        .expect("write resident events");
+
+        let snapshot = build_error_logs_snapshot(&PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            ..PortfolioDashboardOptions::default()
+        });
+        let json = error_logs_json(&snapshot);
+
+        assert_eq!(snapshot.entries.len(), 1);
+        assert!(json.contains("门禁通过后下单失败"));
+        assert!(json.contains("external signer exited unsuccessfully"));
+        assert!(json.contains("aster:hyperliquid:CHIPUSDT:CHIP"));
+    }
+
+    #[test]
     fn navigation_dashboard_registers_system_pages() {
         let html = navigation_dashboard_html();
         let json = system_navigation_pages_json();
@@ -49824,11 +50797,12 @@ mod tests {
         assert!(html.contains("/api/navigation/pages"));
         assert!(json.contains("系统导航"));
         assert!(json.contains("组合余额与仓位"));
+        assert!(json.contains("错误日志"));
         assert!(json.contains("Binance basis"));
         assert!(json.contains("Funding arb"));
         assert!(json.contains("Bitget futures WSS"));
         assert!(json.contains("http://127.0.0.1:8805/nav"));
-        assert_eq!(system_navigation_entries().len(), 17);
+        assert_eq!(system_navigation_entries().len(), 18);
     }
 
     #[test]
@@ -50049,19 +51023,58 @@ mod tests {
     }
 
     #[test]
-    fn hyperliquid_private_account_reconciliation_ignores_spot_state_as_perp_margin() {
+    fn hyperliquid_private_account_reconciliation_uses_unified_account_spot_state() {
         let statement = FundingPrivateRawStatement {
             venue_family: "hyperliquid".to_owned(),
             account_id: "acct:hyperliquid-funding-arb-readonly".to_owned(),
-            payload_json: r#"{"clearinghouseState":{"marginSummary":{"accountValue":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"0.0","assetPositions":[]},"spotState":{"balances":[{"coin":"USDC","token":0,"total":"101","hold":"0.0","entryNtl":"0.0"}]}}"#.to_owned(),
+            payload_json: r#"{"clearinghouseState":{"marginSummary":{"accountValue":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"0.0","assetPositions":[]},"spotState":{"balances":[{"coin":"USDC","token":0,"total":"101","hold":"0.0","entryNtl":"0.0"}],"tokenToAvailableAfterMaintenance":[[0,"100.5"]]}}"#.to_owned(),
         };
 
         let entry = hyperliquid_private_account_entry_from_raw_statement(&statement)
             .expect("hyperliquid account entry")
-            .expect("perp clearinghouse entry");
+            .expect("unified account entry");
 
-        assert_eq!(entry.available_usd.as_deref(), Some("0.0"));
-        assert_eq!(entry.margin_balance_usd.as_deref(), Some("0.0"));
+        assert_eq!(entry.available_usd.as_deref(), Some("100.5"));
+        assert_eq!(entry.margin_balance_usd.as_deref(), Some("101"));
+        assert_eq!(entry.margin_buffer_usd.as_deref(), Some("100.5"));
+    }
+
+    #[test]
+    fn funding_private_account_raw_snapshot_matches_hyperliquid_unified_account_collateral() {
+        let mut config = CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt();
+        config.symbol.symbol = "CHIPUSDT".to_owned();
+        config.venues.venue_a = funding_arb_leg_config("aster", "CHIPUSDT").expect("aster leg");
+        config.venues.venue_b =
+            funding_arb_leg_config("hyperliquid", "CHIPUSDT").expect("hyperliquid leg");
+        config.economics.notional_usd = "100".to_owned();
+        let mut venue_capabilities =
+            arb_venue_capability_descriptors("aster").expect("aster capabilities");
+        venue_capabilities.extend(
+            arb_venue_capability_descriptors("hyperliquid").expect("hyperliquid capabilities"),
+        );
+        let spec = CrossExchangeFundingArbPipelineSpec::new(
+            config,
+            venue_capabilities,
+            "state:test:funding-arb-aster-hyperliquid",
+            "hash:test:funding-arb-aster-hyperliquid",
+        )
+        .expect("spec");
+
+        let summary = reconcile_funding_private_account_raw_snapshot_json(
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-21T01:56:59Z","statements":[
+                {"venue_family":"aster","account_id":"acct:aster-funding-arb-readonly","payload":[{"asset":"USDT","balance":"102.2","availableBalance":"102.17","crossWalletBalance":"102.2","crossUnPnl":"0","maxWithdrawAmount":"102.2","marginAvailable":true}]},
+                {"venue_family":"hyperliquid","account_id":"acct:hyperliquid-funding-arb-readonly","payload":{"clearinghouseState":{"marginSummary":{"accountValue":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"0.0","assetPositions":[]},"spotState":{"balances":[{"coin":"USDC","token":0,"total":"101.0","hold":"0.0","entryNtl":"0.0"}],"tokenToAvailableAfterMaintenance":[[0,"101.0"]]}}}
+            ]}"#,
+        )
+        .expect("summary");
+
+        assert_eq!(summary.status, "Matched");
+        assert_eq!(summary.checked_account_count, 2);
+        assert_eq!(summary.min_required_available_usd.as_deref(), Some("10"));
+        assert_eq!(summary.min_available_usd.as_deref(), Some("101"));
+        assert_eq!(summary.min_margin_buffer_usd.as_deref(), Some("101"));
+        assert!(summary.reason.is_none());
     }
 
     #[test]
@@ -50460,6 +51473,8 @@ mod tests {
             "target/arb-opportunity-observer/dry-run/dry-run-reports.jsonl".to_owned(),
             "--resident-events".to_owned(),
             "target/arb-opportunity-observer/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_events.jsonl".to_owned(),
+            "--opportunity-history".to_owned(),
+            "target/arb-opportunity-observer/opportunities/cross-exchange-funding-arb.jsonl".to_owned(),
             "--once".to_owned(),
         ];
 
@@ -50477,6 +51492,10 @@ mod tests {
             .resident_events_path
             .as_deref()
             .is_some_and(|path| path.ends_with("funding_arb_resident_live_events.jsonl")));
+        assert!(options
+            .opportunity_history_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("cross-exchange-funding-arb.jsonl")));
     }
 
     #[test]
@@ -52369,6 +53388,18 @@ mod tests {
             options.output_dir,
             Some(PathBuf::from("target/wallet-signer-preflight"))
         );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn wallet_signer_preflight_failure_message_includes_stderr() {
+        let message = wallet_signer_preflight_failure_message(
+            "arb-wallet-signer Hyperliquid preflight exited unsuccessfully",
+            b"required private key environment variable `HYPERLIQUID_AGENT_PRIVATE_KEY` is not set\n",
+        );
+
+        assert!(message.contains("Hyperliquid preflight exited unsuccessfully"));
+        assert!(message.contains("stderr=required private key environment variable"));
     }
 
     #[test]

@@ -659,8 +659,9 @@ fn msgpack_encode_hyperliquid_action(action: &Value, output: &mut Vec<u8>) -> Si
         "order" => msgpack_encode_hyperliquid_order_action(object, output),
         "cancel" => msgpack_encode_hyperliquid_cancel_action(object, output),
         "cancelByCloid" => msgpack_encode_hyperliquid_cancel_by_cloid_action(object, output),
+        "updateLeverage" => msgpack_encode_hyperliquid_update_leverage_action(object, output),
         _ => Err(SignerError::new(
-            "Hyperliquid action signer only supports order, cancel and cancelByCloid",
+            "Hyperliquid action signer only supports order, cancel, cancelByCloid and updateLeverage",
         )),
     }
 }
@@ -817,6 +818,21 @@ fn msgpack_encode_hyperliquid_cancel_by_cloid_action(
         msgpack_write_string(output, json_required_string(cancel, "cloid")?)?;
     }
     Ok(())
+}
+
+fn msgpack_encode_hyperliquid_update_leverage_action(
+    object: &serde_json::Map<String, Value>,
+    output: &mut Vec<u8>,
+) -> SignerResult<()> {
+    msgpack_write_map_len(output, 4)?;
+    msgpack_write_string(output, "type")?;
+    msgpack_write_string(output, "updateLeverage")?;
+    msgpack_write_string(output, "asset")?;
+    msgpack_write_u64(output, json_required_u64(object, "asset")?)?;
+    msgpack_write_string(output, "isCross")?;
+    msgpack_write_bool(output, json_required_bool(object, "isCross")?);
+    msgpack_write_string(output, "leverage")?;
+    msgpack_write_u64(output, json_required_u64(object, "leverage")?)
 }
 
 fn json_required_string<'a>(
@@ -1149,6 +1165,30 @@ mod tests {
             Some(ADDRESS),
         )
         .expect("hyperliquid action signature");
+        assert!(signature.r.starts_with("0x"));
+        assert_eq!(signature.s.len(), 66);
+        assert!(matches!(signature.v, 27 | 28));
+    }
+
+    #[test]
+    fn signs_hyperliquid_l1_update_leverage_action_as_json_signature() {
+        let key = test_key();
+        let action = r#"{"type":"updateLeverage","asset":0,"isCross":true,"leverage":1}"#;
+        let connection_id =
+            hyperliquid_l1_action_connection_id(action, 1_779_348_657_000, None, None)
+                .expect("update leverage connection id");
+        assert_ne!(connection_id, [0_u8; 32]);
+
+        let signature = sign_hyperliquid_l1_action(
+            action,
+            1_779_348_657_000,
+            None,
+            None,
+            "a",
+            &key,
+            Some(ADDRESS),
+        )
+        .expect("hyperliquid update leverage signature");
         assert!(signature.r.starts_with("0x"));
         assert_eq!(signature.s.len(), 66);
         assert!(matches!(signature.v, 27 | 28));

@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>错误日志</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #607080;
+      --line: #d9e0e7;
+      --soft: #eef2f6;
+      --ok: #0b7f5f;
+      --warn: #9a6700;
+      --error: #b42318;
+      --critical: #7a271a;
+      --info: #1f5f99;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    main {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 18px 20px 28px;
+    }
+
+    .nav {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    button,
+    input,
+    select {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: var(--soft);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      min-height: 64px;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 4px;
+      font-size: 22px;
+      line-height: 1.1;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) 160px 180px auto;
+      gap: 8px;
+      margin-bottom: 12px;
+      align-items: center;
+    }
+
+    .table-wrap {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      min-width: 1180px;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #fbfcfd;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      position: sticky;
+      top: 67px;
+      z-index: 5;
+    }
+
+    tbody tr:hover {
+      background: #fbfcfd;
+    }
+
+    .time { width: 176px; }
+    .severity { width: 92px; }
+    .category { width: 150px; }
+    .source { width: 180px; }
+    .pair { width: 220px; }
+    .line { width: 76px; }
+    .message { width: auto; }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .badge.healthy { color: var(--ok); border-color: #8ed7c1; background: #ecfdf7; }
+    .badge.warning { color: var(--warn); border-color: #f1c565; background: #fff7e1; }
+    .badge.error { color: var(--error); border-color: #f0a39c; background: #fff1f0; }
+    .badge.critical { color: var(--critical); border-color: #d98a7f; background: #fff0ec; }
+    .badge.info { color: var(--info); border-color: #98c5ec; background: #eef7ff; }
+
+    .muted { color: var(--muted); }
+
+    .msg {
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    details {
+      margin-top: 6px;
+    }
+
+    summary {
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    pre {
+      margin: 6px 0 0;
+      padding: 8px;
+      background: #111827;
+      color: #f9fafb;
+      border-radius: 4px;
+      overflow: auto;
+      max-height: 160px;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    .errors {
+      margin: 0 0 12px;
+      color: var(--error);
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 900px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolbar { grid-template-columns: 1fr; }
+      th { top: 112px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>错误日志</h1>
+    <nav class="nav" aria-label="导航">
+      <button type="button" data-open="/nav">系统导航</button>
+      <button type="button" data-open="/dashboard">组合看板</button>
+      <button type="button" data-open="http://127.0.0.1:8804/dashboard">Funding arb</button>
+      <button id="refresh" type="button">刷新</button>
+    </nav>
+  </header>
+
+  <main>
+    <section class="summary" aria-label="汇总">
+      <article class="metric"><span>状态</span><strong id="status">-</strong></article>
+      <article class="metric"><span>错误条数</span><strong id="entry-count">0</strong></article>
+      <article class="metric"><span>来源数</span><strong id="source-count">0</strong></article>
+      <article class="metric"><span>跳过行数</span><strong id="skipped-count">0</strong></article>
+      <article class="metric"><span>更新时间</span><strong id="updated-at">-</strong></article>
+    </section>
+
+    <div id="source-errors" class="errors"></div>
+
+    <section class="toolbar" aria-label="过滤">
+      <input id="search" type="search" placeholder="搜索交易对、来源或错误内容">
+      <select id="severity-filter" aria-label="严重程度">
+        <option value="">全部严重程度</option>
+        <option value="critical">critical</option>
+        <option value="error">error</option>
+        <option value="warning">warning</option>
+      </select>
+      <select id="category-filter" aria-label="类别">
+        <option value="">全部类别</option>
+      </select>
+      <button id="clear" type="button">清空过滤</button>
+    </section>
+
+    <section class="table-wrap" aria-label="错误日志表">
+      <table>
+        <thead>
+          <tr>
+            <th class="time">本地时间 (UTC+8)</th>
+            <th class="severity">级别</th>
+            <th class="category">类别</th>
+            <th class="source">来源</th>
+            <th class="pair">交易对</th>
+            <th class="message">错误内容</th>
+            <th class="line">行号</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="7" class="muted">加载中</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const state = { snapshot: null, entries: [] };
+    const LOCAL_TIME_ZONE = "Asia/Shanghai";
+    const LOCAL_TIME_ZONE_LABEL = "UTC+8";
+    const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[char]));
+    }
+
+    function statusBadge(value) {
+      const status = value || "unknown";
+      const className = status === "healthy" ? "healthy" : status === "missing" ? "warning" : "error";
+      return `<span class="badge ${className}">${escapeHtml(status)}</span>`;
+    }
+
+    function severityBadge(value) {
+      const severity = value || "warning";
+      const className = ["critical", "error", "warning"].includes(severity) ? severity : "info";
+      return `<span class="badge ${className}">${escapeHtml(severity)}</span>`;
+    }
+
+    function parsedTimestampMs(value) {
+      const text = String(value ?? "").trim();
+      if (!text || text === "not-yet-updated" || text === "timestamp-unavailable") return null;
+      const normalized = text.replace(/\.(\d{3})\d+(Z|[+-]\d{2}:?\d{2})$/, ".$1$2");
+      const parsed = Date.parse(normalized);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function compactTime(value) {
+      const parsed = parsedTimestampMs(value);
+      if (parsed === null) return value ? String(value) : "-";
+      const parts = Object.fromEntries(new Intl.DateTimeFormat("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23"
+      }).formatToParts(new Date(parsed)).map((part) => [part.type, part.value]));
+      return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} ${LOCAL_TIME_ZONE_LABEL}`;
+    }
+
+    function pairText(row) {
+      const pair = row.pair_id || "-";
+      const symbol = row.symbol ? ` / ${row.symbol}` : "";
+      return `${pair}${symbol}`;
+    }
+
+    function fillCategories(entries) {
+      const select = $("category-filter");
+      const current = select.value;
+      const categories = [...new Set(entries.map((entry) => entry.category).filter(Boolean))].sort();
+      select.innerHTML = `<option value="">全部类别</option>${categories.map((category) => (
+        `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`
+      )).join("")}`;
+      if (categories.includes(current)) select.value = current;
+    }
+
+    function filteredEntries() {
+      const query = $("search").value.trim().toLowerCase();
+      const severity = $("severity-filter").value;
+      const category = $("category-filter").value;
+      return state.entries.filter((entry) => {
+        if (severity && entry.severity !== severity) return false;
+        if (category && entry.category !== category) return false;
+        if (!query) return true;
+        const haystack = [
+          entry.observed_at,
+          entry.severity,
+          entry.category,
+          entry.source,
+          entry.strategy,
+          entry.pair_id,
+          entry.symbol,
+          entry.message,
+          entry.path
+        ].join(" ").toLowerCase();
+        return haystack.includes(query);
+      });
+    }
+
+    function renderRows() {
+      const rows = filteredEntries();
+      if (!rows.length) {
+        $("rows").innerHTML = `<tr><td colspan="7" class="muted">没有匹配的错误日志</td></tr>`;
+        return;
+      }
+      $("rows").innerHTML = rows.map((row) => (
+        `<tr>
+          <td>${escapeHtml(compactTime(row.observed_at))}</td>
+          <td>${severityBadge(row.severity)}</td>
+          <td>${escapeHtml(row.category || "-")}</td>
+          <td>${escapeHtml(row.source || "-")}</td>
+          <td>${escapeHtml(pairText(row))}</td>
+          <td>
+            <div class="msg">${escapeHtml(row.message || "-")}</div>
+            <details>
+              <summary>${escapeHtml(row.path || "-")}</summary>
+              <pre>${escapeHtml(row.raw || "")}</pre>
+            </details>
+          </td>
+          <td>${escapeHtml(row.line_number ?? "-")}</td>
+        </tr>`
+      )).join("");
+    }
+
+    function render(snapshot) {
+      state.snapshot = snapshot;
+      state.entries = snapshot.entries || [];
+      $("status").innerHTML = statusBadge(snapshot.status);
+      $("entry-count").textContent = snapshot.entry_count ?? state.entries.length;
+      $("source-count").textContent = snapshot.source_count ?? 0;
+      $("skipped-count").textContent = snapshot.skipped_line_count ?? 0;
+      $("updated-at").textContent = compactTime(snapshot.updated_at);
+      $("source-errors").textContent = (snapshot.source_errors || []).join("；");
+      fillCategories(state.entries);
+      renderRows();
+    }
+
+    async function refresh() {
+      const response = await fetch("/api/errors/logs", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      render(await response.json());
+    }
+
+    document.querySelectorAll("[data-open]").forEach((button) => {
+      button.addEventListener("click", () => {
+        window.location.href = button.dataset.open;
+      });
+    });
+    $("refresh").addEventListener("click", () => refresh().catch((error) => {
+      $("source-errors").textContent = error.message;
+    }));
+    $("clear").addEventListener("click", () => {
+      $("search").value = "";
+      $("severity-filter").value = "";
+      $("category-filter").value = "";
+      renderRows();
+    });
+    ["search", "severity-filter", "category-filter"].forEach((id) => {
+      $(id).addEventListener("input", renderRows);
+      $(id).addEventListener("change", renderRows);
+    });
+
+    refresh().catch((error) => {
+      $("rows").innerHTML = `<tr><td colspan="7" class="muted">${escapeHtml(error.message)}</td></tr>`;
+    });
+    setInterval(() => refresh().catch(() => {}), 5000);
+  </script>
+</body>
+</html>

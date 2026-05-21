@@ -146,13 +146,21 @@ target/debug/arb-runtime live --i-understand-live-orders
 
 `scripts/start-arb-runtime-live.sh` 会把 `BASIS_OBSERVER_CONFIG`、`BASIS_OBSERVER_MIN_NET_BPS`、`BASIS_OBSERVER_INTERVAL_SECS`、`BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS` 和 `BASIS_OBSERVER_VALIDATE_AUTO_ONCE` 映射为 `arb-runtime live` 参数；也可以用同名 `ARB_RUNTIME_LIVE_*` 变量覆盖这些入口参数。改动阈值后先跑 dry-run 或小额实盘验证，不要直接切到大额长期运行。
 
+启动前脚本会默认回收本仓库 `target/.../arb-runtime` 残留进程占用的 dashboard、WSS 和 basis/funding monitor 端口，避免旧 monitor 占用 `127.0.0.1:8804` 这类端口导致新 live 进程启动失败。如果端口被非本仓库进程占用，脚本会提前报错并要求手动处理；如需禁用自动回收，设置 `ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS=0` 或 `BASIS_OBSERVER_RECLAIM_STALE_MONITOR_PORTS=0`。
+
 ## 启动后健康检查
 
-先看启动日志：
+先看启动日志。前台运行时，启动脚本自身输出写入 `arb-runtime-live-precheck.log`；后台运行（`--detach`，即分离到后台）时，`arb-runtime live` 的进程输出另写入 `arb-runtime-live.log`。
+
+```bash
+tail -f target/arb-runtime/live-prereq/logs/arb-runtime-live-precheck.log
+tail -f target/arb-runtime/live/logs/realtime-feedback.log
+```
+
+仅后台运行（`--detach`，即分离到后台）时再看 live 进程输出：
 
 ```bash
 tail -f target/arb-runtime/live-prereq/logs/arb-runtime-live.log
-tail -f target/arb-runtime/live/logs/realtime-feedback.log
 ```
 
 检查 WSS 状态。全部必须是 `streaming`，且 `wss_update_count` 持续增加：
@@ -199,8 +207,97 @@ curl -fsS --max-time 10 http://127.0.0.1:8805/api/portfolio/positions | jq '.'
 ```text
 http://127.0.0.1:8805/nav
 http://127.0.0.1:8805/dashboard
+http://127.0.0.1:8805/errors
 http://127.0.0.1:8804/dashboard
 ```
+
+## 实时查看下单门禁错误
+
+优先打开错误日志页面：
+
+```text
+http://127.0.0.1:8805/errors
+```
+
+该页面会聚合本次运行目录中的 `logs/*.log`、`logs/*.jsonl`、`live/live-reports.jsonl`、`live/validation-events.jsonl` 和 resident event JSONL，展示所有已收集到的错误、阻断、未知状态和门禁通过后下单失败事件。
+
+`funding_arb_resident_live_events.jsonl` 是 `cross-exchange-funding-arb` 常驻 runner 的门禁和下单事件流。启动后如果 dashboard 显示“待校验”“下单阻断”或签名失败，先实时跟这个文件：
+
+运行方式：先按“启动”小节启动实盘进程，然后另开一个终端，在仓库根目录完整复制下面命令。默认运行目录是 `target/arb-runtime/live`；如果启动时设置了自定义 `ARB_RUNTIME_LIVE_ROOT`，把下面的 `RUN_ROOT` 改成同一个目录。不要把 `...` 省略号当作 jq 程序执行。
+
+```bash
+cd /Users/danta/WebstormProjects/easy-arb
+RUN_ROOT=target/arb-runtime/live
+
+tail -F "$RUN_ROOT/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_events.jsonl" \
+| jq -r --unbuffered '
+  def reasons:
+    if (.blocking_reason_details | type) == "array" then .blocking_reason_details
+    elif (.blocking_reasons | type) == "array" then .blocking_reasons
+    elif .reason then [.reason]
+    elif .error then [.error]
+    else [] end;
+
+  select(.event_type == "candidate_cycle" or .event_type == "no_candidate" or .event_type == "cycle_error")
+  | [
+      (.recorded_at // "-"),
+      .event_type,
+      (.pair_id // "-"),
+      (.symbol // "-"),
+      ((reasons | map(select(. != null)) | join(" | ")))
+    ]
+  | @tsv
+'
+```
+
+如果要实时查看“下单前门禁已通过，但真实分发或下单仍失败”的事件，用下面的结构化过滤命令。这里的“门禁已通过”按字段判断：`dry_run_live_ready=true`、`manual_gate_released=true`、`dispatch_plan_built=true`，并且已经进入 `dispatch_attempted` 或 `mutable_execution_started`。它会覆盖所有交易所和所有失败原因，不按错误字符串白名单过滤。
+
+```bash
+cd /Users/danta/WebstormProjects/easy-arb
+RUN_ROOT=target/arb-runtime/live
+
+tail -F "$RUN_ROOT/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_events.jsonl" \
+| jq -r --unbuffered '
+  def reasons:
+    if (.blocking_reason_details | type) == "array" then .blocking_reason_details
+    elif (.blocking_reasons | type) == "array" then .blocking_reasons
+    elif .reason then [.reason]
+    elif .error then [.error]
+    else [] end;
+
+  select(.event_type == "candidate_cycle")
+  | select(
+      (.dry_run_live_ready == true)
+      and (.manual_gate_released == true)
+      and (.dispatch_plan_built == true)
+      and ((.dispatch_attempted == true) or (.mutable_execution_started == true))
+      and ((.dispatch_allowed == false) or ((reasons | length) > 0))
+    )
+  | [
+      (.recorded_at // "-"),
+      (.pair_id // "-"),
+      (.symbol // "-"),
+      ("dispatch_attempted=" + ((.dispatch_attempted // false) | tostring)),
+      ("mutable_execution_started=" + ((.mutable_execution_started // false) | tostring)),
+      ((reasons | map(select(. != null)) | join(" | ")))
+    ]
+  | @tsv
+'
+```
+
+也可以直接轮询 funding arb 的下单门禁 API，确认 dashboard 当前读到的最新 `observed_at`、交易对和阻断原因：
+
+```bash
+cd /Users/danta/WebstormProjects/easy-arb
+
+while true; do
+  curl -sS http://127.0.0.1:8804/api/funding-arb/execution-status \
+  | jq -r '.rows[] | [.observed_at,.pair_id,.dispatch_status,((.blocking_reasons // []) | join(" | "))] | @tsv'
+  sleep 2
+done
+```
+
+`target/arb-runtime/live/logs/realtime-feedback.log` 适合看整体机会、健康状态和轮询节奏；下单门禁、私有只读快照失败、签名器退出、第一腿/第二腿下单失败等细节，以 `funding_arb_resident_live_events.jsonl` 和 `/api/funding-arb/execution-status` 为准。
 
 ## 实盘产物位置
 
@@ -208,7 +305,8 @@ http://127.0.0.1:8804/dashboard
 
 ```text
 target/arb-runtime/live/logs/realtime-feedback.log
-target/arb-runtime/live-prereq/logs/arb-runtime-live.log
+target/arb-runtime/live-prereq/logs/arb-runtime-live-precheck.log
+target/arb-runtime/live-prereq/logs/arb-runtime-live.log # 仅后台运行（--detach）时创建
 target/arb-runtime/live-prereq/logs/portfolio-dashboard.log
 ```
 
@@ -300,7 +398,7 @@ scripts/release-funding-arb-unknown-position.sh \
 
 每个实盘时段结束后至少检查：
 
-```bash
+```bas
 tail -n 50 target/arb-runtime/live/live/live-reports.jsonl | jq -c '.'
 tail -n 50 target/arb-runtime/live/opportunities/cross-exchange-funding-arb.jsonl | jq -c '.'
 tail -n 50 target/arb-runtime/live/private-order-events/*.jsonl

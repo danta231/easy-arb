@@ -434,6 +434,10 @@
       margin-top: 14px;
     }
 
+    .history-wrap {
+      margin-top: 14px;
+    }
+
     .endpoint-grid {
       display: flex;
       flex-wrap: wrap;
@@ -628,6 +632,37 @@
       </div>
     </section>
 
+    <section class="table-wrap history-wrap" aria-label="funding history">
+      <div class="table-head">
+        <strong>历史记录</strong>
+        <span id="history-state">等待中</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>出现时间</th>
+              <th>配对</th>
+              <th>方向</th>
+              <th>交易对</th>
+              <th>A 交易所买一</th>
+              <th>A 交易所卖一</th>
+              <th>B 交易所买一</th>
+              <th>B 交易所卖一</th>
+              <th>净收益 bps</th>
+              <th>预期 USD</th>
+              <th>下次结算</th>
+              <th>状态</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody id="funding-history-rows">
+            <tr><td class="empty-row" colspan="13">加载中</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="api-wrap" aria-label="realtime api">
       <div class="api-head">
         <strong>实时 API</strong>
@@ -635,6 +670,7 @@
           <button type="button" data-endpoint="/api/funding-arb/status">状态接口</button>
           <button type="button" data-endpoint="/api/funding-arb/opportunities">机会接口</button>
           <button type="button" data-endpoint="/api/funding-arb/execution-status">下单门禁接口</button>
+          <button type="button" data-endpoint="/api/funding-arb/history">历史接口</button>
         </div>
       </div>
       <pre id="api-preview">{}</pre>
@@ -645,7 +681,11 @@
     const statusUrl = "/api/funding-arb/status";
     const opportunitiesUrl = "/api/funding-arb/opportunities";
     const executionStatusUrl = "/api/funding-arb/execution-status";
-    const state = { snapshot: null, execution: null, timer: null };
+    const historyUrl = "/api/funding-arb/history";
+    const state = { snapshot: null, execution: null, history: null, timer: null };
+    const LOCAL_TIME_ZONE = "Asia/Shanghai";
+    const LOCAL_TIME_ZONE_LABEL = "UTC+8";
+    let latestSnapshotUpdatedAt = "";
     const $ = (id) => document.getElementById(id);
 
     function escapeHtml(value) {
@@ -683,6 +723,23 @@
       const number = numeric(value);
       if (number === null) return "-";
       return `${(number * 100).toFixed(5).replace(/\.?0+$/, "")}%`;
+    }
+
+    function compactTimestamp(value) {
+      const text = String(value ?? "").trim();
+      if (!text || text === "not-yet-updated") return "-";
+      const parsed = parsedTimestampMs(text);
+      if (!Number.isFinite(parsed)) return text;
+      const rendered = new Date(parsed).toLocaleString("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+      return `${rendered} ${LOCAL_TIME_ZONE_LABEL}`;
     }
 
     function venueLabel(value) {
@@ -805,6 +862,10 @@
       const exact = exactReasonLabels.get(raw);
       if (exact) return exact;
       if (hasChineseText(raw)) return raw;
+      const privateAccountCollateralMatch = raw.match(/^private account minimum available=([^ ]+) USD and margin_buffer=([^ ]+) USD must both be at least ([^ ]+) USD$/);
+      if (privateAccountCollateralMatch) {
+        return `私有账户可用余额和保证金缓冲不足：最小可用余额 ${privateAccountCollateralMatch[1]} USD，最小保证金缓冲 ${privateAccountCollateralMatch[2]} USD，二者都必须至少达到 ${privateAccountCollateralMatch[3]} USD`;
+      }
       let translated = raw;
       for (const [needle, label] of reasonPhraseLabels) {
         translated = translated.split(needle).join(label);
@@ -862,7 +923,22 @@
       return new Map((execution?.rows || []).map((row) => [row.pair_id, row]));
     }
 
-    function gateStatus(row, executionByPair) {
+    function parsedTimestampMs(value) {
+      const text = String(value ?? "").trim();
+      if (!text || text === "not-yet-updated") return null;
+      const normalized = text.replace(/\.(\d{3})\d+(Z|[+-]\d{2}:?\d{2})$/, ".$1$2");
+      const parsed = Date.parse(normalized);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function staleExecutionReason(execution, snapshotUpdatedAt) {
+      const executionMs = parsedTimestampMs(execution?.observed_at);
+      const snapshotMs = parsedTimestampMs(snapshotUpdatedAt);
+      if (executionMs === null || snapshotMs === null || executionMs >= snapshotMs) return "";
+      return `最近门禁报告早于当前机会快照：门禁 ${execution.observed_at}，机会 ${snapshotUpdatedAt}；需要重新运行下单校验。`;
+    }
+
+    function gateStatus(row, executionByPair, snapshotUpdatedAt = "") {
       if (!row.is_candidate) {
         return { label: "非候选", className: "badge", reasons: [row.reason || row.source_status || "未满足公开候选条件"] };
       }
@@ -873,6 +949,10 @@
           className: "badge pending-badge",
           reasons: ["尚未看到该候选的下单校验报告；观察器只负责发现机会，真实下单需要 auto-once 单次执行或 resident live 常驻执行器继续通过门禁。"]
         };
+      }
+      const staleReason = staleExecutionReason(execution, snapshotUpdatedAt);
+      if (staleReason) {
+        return { label: "待校验", className: "badge pending-badge", reasons: [staleReason] };
       }
       if (execution.dispatch_attempted) {
         return { label: "已触发", className: "badge attempted-badge", reasons: ["已进入下单链路。"] };
@@ -893,23 +973,47 @@
       )).join("")}</div>`;
     }
 
-    function nextFunding(row) {
-      const values = [row.venue_a_next_funding_time_ms, row.venue_b_next_funding_time_ms]
-        .map((value) => Number(value))
-        .filter(Number.isFinite);
-      if (!values.length) return "-";
-      return new Date(Math.min(...values)).toLocaleString("zh-CN", {
+    function validFundingTimeMs(value) {
+      const text = String(value ?? "").trim();
+      if (!text) return null;
+      const number = Number(text);
+      return Number.isFinite(number) && number > 0 ? number : null;
+    }
+
+    function formatFundingTimeMs(value) {
+      const rendered = new Date(value).toLocaleString("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
         minute: "2-digit"
       });
+      return `${rendered} ${LOCAL_TIME_ZONE_LABEL}`;
+    }
+
+    function fundingLegTimes(row) {
+      return [
+        { venue: venueLabel(row.venue_a_family), value: row.venue_a_next_funding_time_ms },
+        { venue: venueLabel(row.venue_b_family), value: row.venue_b_next_funding_time_ms }
+      ]
+        .map((entry) => ({ venue: entry.venue, ms: validFundingTimeMs(entry.value) }))
+        .filter((entry) => entry.ms !== null);
+    }
+
+    function nextFunding(row) {
+      const values = fundingLegTimes(row);
+      if (!values.length) return "-";
+      const minMs = Math.min(...values.map((entry) => entry.ms));
+      const hasUnknownLeg = values.length < 2;
+      const hasDifferentTimes = new Set(values.map((entry) => entry.ms)).size > 1;
+      const suffix = hasUnknownLeg || hasDifferentTimes
+        ? `（${values.filter((entry) => entry.ms === minMs).map((entry) => entry.venue).join("/")}）`
+        : "";
+      return `${formatFundingTimeMs(minMs)}${suffix}`;
     }
 
     function nextFundingMs(row) {
-      const values = [row.venue_a_next_funding_time_ms, row.venue_b_next_funding_time_ms]
-        .map((value) => Number(value))
-        .filter(Number.isFinite);
+      const values = fundingLegTimes(row).map((entry) => entry.ms);
       return values.length ? Math.min(...values) : Infinity;
     }
 
@@ -938,19 +1042,21 @@
       select.value = venues.includes(current) ? current : "";
     }
 
-    function filteredRows(rows) {
+    function rowMatchesFilters(row) {
       const symbolFilter = $("symbol-filter").value.trim().toUpperCase();
       const venueFilter = $("venue-filter").value;
       const onlyCandidates = $("only-candidates").checked;
       const onlyComplete = $("only-complete").checked;
+      if (symbolFilter && !String(row.symbol || "").toUpperCase().includes(symbolFilter)) return false;
+      if (venueFilter && row.venue_a_family !== venueFilter && row.venue_b_family !== venueFilter) return false;
+      if (onlyCandidates && !row.is_candidate) return false;
+      if (onlyComplete && row.source_status !== "complete") return false;
+      return true;
+    }
+
+    function filteredRows(rows) {
       const sortMode = $("sort-mode").value;
-      const result = rows.filter((row) => {
-        if (symbolFilter && !String(row.symbol || "").toUpperCase().includes(symbolFilter)) return false;
-        if (venueFilter && row.venue_a_family !== venueFilter && row.venue_b_family !== venueFilter) return false;
-        if (onlyCandidates && !row.is_candidate) return false;
-        if (onlyComplete && row.source_status !== "complete") return false;
-        return true;
-      });
+      const result = rows.filter(rowMatchesFilters);
       result.sort((left, right) => {
         if (sortMode === "symbol-asc") return String(left.symbol || "").localeCompare(String(right.symbol || ""));
         if (sortMode === "spread-desc") {
@@ -997,7 +1103,7 @@
       $("top-net").textContent = bps(row.net_funding_bps);
       $("top-expected").textContent = usd(row.expected_funding_usd);
       $("top-next").textContent = nextFunding(row);
-      const gate = gateStatus(row, executionByPair);
+      const gate = gateStatus(row, executionByPair, latestSnapshotUpdatedAt);
       $("top-gate").textContent = `${gate.label}: ${formatFundingReason(gate.reasons[0] || "-")}`;
       $("top-status").textContent = statusLabel(row.source_status || "complete");
       $("top-venue-a").textContent = venueLabel(row.venue_a_family);
@@ -1020,7 +1126,7 @@
       }
       body.innerHTML = view.map((row) => {
         const candidate = row.is_candidate ? `<span class="badge candidate-badge">候选</span>` : `<span class="badge">观察</span>`;
-        const gate = gateStatus(row, executionByPair);
+        const gate = gateStatus(row, executionByPair, latestSnapshotUpdatedAt);
         return `<tr>
           <td class="${row.is_candidate ? "candidate" : ""}">${escapeHtml(pairLabel(row))}</td>
           <td><span class="badge direction-badge">${escapeHtml(directionLabel(row))}</span></td>
@@ -1045,19 +1151,79 @@
       }).join("");
     }
 
-    function render(snapshot, execution) {
+    function historyEntries(history) {
+      return (history?.records || []).flatMap((record) => {
+        const observedAt = record.recorded_at || record.updated_at || "-";
+        return (record.rows || []).map((row) => ({
+          ...row,
+          history_observed_at: observedAt,
+          history_updated_at: record.updated_at || ""
+        }));
+      });
+    }
+
+    function filteredHistoryEntries(history) {
+      return historyEntries(history)
+        .filter(rowMatchesFilters)
+        .sort((left, right) => {
+          const leftTime = parsedTimestampMs(left.history_observed_at) ?? 0;
+          const rightTime = parsedTimestampMs(right.history_observed_at) ?? 0;
+          return rightTime - leftTime || (numeric(right.net_funding_bps) ?? -Infinity) - (numeric(left.net_funding_bps) ?? -Infinity);
+        })
+        .slice(0, 240);
+    }
+
+    function renderHistory(history) {
+      const body = $("funding-history-rows");
+      if (!history) {
+        $("history-state").textContent = "等待中";
+        body.innerHTML = `<tr><td class="empty-row" colspan="13">加载中</td></tr>`;
+        return;
+      }
+      const rows = filteredHistoryEntries(history);
+      const status = statusLabel(history.status || "unknown");
+      const totalRecords = history.record_count ?? 0;
+      $("history-state").textContent = history.configured === false
+        ? "未配置历史文件"
+        : `${status} / ${rows.length} 行 / ${totalRecords} 批次`;
+      $("history-state").title = history.last_error ? formatFundingReason(history.last_error) : (history.path || "");
+      if (!rows.length) {
+        body.innerHTML = `<tr><td class="empty-row" colspan="13">无历史记录</td></tr>`;
+        return;
+      }
+      body.innerHTML = rows.map((row) => `
+          <tr>
+            <td>${escapeHtml(compactTimestamp(row.history_observed_at))}</td>
+            <td class="${row.is_candidate ? "candidate" : ""}">${escapeHtml(pairLabel(row))}</td>
+            <td><span class="badge direction-badge">${escapeHtml(directionLabel(row))}</span></td>
+            <td>${escapeHtml(row.symbol)}</td>
+            <td>${escapeHtml(row.venue_a_bid)}</td>
+            <td>${escapeHtml(row.venue_a_ask)}</td>
+            <td>${escapeHtml(row.venue_b_bid)}</td>
+            <td>${escapeHtml(row.venue_b_ask)}</td>
+            <td class="${signedClass(row.net_funding_bps)}">${escapeHtml(bps(row.net_funding_bps))}</td>
+            <td class="${signedClass(row.expected_funding_usd)}">${escapeHtml(usd(row.expected_funding_usd))}</td>
+            <td>${escapeHtml(nextFunding(row))}</td>
+            <td>${row.is_candidate ? `<span class="badge candidate-badge">候选</span>` : `<span class="badge">观察</span>`}</td>
+            <td class="reason-cell">${escapeHtml(formatFundingReason(row.reason || row.source_status))}</td>
+          </tr>
+      `).join("");
+    }
+
+    function render(snapshot, execution, history = state.history) {
+      latestSnapshotUpdatedAt = snapshot.updated_at || "";
       const rows = snapshot.rows || [];
       const executionByPair = executionRowsByPair(execution);
       $("runtime-status").textContent = statusLabel(snapshot.status || "unknown");
       $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : snapshot.last_error ? "error" : ""}`;
-      $("updated-at").textContent = snapshot.updated_at || "尚未更新";
+      $("updated-at").textContent = compactTimestamp(snapshot.updated_at);
       $("metric-candidates").textContent = snapshot.candidate_count ?? 0;
       $("metric-total").textContent = snapshot.total_rows ?? 0;
       $("metric-sources").textContent = snapshot.source_count ?? 0;
       $("metric-source-errors").textContent = snapshot.source_error_count ?? 0;
       $("metric-min-net").textContent = bps(snapshot.min_net_funding_bps);
       $("metric-gate-blocked").textContent = rows.filter((row) => {
-        const gate = gateStatus(row, executionByPair);
+        const gate = gateStatus(row, executionByPair, latestSnapshotUpdatedAt);
         return row.is_candidate && gate.label !== "已触发";
       }).length;
       $("api-state").textContent = snapshot.last_error ? "上游错误" : execution?.status === "degraded" ? "门禁报告异常" : "正常";
@@ -1066,22 +1232,31 @@
       updateVenueFilter(rows);
       renderTopOpportunity(rows, executionByPair);
       renderRows(rows, executionByPair);
+      renderHistory(history);
     }
 
     async function refreshStatus() {
       $("api-state").textContent = "加载中";
       try {
-        const [snapshot, execution] = await Promise.all([
+        const [snapshot, execution, history] = await Promise.all([
           requestJson(statusUrl),
           requestJson(executionStatusUrl).catch((error) => ({
             status: "unavailable",
             last_error: error.message,
             rows: []
+          })),
+          requestJson(historyUrl).catch((error) => ({
+            configured: false,
+            status: "unavailable",
+            last_error: error.message,
+            record_count: 0,
+            records: []
           }))
         ]);
         state.snapshot = snapshot;
         state.execution = execution;
-        render(snapshot, execution);
+        state.history = history;
+        render(snapshot, execution, history);
       } catch (error) {
         $("runtime-status").textContent = "错误";
         $("runtime-status").className = "pill error";
@@ -1110,9 +1285,11 @@
     ["symbol-filter", "venue-filter", "only-candidates", "only-complete", "sort-mode"].forEach((id) => {
       $(id).addEventListener("input", () => {
         if (state.snapshot) renderRows(state.snapshot.rows || [], executionRowsByPair(state.execution));
+        renderHistory(state.history);
       });
       $(id).addEventListener("change", () => {
         if (state.snapshot) renderRows(state.snapshot.rows || [], executionRowsByPair(state.execution));
+        renderHistory(state.history);
       });
     });
     $("refresh-button").addEventListener("click", refreshStatus);

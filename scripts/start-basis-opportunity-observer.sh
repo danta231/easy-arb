@@ -36,6 +36,7 @@ usage() {
   BASIS_OBSERVER_MONITORS="binance bybit okx bitget aster hyperliquid" # 启用的交易所 monitor 列表。
   BASIS_OBSERVER_INTERVAL_SECS=5 # observer 轮询公开 monitor 的间隔秒数。
   BASIS_OBSERVER_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps。
+  ARB_RUNTIME_LOCAL_TZ=Asia/Shanghai # 面向人读的日志展示时区；默认 UTC+8。
   BASIS_OBSERVER_MIN_ABS_FUNDING_RATE=0 # 最小绝对资金费率过滤阈值；0 表示不过滤。
   BASIS_OBSERVER_NOTIONAL_USD=100.00 # 单次候选机会用于计算和下单的目标名义本金，单位美元。
   BASIS_OBSERVER_SPOT_FEE_BPS=10 # spot 腿手续费估算，单位 bps。
@@ -78,6 +79,7 @@ usage() {
   BASIS_OBSERVER_STARTUP_WAIT_SECS=180 # 启动健康检查最长等待秒数。
   BASIS_OBSERVER_STOP_DRAIN_SECS=15 # 停止时等待子进程自然收尾的秒数。
   BASIS_OBSERVER_STOP_GRACE_SECS=3 # 停止时发送终止信号后的宽限秒数。
+  BASIS_OBSERVER_RECLAIM_STALE_MONITOR_PORTS=1 # 启动前是否回收本仓库 arb-runtime 残留 monitor 占用的端口；0 表示只报错。
   BASIS_OBSERVER_FOREGROUND=0 # 是否前台运行 observer；1 表示前台。
   BINANCE_BASIS_BIND=127.0.0.1:8796 # Binance basis monitor 监听地址。
   BYBIT_BASIS_BIND=127.0.0.1:8797 # Bybit basis monitor 监听地址。
@@ -126,6 +128,12 @@ die() {
   exit 1
 }
 
+local_log_timestamp() {
+  local timestamp
+  timestamp="$(TZ="${ARB_RUNTIME_LOCAL_TZ:-Asia/Shanghai}" date +%Y-%m-%dT%H:%M:%S%z)"
+  printf '%s:%s\n' "${timestamp%??}" "${timestamp: -2}"
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
@@ -133,6 +141,79 @@ require_command() {
 is_alive() {
   local pid="$1"
   [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+bind_port() {
+  local bind_addr="$1"
+  local port="${bind_addr##*:}"
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${port}"
+}
+
+pid_file_contains_pid() {
+  local needle="$1"
+  local pid
+  local _name
+  local _log_file
+
+  [[ -s "${PID_FILE:-}" ]] || return 1
+  while IFS=$'\t' read -r pid _name _log_file; do
+    [[ "${pid}" == "${needle}" ]] && return 0
+  done < "${PID_FILE}"
+  return 1
+}
+
+pid_looks_like_repo_arb_runtime() {
+  local pid="$1"
+  local open_files
+
+  command -v lsof >/dev/null 2>&1 || return 1
+  open_files="$(lsof -nP -p "${pid}" 2>/dev/null || true)"
+  [[ -n "${open_files}" ]] || return 1
+  if [[ "${open_files}" == *"${REPO_ROOT}/target/"*"arb-runtime"* ]]; then
+    return 0
+  fi
+  [[ -n "${RUNTIME_BIN:-}" && "${open_files}" == *"${RUNTIME_BIN}"* ]]
+}
+
+wait_for_pid_exit() {
+  local pid="$1"
+  local timeout_secs="$2"
+  local deadline="$((SECONDS + timeout_secs))"
+
+  while (( SECONDS <= deadline )); do
+    if ! is_alive "${pid}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+reclaim_stale_monitor_port() {
+  local label="$1"
+  local bind_addr="$2"
+  local port
+  local pid
+
+  [[ "${RECLAIM_STALE_MONITOR_PORTS:-1}" == "1" ]] || return 0
+  command -v lsof >/dev/null 2>&1 || return 0
+  port="$(bind_port "${bind_addr}")" || return 0
+
+  while IFS= read -r pid; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    pid_file_contains_pid "${pid}" && continue
+    if pid_looks_like_repo_arb_runtime "${pid}"; then
+      echo "reclaiming stale monitor port: label=${label} bind=${bind_addr} pid=${pid}"
+      kill -TERM "${pid}" 2>/dev/null || true
+      if ! wait_for_pid_exit "${pid}" "${STOP_GRACE_SECS:-3}"; then
+        echo "stale monitor did not exit after TERM; sending KILL: label=${label} bind=${bind_addr} pid=${pid}"
+        kill -KILL "${pid}" 2>/dev/null || true
+      fi
+    else
+      die "cannot bind ${label} on ${bind_addr}: address already in use by pid=${pid}; not a managed ${REPO_ROOT}/target arb-runtime process"
+    fi
+  done < <(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true)
 }
 
 set_default_env() {
@@ -768,6 +849,13 @@ is_core_process_name() {
   esac
 }
 
+is_supervised_core_process_name() {
+  case "$1" in
+    *-basis-monitor|funding-arb-monitor|opportunity-recorder|spot-perp-basis-resident-live|funding-arb-resident-live) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 stop_core_processes() {
   local pid
   local name
@@ -1022,10 +1110,21 @@ funding_arb_resident_exit_is_accepted() {
 
   [[ -s "${summary_path}" ]] || return 1
   jq -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
     (.phase // "") == "halted"
-    and (.halt_reason // "") == "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
-    and ((.open_position_count // 0) | tonumber) == 0
-    and ((.unknown_position_count // 0) | tonumber) == 0
+    and (((.open_position_count // 0) | as_count) == 0)
+    and (((.unknown_position_count // 0) | as_count) == 0)
+    and (
+      (.halt_reason // "") == "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
+      or (
+        ((.halt_reason // "") | startswith("max live entries reached: "))
+        and (((.closed_position_count // 0) | as_count) >= ((.live_entry_count // 0) | as_count))
+      )
+    )
   ' "${summary_path}" >/dev/null 2>&1
 }
 
@@ -1079,7 +1178,7 @@ supervise_started_processes() {
 
     failed=0
     while IFS=$'\t' read -r pid name log_file; do
-      if is_core_process_name "${name}" && ! is_alive "${pid}"; then
+      if is_supervised_core_process_name "${name}" && ! is_alive "${pid}"; then
         if resident_exit_is_accepted "${name}"; then
           record_accepted_resident_exit_once "${pid}" "${name}" "${log_file}"
           continue
@@ -1219,7 +1318,7 @@ run_validation_job() {
   mkdir -p "${out_dir}"
 
   {
-    echo "[${started_at}] validation_start venue=${venue} symbol=${symbol} run_id=${run_id}"
+    echo "[$(local_log_timestamp)] validation_start venue=${venue} symbol=${symbol} run_id=${run_id}"
 
     args=(
       "${RUNTIME_BIN}"
@@ -1251,7 +1350,7 @@ run_validation_job() {
         --argjson exit_status "${status}" \
         --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
         '{execution_mode:$execution_mode,venue:$venue,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"target_wss_setup_failed",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,target_wss_setup_failed:true}'
-      echo "[${finished_at}] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} result=target_wss_setup_failed out=${out_dir}"
+      echo "[$(local_log_timestamp)] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} result=target_wss_setup_failed out=${out_dir}"
       return 0
     fi
     if [[ -n "${wss_values}" ]]; then
@@ -1316,7 +1415,7 @@ run_validation_job() {
         '{execution_mode:$execution_mode,venue:$venue,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,report_missing:true}'
     fi
 
-    echo "[${finished_at}] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
+    echo "[$(local_log_timestamp)] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
   } >> "${job_log}" 2>&1
 }
 
@@ -1349,7 +1448,7 @@ run_funding_arb_validation_job() {
   mkdir -p "${out_dir}"
 
   {
-    echo "[${started_at}] funding_validation_start pair_id=${pair_id} symbol=${symbol} run_id=${run_id}"
+    echo "[$(local_log_timestamp)] funding_validation_start pair_id=${pair_id} symbol=${symbol} run_id=${run_id}"
 
     args=(
       "${RUNTIME_BIN}" "${command_name}"
@@ -1446,7 +1545,7 @@ run_funding_arb_validation_job() {
         '{execution_mode:$execution_mode,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,report_missing:true}'
     fi
 
-    echo "[${finished_at}] funding_validation_end pair_id=${pair_id} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
+    echo "[$(local_log_timestamp)] funding_validation_end pair_id=${pair_id} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
   } >> "${job_log}" 2>&1
 }
 
@@ -1704,7 +1803,7 @@ poll_venue() {
       >> "${OPPORTUNITY_DIR}/all-opportunities.jsonl"
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.symbol):net=\(.net_basis_bps // "null")bps profit=\(.expected_profit_usd // "null")"] | join(", ")')"
-    echo "[${ts}] opportunity venue=${venue} candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
+    echo "[$(local_log_timestamp)] opportunity venue=${venue} candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
     start_target_wss_warmups_for_candidates "${venue}" "${body}" "${ts}"
     if [[ "${SPOT_PERP_BASIS_MODE}" == "auto-once" ]]; then
       start_validations_for_candidates "${venue}" "${body}" "${ts}"
@@ -1775,7 +1874,7 @@ poll_funding_arb() {
       >> "${OPPORTUNITY_DIR}/all-opportunities.jsonl"
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.pair_id):net=\(.net_funding_bps // "null")bps funding=\(.expected_funding_usd // "null")"] | join(", ")')"
-    echo "[${ts}] opportunity strategy=cross-exchange-funding-arb candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
+    echo "[$(local_log_timestamp)] opportunity strategy=cross-exchange-funding-arb candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
     if [[ "${FUNDING_ARB_MODE}" == "auto-once" ]]; then
       start_funding_arb_validations_for_candidates "${body}" "${ts}"
     fi
@@ -1784,12 +1883,12 @@ poll_funding_arb() {
 
 run_recorder() {
   cd "${REPO_ROOT}"
-  trap 'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_stop" >> "${FEEDBACK_LOG}"; exit 0' INT TERM
+  trap 'echo "[$(local_log_timestamp)] recorder_stop" >> "${FEEDBACK_LOG}"; exit 0' INT TERM
   mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${SNAPSHOT_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}" "${TARGET_WSS_LOG_DIR}" "${TARGET_WSS_STATE_DIR}"
   touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
   touch "${VALIDATION_EVENTS_JSONL}" "${EXECUTION_REPORTS_JSONL}"
   IFS=' ' read -r -a RECORDER_MONITORS <<< "${EFFECTIVE_MONITORS}"
-  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] recorder_start mode=${EXECUTION_MODE} spot_perp_basis_mode=${SPOT_PERP_BASIS_MODE} funding_arb_mode=${FUNDING_ARB_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}" >> "${FEEDBACK_LOG}"
+  echo "[$(local_log_timestamp)] recorder_start mode=${EXECUTION_MODE} spot_perp_basis_mode=${SPOT_PERP_BASIS_MODE} funding_arb_mode=${FUNDING_ARB_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}" >> "${FEEDBACK_LOG}"
   append_json_line "${HEALTH_EVENTS_JSONL}" \
     --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg strategies "${EFFECTIVE_STRATEGIES}" \
@@ -2038,6 +2137,7 @@ STARTUP_CHECK="${BASIS_OBSERVER_STARTUP_CHECK:-1}"
 STARTUP_WAIT_SECS="${BASIS_OBSERVER_STARTUP_WAIT_SECS:-180}"
 STOP_DRAIN_SECS="${BASIS_OBSERVER_STOP_DRAIN_SECS:-15}"
 STOP_GRACE_SECS="${BASIS_OBSERVER_STOP_GRACE_SECS:-3}"
+RECLAIM_STALE_MONITOR_PORTS="${BASIS_OBSERVER_RECLAIM_STALE_MONITOR_PORTS:-1}"
 FOREGROUND="${BASIS_OBSERVER_FOREGROUND:-0}"
 STRATEGIES="${CLI_STRATEGIES:-${BASIS_OBSERVER_STRATEGIES:-spot-perp-basis,cross-exchange-funding-arb}}"
 
@@ -2134,6 +2234,7 @@ start_monitor() {
   )
   append_basis_monitor_wss_args "${venue}"
 
+  reclaim_stale_monitor_port "${venue}-basis-monitor" "${bind_addr}"
   echo "starting ${venue} monitor: http://${bind_addr}/dashboard"
   nohup "${MONITOR_ARGS[@]}" >> "${log_file}" 2>&1 &
   pid="$!"
@@ -2155,6 +2256,7 @@ start_funding_arb_monitor() {
     source_args+=(--source "${monitor}=${source}")
   done
 
+  reclaim_stale_monitor_port "funding-arb-monitor" "${FUNDING_ARB_BIND}"
   echo "starting funding arb monitor: http://${FUNDING_ARB_BIND}/dashboard"
   nohup "${RUNTIME_BIN}" funding-arb-monitor \
     --bind "${FUNDING_ARB_BIND}" \
@@ -2167,6 +2269,7 @@ start_funding_arb_monitor() {
     --out "${out_dir}" \
     --execution-reports "${EXECUTION_REPORTS_JSONL}" \
     --resident-events "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_events.jsonl" \
+    --opportunity-history "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl" \
     "${source_args[@]}" \
     >> "${log_file}" 2>&1 &
   pid="$!"

@@ -409,6 +409,8 @@
     const statusUrl = "/api/basis/status";
     const opportunitiesUrl = "/api/basis/opportunities";
     const state = { snapshot: null, timer: null };
+    const LOCAL_TIME_ZONE = "Asia/Shanghai";
+    const LOCAL_TIME_ZONE_LABEL = "UTC+8";
     const $ = (id) => document.getElementById(id);
 
     function escapeHtml(value) {
@@ -430,6 +432,29 @@
       const number = numeric(value);
       if (number === null || number === 0) return "";
       return number > 0 ? "positive" : "negative";
+    }
+
+    function parsedTimestampMs(value) {
+      const text = String(value ?? "").trim();
+      if (!text || text === "not-yet-updated" || text === "timestamp-unavailable") return null;
+      const normalized = text.replace(/\.(\d{3})\d+(Z|[+-]\d{2}:?\d{2})$/, ".$1$2");
+      const parsed = Date.parse(normalized);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function localTimestamp(value) {
+      const parsed = parsedTimestampMs(value);
+      if (parsed === null) return value || "尚未更新";
+      const rendered = new Date(parsed).toLocaleString("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+      return `${rendered} ${LOCAL_TIME_ZONE_LABEL}`;
     }
 
     async function requestJson(url) {
@@ -503,7 +528,7 @@
     function render(snapshot) {
       $("runtime-status").textContent = snapshot.status || "未知";
       $("runtime-status").className = `pill ${snapshot.status === "healthy" ? "healthy" : ""}`;
-      $("updated-at").textContent = snapshot.updated_at || "尚未更新";
+      $("updated-at").textContent = localTimestamp(snapshot.updated_at);
       $("metric-candidates").textContent = snapshot.candidate_count ?? 0;
       $("metric-total").textContent = snapshot.total_rows ?? 0;
       $("metric-filtered").textContent = snapshot.filtered_funding_count ?? 0;
