@@ -133,6 +133,7 @@
       background: #171a1d;
     }
     .pill.open { color: var(--good); border-color: rgba(93, 196, 138, .5); }
+    .pill.stale_open, .pill.stale_unknown { color: var(--warn); border-color: rgba(228, 167, 83, .55); }
     .pill.unknown, .pill.missing { color: var(--bad); border-color: rgba(225, 109, 109, .55); }
     .empty { padding: 18px; color: var(--muted); }
     #errors {
@@ -282,8 +283,12 @@
         const haystack = `${row.coin || ""} ${row.symbol || ""} ${row.asset || ""}`.toUpperCase();
         if (!haystack.includes(symbol)) return false;
       }
-      if (openOnly && row.position_status && row.position_status !== "open") return false;
+      if (openOnly && row.position_status && !isOpenRiskStatus(row.position_status)) return false;
       return true;
+    }
+    function isOpenRiskStatus(status) {
+      const value = String(status || "").toLowerCase();
+      return value === "open" || value === "stale_open";
     }
     function renderTable(tbodyId, rows, keys) {
       const tbody = document.getElementById(tbodyId);

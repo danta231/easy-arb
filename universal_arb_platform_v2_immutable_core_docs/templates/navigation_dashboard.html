@@ -205,16 +205,27 @@
       checkHealth();
     }
 
+    async function fetchHealth(url) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2500);
+      try {
+        const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+        return response.ok;
+      } catch (_) {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
     async function checkHealth() {
-      for (const link of document.querySelectorAll("[data-health]")) {
-        try {
-          const response = await fetch(link.dataset.health, { cache: "no-store" });
-          link.classList.toggle("ok", response.ok);
-          link.classList.toggle("bad", !response.ok);
-        } catch (_) {
-          link.classList.add("bad");
-          link.classList.remove("ok");
-        }
+      const links = Array.from(document.querySelectorAll("[data-health]"));
+      const urls = Array.from(new Set(links.map(link => link.dataset.health).filter(Boolean)));
+      const results = new Map(await Promise.all(urls.map(async url => [url, await fetchHealth(url)])));
+      for (const link of links) {
+        const ok = results.get(link.dataset.health) === true;
+        link.classList.toggle("ok", ok);
+        link.classList.toggle("bad", !ok);
       }
     }
 

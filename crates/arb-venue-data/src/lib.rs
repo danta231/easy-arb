@@ -3791,6 +3791,7 @@ impl VenueHealthReader for BinancePublicTicker24hAdapter {
 pub enum BinancePrivateAccountMarket {
     Spot,
     UsdmFutures,
+    PortfolioMargin,
 }
 
 impl BinancePrivateAccountMarket {
@@ -3798,6 +3799,7 @@ impl BinancePrivateAccountMarket {
         match self {
             Self::Spot => "Spot",
             Self::UsdmFutures => "UsdmFutures",
+            Self::PortfolioMargin => "PortfolioMargin",
         }
     }
 
@@ -3805,6 +3807,7 @@ impl BinancePrivateAccountMarket {
         match self {
             Self::Spot => "spot",
             Self::UsdmFutures => "usdm-futures",
+            Self::PortfolioMargin => "portfolio-margin",
         }
     }
 
@@ -3812,6 +3815,15 @@ impl BinancePrivateAccountMarket {
         match self {
             Self::Spot => "/api/v3/account",
             Self::UsdmFutures => "/fapi/v3/account",
+            Self::PortfolioMargin => "/papi/v1/account",
+        }
+    }
+
+    fn position_endpoint(self) -> &'static str {
+        match self {
+            Self::Spot => "",
+            Self::UsdmFutures => "/fapi/v3/positionRisk",
+            Self::PortfolioMargin => "/papi/v1/um/positionRisk",
         }
     }
 }
@@ -4346,6 +4358,90 @@ impl BinancePrivateAccountAdapter {
         })
     }
 
+    /// 解析 Binance Portfolio Margin `/papi/v1/account` 响应为余额快照。
+    ///
+    /// 中文说明：该接口返回 USD 口径账户可用额度，不是逐资产余额。这里将
+    /// `virtualMaxWithdrawAmount` / `totalAvailableBalance` 映射为 USDT 保守可用额，
+    /// 仅用于统一账户 live preflight 的可用资金检查，不输出原始私有金额。
+    pub fn ingest_portfolio_margin_account_json(
+        &mut self,
+        raw_json: &str,
+        raw_response_ref: impl Into<String>,
+        ingested_at: UtcTimestamp,
+    ) -> VenueDataResult<BinancePrivateBalanceBatch> {
+        self.ensure_market(
+            BinancePrivateAccountMarket::PortfolioMargin,
+            "binance.portfolio_margin.account",
+        )?;
+        let raw_response_ref = raw_response_ref.into();
+        let object =
+            parse_binance_private_object(raw_json, &self.venue_id, ReadOnlySurface::Balance)?;
+        let update_time_ms = required_u64(
+            &object,
+            "updateTime",
+            self.venue_id.clone(),
+            ReadOnlySurface::Balance,
+        )?;
+        let observed_at = timestamp_from_unix_millis(update_time_ms).map_err(|detail| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                self.venue_id.clone(),
+                ReadOnlySurface::Balance,
+                ExternalErrorClass::MalformedPayload,
+                detail,
+            ))
+        })?;
+        let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
+        let source_sequence = update_time_ms.to_string();
+        let balance_event_id =
+            binance_private_event_id("balance", self.market, &self.account_id, &source_sequence);
+
+        let balances = vec![VenueBalance {
+            venue_id: self.venue_id.clone(),
+            account_id: self.account_id.clone(),
+            asset_id: binance_asset_id("USDT")?,
+            free: parse_amount_surface_field_any_non_empty(
+                &object,
+                &["totalAvailableBalance", "virtualMaxWithdrawAmount"],
+                &self.venue_id,
+                ReadOnlySurface::Balance,
+            )?,
+            locked: parse_optional_amount_surface_field_non_empty(
+                &object,
+                "accountInitialMargin",
+                &self.venue_id,
+                ReadOnlySurface::Balance,
+            )?,
+            reserved: parse_optional_amount_surface_field_non_empty(
+                &object,
+                "totalMarginOpenLoss",
+                &self.venue_id,
+                ReadOnlySurface::Balance,
+            )?,
+            pending: zero_amount(),
+            borrowed: zero_amount(),
+            lent: zero_amount(),
+            unsettled: zero_amount(),
+            source_event_id: Some(balance_event_id.clone()),
+            freshness,
+        }];
+
+        let balance_event = self.balance_snapshot_event(
+            &raw_response_ref,
+            &source_sequence,
+            observed_at,
+            ingested_at,
+            freshness,
+            &balances,
+        )?;
+        self.balances = balances.clone();
+        self.update_health(freshness, balance_event.event_id.as_str());
+
+        Ok(BinancePrivateBalanceBatch {
+            balance_event,
+            balances,
+        })
+    }
+
     /// 解析 Binance USD-M `/fapi/v3/positionRisk` 响应为仓位快照。
     ///
     /// 中文说明：`/fapi/v3/account` 的 positions 字段不提供 mark price，不能单独
@@ -4357,10 +4453,7 @@ impl BinancePrivateAccountAdapter {
         raw_response_ref: impl Into<String>,
         ingested_at: UtcTimestamp,
     ) -> VenueDataResult<BinancePrivatePositionBatch> {
-        self.ensure_market(
-            BinancePrivateAccountMarket::UsdmFutures,
-            "binance.usdm.position_risk",
-        )?;
+        self.ensure_usdm_position_market("binance.usdm.position_risk")?;
         let raw_response_ref = raw_response_ref.into();
         let value = FlatJsonParser::new(raw_json)
             .parse_value_root()
@@ -4527,6 +4620,20 @@ impl BinancePrivateAccountAdapter {
         }
     }
 
+    fn ensure_usdm_position_market(&self, field: &'static str) -> VenueDataResult<()> {
+        if matches!(
+            self.market,
+            BinancePrivateAccountMarket::UsdmFutures | BinancePrivateAccountMarket::PortfolioMargin
+        ) {
+            Ok(())
+        } else {
+            Err(VenueDataError::InvalidQuery {
+                field,
+                reason: "adapter was not configured for a Binance UM private position market",
+            })
+        }
+    }
+
     fn balance_snapshot_event(
         &self,
         raw_response_ref: &str,
@@ -4598,8 +4705,9 @@ impl BinancePrivateAccountAdapter {
             .map(|position| position.instrument_id.as_str().to_owned())
             .collect::<BTreeSet<_>>();
         let payload = format!(
-            "{{\"account_id\":{},\"adapter\":\"BinancePrivateAccountAdapter\",\"endpoint\":\"/fapi/v3/positionRisk\",\"freshness\":{},\"instrument_ids\":{},\"kind\":\"BinancePrivatePositionSnapshot\",\"market\":\"{}\",\"position_count\":{},\"raw_response_ref\":{},\"redaction\":\"private_position_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
+            "{{\"account_id\":{},\"adapter\":\"BinancePrivateAccountAdapter\",\"endpoint\":{},\"freshness\":{},\"instrument_ids\":{},\"kind\":\"BinancePrivatePositionSnapshot\",\"market\":\"{}\",\"position_count\":{},\"raw_response_ref\":{},\"redaction\":\"private_position_amounts_available_in_typed_snapshot_not_event_payload\",\"risk_reason_code\":{}}}",
             json_string(self.account_id.as_str()),
+            json_string(self.market.position_endpoint()),
             freshness_payload_json(freshness),
             json_string_array(instrument_ids.iter().map(String::as_str)),
             self.market.as_str(),
@@ -8898,6 +9006,48 @@ fn parse_amount_surface_field(
         })
 }
 
+fn parse_amount_surface_field_any_non_empty(
+    object: &BTreeMap<String, FlatJsonValue>,
+    fields: &[&'static str],
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<Amount> {
+    for field in fields {
+        let Some(value) = object.get(*field) else {
+            continue;
+        };
+        let value = match value {
+            FlatJsonValue::String(value) | FlatJsonValue::Number(value) => value.trim(),
+            FlatJsonValue::Null => continue,
+            _ => {
+                return Err(VenueDataError::External(ClassifiedExternalError::new(
+                    venue_id.clone(),
+                    surface,
+                    ExternalErrorClass::MalformedPayload,
+                    format!("field `{field}` must be a decimal string or number when present"),
+                )))
+            }
+        };
+        if value.is_empty() {
+            continue;
+        }
+        return value.parse::<Amount>().map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                surface,
+                ExternalErrorClass::MalformedPayload,
+                format!("field `{field}` is not a valid non-negative amount: {error}"),
+            ))
+        });
+    }
+    Err(VenueDataError::External(ClassifiedExternalError::new(
+        venue_id.clone(),
+        surface,
+        ExternalErrorClass::MissingField,
+        format!("required field `{}` is missing", fields.join("` or `")),
+    )))
+}
+
 fn parse_optional_amount_surface_field(
     object: &BTreeMap<String, FlatJsonValue>,
     field: &'static str,
@@ -8907,6 +9057,40 @@ fn parse_optional_amount_surface_field(
     let Some(value) = optional_decimal_text(object, field, venue_id, surface)? else {
         return Ok(zero_amount());
     };
+    value.parse::<Amount>().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            surface,
+            ExternalErrorClass::MalformedPayload,
+            format!("field `{field}` is not a valid non-negative amount: {error}"),
+        ))
+    })
+}
+
+fn parse_optional_amount_surface_field_non_empty(
+    object: &BTreeMap<String, FlatJsonValue>,
+    field: &'static str,
+    venue_id: &VenueId,
+    surface: ReadOnlySurface,
+) -> VenueDataResult<Amount> {
+    let Some(value) = object.get(field) else {
+        return Ok(zero_amount());
+    };
+    let value = match value {
+        FlatJsonValue::String(value) | FlatJsonValue::Number(value) => value.trim(),
+        FlatJsonValue::Null => return Ok(zero_amount()),
+        _ => {
+            return Err(VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                surface,
+                ExternalErrorClass::MalformedPayload,
+                format!("field `{field}` must be a decimal string or number when present"),
+            )))
+        }
+    };
+    if value.is_empty() {
+        return Ok(zero_amount());
+    }
     value.parse::<Amount>().map_err(|error| {
         VenueDataError::External(ClassifiedExternalError::new(
             venue_id.clone(),
@@ -11758,6 +11942,47 @@ mod tests {
     }
 
     #[test]
+    fn binance_private_portfolio_margin_maps_account_and_um_position_risk() {
+        let mut adapter = binance_private_portfolio_margin_adapter();
+        let balances = adapter
+            .ingest_portfolio_margin_account_json(
+                r#"{"uniMMR":"5167.92171923","accountEquity":"122607.35137903","actualEquity":"73.47428058","accountInitialMargin":"23.72469206","accountMaintMargin":"23.72469206","accountStatus":"NORMAL","virtualMaxWithdrawAmount":"1627523.32459208","totalAvailableBalance":"","totalMarginOpenLoss":"","updateTime":1767225601000}"#,
+                "redacted:binance-papi-account",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("portfolio margin account snapshot");
+        assert_eq!(
+            payload_string(&balances.balance_event, "endpoint"),
+            "/papi/v1/account"
+        );
+        assert_eq!(
+            payload_string(&balances.balance_event, "market"),
+            "PortfolioMargin"
+        );
+        assert_eq!(balances.balances.len(), 1);
+        assert_eq!(balances.balances[0].asset_id.as_str(), "asset:USDT");
+        assert_eq!(balances.balances[0].free.to_string(), "1627523.32459208");
+        assert_eq!(balances.balances[0].locked.to_string(), "23.72469206");
+
+        let positions = adapter
+            .ingest_usdm_position_risk_json(
+                r#"[{"symbol":"BTCUSDT","positionSide":"LONG","positionAmt":"0.001","entryPrice":"43100.00","markPrice":"43250.50","unRealizedProfit":"0.15","liquidationPrice":"35000.00","updateTime":1767225601500}]"#,
+                "redacted:binance-papi-um-position-risk",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("portfolio margin UM position risk snapshot");
+        assert_eq!(
+            payload_string(&positions.position_event, "endpoint"),
+            "/papi/v1/um/positionRisk"
+        );
+        assert_eq!(positions.positions.len(), 1);
+        assert_eq!(
+            positions.positions[0].instrument_id.as_str(),
+            "inst:BINANCE:BTCUSDT:USDM-PERP"
+        );
+    }
+
+    #[test]
     fn binance_private_position_requires_mark_price_for_nonzero_position() {
         let mut adapter = binance_private_usdm_adapter();
         let error = adapter
@@ -12311,6 +12536,17 @@ mod tests {
             5_000,
         )
         .expect("private usdm adapter")
+    }
+
+    fn binance_private_portfolio_margin_adapter() -> BinancePrivateAccountAdapter {
+        BinancePrivateAccountAdapter::new(
+            VenueId::new("venue:BINANCE-USDM-PRIVATE").expect("venue"),
+            AccountId::new("account:binance-usdm-read-only").expect("account"),
+            BinancePrivateAccountMarket::PortfolioMargin,
+            timestamp("2026-01-01T00:00:00Z"),
+            5_000,
+        )
+        .expect("private portfolio margin adapter")
     }
 
     fn bybit_private_unified_adapter() -> BybitPrivateAccountAdapter {

@@ -2579,11 +2579,49 @@ fn plan_id(risk_decision: &RiskDecision) -> String {
 
 fn bounded_identifier(prefix: &str, source: &str) -> String {
     let candidate = format!("{prefix}:{source}");
-    if candidate.len() <= 128 {
+    if identifier_is_contract_safe(&candidate) {
         candidate
     } else {
         format!("{prefix}:sha256:{}", sha256_hex(source.as_bytes()))
     }
+}
+
+pub fn bounded_source_event_id(source_event_id: &str) -> String {
+    if source_event_id.trim().is_empty() {
+        return format!("event:sha256:{}", sha256_hex(source_event_id.as_bytes()));
+    }
+    let candidate = if source_event_id.starts_with("event:") {
+        source_event_id.to_owned()
+    } else {
+        format!("event:{source_event_id}")
+    };
+    if identifier_is_contract_safe(&candidate) {
+        candidate
+    } else {
+        format!("event:sha256:{}", sha256_hex(source_event_id.as_bytes()))
+    }
+}
+
+fn execution_event_id(scope: &str, plan_id: &str, index: usize, suffix: &str) -> String {
+    bounded_identifier(
+        "event",
+        &format!("{scope}:{plan_id}:{:04}:{suffix}", index + 1),
+    )
+}
+
+fn identifier_is_contract_safe(value: &str) -> bool {
+    let len = value.len();
+    if !(2..=128).contains(&len) {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
 }
 
 fn render_pair(key: &str, value: String) -> String {
@@ -2628,10 +2666,11 @@ fn build_read_only_report(
             render_leg_report(
                 leg.plan_leg_id.as_str(),
                 LegReportStatus::Skipped,
-                &[format!(
-                    "event:sim:{}:{:04}:read-only",
+                &[execution_event_id(
+                    "sim",
                     plan.plan_id.as_str(),
-                    index + 1
+                    index,
+                    "read-only",
                 )],
             )
         })
@@ -2723,10 +2762,11 @@ fn apply_private_confirmation(
     aggregate: &mut PrivateExecutionAggregate,
 ) -> ExecutionResult<()> {
     let Some(confirmation) = confirmation else {
-        let event_id = format!(
-            "event:private:{}:{:04}:missing-confirmation",
+        let event_id = execution_event_id(
+            "private",
             plan.plan_id.as_str(),
-            index + 1
+            index,
+            "missing-confirmation",
         );
         aggregate.failures.push(render_failure(
             plan,
@@ -2948,10 +2988,10 @@ fn is_private_order_leg(leg: &arb_contracts::ExecutionLeg) -> bool {
 fn private_confirmation_refs(confirmation: &PrivateOrderConfirmation) -> Vec<String> {
     let mut refs = BTreeSet::new();
     for event_id in &confirmation.source_event_refs {
-        refs.insert(event_id.clone());
+        refs.insert(bounded_source_event_id(event_id));
     }
     for fill in &confirmation.fills {
-        refs.insert(fill.source_event_id.clone());
+        refs.insert(bounded_source_event_id(&fill.source_event_id));
     }
     refs.into_iter().collect()
 }
@@ -3013,10 +3053,11 @@ fn simulate_dispatchable_plan(
             aggregate.leg_reports.push(render_leg_report(
                 leg.plan_leg_id.as_str(),
                 LegReportStatus::Skipped,
-                &[format!(
-                    "event:sim:{}:{:04}:blocked",
+                &[execution_event_id(
+                    "sim",
                     input.plan.plan_id.as_str(),
-                    index + 1
+                    index,
+                    "blocked",
                 )],
             ));
             continue;
@@ -3073,7 +3114,7 @@ fn default_simulation_outcome(
         "1",
         default_fee_asset_id(leg),
         "0",
-        format!("event:sim:{}:{:04}:fill", plan.plan_id.as_str(), index + 1),
+        execution_event_id("sim", plan.plan_id.as_str(), index, "fill"),
     ))
 }
 
@@ -3109,10 +3150,11 @@ fn simulate_leg(
             aggregate.leg_reports.push(render_leg_report(
                 leg.plan_leg_id.as_str(),
                 LegReportStatus::Skipped,
-                &[format!(
-                    "event:sim:{}:{:04}:skipped",
+                &[execution_event_id(
+                    "sim",
                     plan.plan_id.as_str(),
-                    index + 1
+                    index,
+                    "skipped",
                 )],
             ));
             Ok(false)
@@ -3126,11 +3168,7 @@ fn simulate_leg(
                 leg.plan_leg_id.as_str(),
                 &acknowledged,
                 ExecutionLegState::Filled,
-                format!(
-                    "event:sim:{}:{:04}:filled",
-                    plan.plan_id.as_str(),
-                    index + 1
-                ),
+                execution_event_id("sim", plan.plan_id.as_str(), index, "filled"),
             )?;
             refs.push(fill.source_event_id.clone());
             aggregate
@@ -3153,11 +3191,7 @@ fn simulate_leg(
                 leg.plan_leg_id.as_str(),
                 &acknowledged,
                 ExecutionLegState::PartiallyFilled,
-                format!(
-                    "event:sim:{}:{:04}:partial",
-                    plan.plan_id.as_str(),
-                    index + 1
-                ),
+                execution_event_id("sim", plan.plan_id.as_str(), index, "partial"),
             )?;
             refs.push(fill.source_event_id.clone());
             aggregate.fills.push(render_fill(
@@ -3196,11 +3230,7 @@ fn simulate_leg(
                 leg.plan_leg_id.as_str(),
                 &acknowledged,
                 ExecutionLegState::PartiallyFilled,
-                format!(
-                    "event:sim:{}:{:04}:partial",
-                    plan.plan_id.as_str(),
-                    index + 1
-                ),
+                execution_event_id("sim", plan.plan_id.as_str(), index, "partial"),
             )?;
             let cancel_requested = push_transition(
                 &mut aggregate.transitions,
@@ -3216,11 +3246,7 @@ fn simulate_leg(
                 leg.plan_leg_id.as_str(),
                 &cancel_requested,
                 ExecutionLegState::Cancelled,
-                format!(
-                    "event:sim:{}:{:04}:cancelled",
-                    plan.plan_id.as_str(),
-                    index + 1
-                ),
+                execution_event_id("sim", plan.plan_id.as_str(), index, "cancelled"),
             )?;
             refs.push(fill.source_event_id.clone());
             aggregate.fills.push(render_fill(
@@ -3320,11 +3346,7 @@ fn simulate_unknown_leg(
 
     if compensate {
         let compensation_event_id = unknown.compensation_event_id.unwrap_or_else(|| {
-            format!(
-                "event:sim:{}:{:04}:compensate",
-                plan.plan_id.as_str(),
-                index + 1
-            )
+            execution_event_id("sim", plan.plan_id.as_str(), index, "compensate")
         });
         let compensating = push_transition(
             &mut aggregate.transitions,
@@ -3340,11 +3362,7 @@ fn simulate_unknown_leg(
             leg.plan_leg_id.as_str(),
             &compensating,
             ExecutionLegState::Compensated,
-            format!(
-                "event:sim:{}:{:04}:compensated",
-                plan.plan_id.as_str(),
-                index + 1
-            ),
+            execution_event_id("sim", plan.plan_id.as_str(), index, "compensated"),
         )?;
         aggregate.failures.push(render_failure(
             plan,
@@ -3418,11 +3436,7 @@ fn drive_leg_to_acknowledged(
         leg.plan_leg_id.as_str(),
         &ready,
         ExecutionLegState::Dispatched,
-        format!(
-            "event:sim:{}:{:04}:dispatch",
-            plan.plan_id.as_str(),
-            index + 1
-        ),
+        execution_event_id("sim", plan.plan_id.as_str(), index, "dispatch"),
     )?;
     push_transition(
         &mut aggregate.transitions,
@@ -3430,7 +3444,7 @@ fn drive_leg_to_acknowledged(
         leg.plan_leg_id.as_str(),
         &dispatched,
         ExecutionLegState::Acknowledged,
-        format!("event:sim:{}:{:04}:ack", plan.plan_id.as_str(), index + 1),
+        execution_event_id("sim", plan.plan_id.as_str(), index, "ack"),
     )
 }
 
@@ -3449,11 +3463,7 @@ fn drive_leg_to_ready(
             leg.plan_leg_id.as_str(),
             &current,
             ExecutionLegState::WaitingDependency,
-            format!(
-                "event:sim:{}:{:04}:waiting",
-                plan.plan_id.as_str(),
-                index + 1
-            ),
+            execution_event_id("sim", plan.plan_id.as_str(), index, "waiting"),
         )?;
     }
     if current == ExecutionLegState::WaitingDependency {
@@ -3463,7 +3473,7 @@ fn drive_leg_to_ready(
             leg.plan_leg_id.as_str(),
             &current,
             ExecutionLegState::Ready,
-            format!("event:sim:{}:{:04}:ready", plan.plan_id.as_str(), index + 1),
+            execution_event_id("sim", plan.plan_id.as_str(), index, "ready"),
         )?;
     }
     if current != ExecutionLegState::Ready {
@@ -3484,6 +3494,7 @@ fn push_transition(
     to_state: ExecutionLegState,
     source_event_id: String,
 ) -> ExecutionResult<ExecutionLegState> {
+    let source_event_id = bounded_source_event_id(&source_event_id);
     let transition =
         transition_execution_leg(plan_leg_id, from_state, to_state.clone(), &source_event_id)?;
     refs.push(source_event_id);
@@ -3561,7 +3572,7 @@ fn render_leg_report(
                 "[{}]",
                 source_event_refs
                     .iter()
-                    .map(|event_id| json_string(event_id))
+                    .map(|event_id| json_string(&bounded_source_event_id(event_id)))
                     .collect::<Vec<_>>()
                     .join(",")
             ),
@@ -3603,11 +3614,9 @@ fn render_fill(
         render_pair("schema_version", json_string(plan.schema_version.as_str())),
         render_pair(
             "fill_id",
-            json_string(&format!(
-                "fill:{}:{:04}:{}",
-                plan.plan_id.as_str(),
-                index + 1,
-                suffix
+            json_string(&bounded_identifier(
+                "fill",
+                &format!("{}:{:04}:{}", plan.plan_id.as_str(), index + 1, suffix),
             )),
         ),
         render_pair("plan_id", json_string(plan.plan_id.as_str())),
@@ -3627,7 +3636,10 @@ fn render_fill(
                 json_string(&fill.fee_asset_id),
             ),
         ),
-        render_pair("source_event_id", json_string(&fill.source_event_id)),
+        render_pair(
+            "source_event_id",
+            json_string(&bounded_source_event_id(&fill.source_event_id)),
+        ),
     ];
     if let Some(client_order_id) = &leg.client_order_id {
         fields.push(render_pair(
@@ -3685,11 +3697,14 @@ fn render_private_fill(
         render_pair("schema_version", json_string(plan.schema_version.as_str())),
         render_pair(
             "fill_id",
-            json_string(&format!(
-                "fill:{}:{:04}:private:{:04}",
-                plan.plan_id.as_str(),
-                leg_index + 1,
-                fill_index + 1
+            json_string(&bounded_identifier(
+                "fill",
+                &format!(
+                    "{}:{:04}:private:{:04}",
+                    plan.plan_id.as_str(),
+                    leg_index + 1,
+                    fill_index + 1
+                ),
             )),
         ),
         render_pair("plan_id", json_string(plan.plan_id.as_str())),
@@ -3709,7 +3724,10 @@ fn render_private_fill(
                 json_string(&fill.fee_asset_id),
             ),
         ),
-        render_pair("source_event_id", json_string(&fill.source_event_id)),
+        render_pair(
+            "source_event_id",
+            json_string(&bounded_source_event_id(&fill.source_event_id)),
+        ),
     ];
     if let Some(venue_order_id) = venue_order_id {
         fields.push(render_pair("venue_order_id", json_string(venue_order_id)));
@@ -3735,11 +3753,9 @@ fn render_failure(
     let mut fields = vec![
         render_pair(
             "failure_id",
-            json_string(&format!(
-                "failure:{}:{:04}:{}",
-                plan.plan_id.as_str(),
-                index + 1,
-                suffix
+            json_string(&bounded_identifier(
+                "failure",
+                &format!("{}:{:04}:{}", plan.plan_id.as_str(), index + 1, suffix),
             )),
         ),
         render_pair("failure_type", json_string(failure_type.as_str())),
@@ -3774,16 +3790,19 @@ fn render_ledger_entry(
         .as_ref()
         .map(|entry_id| entry_id.as_str().to_owned())
         .unwrap_or_else(|| {
-            format!(
-                "ledger:{}:{}",
-                ledger_namespace_token(namespace),
-                fill.fill_id.as_str()
+            bounded_identifier(
+                "ledger",
+                &format!(
+                    "{}:{}",
+                    ledger_namespace_token(namespace),
+                    fill.fill_id.as_str()
+                ),
             )
         });
-    let journal_entry_id = format!("journal:{}", ledger_entry_id);
-    let idempotency_key = format!("idem:{}", ledger_entry_id);
-    let debit_leg_id = format!("ledleg:{}:debit", fill.fill_id.as_str());
-    let credit_leg_id = format!("ledleg:{}:credit", fill.fill_id.as_str());
+    let journal_entry_id = bounded_identifier("journal", &ledger_entry_id);
+    let idempotency_key = bounded_identifier("idem", &ledger_entry_id);
+    let debit_leg_id = bounded_identifier("ledleg", &format!("{}:debit", fill.fill_id.as_str()));
+    let credit_leg_id = bounded_identifier("ledleg", &format!("{}:credit", fill.fill_id.as_str()));
     let assertion_hash = format!(
         "hash:{}-ledger:{}",
         ledger_namespace_token(namespace),
@@ -3933,7 +3952,7 @@ fn build_execution_report_contract(
     let report_json = format!(
         "{{\"schema_version\":{},\"report_id\":{},\"plan_id\":{},\"generated_at\":{},\"status\":{},\"leg_reports\":[{}],\"fills\":[{}],\"failures\":[{}],\"reconciliation_status\":{}}}",
         json_string(plan.schema_version.as_str()),
-        json_string(&format!("report:{}", plan.plan_id.as_str())),
+        json_string(&bounded_identifier("report", plan.plan_id.as_str())),
         json_string(plan.plan_id.as_str()),
         json_string(generated_at),
         json_string(status.as_str()),
@@ -4313,6 +4332,97 @@ mod tests {
             .idempotency_key
             .as_str()
             .starts_with("idem:sha256:"));
+    }
+
+    #[test]
+    fn private_execution_report_bounds_long_source_event_refs() {
+        let candidate = candidate(FUNDING_ARB_CANDIDATE);
+        let risk_decision = decision(&manual_decision_json());
+        let pending = match build_execution_plan_preview(ExecutionPlanBuildInput::new(
+            &risk_decision,
+            &candidate,
+            ExecutionMode::ReadOnly,
+            "2026-01-01T00:00:04Z",
+        ))
+        .expect("manual approval should produce a funding arb preview")
+        {
+            PlanBuildOutcome::PendingManualApproval(pending) => pending,
+            PlanBuildOutcome::Schedulable(_) => panic!("manual approval must not be dispatchable"),
+        };
+        let order_leg = &pending.plan_preview.legs[1];
+        let long_source_event_id = format!(
+            "event:funding-arb-live-canary-order-query:first-perp-after-submit:{}:{}",
+            order_leg.plan_leg_id.as_str(),
+            "x".repeat(120)
+        );
+        assert!(long_source_event_id.len() > 128);
+        let confirmation = PrivateOrderConfirmation::new(
+            order_leg.plan_leg_id.as_str(),
+            PrivateOrderConfirmationStatus::Cancelled,
+            PrivateOrderConfirmationSource::OrderQuery,
+            long_source_event_id,
+        );
+
+        let report = execution_report_from_private_confirmations(PrivateExecutionReportInput::new(
+            &pending.plan_preview,
+            "2026-01-01T00:00:06Z",
+            std::slice::from_ref(&confirmation),
+        ))
+        .expect("long source event refs are compacted before contract validation");
+
+        for refs in report
+            .leg_reports
+            .iter()
+            .filter_map(|leg_report| leg_report.source_event_refs.as_ref())
+        {
+            for event_id in refs {
+                assert!(event_id.as_str().len() <= 128);
+            }
+        }
+        assert!(report.leg_reports[1]
+            .source_event_refs
+            .as_ref()
+            .expect("bounded source refs")
+            .iter()
+            .any(|event_id| event_id.as_str().starts_with("event:sha256:")));
+    }
+
+    #[test]
+    fn private_execution_report_bounds_empty_source_event_refs() {
+        let candidate = candidate(FUNDING_ARB_CANDIDATE);
+        let risk_decision = decision(&manual_decision_json());
+        let pending = match build_execution_plan_preview(ExecutionPlanBuildInput::new(
+            &risk_decision,
+            &candidate,
+            ExecutionMode::ReadOnly,
+            "2026-01-01T00:00:04Z",
+        ))
+        .expect("manual approval should produce a funding arb preview")
+        {
+            PlanBuildOutcome::PendingManualApproval(pending) => pending,
+            PlanBuildOutcome::Schedulable(_) => panic!("manual approval must not be dispatchable"),
+        };
+        let order_leg = &pending.plan_preview.legs[1];
+        let confirmation = PrivateOrderConfirmation::new(
+            order_leg.plan_leg_id.as_str(),
+            PrivateOrderConfirmationStatus::Cancelled,
+            PrivateOrderConfirmationSource::OrderQuery,
+            "",
+        );
+
+        let report = execution_report_from_private_confirmations(PrivateExecutionReportInput::new(
+            &pending.plan_preview,
+            "2026-01-01T00:00:06Z",
+            std::slice::from_ref(&confirmation),
+        ))
+        .expect("empty source event refs are compacted before contract validation");
+
+        assert!(report.leg_reports[1]
+            .source_event_refs
+            .as_ref()
+            .expect("bounded source refs")
+            .iter()
+            .any(|event_id| event_id.as_str().starts_with("event:sha256:")));
     }
 
     #[test]

@@ -3537,6 +3537,10 @@ pub mod live {
     pub const BINANCE_USDM_ORDER_ENDPOINT: &str = "/fapi/v1/order";
     /// Binance USD-M Futures 调整初始杠杆 endpoint。
     pub const BINANCE_USDM_LEVERAGE_ENDPOINT: &str = "/fapi/v1/leverage";
+    /// Binance Portfolio Margin 统一账户 UM 下单、撤单和查单 endpoint。
+    pub const BINANCE_PORTFOLIO_MARGIN_UM_ORDER_ENDPOINT: &str = "/papi/v1/um/order";
+    /// Binance Portfolio Margin 统一账户 UM 调整初始杠杆 endpoint。
+    pub const BINANCE_PORTFOLIO_MARGIN_UM_LEVERAGE_ENDPOINT: &str = "/papi/v1/um/leverage";
     /// 默认 Binance signed endpoint 接收窗口。
     pub const DEFAULT_BINANCE_RECV_WINDOW_MS: u64 = 5_000;
     /// 默认所有 live perp 适配器使用的目标杠杆。
@@ -3711,19 +3715,22 @@ pub mod live {
             }
         }
 
-        fn order_endpoint(self) -> &'static str {
-            match self {
-                Self::Spot => BINANCE_SPOT_ORDER_ENDPOINT,
-                Self::UsdmFutures => BINANCE_USDM_ORDER_ENDPOINT,
-            }
-        }
-
         fn expected_instrument_suffix(self) -> &'static str {
             match self {
                 Self::Spot => "SPOT",
                 Self::UsdmFutures => "USDM-PERP",
             }
         }
+    }
+
+    /// Binance UM 永续账户接口模式。
+    ///
+    /// 中文说明：`UsdmFutures` 使用普通 USD-M Futures `/fapi` 私有接口；
+    /// `PortfolioMargin` 使用统一账户 / Portfolio Margin 的 `/papi/v1/um` 私有接口。
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub enum BinanceUsdmAccountMode {
+        UsdmFutures,
+        PortfolioMargin,
     }
 
     impl fmt::Display for BinanceExecMarket {
@@ -3739,6 +3746,7 @@ pub mod live {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct BinanceExecConfig {
         market: BinanceExecMarket,
+        usdm_account_mode: BinanceUsdmAccountMode,
         venue_id: VenueId,
         account_id: AccountId,
         base_url: String,
@@ -3781,6 +3789,24 @@ pub mod live {
             )
         }
 
+        pub fn portfolio_margin_um_futures(
+            venue_id: VenueId,
+            account_id: AccountId,
+            base_url: impl Into<String>,
+            signing_policy: SigningPolicy,
+        ) -> VenueExecResult<Self> {
+            let mut config = Self::new(
+                BinanceExecMarket::UsdmFutures,
+                venue_id,
+                account_id,
+                base_url,
+                DEFAULT_BINANCE_RECV_WINDOW_MS,
+                signing_policy,
+            )?;
+            config.usdm_account_mode = BinanceUsdmAccountMode::PortfolioMargin;
+            Ok(config)
+        }
+
         pub fn new(
             market: BinanceExecMarket,
             venue_id: VenueId,
@@ -3792,6 +3818,7 @@ pub mod live {
             validate_recv_window(recv_window_ms)?;
             Ok(Self {
                 market,
+                usdm_account_mode: BinanceUsdmAccountMode::UsdmFutures,
                 venue_id,
                 account_id,
                 base_url: normalize_base_url(base_url.into())?,
@@ -3834,6 +3861,31 @@ pub mod live {
 
         pub fn market(&self) -> BinanceExecMarket {
             self.market
+        }
+
+        pub fn usdm_account_mode(&self) -> BinanceUsdmAccountMode {
+            self.usdm_account_mode
+        }
+
+        fn order_endpoint(&self) -> &'static str {
+            match (self.market, self.usdm_account_mode) {
+                (BinanceExecMarket::Spot, _) => BINANCE_SPOT_ORDER_ENDPOINT,
+                (BinanceExecMarket::UsdmFutures, BinanceUsdmAccountMode::UsdmFutures) => {
+                    BINANCE_USDM_ORDER_ENDPOINT
+                }
+                (BinanceExecMarket::UsdmFutures, BinanceUsdmAccountMode::PortfolioMargin) => {
+                    BINANCE_PORTFOLIO_MARGIN_UM_ORDER_ENDPOINT
+                }
+            }
+        }
+
+        fn leverage_endpoint(&self) -> &'static str {
+            match self.usdm_account_mode {
+                BinanceUsdmAccountMode::UsdmFutures => BINANCE_USDM_LEVERAGE_ENDPOINT,
+                BinanceUsdmAccountMode::PortfolioMargin => {
+                    BINANCE_PORTFOLIO_MARGIN_UM_LEVERAGE_ENDPOINT
+                }
+            }
         }
 
         pub fn venue_id(&self) -> &VenueId {
@@ -4430,10 +4482,10 @@ pub mod live {
             let signed = self.sign(SigningPurpose::SubmitOrder, &action_id, params)?;
             let response = self.dispatch_signed(
                 BinanceExecHttpMethod::Post,
-                self.config.market.order_endpoint(),
+                self.config.order_endpoint(),
                 &signed,
             )?;
-            self.ensure_success(self.config.market.order_endpoint(), &response)?;
+            self.ensure_success(self.config.order_endpoint(), &response)?;
 
             let known_order = known_order_from_response(
                 self.config.market,
@@ -4483,10 +4535,10 @@ pub mod live {
             let signed = self.sign(SigningPurpose::CancelOrder, &action_id, params)?;
             let response = self.dispatch_signed(
                 BinanceExecHttpMethod::Delete,
-                self.config.market.order_endpoint(),
+                self.config.order_endpoint(),
                 &signed,
             )?;
-            self.ensure_success(self.config.market.order_endpoint(), &response)?;
+            self.ensure_success(self.config.order_endpoint(), &response)?;
 
             let receipt = MutableActionReceipt {
                 action_id: action_id.clone(),
@@ -4516,10 +4568,10 @@ pub mod live {
                 self.sign_with_request_id(SigningPurpose::QueryOrder, signing_request_id, params)?;
             let response = self.dispatch_signed(
                 BinanceExecHttpMethod::Get,
-                self.config.market.order_endpoint(),
+                self.config.order_endpoint(),
                 &signed,
             )?;
-            self.ensure_success(self.config.market.order_endpoint(), &response)?;
+            self.ensure_success(self.config.order_endpoint(), &response)?;
             parse_binance_order_query_confirmation(
                 private_market_from_exec_market(self.config.market),
                 self.config.venue_id.clone(),
@@ -4546,10 +4598,10 @@ pub mod live {
                 self.sign_with_request_id(SigningPurpose::SubmitOrder, signing_request_id, params)?;
             let response = self.dispatch_signed(
                 BinanceExecHttpMethod::Post,
-                BINANCE_USDM_LEVERAGE_ENDPOINT,
+                self.config.leverage_endpoint(),
                 &signed,
             )?;
-            self.ensure_success(BINANCE_USDM_LEVERAGE_ENDPOINT, &response)
+            self.ensure_success(self.config.leverage_endpoint(), &response)
         }
 
         fn duplicate_receipt(
@@ -6061,6 +6113,9 @@ pub mod live {
         }
         if request.reduce_only {
             params.push(aster_param("reduceOnly", "true")?);
+        }
+        if let Some(position_side) = request.position_side {
+            params.push(aster_param("positionSide", position_side.as_str())?);
         }
         if let Some(client_order_id) = &request.client_order_id {
             validate_aster_client_order_id(client_order_id.as_str())?;
@@ -10318,7 +10373,20 @@ pub mod live {
         let mut first = true;
         push_json_string_field(&mut body, &mut first, "instId", inst_id)?;
         push_json_string_field(&mut body, &mut first, "tdMode", config.td_mode())?;
-        if let Some(pos_side) = config.pos_side() {
+        if let Some(position_side) = request.position_side {
+            if config.market == OkxExecMarket::Spot {
+                return Err(VenueExecError::InvalidRequest {
+                    field: "position_side",
+                    reason: "OKX spot orders do not support position_side",
+                });
+            }
+            push_json_string_field(
+                &mut body,
+                &mut first,
+                "posSide",
+                okx_position_side(position_side),
+            )?;
+        } else if let Some(pos_side) = config.pos_side() {
             push_json_string_field(&mut body, &mut first, "posSide", pos_side)?;
         }
         push_json_string_field(&mut body, &mut first, "side", okx_side(request.side))?;
@@ -10602,6 +10670,14 @@ pub mod live {
         match side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
+        }
+    }
+
+    fn okx_position_side(position_side: super::PerpPositionSide) -> &'static str {
+        match position_side {
+            super::PerpPositionSide::Both => "net",
+            super::PerpPositionSide::Long => "long",
+            super::PerpPositionSide::Short => "short",
         }
     }
 
@@ -11822,7 +11898,8 @@ pub mod live {
             push_json_string_field(&mut body, &mut first, "marginCoin", config.margin_coin())?;
         }
         push_json_string_field(&mut body, &mut first, "side", bitget_side(request.side))?;
-        if let Some(trade_side) = config.trade_side() {
+        let trade_side = bitget_order_trade_side(config, request)?;
+        if let Some(trade_side) = trade_side.as_deref() {
             push_json_string_field(&mut body, &mut first, "tradeSide", trade_side)?;
         }
         match request.order_type {
@@ -11864,7 +11941,11 @@ pub mod live {
                 )?;
             }
         }
-        if request.reduce_only {
+        let one_way_usdt_futures = config.market == BitgetExecMarket::UsdtFutures
+            && trade_side.is_none()
+            && config.trade_side().is_none()
+            && request.position_side.is_none();
+        if request.reduce_only || one_way_usdt_futures {
             match config.market {
                 BitgetExecMarket::Spot => {
                     return Err(VenueExecError::InvalidRequest {
@@ -11873,7 +11954,12 @@ pub mod live {
                     });
                 }
                 BitgetExecMarket::UsdtFutures => {
-                    push_json_string_field(&mut body, &mut first, "reduceOnly", "YES")?;
+                    push_json_string_field(
+                        &mut body,
+                        &mut first,
+                        "reduceOnly",
+                        if request.reduce_only { "YES" } else { "NO" },
+                    )?;
                 }
             }
         }
@@ -11883,6 +11969,32 @@ pub mod live {
         }
         body.push('}');
         Ok(body)
+    }
+
+    fn bitget_order_trade_side(
+        config: &BitgetExecConfig,
+        request: &SubmitOrderRequest,
+    ) -> VenueExecResult<Option<String>> {
+        if let Some(trade_side) = config.trade_side() {
+            return Ok(Some(trade_side.to_owned()));
+        }
+        match (config.market, request.position_side) {
+            (BitgetExecMarket::Spot, Some(_)) => Err(VenueExecError::InvalidRequest {
+                field: "position_side",
+                reason: "Bitget spot orders do not support position_side",
+            }),
+            (BitgetExecMarket::Spot, None) | (BitgetExecMarket::UsdtFutures, None) => Ok(None),
+            (BitgetExecMarket::UsdtFutures, Some(super::PerpPositionSide::Both)) => {
+                Err(VenueExecError::InvalidRequest {
+                    field: "position_side",
+                    reason:
+                        "Bitget USDT-FUTURES hedge-mode orders require Long or Short position_side",
+                })
+            }
+            (BitgetExecMarket::UsdtFutures, Some(_)) => Ok(Some(
+                if request.reduce_only { "close" } else { "open" }.to_owned(),
+            )),
+        }
     }
 
     fn bitget_order_quantity(
@@ -13266,6 +13378,94 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn binance_portfolio_margin_um_adapter_uses_papi_endpoints() {
+        let client_order_id = OrderId::new("client:papi:um:1").unwrap();
+        let mut adapter = live::BinanceUsdmExecAdapter::new(
+            live::BinanceExecConfig::portfolio_margin_um_futures(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                "https://papi.binance.com",
+                binance_signing_policy("kms-policy/binance-papi-um-exec-unit"),
+            )
+            .unwrap()
+            .with_target_leverage(1)
+            .unwrap(),
+            binance_test_signer(1_700_000_000_555),
+            RecordingTransport::ok(
+                200,
+                r#"{"symbol":"BTCUSDT","orderId":994,"clientOrderId":"client:papi:um:1","status":"NEW","time":1700000000555}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(SubmitOrderRequest::new(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                instrument("inst:BINANCE:BTCUSDT:USDM-PERP"),
+                OrderSide::Sell,
+                MutableOrderType::Limit,
+                quantity("0.002").unwrap(),
+                Some(price("43200.00").unwrap()),
+                Some(client_order_id.clone()),
+                IdempotencyKey::new("idem:binance:papi:um:1").unwrap(),
+            ))
+            .expect("signed PAPI UM order dispatches");
+        adapter
+            .confirm_order_status(ConfirmOrderStatusRequest::new(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                instrument("inst:BINANCE:BTCUSDT:USDM-PERP"),
+                OrderReference::ClientOrderId(client_order_id.clone()),
+                "event:binance:papi:um:query:1",
+            ))
+            .expect("signed PAPI UM order query dispatches");
+        adapter
+            .cancel_order(CancelOrderRequest::new(
+                venue("venue:BINANCE-USDM"),
+                account("account:binance-usdm-unit"),
+                OrderReference::ClientOrderId(client_order_id),
+                IdempotencyKey::new("idem:binance:papi:um:cancel:1").unwrap(),
+            ))
+            .expect("signed PAPI UM cancel dispatches");
+
+        assert_eq!(adapter.transport().calls.len(), 4);
+        assert!(adapter
+            .transport()
+            .calls
+            .iter()
+            .all(|call| call.base_url == "https://papi.binance.com"));
+        assert_eq!(
+            adapter.transport().calls[0].endpoint,
+            live::BINANCE_PORTFOLIO_MARGIN_UM_LEVERAGE_ENDPOINT
+        );
+        assert!(adapter.transport().calls[0]
+            .signed_query
+            .contains("leverage=1"));
+        assert_eq!(
+            adapter.transport().calls[1].endpoint,
+            live::BINANCE_PORTFOLIO_MARGIN_UM_ORDER_ENDPOINT
+        );
+        assert_eq!(
+            adapter.transport().calls[2].method,
+            live::BinanceExecHttpMethod::Get
+        );
+        assert_eq!(
+            adapter.transport().calls[2].endpoint,
+            live::BINANCE_PORTFOLIO_MARGIN_UM_ORDER_ENDPOINT
+        );
+        assert_eq!(
+            adapter.transport().calls[3].method,
+            live::BinanceExecHttpMethod::Delete
+        );
+        assert_eq!(
+            adapter.transport().calls[3].endpoint,
+            live::BINANCE_PORTFOLIO_MARGIN_UM_ORDER_ENDPOINT
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_usdm_adapter_maps_explicit_position_side() {
         let mut adapter = live::BinanceUsdmExecAdapter::new(
             live::BinanceExecConfig::usdm_futures(
@@ -13455,17 +13655,20 @@ mod tests {
         .unwrap();
 
         let receipt = adapter
-            .submit_order(SubmitOrderRequest::new(
-                venue("venue:ASTER-USDT-FUTURES"),
-                account("account:aster-unit"),
-                instrument("inst:ASTER:BTCUSDT:USDT-FUTURES"),
-                OrderSide::Buy,
-                MutableOrderType::PostOnly,
-                quantity("0.001").unwrap(),
-                Some(price("43100.50").unwrap()),
-                Some(OrderId::new("asterUnit1").unwrap()),
-                IdempotencyKey::new("idem:aster:perp:submit:1").unwrap(),
-            ))
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:ASTER-USDT-FUTURES"),
+                    account("account:aster-unit"),
+                    instrument("inst:ASTER:BTCUSDT:USDT-FUTURES"),
+                    OrderSide::Buy,
+                    MutableOrderType::PostOnly,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("asterUnit1").unwrap()),
+                    IdempotencyKey::new("idem:aster:perp:submit:1").unwrap(),
+                )
+                .with_position_side(PerpPositionSide::Long),
+            )
             .expect("signed Aster order dispatches");
 
         assert_eq!(receipt.status, MutableActionStatus::Accepted);
@@ -13478,6 +13681,7 @@ mod tests {
         assert!(submit_call.signed_query.contains("timeInForce=GTX"));
         assert!(submit_call.signed_query.contains("quantity=0.001"));
         assert!(submit_call.signed_query.contains("price=43100.50"));
+        assert!(submit_call.signed_query.contains("positionSide=LONG"));
         assert!(submit_call
             .signed_query
             .contains("newClientOrderId=asterUnit1"));
@@ -14161,6 +14365,46 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn okx_swap_adapter_maps_explicit_position_side() {
+        let mut adapter = live::OkxSwapExecAdapter::new(
+            live::OkxExecConfig::swap(
+                venue("venue:OKX-SWAP"),
+                account("account:okx-unit"),
+                "https://www.okx.com",
+                okx_signing_policy("kms-policy/okx-swap-position-side-unit"),
+            )
+            .unwrap(),
+            okx_test_signer("2026-05-17T12:34:56.789Z"),
+            RecordingOkxTransport::ok(
+                200,
+                r#"{"code":"0","msg":"","data":[{"ordId":"612269865356378888","clOrdId":"rvoP5","sCode":"0","sMsg":""}]}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:OKX-SWAP"),
+                    account("account:okx-unit"),
+                    instrument("inst:OKX:BTC-USDT-SWAP:SWAP"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("0.001").unwrap(),
+                    Some(price("43100.50").unwrap()),
+                    Some(OrderId::new("rvoP5").unwrap()),
+                    IdempotencyKey::new("idem:okx:swap:position-side").unwrap(),
+                )
+                .with_position_side(PerpPositionSide::Long),
+            )
+            .expect("signed OKX order dispatches with posSide");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""posSide":"long""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn okx_swap_adapter_applies_inst_id_quantity_step() {
         let mut adapter = live::OkxSwapExecAdapter::new(
             live::OkxExecConfig::swap(
@@ -14476,6 +14720,49 @@ mod tests {
         assert!(call.body.contains(r#""size":"1869""#));
         assert!(!call.body.contains(r#""size":"1869.8588""#));
         assert!(!call.body.contains(r#""tradeSide":"#));
+        assert!(call.body.contains(r#""reduceOnly":"NO""#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bitget_usdt_futures_adapter_maps_position_side_to_hedge_trade_side() {
+        let mut adapter = live::BitgetUsdtFuturesExecAdapter::new(
+            live::BitgetExecConfig::usdt_futures(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-usdt-futures-submit-unit"),
+            )
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000000124,"data":{"orderId":"1234567893","clientOid":"bitgetHedge1"}}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BITGET-USDT-FUTURES"),
+                    account("account:bitget-unit"),
+                    instrument("inst:BITGET:CHIPUSDT:USDT-FUTURES"),
+                    OrderSide::Sell,
+                    MutableOrderType::Limit,
+                    quantity("10").unwrap(),
+                    Some(price("0.05348").unwrap()),
+                    Some(OrderId::new("bitgetHedge1").unwrap()),
+                    IdempotencyKey::new("idem:bitget:usdt-futures:hedge").unwrap(),
+                )
+                .with_position_side(PerpPositionSide::Short),
+            )
+            .expect("signed Bitget hedge-mode order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""side":"sell""#));
+        assert!(call.body.contains(r#""tradeSide":"open""#));
+        assert!(!call.body.contains(r#""reduceOnly":"NO""#));
     }
 
     #[cfg(feature = "live-exec")]
@@ -15495,6 +15782,7 @@ mod tests {
     struct RecordedBinanceCall {
         market: live::BinanceExecMarket,
         method: live::BinanceExecHttpMethod,
+        base_url: String,
         endpoint: &'static str,
         api_key_header_name: String,
         api_key_header_value: String,
@@ -15530,6 +15818,7 @@ mod tests {
             self.calls.push(RecordedBinanceCall {
                 market: request.market(),
                 method: request.method(),
+                base_url: request.base_url().to_owned(),
                 endpoint: request.endpoint(),
                 api_key_header_name: request.api_key_header_name().to_owned(),
                 api_key_header_value: request.api_key_header_value().to_owned(),

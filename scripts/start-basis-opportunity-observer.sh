@@ -50,10 +50,15 @@ usage() {
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00 # spot-perp-basis 总名义本金上限，单位 USDT。
   BASIS_OBSERVER_PERP_TARGET_LEVERAGE=1 # 所有永续交易所默认目标杠杆；实盘非 reduce-only 下单前会先设置该杠杆。
   BASIS_OBSERVER_BINANCE_USDM_LEVERAGE=1 # 可选覆盖 Binance USD-M 永续目标杠杆。
+  BASIS_OBSERVER_BINANCE_POSITION_MODE=hedge # Binance USD-M 持仓模式；默认 hedge（双向持仓），设为 one-way 可覆盖；留空且未传配置时才走只读接口查询。
   BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE=1 # 可选覆盖 Bybit linear 永续目标杠杆。
+  BASIS_OBSERVER_BYBIT_POSITION_MODE=hedge # Bybit linear 持仓模式；默认 hedge（双向持仓），设为 one-way 可覆盖；留空且未传配置时才走只读接口查询。
   BASIS_OBSERVER_OKX_SWAP_LEVERAGE=1 # 可选覆盖 OKX swap 永续目标杠杆。
+  BASIS_OBSERVER_OKX_POSITION_MODE=long-short # OKX swap 持仓模式；默认 long-short（双向持仓），设为 net 可覆盖；留空且未传配置时才走只读接口查询。
   BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE=1 # 可选覆盖 Bitget USDT-FUTURES 目标杠杆。
+  BASIS_OBSERVER_BITGET_POSITION_MODE=hedge # Bitget USDT-FUTURES 持仓模式；默认 hedge（双向持仓），设为 one-way 可覆盖；留空且未传配置时才走只读接口查询。
   BASIS_OBSERVER_ASTER_PERP_LEVERAGE=1 # 可选覆盖 Aster USDT perp 目标杠杆。
+  BASIS_OBSERVER_ASTER_POSITION_MODE=hedge # Aster USDT perp 持仓模式；默认 hedge（双向持仓），设为 one-way 可覆盖；留空且未传配置时才走只读接口查询。
   BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE=1 # 可选覆盖 Hyperliquid perp 目标杠杆。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES= # spot-perp-basis 最大循环次数；留空表示长期运行。
   BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻运行。
@@ -1126,9 +1131,29 @@ accepted_exit_marker_path() {
 
 funding_arb_resident_exit_is_accepted() {
   local summary_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json"
+  local events_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_events.jsonl"
+  local rejected_dispatch_had_no_order_effects=false
 
   [[ -s "${summary_path}" ]] || return 1
-  jq -e '
+  refresh_funding_arb_summary_position_counts "${summary_path}"
+  if [[ -s "${events_path}" ]] && jq -s -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+    ([.[] | select((.event_type // "") == "candidate_cycle")] | last) as $last
+    | ($last != null)
+    and (($last.mutable_execution_started // false) == true)
+    and (($last.dispatch_attempted // false) == true)
+    and (($last.dispatch_plan_built // false) == true)
+    and (((($last.submitted_receipt_count // $last.submitted_receipts // 0) | as_count) == 0))
+    and (((($last.private_confirmation_count // $last.private_confirmations // 0) | as_count) == 0))
+    and (($last.residual_risk // null) == null)
+  ' "${events_path}" >/dev/null 2>&1; then
+    rejected_dispatch_had_no_order_effects=true
+  fi
+  jq --argjson rejected_dispatch_had_no_order_effects "${rejected_dispatch_had_no_order_effects}" -e '
     def as_count:
       if type == "number" then .
       elif type == "string" then (tonumber? // 0)
@@ -1141,7 +1166,12 @@ funding_arb_resident_exit_is_accepted() {
       (.halt_reason // "") == "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
       or (
         ((.halt_reason // "") | startswith("max live entries reached: "))
-        and (((.closed_position_count // 0) | as_count) >= ((.live_entry_count // 0) | as_count))
+        and (((.open_position_count // 0) | as_count) == 0)
+        and (((.unknown_position_count // 0) | as_count) == 0)
+      )
+      or (
+        (.halt_reason // "") == "funding arb entry dispatch was rejected after mutable execution started; resident live stopped"
+        and $rejected_dispatch_had_no_order_effects
       )
     )
   ' "${summary_path}" >/dev/null 2>&1
@@ -2524,6 +2554,11 @@ nohup env \
   BASIS_OBSERVER_FUNDING_ARB_MODE="${FUNDING_ARB_MODE}" \
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER="${FUNDING_SETTLEMENT_LEDGER}" \
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT="${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" \
+  BASIS_OBSERVER_BINANCE_POSITION_MODE="${BASIS_OBSERVER_BINANCE_POSITION_MODE:-hedge}" \
+  BASIS_OBSERVER_BYBIT_POSITION_MODE="${BASIS_OBSERVER_BYBIT_POSITION_MODE:-hedge}" \
+  BASIS_OBSERVER_OKX_POSITION_MODE="${BASIS_OBSERVER_OKX_POSITION_MODE:-long-short}" \
+  BASIS_OBSERVER_BITGET_POSITION_MODE="${BASIS_OBSERVER_BITGET_POSITION_MODE:-hedge}" \
+  BASIS_OBSERVER_ASTER_POSITION_MODE="${BASIS_OBSERVER_ASTER_POSITION_MODE:-hedge}" \
   BASIS_OBSERVER_DYNAMIC_TARGET_WSS="${DYNAMIC_TARGET_WSS}" \
   BASIS_OBSERVER_TARGET_WSS_ROOT="${TARGET_WSS_ROOT}" \
   BASIS_OBSERVER_TARGET_WSS_BASE_PORT="${TARGET_WSS_BASE_PORT}" \

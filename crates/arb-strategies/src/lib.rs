@@ -2210,7 +2210,7 @@ pub fn evaluate_spot_perp_basis_signal(
         .spot_ask_size
         .as_deref()
         .map(|value| {
-            FixedDecimal::parse_non_negative("spot_ask_size", value).and_then(|size| {
+            FixedDecimal::parse_non_negative_depth("spot_ask_size", value).and_then(|size| {
                 spot_ask.checked_mul_decimal(size, "spot ask depth calculation overflowed")
             })
         })
@@ -2219,7 +2219,7 @@ pub fn evaluate_spot_perp_basis_signal(
         .perp_bid_size
         .as_deref()
         .map(|value| {
-            FixedDecimal::parse_non_negative("perp_bid_size", value).and_then(|size| {
+            FixedDecimal::parse_non_negative_depth("perp_bid_size", value).and_then(|size| {
                 perp_bid.checked_mul_decimal(size, "perp bid depth calculation overflowed")
             })
         })
@@ -2331,7 +2331,7 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         .as_deref()
         .ok_or_else(|| "long_ask_size is required for fail-closed liquidity checks".to_owned())
         .and_then(|value| {
-            FixedDecimal::parse_non_negative("long_ask_size", value).and_then(|size| {
+            FixedDecimal::parse_non_negative_depth("long_ask_size", value).and_then(|size| {
                 long_ask.checked_mul_decimal(size, "long ask depth calculation overflowed")
             })
         })?;
@@ -2340,7 +2340,7 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         .as_deref()
         .ok_or_else(|| "short_bid_size is required for fail-closed liquidity checks".to_owned())
         .and_then(|value| {
-            FixedDecimal::parse_non_negative("short_bid_size", value).and_then(|size| {
+            FixedDecimal::parse_non_negative_depth("short_bid_size", value).and_then(|size| {
                 short_bid.checked_mul_decimal(size, "short bid depth calculation overflowed")
             })
         })?;
@@ -2733,6 +2733,11 @@ impl FixedDecimal {
     fn parse_non_negative(field: &'static str, value: &str) -> Result<Self, String> {
         validate_market_decimal(field, value)?;
         Self::parse_decimal_body(field, value, false, false)
+    }
+
+    fn parse_non_negative_depth(field: &'static str, value: &str) -> Result<Self, String> {
+        validate_market_decimal(field, value)?;
+        Self::parse_decimal_body(field, value, false, true)
     }
 
     fn parse_signed_rate(field: &'static str, value: &str) -> Result<Self, String> {
@@ -3966,6 +3971,30 @@ mod tests {
     }
 
     #[test]
+    fn spot_perp_basis_signal_accepts_high_precision_depth_sizes() {
+        let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: "BTCUSDT".to_owned(),
+            spot_best_bid: "99.90".to_owned(),
+            spot_best_ask: "100.00".to_owned(),
+            spot_ask_size: Some("2.000000009".to_owned()),
+            perp_best_bid: "101.00".to_owned(),
+            perp_best_ask: "101.10".to_owned(),
+            perp_bid_size: Some("1.500000009".to_owned()),
+            last_funding_rate: "0.00010000".to_owned(),
+            notional_usd: "100.00".to_owned(),
+            spot_taker_fee_bps: 10,
+            perp_taker_fee_bps: 5,
+            slippage_buffer_bps: 5,
+            min_net_bps: 5,
+        })
+        .expect("high precision depth sizes are truncated conservatively");
+
+        assert!(signal.is_candidate);
+        assert_eq!(signal.spot_ask_depth_usd.as_deref(), Some("200"));
+        assert_eq!(signal.perp_bid_depth_usd.as_deref(), Some("151.5"));
+    }
+
+    #[test]
     fn spot_perp_basis_signal_rejects_insufficient_top_of_book_depth() {
         let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
             symbol: "BTCUSDT".to_owned(),
@@ -4009,6 +4038,32 @@ mod tests {
         assert_eq!(signal.long_ask_depth_usd.as_deref(), Some("200"));
         assert_eq!(signal.short_bid_depth_usd.as_deref(), Some("200.1"));
         assert_eq!(signal.quantity, "1");
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_accepts_high_precision_depth_sizes() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.long_ask_size = Some("2.000000009".to_owned());
+        input.short_bid_size = Some("2.001000009".to_owned());
+
+        let signal = evaluate_cross_exchange_funding_arb_signal(&input)
+            .expect("high precision depth sizes are truncated conservatively");
+
+        assert!(signal.is_candidate);
+        assert_eq!(signal.long_ask_depth_usd.as_deref(), Some("200"));
+        assert_eq!(signal.short_bid_depth_usd.as_deref(), Some("200.20005"));
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_keeps_price_precision_strict() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.long_best_ask = "100.000000001".to_owned();
+
+        let error =
+            evaluate_cross_exchange_funding_arb_signal(&input).expect_err("price stays strict");
+
+        assert!(error.contains("long_best_ask"));
+        assert!(error.contains("exceeds 8 fractional digits"));
     }
 
     #[test]
