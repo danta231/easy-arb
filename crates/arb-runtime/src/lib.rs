@@ -70,8 +70,9 @@ use arb_risk::{RiskEvaluationInput, RiskEvaluator, StaticRiskEvaluator};
 use arb_strategies::{
     evaluate_cross_exchange_funding_arb_signal, evaluate_spot_perp_basis_signal,
     sample_spot_strategy, CrossExchangeFundingArbSignalInput, CrossExchangeFundingArbStrategy,
-    CrossExchangeFundingArbStrategyConfig, CrossExchangeFundingLegConfig, SpotPerpBasisSignal,
-    SpotPerpBasisSignalInput, SpotPerpBasisStrategy, SpotPerpBasisStrategyConfig,
+    CrossExchangeFundingArbStrategyConfig, CrossExchangeFundingLegConfig, SignalDepthLevel,
+    SpotPerpBasisSignal, SpotPerpBasisSignalInput, SpotPerpBasisStrategy,
+    SpotPerpBasisStrategyConfig,
 };
 #[cfg(feature = "live-exec")]
 use arb_strategies::{
@@ -365,6 +366,8 @@ const PORTFOLIO_PRIVATE_READONLY_SNAPSHOT_DEFAULT_INTERVAL_SECS: u64 = 60;
 const FUNDING_ARB_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/funding-arb-resident-live";
 const FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS: i128 = 150;
 const FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS: i128 = 5;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_EMERGENCY_DE_RISK_SLIPPAGE_BPS: i128 = 100;
 const BASIS_AUTO_PRICE_GUARD_MAX_BPS: i128 = 100;
 const PORTFOLIO_DASHBOARD_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8805";
 #[cfg(feature = "live-exec")]
@@ -2885,6 +2888,7 @@ pub struct FundingArbResidentLiveOptions {
     pub min_net_funding_bps: i128,
     pub execute_live: bool,
     pub acknowledge_funding_arb_live_orders: bool,
+    pub allow_unknown_recovery: bool,
     pub hyperliquid_user: Option<String>,
     pub hyperliquid_source: String,
     pub hyperliquid_vault_address: Option<String>,
@@ -3074,10 +3078,14 @@ pub struct BinanceBasisMarketRow {
     pub spot_ask: Option<String>,
     pub spot_bid_qty: Option<String>,
     pub spot_ask_qty: Option<String>,
+    pub spot_bid_depth: Vec<SignalDepthLevel>,
+    pub spot_ask_depth: Vec<SignalDepthLevel>,
     pub perp_bid: Option<String>,
     pub perp_ask: Option<String>,
     pub perp_bid_qty: Option<String>,
     pub perp_ask_qty: Option<String>,
+    pub perp_bid_depth: Vec<SignalDepthLevel>,
+    pub perp_ask_depth: Vec<SignalDepthLevel>,
     pub mark_price: String,
     pub index_price: String,
     pub last_funding_rate: String,
@@ -4964,11 +4972,36 @@ fn runtime_binance_execution_signing_provider(
 }
 
 #[cfg(feature = "live-exec")]
-fn binance_server_time_endpoint_for_private_endpoint(endpoint: &str) -> &'static str {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BinanceServerTimeSource<'a> {
+    base_url: &'a str,
+    time_endpoint: &'static str,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BinancePrivateTimestampSource<'a> {
+    ServerTime(BinanceServerTimeSource<'a>),
+    SystemTime,
+}
+
+#[cfg(feature = "live-exec")]
+fn binance_private_timestamp_source_for_private_endpoint<'a>(
+    base_url: &'a str,
+    endpoint: &str,
+) -> BinancePrivateTimestampSource<'a> {
     if endpoint.starts_with("/api/") {
-        "/api/v3/time"
+        BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
+            base_url,
+            time_endpoint: "/api/v3/time",
+        })
+    } else if endpoint.starts_with("/papi/") && base_url == BINANCE_PORTFOLIO_MARGIN_BASE_URL {
+        BinancePrivateTimestampSource::SystemTime
     } else {
-        "/fapi/v1/time"
+        BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
+            base_url,
+            time_endpoint: "/fapi/v1/time",
+        })
     }
 }
 
@@ -5072,42 +5105,35 @@ fn sign_and_fetch_binance_private_get_with_retry(
     account_id: &str,
     params: Vec<BinanceRequestParam>,
 ) -> RuntimeResult<String> {
-    let time_endpoint = binance_server_time_endpoint_for_private_endpoint(endpoint);
-    let signer = runtime_binance_signing_provider(base_url, time_endpoint)?;
-    sign_and_fetch_binance_private_get_with_signer_retry(
-        &signer,
-        base_url,
-        endpoint,
-        request_id_base,
-        signing_policy,
-        venue_id,
-        account_id,
-        params,
-    )
-}
-
-#[cfg(feature = "live-exec")]
-#[allow(clippy::too_many_arguments)]
-fn sign_and_fetch_binance_private_get_with_system_time_retry(
-    base_url: &str,
-    endpoint: &str,
-    request_id_base: &str,
-    signing_policy: &SigningPolicy,
-    venue_id: &str,
-    account_id: &str,
-    params: Vec<BinanceRequestParam>,
-) -> RuntimeResult<String> {
-    let signer = runtime_binance_system_time_signing_provider()?;
-    sign_and_fetch_binance_private_get_with_signer_retry(
-        &signer,
-        base_url,
-        endpoint,
-        request_id_base,
-        signing_policy,
-        venue_id,
-        account_id,
-        params,
-    )
+    match binance_private_timestamp_source_for_private_endpoint(base_url, endpoint) {
+        BinancePrivateTimestampSource::ServerTime(time_source) => {
+            let signer =
+                runtime_binance_signing_provider(time_source.base_url, time_source.time_endpoint)?;
+            sign_and_fetch_binance_private_get_with_signer_retry(
+                &signer,
+                base_url,
+                endpoint,
+                request_id_base,
+                signing_policy,
+                venue_id,
+                account_id,
+                params,
+            )
+        }
+        BinancePrivateTimestampSource::SystemTime => {
+            let signer = runtime_binance_system_time_signing_provider()?;
+            sign_and_fetch_binance_private_get_with_signer_retry(
+                &signer,
+                base_url,
+                endpoint,
+                request_id_base,
+                signing_policy,
+                venue_id,
+                account_id,
+                params,
+            )
+        }
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -5365,7 +5391,7 @@ fn fetch_binance_portfolio_margin_funding_private_readonly_snapshots(
         None => cached_funding_arb_mode_preflight_json(
             format!("binance:papi-um-position-mode:{venue_id}:{account_id}"),
             || {
-                sign_and_fetch_binance_private_get_with_system_time_retry(
+                sign_and_fetch_binance_private_get_with_retry(
                     BINANCE_PORTFOLIO_MARGIN_BASE_URL,
                     "/papi/v1/um/positionSide/dual",
                     "signing-request/funding-arb-readonly/binance-papi/um-position-mode",
@@ -5380,7 +5406,7 @@ fn fetch_binance_portfolio_margin_funding_private_readonly_snapshots(
             },
         )?,
     };
-    let account_payload_json = sign_and_fetch_binance_private_get_with_system_time_retry(
+    let account_payload_json = sign_and_fetch_binance_private_get_with_retry(
         BINANCE_PORTFOLIO_MARGIN_BASE_URL,
         "/papi/v1/account",
         &format!("signing-request/funding-arb-readonly/binance-papi/account/{symbol}"),
@@ -5392,7 +5418,7 @@ fn fetch_binance_portfolio_margin_funding_private_readonly_snapshots(
             recv_window_ms.to_string(),
         )?],
     )?;
-    let position_payload_json = sign_and_fetch_binance_private_get_with_system_time_retry(
+    let position_payload_json = sign_and_fetch_binance_private_get_with_retry(
         BINANCE_PORTFOLIO_MARGIN_BASE_URL,
         "/papi/v1/um/positionRisk",
         "signing-request/funding-arb-readonly/binance-papi/um-positions-all",
@@ -5409,7 +5435,7 @@ fn fetch_binance_portfolio_margin_funding_private_readonly_snapshots(
         &position_payload_json,
     );
     let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
-    let settlement_payload_json = sign_and_fetch_binance_private_get_with_system_time_retry(
+    let settlement_payload_json = sign_and_fetch_binance_private_get_with_retry(
         BINANCE_PORTFOLIO_MARGIN_BASE_URL,
         "/papi/v1/um/income",
         &format!("signing-request/funding-arb-readonly/binance-papi/um-settlement/{symbol}"),
@@ -8828,6 +8854,13 @@ fn portfolio_apply_terminal_resident_position_overrides(
 ) {
     let mut replacements = Vec::new();
     for terminal_row in terminal_rows {
+        if rows.iter().any(|row| {
+            portfolio_position_row_matches_terminal_resident(row, terminal_row)
+                && row.source == "position-raw-snapshot"
+                && !portfolio_position_row_is_flat(row)
+        }) {
+            continue;
+        }
         let before = rows.len();
         rows.retain(|row| !portfolio_position_row_matches_terminal_resident(row, terminal_row));
         if rows.len() != before {
@@ -8835,6 +8868,12 @@ fn portfolio_apply_terminal_resident_position_overrides(
         }
     }
     rows.extend(replacements);
+}
+
+fn portfolio_position_row_is_flat(row: &PortfolioPositionRow) -> bool {
+    MonitorDecimal::parse("portfolio.position_quantity", &row.position_quantity)
+        .is_ok_and(|quantity| quantity.raw == 0)
+        || row.position_status == "flat"
 }
 
 fn portfolio_position_row_matches_terminal_resident(
@@ -11983,6 +12022,7 @@ fn resident_entry_cycle_error_can_retry(error: &RuntimeError) -> bool {
             message.starts_with("Public WSS monitor ")
                 || message.starts_with("public market data GET failed")
                 || message.starts_with("public market data POST failed")
+                || message.starts_with("OKX returned code=50011")
                 || message == "top-of-book prices must be greater than zero"
         }
         _ => false,
@@ -14438,13 +14478,13 @@ fn public_wss_quote_to_monitor_book_ticker_row(
         expected_instrument_id,
         fetched_at,
     )?;
-    Ok(MonitorBookTickerRow {
-        symbol: quote.symbol.clone(),
-        bid_price: required_quote_field(&quote.best_bid, monitor_ref, "best_bid")?.to_owned(),
-        bid_qty: required_quote_field(&quote.bid_size, monitor_ref, "bid_size")?.to_owned(),
-        ask_price: required_quote_field(&quote.best_ask, monitor_ref, "best_ask")?.to_owned(),
-        ask_qty: required_quote_field(&quote.ask_size, monitor_ref, "ask_size")?.to_owned(),
-    })
+    Ok(monitor_book_ticker_row_with_top_depth(
+        quote.symbol.clone(),
+        required_quote_field(&quote.best_bid, monitor_ref, "best_bid")?.to_owned(),
+        required_quote_field(&quote.bid_size, monitor_ref, "bid_size")?.to_owned(),
+        required_quote_field(&quote.best_ask, monitor_ref, "best_ask")?.to_owned(),
+        required_quote_field(&quote.ask_size, monitor_ref, "ask_size")?.to_owned(),
+    ))
 }
 
 #[cfg(feature = "live-exec")]
@@ -16757,9 +16797,14 @@ impl<'a> BasisLiveDispatchContext<'a> {
             private_order_events: self.private_order_events,
             market,
             order_query_event_prefix: self.order_query_event_prefix,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            price_tick_resolver: funding_arb_price_tick_for_venue,
         }
     }
 }
+
+#[cfg(feature = "live-exec")]
+type FundingArbPriceTickResolver = fn(&str, &str) -> RuntimeResult<Option<(Price, &'static str)>>;
 
 #[cfg(feature = "live-exec")]
 #[derive(Clone, Copy)]
@@ -16768,6 +16813,8 @@ struct BasisOrderConfirmContext<'a> {
     private_order_events: Option<&'a PrivateOrderEventStore>,
     market: PrivateOrderMarket,
     order_query_event_prefix: &'a str,
+    slippage_buffer_bps: i128,
+    price_tick_resolver: FundingArbPriceTickResolver,
 }
 
 #[cfg(feature = "live-exec")]
@@ -16778,6 +16825,8 @@ struct FundingLiveCanaryContext<'a> {
     protection_suffix: &'a str,
     private_order_events: Option<&'a PrivateOrderEventStore>,
     order_query_event_prefix: &'a str,
+    slippage_buffer_bps: i128,
+    price_tick_resolver: FundingArbPriceTickResolver,
 }
 
 #[cfg(feature = "live-exec")]
@@ -16788,6 +16837,8 @@ impl<'a> FundingLiveCanaryContext<'a> {
             private_order_events: self.private_order_events,
             market,
             order_query_event_prefix: self.order_query_event_prefix,
+            slippage_buffer_bps: self.slippage_buffer_bps,
+            price_tick_resolver: self.price_tick_resolver,
         }
     }
 }
@@ -17232,6 +17283,32 @@ fn execute_funding_arb_live_canary(
         build_funding_perp_live_adapter(first, options, signing_policy)?;
     let (mut second_adapter, second_market) =
         build_funding_perp_live_adapter(second, options, signing_policy)?;
+    execute_funding_arb_live_canary_dispatch(
+        dispatch_plan,
+        &mut first_adapter,
+        &mut second_adapter,
+        first_market,
+        second_market,
+        context,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn execute_funding_arb_live_canary_dispatch<F, S>(
+    dispatch_plan: &ExecutionDispatchPlan,
+    first_adapter: &mut F,
+    second_adapter: &mut S,
+    first_market: PrivateOrderMarket,
+    second_market: PrivateOrderMarket,
+    context: FundingLiveCanaryContext<'_>,
+) -> RuntimeResult<BasisLiveExecutionOutcome>
+where
+    F: SubmitOrder + CancelOrder + ConfirmOrderStatus,
+    S: SubmitOrder + CancelOrder + ConfirmOrderStatus,
+{
+    let planned_legs = funding_planned_legs(dispatch_plan)?;
+    let first = planned_legs[0];
+    let second = planned_legs[1];
     let first_context = context.order_context(first_market);
     let second_context = context.order_context(second_market);
     let mut outcome = BasisLiveExecutionOutcome::default();
@@ -17245,7 +17322,7 @@ fn execute_funding_arb_live_canary(
             }
             outcome.receipts.push(receipt.clone());
             let update = match confirm_planned_receipt_with_private_stream_or_order_query(
-                &mut first_adapter,
+                first_adapter,
                 first,
                 &receipt,
                 "first-perp-after-submit",
@@ -17265,7 +17342,7 @@ fn execute_funding_arb_live_canary(
                         "first funding perp leg was accepted but private confirmation failed; second leg skipped: {error}"
                     ));
                     let _ = attempt_cancel_live_order(
-                        &mut first_adapter,
+                        first_adapter,
                         first,
                         &receipt,
                         "first-confirmation-failed",
@@ -17288,7 +17365,7 @@ fn execute_funding_arb_live_canary(
                 return Ok(outcome);
             }
             let update = match confirm_unknown_submit_with_client_order_id(
-                &mut first_adapter,
+                first_adapter,
                 first,
                 "first-perp-submit-unknown",
                 first_context,
@@ -17327,7 +17404,7 @@ fn execute_funding_arb_live_canary(
                     .to_owned(),
             );
             let _ = attempt_cancel_live_order_ref(
-                &mut first_adapter,
+                first_adapter,
                 first,
                 first_order_ref.clone(),
                 "first-partial-fill",
@@ -17338,14 +17415,15 @@ fn execute_funding_arb_live_canary(
                 .cumulative_filled_quantity
                 .filter(|quantity| quantity_is_positive(*quantity))
             {
-                attempt_funding_reduce_only_unwind(
-                    &mut first_adapter,
+                let unwind_filled = attempt_funding_reduce_only_unwind(
+                    first_adapter,
                     first,
                     quantity,
                     "first-partial-fill",
                     first_context,
                     &mut outcome,
                 )?;
+                mark_flat_after_successful_funding_unwind(&mut outcome, unwind_filled);
             }
             return Ok(outcome);
         }
@@ -17355,7 +17433,7 @@ fn execute_funding_arb_live_canary(
                     .to_owned(),
             );
             let cancel_update = attempt_cancel_live_order_ref(
-                &mut first_adapter,
+                first_adapter,
                 first,
                 first_order_ref.clone(),
                 "first-not-filled",
@@ -17364,7 +17442,7 @@ fn execute_funding_arb_live_canary(
             )?;
             if let Some(cancel_update) = cancel_update.as_ref() {
                 handle_first_funding_perp_cancel_update_after_ack(
-                    &mut first_adapter,
+                    first_adapter,
                     first,
                     cancel_update,
                     first_context,
@@ -17377,7 +17455,7 @@ fn execute_funding_arb_live_canary(
         | OrderConfirmationStatus::Rejected
         | OrderConfirmationStatus::Expired => {
             handle_first_funding_perp_terminal_update(
-                &mut first_adapter,
+                first_adapter,
                 first,
                 &first_update,
                 first_context,
@@ -17391,7 +17469,7 @@ fn execute_funding_arb_live_canary(
                     .to_owned(),
             );
             let _ = attempt_cancel_live_order_ref(
-                &mut first_adapter,
+                first_adapter,
                 first,
                 first_order_ref,
                 "first-unknown",
@@ -17427,21 +17505,22 @@ fn execute_funding_arb_live_canary(
                     "second funding perp submit result is unknown after first fill; automatic unwind is suppressed to avoid flipping exposure",
                 );
             } else {
-                attempt_funding_reduce_only_unwind(
-                    &mut first_adapter,
+                let unwind_filled = attempt_funding_reduce_only_unwind(
+                    first_adapter,
                     first,
                     first_filled_quantity,
                     "second-submit-failed",
                     first_context,
                     &mut outcome,
                 )?;
+                mark_flat_after_successful_funding_unwind(&mut outcome, unwind_filled);
             }
             return Ok(outcome);
         }
     };
 
     let second_update = match confirm_planned_receipt_with_private_stream_or_order_query(
-        &mut second_adapter,
+        second_adapter,
         second,
         &second_receipt,
         "second-perp-after-submit",
@@ -17486,7 +17565,7 @@ fn execute_funding_arb_live_canary(
                     .to_owned(),
             );
             let _ = attempt_cancel_live_order(
-                &mut second_adapter,
+                second_adapter,
                 second,
                 &second_receipt,
                 "second-partial-fill",
@@ -17503,21 +17582,22 @@ fn execute_funding_arb_live_canary(
                     .to_owned(),
             );
             let _ = attempt_cancel_live_order(
-                &mut second_adapter,
+                second_adapter,
                 second,
                 &second_receipt,
                 "second-not-filled",
                 second_context,
                 &mut outcome,
             )?;
-            attempt_funding_reduce_only_unwind(
-                &mut first_adapter,
+            let unwind_filled = attempt_funding_reduce_only_unwind(
+                first_adapter,
                 first,
                 first_filled_quantity,
                 "second-not-filled",
                 first_context,
                 &mut outcome,
             )?;
+            mark_flat_after_successful_funding_unwind(&mut outcome, unwind_filled);
         }
         OrderConfirmationStatus::Cancelled
         | OrderConfirmationStatus::Rejected
@@ -17526,14 +17606,15 @@ fn execute_funding_arb_live_canary(
                 "second funding perp leg reached terminal non-filled status `{}`; unwinding first leg",
                 second_update.status.as_str()
             ));
-            attempt_funding_reduce_only_unwind(
-                &mut first_adapter,
+            let unwind_filled = attempt_funding_reduce_only_unwind(
+                first_adapter,
                 first,
                 first_filled_quantity,
                 "second-terminal-unfilled",
                 first_context,
                 &mut outcome,
             )?;
+            mark_flat_after_successful_funding_unwind(&mut outcome, unwind_filled);
         }
         OrderConfirmationStatus::Unknown => {
             outcome.blocking_reasons.push(
@@ -17676,10 +17757,18 @@ where
     };
     let unwind_filled =
         attempt_funding_reduce_only_unwind(adapter, first, quantity, reason, context, outcome)?;
+    mark_flat_after_successful_funding_unwind(outcome, unwind_filled);
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn mark_flat_after_successful_funding_unwind(
+    outcome: &mut BasisLiveExecutionOutcome,
+    unwind_filled: bool,
+) {
     if unwind_filled && outcome.protection.residual_risk.is_none() {
         outcome.flat_after_cancel = true;
     }
-    Ok(())
 }
 
 #[cfg(feature = "live-exec")]
@@ -17697,6 +17786,20 @@ fn align_funding_arb_dispatch_plan_quantities(
 #[cfg(feature = "live-exec")]
 fn apply_funding_arb_entry_time_in_force_ioc(
     dispatch_plan: &mut ExecutionDispatchPlan,
+    slippage_buffer_bps: i128,
+) -> RuntimeResult<()> {
+    apply_funding_arb_entry_time_in_force_ioc_with_price_tick_resolver(
+        dispatch_plan,
+        slippage_buffer_bps,
+        funding_arb_price_tick_for_venue,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn apply_funding_arb_entry_time_in_force_ioc_with_price_tick_resolver(
+    dispatch_plan: &mut ExecutionDispatchPlan,
+    slippage_buffer_bps: i128,
+    price_tick_resolver: FundingArbPriceTickResolver,
 ) -> RuntimeResult<()> {
     funding_planned_legs(dispatch_plan)?;
     for planned in &mut dispatch_plan.requests {
@@ -17709,10 +17812,32 @@ fn apply_funding_arb_entry_time_in_force_ioc(
                 ),
             });
         }
+        let Some(limit_price) = planned.request.limit_price else {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "funding arb entry request `{}` must have a protective limit price before IOC enforcement",
+                    planned.plan_leg_id
+                ),
+            });
+        };
+        let protected_limit_price = funding_arb_ioc_limit_price_with_slippage(
+            &limit_price.to_string(),
+            planned.request.side,
+            slippage_buffer_bps,
+            "funding arb entry limit price",
+        )?;
+        let protected_limit_price = funding_arb_quantize_limit_price_for_venue_with_resolver(
+            planned.request.venue_id.as_str(),
+            planned.request.instrument_id.as_str(),
+            protected_limit_price,
+            planned.request.side,
+            price_tick_resolver,
+        )?;
         planned.request = planned
             .request
             .clone()
             .with_time_in_force(MutableTimeInForce::Ioc);
+        planned.request.limit_price = Some(protected_limit_price);
     }
     Ok(())
 }
@@ -19182,13 +19307,29 @@ fn attempt_funding_reduce_only_unwind<A>(
 where
     A: SubmitOrder + ConfirmOrderStatus,
 {
-    let Some(limit_price) = planned.request.limit_price else {
+    let Some(entry_limit_price) = planned.request.limit_price else {
         outcome.protection.record_residual_risk(format!(
             "funding unwind for `{}` lacks a protective limit price",
             planned.plan_leg_id
         ));
         return Ok(false);
     };
+    let close_side = opposite_order_side(planned.request.side);
+    let unwind_slippage_buffer_bps =
+        funding_arb_exit_emergency_de_risk_slippage_bps(context.slippage_buffer_bps);
+    let limit_price = funding_arb_ioc_limit_price_with_slippage(
+        &entry_limit_price.to_string(),
+        close_side,
+        unwind_slippage_buffer_bps,
+        "funding arb protection unwind price",
+    )?;
+    let limit_price = funding_arb_quantize_limit_price_for_venue_with_resolver(
+        planned.request.venue_id.as_str(),
+        planned.request.instrument_id.as_str(),
+        limit_price,
+        close_side,
+        context.price_tick_resolver,
+    )?;
     outcome.protection.record_action(format!(
         "funding_reduce_only_unwind:{reason}:{}",
         planned.plan_leg_id
@@ -19197,7 +19338,7 @@ where
         planned.request.venue_id.clone(),
         planned.request.account_id.clone(),
         planned.request.instrument_id.clone(),
-        opposite_order_side(planned.request.side),
+        close_side,
         MutableOrderType::Limit,
         quantity,
         Some(limit_price),
@@ -19208,10 +19349,15 @@ where
             context.protection_suffix
         ))?,
     )
-    .with_time_in_force(MutableTimeInForce::Ioc)
-    .with_reduce_only(true);
+    .with_time_in_force(MutableTimeInForce::Ioc);
     if let Some(position_side) = planned.request.position_side {
         unwind_request = unwind_request.with_position_side(position_side);
+    }
+    if funding_arb_close_request_should_send_reduce_only(
+        unwind_request.venue_id.as_str(),
+        unwind_request.position_side,
+    ) {
+        unwind_request = unwind_request.with_reduce_only(true);
     }
     let unwind_plan = PlannedSubmitOrder {
         plan_leg_id: format!("{}:funding-protection-unwind", planned.plan_leg_id),
@@ -20904,27 +21050,15 @@ fn fetch_binance_usdm_private_position_snapshot(
         BinanceRequestParam::new("symbol", state.symbol.clone())?,
         BinanceRequestParam::new("recvWindow", recv_window_ms.to_string())?,
     ];
-    let raw_json = if mode == BinancePrivateAccountMode::PortfolioMargin {
-        sign_and_fetch_binance_private_get_with_system_time_retry(
-            base_url,
-            endpoint,
-            &request_id,
-            signing_policy,
-            &state.perp_venue_id,
-            &state.perp_account_id,
-            params,
-        )?
-    } else {
-        sign_and_fetch_binance_private_get_with_retry(
-            base_url,
-            endpoint,
-            &request_id,
-            signing_policy,
-            &state.perp_venue_id,
-            &state.perp_account_id,
-            params,
-        )?
-    };
+    let raw_json = sign_and_fetch_binance_private_get_with_retry(
+        base_url,
+        endpoint,
+        &request_id,
+        signing_policy,
+        &state.perp_venue_id,
+        &state.perp_account_id,
+        params,
+    )?;
     let mut adapter = BinancePrivateAccountAdapter::new(
         VenueId::new(&state.perp_venue_id)?,
         AccountId::new(&state.perp_account_id)?,
@@ -21230,6 +21364,8 @@ where
         private_order_events: None,
         market: perp_market,
         order_query_event_prefix,
+        slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+        price_tick_resolver: funding_arb_price_tick_for_venue,
     };
     if let Some(perp_quantity) = reconciled
         .perp_close_quantity
@@ -21308,6 +21444,8 @@ where
         private_order_events: None,
         market: spot_market,
         order_query_event_prefix,
+        slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+        price_tick_resolver: funding_arb_price_tick_for_venue,
     };
     let spot_close = basis_exit_close_planned_order(
         state,
@@ -22951,6 +23089,8 @@ fn bootstrap_bybit_wss_book_ticker_all_market(
                 bid_qty: row.bid_qty,
                 ask_price: row.ask_price,
                 ask_qty: row.ask_qty,
+                bid_depth: row.bid_depth,
+                ask_depth: row.ask_depth,
             })
             .collect(),
     };
@@ -23111,6 +23251,8 @@ fn bootstrap_bitget_wss_book_ticker(
                     bid_qty: row.bid_qty,
                     ask_price: row.ask_price,
                     ask_qty: row.ask_qty,
+                    bid_depth: row.bid_depth,
+                    ask_depth: row.ask_depth,
                 })
                 .collect::<Vec<_>>()
         }
@@ -24947,14 +25089,57 @@ fn fetch_binance_basis_monitor_snapshot(
     let spot_json = fetch_public_json_with_curl(&binance_spot_book_ticker_all_url())?;
     let perp_json = fetch_public_json_with_curl(&binance_usdm_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&binance_usdm_premium_index_all_url())?;
-    build_binance_basis_monitor_snapshot_from_json(&spot_json, &perp_json, &premium_json, options)
+    let depth_symbols =
+        binance_basis_monitor_depth_symbols(&spot_json, &perp_json, &premium_json, options)?;
+    let spot_depths =
+        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BinanceSpot, &depth_symbols);
+    let perp_depths = fetch_public_order_book_depth_map(
+        PublicOrderBookDepthVenue::BinanceUsdmPerp,
+        &depth_symbols,
+    );
+    let warnings = spot_depths
+        .warnings
+        .into_iter()
+        .chain(perp_depths.warnings)
+        .collect::<Vec<_>>();
+    build_binance_basis_monitor_snapshot_from_json_with_depth(
+        &spot_json,
+        &perp_json,
+        &premium_json,
+        options,
+        &spot_depths.depths,
+        &perp_depths.depths,
+        warnings,
+    )
 }
 
+#[cfg(test)]
 fn build_binance_basis_monitor_snapshot_from_json(
     spot_json: &str,
     perp_json: &str,
     premium_json: &str,
     options: &BinanceBasisMonitorOptions,
+) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
+    build_binance_basis_monitor_snapshot_from_json_with_depth(
+        spot_json,
+        perp_json,
+        premium_json,
+        options,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_binance_basis_monitor_snapshot_from_json_with_depth(
+    spot_json: &str,
+    perp_json: &str,
+    premium_json: &str,
+    options: &BinanceBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
 ) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
@@ -25015,14 +25200,28 @@ fn build_binance_basis_monitor_snapshot_from_json(
         let mut signal_error = None;
         let signal = match (spot, perp) {
             (Some(spot), Some(perp)) => {
+                let spot_ask_depth = spot_depths
+                    .get(&premium.symbol)
+                    .map(|depth| depth.ask_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&spot.ask_price, &spot.ask_qty)
+                    });
+                let perp_bid_depth = perp_depths
+                    .get(&premium.symbol)
+                    .map(|depth| depth.bid_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&perp.bid_price, &perp.bid_qty)
+                    });
                 match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
                     symbol: premium.symbol.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
                     spot_ask_size: Some(spot.ask_qty.clone()),
+                    spot_ask_depth,
                     perp_best_bid: perp.bid_price.clone(),
                     perp_best_ask: perp.ask_price.clone(),
                     perp_bid_size: Some(perp.bid_qty.clone()),
+                    perp_bid_depth,
                     last_funding_rate: premium.last_funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
@@ -25054,10 +25253,50 @@ fn build_binance_basis_monitor_snapshot_from_json(
             spot_ask: spot.map(|row| row.ask_price.clone()),
             spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
             spot_ask_qty: spot.map(|row| row.ask_qty.clone()),
+            spot_bid_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            spot_ask_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
             perp_bid: perp.map(|row| row.bid_price.clone()),
             perp_ask: perp.map(|row| row.ask_price.clone()),
             perp_bid_qty: perp.map(|row| row.bid_qty.clone()),
             perp_ask_qty: perp.map(|row| row.ask_qty.clone()),
+            perp_bid_depth: perp
+                .map(|row| {
+                    perp_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            perp_ask_depth: perp
+                .map(|row| {
+                    perp_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
             mark_price: premium.mark_price,
             index_price: premium.index_price,
             last_funding_rate: premium.last_funding_rate,
@@ -25095,9 +25334,107 @@ fn build_binance_basis_monitor_snapshot_from_json(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
-        last_error: None,
+        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
+}
+
+fn binance_basis_monitor_depth_symbols(
+    spot_json: &str,
+    perp_json: &str,
+    premium_json: &str,
+    options: &BinanceBasisMonitorOptions,
+) -> RuntimeResult<BTreeSet<String>> {
+    binance_basis_monitor_depth_symbols_with_limit(
+        spot_json,
+        perp_json,
+        premium_json,
+        options,
+        BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
+    )
+}
+
+fn binance_basis_monitor_depth_symbols_with_limit(
+    spot_json: &str,
+    perp_json: &str,
+    premium_json: &str,
+    options: &BinanceBasisMonitorOptions,
+    limit: usize,
+) -> RuntimeResult<BTreeSet<String>> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let min_abs_funding_rate =
+        MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
+    let spot_books = parse_book_ticker_rows(spot_json, "spot")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let perp_books = parse_book_ticker_rows(perp_json, "usdm-perp")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut scored_symbols = Vec::new();
+    for premium in parse_premium_index_rows(premium_json)? {
+        if !premium.symbol.ends_with("USDT") {
+            continue;
+        }
+        let Some(spot) = spot_books.get(&premium.symbol) else {
+            continue;
+        };
+        let Some(perp) = perp_books.get(&premium.symbol) else {
+            continue;
+        };
+        let funding_rate = MonitorDecimal::parse("lastFundingRate", &premium.last_funding_rate)?;
+        if funding_rate.abs_less_than(min_abs_funding_rate) {
+            continue;
+        }
+        let Ok(signal) = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: premium.symbol.clone(),
+            spot_best_bid: spot.bid_price.clone(),
+            spot_best_ask: spot.ask_price.clone(),
+            spot_ask_size: Some(spot.ask_qty.clone()),
+            spot_ask_depth: spot.ask_depth.clone(),
+            perp_best_bid: perp.bid_price.clone(),
+            perp_best_ask: perp.ask_price.clone(),
+            perp_bid_size: Some(perp.bid_qty.clone()),
+            perp_bid_depth: perp.bid_depth.clone(),
+            last_funding_rate: premium.last_funding_rate,
+            notional_usd: options.notional_usd.clone(),
+            spot_taker_fee_bps: options.spot_taker_fee_bps,
+            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            slippage_buffer_bps: options.slippage_buffer_bps,
+            min_net_bps: options.min_net_bps,
+        }) else {
+            continue;
+        };
+        scored_symbols.push((
+            signal.expected_profit_bps,
+            signal.net_bps,
+            funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
+            premium.symbol,
+        ));
+    }
+    Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
+}
+
+fn top_scored_basis_depth_symbols(
+    mut scored_symbols: Vec<(i128, i128, i128, String)>,
+    limit: usize,
+) -> BTreeSet<String> {
+    scored_symbols.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    scored_symbols
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, _, symbol)| symbol)
+        .collect()
 }
 
 fn fetch_aster_basis_monitor_snapshot(
@@ -25115,45 +25452,116 @@ fn fetch_aster_basis_monitor_snapshot(
     };
     let perp_json = fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&aster_futures_premium_index_all_url())?;
-    if warnings.is_empty() {
-        if let Some(spot_json) = spot_json.as_deref() {
-            return build_aster_basis_monitor_snapshot_from_json(
-                spot_json,
-                &perp_json,
-                &premium_json,
-                options,
-            );
-        }
-    }
-    build_aster_basis_monitor_snapshot_from_optional_spot_json(
+    let depth_symbols = aster_basis_monitor_depth_symbols(
         spot_json.as_deref(),
         &perp_json,
         &premium_json,
         options,
+    )?;
+    let spot_depths = if spot_json.is_some() {
+        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::AsterSpot, &depth_symbols)
+    } else {
+        PublicOrderBookDepthFetchReport {
+            depths: BTreeMap::new(),
+            warnings: Vec::new(),
+        }
+    };
+    let perp_depths = fetch_public_order_book_depth_map(
+        PublicOrderBookDepthVenue::AsterUsdtFutures,
+        &depth_symbols,
+    );
+    warnings.extend(spot_depths.warnings);
+    warnings.extend(perp_depths.warnings);
+    if warnings.is_empty() {
+        if let Some(spot_json) = spot_json.as_deref() {
+            return build_aster_basis_monitor_snapshot_from_json_with_depth(
+                spot_json,
+                &perp_json,
+                &premium_json,
+                options,
+                &spot_depths.depths,
+                &perp_depths.depths,
+                Vec::new(),
+            );
+        }
+    }
+    build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+        spot_json.as_deref(),
+        &perp_json,
+        &premium_json,
+        options,
+        &spot_depths.depths,
+        &perp_depths.depths,
         warnings,
     )
 }
 
+#[cfg(test)]
 fn build_aster_basis_monitor_snapshot_from_json(
     spot_json: &str,
     perp_json: &str,
     premium_json: &str,
     options: &AsterBasisMonitorOptions,
 ) -> RuntimeResult<AsterBasisMonitorSnapshot> {
-    build_aster_basis_monitor_snapshot_from_optional_spot_json(
-        Some(spot_json),
+    build_aster_basis_monitor_snapshot_from_json_with_depth(
+        spot_json,
         perp_json,
         premium_json,
         options,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         Vec::new(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_aster_basis_monitor_snapshot_from_json_with_depth(
+    spot_json: &str,
+    perp_json: &str,
+    premium_json: &str,
+    options: &AsterBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
+) -> RuntimeResult<AsterBasisMonitorSnapshot> {
+    build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+        Some(spot_json),
+        perp_json,
+        premium_json,
+        options,
+        spot_depths,
+        perp_depths,
+        warnings,
+    )
+}
+
+#[cfg(test)]
 fn build_aster_basis_monitor_snapshot_from_optional_spot_json(
     spot_json: Option<&str>,
     perp_json: &str,
     premium_json: &str,
     options: &AsterBasisMonitorOptions,
+    warnings: Vec<String>,
+) -> RuntimeResult<AsterBasisMonitorSnapshot> {
+    build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+        spot_json,
+        perp_json,
+        premium_json,
+        options,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        warnings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+    spot_json: Option<&str>,
+    perp_json: &str,
+    premium_json: &str,
+    options: &AsterBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
     mut warnings: Vec<String>,
 ) -> RuntimeResult<AsterBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
@@ -25284,10 +25692,50 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json(
             spot_ask: spot.map(|row| row.ask_price.clone()),
             spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
             spot_ask_qty: spot.map(|row| row.ask_qty.clone()),
+            spot_bid_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            spot_ask_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
             perp_bid: perp.map(|row| row.bid_price.clone()),
             perp_ask: perp.map(|row| row.ask_price.clone()),
             perp_bid_qty: perp.map(|row| row.bid_qty.clone()),
             perp_ask_qty: perp.map(|row| row.ask_qty.clone()),
+            perp_bid_depth: perp
+                .map(|row| {
+                    perp_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            perp_ask_depth: perp
+                .map(|row| {
+                    perp_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
             mark_price: premium.mark_price,
             index_price: premium.index_price,
             last_funding_rate: premium.last_funding_rate,
@@ -25340,17 +25788,113 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json(
     })
 }
 
+fn aster_basis_monitor_depth_symbols(
+    spot_json: Option<&str>,
+    perp_json: &str,
+    premium_json: &str,
+    options: &AsterBasisMonitorOptions,
+) -> RuntimeResult<BTreeSet<String>> {
+    aster_basis_monitor_depth_symbols_with_limit(
+        spot_json,
+        perp_json,
+        premium_json,
+        options,
+        BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
+    )
+}
+
+fn aster_basis_monitor_depth_symbols_with_limit(
+    spot_json: Option<&str>,
+    perp_json: &str,
+    premium_json: &str,
+    options: &AsterBasisMonitorOptions,
+    limit: usize,
+) -> RuntimeResult<BTreeSet<String>> {
+    let Some(spot_json) = spot_json else {
+        return Ok(BTreeSet::new());
+    };
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let min_abs_funding_rate =
+        MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
+    let spot_books = parse_book_ticker_rows(spot_json, "aster spot")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let perp_books = parse_book_ticker_rows(perp_json, "aster perp")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut scored_symbols = Vec::new();
+    for premium in parse_premium_index_rows(premium_json)? {
+        if !premium.symbol.ends_with("USDT") || premium.symbol.starts_with("TEST") {
+            continue;
+        }
+        let Some(spot) = spot_books.get(&premium.symbol) else {
+            continue;
+        };
+        let Some(perp) = perp_books.get(&premium.symbol) else {
+            continue;
+        };
+        let funding_rate = MonitorDecimal::parse("lastFundingRate", &premium.last_funding_rate)?;
+        if funding_rate.abs_less_than(min_abs_funding_rate) {
+            continue;
+        }
+        let Ok(signal) = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: premium.symbol.clone(),
+            spot_best_bid: spot.bid_price.clone(),
+            spot_best_ask: spot.ask_price.clone(),
+            spot_ask_size: Some(spot.ask_qty.clone()),
+            spot_ask_depth: spot.ask_depth.clone(),
+            perp_best_bid: perp.bid_price.clone(),
+            perp_best_ask: perp.ask_price.clone(),
+            perp_bid_size: Some(perp.bid_qty.clone()),
+            perp_bid_depth: perp.bid_depth.clone(),
+            last_funding_rate: premium.last_funding_rate,
+            notional_usd: options.notional_usd.clone(),
+            spot_taker_fee_bps: options.spot_taker_fee_bps,
+            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            slippage_buffer_bps: options.slippage_buffer_bps,
+            min_net_bps: options.min_net_bps,
+        }) else {
+            continue;
+        };
+        scored_symbols.push((
+            signal.expected_profit_bps,
+            signal.net_bps,
+            funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
+            premium.symbol,
+        ));
+    }
+    Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
+}
+
 fn fetch_bybit_basis_monitor_snapshot(
     options: &BybitBasisMonitorOptions,
 ) -> RuntimeResult<BybitBasisMonitorSnapshot> {
     let spot_json = fetch_public_json_with_curl(&bybit_spot_tickers_url())?;
     let linear_json = fetch_public_json_with_curl(&bybit_linear_tickers_url())?;
     let instrument_pages = fetch_bybit_linear_instrument_pages()?;
-    build_bybit_basis_monitor_snapshot_from_json(
+    let depth_symbols =
+        bybit_basis_monitor_depth_symbols(&spot_json, &linear_json, &instrument_pages, options)?;
+    let spot_depths =
+        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BybitSpot, &depth_symbols);
+    let linear_depths =
+        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BybitLinear, &depth_symbols);
+    let warnings = spot_depths
+        .warnings
+        .into_iter()
+        .chain(linear_depths.warnings)
+        .collect::<Vec<_>>();
+    build_bybit_basis_monitor_snapshot_from_json_with_depth(
         &spot_json,
         &linear_json,
         &instrument_pages,
         options,
+        &spot_depths.depths,
+        &linear_depths.depths,
+        warnings,
     )
 }
 
@@ -25376,11 +25920,33 @@ fn fetch_bybit_linear_instrument_pages() -> RuntimeResult<Vec<String>> {
     Ok(pages)
 }
 
+#[cfg(test)]
 fn build_bybit_basis_monitor_snapshot_from_json(
     spot_json: &str,
     linear_json: &str,
     instrument_pages: &[String],
     options: &BybitBasisMonitorOptions,
+) -> RuntimeResult<BybitBasisMonitorSnapshot> {
+    build_bybit_basis_monitor_snapshot_from_json_with_depth(
+        spot_json,
+        linear_json,
+        instrument_pages,
+        options,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_bybit_basis_monitor_snapshot_from_json_with_depth(
+    spot_json: &str,
+    linear_json: &str,
+    instrument_pages: &[String],
+    options: &BybitBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    linear_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
 ) -> RuntimeResult<BybitBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
@@ -25440,14 +26006,28 @@ fn build_bybit_basis_monitor_snapshot_from_json(
         let mut signal_error = None;
         let signal = match (spot, linear) {
             (Some(spot), Some(linear)) => {
+                let spot_ask_depth = spot_depths
+                    .get(&symbol)
+                    .map(|depth| depth.ask_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&spot.ask_price, &spot.ask_qty)
+                    });
+                let perp_bid_depth = linear_depths
+                    .get(&symbol)
+                    .map(|depth| depth.bid_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&linear.bid_price, &linear.bid_qty)
+                    });
                 match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
                     symbol: symbol.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
                     spot_ask_size: Some(spot.ask_qty.clone()),
+                    spot_ask_depth,
                     perp_best_bid: linear.bid_price.clone(),
                     perp_best_ask: linear.ask_price.clone(),
                     perp_bid_size: Some(linear.bid_qty.clone()),
+                    perp_bid_depth,
                     last_funding_rate: linear.last_funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
@@ -25477,10 +26057,50 @@ fn build_bybit_basis_monitor_snapshot_from_json(
             spot_ask: spot.map(|row| row.ask_price.clone()),
             spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
             spot_ask_qty: spot.map(|row| row.ask_qty.clone()),
+            spot_bid_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            spot_ask_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
             perp_bid: linear.map(|row| row.bid_price.clone()),
             perp_ask: linear.map(|row| row.ask_price.clone()),
             perp_bid_qty: linear.map(|row| row.bid_qty.clone()),
             perp_ask_qty: linear.map(|row| row.ask_qty.clone()),
+            perp_bid_depth: linear
+                .map(|row| {
+                    linear_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            perp_ask_depth: linear
+                .map(|row| {
+                    linear_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
             mark_price: linear.map(|row| row.mark_price.clone()).unwrap_or_default(),
             index_price: linear
                 .map(|row| row.index_price.clone())
@@ -25527,9 +26147,86 @@ fn build_bybit_basis_monitor_snapshot_from_json(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
-        last_error: None,
+        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
+}
+
+fn bybit_basis_monitor_depth_symbols(
+    spot_json: &str,
+    linear_json: &str,
+    instrument_pages: &[String],
+    options: &BybitBasisMonitorOptions,
+) -> RuntimeResult<BTreeSet<String>> {
+    bybit_basis_monitor_depth_symbols_with_limit(
+        spot_json,
+        linear_json,
+        instrument_pages,
+        options,
+        BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
+    )
+}
+
+fn bybit_basis_monitor_depth_symbols_with_limit(
+    spot_json: &str,
+    linear_json: &str,
+    instrument_pages: &[String],
+    options: &BybitBasisMonitorOptions,
+    limit: usize,
+) -> RuntimeResult<BTreeSet<String>> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let min_abs_funding_rate =
+        MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
+    let spot_books = parse_bybit_spot_ticker_rows(spot_json)?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let linear_tickers = parse_bybit_linear_ticker_rows(linear_json)?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let linear_symbols = parse_bybit_linear_perpetual_symbols(instrument_pages)?;
+    let mut scored_symbols = Vec::new();
+    for symbol in linear_symbols {
+        let Some(spot) = spot_books.get(&symbol) else {
+            continue;
+        };
+        let Some(linear) = linear_tickers.get(&symbol) else {
+            continue;
+        };
+        let funding_rate = MonitorDecimal::parse("fundingRate", &linear.last_funding_rate)?;
+        if funding_rate.abs_less_than(min_abs_funding_rate) {
+            continue;
+        }
+        let Ok(signal) = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: symbol.clone(),
+            spot_best_bid: spot.bid_price.clone(),
+            spot_best_ask: spot.ask_price.clone(),
+            spot_ask_size: Some(spot.ask_qty.clone()),
+            spot_ask_depth: spot.ask_depth.clone(),
+            perp_best_bid: linear.bid_price.clone(),
+            perp_best_ask: linear.ask_price.clone(),
+            perp_bid_size: Some(linear.bid_qty.clone()),
+            perp_bid_depth: linear.bid_depth.clone(),
+            last_funding_rate: linear.last_funding_rate.clone(),
+            notional_usd: options.notional_usd.clone(),
+            spot_taker_fee_bps: options.spot_taker_fee_bps,
+            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            slippage_buffer_bps: options.slippage_buffer_bps,
+            min_net_bps: options.min_net_bps,
+        }) else {
+            continue;
+        };
+        scored_symbols.push((
+            signal.expected_profit_bps,
+            signal.net_bps,
+            funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
+            symbol,
+        ));
+    }
+    Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
 }
 
 fn fetch_okx_basis_monitor_snapshot(
@@ -25541,16 +26238,37 @@ fn fetch_okx_basis_monitor_snapshot(
     let index_json = fetch_public_json_with_curl(&okx_index_tickers_url())?;
     let swap_rows = parse_okx_ticker_rows(&swap_json, "okx swap tickers")?;
     let funding_pages = fetch_okx_usdt_swap_funding_rate_pages(&swap_rows);
-    let mut snapshot = build_okx_basis_monitor_snapshot_from_json(
+    let depth_symbols =
+        okx_basis_monitor_depth_symbols(&spot_json, &swap_json, &funding_pages.pages, options)?;
+    let spot_depths =
+        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::Okx, &depth_symbols.spot);
+    let swap_depths =
+        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::Okx, &depth_symbols.swap);
+    let depth_warnings = spot_depths
+        .warnings
+        .into_iter()
+        .chain(swap_depths.warnings)
+        .collect::<Vec<_>>();
+    let mut snapshot = build_okx_basis_monitor_snapshot_from_json_with_depth(
         &spot_json,
         &swap_json,
         &mark_json,
         &index_json,
         &funding_pages.pages,
         options,
+        &spot_depths.depths,
+        &swap_depths.depths,
+        depth_warnings,
     )?;
     if !funding_pages.warnings.is_empty() {
-        snapshot.last_error = Some(funding_pages.warnings.join("; "));
+        snapshot.last_error = Some(
+            snapshot
+                .last_error
+                .into_iter()
+                .chain([funding_pages.warnings.join("; ")])
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
     }
     Ok(snapshot)
 }
@@ -25558,6 +26276,11 @@ fn fetch_okx_basis_monitor_snapshot(
 struct OkxFundingRateFetchReport {
     pages: Vec<String>,
     warnings: Vec<String>,
+}
+
+struct OkxBasisMonitorDepthSymbols {
+    spot: BTreeSet<String>,
+    swap: BTreeSet<String>,
 }
 
 fn fetch_okx_usdt_swap_funding_rate_pages(swap_rows: &[OkxTickerRow]) -> OkxFundingRateFetchReport {
@@ -25620,6 +26343,7 @@ fn okx_funding_rate_fetch_warning(errors: &[(String, String)]) -> Option<String>
     ))
 }
 
+#[cfg(test)]
 fn build_okx_basis_monitor_snapshot_from_json(
     spot_json: &str,
     swap_json: &str,
@@ -25627,6 +26351,31 @@ fn build_okx_basis_monitor_snapshot_from_json(
     index_json: &str,
     funding_pages: &[String],
     options: &OkxBasisMonitorOptions,
+) -> RuntimeResult<OkxBasisMonitorSnapshot> {
+    build_okx_basis_monitor_snapshot_from_json_with_depth(
+        spot_json,
+        swap_json,
+        mark_json,
+        index_json,
+        funding_pages,
+        options,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_okx_basis_monitor_snapshot_from_json_with_depth(
+    spot_json: &str,
+    swap_json: &str,
+    mark_json: &str,
+    index_json: &str,
+    funding_pages: &[String],
+    options: &OkxBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    swap_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
 ) -> RuntimeResult<OkxBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
@@ -25698,14 +26447,28 @@ fn build_okx_basis_monitor_snapshot_from_json(
         let mut signal_error = None;
         let signal = match (spot, funding) {
             (Some(spot), Some(funding)) => {
+                let spot_ask_depth = spot_depths
+                    .get(&spot_inst_id)
+                    .map(|depth| depth.ask_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&spot.ask_price, &spot.ask_qty)
+                    });
+                let perp_bid_depth = swap_depths
+                    .get(&swap_inst_id)
+                    .map(|depth| depth.bid_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&swap.bid_price, &swap.bid_qty)
+                    });
                 match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
                     symbol: spot_inst_id.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
                     spot_ask_size: Some(spot.ask_qty.clone()),
+                    spot_ask_depth,
                     perp_best_bid: swap.bid_price.clone(),
                     perp_best_ask: swap.ask_price.clone(),
                     perp_bid_size: Some(swap.bid_qty.clone()),
+                    perp_bid_depth,
                     last_funding_rate: funding.funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
@@ -25735,10 +26498,38 @@ fn build_okx_basis_monitor_snapshot_from_json(
             spot_ask: spot.map(|row| row.ask_price.clone()),
             spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
             spot_ask_qty: spot.map(|row| row.ask_qty.clone()),
-            perp_bid: Some(swap.bid_price),
-            perp_ask: Some(swap.ask_price),
-            perp_bid_qty: Some(swap.bid_qty),
-            perp_ask_qty: Some(swap.ask_qty),
+            spot_bid_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.inst_id)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            spot_ask_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.inst_id)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            perp_bid: Some(swap.bid_price.clone()),
+            perp_ask: Some(swap.ask_price.clone()),
+            perp_bid_qty: Some(swap.bid_qty.clone()),
+            perp_ask_qty: Some(swap.ask_qty.clone()),
+            perp_bid_depth: swap_depths
+                .get(&swap_inst_id)
+                .map(|depth| depth.bid_depth.clone())
+                .unwrap_or_else(|| signal_depth_from_top_strings(&swap.bid_price, &swap.bid_qty)),
+            perp_ask_depth: swap_depths
+                .get(&swap_inst_id)
+                .map(|depth| depth.ask_depth.clone())
+                .unwrap_or_else(|| signal_depth_from_top_strings(&swap.ask_price, &swap.ask_qty)),
             mark_price: mark.map(|row| row.mark_price.clone()).unwrap_or_default(),
             index_price: index.map(|row| row.index_price.clone()).unwrap_or_default(),
             last_funding_rate: funding
@@ -25790,9 +26581,111 @@ fn build_okx_basis_monitor_snapshot_from_json(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
-        last_error: None,
+        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
+}
+
+fn okx_basis_monitor_depth_symbols(
+    spot_json: &str,
+    swap_json: &str,
+    funding_pages: &[String],
+    options: &OkxBasisMonitorOptions,
+) -> RuntimeResult<OkxBasisMonitorDepthSymbols> {
+    okx_basis_monitor_depth_symbols_with_limit(
+        spot_json,
+        swap_json,
+        funding_pages,
+        options,
+        BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
+    )
+}
+
+fn okx_basis_monitor_depth_symbols_with_limit(
+    spot_json: &str,
+    swap_json: &str,
+    funding_pages: &[String],
+    options: &OkxBasisMonitorOptions,
+    limit: usize,
+) -> RuntimeResult<OkxBasisMonitorDepthSymbols> {
+    if limit == 0 {
+        return Ok(OkxBasisMonitorDepthSymbols {
+            spot: BTreeSet::new(),
+            swap: BTreeSet::new(),
+        });
+    }
+    let min_abs_funding_rate =
+        MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
+    let spot_books = parse_okx_ticker_rows(spot_json, "okx spot tickers")?
+        .into_iter()
+        .map(|row| (row.inst_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let swap_tickers = parse_okx_ticker_rows(swap_json, "okx swap tickers")?
+        .into_iter()
+        .map(|row| (row.inst_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let funding_rates = parse_okx_funding_rate_pages(funding_pages)?
+        .into_iter()
+        .map(|row| (row.inst_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut scored_symbols = Vec::new();
+    for (swap_inst_id, swap) in swap_tickers {
+        let Some(spot_inst_id) = okx_spot_inst_id_from_swap(&swap_inst_id) else {
+            continue;
+        };
+        let Some(spot) = spot_books.get(&spot_inst_id) else {
+            continue;
+        };
+        let Some(funding) = funding_rates.get(&swap_inst_id) else {
+            continue;
+        };
+        let funding_rate = MonitorDecimal::parse("fundingRate", &funding.funding_rate)?;
+        if funding_rate.abs_less_than(min_abs_funding_rate) {
+            continue;
+        }
+        let Ok(signal) = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: spot_inst_id.clone(),
+            spot_best_bid: spot.bid_price.clone(),
+            spot_best_ask: spot.ask_price.clone(),
+            spot_ask_size: Some(spot.ask_qty.clone()),
+            spot_ask_depth: spot.ask_depth.clone(),
+            perp_best_bid: swap.bid_price.clone(),
+            perp_best_ask: swap.ask_price.clone(),
+            perp_bid_size: Some(swap.bid_qty.clone()),
+            perp_bid_depth: swap.bid_depth.clone(),
+            last_funding_rate: funding.funding_rate.clone(),
+            notional_usd: options.notional_usd.clone(),
+            spot_taker_fee_bps: options.spot_taker_fee_bps,
+            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            slippage_buffer_bps: options.slippage_buffer_bps,
+            min_net_bps: options.min_net_bps,
+        }) else {
+            continue;
+        };
+        scored_symbols.push((
+            signal.expected_profit_bps,
+            signal.net_bps,
+            funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
+            spot_inst_id,
+            swap_inst_id,
+        ));
+    }
+    scored_symbols.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+    });
+    let mut spot = BTreeSet::new();
+    let mut swap = BTreeSet::new();
+    for (_, _, _, spot_inst_id, swap_inst_id) in scored_symbols.into_iter().take(limit) {
+        spot.insert(spot_inst_id);
+        swap.insert(swap_inst_id);
+    }
+    Ok(OkxBasisMonitorDepthSymbols { spot, swap })
 }
 
 fn fetch_bitget_basis_monitor_snapshot(
@@ -25801,14 +26694,57 @@ fn fetch_bitget_basis_monitor_snapshot(
     let spot_json = fetch_public_json_with_curl(&bitget_spot_tickers_url())?;
     let futures_json = fetch_public_json_with_curl(&bitget_usdt_futures_tickers_url())?;
     let funding_json = fetch_public_json_with_curl(&bitget_usdt_futures_funding_rate_url())?;
-    build_bitget_basis_monitor_snapshot_from_json(&spot_json, &futures_json, &funding_json, options)
+    let depth_symbols =
+        bitget_basis_monitor_depth_symbols(&spot_json, &futures_json, &funding_json, options)?;
+    let spot_depths =
+        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BitgetSpot, &depth_symbols);
+    let futures_depths = fetch_public_order_book_depth_map(
+        PublicOrderBookDepthVenue::BitgetUsdtFutures,
+        &depth_symbols,
+    );
+    let warnings = spot_depths
+        .warnings
+        .into_iter()
+        .chain(futures_depths.warnings)
+        .collect::<Vec<_>>();
+    build_bitget_basis_monitor_snapshot_from_json_with_depth(
+        &spot_json,
+        &futures_json,
+        &funding_json,
+        options,
+        &spot_depths.depths,
+        &futures_depths.depths,
+        warnings,
+    )
 }
 
+#[cfg(test)]
 fn build_bitget_basis_monitor_snapshot_from_json(
     spot_json: &str,
     futures_json: &str,
     funding_json: &str,
     options: &BitgetBasisMonitorOptions,
+) -> RuntimeResult<BitgetBasisMonitorSnapshot> {
+    build_bitget_basis_monitor_snapshot_from_json_with_depth(
+        spot_json,
+        futures_json,
+        funding_json,
+        options,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_bitget_basis_monitor_snapshot_from_json_with_depth(
+    spot_json: &str,
+    futures_json: &str,
+    funding_json: &str,
+    options: &BitgetBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    futures_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
 ) -> RuntimeResult<BitgetBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
@@ -25867,14 +26803,28 @@ fn build_bitget_basis_monitor_snapshot_from_json(
         let mut signal_error = None;
         let signal = match (spot, funding) {
             (Some(spot), Some(funding)) => {
+                let spot_ask_depth = spot_depths
+                    .get(&futures.symbol)
+                    .map(|depth| depth.ask_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&spot.ask_price, &spot.ask_qty)
+                    });
+                let perp_bid_depth = futures_depths
+                    .get(&futures.symbol)
+                    .map(|depth| depth.bid_depth.clone())
+                    .unwrap_or_else(|| {
+                        signal_depth_from_top_strings(&futures.bid_price, &futures.bid_qty)
+                    });
                 match evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
                     symbol: futures.symbol.clone(),
                     spot_best_bid: spot.bid_price.clone(),
                     spot_best_ask: spot.ask_price.clone(),
                     spot_ask_size: Some(spot.ask_qty.clone()),
+                    spot_ask_depth,
                     perp_best_bid: futures.bid_price.clone(),
                     perp_best_ask: futures.ask_price.clone(),
                     perp_bid_size: Some(futures.bid_qty.clone()),
+                    perp_bid_depth,
                     last_funding_rate: funding.funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
                     spot_taker_fee_bps: options.spot_taker_fee_bps,
@@ -25899,15 +26849,47 @@ fn build_bitget_basis_monitor_snapshot_from_json(
             .or(reason);
 
         rows.push(BitgetBasisMarketRow {
-            symbol: futures.symbol,
+            symbol: futures.symbol.clone(),
             spot_bid: spot.map(|row| row.bid_price.clone()),
             spot_ask: spot.map(|row| row.ask_price.clone()),
             spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
             spot_ask_qty: spot.map(|row| row.ask_qty.clone()),
-            perp_bid: Some(futures.bid_price),
-            perp_ask: Some(futures.ask_price),
-            perp_bid_qty: Some(futures.bid_qty),
-            perp_ask_qty: Some(futures.ask_qty),
+            spot_bid_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.bid_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.bid_price, &row.bid_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            spot_ask_depth: spot
+                .map(|row| {
+                    spot_depths
+                        .get(&row.symbol)
+                        .map(|depth| depth.ask_depth.clone())
+                        .unwrap_or_else(|| {
+                            signal_depth_from_top_strings(&row.ask_price, &row.ask_qty)
+                        })
+                })
+                .unwrap_or_default(),
+            perp_bid: Some(futures.bid_price.clone()),
+            perp_ask: Some(futures.ask_price.clone()),
+            perp_bid_qty: Some(futures.bid_qty.clone()),
+            perp_ask_qty: Some(futures.ask_qty.clone()),
+            perp_bid_depth: futures_depths
+                .get(&futures.symbol)
+                .map(|depth| depth.bid_depth.clone())
+                .unwrap_or_else(|| {
+                    signal_depth_from_top_strings(&futures.bid_price, &futures.bid_qty)
+                }),
+            perp_ask_depth: futures_depths
+                .get(&futures.symbol)
+                .map(|depth| depth.ask_depth.clone())
+                .unwrap_or_else(|| {
+                    signal_depth_from_top_strings(&futures.ask_price, &futures.ask_qty)
+                }),
             mark_price: futures.mark_price,
             index_price: futures.index_price,
             last_funding_rate: funding
@@ -25952,9 +26934,89 @@ fn build_bitget_basis_monitor_snapshot_from_json(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
-        last_error: None,
+        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
+}
+
+fn bitget_basis_monitor_depth_symbols(
+    spot_json: &str,
+    futures_json: &str,
+    funding_json: &str,
+    options: &BitgetBasisMonitorOptions,
+) -> RuntimeResult<BTreeSet<String>> {
+    bitget_basis_monitor_depth_symbols_with_limit(
+        spot_json,
+        futures_json,
+        funding_json,
+        options,
+        BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
+    )
+}
+
+fn bitget_basis_monitor_depth_symbols_with_limit(
+    spot_json: &str,
+    futures_json: &str,
+    funding_json: &str,
+    options: &BitgetBasisMonitorOptions,
+    limit: usize,
+) -> RuntimeResult<BTreeSet<String>> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let min_abs_funding_rate =
+        MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
+    let spot_books = parse_bitget_spot_ticker_rows(spot_json)?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let futures_tickers = parse_bitget_usdt_futures_ticker_rows(futures_json)?;
+    let funding_rates = parse_bitget_funding_rate_rows(funding_json)?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut scored_symbols = Vec::new();
+    for futures in futures_tickers {
+        if !futures.symbol.ends_with("USDT") {
+            continue;
+        }
+        let Some(spot) = spot_books.get(&futures.symbol) else {
+            continue;
+        };
+        let Some(funding) = funding_rates.get(&futures.symbol) else {
+            continue;
+        };
+        let funding_rate = MonitorDecimal::parse("fundingRate", &funding.funding_rate)?;
+        if funding_rate.abs_less_than(min_abs_funding_rate) {
+            continue;
+        }
+        let Ok(signal) = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: futures.symbol.clone(),
+            spot_best_bid: spot.bid_price.clone(),
+            spot_best_ask: spot.ask_price.clone(),
+            spot_ask_size: Some(spot.ask_qty.clone()),
+            spot_ask_depth: spot.ask_depth.clone(),
+            perp_best_bid: futures.bid_price.clone(),
+            perp_best_ask: futures.ask_price.clone(),
+            perp_bid_size: Some(futures.bid_qty.clone()),
+            perp_bid_depth: futures.bid_depth.clone(),
+            last_funding_rate: funding.funding_rate.clone(),
+            notional_usd: options.notional_usd.clone(),
+            spot_taker_fee_bps: options.spot_taker_fee_bps,
+            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            slippage_buffer_bps: options.slippage_buffer_bps,
+            min_net_bps: options.min_net_bps,
+        }) else {
+            continue;
+        };
+        scored_symbols.push((
+            signal.expected_profit_bps,
+            signal.net_bps,
+            funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
+            futures.symbol,
+        ));
+    }
+    Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
 }
 
 fn fetch_hyperliquid_basis_monitor_snapshot(
@@ -26088,6 +27150,8 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
             spot_ask: spot.map(|row| row.price.clone()),
             spot_bid_qty: None,
             spot_ask_qty: None,
+            spot_bid_depth: Vec::new(),
+            spot_ask_depth: Vec::new(),
             perp_bid: perp_wss_row
                 .as_ref()
                 .map(|row| row.bid_price.clone())
@@ -26098,6 +27162,18 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
                 .or_else(|| Some(perp.price.clone())),
             perp_bid_qty: perp_wss_row.as_ref().map(|row| row.bid_qty.clone()),
             perp_ask_qty: perp_wss_row.as_ref().map(|row| row.ask_qty.clone()),
+            perp_bid_depth: perp_wss_row
+                .as_ref()
+                .map(|row| {
+                    signal_depth_or_top_strings(&row.bid_depth, &row.bid_price, &row.bid_qty)
+                })
+                .unwrap_or_default(),
+            perp_ask_depth: perp_wss_row
+                .as_ref()
+                .map(|row| {
+                    signal_depth_or_top_strings(&row.ask_depth, &row.ask_price, &row.ask_qty)
+                })
+                .unwrap_or_default(),
             mark_price: perp.mark_price,
             index_price: perp.oracle_price,
             last_funding_rate: perp.funding_rate,
@@ -26198,22 +27274,28 @@ fn parse_funding_arb_basis_status_snapshot(
         if funding_rate.trim().is_empty() {
             continue;
         }
+        let perp_bid = optional_json_value_string(&row_fields, "perp_bid", "basis monitor row")?;
+        let perp_ask = optional_json_value_string(&row_fields, "perp_ask", "basis monitor row")?;
+        let perp_bid_qty =
+            optional_json_value_string(&row_fields, "perp_bid_qty", "basis monitor row")?;
+        let perp_ask_qty =
+            optional_json_value_string(&row_fields, "perp_ask_qty", "basis monitor row")?;
+        let perp_bid_depth =
+            optional_signal_depth_levels_from_json_field(&row_fields, "perp_bid_depth_levels")?
+                .unwrap_or_else(|| signal_depth_from_optional_top(&perp_bid, &perp_bid_qty));
+        let perp_ask_depth =
+            optional_signal_depth_levels_from_json_field(&row_fields, "perp_ask_depth_levels")?
+                .unwrap_or_else(|| signal_depth_from_optional_top(&perp_ask, &perp_ask_qty));
         rows.push(FundingArbVenueMarket {
             venue_family: venue_family.clone(),
             base_asset: funding_base_asset_from_symbol(&symbol),
             symbol,
-            perp_bid: optional_json_value_string(&row_fields, "perp_bid", "basis monitor row")?,
-            perp_ask: optional_json_value_string(&row_fields, "perp_ask", "basis monitor row")?,
-            perp_bid_qty: optional_json_value_string(
-                &row_fields,
-                "perp_bid_qty",
-                "basis monitor row",
-            )?,
-            perp_ask_qty: optional_json_value_string(
-                &row_fields,
-                "perp_ask_qty",
-                "basis monitor row",
-            )?,
+            perp_bid,
+            perp_ask,
+            perp_bid_qty,
+            perp_ask_qty,
+            perp_bid_depth,
+            perp_ask_depth,
             mark_price: optional_json_value_string(&row_fields, "mark_price", "basis monitor row")?,
             index_price: optional_json_value_string(
                 &row_fields,
@@ -26246,6 +27328,56 @@ fn parse_funding_arb_basis_status_snapshot(
     }
 
     Ok(FundingArbVenueSnapshot { status, rows })
+}
+
+fn optional_signal_depth_levels_from_json_field(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+) -> RuntimeResult<Option<Vec<SignalDepthLevel>>> {
+    let Some(raw) = fields.get(field) else {
+        return Ok(None);
+    };
+    let mut levels = Vec::new();
+    for object in json_array_value_slices(raw)? {
+        let level_fields = parse_json_object_value_slices(object)?;
+        levels.push(SignalDepthLevel {
+            price: required_json_value_string(&level_fields, "price", field)?,
+            size: required_json_value_string(&level_fields, "size", field)?,
+        });
+    }
+    Ok(Some(levels))
+}
+
+fn signal_depth_from_optional_top(
+    price: &Option<String>,
+    size: &Option<String>,
+) -> Vec<SignalDepthLevel> {
+    match (price, size) {
+        (Some(price), Some(size)) => vec![SignalDepthLevel {
+            price: price.clone(),
+            size: size.clone(),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn signal_depth_from_top_strings(price: &str, size: &str) -> Vec<SignalDepthLevel> {
+    vec![SignalDepthLevel {
+        price: price.to_owned(),
+        size: size.to_owned(),
+    }]
+}
+
+fn signal_depth_or_top_strings(
+    levels: &[SignalDepthLevel],
+    price: &str,
+    size: &str,
+) -> Vec<SignalDepthLevel> {
+    if levels.is_empty() {
+        signal_depth_from_top_strings(price, size)
+    } else {
+        levels.to_vec()
+    }
 }
 
 fn build_funding_arb_monitor_snapshot_from_sources(
@@ -26328,6 +27460,8 @@ fn funding_arb_pair_row(
         venue_a_ask: venue_a.perp_ask.clone().unwrap_or_default(),
         venue_a_bid_qty: venue_a.perp_bid_qty.clone().unwrap_or_default(),
         venue_a_ask_qty: venue_a.perp_ask_qty.clone().unwrap_or_default(),
+        venue_a_bid_depth: venue_a.perp_bid_depth.clone(),
+        venue_a_ask_depth: venue_a.perp_ask_depth.clone(),
         venue_a_mark_price: venue_a.mark_price.clone().unwrap_or_default(),
         venue_a_index_price: venue_a.index_price.clone().unwrap_or_default(),
         venue_a_funding_rate: normalize_funding_rate_string_to_8h(
@@ -26341,6 +27475,8 @@ fn funding_arb_pair_row(
         venue_b_ask: venue_b.perp_ask.clone().unwrap_or_default(),
         venue_b_bid_qty: venue_b.perp_bid_qty.clone().unwrap_or_default(),
         venue_b_ask_qty: venue_b.perp_ask_qty.clone().unwrap_or_default(),
+        venue_b_bid_depth: venue_b.perp_bid_depth.clone(),
+        venue_b_ask_depth: venue_b.perp_ask_depth.clone(),
         venue_b_mark_price: venue_b.mark_price.clone().unwrap_or_default(),
         venue_b_index_price: venue_b.index_price.clone().unwrap_or_default(),
         venue_b_funding_rate: normalize_funding_rate_string_to_8h(
@@ -26446,9 +27582,11 @@ fn funding_arb_pair_row(
         long_best_bid: venue_a.perp_bid.clone().unwrap_or_default(),
         long_best_ask: venue_a.perp_ask.clone().unwrap_or_default(),
         long_ask_size: venue_a.perp_ask_qty.clone(),
+        long_ask_depth: venue_a.perp_ask_depth.clone(),
         short_best_bid: venue_b.perp_bid.clone().unwrap_or_default(),
         short_best_ask: venue_b.perp_ask.clone().unwrap_or_default(),
         short_bid_size: venue_b.perp_bid_qty.clone(),
+        short_bid_depth: venue_b.perp_bid_depth.clone(),
         long_funding_rate: rate_a_8h.clone(),
         short_funding_rate: rate_b_8h.clone(),
         funding_interval_hours: "8".to_owned(),
@@ -26467,9 +27605,11 @@ fn funding_arb_pair_row(
         long_best_bid: venue_b.perp_bid.clone().unwrap_or_default(),
         long_best_ask: venue_b.perp_ask.clone().unwrap_or_default(),
         long_ask_size: venue_b.perp_ask_qty.clone(),
+        long_ask_depth: venue_b.perp_ask_depth.clone(),
         short_best_bid: venue_a.perp_bid.clone().unwrap_or_default(),
         short_best_ask: venue_a.perp_ask.clone().unwrap_or_default(),
         short_bid_size: venue_a.perp_bid_qty.clone(),
+        short_bid_depth: venue_a.perp_bid_depth.clone(),
         long_funding_rate: rate_b_8h,
         short_funding_rate: rate_a_8h,
         funding_interval_hours: "8".to_owned(),
@@ -27402,10 +28542,12 @@ fn bybit_wss_book_ticker_public_stream_url(market: BybitPublicMarket) -> String 
 }
 
 fn binance_ticker_24h_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
     format!("{BINANCE_MARKET_DATA_BASE_URL}/api/v3/ticker/24hr?symbol={symbol}")
 }
 
 fn binance_spot_book_ticker_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
     format!("{BINANCE_SPOT_REST_BASE_URL}/api/v3/ticker/bookTicker?symbol={symbol}")
 }
 
@@ -27413,7 +28555,15 @@ fn binance_spot_book_ticker_all_url() -> String {
     format!("{BINANCE_SPOT_REST_BASE_URL}/api/v3/ticker/bookTicker")
 }
 
+fn binance_spot_depth_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
+    format!(
+        "{BINANCE_SPOT_REST_BASE_URL}/api/v3/depth?symbol={symbol}&limit={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
+}
+
 fn binance_usdm_book_ticker_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
     format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/ticker/bookTicker?symbol={symbol}")
 }
 
@@ -27421,17 +28571,39 @@ fn binance_usdm_book_ticker_all_url() -> String {
     format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/ticker/bookTicker")
 }
 
+fn binance_usdm_depth_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
+    format!(
+        "{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/depth?symbol={symbol}&limit={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
+}
+
 #[cfg(feature = "live-exec")]
 fn binance_usdm_exchange_info_symbol_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
     format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/exchangeInfo?symbol={symbol}")
 }
 
 fn binance_usdm_premium_index_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
     format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/premiumIndex?symbol={symbol}")
 }
 
 fn binance_usdm_premium_index_all_url() -> String {
     format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/premiumIndex")
+}
+
+fn public_url_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn aster_spot_book_ticker_all_url() -> String {
@@ -27446,6 +28618,24 @@ fn aster_futures_book_ticker_url(symbol: &str) -> String {
     format!("{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/ticker/bookTicker?symbol={symbol}")
 }
 
+#[cfg(feature = "live-exec")]
+fn aster_futures_exchange_info_symbol_url(symbol: &str) -> String {
+    let symbol = public_url_query_component(symbol);
+    format!("{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/exchangeInfo?symbol={symbol}")
+}
+
+fn aster_spot_depth_url(symbol: &str) -> String {
+    format!(
+        "{ASTER_SPOT_REST_BASE_URL}/api/v3/depth?symbol={symbol}&limit={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
+}
+
+fn aster_futures_depth_url(symbol: &str) -> String {
+    format!(
+        "{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/depth?symbol={symbol}&limit={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
+}
+
 fn aster_futures_premium_index_all_url() -> String {
     format!("{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/premiumIndex")
 }
@@ -27456,6 +28646,12 @@ fn bybit_spot_tickers_url() -> String {
 
 fn bybit_linear_tickers_url() -> String {
     format!("{BYBIT_REST_BASE_URL}/v5/market/tickers?category=linear")
+}
+
+fn bybit_orderbook_url(category: &str, symbol: &str) -> String {
+    format!(
+        "{BYBIT_REST_BASE_URL}/v5/market/orderbook?category={category}&symbol={symbol}&limit={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
 }
 
 fn bybit_linear_instruments_info_url(cursor: Option<&str>) -> String {
@@ -27475,6 +28671,12 @@ fn bybit_linear_instrument_info_symbol_url(symbol: &str) -> String {
 
 fn okx_tickers_url(inst_type: &str) -> String {
     format!("{OKX_REST_BASE_URL}/api/v5/market/tickers?instType={inst_type}")
+}
+
+fn okx_order_book_url(inst_id: &str) -> String {
+    format!(
+        "{OKX_REST_BASE_URL}/api/v5/market/books?instId={inst_id}&sz={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
 }
 
 fn okx_mark_price_url() -> String {
@@ -27498,8 +28700,20 @@ fn bitget_spot_tickers_url() -> String {
     format!("{BITGET_REST_BASE_URL}/api/v2/spot/market/tickers")
 }
 
+fn bitget_spot_order_book_url(symbol: &str) -> String {
+    format!(
+        "{BITGET_REST_BASE_URL}/api/v2/spot/market/orderbook?symbol={symbol}&type=step0&limit={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
+}
+
 fn bitget_usdt_futures_tickers_url() -> String {
     format!("{BITGET_REST_BASE_URL}/api/v2/mix/market/tickers?productType=USDT-FUTURES")
+}
+
+fn bitget_usdt_futures_order_book_url(symbol: &str) -> String {
+    format!(
+        "{BITGET_REST_BASE_URL}/api/v2/mix/market/merge-depth?symbol={symbol}&productType=USDT-FUTURES&precision=scale0&limit={BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT}"
+    )
 }
 
 fn bitget_usdt_futures_funding_rate_url() -> String {
@@ -27515,11 +28729,316 @@ fn hyperliquid_info_request_body(request_type: &str) -> String {
     format!("{{\"type\":{}}}", json_string(request_type))
 }
 
+fn public_order_book_depth_url(venue: PublicOrderBookDepthVenue, symbol: &str) -> String {
+    match venue {
+        PublicOrderBookDepthVenue::BinanceSpot => binance_spot_depth_url(symbol),
+        PublicOrderBookDepthVenue::BinanceUsdmPerp => binance_usdm_depth_url(symbol),
+        PublicOrderBookDepthVenue::AsterSpot => aster_spot_depth_url(symbol),
+        PublicOrderBookDepthVenue::AsterUsdtFutures => aster_futures_depth_url(symbol),
+        PublicOrderBookDepthVenue::BybitSpot => bybit_orderbook_url("spot", symbol),
+        PublicOrderBookDepthVenue::BybitLinear => bybit_orderbook_url("linear", symbol),
+        PublicOrderBookDepthVenue::Okx => okx_order_book_url(symbol),
+        PublicOrderBookDepthVenue::BitgetSpot => bitget_spot_order_book_url(symbol),
+        PublicOrderBookDepthVenue::BitgetUsdtFutures => bitget_usdt_futures_order_book_url(symbol),
+    }
+}
+
+fn public_order_book_depth_venue_label(venue: PublicOrderBookDepthVenue) -> &'static str {
+    match venue {
+        PublicOrderBookDepthVenue::BinanceSpot => "Binance spot",
+        PublicOrderBookDepthVenue::BinanceUsdmPerp => "Binance USD-M perp",
+        PublicOrderBookDepthVenue::AsterSpot => "Aster spot",
+        PublicOrderBookDepthVenue::AsterUsdtFutures => "Aster USDT futures",
+        PublicOrderBookDepthVenue::BybitSpot => "Bybit spot",
+        PublicOrderBookDepthVenue::BybitLinear => "Bybit linear",
+        PublicOrderBookDepthVenue::Okx => "OKX",
+        PublicOrderBookDepthVenue::BitgetSpot => "Bitget spot",
+        PublicOrderBookDepthVenue::BitgetUsdtFutures => "Bitget USDT futures",
+    }
+}
+
+fn fetch_public_order_book_depth_map(
+    venue: PublicOrderBookDepthVenue,
+    symbols: &BTreeSet<String>,
+) -> PublicOrderBookDepthFetchReport {
+    let mut depths = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let symbols = symbols.iter().cloned().collect::<Vec<_>>();
+    for chunk in symbols.chunks(BASIS_MONITOR_DEPTH_FETCH_CONCURRENCY) {
+        let batch_results = thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|symbol| {
+                    let symbol = symbol.clone();
+                    scope.spawn(move || {
+                        let url = public_order_book_depth_url(venue, &symbol);
+                        let parsed = fetch_public_json_with_curl_max_time(
+                            &url,
+                            BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS,
+                        )
+                        .and_then(|raw| parse_public_order_book_depth(venue, &raw));
+                        match parsed {
+                            Ok(depth) => Ok((symbol, depth)),
+                            Err(error) => Err((symbol, error.to_string())),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Vec<_>>()
+        });
+        for result in batch_results {
+            match result {
+                Ok(Ok((symbol, depth))) => {
+                    depths.insert(symbol, depth);
+                }
+                Ok(Err((symbol, error))) => warnings.push(format!(
+                    "{} order-book depth unavailable for {symbol}: {error}",
+                    public_order_book_depth_venue_label(venue)
+                )),
+                Err(_) => warnings.push(format!(
+                    "{} order-book depth worker panicked",
+                    public_order_book_depth_venue_label(venue)
+                )),
+            }
+        }
+    }
+    PublicOrderBookDepthFetchReport {
+        depths,
+        warnings: summarize_public_order_book_depth_warnings(warnings),
+    }
+}
+
+fn summarize_public_order_book_depth_warnings(mut warnings: Vec<String>) -> Vec<String> {
+    if warnings.len() <= BASIS_MONITOR_DEPTH_WARNING_LIMIT {
+        return warnings;
+    }
+    let omitted_count = warnings.len() - BASIS_MONITOR_DEPTH_WARNING_LIMIT;
+    warnings.truncate(BASIS_MONITOR_DEPTH_WARNING_LIMIT);
+    warnings.push(format!(
+        "{omitted_count} additional order-book depth warnings omitted"
+    ));
+    warnings
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_public_order_book_depth(
+    venue: PublicOrderBookDepthVenue,
+    symbol: &str,
+) -> RuntimeResult<PublicOrderBookDepth> {
+    let url = public_order_book_depth_url(venue, symbol);
+    let raw = fetch_public_json_with_curl_max_time(&url, BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS)?;
+    parse_public_order_book_depth(venue, &raw)
+}
+
+fn parse_public_order_book_depth(
+    venue: PublicOrderBookDepthVenue,
+    input: &str,
+) -> RuntimeResult<PublicOrderBookDepth> {
+    match venue {
+        PublicOrderBookDepthVenue::BinanceSpot
+        | PublicOrderBookDepthVenue::BinanceUsdmPerp
+        | PublicOrderBookDepthVenue::AsterSpot
+        | PublicOrderBookDepthVenue::AsterUsdtFutures => {
+            parse_binance_style_order_book_depth(input, public_order_book_depth_venue_label(venue))
+        }
+        PublicOrderBookDepthVenue::BybitSpot | PublicOrderBookDepthVenue::BybitLinear => {
+            parse_bybit_order_book_depth(input, public_order_book_depth_venue_label(venue))
+        }
+        PublicOrderBookDepthVenue::Okx => {
+            parse_okx_order_book_depth(input, public_order_book_depth_venue_label(venue))
+        }
+        PublicOrderBookDepthVenue::BitgetSpot | PublicOrderBookDepthVenue::BitgetUsdtFutures => {
+            parse_bitget_order_book_depth(input, public_order_book_depth_venue_label(venue))
+        }
+    }
+}
+
+fn parse_binance_style_order_book_depth(
+    input: &str,
+    source: &'static str,
+) -> RuntimeResult<PublicOrderBookDepth> {
+    let fields = parse_json_object_value_slices(input)?;
+    let bids = fields
+        .get("bids")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing bids"),
+        })?;
+    let asks = fields
+        .get("asks")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing asks"),
+        })?;
+    Ok(PublicOrderBookDepth {
+        bid_depth: parse_order_book_depth_levels(bids, source, "bids")?,
+        ask_depth: parse_order_book_depth_levels(asks, source, "asks")?,
+    })
+}
+
+fn parse_bybit_order_book_depth(
+    input: &str,
+    source: &'static str,
+) -> RuntimeResult<PublicOrderBookDepth> {
+    let result_fields = bybit_response_result_fields(input, source)?;
+    let bids = result_fields
+        .get("b")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing result.b"),
+        })?;
+    let asks = result_fields
+        .get("a")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing result.a"),
+        })?;
+    Ok(PublicOrderBookDepth {
+        bid_depth: parse_order_book_depth_levels(bids, source, "b")?,
+        ask_depth: parse_order_book_depth_levels(asks, source, "a")?,
+    })
+}
+
+fn parse_okx_order_book_depth(
+    input: &str,
+    source: &'static str,
+) -> RuntimeResult<PublicOrderBookDepth> {
+    let object = okx_response_data_object_slices(input, source)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response has empty data"),
+        })?;
+    let fields = parse_json_object_value_slices(object)?;
+    let bids = fields
+        .get("bids")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing data[0].bids"),
+        })?;
+    let asks = fields
+        .get("asks")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing data[0].asks"),
+        })?;
+    Ok(PublicOrderBookDepth {
+        bid_depth: parse_order_book_depth_levels(bids, source, "bids")?,
+        ask_depth: parse_order_book_depth_levels(asks, source, "asks")?,
+    })
+}
+
+fn parse_bitget_order_book_depth(
+    input: &str,
+    source: &'static str,
+) -> RuntimeResult<PublicOrderBookDepth> {
+    let top_fields = parse_json_object_value_slices(input)?;
+    let code = required_json_value_string(&top_fields, "code", source)?;
+    if code != "00000" {
+        let msg = optional_json_value_string(&top_fields, "msg", source)?
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth returned code={code}, msg={msg}"),
+        });
+    }
+    let data = top_fields
+        .get("data")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing data"),
+        })?;
+    let fields = parse_json_object_value_slices(data)?;
+    let bids = fields
+        .get("bids")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing data.bids"),
+        })?;
+    let asks = fields
+        .get("asks")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} order-book depth response is missing data.asks"),
+        })?;
+    Ok(PublicOrderBookDepth {
+        bid_depth: parse_order_book_depth_levels(bids, source, "bids")?,
+        ask_depth: parse_order_book_depth_levels(asks, source, "asks")?,
+    })
+}
+
+fn parse_order_book_depth_levels(
+    value: &str,
+    source: &'static str,
+    side: &'static str,
+) -> RuntimeResult<Vec<SignalDepthLevel>> {
+    json_array_value_slices(value)?
+        .into_iter()
+        .map(|level| parse_order_book_depth_level(level, source, side))
+        .collect()
+}
+
+fn parse_order_book_depth_level(
+    level: &str,
+    source: &'static str,
+    side: &'static str,
+) -> RuntimeResult<SignalDepthLevel> {
+    let level = level.trim();
+    if level.starts_with('[') {
+        let fields = json_array_value_slices(level)?;
+        if fields.len() < 2 {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("{source} order-book {side} level lacks price or size"),
+            });
+        }
+        return Ok(SignalDepthLevel {
+            price: decode_json_scalar_string(fields[0], "order-book depth price")?,
+            size: decode_json_scalar_string(fields[1], "order-book depth size")?,
+        });
+    }
+    let fields = parse_json_object_value_slices(level)?;
+    Ok(SignalDepthLevel {
+        price: required_first_json_value_string(
+            &fields,
+            &["price", "px", "p"],
+            "order-book depth level",
+        )?,
+        size: required_first_json_value_string(
+            &fields,
+            &["size", "qty", "sz", "q"],
+            "order-book depth level",
+        )?,
+    })
+}
+
 const PUBLIC_MARKET_CURL_ATTEMPTS: usize = 3;
 const PUBLIC_MARKET_CURL_RETRY_SLEEP_MS: u64 = 250;
 const PUBLIC_MARKET_CURL_MAX_TIME_SECS: u64 = 10;
 const OKX_FUNDING_RATE_FETCH_CONCURRENCY: usize = 32;
 const OKX_FUNDING_RATE_CURL_MAX_TIME_SECS: u64 = 3;
+const BASIS_MONITOR_DEPTH_FETCH_CONCURRENCY: usize = 12;
+const BASIS_MONITOR_DEPTH_SYMBOL_LIMIT: usize = 12;
+const BASIS_MONITOR_DEPTH_WARNING_LIMIT: usize = 8;
+const BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS: u64 = 5;
+const BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT: usize = 20;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicOrderBookDepthVenue {
+    BinanceSpot,
+    BinanceUsdmPerp,
+    AsterSpot,
+    AsterUsdtFutures,
+    BybitSpot,
+    BybitLinear,
+    Okx,
+    BitgetSpot,
+    BitgetUsdtFutures,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicOrderBookDepth {
+    bid_depth: Vec<SignalDepthLevel>,
+    ask_depth: Vec<SignalDepthLevel>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicOrderBookDepthFetchReport {
+    depths: BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
+}
 
 fn public_market_curl_body(
     output: std::process::Output,
@@ -27567,12 +29086,49 @@ fn fetch_public_json_with_curl_max_time(url: &str, max_time_secs: u64) -> Runtim
         }
     }
     Err(RuntimeError::LiveMarketData {
-        message: format!(
-            "public market data GET failed after {} attempts: {}",
-            PUBLIC_MARKET_CURL_ATTEMPTS,
-            last_error.unwrap_or_else(|| "unknown curl error".to_owned())
+        message: public_market_get_failure_message(
+            url,
+            &last_error.unwrap_or_else(|| "unknown curl error".to_owned()),
         ),
     })
+}
+
+fn public_market_get_failure_message(url: &str, detail: &str) -> String {
+    format!(
+        "public market data GET failed after {} attempts; url={}: {}",
+        PUBLIC_MARKET_CURL_ATTEMPTS,
+        redact_public_market_url_for_log(url),
+        detail
+    )
+}
+
+fn redact_public_market_url_for_log(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    let redacted_query = query
+        .split('&')
+        .map(|part| {
+            let Some((name, _value)) = part.split_once('=') else {
+                return part.to_owned();
+            };
+            if public_market_query_name_is_sensitive(name) {
+                format!("{name}=<redacted>")
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{redacted_query}")
+}
+
+fn public_market_query_name_is_sensitive(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("key")
+        || lower.contains("secret")
+        || lower.contains("signature")
+        || lower.contains("token")
 }
 
 fn fetch_public_json_post_with_curl(url: &str, body: &str) -> RuntimeResult<String> {
@@ -27793,6 +29349,26 @@ struct MonitorBookTickerRow {
     bid_qty: String,
     ask_price: String,
     ask_qty: String,
+    bid_depth: Vec<SignalDepthLevel>,
+    ask_depth: Vec<SignalDepthLevel>,
+}
+
+fn monitor_book_ticker_row_with_top_depth(
+    symbol: String,
+    bid_price: String,
+    bid_qty: String,
+    ask_price: String,
+    ask_qty: String,
+) -> MonitorBookTickerRow {
+    MonitorBookTickerRow {
+        bid_depth: signal_depth_from_top_strings(&bid_price, &bid_qty),
+        ask_depth: signal_depth_from_top_strings(&ask_price, &ask_qty),
+        symbol,
+        bid_price,
+        bid_qty,
+        ask_price,
+        ask_qty,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27812,6 +29388,8 @@ struct BybitLinearTickerRow {
     bid_qty: String,
     ask_price: String,
     ask_qty: String,
+    bid_depth: Vec<SignalDepthLevel>,
+    ask_depth: Vec<SignalDepthLevel>,
     mark_price: String,
     index_price: String,
     last_funding_rate: String,
@@ -27826,6 +29404,8 @@ struct BitgetUsdtFuturesTickerRow {
     bid_qty: String,
     ask_price: String,
     ask_qty: String,
+    bid_depth: Vec<SignalDepthLevel>,
+    ask_depth: Vec<SignalDepthLevel>,
     mark_price: String,
     index_price: String,
 }
@@ -27854,6 +29434,8 @@ struct OkxTickerRow {
     bid_qty: String,
     ask_price: String,
     ask_qty: String,
+    bid_depth: Vec<SignalDepthLevel>,
+    ask_depth: Vec<SignalDepthLevel>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27899,13 +29481,13 @@ fn parse_book_ticker_rows(
         .into_iter()
         .map(|object| {
             let fields = parse_flat_json_object(object)?;
-            Ok(MonitorBookTickerRow {
-                symbol: required_json_string(&fields, "symbol", source_name)?,
-                bid_price: required_json_string(&fields, "bidPrice", source_name)?,
-                bid_qty: required_json_string(&fields, "bidQty", source_name)?,
-                ask_price: required_json_string(&fields, "askPrice", source_name)?,
-                ask_qty: required_json_string(&fields, "askQty", source_name)?,
-            })
+            Ok(monitor_book_ticker_row_with_top_depth(
+                required_json_string(&fields, "symbol", source_name)?,
+                required_json_string(&fields, "bidPrice", source_name)?,
+                required_json_string(&fields, "bidQty", source_name)?,
+                required_json_string(&fields, "askPrice", source_name)?,
+                required_json_string(&fields, "askQty", source_name)?,
+            ))
         })
         .collect()
 }
@@ -27942,13 +29524,13 @@ fn parse_bybit_spot_ticker_rows(input: &str) -> RuntimeResult<Vec<MonitorBookTic
         .into_iter()
         .map(|object| {
             let fields = parse_json_object_value_slices(object)?;
-            Ok(MonitorBookTickerRow {
-                symbol: required_json_value_string(&fields, "symbol", "bybit spot tickers")?,
-                bid_price: required_json_value_string(&fields, "bid1Price", "bybit spot tickers")?,
-                bid_qty: required_json_value_string(&fields, "bid1Size", "bybit spot tickers")?,
-                ask_price: required_json_value_string(&fields, "ask1Price", "bybit spot tickers")?,
-                ask_qty: required_json_value_string(&fields, "ask1Size", "bybit spot tickers")?,
-            })
+            Ok(monitor_book_ticker_row_with_top_depth(
+                required_json_value_string(&fields, "symbol", "bybit spot tickers")?,
+                required_json_value_string(&fields, "bid1Price", "bybit spot tickers")?,
+                required_json_value_string(&fields, "bid1Size", "bybit spot tickers")?,
+                required_json_value_string(&fields, "ask1Price", "bybit spot tickers")?,
+                required_json_value_string(&fields, "ask1Size", "bybit spot tickers")?,
+            ))
         })
         .collect()
 }
@@ -27972,6 +29554,8 @@ fn parse_bybit_linear_ticker_rows(input: &str) -> RuntimeResult<Vec<BybitLinearT
                     "bybit linear tickers",
                 )?,
                 ask_qty: required_json_value_string(&fields, "ask1Size", "bybit linear tickers")?,
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
                 mark_price: required_json_value_string(
                     &fields,
                     "markPrice",
@@ -28103,6 +29687,86 @@ fn parse_binance_usdm_quantity_step(input: &str, symbol: &str) -> RuntimeResult<
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_binance_usdm_price_tick(symbol: &str) -> RuntimeResult<Price> {
+    parse_binance_usdm_price_tick(
+        &fetch_public_json_with_curl(&binance_usdm_exchange_info_symbol_url(symbol))?,
+        symbol,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_binance_usdm_price_tick(input: &str, symbol: &str) -> RuntimeResult<Price> {
+    parse_exchange_info_price_filter_tick(
+        input,
+        symbol,
+        "Binance USD-M",
+        "binance usdm exchangeInfo",
+        "Binance tickSize",
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_aster_futures_price_tick(symbol: &str) -> RuntimeResult<Price> {
+    parse_aster_futures_price_tick(
+        &fetch_public_json_with_curl(&aster_futures_exchange_info_symbol_url(symbol))?,
+        symbol,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_aster_futures_price_tick(input: &str, symbol: &str) -> RuntimeResult<Price> {
+    parse_exchange_info_price_filter_tick(
+        input,
+        symbol,
+        "Aster Futures",
+        "aster futures exchangeInfo",
+        "Aster tickSize",
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_exchange_info_price_filter_tick(
+    input: &str,
+    symbol: &str,
+    venue_label: &'static str,
+    source: &'static str,
+    rule_field: &'static str,
+) -> RuntimeResult<Price> {
+    let top_fields = parse_json_object_value_slices(input)?;
+    let symbols = top_fields
+        .get("symbols")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{venue_label} exchangeInfo response is missing symbols"),
+        })?;
+    for object in json_object_slices(symbols)? {
+        let fields = parse_json_object_value_slices(object)?;
+        let row_symbol = required_json_value_string(&fields, "symbol", source)?;
+        if row_symbol != symbol {
+            continue;
+        }
+        let filters = fields
+            .get("filters")
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: format!("{venue_label} symbol `{symbol}` is missing filters"),
+            })?;
+        for filter in json_object_slices(filters)? {
+            let filter_fields = parse_json_object_value_slices(filter)?;
+            let filter_type = required_json_value_string(&filter_fields, "filterType", source)?;
+            if filter_type == "PRICE_FILTER" {
+                let tick_size = required_json_value_string(&filter_fields, "tickSize", source)?;
+                return parse_positive_price_rule(rule_field, &tick_size);
+            }
+        }
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{venue_label} symbol `{symbol}` is missing PRICE_FILTER"),
+        });
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("{venue_label} exchangeInfo does not contain `{symbol}`"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
 fn fetch_bybit_linear_quantity_step(symbol: &str) -> RuntimeResult<Quantity> {
     parse_bybit_linear_quantity_step(
         &fetch_public_json_with_curl(&bybit_linear_instrument_info_symbol_url(symbol))?,
@@ -28133,6 +29797,44 @@ fn parse_bybit_linear_quantity_step(input: &str, symbol: &str) -> RuntimeResult<
             "bybit linear instrument rules",
         )?;
         return parse_positive_quantity_rule("Bybit qtyStep", &qty_step);
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("Bybit linear instrument rules do not contain `{symbol}`"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_bybit_linear_price_tick(symbol: &str) -> RuntimeResult<Price> {
+    parse_bybit_linear_price_tick(
+        &fetch_public_json_with_curl(&bybit_linear_instrument_info_symbol_url(symbol))?,
+        symbol,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_bybit_linear_price_tick(input: &str, symbol: &str) -> RuntimeResult<Price> {
+    for object in
+        bybit_response_list_object_slices(input, "bybit linear instrument rules", "linear")?
+    {
+        let fields = parse_json_object_value_slices(object)?;
+        let row_symbol =
+            required_json_value_string(&fields, "symbol", "bybit linear instrument rules")?;
+        if row_symbol != symbol {
+            continue;
+        }
+        let price_filter =
+            fields
+                .get("priceFilter")
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("Bybit linear instrument `{symbol}` is missing priceFilter"),
+                })?;
+        let price_filter_fields = parse_json_object_value_slices(price_filter)?;
+        let tick_size = required_json_value_string(
+            &price_filter_fields,
+            "tickSize",
+            "bybit linear instrument rules",
+        )?;
+        return parse_positive_price_rule("Bybit tickSize", &tick_size);
     }
     Err(RuntimeError::LiveMarketData {
         message: format!("Bybit linear instrument rules do not contain `{symbol}`"),
@@ -28195,29 +29897,30 @@ fn parse_bitget_spot_ticker_rows(input: &str) -> RuntimeResult<Vec<MonitorBookTi
         .into_iter()
         .map(|object| {
             let fields = parse_json_object_value_slices(object)?;
-            Ok(MonitorBookTickerRow {
-                symbol: required_json_value_string(&fields, "symbol", "bitget spot tickers")?,
-                bid_price: required_first_bitget_ticker_value_string(
-                    &fields,
-                    &["bidPr", "bidPx", "bidPrice"],
-                    "bitget spot tickers",
-                )?,
-                bid_qty: required_first_bitget_ticker_value_string(
-                    &fields,
-                    &["bidSz", "bidSize", "bidQty"],
-                    "bitget spot tickers",
-                )?,
-                ask_price: required_first_bitget_ticker_value_string(
-                    &fields,
-                    &["askPr", "askPx", "askPrice"],
-                    "bitget spot tickers",
-                )?,
-                ask_qty: required_first_bitget_ticker_value_string(
-                    &fields,
-                    &["askSz", "askSize", "askQty"],
-                    "bitget spot tickers",
-                )?,
-            })
+            let symbol = required_json_value_string(&fields, "symbol", "bitget spot tickers")?;
+            let bid_price = required_first_bitget_ticker_value_string(
+                &fields,
+                &["bidPr", "bidPx", "bidPrice"],
+                "bitget spot tickers",
+            )?;
+            let bid_qty = required_first_bitget_ticker_value_string(
+                &fields,
+                &["bidSz", "bidSize", "bidQty"],
+                "bitget spot tickers",
+            )?;
+            let ask_price = required_first_bitget_ticker_value_string(
+                &fields,
+                &["askPr", "askPx", "askPrice"],
+                "bitget spot tickers",
+            )?;
+            let ask_qty = required_first_bitget_ticker_value_string(
+                &fields,
+                &["askSz", "askSize", "askQty"],
+                "bitget spot tickers",
+            )?;
+            Ok(monitor_book_ticker_row_with_top_depth(
+                symbol, bid_price, bid_qty, ask_price, ask_qty,
+            ))
         })
         .collect()
 }
@@ -28255,6 +29958,8 @@ fn parse_bitget_usdt_futures_ticker_rows(
                     &["askSz", "askSize", "askQty"],
                     "bitget usdt-futures tickers",
                 )?,
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
                 mark_price: required_first_bitget_ticker_value_string(
                     &fields,
                     &["markPrice", "markPr"],
@@ -28336,6 +30041,100 @@ fn parse_bitget_usdt_futures_quantity_step(input: &str, symbol: &str) -> Runtime
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_bitget_usdt_futures_price_tick(symbol: &str) -> RuntimeResult<Price> {
+    parse_bitget_usdt_futures_price_tick(
+        &fetch_public_json_with_curl(&bitget_usdt_futures_contract_config_url(symbol))?,
+        symbol,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_bitget_usdt_futures_price_tick(input: &str, symbol: &str) -> RuntimeResult<Price> {
+    for object in bitget_response_data_object_slices(input, "bitget usdt-futures contract rules")? {
+        let fields = parse_json_object_value_slices(object)?;
+        let row_symbol =
+            required_json_value_string(&fields, "symbol", "bitget usdt-futures contract rules")?;
+        if row_symbol != symbol {
+            continue;
+        }
+        if let Some(tick_size) = optional_first_json_value_string(
+            &fields,
+            &["tickSize", "priceTick", "priceStep"],
+            "bitget usdt-futures contract rules",
+        )? {
+            return parse_positive_price_rule("Bitget price tick", &tick_size);
+        }
+        let price_place = required_json_value_string(
+            &fields,
+            "pricePlace",
+            "bitget usdt-futures contract rules",
+        )?;
+        let price_end_step = optional_json_value_string(
+            &fields,
+            "priceEndStep",
+            "bitget usdt-futures contract rules",
+        )?
+        .unwrap_or_else(|| "1".to_owned());
+        return bitget_price_tick_from_place_and_end_step(&price_place, &price_end_step);
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("Bitget USDT-FUTURES contract rules do not contain `{symbol}`"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn bitget_price_tick_from_place_and_end_step(
+    price_place: &str,
+    price_end_step: &str,
+) -> RuntimeResult<Price> {
+    let place = price_place
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: format!("Bitget pricePlace `{price_place}` is not an integer"),
+        })?;
+    if place as usize > MonitorDecimal::SCALE_DIGITS {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Bitget pricePlace {place} exceeds supported scale {}",
+                MonitorDecimal::SCALE_DIGITS
+            ),
+        });
+    }
+    let step = price_end_step
+        .trim()
+        .parse::<u128>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: format!("Bitget priceEndStep `{price_end_step}` is not an integer"),
+        })?;
+    if step == 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("Bitget priceEndStep `{price_end_step}` must be greater than zero"),
+        });
+    }
+    let scale = 10_u128
+        .checked_pow(place)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "Bitget pricePlace overflowed while building price tick".to_owned(),
+        })?;
+    let tick = if place == 0 {
+        step.to_string()
+    } else {
+        let whole = step / scale;
+        let mut fraction = format!("{:0width$}", step % scale, width = place as usize);
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        if fraction.is_empty() {
+            whole.to_string()
+        } else {
+            format!("{whole}.{fraction}")
+        }
+    };
+    parse_positive_price_rule("Bitget pricePlace/priceEndStep", &tick)
+}
+
+#[cfg(feature = "live-exec")]
 fn fetch_hyperliquid_perp_quantity_step(symbol: &str) -> RuntimeResult<Quantity> {
     parse_hyperliquid_perp_quantity_step_from_meta_and_contexts(
         &fetch_public_json_post_with_curl(
@@ -28414,6 +30213,19 @@ fn parse_positive_quantity_rule(field: &'static str, value: &str) -> RuntimeResu
         });
     }
     Ok(quantity)
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_positive_price_rule(field: &'static str, value: &str) -> RuntimeResult<Price> {
+    let price = Price::from_str(value).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("{field} `{value}` is not a valid price: {error}"),
+    })?;
+    if price.atoms() <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{field} `{value}` must be greater than zero"),
+        });
+    }
+    Ok(price)
 }
 
 fn required_first_bitget_ticker_value_string(
@@ -28511,6 +30323,8 @@ fn parse_okx_ticker_rows(input: &str, source: &'static str) -> RuntimeResult<Vec
                 bid_qty: required_json_value_string(&fields, "bidSz", source)?,
                 ask_price: required_json_value_string(&fields, "askPx", source)?,
                 ask_qty: required_json_value_string(&fields, "askSz", source)?,
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
             })
         })
         .collect()
@@ -28535,6 +30349,31 @@ fn parse_okx_swap_quantity_step(input: &str, inst_id: &str) -> RuntimeResult<Qua
         }
         let lot_size = required_json_value_string(&fields, "lotSz", "okx swap instrument rules")?;
         return parse_positive_quantity_rule("OKX lotSz", &lot_size);
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!("OKX swap instrument rules do not contain `{inst_id}`"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_okx_swap_price_tick(inst_id: &str) -> RuntimeResult<Price> {
+    parse_okx_swap_price_tick(
+        &fetch_public_json_with_curl(&okx_swap_instrument_info_url(inst_id))?,
+        inst_id,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_okx_swap_price_tick(input: &str, inst_id: &str) -> RuntimeResult<Price> {
+    for object in okx_response_data_object_slices(input, "okx swap instrument rules")? {
+        let fields = parse_json_object_value_slices(object)?;
+        let row_inst_id =
+            required_json_value_string(&fields, "instId", "okx swap instrument rules")?;
+        if row_inst_id != inst_id {
+            continue;
+        }
+        let tick_size = required_json_value_string(&fields, "tickSz", "okx swap instrument rules")?;
+        return parse_positive_price_rule("OKX tickSz", &tick_size);
     }
     Err(RuntimeError::LiveMarketData {
         message: format!("OKX swap instrument rules do not contain `{inst_id}`"),
@@ -29806,6 +31645,8 @@ pub struct FundingArbMarketRow {
     pub venue_a_ask: String,
     pub venue_a_bid_qty: String,
     pub venue_a_ask_qty: String,
+    pub venue_a_bid_depth: Vec<SignalDepthLevel>,
+    pub venue_a_ask_depth: Vec<SignalDepthLevel>,
     pub venue_a_mark_price: String,
     pub venue_a_index_price: String,
     pub venue_a_funding_rate: String,
@@ -29815,6 +31656,8 @@ pub struct FundingArbMarketRow {
     pub venue_b_ask: String,
     pub venue_b_bid_qty: String,
     pub venue_b_ask_qty: String,
+    pub venue_b_bid_depth: Vec<SignalDepthLevel>,
+    pub venue_b_ask_depth: Vec<SignalDepthLevel>,
     pub venue_b_mark_price: String,
     pub venue_b_index_price: String,
     pub venue_b_funding_rate: String,
@@ -29882,6 +31725,8 @@ struct FundingArbVenueMarket {
     perp_ask: Option<String>,
     perp_bid_qty: Option<String>,
     perp_ask_qty: Option<String>,
+    perp_bid_depth: Vec<SignalDepthLevel>,
+    perp_ask_depth: Vec<SignalDepthLevel>,
     mark_price: Option<String>,
     index_price: Option<String>,
     funding_rate: String,
@@ -30848,6 +32693,7 @@ fn candidate_leg_exchange_rule_surface_present(leg: &TransitionLeg) -> bool {
         && leg.account_id.is_some()
         && leg.side.is_some()
         && candidate_leg_constraint_string(leg, "venue_symbol").is_some()
+        && candidate_leg_constraint_string(leg, "client_order_id").is_some()
         && candidate_leg_limit_price(leg).is_some()
         && candidate_leg_notional_usd(leg).is_some()
 }
@@ -30976,7 +32822,7 @@ fn funding_arb_execution_constraints(
             checked_exchange_rule_count += 1;
         } else {
             reasons.push(format!(
-                "funding-arb candidate leg `{}` lacks exchange-rule surface for venue symbol, side, price, quantity, and order type",
+                "funding-arb candidate leg `{}` lacks exchange-rule/reconciliation surface for venue symbol, side, price, quantity, notional, and client_order_id",
                 leg.leg_id.as_str()
             ));
         }
@@ -31948,7 +33794,23 @@ fn reconcile_funding_settlement_ledger_snapshot(
         });
     }
 
-    let expected = expected_gross_funding_usd(row, spec)?;
+    let expected = match expected_gross_funding_usd(row, spec) {
+        Ok(expected) => expected,
+        Err(error) if funding_arb_expected_funding_unavailable_can_hold(&error) => {
+            return Ok(FundingSettlementReconciliationSummary {
+                status: "Missing".to_owned(),
+                snapshot_updated_at: snapshot.updated_at.clone(),
+                expected_funding_usd: None,
+                actual_funding_usd: None,
+                difference_usd: None,
+                checked_entry_count: 0,
+                reason: Some(format!(
+                    "{source_label} expected funding cannot be computed; exit will hold or de-risk from private position state instead: {error}"
+                )),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let mut actual = MonitorDecimal { raw: 0 };
     let mut checked_entry_count = 0_usize;
     let venue_a_family = normalize_venue_family(&row.venue_a_family);
@@ -32009,6 +33871,18 @@ fn reconcile_funding_settlement_ledger_snapshot(
             )
         }),
     })
+}
+
+fn funding_arb_expected_funding_unavailable_can_hold(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Module { module, message }
+            if *module == "arb-runtime"
+                && (
+                    message == "funding arb row is missing gross_funding_spread_bps"
+                    || message == "funding arb row gross_funding_spread_bps must be an integer"
+                )
+    )
 }
 
 fn expected_gross_funding_usd(
@@ -33317,8 +35191,9 @@ fn generic_private_position_entries_from_raw_statement(
     statement: &FundingPrivateRawStatement,
     expected_symbol: &str,
 ) -> RuntimeResult<Vec<FundingPrivatePositionEntry>> {
+    let payload = private_position_payload_scope(&statement.payload_json)?;
     let mut object_slices = Vec::new();
-    collect_json_objects_recursive(&statement.payload_json, &mut object_slices)?;
+    collect_json_objects_recursive(payload, &mut object_slices)?;
     let mut positions = Vec::new();
     for object in object_slices {
         let fields = parse_json_object_value_slices(object)?;
@@ -33364,6 +35239,18 @@ fn generic_private_position_entries_from_raw_statement(
         });
     }
     Ok(positions)
+}
+
+fn private_position_payload_scope(payload: &str) -> RuntimeResult<&str> {
+    let trimmed = payload.trim();
+    if !trimmed.starts_with('{') {
+        return Ok(trimmed);
+    }
+    let fields = parse_json_object_value_slices(trimmed)?;
+    Ok(fields
+        .get("positions")
+        .map(|value| value.trim())
+        .unwrap_or(trimmed))
 }
 
 fn private_position_statement_can_imply_missing_symbol_is_flat(
@@ -34220,14 +36107,28 @@ fn run_funding_arb_resident_live_inner(
             .join(resident_cycle_dir_name(cycles)?);
 
         if options.execute_live {
-            let recovered_unknown_positions = recover_funding_arb_unknown_positions_for_exit(
-                &options,
-                &output_root,
-                cycles,
-                &cycle_dir,
-            )?;
+            let recovered_unknown_positions = if options.allow_unknown_recovery {
+                recover_funding_arb_unknown_positions_for_exit(
+                    &options,
+                    &output_root,
+                    cycles,
+                    &cycle_dir,
+                )?
+            } else {
+                let unknowns = load_funding_arb_unknown_position_recovery_records(&output_root)?;
+                if !unknowns.is_empty() {
+                    halt_reason = Some(format!(
+                        "{} unresolved funding arb unknown position(s) exist; startup recovery requires --allow-unknown-recovery",
+                        unknowns.len()
+                    ));
+                    break;
+                }
+                0
+            };
             let registry = load_funding_arb_resident_position_registry(&output_root)?;
-            for position in registry.active_positions() {
+            let active_positions = registry.active_positions();
+            let exit_position_count = active_positions.len();
+            for position in active_positions {
                 let exit_dir = output_root
                     .join("exit")
                     .join(&position.position_id)
@@ -34293,11 +36194,16 @@ fn run_funding_arb_resident_live_inner(
             if halt_reason.is_some() {
                 break;
             }
-            if recovered_unknown_positions > 0 {
-                halt_reason = Some(
+            if recovered_unknown_positions > 0
+                || (options.allow_unknown_recovery && exit_position_count > 0)
+            {
+                halt_reason = Some(if recovered_unknown_positions > 0 {
                     "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
-                        .to_owned(),
-                );
+                        .to_owned()
+                } else {
+                    "funding arb existing position recovery cycle completed; resident live stopped before new entries"
+                        .to_owned()
+                });
                 break;
             }
         }
@@ -34750,7 +36656,10 @@ fn run_funding_arb_guarded_live_canary_once_live(
                 .private_position_raw_snapshot_path
                 .as_deref(),
         )?;
-        apply_funding_arb_entry_time_in_force_ioc(dispatch_plan)?;
+        apply_funding_arb_entry_time_in_force_ioc(
+            dispatch_plan,
+            options.dry_run.slippage_buffer_bps,
+        )?;
         if let Some(reason) = funding_arb_live_dispatch_affordability_blocking_reason(
             &dry_run.private_accounts,
             dispatch_plan,
@@ -34777,6 +36686,8 @@ fn run_funding_arb_guarded_live_canary_once_live(
                     protection_suffix: &observed_at.unix_seconds().to_string(),
                     private_order_events: private_order_events.as_ref(),
                     order_query_event_prefix: "event:funding-arb-live-canary-order-query",
+                    slippage_buffer_bps: options.dry_run.slippage_buffer_bps,
+                    price_tick_resolver: funding_arb_price_tick_for_venue,
                 },
             )?;
             flat_after_cancel = outcome.flat_after_cancel;
@@ -35881,13 +37792,6 @@ fn funding_arb_resident_entry_capacity(
             "active funding arb position count is {active_count}; new entries wait for exit supervisor"
         )));
     }
-    if registry.live_entry_count() >= options.max_live_entries as usize {
-        return Ok(ResidentEntryCapacity::Blocked(format!(
-            "max live entries reached: {} >= {}",
-            registry.live_entry_count(),
-            options.max_live_entries
-        )));
-    }
     Ok(ResidentEntryCapacity::Allowed)
 }
 
@@ -36091,20 +37995,37 @@ fn run_funding_arb_resident_exit_cycle(
         message: error.to_string(),
     })?;
     let state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
-    let snapshot = load_funding_arb_resident_snapshot(options)?;
+    let snapshot = match load_funding_arb_resident_snapshot(options) {
+        Ok(snapshot) => snapshot,
+        Err(error) if funding_arb_exit_pre_dispatch_error_can_retry(&error) => {
+            return funding_arb_exit_cycle_blocked_before_dispatch(
+                &state,
+                output_dir,
+                "exit_market_snapshot_unavailable",
+                format!(
+                    "funding arb exit market snapshot unavailable before dispatch; exit will retry: {error}"
+                ),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let snapshot_path = output_dir.join("funding_arb_monitor_snapshot.json");
     write_utf8(snapshot_path.clone(), &snapshot.to_json())?;
-    let row = snapshot
+    let Some(row) = snapshot
         .rows
         .iter()
         .find(|row| row.pair_id == state.pair_id)
-        .ok_or_else(|| RuntimeError::Module {
-            module: "arb-runtime",
-            message: format!(
-                "funding arb exit snapshot does not contain active pair_id `{}`",
+    else {
+        return funding_arb_exit_cycle_blocked_before_dispatch(
+            &state,
+            output_dir,
+            "active_pair_missing_from_exit_snapshot",
+            format!(
+                "funding arb exit snapshot does not contain active pair_id `{}`; position remains open and exit will retry",
                 state.pair_id
             ),
-        })?;
+        );
+    };
     let spec = funding_arb_pipeline_spec_from_monitor_row(
         row,
         &funding_arb_resident_dry_run_options(
@@ -36114,7 +38035,7 @@ fn run_funding_arb_resident_exit_cycle(
             None,
         ),
     )?;
-    let private = run_funding_arb_private_readonly_snapshot_once(
+    let private = match run_funding_arb_private_readonly_snapshot_once(
         FundingArbPrivateReadonlySnapshotOnceOptions {
             config_path: options.config_path.clone(),
             snapshot_path,
@@ -36128,7 +38049,20 @@ fn run_funding_arb_resident_exit_cycle(
             aster_signer: options.aster_signer.clone(),
             aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
         },
-    )?;
+    ) {
+        Ok(private) => private,
+        Err(error) if funding_arb_private_readonly_error_is_unavailable(&error) => {
+            return funding_arb_exit_cycle_blocked_before_dispatch(
+                &state,
+                output_dir,
+                "private_readonly_snapshot_unavailable",
+                format!(
+                    "funding arb exit private read-only snapshot unavailable before dispatch; exit will retry: {error}"
+                ),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let position_raw_json = read_utf8(&private.position_raw_snapshot_path)?;
     let position_raw = parse_funding_private_raw_snapshot_json(
         &position_raw_json,
@@ -36190,13 +38124,13 @@ fn run_funding_arb_resident_exit_cycle(
         &spec,
         Some(&private.settlement_raw_snapshot_path),
     )?;
-    let leg_a = funding_arb_exit_leg_snapshot(
+    let mut leg_a = funding_arb_exit_leg_snapshot(
         row,
         &state.leg_a,
         &position_snapshot,
         options.slippage_buffer_bps,
     )?;
-    let leg_b = funding_arb_exit_leg_snapshot(
+    let mut leg_b = funding_arb_exit_leg_snapshot(
         row,
         &state.leg_b,
         &position_snapshot,
@@ -36213,25 +38147,15 @@ fn run_funding_arb_resident_exit_cycle(
         .into_iter()
         .filter(|required| *required)
         .count();
-    let decision = if !position_status.is_matched() {
-        reason_codes.push("private_position_unknown".to_owned());
-        blocking_reasons.push(position_status.reason.clone().unwrap_or_else(|| {
-            "funding arb exit private position snapshot is not matched".to_owned()
-        }));
-        "blocked".to_owned()
-    } else if close_required_count == 0 {
-        reason_codes.push("already_flat".to_owned());
-        "closed".to_owned()
-    } else if close_required_count != 2 {
-        reason_codes.push("position_imbalance".to_owned());
-        "emergency_de_risk".to_owned()
-    } else if settlement.is_matched() {
-        reason_codes.push("funding_settlement_matched".to_owned());
-        "close".to_owned()
-    } else {
-        reason_codes.push("waiting_for_funding_settlement".to_owned());
-        "hold".to_owned()
-    };
+    let decision = funding_arb_exit_cycle_decision(
+        position_status.is_matched(),
+        position_status.reason.as_deref(),
+        settlement.is_matched(),
+        close_required_count,
+        options.allow_unknown_recovery && state.plan_hash.is_none(),
+        &mut reason_codes,
+        &mut blocking_reasons,
+    );
 
     if matches!(decision.as_str(), "close" | "emergency_de_risk") {
         if !options.acknowledge_funding_arb_live_orders {
@@ -36240,6 +38164,22 @@ fn run_funding_arb_resident_exit_cycle(
                     .to_owned(),
             );
         } else {
+            if decision == "emergency_de_risk" {
+                let de_risk_slippage_buffer_bps =
+                    funding_arb_exit_emergency_de_risk_slippage_bps(options.slippage_buffer_bps);
+                leg_a = funding_arb_exit_leg_snapshot(
+                    row,
+                    &state.leg_a,
+                    &position_snapshot,
+                    de_risk_slippage_buffer_bps,
+                )?;
+                leg_b = funding_arb_exit_leg_snapshot(
+                    row,
+                    &state.leg_b,
+                    &position_snapshot,
+                    de_risk_slippage_buffer_bps,
+                )?;
+            }
             let config = arb_config::ArbConfig::from_path(&options.config_path)?;
             let signing_policy = signing_policy_from_config(&config)?;
             let private_order_events = state
@@ -36278,6 +38218,80 @@ fn run_funding_arb_resident_exit_cycle(
     };
     write_funding_arb_exit_cycle_artifacts(output_dir, &report, &receipts, &confirmations)?;
     Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_pre_dispatch_error_can_retry(error: &RuntimeError) -> bool {
+    matches!(error, RuntimeError::LiveMarketData { .. })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_cycle_blocked_before_dispatch(
+    state: &FundingArbPositionState,
+    output_dir: &Path,
+    reason_code: &str,
+    blocking_reason: String,
+) -> RuntimeResult<FundingArbExitCycleReport> {
+    let report = FundingArbExitCycleReport {
+        pair_id: state.pair_id.clone(),
+        symbol: state.symbol.clone(),
+        decision: "blocked".to_owned(),
+        reason_codes: vec![reason_code.to_owned()],
+        funding_settlement_status: "NotChecked".to_owned(),
+        private_position_status: "Unknown".to_owned(),
+        dispatch_attempted: false,
+        submitted_receipt_count: 0,
+        private_confirmation_count: 0,
+        residual_risk: Some(blocking_reason.clone()),
+        blocking_reasons: vec![blocking_reason],
+        output_dir: Some(output_dir.to_path_buf()),
+    };
+    write_funding_arb_exit_cycle_artifacts(output_dir, &report, &[], &[])?;
+    Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_emergency_de_risk_slippage_bps(configured_slippage_bps: i128) -> i128 {
+    configured_slippage_bps.max(FUNDING_ARB_EXIT_EMERGENCY_DE_RISK_SLIPPAGE_BPS)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_cycle_decision(
+    private_position_matched: bool,
+    private_position_reason: Option<&str>,
+    settlement_matched: bool,
+    close_required_count: usize,
+    unknown_recovery_exit: bool,
+    reason_codes: &mut Vec<String>,
+    blocking_reasons: &mut Vec<String>,
+) -> String {
+    if !private_position_matched {
+        reason_codes.push("private_position_unknown".to_owned());
+        blocking_reasons.push(
+            private_position_reason
+                .unwrap_or("funding arb exit private position snapshot is not matched")
+                .to_owned(),
+        );
+        return "blocked".to_owned();
+    }
+    if close_required_count == 0 {
+        reason_codes.push("already_flat".to_owned());
+        return "closed".to_owned();
+    }
+    if close_required_count != 2 {
+        reason_codes.push("position_imbalance".to_owned());
+        return "emergency_de_risk".to_owned();
+    }
+    if settlement_matched {
+        reason_codes.push("funding_settlement_matched".to_owned());
+        return "close".to_owned();
+    }
+    if unknown_recovery_exit {
+        reason_codes.push("unknown_recovery_settlement_bypass".to_owned());
+        return "emergency_de_risk".to_owned();
+    }
+    reason_codes.push("waiting_for_funding_settlement".to_owned());
+    "hold".to_owned()
 }
 
 #[cfg(feature = "live-exec")]
@@ -36479,35 +38493,50 @@ fn funding_arb_exit_close_price_with_slippage(
     close_side: OrderSide,
     slippage_buffer_bps: i128,
 ) -> RuntimeResult<Price> {
+    funding_arb_ioc_limit_price_with_slippage(
+        raw_price,
+        close_side,
+        slippage_buffer_bps,
+        "funding arb exit close price",
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_ioc_limit_price_with_slippage(
+    raw_price: &str,
+    side: OrderSide,
+    slippage_buffer_bps: i128,
+    context: &'static str,
+) -> RuntimeResult<Price> {
     if slippage_buffer_bps < 0 {
         return Err(RuntimeError::UnsafeConfig {
             message: format!(
-                "funding arb exit slippage_buffer_bps must be non-negative, got {slippage_buffer_bps}"
+                "{context} slippage_buffer_bps must be non-negative, got {slippage_buffer_bps}"
             ),
         });
     }
-    let price = MonitorDecimal::parse("funding_arb_exit_close_price", raw_price)?;
+    let price = MonitorDecimal::parse(context, raw_price)?;
     if price.raw <= 0 {
         return Err(RuntimeError::LiveMarketData {
-            message: format!("funding arb exit close price must be positive, got `{raw_price}`"),
+            message: format!("{context} must be positive, got `{raw_price}`"),
         });
     }
-    let multiplier = match close_side {
+    let multiplier = match side {
         OrderSide::Buy => 10_000_i128
             .checked_add(slippage_buffer_bps)
             .ok_or_else(|| RuntimeError::UnsafeConfig {
-                message: "funding arb exit buy slippage multiplier overflowed".to_owned(),
+                message: format!("{context} buy slippage multiplier overflowed"),
             })?,
         OrderSide::Sell => 10_000_i128
             .checked_sub(slippage_buffer_bps)
             .ok_or_else(|| RuntimeError::UnsafeConfig {
-                message: "funding arb exit sell slippage multiplier overflowed".to_owned(),
+                message: format!("{context} sell slippage multiplier overflowed"),
             })?,
     };
     if multiplier <= 0 {
         return Err(RuntimeError::UnsafeConfig {
             message: format!(
-                "funding arb exit sell slippage_buffer_bps must be below 10000, got {slippage_buffer_bps}"
+                "{context} sell slippage_buffer_bps must be below 10000, got {slippage_buffer_bps}"
             ),
         });
     }
@@ -36516,43 +38545,202 @@ fn funding_arb_exit_close_price_with_slippage(
             .raw
             .checked_mul(multiplier)
             .ok_or_else(|| RuntimeError::LiveMarketData {
-                message: "funding arb exit close price slippage overflowed".to_owned(),
+                message: format!("{context} slippage overflowed"),
             })?;
     let mut adjusted_raw = product / 10_000;
-    if close_side == OrderSide::Buy && product % 10_000 != 0 {
+    if side == OrderSide::Buy && product % 10_000 != 0 {
         adjusted_raw = adjusted_raw
             .checked_add(1)
             .ok_or_else(|| RuntimeError::LiveMarketData {
-                message: "funding arb exit close price slippage overflowed".to_owned(),
+                message: format!("{context} slippage overflowed"),
             })?;
     }
-    let fractional_digits =
-        decimal_fraction_digit_count("funding_arb_exit_close_price", raw_price)?;
+    let fractional_digits = decimal_fraction_digit_count(context, raw_price)?;
     let quantum = 10_i128.pow((MonitorDecimal::SCALE_DIGITS - fractional_digits) as u32);
     let remainder = adjusted_raw % quantum;
-    let quantized_raw = match close_side {
+    let quantized_raw = match side {
         OrderSide::Buy if remainder != 0 => adjusted_raw
             .checked_add(quantum - remainder)
             .ok_or_else(|| RuntimeError::LiveMarketData {
-                message: "funding arb exit close price tick rounding overflowed".to_owned(),
+                message: format!("{context} tick rounding overflowed"),
             })?,
         OrderSide::Buy => adjusted_raw,
         OrderSide::Sell => {
             adjusted_raw
                 .checked_sub(remainder)
                 .ok_or_else(|| RuntimeError::LiveMarketData {
-                    message: "funding arb exit close price tick rounding overflowed".to_owned(),
+                    message: format!("{context} tick rounding overflowed"),
                 })?
         }
     };
     if quantized_raw <= 0 {
         return Err(RuntimeError::LiveMarketData {
-            message: format!(
-                "funding arb exit close price became non-positive after slippage: `{raw_price}`"
-            ),
+            message: format!("{context} became non-positive after slippage: `{raw_price}`"),
         });
     }
     Price::from_str(&MonitorDecimal { raw: quantized_raw }.format_trimmed()).map_err(Into::into)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_quantize_limit_price_for_venue(
+    venue_id: &str,
+    instrument_id: &str,
+    price: Price,
+    side: OrderSide,
+) -> RuntimeResult<Price> {
+    funding_arb_quantize_limit_price_for_venue_with_resolver(
+        venue_id,
+        instrument_id,
+        price,
+        side,
+        funding_arb_price_tick_for_venue,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_quantize_limit_price_for_venue_with_resolver(
+    venue_id: &str,
+    instrument_id: &str,
+    price: Price,
+    side: OrderSide,
+    price_tick_resolver: FundingArbPriceTickResolver,
+) -> RuntimeResult<Price> {
+    match price_tick_resolver(venue_id, instrument_id)? {
+        Some((tick, context)) => quantize_price_to_tick(price, tick, side, context),
+        None => Ok(price),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_price_tick_for_venue(
+    venue_id: &str,
+    instrument_id: &str,
+) -> RuntimeResult<Option<(Price, &'static str)>> {
+    let tick = match venue_id {
+        BINANCE_BASIS_PERP_VENUE_ID => {
+            let symbol = funding_arb_symbol_from_instrument_id(
+                instrument_id,
+                "BINANCE",
+                "USDM-PERP",
+                "Binance funding arb tick-size instrument",
+            )?;
+            Some((
+                fetch_binance_usdm_price_tick(&symbol)?,
+                "Binance USD-M price tick",
+            ))
+        }
+        BYBIT_BASIS_PERP_VENUE_ID => {
+            let symbol = funding_arb_symbol_from_instrument_id(
+                instrument_id,
+                "BYBIT",
+                "LINEAR-PERP",
+                "Bybit funding arb tick-size instrument",
+            )?;
+            Some((fetch_bybit_linear_price_tick(&symbol)?, "Bybit price tick"))
+        }
+        OKX_BASIS_PERP_VENUE_ID => {
+            let inst_id = funding_arb_symbol_from_instrument_id(
+                instrument_id,
+                "OKX",
+                "SWAP",
+                "OKX funding arb tick-size instrument",
+            )?;
+            Some((fetch_okx_swap_price_tick(&inst_id)?, "OKX price tick"))
+        }
+        BITGET_BASIS_PERP_VENUE_ID => {
+            let symbol = funding_arb_symbol_from_instrument_id(
+                instrument_id,
+                "BITGET",
+                "USDT-FUTURES",
+                "Bitget funding arb tick-size instrument",
+            )?;
+            Some((
+                fetch_bitget_usdt_futures_price_tick(&symbol)?,
+                "Bitget price tick",
+            ))
+        }
+        ASTER_BASIS_PERP_VENUE_ID => {
+            let symbol = funding_arb_symbol_from_instrument_id(
+                instrument_id,
+                "ASTER",
+                "USDT-FUTURES",
+                "Aster funding arb tick-size instrument",
+            )?;
+            Some((fetch_aster_futures_price_tick(&symbol)?, "Aster price tick"))
+        }
+        _ => None,
+    };
+    Ok(tick)
+}
+
+#[cfg(feature = "live-exec")]
+fn quantize_price_to_tick(
+    price: Price,
+    tick: Price,
+    side: OrderSide,
+    context: &'static str,
+) -> RuntimeResult<Price> {
+    if tick.atoms() <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{context} must be greater than zero"),
+        });
+    }
+    let scale = price.scale().max(tick.scale());
+    let raw = rescale_price_atoms(price, scale)?;
+    let tick_raw = rescale_price_atoms(tick, scale)?;
+    if tick_raw <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{context} must be greater than zero"),
+        });
+    }
+    let quantized = match side {
+        OrderSide::Buy => {
+            let adjusted =
+                raw.checked_add(tick_raw - 1)
+                    .ok_or_else(|| RuntimeError::LiveMarketData {
+                        message: format!("{context} rounding overflowed"),
+                    })?;
+            adjusted
+                .checked_div(tick_raw)
+                .and_then(|multiple| multiple.checked_mul(tick_raw))
+        }
+        OrderSide::Sell => raw
+            .checked_div(tick_raw)
+            .and_then(|multiple| multiple.checked_mul(tick_raw)),
+    }
+    .ok_or_else(|| RuntimeError::LiveMarketData {
+        message: format!("{context} rounding overflowed"),
+    })?;
+    if quantized <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("price {price} is below {context} {tick}"),
+        });
+    }
+    Price::from_str(&format_scaled_atoms_trimmed(quantized, scale)).map_err(|error| {
+        RuntimeError::LiveMarketData {
+            message: format!("tick-aligned price is invalid: {error}"),
+        }
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn rescale_price_atoms(price: Price, target_scale: u32) -> RuntimeResult<i128> {
+    let scale_delta =
+        target_scale
+            .checked_sub(price.scale())
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "price target scale is lower than current scale".to_owned(),
+            })?;
+    let multiplier =
+        checked_pow10_i128(scale_delta).ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "price scale overflowed while applying venue tick size".to_owned(),
+        })?;
+    price
+        .atoms()
+        .checked_mul(multiplier)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "price overflowed while applying venue tick size".to_owned(),
+        })
 }
 
 #[cfg(feature = "live-exec")]
@@ -36607,6 +38795,7 @@ fn execute_funding_arb_exit_close_orders(
             position_modes.bitget,
             position_modes.aster,
         )?;
+        let planned = funding_arb_exit_close_planned_order_with_venue_tick(planned)?;
         outcome
             .protection
             .record_action(format!("funding_exit_close:{}", leg.leg.role));
@@ -36628,41 +38817,161 @@ fn execute_funding_arb_exit_close_orders(
                 continue;
             }
         };
-        match confirm_planned_receipt_with_private_stream_or_order_query(
+        confirm_funding_arb_exit_close_with_market_retry(
             &mut adapter,
             &planned,
             &receipt,
-            "funding-exit-close",
+            leg,
             private_order_events,
             market,
-            "event:funding-arb-exit-order-query",
-        ) {
-            Ok(update) => {
-                if update.status != OrderConfirmationStatus::Filled {
-                    outcome.protection.record_residual_risk(format!(
-                        "funding exit close on {} returned `{}`",
-                        leg.leg.venue_family,
-                        update.status.as_str()
-                    ));
-                }
-                outcome.confirmations.push(private_confirmation_from_update(
-                    &planned.plan_leg_id,
-                    &update,
-                ));
-            }
-            Err(error) => {
-                outcome.blocking_reasons.push(format!(
-                    "funding exit close confirmation failed for {}: {error}",
-                    leg.leg.venue_family
-                ));
+            &mut outcome,
+        )?;
+    }
+    Ok(outcome)
+}
+
+#[cfg(feature = "live-exec")]
+fn confirm_funding_arb_exit_close_with_market_retry<A>(
+    adapter: &mut A,
+    planned: &PlannedSubmitOrder,
+    receipt: &MutableActionReceipt,
+    leg: &FundingArbExitLegSnapshot,
+    private_order_events: Option<&PrivateOrderEventStore>,
+    market: PrivateOrderMarket,
+    outcome: &mut BasisLiveExecutionOutcome,
+) -> RuntimeResult<()>
+where
+    A: SubmitOrder + ConfirmOrderStatus,
+{
+    let update = match confirm_planned_receipt_with_private_stream_or_order_query(
+        adapter,
+        planned,
+        receipt,
+        "funding-exit-close",
+        private_order_events,
+        market,
+        "event:funding-arb-exit-order-query",
+    ) {
+        Ok(update) => {
+            outcome.confirmations.push(private_confirmation_from_update(
+                &planned.plan_leg_id,
+                &update,
+            ));
+            update
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "funding exit close confirmation failed for {}: {error}",
+                leg.leg.venue_family
+            ));
+            outcome.protection.record_residual_risk(format!(
+                "funding exit close state is unknown for {}; private reconciliation is required",
+                leg.leg.venue_family
+            ));
+            return Ok(());
+        }
+    };
+    if update.status == OrderConfirmationStatus::Filled {
+        return Ok(());
+    }
+    if !funding_arb_exit_close_update_allows_market_retry(&update) {
+        outcome.protection.record_residual_risk(format!(
+            "funding exit close on {} returned `{}`",
+            leg.leg.venue_family,
+            update.status.as_str()
+        ));
+        return Ok(());
+    }
+
+    let retry = funding_arb_exit_close_market_retry_planned_order(planned)?;
+    outcome
+        .protection
+        .record_action(format!("funding_exit_close_market_retry:{}", leg.leg.role));
+    let retry_receipt = match adapter.submit_order(retry.request.clone()) {
+        Ok(receipt) => {
+            outcome.protection.record_receipt();
+            outcome.receipts.push(receipt.clone());
+            receipt
+        }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "funding exit close market retry submit failed for {} after `{}`: {error}",
+                leg.leg.venue_family,
+                update.status.as_str()
+            ));
+            outcome.protection.record_residual_risk(format!(
+                "funding exit close on {} returned `{}` and market retry submit failed; manual close is required",
+                leg.leg.venue_family,
+                update.status.as_str()
+            ));
+            return Ok(());
+        }
+    };
+    match confirm_planned_receipt_with_private_stream_or_order_query(
+        adapter,
+        &retry,
+        &retry_receipt,
+        "funding-exit-close-market-retry",
+        private_order_events,
+        market,
+        "event:funding-arb-exit-order-query",
+    ) {
+        Ok(retry_update) => {
+            let retry_status = retry_update.status;
+            outcome.confirmations.push(private_confirmation_from_update(
+                &retry.plan_leg_id,
+                &retry_update,
+            ));
+            if retry_status != OrderConfirmationStatus::Filled {
                 outcome.protection.record_residual_risk(format!(
-                    "funding exit close state is unknown for {}; private reconciliation is required",
-                    leg.leg.venue_family
+                    "funding exit close on {} returned `{}` and market retry returned `{}`",
+                    leg.leg.venue_family,
+                    update.status.as_str(),
+                    retry_status.as_str()
                 ));
             }
         }
+        Err(error) => {
+            outcome.blocking_reasons.push(format!(
+                "funding exit close market retry confirmation failed for {} after `{}`: {error}",
+                leg.leg.venue_family,
+                update.status.as_str()
+            ));
+            outcome.protection.record_residual_risk(format!(
+                "funding exit close on {} returned `{}` and market retry state is unknown; private reconciliation is required",
+                leg.leg.venue_family,
+                update.status.as_str()
+            ));
+        }
     }
-    Ok(outcome)
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_update_allows_market_retry(update: &PrivateOrderUpdate) -> bool {
+    matches!(
+        update.status,
+        OrderConfirmationStatus::Cancelled
+            | OrderConfirmationStatus::Rejected
+            | OrderConfirmationStatus::Expired
+    ) && !private_order_update_has_positive_fill(update)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_market_retry_planned_order(
+    planned: &PlannedSubmitOrder,
+) -> RuntimeResult<PlannedSubmitOrder> {
+    let mut retry = planned.clone();
+    retry.plan_leg_id = format!("{}:market-retry", planned.plan_leg_id);
+    retry.request.order_type = MutableOrderType::Market;
+    retry.request.time_in_force = None;
+    retry.request.limit_price = None;
+    retry.request.client_order_id = None;
+    retry.request.idempotency_key = ExecIdempotencyKey::new(format!(
+        "{}:market-retry",
+        planned.request.idempotency_key.as_str()
+    ))?;
+    Ok(retry)
 }
 
 #[cfg(feature = "live-exec")]
@@ -36694,8 +39003,7 @@ fn funding_arb_exit_close_planned_order(
             leg.leg.venue_family, leg.leg.role
         ))?,
     )
-    .with_time_in_force(MutableTimeInForce::Ioc)
-    .with_reduce_only(true);
+    .with_time_in_force(MutableTimeInForce::Ioc);
     if leg.leg.venue_id == BINANCE_BASIS_PERP_VENUE_ID
         && binance_position_mode == FundingArbBinancePositionMode::Hedge
     {
@@ -36736,6 +39044,12 @@ fn funding_arb_exit_close_planned_order(
             "funding arb Aster exit close",
         )?);
     }
+    if funding_arb_close_request_should_send_reduce_only(
+        request.venue_id.as_str(),
+        request.position_side,
+    ) {
+        request = request.with_reduce_only(true);
+    }
     Ok(PlannedSubmitOrder {
         plan_leg_id: format!(
             "pleg:funding-arb-exit:{}:{}:{suffix}",
@@ -36746,6 +39060,29 @@ fn funding_arb_exit_close_planned_order(
         notional_usd: Amount::from_str("0")?,
         request,
     })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_planned_order_with_venue_tick(
+    mut planned: PlannedSubmitOrder,
+) -> RuntimeResult<PlannedSubmitOrder> {
+    if let Some(limit_price) = planned.request.limit_price {
+        planned.request.limit_price = Some(funding_arb_quantize_limit_price_for_venue(
+            planned.request.venue_id.as_str(),
+            planned.request.instrument_id.as_str(),
+            limit_price,
+            planned.request.side,
+        )?);
+    }
+    Ok(planned)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_close_request_should_send_reduce_only(
+    venue_id: &str,
+    position_side: Option<PerpPositionSide>,
+) -> bool {
+    !(venue_id == BINANCE_BASIS_PERP_VENUE_ID && position_side.is_some())
 }
 
 #[cfg(feature = "live-exec")]
@@ -37100,7 +39437,8 @@ fn write_funding_arb_resident_live_config(
     options: &FundingArbResidentLiveOptions,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_live_entries\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
+        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_live_entries\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
+        options.allow_unknown_recovery,
         json_string(&options.aster_signer_cmd_env),
         optional_json_string(options.aster_user.as_deref()),
         json_string(&options.config_path.display().to_string()),
@@ -37694,7 +40032,7 @@ pub fn basis_monitor_row_to_normalized_events(
     let next_funding_time_ms =
         required_monitor_row_text(row, "next_funding_time_ms", &row.next_funding_time_ms)?;
 
-    let spot = monitor_book_ticker_event_json(
+    let spot = monitor_book_ticker_event_json_with_depth(
         &format!("{event_prefix}:spot-book"),
         &correlation_id,
         &format!("{source_prefix}:spot-book"),
@@ -37709,8 +40047,10 @@ pub fn basis_monitor_row_to_normalized_events(
         spot_ask,
         spot_bid_qty,
         spot_ask_qty,
+        &row.spot_bid_depth,
+        &row.spot_ask_depth,
     );
-    let perp = monitor_book_ticker_event_json(
+    let perp = monitor_book_ticker_event_json_with_depth(
         &format!("{event_prefix}:perp-book"),
         &correlation_id,
         &format!("{source_prefix}:perp-book"),
@@ -37725,6 +40065,8 @@ pub fn basis_monitor_row_to_normalized_events(
         perp_ask,
         perp_bid_qty,
         perp_ask_qty,
+        &row.perp_bid_depth,
+        &row.perp_ask_depth,
     );
     let premium = monitor_premium_index_event_json(
         &format!("{event_prefix}:premium"),
@@ -37815,9 +40157,11 @@ fn funding_arb_monitor_row_to_normalized_events(
             long_best_bid: row.venue_a_bid.clone(),
             long_best_ask: row.venue_a_ask.clone(),
             long_ask_size: Some(row.venue_a_ask_qty.clone()),
+            long_ask_depth: row.venue_a_ask_depth.clone(),
             short_best_bid: row.venue_b_bid.clone(),
             short_best_ask: row.venue_b_ask.clone(),
             short_bid_size: Some(row.venue_b_bid_qty.clone()),
+            short_bid_depth: row.venue_b_bid_depth.clone(),
             long_funding_rate: row.venue_a_funding_rate.clone(),
             short_funding_rate: row.venue_b_funding_rate.clone(),
             funding_interval_hours: row.venue_a_funding_interval_hours.clone(),
@@ -37843,9 +40187,11 @@ fn funding_arb_monitor_row_to_normalized_events(
             long_best_bid: row.venue_b_bid.clone(),
             long_best_ask: row.venue_b_ask.clone(),
             long_ask_size: Some(row.venue_b_ask_qty.clone()),
+            long_ask_depth: row.venue_b_ask_depth.clone(),
             short_best_bid: row.venue_a_bid.clone(),
             short_best_ask: row.venue_a_ask.clone(),
             short_bid_size: Some(row.venue_a_bid_qty.clone()),
+            short_bid_depth: row.venue_a_bid_depth.clone(),
             long_funding_rate: row.venue_b_funding_rate.clone(),
             short_funding_rate: row.venue_a_funding_rate.clone(),
             funding_interval_hours: row.venue_b_funding_interval_hours.clone(),
@@ -37897,7 +40243,7 @@ fn funding_arb_monitor_row_to_normalized_events(
         spec.strategy_config.instance.strategy_id, symbol_component
     );
 
-    let venue_a_book = monitor_book_ticker_event_json(
+    let venue_a_book = monitor_book_ticker_event_json_with_depth(
         &format!("{event_prefix}:venue-a-book"),
         &correlation_id,
         &format!("{source_prefix}:venue-a-book"),
@@ -37912,8 +40258,10 @@ fn funding_arb_monitor_row_to_normalized_events(
         &row.venue_a_ask,
         &row.venue_a_bid_qty,
         &row.venue_a_ask_qty,
+        &row.venue_a_bid_depth,
+        &row.venue_a_ask_depth,
     );
-    let venue_b_book = monitor_book_ticker_event_json(
+    let venue_b_book = monitor_book_ticker_event_json_with_depth(
         &format!("{event_prefix}:venue-b-book"),
         &correlation_id,
         &format!("{source_prefix}:venue-b-book"),
@@ -37928,6 +40276,8 @@ fn funding_arb_monitor_row_to_normalized_events(
         &row.venue_b_ask,
         &row.venue_b_bid_qty,
         &row.venue_b_ask_qty,
+        &row.venue_b_bid_depth,
+        &row.venue_b_ask_depth,
     );
     let venue_a_premium = funding_monitor_premium_index_event_json(
         &format!("{event_prefix}:venue-a-premium"),
@@ -38003,6 +40353,7 @@ fn required_monitor_row_text<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn monitor_book_ticker_event_json(
     event_id: &str,
     correlation_id: &str,
@@ -38019,16 +40370,59 @@ fn monitor_book_ticker_event_json(
     bid_size: &str,
     ask_size: &str,
 ) -> String {
+    monitor_book_ticker_event_json_with_depth(
+        event_id,
+        correlation_id,
+        source_sequence,
+        checksum,
+        observed_at,
+        venue_id,
+        instrument_id,
+        basis_role,
+        venue_symbol,
+        market,
+        best_bid,
+        best_ask,
+        bid_size,
+        ask_size,
+        &signal_depth_from_top_strings(best_bid, bid_size),
+        &signal_depth_from_top_strings(best_ask, ask_size),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_book_ticker_event_json_with_depth(
+    event_id: &str,
+    correlation_id: &str,
+    source_sequence: &str,
+    checksum: &str,
+    observed_at: &str,
+    venue_id: &str,
+    instrument_id: &str,
+    basis_role: &str,
+    venue_symbol: &str,
+    market: &str,
+    best_bid: &str,
+    best_ask: &str,
+    bid_size: &str,
+    ask_size: &str,
+    bid_depth: &[SignalDepthLevel],
+    ask_depth: &[SignalDepthLevel],
+) -> String {
+    let bid_depth_json = signal_depth_levels_json(bid_depth);
+    let ask_depth_json = signal_depth_levels_json(ask_depth);
     format!(
-        r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"basis-monitor","ask_size":{},"basis_role":{},"best_ask":{},"best_bid":{},"bid_size":{},"freshness":"Fresh","kind":"BookTicker","market":{},"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"basis-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
+        r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"basis-monitor","ask_depth_levels":{},"ask_size":{},"basis_role":{},"best_ask":{},"best_bid":{},"bid_depth_levels":{},"bid_size":{},"freshness":"Fresh","kind":"BookTicker","market":{},"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"basis-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
         json_string(checksum),
         json_string(correlation_id),
         json_string(event_id),
         json_string(instrument_id),
+        ask_depth_json,
         json_string(ask_size),
         json_string(basis_role),
         json_string(best_ask),
         json_string(best_bid),
+        bid_depth_json,
         json_string(bid_size),
         json_string(market),
         json_string(venue_symbol),
@@ -38835,14 +41229,20 @@ fn write_binance_basis_guarded_live_auto_market_artifacts(
         &perp_instrument_id,
         "Binance basis premium index",
     )?;
+    let spot_depth =
+        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BinanceSpot, &symbol)?;
+    let perp_depth =
+        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BinanceUsdmPerp, &symbol)?;
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
         spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
         spot_best_ask: payload_string(spot, "best_ask")?.to_owned(),
         spot_ask_size: Some(payload_string(spot, "ask_size")?.to_owned()),
+        spot_ask_depth: spot_depth.ask_depth.clone(),
         perp_best_bid: payload_string(perp, "best_bid")?.to_owned(),
         perp_best_ask: payload_string(perp, "best_ask")?.to_owned(),
         perp_bid_size: Some(payload_string(perp, "bid_size")?.to_owned()),
+        perp_bid_depth: perp_depth.bid_depth.clone(),
         last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
         spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
@@ -38920,14 +41320,19 @@ fn write_bybit_basis_guarded_live_auto_market_artifacts(
         &perp_instrument_id,
         "Bybit basis premium index",
     )?;
+    let spot_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::BybitSpot, &symbol)?;
+    let perp_depth =
+        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BybitLinear, &symbol)?;
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
         spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
         spot_best_ask: payload_string(spot, "best_ask")?.to_owned(),
         spot_ask_size: Some(payload_string(spot, "ask_size")?.to_owned()),
+        spot_ask_depth: spot_depth.ask_depth.clone(),
         perp_best_bid: payload_string(perp, "best_bid")?.to_owned(),
         perp_best_ask: payload_string(perp, "best_ask")?.to_owned(),
         perp_bid_size: Some(payload_string(perp, "bid_size")?.to_owned()),
+        perp_bid_depth: perp_depth.bid_depth.clone(),
         last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
         spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
@@ -39021,15 +41426,20 @@ fn write_bitget_basis_guarded_live_auto_market_artifacts(
                 inputs.usdt_futures_funding_rate_ref, symbol
             ),
         })?;
+    let spot_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::BitgetSpot, &symbol)?;
+    let futures_depth =
+        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BitgetUsdtFutures, &symbol)?;
 
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
         spot_best_bid: spot.bid_price.clone(),
         spot_best_ask: spot.ask_price.clone(),
         spot_ask_size: Some(spot.ask_qty.clone()),
+        spot_ask_depth: spot_depth.ask_depth.clone(),
         perp_best_bid: perp.bid_price.clone(),
         perp_best_ask: perp.ask_price.clone(),
         perp_bid_size: Some(perp.bid_qty.clone()),
+        perp_bid_depth: futures_depth.bid_depth.clone(),
         last_funding_rate: funding.funding_rate.clone(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
         spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
@@ -39051,38 +41461,44 @@ fn write_bitget_basis_guarded_live_auto_market_artifacts(
         "corr:bitget:basis-live:{}:{sequence}",
         basis_identifier_component(&symbol)
     );
-    let spot_event = from_json_strict::<NormalizedEvent>(&monitor_book_ticker_event_json(
-        &spot_event_id,
-        &correlation_id,
-        &format!("bitget:spot-ticker:{sequence}"),
-        &format!("hash:bitget:spot-ticker:{sequence}"),
-        &observed_at,
-        BITGET_BASIS_SPOT_VENUE_ID,
-        &spot_instrument_id,
-        "Spot",
-        &symbol,
-        "Spot",
-        &spot.bid_price,
-        &spot.ask_price,
-        &spot.bid_qty,
-        &spot.ask_qty,
-    ))?;
-    let perp_event = from_json_strict::<NormalizedEvent>(&monitor_book_ticker_event_json(
-        &perp_event_id,
-        &correlation_id,
-        &format!("bitget:usdt-futures-ticker:{sequence}"),
-        &format!("hash:bitget:usdt-futures-ticker:{sequence}"),
-        &observed_at,
-        BITGET_BASIS_PERP_VENUE_ID,
-        &perp_instrument_id,
-        "Perp",
-        &symbol,
-        "Perp",
-        &perp.bid_price,
-        &perp.ask_price,
-        &perp.bid_qty,
-        &perp.ask_qty,
-    ))?;
+    let spot_event =
+        from_json_strict::<NormalizedEvent>(&monitor_book_ticker_event_json_with_depth(
+            &spot_event_id,
+            &correlation_id,
+            &format!("bitget:spot-ticker:{sequence}"),
+            &format!("hash:bitget:spot-ticker:{sequence}"),
+            &observed_at,
+            BITGET_BASIS_SPOT_VENUE_ID,
+            &spot_instrument_id,
+            "Spot",
+            &symbol,
+            "Spot",
+            &spot.bid_price,
+            &spot.ask_price,
+            &spot.bid_qty,
+            &spot.ask_qty,
+            &spot_depth.bid_depth,
+            &spot_depth.ask_depth,
+        ))?;
+    let perp_event =
+        from_json_strict::<NormalizedEvent>(&monitor_book_ticker_event_json_with_depth(
+            &perp_event_id,
+            &correlation_id,
+            &format!("bitget:usdt-futures-ticker:{sequence}"),
+            &format!("hash:bitget:usdt-futures-ticker:{sequence}"),
+            &observed_at,
+            BITGET_BASIS_PERP_VENUE_ID,
+            &perp_instrument_id,
+            "Perp",
+            &symbol,
+            "Perp",
+            &perp.bid_price,
+            &perp.ask_price,
+            &perp.bid_qty,
+            &perp.ask_qty,
+            &futures_depth.bid_depth,
+            &futures_depth.ask_depth,
+        ))?;
     let premium_event = from_json_strict::<NormalizedEvent>(&monitor_premium_index_event_json(
         &premium_event_id,
         &correlation_id,
@@ -39210,15 +41626,19 @@ fn write_okx_basis_guarded_live_auto_market_artifacts(
                 inputs.funding_rate_ref
             ),
         })?;
+    let spot_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::Okx, &symbol)?;
+    let swap_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::Okx, &swap_inst_id)?;
 
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
         spot_best_bid: spot.bid_price.clone(),
         spot_best_ask: spot.ask_price.clone(),
         spot_ask_size: Some(spot.ask_qty.clone()),
+        spot_ask_depth: spot_depth.ask_depth.clone(),
         perp_best_bid: swap.bid_price.clone(),
         perp_best_ask: swap.ask_price.clone(),
         perp_bid_size: Some(swap.bid_qty.clone()),
+        perp_bid_depth: swap_depth.bid_depth.clone(),
         last_funding_rate: funding.funding_rate.clone(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
         spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
@@ -39758,7 +42178,8 @@ fn binance_basis_guarded_live_candidate(
             context.next_funding_time_ms
         )),
         liquidity_summary = json_string(&format!(
-            "top_of_book_depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            "depth_vwap: liquidity_model={}, spot_ask_depth_usd={}, perp_bid_depth_usd={}, spot_ask_vwap={}, perp_bid_vwap={}, required_notional_usd={}",
+            context.signal.liquidity_model,
             context
                 .signal
                 .spot_ask_depth_usd
@@ -39767,6 +42188,16 @@ fn binance_basis_guarded_live_candidate(
             context
                 .signal
                 .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .spot_ask_vwap
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .perp_bid_vwap
                 .as_deref()
                 .unwrap_or("missing"),
             context.signal.liquidity_required_usd
@@ -40047,7 +42478,8 @@ fn bybit_basis_guarded_live_candidate(
             context.next_funding_time_ms
         )),
         liquidity_summary = json_string(&format!(
-            "top_of_book_depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            "depth_vwap: liquidity_model={}, spot_ask_depth_usd={}, perp_bid_depth_usd={}, spot_ask_vwap={}, perp_bid_vwap={}, required_notional_usd={}",
+            context.signal.liquidity_model,
             context
                 .signal
                 .spot_ask_depth_usd
@@ -40056,6 +42488,16 @@ fn bybit_basis_guarded_live_candidate(
             context
                 .signal
                 .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .spot_ask_vwap
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .perp_bid_vwap
                 .as_deref()
                 .unwrap_or("missing"),
             context.signal.liquidity_required_usd
@@ -40336,7 +42778,8 @@ fn bitget_basis_guarded_live_candidate(
             context.next_funding_time_ms
         )),
         liquidity_summary = json_string(&format!(
-            "top_of_book_depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            "depth_vwap: liquidity_model={}, spot_ask_depth_usd={}, perp_bid_depth_usd={}, spot_ask_vwap={}, perp_bid_vwap={}, required_notional_usd={}",
+            context.signal.liquidity_model,
             context
                 .signal
                 .spot_ask_depth_usd
@@ -40345,6 +42788,16 @@ fn bitget_basis_guarded_live_candidate(
             context
                 .signal
                 .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .spot_ask_vwap
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .perp_bid_vwap
                 .as_deref()
                 .unwrap_or("missing"),
             context.signal.liquidity_required_usd
@@ -40579,7 +43032,8 @@ fn okx_basis_guarded_live_candidate(
             context.next_funding_time_ms
         )),
         liquidity_summary = json_string(&format!(
-            "top_of_book_depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
+            "depth_vwap: liquidity_model={}, spot_ask_depth_usd={}, perp_bid_depth_usd={}, spot_ask_vwap={}, perp_bid_vwap={}, required_notional_usd={}",
+            context.signal.liquidity_model,
             context
                 .signal
                 .spot_ask_depth_usd
@@ -40588,6 +43042,16 @@ fn okx_basis_guarded_live_candidate(
             context
                 .signal
                 .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .spot_ask_vwap
+                .as_deref()
+                .unwrap_or("missing"),
+            context
+                .signal
+                .perp_bid_vwap
                 .as_deref()
                 .unwrap_or("missing"),
             context.signal.liquidity_required_usd
@@ -41992,27 +44456,15 @@ fn fetch_binance_private_account_snapshot(
         recv_window_ms.to_string(),
     )?];
     let request_id = format!("signing-request/binance-live/account/{scope}");
-    let raw_json = if endpoint.starts_with("/papi/") {
-        sign_and_fetch_binance_private_get_with_system_time_retry(
-            base_url,
-            endpoint,
-            &request_id,
-            signing_policy,
-            venue_id,
-            BINANCE_GUARDED_LIVE_ACCOUNT_REF,
-            params,
-        )?
-    } else {
-        sign_and_fetch_binance_private_get_with_retry(
-            base_url,
-            endpoint,
-            &request_id,
-            signing_policy,
-            venue_id,
-            BINANCE_GUARDED_LIVE_ACCOUNT_REF,
-            params,
-        )?
-    };
+    let raw_json = sign_and_fetch_binance_private_get_with_retry(
+        base_url,
+        endpoint,
+        &request_id,
+        signing_policy,
+        venue_id,
+        BINANCE_GUARDED_LIVE_ACCOUNT_REF,
+        params,
+    )?;
     let mut adapter = BinancePrivateAccountAdapter::new(
         VenueId::new(venue_id)?,
         AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
@@ -44151,6 +46603,18 @@ fn parse_funding_arb_market_row_json_fields(
     if product_tags.is_empty() {
         product_tags = funding_arb_product_tags_for_symbol(&symbol);
     }
+    let venue_a_bid = required_json_value_string(fields, "venue_a_bid", "funding arb monitor row")?;
+    let venue_a_ask = required_json_value_string(fields, "venue_a_ask", "funding arb monitor row")?;
+    let venue_a_bid_qty =
+        required_json_value_string(fields, "venue_a_bid_qty", "funding arb monitor row")?;
+    let venue_a_ask_qty =
+        required_json_value_string(fields, "venue_a_ask_qty", "funding arb monitor row")?;
+    let venue_b_bid = required_json_value_string(fields, "venue_b_bid", "funding arb monitor row")?;
+    let venue_b_ask = required_json_value_string(fields, "venue_b_ask", "funding arb monitor row")?;
+    let venue_b_bid_qty =
+        required_json_value_string(fields, "venue_b_bid_qty", "funding arb monitor row")?;
+    let venue_b_ask_qty =
+        required_json_value_string(fields, "venue_b_ask_qty", "funding arb monitor row")?;
     Ok(FundingArbMarketRow {
         pair_id: required_json_value_string(fields, "pair_id", "funding arb monitor row")?,
         symbol,
@@ -44164,18 +46628,20 @@ fn parse_funding_arb_market_row_json_fields(
             "venue_b_family",
             "funding arb monitor row",
         )?,
-        venue_a_bid: required_json_value_string(fields, "venue_a_bid", "funding arb monitor row")?,
-        venue_a_ask: required_json_value_string(fields, "venue_a_ask", "funding arb monitor row")?,
-        venue_a_bid_qty: required_json_value_string(
+        venue_a_bid: venue_a_bid.clone(),
+        venue_a_ask: venue_a_ask.clone(),
+        venue_a_bid_qty: venue_a_bid_qty.clone(),
+        venue_a_ask_qty: venue_a_ask_qty.clone(),
+        venue_a_bid_depth: optional_signal_depth_levels_from_json_field(
             fields,
-            "venue_a_bid_qty",
-            "funding arb monitor row",
-        )?,
-        venue_a_ask_qty: required_json_value_string(
+            "venue_a_bid_depth_levels",
+        )?
+        .unwrap_or_else(|| signal_depth_from_top_strings(&venue_a_bid, &venue_a_bid_qty)),
+        venue_a_ask_depth: optional_signal_depth_levels_from_json_field(
             fields,
-            "venue_a_ask_qty",
-            "funding arb monitor row",
-        )?,
+            "venue_a_ask_depth_levels",
+        )?
+        .unwrap_or_else(|| signal_depth_from_top_strings(&venue_a_ask, &venue_a_ask_qty)),
         venue_a_mark_price: required_json_value_string(
             fields,
             "venue_a_mark_price",
@@ -44202,18 +46668,20 @@ fn parse_funding_arb_market_row_json_fields(
             "funding arb monitor row",
         )?
         .unwrap_or_default(),
-        venue_b_bid: required_json_value_string(fields, "venue_b_bid", "funding arb monitor row")?,
-        venue_b_ask: required_json_value_string(fields, "venue_b_ask", "funding arb monitor row")?,
-        venue_b_bid_qty: required_json_value_string(
+        venue_b_bid: venue_b_bid.clone(),
+        venue_b_ask: venue_b_ask.clone(),
+        venue_b_bid_qty: venue_b_bid_qty.clone(),
+        venue_b_ask_qty: venue_b_ask_qty.clone(),
+        venue_b_bid_depth: optional_signal_depth_levels_from_json_field(
             fields,
-            "venue_b_bid_qty",
-            "funding arb monitor row",
-        )?,
-        venue_b_ask_qty: required_json_value_string(
+            "venue_b_bid_depth_levels",
+        )?
+        .unwrap_or_else(|| signal_depth_from_top_strings(&venue_b_bid, &venue_b_bid_qty)),
+        venue_b_ask_depth: optional_signal_depth_levels_from_json_field(
             fields,
-            "venue_b_ask_qty",
-            "funding arb monitor row",
-        )?,
+            "venue_b_ask_depth_levels",
+        )?
+        .unwrap_or_else(|| signal_depth_from_top_strings(&venue_b_ask, &venue_b_ask_qty)),
         venue_b_mark_price: required_json_value_string(
             fields,
             "venue_b_mark_price",
@@ -44454,7 +46922,12 @@ fn funding_arb_monitor_row_blocking_reason(row: &FundingArbMarketRow) -> String 
             reason if reason.contains("net_funding_bps=") => {
                 "阻断原因：净 funding 收益低于最小阈值"
             }
-            reason if reason.contains("insufficient top-of-book depth") => "阻断原因：盘口深度不足",
+            reason
+                if reason.contains("insufficient top-of-book depth")
+                    || reason.contains("insufficient order-book depth") =>
+            {
+                "阻断原因：盘口深度不足"
+            }
             reason if reason.contains("entry_price_divergence_bps=") => {
                 "阻断原因：入场价格偏离超过阈值"
             }
@@ -44632,7 +47105,9 @@ fn basis_monitor_row_blocking_reason(row: &BinanceBasisMarketRow) -> String {
 fn basis_complete_row_blocking_summary(reason: &str) -> &'static str {
     if reason.contains("expected_profit_bps=") || reason.contains("below minimum") {
         "阻断原因：预期收益低于最小阈值"
-    } else if reason.contains("insufficient top-of-book depth") {
+    } else if reason.contains("insufficient top-of-book depth")
+        || reason.contains("insufficient order-book depth")
+    {
         "阻断原因：盘口深度不足"
     } else if reason.contains("DRY_RUN_NOT_SUPPORTED") {
         "阻断原因：该 venue 的 spot-perp-basis dry-run/execution profile 未启用"
@@ -45027,10 +47502,25 @@ impl BinanceBasisMonitorSnapshot {
     }
 }
 
+fn signal_depth_levels_json(levels: &[SignalDepthLevel]) -> String {
+    format!(
+        "[{}]",
+        levels
+            .iter()
+            .map(|level| format!(
+                "{{\"price\":{},\"size\":{}}}",
+                json_string(&level.price),
+                json_string(&level.size)
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 impl BinanceBasisMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"expected_profit_usd\":{},\"funding_interval_hours\":{},\"gross_basis_bps\":{},\"index_price\":{},\"is_candidate\":{},\"last_funding_rate\":{},\"mark_price\":{},\"net_basis_bps\":{},\"next_funding_time_ms\":{},\"perp_ask\":{},\"perp_ask_qty\":{},\"perp_bid\":{},\"perp_bid_qty\":{},\"quantity\":{},\"reason\":{},\"source_status\":{},\"spot_ask\":{},\"spot_ask_qty\":{},\"spot_bid\":{},\"spot_bid_qty\":{},\"symbol\":{},\"total_cost_bps\":{}}}",
+            "{{\"expected_profit_usd\":{},\"funding_interval_hours\":{},\"gross_basis_bps\":{},\"index_price\":{},\"is_candidate\":{},\"last_funding_rate\":{},\"mark_price\":{},\"net_basis_bps\":{},\"next_funding_time_ms\":{},\"perp_ask\":{},\"perp_ask_depth_levels\":{},\"perp_ask_qty\":{},\"perp_bid\":{},\"perp_bid_depth_levels\":{},\"perp_bid_qty\":{},\"quantity\":{},\"reason\":{},\"source_status\":{},\"spot_ask\":{},\"spot_ask_depth_levels\":{},\"spot_ask_qty\":{},\"spot_bid\":{},\"spot_bid_depth_levels\":{},\"spot_bid_qty\":{},\"symbol\":{},\"total_cost_bps\":{}}}",
             json_option_string(&self.expected_profit_usd),
             json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_basis_bps),
@@ -45041,15 +47531,19 @@ impl BinanceBasisMarketRow {
             json_option_string(&self.net_basis_bps),
             json_string(&self.next_funding_time_ms),
             json_option_string(&self.perp_ask),
+            signal_depth_levels_json(&self.perp_ask_depth),
             json_option_string(&self.perp_ask_qty),
             json_option_string(&self.perp_bid),
+            signal_depth_levels_json(&self.perp_bid_depth),
             json_option_string(&self.perp_bid_qty),
             json_option_string(&self.quantity),
             json_option_string(&self.reason),
             json_string(&self.source_status),
             json_option_string(&self.spot_ask),
+            signal_depth_levels_json(&self.spot_ask_depth),
             json_option_string(&self.spot_ask_qty),
             json_option_string(&self.spot_bid),
+            signal_depth_levels_json(&self.spot_bid_depth),
             json_option_string(&self.spot_bid_qty),
             json_string(&self.symbol),
             json_option_string(&self.total_cost_bps),
@@ -45191,7 +47685,7 @@ fn funding_arb_history_json(context: &FundingArbDashboardContext) -> String {
 impl FundingArbMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
+            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_depth_levels\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_depth_levels\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_depth_levels\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_depth_levels\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
             json_option_string(&self.expected_funding_usd),
             json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_funding_spread_bps),
@@ -45206,8 +47700,10 @@ impl FundingArbMarketRow {
             json_string(&self.symbol),
             json_option_string(&self.total_cost_bps),
             json_string(&self.venue_a_ask),
+            signal_depth_levels_json(&self.venue_a_ask_depth),
             json_string(&self.venue_a_ask_qty),
             json_string(&self.venue_a_bid),
+            signal_depth_levels_json(&self.venue_a_bid_depth),
             json_string(&self.venue_a_bid_qty),
             json_string(&self.venue_a_family),
             json_string(&self.venue_a_funding_interval_hours),
@@ -45216,8 +47712,10 @@ impl FundingArbMarketRow {
             json_string(&self.venue_a_mark_price),
             json_string(&self.venue_a_next_funding_time_ms),
             json_string(&self.venue_b_ask),
+            signal_depth_levels_json(&self.venue_b_ask_depth),
             json_string(&self.venue_b_ask_qty),
             json_string(&self.venue_b_bid),
+            signal_depth_levels_json(&self.venue_b_bid_depth),
             json_string(&self.venue_b_bid_qty),
             json_string(&self.venue_b_family),
             json_string(&self.venue_b_funding_interval_hours),
@@ -49094,7 +51592,7 @@ fn legacy_help_text() -> String {
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
         "  funding-arb-guarded-live-canary-once --snapshot file --pair-id id [dry-run snapshot options] [--private-order-events-dir dir] [--aster-user 0x...] [--aster-signer 0x...] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--execute-live --i-understand-funding-arb-live-orders]",
         "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the Aster USDT-settled and Hyperliquid USDC-settled perp legs; Hyperliquid asset id auto-resolves unless overridden",
-        "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders]",
+        "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders] [--allow-unknown-recovery]",
         "                                    Resident funding-arb scanner: refresh private read-only snapshots, run guarded entry cycles, register live positions, and supervise reduce-only exit/de-risk; Aster defaults to USDT and Hyperliquid defaults to USDC",
     ]
     .join("\n")
@@ -53445,6 +55943,7 @@ fn parse_funding_arb_resident_live_args(
     let mut min_net_funding_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
     let mut execute_live = false;
     let mut acknowledge_funding_arb_live_orders = false;
+    let mut allow_unknown_recovery = false;
     let mut hyperliquid_user = None;
     let mut hyperliquid_source =
         std::env::var("HYPERLIQUID_SOURCE").unwrap_or_else(|_| "a".to_owned());
@@ -53652,6 +56151,7 @@ fn parse_funding_arb_resident_live_args(
             "--execute-live" => execute_live = true,
             "--dry-run" => execute_live = false,
             "--i-understand-funding-arb-live-orders" => acknowledge_funding_arb_live_orders = true,
+            "--allow-unknown-recovery" => allow_unknown_recovery = true,
             "--hyperliquid-user" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -53752,6 +56252,7 @@ fn parse_funding_arb_resident_live_args(
         min_net_funding_bps,
         execute_live,
         acknowledge_funding_arb_live_orders,
+        allow_unknown_recovery,
         hyperliquid_user,
         hyperliquid_source,
         hyperliquid_vault_address,
@@ -53810,6 +56311,23 @@ mod tests {
 
     fn full_pipeline_case_root(case_name: &str) -> PathBuf {
         full_pipeline_fixture_root().join("cases").join(case_name)
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn test_funding_arb_price_tick_for_venue(
+        venue_id: &str,
+        _instrument_id: &str,
+    ) -> RuntimeResult<Option<(Price, &'static str)>> {
+        let tick = match venue_id {
+            BINANCE_BASIS_PERP_VENUE_ID => "0.01",
+            BYBIT_BASIS_PERP_VENUE_ID => "0.0001",
+            OKX_BASIS_PERP_VENUE_ID => "0.01",
+            BITGET_BASIS_PERP_VENUE_ID => "0.0001",
+            ASTER_BASIS_PERP_VENUE_ID => "0.00001",
+            _ => return Ok(None),
+        };
+        parse_positive_price_rule("test funding arb price tick", tick)
+            .map(|tick| Some((tick, "test funding arb price tick")))
     }
 
     #[test]
@@ -53970,13 +56488,13 @@ mod tests {
     }
 
     fn monitor_book_ticker_row(symbol: &str) -> MonitorBookTickerRow {
-        MonitorBookTickerRow {
-            symbol: symbol.to_owned(),
-            bid_price: "100.01".to_owned(),
-            bid_qty: "1.2".to_owned(),
-            ask_price: "100.02".to_owned(),
-            ask_qty: "1.3".to_owned(),
-        }
+        monitor_book_ticker_row_with_top_depth(
+            symbol.to_owned(),
+            "100.01".to_owned(),
+            "1.2".to_owned(),
+            "100.02".to_owned(),
+            "1.3".to_owned(),
+        )
     }
 
     fn funding_arb_test_row(
@@ -53992,6 +56510,8 @@ mod tests {
             venue_a_ask: "100.00".to_owned(),
             venue_a_bid_qty: "2.0".to_owned(),
             venue_a_ask_qty: "2.0".to_owned(),
+            venue_a_bid_depth: signal_depth_from_top_strings("99.95", "2.0"),
+            venue_a_ask_depth: signal_depth_from_top_strings("100.00", "2.0"),
             venue_a_mark_price: "100.00".to_owned(),
             venue_a_index_price: "100.00".to_owned(),
             venue_a_funding_rate: venue_a_funding_rate.to_owned(),
@@ -54001,6 +56521,8 @@ mod tests {
             venue_b_ask: "100.10".to_owned(),
             venue_b_bid_qty: "2.0".to_owned(),
             venue_b_ask_qty: "2.0".to_owned(),
+            venue_b_bid_depth: signal_depth_from_top_strings("100.05", "2.0"),
+            venue_b_ask_depth: signal_depth_from_top_strings("100.10", "2.0"),
             venue_b_mark_price: "100.05".to_owned(),
             venue_b_index_price: "100.00".to_owned(),
             venue_b_funding_rate: venue_b_funding_rate.to_owned(),
@@ -54719,20 +57241,20 @@ mod tests {
     #[test]
     fn bybit_wss_scoped_rest_bootstrap_skips_non_usdt_rows() {
         let rows = vec![
-            MonitorBookTickerRow {
-                symbol: "BTCUSDC".to_owned(),
-                bid_price: "100".to_owned(),
-                bid_qty: "1".to_owned(),
-                ask_price: "101".to_owned(),
-                ask_qty: "1".to_owned(),
-            },
-            MonitorBookTickerRow {
-                symbol: "BTCUSDT".to_owned(),
-                bid_price: "100".to_owned(),
-                bid_qty: "1".to_owned(),
-                ask_price: "101".to_owned(),
-                ask_qty: "1".to_owned(),
-            },
+            monitor_book_ticker_row_with_top_depth(
+                "BTCUSDC".to_owned(),
+                "100".to_owned(),
+                "1".to_owned(),
+                "101".to_owned(),
+                "1".to_owned(),
+            ),
+            monitor_book_ticker_row_with_top_depth(
+                "BTCUSDT".to_owned(),
+                "100".to_owned(),
+                "1".to_owned(),
+                "101".to_owned(),
+                "1".to_owned(),
+            ),
         ];
 
         let prepared =
@@ -54845,6 +57367,8 @@ mod tests {
                 bid_qty: "3".to_owned(),
                 ask_price: "11".to_owned(),
                 ask_qty: "3".to_owned(),
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
             },
             OkxTickerRow {
                 inst_id: "BTC-USDT-SWAP".to_owned(),
@@ -54852,6 +57376,8 @@ mod tests {
                 bid_qty: "1".to_owned(),
                 ask_price: "101".to_owned(),
                 ask_qty: "1".to_owned(),
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
             },
             OkxTickerRow {
                 inst_id: "ETH-USDT-SWAP".to_owned(),
@@ -54859,6 +57385,8 @@ mod tests {
                 bid_qty: "2".to_owned(),
                 ask_price: "51".to_owned(),
                 ask_qty: "2".to_owned(),
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
             },
             OkxTickerRow {
                 inst_id: "BTC-USDC-SWAP".to_owned(),
@@ -54866,6 +57394,8 @@ mod tests {
                 bid_qty: "1".to_owned(),
                 ask_price: "101".to_owned(),
                 ask_qty: "1".to_owned(),
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
             },
             OkxTickerRow {
                 inst_id: "ADA-USDT-SWAP".to_owned(),
@@ -54873,6 +57403,8 @@ mod tests {
                 bid_qty: "".to_owned(),
                 ask_price: "".to_owned(),
                 ask_qty: "".to_owned(),
+                bid_depth: Vec::new(),
+                ask_depth: Vec::new(),
             },
         ];
         let prepared_okx = prepare_okx_wss_book_ticker_rest_rows(
@@ -54921,34 +57453,34 @@ mod tests {
         assert_eq!(okx_snapshot.rows[0].symbol, "BTC-USDT");
 
         let bitget_rows = vec![
-            MonitorBookTickerRow {
-                symbol: "1INCHUSDT".to_owned(),
-                bid_price: "10".to_owned(),
-                bid_qty: "3".to_owned(),
-                ask_price: "11".to_owned(),
-                ask_qty: "3".to_owned(),
-            },
-            MonitorBookTickerRow {
-                symbol: "BTCUSDT".to_owned(),
-                bid_price: "100".to_owned(),
-                bid_qty: "1".to_owned(),
-                ask_price: "101".to_owned(),
-                ask_qty: "1".to_owned(),
-            },
-            MonitorBookTickerRow {
-                symbol: "ETHUSDT".to_owned(),
-                bid_price: "50".to_owned(),
-                bid_qty: "2".to_owned(),
-                ask_price: "51".to_owned(),
-                ask_qty: "2".to_owned(),
-            },
-            MonitorBookTickerRow {
-                symbol: "BTCUSDC".to_owned(),
-                bid_price: "100".to_owned(),
-                bid_qty: "1".to_owned(),
-                ask_price: "101".to_owned(),
-                ask_qty: "1".to_owned(),
-            },
+            monitor_book_ticker_row_with_top_depth(
+                "1INCHUSDT".to_owned(),
+                "10".to_owned(),
+                "3".to_owned(),
+                "11".to_owned(),
+                "3".to_owned(),
+            ),
+            monitor_book_ticker_row_with_top_depth(
+                "BTCUSDT".to_owned(),
+                "100".to_owned(),
+                "1".to_owned(),
+                "101".to_owned(),
+                "1".to_owned(),
+            ),
+            monitor_book_ticker_row_with_top_depth(
+                "ETHUSDT".to_owned(),
+                "50".to_owned(),
+                "2".to_owned(),
+                "51".to_owned(),
+                "2".to_owned(),
+            ),
+            monitor_book_ticker_row_with_top_depth(
+                "BTCUSDC".to_owned(),
+                "100".to_owned(),
+                "1".to_owned(),
+                "101".to_owned(),
+                "1".to_owned(),
+            ),
         ];
         let prepared_bitget = prepare_bitget_wss_book_ticker_rest_rows(
             bitget_rows,
@@ -55326,6 +57858,86 @@ mod tests {
     }
 
     #[test]
+    fn binance_public_symbol_urls_percent_encode_query_components() {
+        let unicode_symbol = "\u{5E01}\u{5B89}\u{4EBA}\u{751F}USDT";
+        let encoded_symbol = "%E5%B8%81%E5%AE%89%E4%BA%BA%E7%94%9FUSDT";
+
+        assert_eq!(public_url_query_component("BTCUSDT"), "BTCUSDT");
+        assert_eq!(public_url_query_component(unicode_symbol), encoded_symbol);
+
+        let url = binance_spot_depth_url(unicode_symbol);
+        assert!(url.contains(&format!("symbol={encoded_symbol}")));
+        assert!(!url.contains(unicode_symbol));
+    }
+
+    #[test]
+    fn binance_depth_symbol_selection_limits_to_highest_preliminary_profit() {
+        let spot = r#"[
+          {"symbol":"AAAUSDT","bidPrice":"99.90","bidQty":"2.0","askPrice":"100.00","askQty":"2.0"},
+          {"symbol":"BBBUSDT","bidPrice":"99.90","bidQty":"2.0","askPrice":"100.00","askQty":"2.0"},
+          {"symbol":"CCCUSDT","bidPrice":"99.90","bidQty":"2.0","askPrice":"100.00","askQty":"2.0"},
+          {"symbol":"DDDUSDT","bidPrice":"99.90","bidQty":"2.0","askPrice":"100.00","askQty":"2.0"}
+        ]"#;
+        let perp = r#"[
+          {"symbol":"AAAUSDT","bidPrice":"101.00","bidQty":"2.0","askPrice":"101.10","askQty":"2.0","time":1778584221117},
+          {"symbol":"BBBUSDT","bidPrice":"105.00","bidQty":"2.0","askPrice":"105.10","askQty":"2.0","time":1778584221117},
+          {"symbol":"CCCUSDT","bidPrice":"103.00","bidQty":"2.0","askPrice":"103.10","askQty":"2.0","time":1778584221117},
+          {"symbol":"DDDUSDT","bidPrice":"102.00","bidQty":"2.0","askPrice":"102.10","askQty":"2.0","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"AAAUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"BBBUSDT","markPrice":"105.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"CCCUSDT","markPrice":"103.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"DDDUSDT","markPrice":"102.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let options = BinanceBasisMonitorOptions {
+            min_abs_funding_rate: "0".to_owned(),
+            once: true,
+            ..BinanceBasisMonitorOptions::default()
+        };
+
+        let symbols =
+            binance_basis_monitor_depth_symbols_with_limit(spot, perp, premium, &options, 2)
+                .expect("depth symbols");
+
+        assert_eq!(
+            symbols,
+            BTreeSet::from(["BBBUSDT".to_owned(), "CCCUSDT".to_owned()])
+        );
+    }
+
+    #[test]
+    fn public_market_get_failure_message_reports_redacted_url() {
+        let message = public_market_get_failure_message(
+            "https://example.test/api/v3/depth?symbol=BTCUSDT&apiKey=plain&signature=signed",
+            "curl returned exit status: 28",
+        );
+
+        assert!(message.starts_with("public market data GET failed after 3 attempts"));
+        assert!(message.contains("url=https://example.test/api/v3/depth?symbol=BTCUSDT"));
+        assert!(message.contains("apiKey=<redacted>"));
+        assert!(message.contains("signature=<redacted>"));
+        assert!(!message.contains("plain"));
+        assert!(!message.contains("signed"));
+    }
+
+    #[test]
+    fn public_order_book_depth_warnings_are_capped() {
+        let warnings = (0..10)
+            .map(|index| format!("warning-{index}"))
+            .collect::<Vec<_>>();
+
+        let summarized = summarize_public_order_book_depth_warnings(warnings);
+
+        assert_eq!(summarized.len(), BASIS_MONITOR_DEPTH_WARNING_LIMIT + 1);
+        assert_eq!(summarized.first().map(String::as_str), Some("warning-0"));
+        assert_eq!(
+            summarized.last().map(String::as_str),
+            Some("2 additional order-book depth warnings omitted")
+        );
+    }
+
+    #[test]
     fn bybit_wss_orderbook_message_updates_quote() {
         let mut state = bybit_wss_test_market_state("BTCUSDT", false);
         let raw = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1778630401123,"data":{"s":"BTCUSDT","b":[["43250.10","1.00000000"]],"a":[["43251.20","1.50000000"]],"u":400900301,"seq":9001}}"#;
@@ -55670,13 +58282,13 @@ mod tests {
     fn binance_wss_all_symbol_scope_keeps_non_ascii_usdt_symbol() {
         let symbol = "中文USDT";
         let rows = prepare_binance_wss_book_ticker_rest_rows(
-            vec![MonitorBookTickerRow {
-                symbol: symbol.to_owned(),
-                bid_price: "99.90".to_owned(),
-                bid_qty: "1.0".to_owned(),
-                ask_price: "100.00".to_owned(),
-                ask_qty: "2.0".to_owned(),
-            }],
+            vec![monitor_book_ticker_row_with_top_depth(
+                symbol.to_owned(),
+                "99.90".to_owned(),
+                "1.0".to_owned(),
+                "100.00".to_owned(),
+                "2.0".to_owned(),
+            )],
             true,
         )
         .expect("prepared rows");
@@ -56438,7 +59050,7 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_dashboard_terminal_registry_overrides_older_raw_position() {
+    fn portfolio_dashboard_keeps_nonzero_exchange_position_over_terminal_registry() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let resident_dir = root
             .path()
@@ -56474,11 +59086,11 @@ mod tests {
         assert_eq!(snapshot.positions.len(), 1);
         let row = &snapshot.positions[0];
         assert_eq!(row.symbol, "FIDAUSDT");
-        assert_eq!(row.venue_family, "binance / bybit");
-        assert_eq!(row.source, "funding-arb-resident-live");
-        assert_eq!(row.position_status, "closed");
-        assert_eq!(row.position_quantity, "0 USDT");
-        assert_eq!(row.accumulated_position.as_deref(), Some("0 USDT"));
+        assert_eq!(row.venue_family, "bybit");
+        assert_eq!(row.source, "position-raw-snapshot");
+        assert_eq!(row.position_status, "open");
+        assert_eq!(row.position_quantity, "2310");
+        assert_eq!(row.account_id, "acct:bybit-funding-arb-readonly");
     }
 
     #[test]
@@ -57098,6 +59710,54 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_monitor_uses_order_book_depth_levels_for_liquidity() {
+        let binance_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"99.95","perp_ask":"100.00","perp_bid_qty":"0.5","perp_ask_qty":"0.5","perp_bid_depth_levels":[{"price":"99.95","size":"0.5"},{"price":"99.80","size":"1.0"}],"perp_ask_depth_levels":[{"price":"100.00","size":"0.5"},{"price":"100.25","size":"1.0"}],"mark_price":"100.00","index_price":"100.00","last_funding_rate":"0.00010000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
+        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"0.5","perp_ask_qty":"0.5","perp_bid_depth_levels":[{"price":"100.05","size":"0.5"},{"price":"99.95","size":"1.0"}],"perp_ask_depth_levels":[{"price":"100.10","size":"0.5"},{"price":"100.30","size":"1.0"}],"mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00300000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
+        let binance = funding_arb_test_venue_snapshot("binance", binance_status);
+        let bybit = funding_arb_test_venue_snapshot("bybit", bybit_status);
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "binance".to_owned(),
+                    status_url: "http://127.0.0.1/binance/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "bybit".to_owned(),
+                    status_url: "http://127.0.0.1/bybit/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![binance, bybit], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.candidate_count, 1);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.long_venue_family.as_deref(), Some("binance"));
+        assert_eq!(row.short_venue_family.as_deref(), Some("bybit"));
+        assert!(row.reason.is_none());
+        assert_eq!(row.venue_a_ask_depth.len(), 2);
+        assert_eq!(row.venue_b_bid_depth.len(), 2);
+        assert!(row.to_json().contains("venue_a_ask_depth_levels"));
+
+        let spec =
+            CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
+        let events = funding_arb_monitor_snapshot_candidate_events(
+            &spec,
+            &snapshot,
+            UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time"),
+        )
+        .expect("funding candidate events");
+        let first_event = events.first().expect("book event");
+        assert!(matches!(
+            first_event.payload.get("ask_depth_levels"),
+            Some(JsonValue::Array(levels)) if levels.len() == 2
+        ));
+    }
+
+    #[test]
     fn funding_arb_monitor_prefers_row_level_funding_interval() {
         let binance = funding_arb_test_venue_snapshot(
             "binance",
@@ -57692,6 +60352,45 @@ mod tests {
             read_utf8(&output_dir.join("funding_arb_settlement_reconciliation.json"))
                 .expect("settlement reconciliation json");
         assert!(settlement_json.contains("\"status\":\"Matched\""));
+    }
+
+    #[test]
+    fn funding_settlement_reconciliation_missing_gross_spread_is_nonfatal() {
+        let mut row = funding_arb_test_row("0.00010000", "0.00300000");
+        row.gross_funding_spread_bps = None;
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("unused.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("funding arb spec");
+        let summary = reconcile_funding_settlement_raw_snapshot_json(
+            &row,
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01"}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30"}]}}}]}"#,
+        )
+        .expect("missing gross funding spread should not halt exit reconciliation");
+
+        assert_eq!(summary.status, "Missing");
+        assert_eq!(summary.expected_funding_usd, None);
+        assert!(summary.reason.as_deref().is_some_and(|reason| {
+            reason.contains("expected funding cannot be computed")
+                && reason.contains("funding arb row is missing gross_funding_spread_bps")
+        }));
     }
 
     #[test]
@@ -58523,6 +61222,31 @@ mod tests {
             .any(|reason| reason.contains("private account runtime reconciliation")));
     }
 
+    #[test]
+    fn funding_arb_private_position_raw_snapshot_ignores_bybit_position_mode_rows() {
+        let mut row = funding_arb_test_row("0.00010000", "0.00400000");
+        row.pair_id = "binance:bybit:BTRUSDT:BTRUSDT".to_owned();
+        row.symbol = "BTRUSDT".to_owned();
+        let raw_snapshot = parse_funding_private_raw_snapshot_json(
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-23T10:25:29Z","statements":[{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"position_mode":{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTRUSDT","side":"","size":"0","positionIdx":1},{"symbol":"BTRUSDT","side":"","size":"0","positionIdx":2}]}},"positions":{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTRUSDT","side":"Buy","size":"3600","positionIdx":1,"riskLimitValue":"5000"}]}}}}]}"#,
+            "funding private position raw snapshot",
+        )
+        .expect("raw snapshot");
+
+        let snapshot = funding_private_position_snapshot_from_raw_snapshot(&row, &raw_snapshot)
+            .expect("position snapshot");
+
+        let btr_positions = snapshot
+            .positions
+            .iter()
+            .filter(|entry| {
+                entry.account_id == "acct:bybit-funding-arb-readonly" && entry.symbol == "BTRUSDT"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(btr_positions.len(), 1);
+        assert_eq!(btr_positions[0].quantity, "3600");
+    }
+
     #[cfg(feature = "live-exec")]
     #[test]
     fn funding_arb_live_canary_releases_manual_gate_for_requires_manual_approval() {
@@ -58799,6 +61523,7 @@ mod tests {
             "8".to_owned(),
             "--execute-live".to_owned(),
             "--i-understand-funding-arb-live-orders".to_owned(),
+            "--allow-unknown-recovery".to_owned(),
             "--hyperliquid-user".to_owned(),
             "0x0000000000000000000000000000000000000000".to_owned(),
             "--hyperliquid-source".to_owned(),
@@ -58838,6 +61563,7 @@ mod tests {
         assert_eq!(options.min_net_funding_bps, 8);
         assert!(options.execute_live);
         assert!(options.acknowledge_funding_arb_live_orders);
+        assert!(options.allow_unknown_recovery);
         assert_eq!(options.hyperliquid_source, "b");
         assert_eq!(options.hyperliquid_asset_ids.get("BTCUSDT"), Some(&0));
         assert_eq!(options.aster_signer_cmd_env, "ASTER_RESIDENT_SIGNER_CMD");
@@ -58909,6 +61635,7 @@ mod tests {
             min_net_funding_bps: 5,
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
+            allow_unknown_recovery: false,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -58973,6 +61700,83 @@ mod tests {
         let flat_capacity =
             funding_arb_resident_entry_capacity(&options, root.path()).expect("flat capacity");
         assert!(matches!(flat_capacity, ResidentEntryCapacity::Allowed));
+
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            "{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:closed-history\",\"position_state_path\":\"target/position.json\",\"status\":\"open\",\"symbol\":\"BTCUSDT\"}\n{\"event_type\":\"position_closed\",\"position_id\":\"pos:closed-history\",\"status\":\"closed\"}\n",
+        )
+        .expect("write closed history registry");
+        let mut one_entry_options = options.clone();
+        one_entry_options.max_live_entries = 1;
+        let closed_history_capacity =
+            funding_arb_resident_entry_capacity(&one_entry_options, root.path())
+                .expect("closed history capacity");
+        assert!(matches!(
+            closed_history_capacity,
+            ResidentEntryCapacity::Allowed
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_live_blocks_unknown_recovery_by_default() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let previous_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(1).expect("cycle dir"));
+        fs::create_dir_all(&previous_cycle).expect("create previous cycle");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":1,\"cycle_dir\":{},\"event_type\":\"position_unknown\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:SOXLUSDT:SOXLUSDT\",\"position_id\":\"pos:funding-arb:soxl:1\",\"reason\":\"reduce-only unwind did not fill\",\"residual_risk\":\"funding reduce-only unwind returned cancelled instead of filled\",\"status\":\"unknown\",\"symbol\":\"SOXLUSDT\"}}\n",
+                json_string(&previous_cycle.display().to_string())
+            ),
+        )
+        .expect("write unknown registry");
+        let options = FundingArbResidentLiveOptions {
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: Some(root.path().to_path_buf()),
+            snapshot_path: Some(root.path().join("funding_arb_monitor_snapshot.json")),
+            pair_id: None,
+            sources: Vec::new(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            private_order_events_dir: Some(root.path().join("private-order-events")),
+            poll_interval_secs: 60,
+            max_cycles: Some(1),
+            max_live_entries: 1,
+            notional_usd: "10.00".to_owned(),
+            taker_fee_bps: 5,
+            slippage_buffer_bps: 5,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: 5,
+            execute_live: true,
+            acknowledge_funding_arb_live_orders: true,
+            allow_unknown_recovery: false,
+            hyperliquid_user: None,
+            hyperliquid_source: "a".to_owned(),
+            hyperliquid_vault_address: None,
+            hyperliquid_expires_after_ms: None,
+            hyperliquid_asset_ids: BTreeMap::new(),
+            aster_user: None,
+            aster_signer: None,
+            aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
+        };
+
+        let report = run_funding_arb_resident_live_inner(options).expect("resident report");
+
+        assert_eq!(report.phase, "halted");
+        assert_eq!(report.cycles, 1);
+        assert!(!report.dispatch_attempted);
+        assert!(!report.mutable_execution_started);
+        assert_eq!(report.unknown_position_count, 1);
+        assert!(report
+            .halt_reason
+            .as_deref()
+            .expect("halt reason")
+            .contains("--allow-unknown-recovery"));
     }
 
     #[test]
@@ -59024,6 +61828,7 @@ mod tests {
             min_net_funding_bps: 5,
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
+            allow_unknown_recovery: true,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -59084,6 +61889,49 @@ mod tests {
         assert_eq!(retry_pending.len(), 1);
         assert_eq!(retry_pending[0].pair_id, "binance:bybit:CHIPUSDT:CHIPUSDT");
         assert_eq!(retry_pending[0].symbol, "CHIPUSDT");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_unknown_recovery_exit_bypasses_settlement_wait() {
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        let decision = funding_arb_exit_cycle_decision(
+            true,
+            None,
+            false,
+            2,
+            true,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert_eq!(decision, "emergency_de_risk");
+        assert_eq!(
+            reason_codes,
+            vec!["unknown_recovery_settlement_bypass".to_owned()]
+        );
+        assert!(blocking_reasons.is_empty());
+
+        reason_codes.clear();
+        blocking_reasons.clear();
+        let normal_decision = funding_arb_exit_cycle_decision(
+            true,
+            None,
+            false,
+            2,
+            false,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert_eq!(normal_decision, "hold");
+        assert_eq!(
+            reason_codes,
+            vec!["waiting_for_funding_settlement".to_owned()]
+        );
+        assert!(blocking_reasons.is_empty());
     }
 
     #[test]
@@ -59194,8 +62042,12 @@ mod tests {
             ],
         };
 
-        apply_funding_arb_entry_time_in_force_ioc(&mut dispatch_plan)
-            .expect("funding arb entry IOC enforcement");
+        apply_funding_arb_entry_time_in_force_ioc_with_price_tick_resolver(
+            &mut dispatch_plan,
+            BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            test_funding_arb_price_tick_for_venue,
+        )
+        .expect("funding arb entry IOC enforcement");
 
         assert_eq!(
             dispatch_plan.requests[0].request.time_in_force,
@@ -59204,6 +62056,22 @@ mod tests {
         assert_eq!(
             dispatch_plan.requests[1].request.time_in_force,
             Some(MutableTimeInForce::Ioc)
+        );
+        assert_eq!(
+            dispatch_plan.requests[0]
+                .request
+                .limit_price
+                .expect("long protected limit")
+                .to_string(),
+            "0.04851"
+        );
+        assert_eq!(
+            dispatch_plan.requests[1]
+                .request
+                .limit_price
+                .expect("short protected limit")
+                .to_string(),
+            "0.04842"
         );
     }
 
@@ -60101,6 +62969,52 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_emergency_de_risk_slippage_has_floor() {
+        assert_eq!(funding_arb_exit_emergency_de_risk_slippage_bps(5), 100);
+        assert_eq!(funding_arb_exit_emergency_de_risk_slippage_bps(150), 150);
+
+        let emergency_buy = funding_arb_exit_close_price_with_slippage(
+            "188.00000",
+            OrderSide::Buy,
+            funding_arb_exit_emergency_de_risk_slippage_bps(5),
+        )
+        .expect("emergency buy close price");
+        assert_eq!(emergency_buy.to_string(), "189.88");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_price_tick_quantization_rounds_toward_marketable_side() {
+        let buy = quantize_price_to_tick(
+            Price::from_str("188.094").expect("price"),
+            Price::from_str("0.01").expect("tick"),
+            OrderSide::Buy,
+            "test tick",
+        )
+        .expect("buy price");
+        assert_eq!(buy.to_string(), "188.1");
+
+        let sell = quantize_price_to_tick(
+            Price::from_str("188.096").expect("price"),
+            Price::from_str("0.01").expect("tick"),
+            OrderSide::Sell,
+            "test tick",
+        )
+        .expect("sell price");
+        assert_eq!(sell.to_string(), "188.09");
+
+        let coarser_buy = quantize_price_to_tick(
+            Price::from_str("188.094").expect("price"),
+            Price::from_str("0.1").expect("tick"),
+            OrderSide::Buy,
+            "test tick",
+        )
+        .expect("coarser buy price");
+        assert_eq!(coarser_buy.to_string(), "188.1");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_exit_close_order_is_ioc_reduce_only() {
         let leg = FundingArbExitLegSnapshot {
             leg: FundingArbPositionLegState {
@@ -60249,6 +63163,182 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_close_expired_retries_reduce_only_market() {
+        let leg = FundingArbExitLegSnapshot {
+            leg: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "aster".to_owned(),
+                venue_id: ASTER_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:aster-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:ASTER:CHIPUSDT:USDT-FUTURES".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "100".to_owned(),
+                entry_limit_price: "0.052".to_owned(),
+            },
+            signed_quantity: MonitorDecimal { raw: -100_000 },
+            close_quantity: Quantity::from_str("100").expect("quantity"),
+            close_price: Price::from_str("0.0521").expect("price"),
+            close_required: true,
+        };
+        let planned = funding_arb_exit_close_planned_order(
+            &leg,
+            "123456",
+            FundingArbBinancePositionMode::OneWay,
+            FundingArbBybitPositionMode::OneWay,
+            FundingArbOkxPositionMode::Net,
+            FundingArbBitgetPositionMode::OneWay,
+            FundingArbAsterPositionMode::Hedge,
+        )
+        .expect("planned close");
+        let mut adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    ASTER_BASIS_PERP_VENUE_ID,
+                    "aster-exit-ioc",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    ASTER_BASIS_PERP_VENUE_ID,
+                    "aster-exit-market-retry",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::AsterPerp,
+                    ASTER_BASIS_PERP_VENUE_ID,
+                    "inst:ASTER:CHIPUSDT:USDT-FUTURES",
+                    OrderConfirmationStatus::Expired,
+                    None,
+                    Some(OrderSide::Buy),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::AsterPerp,
+                    ASTER_BASIS_PERP_VENUE_ID,
+                    "inst:ASTER:CHIPUSDT:USDT-FUTURES",
+                    OrderConfirmationStatus::Filled,
+                    Some("100"),
+                    Some(OrderSide::Buy),
+                )),
+            ],
+        );
+        let mut outcome = BasisLiveExecutionOutcome::default();
+        let receipt = adapter
+            .submit_order(planned.request.clone())
+            .expect("initial submit");
+        outcome.protection.record_receipt();
+        outcome.receipts.push(receipt.clone());
+
+        confirm_funding_arb_exit_close_with_market_retry(
+            &mut adapter,
+            &planned,
+            &receipt,
+            &leg,
+            None,
+            arb_venue_exec::PrivateOrderMarket::AsterPerp,
+            &mut outcome,
+        )
+        .expect("confirm with retry");
+
+        assert!(outcome.protection.residual_risk.is_none());
+        assert!(outcome.blocking_reasons.is_empty());
+        assert_eq!(outcome.receipts.len(), 2);
+        assert_eq!(outcome.confirmations.len(), 2);
+        assert_eq!(adapter.submitted.len(), 2);
+        assert_eq!(adapter.submitted[0].order_type, MutableOrderType::Limit);
+        assert_eq!(
+            adapter.submitted[0].time_in_force,
+            Some(MutableTimeInForce::Ioc)
+        );
+        assert_eq!(adapter.submitted[1].order_type, MutableOrderType::Market);
+        assert_eq!(adapter.submitted[1].time_in_force, None);
+        assert_eq!(adapter.submitted[1].limit_price, None);
+        assert!(adapter.submitted[1].reduce_only);
+        assert_eq!(
+            adapter.submitted[1].position_side,
+            Some(PerpPositionSide::Short)
+        );
+        assert!(adapter.submitted[1]
+            .idempotency_key
+            .as_str()
+            .ends_with(":market-retry"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_close_terminal_fill_evidence_does_not_market_retry() {
+        let leg = FundingArbExitLegSnapshot {
+            leg: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "aster".to_owned(),
+                venue_id: ASTER_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:aster-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:ASTER:CHIPUSDT:USDT-FUTURES".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "100".to_owned(),
+                entry_limit_price: "0.052".to_owned(),
+            },
+            signed_quantity: MonitorDecimal { raw: -100_000 },
+            close_quantity: Quantity::from_str("100").expect("quantity"),
+            close_price: Price::from_str("0.0521").expect("price"),
+            close_required: true,
+        };
+        let planned = funding_arb_exit_close_planned_order(
+            &leg,
+            "123456",
+            FundingArbBinancePositionMode::OneWay,
+            FundingArbBybitPositionMode::OneWay,
+            FundingArbOkxPositionMode::Net,
+            FundingArbBitgetPositionMode::OneWay,
+            FundingArbAsterPositionMode::Hedge,
+        )
+        .expect("planned close");
+        let mut adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                ASTER_BASIS_PERP_VENUE_ID,
+                "aster-exit-terminal-fill-evidence",
+            ))],
+            vec![],
+            vec![Ok(test_private_order_update(
+                arb_venue_exec::PrivateOrderMarket::AsterPerp,
+                ASTER_BASIS_PERP_VENUE_ID,
+                "inst:ASTER:CHIPUSDT:USDT-FUTURES",
+                OrderConfirmationStatus::Cancelled,
+                Some("1"),
+                Some(OrderSide::Buy),
+            ))],
+        );
+        let mut outcome = BasisLiveExecutionOutcome::default();
+        let receipt = adapter
+            .submit_order(planned.request.clone())
+            .expect("initial submit");
+        outcome.protection.record_receipt();
+        outcome.receipts.push(receipt.clone());
+
+        confirm_funding_arb_exit_close_with_market_retry(
+            &mut adapter,
+            &planned,
+            &receipt,
+            &leg,
+            None,
+            arb_venue_exec::PrivateOrderMarket::AsterPerp,
+            &mut outcome,
+        )
+        .expect("confirm without retry");
+
+        assert_eq!(adapter.submitted.len(), 1);
+        assert!(outcome
+            .protection
+            .residual_risk
+            .as_deref()
+            .expect("residual")
+            .contains("returned `cancelled`"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_binance_exit_close_uses_hedge_position_side() {
         let leg = FundingArbExitLegSnapshot {
             leg: FundingArbPositionLegState {
@@ -60280,7 +63370,7 @@ mod tests {
 
         assert_eq!(planned.request.side, OrderSide::Buy);
         assert_eq!(planned.request.position_side, Some(PerpPositionSide::Short));
-        assert!(planned.request.reduce_only);
+        assert!(!planned.request.reduce_only);
     }
 
     #[test]
@@ -60849,6 +63939,9 @@ mod tests {
         let invalid_top_of_book = RuntimeError::LiveMarketData {
             message: "top-of-book prices must be greater than zero".to_owned(),
         };
+        let okx_rate_limit = RuntimeError::LiveMarketData {
+            message: "OKX returned code=50011, msg=Rate limit reached. Please refer to API documentation and throttle requests accordingly.".to_owned(),
+        };
         let private_http = RuntimeError::LiveMarketData {
             message: "curl failed before a reliable Bitget private HTTP response was available"
                 .to_owned(),
@@ -60860,6 +63953,7 @@ mod tests {
         assert!(resident_entry_cycle_error_can_retry(&market_data));
         assert!(resident_entry_cycle_error_can_retry(&public_rest));
         assert!(resident_entry_cycle_error_can_retry(&invalid_top_of_book));
+        assert!(resident_entry_cycle_error_can_retry(&okx_rate_limit));
         assert!(!resident_entry_cycle_error_can_retry(&private_http));
         assert!(!resident_entry_cycle_error_can_retry(&unsafe_config));
     }
@@ -60930,14 +64024,43 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn binance_time_endpoint_matches_private_api_family() {
+    fn binance_timestamp_source_matches_private_api_family() {
         assert_eq!(
-            binance_server_time_endpoint_for_private_endpoint("/api/v3/account"),
-            "/api/v3/time"
+            binance_private_timestamp_source_for_private_endpoint(
+                "https://api.binance.com",
+                "/api/v3/account",
+            ),
+            BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
+                base_url: "https://api.binance.com",
+                time_endpoint: "/api/v3/time",
+            })
         );
         assert_eq!(
-            binance_server_time_endpoint_for_private_endpoint("/fapi/v3/account"),
-            "/fapi/v1/time"
+            binance_private_timestamp_source_for_private_endpoint(
+                BINANCE_USDM_FUTURES_BASE_URL,
+                "/fapi/v3/account",
+            ),
+            BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
+                base_url: BINANCE_USDM_FUTURES_BASE_URL,
+                time_endpoint: "/fapi/v1/time",
+            })
+        );
+        assert_eq!(
+            binance_private_timestamp_source_for_private_endpoint(
+                BINANCE_PORTFOLIO_MARGIN_BASE_URL,
+                "/papi/v1/account",
+            ),
+            BinancePrivateTimestampSource::SystemTime
+        );
+        assert_eq!(
+            binance_private_timestamp_source_for_private_endpoint(
+                "http://127.0.0.1:9000",
+                "/papi/v1/account",
+            ),
+            BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
+                base_url: "http://127.0.0.1:9000",
+                time_endpoint: "/fapi/v1/time",
+            })
         );
     }
 
@@ -60993,6 +64116,65 @@ mod tests {
         assert!(!funding_arb_private_readonly_error_is_unavailable(
             &unsafe_config
         ));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_arb_exit_pre_dispatch_block_writes_retry_report() {
+        let temp = RuntimeTempDir::new().expect("temp dir");
+        let state = FundingArbPositionState {
+            pair_id: "bybit:aster:BSBUSDT:BSBUSDT".to_owned(),
+            symbol: "BSBUSDT".to_owned(),
+            plan_hash: None,
+            notional_usd: "90.00".to_owned(),
+            entry_net_funding_bps: Some(20),
+            opened_at: "2026-05-23T11:27:10Z".to_owned(),
+            private_order_events_dir: None,
+            leg_a: FundingArbPositionLegState {
+                role: "funding_perp_long".to_owned(),
+                venue_family: "aster".to_owned(),
+                venue_id: ASTER_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:aster-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:ASTER:BSBUSDT:USDT-FUTURES".to_owned(),
+                side: OrderSide::Buy,
+                quantity: "67".to_owned(),
+                entry_limit_price: "1.34185".to_owned(),
+            },
+            leg_b: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "bybit".to_owned(),
+                venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: BYBIT_GUARDED_LIVE_ACCOUNT_REF.to_owned(),
+                instrument_id: "inst:BYBIT:BSBUSDT:LINEAR-PERP".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "67".to_owned(),
+                entry_limit_price: "1.33".to_owned(),
+            },
+        };
+
+        let report = funding_arb_exit_cycle_blocked_before_dispatch(
+            &state,
+            temp.path(),
+            "private_readonly_snapshot_unavailable",
+            "funding arb exit private read-only snapshot unavailable before dispatch; exit will retry"
+                .to_owned(),
+        )
+        .expect("blocked retry report");
+
+        assert_eq!(report.decision, "blocked");
+        assert!(!report.dispatch_attempted);
+        assert_eq!(report.submitted_receipt_count, 0);
+        assert_eq!(report.private_confirmation_count, 0);
+        assert!(report.residual_risk.is_some());
+        assert_eq!(
+            read_utf8(&temp.path().join("funding_arb_exit_mutable_receipts.jsonl"))
+                .expect("receipts"),
+            ""
+        );
+        let report_json =
+            read_utf8(&temp.path().join("funding_arb_exit_cycle_report.json")).expect("report");
+        assert!(report_json.contains("\"decision\":\"blocked\""));
+        assert!(report_json.contains("private_readonly_snapshot_unavailable"));
     }
 
     #[cfg(feature = "live-exec")]
@@ -61485,10 +64667,14 @@ mod tests {
             spot_ask: Some("100.00".to_owned()),
             spot_bid_qty: Some("1.0".to_owned()),
             spot_ask_qty: Some("2.0".to_owned()),
+            spot_bid_depth: signal_depth_from_top_strings("99.90", "1.0"),
+            spot_ask_depth: signal_depth_from_top_strings("100.00", "2.0"),
             perp_bid: Some("101.00".to_owned()),
             perp_ask: Some("101.10".to_owned()),
             perp_bid_qty: Some("1.5".to_owned()),
             perp_ask_qty: Some("2.5".to_owned()),
+            perp_bid_depth: signal_depth_from_top_strings("101.00", "1.5"),
+            perp_ask_depth: signal_depth_from_top_strings("101.10", "2.5"),
             mark_price: "101.00".to_owned(),
             index_price: "100.00".to_owned(),
             last_funding_rate: "0.00010000".to_owned(),
@@ -61569,6 +64755,97 @@ mod tests {
     }
 
     #[test]
+    fn binance_basis_monitor_uses_order_book_depth_for_signal_gate() {
+        let spot = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"0.5","askPrice":"100.00","askQty":"0.5"}
+        ]"#;
+        let perp = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"102.00","bidQty":"0.5","askPrice":"102.10","askQty":"0.5","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"BTCUSDT","markPrice":"102.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let mut spot_depths = BTreeMap::new();
+        spot_depths.insert(
+            "BTCUSDT".to_owned(),
+            PublicOrderBookDepth {
+                bid_depth: signal_depth_from_top_strings("99.90", "0.5"),
+                ask_depth: vec![
+                    SignalDepthLevel {
+                        price: "100.00".to_owned(),
+                        size: "0.5".to_owned(),
+                    },
+                    SignalDepthLevel {
+                        price: "100.50".to_owned(),
+                        size: "1.0".to_owned(),
+                    },
+                ],
+            },
+        );
+        let mut perp_depths = BTreeMap::new();
+        perp_depths.insert(
+            "BTCUSDT".to_owned(),
+            PublicOrderBookDepth {
+                bid_depth: vec![
+                    SignalDepthLevel {
+                        price: "102.00".to_owned(),
+                        size: "0.5".to_owned(),
+                    },
+                    SignalDepthLevel {
+                        price: "101.50".to_owned(),
+                        size: "1.0".to_owned(),
+                    },
+                ],
+                ask_depth: signal_depth_from_top_strings("102.10", "0.5"),
+            },
+        );
+        let options = BinanceBasisMonitorOptions {
+            min_abs_funding_rate: "0.00000100".to_owned(),
+            once: true,
+            ..BinanceBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_binance_basis_monitor_snapshot_from_json_with_depth(
+            spot,
+            perp,
+            premium,
+            &options,
+            &spot_depths,
+            &perp_depths,
+            Vec::new(),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.candidate_count, 1);
+        let row = snapshot.rows.first().expect("row");
+        assert!(row.is_candidate);
+        assert_eq!(row.reason, None);
+        assert_eq!(row.spot_ask_depth.len(), 2);
+        assert_eq!(row.perp_bid_depth.len(), 2);
+        assert!(row.to_json().contains("spot_ask_depth_levels"));
+    }
+
+    #[test]
+    fn public_order_book_depth_parsers_accept_supported_venue_shapes() {
+        let binance = r#"{"lastUpdateId":1,"bids":[["102.00","0.5"],["101.50","1.0"]],"asks":[["102.10","0.5"],["102.50","1.0"]]}"#;
+        let bybit = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","s":"BTCUSDT","b":[["102.00","0.5"]],"a":[["102.10","0.5"]]},"retExtInfo":{},"time":1778584220000}"#;
+        let okx = r#"{"code":"0","msg":"","data":[{"asks":[["102.10","0.5","0","1"]],"bids":[["102.00","0.5","0","1"]],"ts":"1778584220000"}]}"#;
+        let bitget = r#"{"code":"00000","msg":"success","data":{"asks":[["102.10","0.5"]],"bids":[["102.00","0.5"]],"ts":"1778584220000"}}"#;
+
+        for (venue, raw) in [
+            (PublicOrderBookDepthVenue::BinanceUsdmPerp, binance),
+            (PublicOrderBookDepthVenue::BybitLinear, bybit),
+            (PublicOrderBookDepthVenue::Okx, okx),
+            (PublicOrderBookDepthVenue::BitgetUsdtFutures, bitget),
+        ] {
+            let depth = parse_public_order_book_depth(venue, raw).expect("depth");
+            assert_eq!(depth.bid_depth[0].price, "102.00");
+            assert_eq!(depth.bid_depth[0].size, "0.5");
+            assert_eq!(depth.ask_depth[0].price, "102.10");
+        }
+    }
+
+    #[test]
     fn basis_monitor_snapshot_candidate_events_filter_symbol_and_fail_closed() {
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
         let spec = BasisPipelineSpec::binance_btcusdt().expect("basis spec");
@@ -61589,10 +64866,14 @@ mod tests {
                 spot_ask: None,
                 spot_bid_qty: None,
                 spot_ask_qty: None,
+                spot_bid_depth: Vec::new(),
+                spot_ask_depth: Vec::new(),
                 perp_bid: None,
                 perp_ask: None,
                 perp_bid_qty: None,
                 perp_ask_qty: None,
+                perp_bid_depth: Vec::new(),
+                perp_ask_depth: Vec::new(),
                 mark_price: String::new(),
                 index_price: String::new(),
                 last_funding_rate: String::new(),
@@ -63000,6 +66281,8 @@ mod tests {
                 private_order_events: None,
                 market: arb_venue_exec::PrivateOrderMarket::BitgetUsdtFutures,
                 order_query_event_prefix: "event:funding-test-order-query",
+                slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+                price_tick_resolver: test_funding_arb_price_tick_for_venue,
             },
         )
         .expect("unknown submit reconciliation should query by client order id");
@@ -63066,6 +66349,8 @@ mod tests {
                 private_order_events: None,
                 market: arb_venue_exec::PrivateOrderMarket::BybitLinear,
                 order_query_event_prefix: "event:funding-test-order-query",
+                slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+                price_tick_resolver: test_funding_arb_price_tick_for_venue,
             },
             &mut outcome,
         )
@@ -63083,10 +66368,135 @@ mod tests {
         assert!(unwind.reduce_only);
         assert_eq!(unwind.side, OrderSide::Sell);
         assert_eq!(unwind.quantity.to_string(), "12");
+        assert_eq!(
+            unwind
+                .limit_price
+                .expect("protected unwind price")
+                .to_string(),
+            "0.2871"
+        );
         assert_eq!(adapter.confirmed.len(), 1);
         assert!(adapter.confirmed[0].source_event_id.starts_with(
             "event:funding-test-order-query:funding-unwind:first-terminal-positive-fill"
         ));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_second_terminal_unfilled_successful_unwind_marks_flat() {
+        let first = test_basis_planned_order_for_account(
+            "perp_long",
+            BYBIT_BASIS_PERP_VENUE_ID,
+            BYBIT_BASIS_PERP_INSTRUMENT_ID,
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "bybitFirstFilled",
+            "idem:test:funding-second-terminal:first",
+        );
+        let second = test_basis_planned_order_for_account(
+            "perp_short",
+            BITGET_BASIS_PERP_VENUE_ID,
+            BITGET_BASIS_PERP_INSTRUMENT_ID,
+            BITGET_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "bitgetSecondCancelled",
+            "idem:test:funding-second-terminal:second",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:funding-second-terminal-unwind".to_owned(),
+            requests: vec![first, second],
+        };
+        let mut first_adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    "funding-first-submit",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    "funding-first-unwind",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("0.100"),
+                    Some(OrderSide::Buy),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("0.100"),
+                    Some(OrderSide::Sell),
+                )),
+            ],
+        );
+        let mut second_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BITGET_BASIS_PERP_VENUE_ID,
+                "funding-second-submit",
+            ))],
+            vec![],
+            vec![Ok(test_private_order_update(
+                arb_venue_exec::PrivateOrderMarket::BitgetUsdtFutures,
+                BITGET_BASIS_PERP_VENUE_ID,
+                BITGET_BASIS_PERP_INSTRUMENT_ID,
+                OrderConfirmationStatus::Cancelled,
+                None,
+                Some(OrderSide::Sell),
+            ))],
+        );
+
+        let outcome = execute_funding_arb_live_canary_dispatch(
+            &dispatch_plan,
+            &mut first_adapter,
+            &mut second_adapter,
+            arb_venue_exec::PrivateOrderMarket::BybitLinear,
+            arb_venue_exec::PrivateOrderMarket::BitgetUsdtFutures,
+            FundingLiveCanaryContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                protection_suffix: "1779466029",
+                private_order_events: None,
+                order_query_event_prefix: "event:funding-test-order-query",
+                slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+                price_tick_resolver: test_funding_arb_price_tick_for_venue,
+            },
+        )
+        .expect("second terminal unfilled should unwind first leg");
+
+        assert!(outcome.flat_after_cancel);
+        assert_eq!(outcome.primary_submit_receipt_count, 2);
+        assert_eq!(outcome.protection.receipt_count, 1);
+        assert!(outcome.protection.residual_risk.is_none());
+        assert!(outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("terminal non-filled")));
+        assert_eq!(first_adapter.submitted.len(), 2);
+        assert_eq!(second_adapter.submitted.len(), 1);
+        let unwind = &first_adapter.submitted[1];
+        assert!(unwind.reduce_only);
+        assert_eq!(unwind.side, OrderSide::Sell);
+        assert_eq!(unwind.quantity.to_string(), "0.100");
+        assert!(outcome
+            .protection
+            .actions
+            .iter()
+            .any(|action| action.contains("funding_reduce_only_unwind:second-terminal-unfilled")));
     }
 
     #[cfg(feature = "live-exec")]
@@ -63773,6 +67183,54 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn binance_usdm_price_tick_parses_price_filter() {
+        let raw = r#"{
+          "timezone": "UTC",
+          "serverTime": 1779285405860,
+          "symbols": [
+            {
+              "symbol": "SOXLUSDT",
+              "contractType": "PERPETUAL",
+              "status": "TRADING",
+              "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.010000"},
+                {"filterType": "LOT_SIZE", "minQty": "0.01", "maxQty": "1000000", "stepSize": "0.01"}
+              ]
+            }
+          ]
+        }"#;
+
+        let tick = parse_binance_usdm_price_tick(raw, "SOXLUSDT").expect("price tick");
+
+        assert_eq!(tick.to_string(), "0.010000");
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn aster_futures_price_tick_parses_price_filter() {
+        let raw = r#"{
+          "timezone": "UTC",
+          "serverTime": 1779285405860,
+          "symbols": [
+            {
+              "symbol": "BSBUSDT",
+              "contractType": "PERPETUAL",
+              "status": "TRADING",
+              "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.000100"},
+                {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "1000000", "stepSize": "1"}
+              ]
+            }
+          ]
+        }"#;
+
+        let tick = parse_aster_futures_price_tick(raw, "BSBUSDT").expect("price tick");
+
+        assert_eq!(tick.to_string(), "0.000100");
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn bybit_linear_quantity_step_parses_lot_size_filter() {
         let raw = r#"{
           "retCode": 0,
@@ -63795,6 +67253,33 @@ mod tests {
         let step = parse_bybit_linear_quantity_step(raw, "CHIPUSDT").expect("quantity step");
 
         assert_eq!(step.to_string(), "10");
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_linear_price_tick_parses_price_filter() {
+        let raw = r#"{
+          "retCode": 0,
+          "retMsg": "OK",
+          "result": {
+            "category": "linear",
+            "list": [
+              {
+                "symbol": "CHIPUSDT",
+                "contractType": "LinearPerpetual",
+                "status": "Trading",
+                "priceFilter": {"minPrice": "0.0001", "maxPrice": "199999.8", "tickSize": "0.0001"},
+                "lotSizeFilter": {"minOrderQty": "10", "qtyStep": "10"}
+              }
+            ]
+          },
+          "retExtInfo": {},
+          "time": 1779285405860
+        }"#;
+
+        let tick = parse_bybit_linear_price_tick(raw, "CHIPUSDT").expect("price tick");
+
+        assert_eq!(tick.to_string(), "0.0001");
     }
 
     #[test]
@@ -63954,6 +67439,29 @@ mod tests {
         assert_eq!(step.to_string(), "0.1");
     }
 
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn okx_swap_price_tick_parses_tick_size() {
+        let raw = r#"{
+          "code": "0",
+          "msg": "",
+          "data": [
+            {
+              "instType": "SWAP",
+              "instId": "USAR-USDT-SWAP",
+              "state": "live",
+              "ctVal": "1",
+              "lotSz": "0.1",
+              "tickSz": "0.01"
+            }
+          ]
+        }"#;
+
+        let tick = parse_okx_swap_price_tick(raw, "USAR-USDT-SWAP").expect("price tick");
+
+        assert_eq!(tick.to_string(), "0.01");
+    }
+
     #[test]
     fn okx_basis_monitor_snapshot_requires_funding_before_candidate() {
         let spot = r#"{
@@ -64087,6 +67595,23 @@ mod tests {
         let step = parse_bitget_usdt_futures_quantity_step(raw, "CHIPUSDT").expect("quantity step");
 
         assert_eq!(step.to_string(), "1");
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bitget_usdt_futures_price_tick_parses_price_place_and_end_step() {
+        let raw = r#"{
+          "code": "00000",
+          "msg": "success",
+          "requestTime": 1779285405902,
+          "data": [
+            {"symbol":"CHIPUSDT","pricePlace":"4","priceEndStep":"5","sizeMultiplier":"1","minTradeNum":"1"}
+          ]
+        }"#;
+
+        let tick = parse_bitget_usdt_futures_price_tick(raw, "CHIPUSDT").expect("price tick");
+
+        assert_eq!(tick.to_string(), "0.0005");
     }
 
     #[test]

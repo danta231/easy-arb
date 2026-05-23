@@ -65,6 +65,12 @@ usage() {
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
+  BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=0 # 实盘启动时是否允许 resident 自动处理历史 unknown 仓位；默认 0 表示启动前失败。
+  BASIS_OBSERVER_FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE=1 # 实盘启动时是否先用私有只读仓位快照自动关闭已确认双边为 0 的历史 unknown。
+  BASIS_OBSERVER_FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN=1 # 只读快照确认历史 unknown 仍有非 0 仓位时，是否自动切入 resident reduce-only recovery。
+  BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_CHECK=1 # 实盘启动 resident 前是否对当前 funding-arb 候选跑只读 guarded dry-run 门禁。
+  BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_LIMIT=3 # 启动前最多检查的 funding-arb 候选数量，按净 funding bps 排序。
+  BASIS_OBSERVER_FUNDING_ARB_STARTUP_PRECHECK_OUT= # funding-arb 启动前拦截报告和 dry-run 预检产物目录。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；启用 raw snapshot 时必须留空。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT= # 资金费率结算原始只读快照输出路径。
   BASIS_OBSERVER_DYNAMIC_TARGET_WSS=0 # candidate 触发 auto-once 验证时，是否按 symbol 动态启动专用 target WSS。
@@ -1344,6 +1350,840 @@ wait_for_funding_arb_opportunities() {
   return 1
 }
 
+funding_arb_unresolved_unknowns_json() {
+  local positions_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_positions.jsonl"
+
+  if [[ ! -s "${positions_path}" ]]; then
+    printf '[]\n'
+    return 0
+  fi
+
+  jq -s -c '
+    reduce .[] as $event ({};
+      ($event.position_id // "") as $position_id
+      | if $position_id == "" then .
+        elif ($event.event_type // "") == "position_opened" then
+          .[$position_id] = {
+            status: "open",
+            event_type: "position_opened",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null)
+          }
+        elif ($event.event_type // "") == "position_unknown" then
+          .[$position_id] = {
+            status: "unknown",
+            event_type: "position_unknown",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null)
+          }
+        elif ($event.event_type // "") == "position_closed" then
+          .[$position_id] = {
+            status: "closed",
+            event_type: "position_closed",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null)
+          }
+        elif ($event.event_type // "") == "position_flat_cancelled" then
+          .[$position_id] = {
+            status: "flat_cancelled",
+            event_type: "position_flat_cancelled",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null)
+          }
+        else .
+        end
+    )
+    | to_entries
+    | map(select(.value.status == "unknown"))
+  ' "${positions_path}"
+}
+
+funding_arb_open_positions_json() {
+  local positions_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_positions.jsonl"
+
+  if [[ ! -s "${positions_path}" ]]; then
+    printf '[]\n'
+    return 0
+  fi
+
+  jq -s -c '
+    reduce .[] as $event ({};
+      ($event.position_id // "") as $position_id
+      | if $position_id == "" then .
+        elif ($event.event_type // "") == "position_opened" then
+          .[$position_id] = {
+            status: "open",
+            event_type: "position_opened",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null),
+            position_state_path: ($event.position_state_path // null),
+            recovered_from_unknown: ($event.recovered_from_unknown // false)
+          }
+        elif ($event.event_type // "") == "position_unknown" then
+          .[$position_id] = {
+            status: "unknown",
+            event_type: "position_unknown",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null)
+          }
+        elif ($event.event_type // "") == "position_closed" then
+          .[$position_id] = {
+            status: "closed",
+            event_type: "position_closed",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null)
+          }
+        elif ($event.event_type // "") == "position_flat_cancelled" then
+          .[$position_id] = {
+            status: "flat_cancelled",
+            event_type: "position_flat_cancelled",
+            pair_id: ($event.pair_id // null),
+            symbol: ($event.symbol // null),
+            reason: ($event.reason // null),
+            residual_risk: ($event.residual_risk // null),
+            cycle_dir: ($event.cycle_dir // null)
+          }
+        else .
+        end
+    )
+    | to_entries
+    | map(select(.value.status == "open"))
+  ' "${positions_path}"
+}
+
+funding_arb_current_candidate_pair_ids() {
+  local snapshot_path="${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
+
+  [[ -s "${snapshot_path}" ]] || return 1
+  jq -r --argjson limit "${FUNDING_ARB_STARTUP_DRY_RUN_LIMIT}" '
+    [(.rows // [])[]
+      | select((.is_candidate // false) == true)
+    ]
+    | sort_by(((.net_funding_bps // "0") | tonumber? // 0))
+    | reverse
+    | .[:$limit][]
+    | .pair_id
+  ' "${snapshot_path}"
+}
+
+write_funding_arb_startup_block_report() {
+  local reason="$1"
+  local unknowns_json="${2:-[]}"
+  local pair_id="${3:-}"
+  local artifact_path="${4:-}"
+  local summary_unknown_count="${5:-0}"
+  local summary_open_count="${6:-0}"
+  local report_path="${FUNDING_ARB_STARTUP_PRECHECK_DIR}/funding_arb_startup_block_report.json"
+
+  mkdir -p "${FUNDING_ARB_STARTUP_PRECHECK_DIR}"
+  jq -n \
+    --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg reason "${reason}" \
+    --arg pair_id "${pair_id}" \
+    --arg artifact_path "${artifact_path}" \
+    --arg resident_out_dir "${FUNDING_ARB_RESIDENT_OUT_DIR}" \
+    --arg snapshot_path "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" \
+    --argjson execute_live "${EXECUTE_LIVE}" \
+    --argjson allow_unknown_recovery "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" \
+    --argjson summary_unknown_count "${summary_unknown_count}" \
+    --argjson summary_open_count "${summary_open_count}" \
+    --argjson unresolved_unknowns "${unknowns_json}" \
+    '{
+      schema_version: "1.0.0",
+      updated_at: $updated_at,
+      phase: "blocked",
+      reason: $reason,
+      execute_live: ($execute_live == 1),
+      allow_unknown_recovery: ($allow_unknown_recovery == 1),
+      resident_out_dir: $resident_out_dir,
+      snapshot_path: $snapshot_path,
+      pair_id: (if $pair_id == "" then null else $pair_id end),
+      artifact_path: (if $artifact_path == "" then null else $artifact_path end),
+      summary_unknown_count: $summary_unknown_count,
+      summary_open_count: $summary_open_count,
+      unresolved_unknown_count: ($unresolved_unknowns | length),
+      unresolved_unknowns: $unresolved_unknowns
+    }' > "${report_path}"
+  echo "funding_arb_startup_block_report=${report_path}" >&2
+}
+
+funding_arb_guarded_dry_run_report_is_stale_candidate_skip() {
+  local report_path="$1"
+  jq -e '
+    def allowed_blocker:
+      . == "funding-arb execution constraints cannot be checked without a candidate"
+      or . == "funding-arb execution preflight cannot run because no candidate was emitted"
+      or . == "funding-arb manual approval plan preview is not built, so the manual gate cannot be released"
+      or . == "funding-arb manual approval plan preview status is NotAttempted"
+      or . == "private execution fill/order reconciliation snapshot was not provided"
+      or . == "risk decision is unavailable; no funding-arb dispatch may be built"
+      or . == "strategy did not emit a funding-arb candidate";
+
+    (.signal_allowed == false)
+    and (.risk_decision == "NoCandidate")
+    and (.dispatch_plan_built == false)
+    and ((.dispatch_request_count // 0) == 0)
+    and ((.private_accounts.status // "") == "Matched")
+    and ((.private_positions.status // "") == "Matched")
+    and ((.snapshot_lineage.status // "") == "Matched")
+    and ((.venue_execution_capability.status // "") == "Matched")
+    and (((.live_blocking_reasons // []) | length) > 0)
+    and (((.live_blocking_reasons // []) | all(allowed_blocker)))
+  ' "${report_path}" >/dev/null
+}
+
+clear_funding_arb_startup_block_report() {
+  local report_path="${FUNDING_ARB_STARTUP_PRECHECK_DIR}/funding_arb_startup_block_report.json"
+  [[ -e "${report_path}" ]] || return 0
+  rm -f "${report_path}"
+}
+
+funding_arb_private_positions_snapshot_confirms_flat() {
+  local raw_snapshot_path="$1"
+  local symbol="$2"
+  local report_path="$3"
+  local flat_status
+
+  if jq -e --arg symbol "${symbol}" '
+    def norm:
+      tostring
+      | ascii_upcase
+      | gsub("[^A-Z0-9]"; "");
+    def symbol_matches($raw):
+      ($raw | norm) as $raw_symbol
+      | ($symbol | norm) as $target_symbol
+      | $raw_symbol != ""
+      and (
+        $raw_symbol == $target_symbol
+        or $raw_symbol == ($target_symbol + "SWAP")
+        or $raw_symbol == ($target_symbol + "PERP")
+        or $target_symbol == ($raw_symbol + "USDT")
+        or $target_symbol == ($raw_symbol + "USD")
+        or $target_symbol == ($raw_symbol + "USDC")
+      );
+    def numeric_quantity:
+      if type == "number" then .
+      else (tostring | tonumber? // 0)
+      end;
+    def quantity_values:
+      [
+        .positionAmt?,
+        .position_amount?,
+        .positionAmtAbs?,
+        .positionSize?,
+        .position_size?,
+        .size?,
+        .szi?,
+        .sz?,
+        .pos?,
+        .qty?,
+        .quantity?,
+        .total?
+      ]
+      | map(select(. != null and . != ""))
+      | map(numeric_quantity);
+
+    (.status == "complete")
+    and (((.source_errors // []) | length) == 0)
+    and (((.statements // []) | length) > 0)
+    and (
+      [
+        (.statements // [])[] as $statement
+        | (($statement.payload // "null") | fromjson? // empty)
+        | .. | objects
+        | select(symbol_matches(.symbol? // .instId? // .instrument? // .coin? // .asset? // ""))
+        | quantity_values
+        | map(abs)
+        | max // 0
+      ]
+      | all(. == 0)
+    )
+  ' "${raw_snapshot_path}" >/dev/null; then
+    flat_status=0
+  else
+    flat_status="$?"
+  fi
+
+  jq -c --arg symbol "${symbol}" '
+    def norm:
+      tostring
+      | ascii_upcase
+      | gsub("[^A-Z0-9]"; "");
+    def symbol_matches($raw):
+      ($raw | norm) as $raw_symbol
+      | ($symbol | norm) as $target_symbol
+      | $raw_symbol != ""
+      and (
+        $raw_symbol == $target_symbol
+        or $raw_symbol == ($target_symbol + "SWAP")
+        or $raw_symbol == ($target_symbol + "PERP")
+        or $target_symbol == ($raw_symbol + "USDT")
+        or $target_symbol == ($raw_symbol + "USD")
+        or $target_symbol == ($raw_symbol + "USDC")
+      );
+    def numeric_quantity:
+      if type == "number" then .
+      else (tostring | tonumber? // 0)
+      end;
+    def quantity_values:
+      [
+        .positionAmt?,
+        .position_amount?,
+        .positionAmtAbs?,
+        .positionSize?,
+        .position_size?,
+        .size?,
+        .szi?,
+        .sz?,
+        .pos?,
+        .qty?,
+        .quantity?,
+        .total?
+      ]
+      | map(select(. != null and . != ""))
+      | map(numeric_quantity);
+    [
+      (.statements // [])[] as $statement
+      | (($statement.payload // "null") | fromjson? // empty)
+      | .. | objects
+      | select(symbol_matches(.symbol? // .instId? // .instrument? // .coin? // .asset? // ""))
+      | {
+          venue_family: ($statement.venue_family // null),
+          account_id: ($statement.account_id // null),
+          quantity_values: quantity_values,
+          max_abs_quantity: ((quantity_values | map(abs) | max) // 0)
+        }
+    ] as $matches
+    | {
+        symbol: $symbol,
+        status: (.status // null),
+        source_error_count: ((.source_errors // []) | length),
+        statement_count: ((.statements // []) | length),
+        matching_position_count: ($matches | length),
+        nonzero_position_count: ($matches | map(select(.max_abs_quantity != 0)) | length),
+        matches: $matches
+      }
+  ' "${raw_snapshot_path}" > "${report_path}"
+  return "${flat_status}"
+}
+
+append_funding_arb_startup_reconciled_position_closed() {
+  local position_id="$1"
+  local pair_id="$2"
+  local symbol="$3"
+  local pair_dir="$4"
+  local flat_report_path="$5"
+  local positions_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_positions.jsonl"
+
+  mkdir -p "${FUNDING_ARB_RESIDENT_OUT_DIR}"
+  jq -nc \
+    --arg cycle_dir "${pair_dir}" \
+    --arg flat_report_path "${flat_report_path}" \
+    --arg pair_id "${pair_id}" \
+    --arg position_id "${position_id}" \
+    --arg symbol "${symbol}" \
+    '{
+      cycle: 0,
+      cycle_dir: $cycle_dir,
+      event_type: "position_closed",
+      flat_reconciliation_report: $flat_report_path,
+      pair_id: $pair_id,
+      position_id: $position_id,
+      reason: "startup private read-only reconciliation confirmed flat positions",
+      status: "closed",
+      symbol: $symbol
+    }' >> "${positions_path}"
+}
+
+funding_arb_reconcile_unknowns_with_private_readonly() {
+  local unknowns_json="$1"
+  local position_id
+  local pair_id
+  local symbol
+  local safe_pair
+  local run_id
+  local pair_dir
+  local readonly_dir
+  local log_file
+  local flat_report_path
+  local reconciled_count=0
+  local failed_count=0
+  local nonzero_confirmed_count=0
+  local -a readonly_args
+
+  FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED=0
+  [[ "${FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE}" == "1" ]] || return 1
+  [[ "${EXECUTE_LIVE}" == "1" ]] || return 1
+
+  while IFS=$'\t' read -r position_id pair_id symbol; do
+    [[ -n "${position_id}" && -n "${pair_id}" && -n "${symbol}" ]] || continue
+    safe_pair="${pair_id//[^A-Za-z0-9_.-]/_}"
+    run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+    pair_dir="${FUNDING_ARB_STARTUP_PRECHECK_DIR}/${run_id}/unknown-readonly/${safe_pair}"
+    readonly_dir="${pair_dir}/private-readonly"
+    log_file="${pair_dir}/readonly-reconcile.log"
+    flat_report_path="${pair_dir}/flat-position-reconciliation.json"
+    mkdir -p "${pair_dir}"
+
+    readonly_args=(
+      "${RUNTIME_BIN}" funding-arb-private-readonly-snapshot-once
+      --snapshot "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
+      --pair-id "${pair_id}"
+      --config "${CONFIG_PATH}"
+      --out "${readonly_dir}"
+    )
+    [[ -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}" ]] && readonly_args+=(--funding-settlement-raw-snapshot "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}")
+    [[ -n "${HYPERLIQUID_USER:-}" ]] && readonly_args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
+    [[ -n "${ASTER_USER:-}" ]] && readonly_args+=(--aster-user "${ASTER_USER}")
+    [[ -n "${ASTER_SIGNER:-}" ]] && readonly_args+=(--aster-signer "${ASTER_SIGNER}")
+    [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && readonly_args+=(--aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
+
+    echo "funding_arb_unknown_readonly_reconcile pair_id=${pair_id} position_id=${position_id} out=${readonly_dir}"
+    if ! "${readonly_args[@]}" >> "${log_file}" 2>&1; then
+      echo "warning: funding-arb unknown readonly reconciliation failed for pair_id=${pair_id}; log=${log_file}" >&2
+      tail -n 20 "${log_file}" >&2 || true
+      failed_count="$((failed_count + 1))"
+      continue
+    fi
+
+    if funding_arb_private_positions_snapshot_confirms_flat "${readonly_dir}/funding_arb_private_position_raw_snapshot.json" "${symbol}" "${flat_report_path}"; then
+      append_funding_arb_startup_reconciled_position_closed "${position_id}" "${pair_id}" "${symbol}" "${pair_dir}" "${flat_report_path}"
+      echo "funding_arb_unknown_readonly_reconciled_flat pair_id=${pair_id} position_id=${position_id} report=${flat_report_path}"
+      reconciled_count="$((reconciled_count + 1))"
+    else
+      if jq -e '(.status == "complete") and ((.source_error_count // 0) == 0) and ((.nonzero_position_count // 0) > 0)' "${flat_report_path}" >/dev/null 2>&1; then
+        echo "warning: funding-arb unknown readonly reconciliation confirmed non-zero positions for pair_id=${pair_id}; report=${flat_report_path}" >&2
+        nonzero_confirmed_count="$((nonzero_confirmed_count + 1))"
+      fi
+      echo "warning: funding-arb unknown readonly reconciliation did not confirm flat positions for pair_id=${pair_id}; report=${flat_report_path}" >&2
+      failed_count="$((failed_count + 1))"
+    fi
+  done < <(
+    printf '%s\n' "${unknowns_json}" | jq -r '
+      .[]
+      | [
+          .key,
+          (.value.pair_id // ""),
+          (.value.symbol // "")
+        ]
+      | @tsv
+    '
+  )
+
+  if (( nonzero_confirmed_count > 0 )); then
+    FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED=1
+  fi
+  (( reconciled_count > 0 && failed_count == 0 ))
+}
+
+check_funding_arb_resident_unknown_startup_risk() {
+  local unknowns_json
+  local open_positions_json
+  local unknown_count
+  local open_count
+  local summary_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json"
+  local summary_unknown_count=0
+  local summary_open_count=0
+
+  [[ "${EXECUTE_LIVE}" == "1" ]] || return 0
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required for live funding-arb startup risk checks" >&2
+    return 1
+  }
+
+  unknowns_json="$(funding_arb_unresolved_unknowns_json)"
+  unknown_count="$(printf '%s\n' "${unknowns_json}" | jq 'length')"
+  if [[ -s "${summary_path}" ]]; then
+    refresh_funding_arb_summary_position_counts "${summary_path}"
+    summary_unknown_count="$(jq -r '(.unknown_position_count // 0) | tonumber' "${summary_path}" 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+    summary_open_count="$(jq -r '(.open_position_count // 0) | tonumber' "${summary_path}" 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+  fi
+
+  if (( unknown_count > 0 || summary_unknown_count > 0 )); then
+    if [[ "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" == "1" ]]; then
+      echo "warning: funding-arb live startup will allow unknown recovery; unresolved_unknown_positions=${unknown_count} summary_unknown_count=${summary_unknown_count}" >&2
+      return 0
+    fi
+
+    if funding_arb_reconcile_unknowns_with_private_readonly "${unknowns_json}"; then
+      unknowns_json="$(funding_arb_unresolved_unknowns_json)"
+      unknown_count="$(printf '%s\n' "${unknowns_json}" | jq 'length')"
+      if [[ -s "${summary_path}" ]]; then
+        refresh_funding_arb_summary_position_counts "${summary_path}"
+        summary_unknown_count="$(jq -r '(.unknown_position_count // 0) | tonumber' "${summary_path}" 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+        summary_open_count="$(jq -r '(.open_position_count // 0) | tonumber' "${summary_path}" 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+      fi
+      if (( unknown_count == 0 && summary_unknown_count == 0 )); then
+        clear_funding_arb_startup_block_report
+        echo "funding_arb_unknown_readonly_reconcile_ok reason=all_unknown_positions_confirmed_flat"
+        return 0
+      fi
+    fi
+
+    if [[ "${FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED:-0}" == "1" && "${FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN}" == "1" ]]; then
+      FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=1
+      echo "warning: funding-arb live startup confirmed non-zero unknown positions; enabling resident reduce-only recovery before new entries" >&2
+      return 0
+    fi
+
+    write_funding_arb_startup_block_report "unresolved_unknown_positions" "${unknowns_json}" "" "" "${summary_unknown_count}" "${summary_open_count}"
+    echo "error: funding-arb live startup blocked before starting background processes: unresolved unknown position state exists." >&2
+    printf '%s\n' "${unknowns_json}" | jq -r '
+      .[:8][]
+      | "  - position_id=\(.key) pair_id=\(.value.pair_id // "unknown") symbol=\(.value.symbol // "unknown") residual_risk=\(.value.residual_risk // "null") reason=\(.value.reason // "unknown")"
+    ' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+    echo "set BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=1 only after deciding that resident reduce-only recovery is intended." >&2
+    return 1
+  fi
+
+  open_positions_json="$(funding_arb_open_positions_json)"
+  open_count="$(printf '%s\n' "${open_positions_json}" | jq 'length')"
+  if (( open_count > 0 || summary_open_count > 0 )); then
+    if [[ "${FUNDING_ARB_STARTUP_OPEN_POSITION_CONTINUE:-0}" == "1" ]]; then
+      clear_funding_arb_startup_block_report
+      echo "funding_arb_open_position_startup_ok reason=existing_position_supervision_continues open_count=${open_count} summary_open_count=${summary_open_count}"
+      return 0
+    fi
+
+    if [[ "${FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN}" == "1" ]]; then
+      FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=1
+      FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED=1
+      echo "warning: funding-arb live startup found open resident positions; enabling foreground reduce-only exit before new entries; open_count=${open_count} summary_open_count=${summary_open_count}" >&2
+      return 0
+    fi
+
+    write_funding_arb_startup_block_report "open_resident_positions" "[]" "" "" "${summary_unknown_count}" "${summary_open_count}"
+    echo "error: funding-arb live startup blocked before starting background processes: open resident position state exists." >&2
+    printf '%s\n' "${open_positions_json}" | jq -r '
+      .[:8][]
+      | "  - position_id=\(.key) pair_id=\(.value.pair_id // "unknown") symbol=\(.value.symbol // "unknown") recovered_from_unknown=\(.value.recovered_from_unknown // false)"
+    ' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+    echo "set BASIS_OBSERVER_FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN=1 only after deciding that resident reduce-only exit is intended." >&2
+    return 1
+  fi
+
+  clear_funding_arb_startup_block_report
+}
+
+funding_arb_startup_open_position_recovery_can_continue() {
+  local summary_path="$1"
+
+  [[ -s "${summary_path}" ]] || return 1
+  jq -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+
+    (.phase // "") == "halted"
+    and (((.unknown_position_count // 0) | as_count) == 0)
+    and (((.open_position_count // 0) | as_count) > 0)
+    and ((.dispatch_attempted // false) == false)
+    and (
+      (.halt_reason // "") == "funding arb existing position recovery cycle completed; resident live stopped before new entries"
+    )
+  ' "${summary_path}" >/dev/null
+}
+
+run_funding_arb_startup_unknown_recovery_once() {
+  local snapshot_path="${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
+  local log_file="${FUNDING_ARB_STARTUP_PRECHECK_DIR}/unknown-recovery-resident.log"
+  local summary_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json"
+  local unknowns_json
+  local open_positions_json
+  local unknown_count
+  local initial_open_count
+  local open_count=0
+  local -a args
+  local -a hyperliquid_asset_id_args
+  local asset_id_arg
+
+  [[ "${EXECUTE_LIVE}" == "1" ]] || return 0
+  open_positions_json="$(funding_arb_open_positions_json)"
+  initial_open_count="$(printf '%s\n' "${open_positions_json}" | jq 'length')"
+  [[ "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" == "1" ]] || return 0
+  if [[ "${FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED:-0}" != "1" && "${FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED:-0}" != "1" && "${initial_open_count}" == "0" ]]; then
+    return 0
+  fi
+
+  if [[ ! -s "${snapshot_path}" ]]; then
+    write_funding_arb_startup_block_report "missing_funding_arb_snapshot_for_unknown_recovery" "[]" "" "${snapshot_path}" 0
+    echo "error: funding-arb unknown recovery requires ${snapshot_path}" >&2
+    return 1
+  fi
+
+  mkdir -p "${FUNDING_ARB_STARTUP_PRECHECK_DIR}"
+  args=(
+    "${RUNTIME_BIN}" funding-arb-resident-live
+    --snapshot "${snapshot_path}"
+    --config "${CONFIG_PATH}"
+    --out "${FUNDING_ARB_RESIDENT_OUT_DIR}"
+    --interval-secs "${FUNDING_ARB_RESIDENT_INTERVAL_SECS}"
+    --max-cycles "1"
+    --max-live-entries "${FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES}"
+    --notional-usd "${NOTIONAL_USD}"
+    --taker-fee-bps "${PERP_FEE_BPS}"
+    --slippage-bps "${SLIPPAGE_BPS}"
+    --max-entry-price-divergence-bps "${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}"
+    --min-net-funding-bps "${MIN_NET_BPS}"
+    --private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}"
+    --execute-live
+    --i-understand-funding-arb-live-orders
+    --allow-unknown-recovery
+  )
+  [[ -n "${FUNDING_SETTLEMENT_LEDGER:-}" ]] && args+=(--funding-settlement-ledger "${FUNDING_SETTLEMENT_LEDGER}")
+  [[ -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}" ]] && args+=(--funding-settlement-raw-snapshot "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}")
+  [[ -n "${HYPERLIQUID_USER:-}" ]] && args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
+  [[ -n "${HYPERLIQUID_SOURCE:-}" ]] && args+=(--hyperliquid-source "${HYPERLIQUID_SOURCE}")
+  [[ -n "${HYPERLIQUID_VAULT_ADDRESS:-}" ]] && args+=(--hyperliquid-vault-address "${HYPERLIQUID_VAULT_ADDRESS}")
+  [[ -n "${HYPERLIQUID_EXPIRES_AFTER_MS:-}" ]] && args+=(--hyperliquid-expires-after-ms "${HYPERLIQUID_EXPIRES_AFTER_MS}")
+  if [[ -n "${HYPERLIQUID_ASSET_IDS:-}" ]]; then
+    IFS=',' read -r -a hyperliquid_asset_id_args <<< "${HYPERLIQUID_ASSET_IDS}"
+    for asset_id_arg in "${hyperliquid_asset_id_args[@]}"; do
+      asset_id_arg="${asset_id_arg//[[:space:]]/}"
+      [[ -n "${asset_id_arg}" ]] && args+=(--hyperliquid-asset-id "${asset_id_arg}")
+    done
+  fi
+  [[ -n "${ASTER_USER:-}" ]] && args+=(--aster-user "${ASTER_USER}")
+  [[ -n "${ASTER_SIGNER:-}" ]] && args+=(--aster-signer "${ASTER_SIGNER}")
+  [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && args+=(--aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
+
+  echo "funding_arb_startup_unknown_recovery_begin log=${log_file}"
+  if ! "${args[@]}" >> "${log_file}" 2>&1; then
+    write_funding_arb_startup_block_report "unknown_recovery_resident_failed" "$(funding_arb_unresolved_unknowns_json)" "" "${log_file}" 0
+    echo "error: funding-arb startup unknown recovery failed; log=${log_file}" >&2
+    tail -n 60 "${log_file}" >&2 || true
+    return 1
+  fi
+
+  unknowns_json="$(funding_arb_unresolved_unknowns_json)"
+  unknown_count="$(printf '%s\n' "${unknowns_json}" | jq 'length')"
+  if [[ -s "${summary_path}" ]]; then
+    refresh_funding_arb_summary_position_counts "${summary_path}"
+    open_count="$(jq -r '(.open_position_count // 0) | tonumber' "${summary_path}" 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+  fi
+
+  if (( unknown_count == 0 && open_count == 0 )); then
+    FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=0
+    FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED=0
+    FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED=0
+    clear_funding_arb_startup_block_report
+    echo "funding_arb_startup_unknown_recovery_ok log=${log_file}"
+    return 0
+  fi
+
+  if (( unknown_count == 0 && open_count > 0 )) \
+    && [[ "${FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED:-0}" == "1" ]] \
+    && [[ "${FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED:-0}" != "1" ]] \
+    && funding_arb_startup_open_position_recovery_can_continue "${summary_path}"; then
+    FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=0
+    FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED=0
+    FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED=0
+    FUNDING_ARB_STARTUP_OPEN_POSITION_CONTINUE=1
+    clear_funding_arb_startup_block_report
+    echo "funding_arb_startup_open_position_supervision_continue open_count=${open_count} log=${log_file}"
+    return 0
+  fi
+
+  write_funding_arb_startup_block_report "unknown_recovery_left_residual_state" "${unknowns_json}" "" "${log_file}" "${unknown_count}" "${open_count}"
+  echo "error: funding-arb startup unknown recovery left residual state; unknown_count=${unknown_count} open_count=${open_count}; log=${log_file}" >&2
+  return 1
+}
+
+run_funding_arb_startup_dry_run_precheck_for_pair() {
+  local pair_id="$1"
+  local snapshot_path="${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
+  local safe_pair="${pair_id//[^A-Za-z0-9_.-]/_}"
+  local run_id
+  local pair_dir
+  local readonly_dir
+  local guarded_dir
+  local log_file
+  local -a readonly_args
+  local -a dry_run_args
+
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+  pair_dir="${FUNDING_ARB_STARTUP_PRECHECK_DIR}/${run_id}/${safe_pair}"
+  readonly_dir="${pair_dir}/private-readonly"
+  guarded_dir="${pair_dir}/guarded-dry-run"
+  log_file="${pair_dir}/startup-precheck.log"
+  mkdir -p "${pair_dir}"
+
+  readonly_args=(
+    "${RUNTIME_BIN}" funding-arb-private-readonly-snapshot-once
+    --snapshot "${snapshot_path}"
+    --pair-id "${pair_id}"
+    --config "${CONFIG_PATH}"
+    --out "${readonly_dir}"
+  )
+  [[ -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}" ]] && readonly_args+=(--funding-settlement-raw-snapshot "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}")
+  [[ -n "${HYPERLIQUID_USER:-}" ]] && readonly_args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
+  [[ -n "${ASTER_USER:-}" ]] && readonly_args+=(--aster-user "${ASTER_USER}")
+  [[ -n "${ASTER_SIGNER:-}" ]] && readonly_args+=(--aster-signer "${ASTER_SIGNER}")
+  [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && readonly_args+=(--aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
+
+  echo "funding_arb_startup_precheck_readonly pair_id=${pair_id} out=${readonly_dir}"
+  if ! "${readonly_args[@]}" >> "${log_file}" 2>&1; then
+    write_funding_arb_startup_block_report "readonly_precheck_failed" "[]" "${pair_id}" "${log_file}" 0
+    echo "error: funding-arb startup readonly precheck failed for pair_id=${pair_id}; log=${log_file}" >&2
+    tail -n 40 "${log_file}" >&2 || true
+    return 1
+  fi
+
+  dry_run_args=(
+    "${RUNTIME_BIN}" funding-arb-guarded-dry-run-once
+    --snapshot "${snapshot_path}"
+    --pair-id "${pair_id}"
+    --config "${CONFIG_PATH}"
+    --out "${guarded_dir}"
+    --private-account-raw-snapshot "${readonly_dir}/funding_arb_private_account_raw_snapshot.json"
+    --private-position-raw-snapshot "${readonly_dir}/funding_arb_private_position_raw_snapshot.json"
+    --notional-usd "${NOTIONAL_USD}"
+    --taker-fee-bps "${PERP_FEE_BPS}"
+    --slippage-bps "${SLIPPAGE_BPS}"
+    --max-entry-price-divergence-bps "${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}"
+    --min-net-funding-bps "${MIN_NET_BPS}"
+  )
+  if [[ -n "${FUNDING_SETTLEMENT_LEDGER:-}" ]]; then
+    dry_run_args+=(--funding-settlement-ledger "${FUNDING_SETTLEMENT_LEDGER}")
+  else
+    dry_run_args+=(--funding-settlement-raw-snapshot "${readonly_dir}/funding_arb_funding_settlement_raw_snapshot.json")
+  fi
+
+  echo "funding_arb_startup_precheck_guarded_dry_run pair_id=${pair_id} out=${guarded_dir}"
+  if ! "${dry_run_args[@]}" >> "${log_file}" 2>&1; then
+    write_funding_arb_startup_block_report "guarded_dry_run_failed" "[]" "${pair_id}" "${log_file}" 0
+    echo "error: funding-arb startup guarded dry-run failed for pair_id=${pair_id}; log=${log_file}" >&2
+    tail -n 40 "${log_file}" >&2 || true
+    return 1
+  fi
+
+  if jq -e '
+    (.signal_allowed == true)
+    and (.live_ready == true)
+    and (.dispatch_plan_built == true)
+    and ((.dispatch_request_count // 0) == 2)
+    and (((.live_blocking_reasons // []) | length) == 0)
+  ' "${guarded_dir}/funding_arb_guarded_dry_run_report.json" >/dev/null 2>&1; then
+    echo "funding_arb_startup_precheck_ok pair_id=${pair_id} report=${guarded_dir}/funding_arb_guarded_dry_run_report.json"
+    return 0
+  fi
+
+  if funding_arb_guarded_dry_run_report_is_stale_candidate_skip "${guarded_dir}/funding_arb_guarded_dry_run_report.json"; then
+    echo "funding_arb_startup_precheck_skip_stale_candidate pair_id=${pair_id} report=${guarded_dir}/funding_arb_guarded_dry_run_report.json"
+    return 2
+  fi
+
+  write_funding_arb_startup_block_report "guarded_dry_run_not_live_ready" "[]" "${pair_id}" "${guarded_dir}/funding_arb_guarded_dry_run_report.json" 0
+  echo "error: funding-arb startup guarded dry-run is not live-ready for pair_id=${pair_id}" >&2
+  jq -c '{
+    pair_id,
+    symbol,
+    signal_allowed,
+    risk_decision,
+    risk_reason_codes,
+    live_ready,
+    live_blocking_reasons,
+    private_account_status: (.private_accounts.status // null),
+    private_position_status: (.private_positions.status // null),
+    execution_preflight_status: (.execution_preflight.status // null)
+  }' "${guarded_dir}/funding_arb_guarded_dry_run_report.json" >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+  return 1
+}
+
+check_funding_arb_resident_startup_risk() {
+  local candidate_pair_ids
+  local pair_id
+  local pair_count=0
+  local ready_count=0
+  local stale_candidate_count=0
+  local precheck_status=0
+
+  [[ "${EXECUTE_LIVE}" == "1" ]] || return 0
+  check_funding_arb_resident_unknown_startup_risk || return 1
+  if [[ "${FUNDING_ARB_STARTUP_OPEN_POSITION_CONTINUE:-0}" == "1" ]]; then
+    echo "funding_arb_startup_precheck_skipped reason=existing_open_position_supervision_continues"
+    return 0
+  fi
+  if [[ "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" == "1" && "${FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED:-0}" == "1" ]]; then
+    echo "funding_arb_startup_precheck_skipped reason=resident_unknown_recovery_only"
+    return 0
+  fi
+
+  if [[ "${FUNDING_ARB_STARTUP_DRY_RUN_CHECK}" != "1" ]]; then
+    echo "funding_arb_startup_precheck_skipped reason=dry_run_check_disabled"
+    return 0
+  fi
+
+  if [[ ! -s "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" ]]; then
+    write_funding_arb_startup_block_report "missing_funding_arb_snapshot" "[]" "" "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" 0
+    echo "error: funding-arb startup precheck requires ${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" >&2
+    return 1
+  fi
+
+  if ! candidate_pair_ids="$(funding_arb_current_candidate_pair_ids)"; then
+    write_funding_arb_startup_block_report "funding_arb_snapshot_candidate_parse_failed" "[]" "" "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" 0
+    echo "error: funding-arb startup precheck could not parse current candidate pair ids" >&2
+    return 1
+  fi
+
+  while IFS= read -r pair_id; do
+    [[ -n "${pair_id}" ]] || continue
+    pair_count="$((pair_count + 1))"
+    precheck_status=0
+    run_funding_arb_startup_dry_run_precheck_for_pair "${pair_id}" || precheck_status="$?"
+    if [[ "${precheck_status}" == "0" ]]; then
+      ready_count="$((ready_count + 1))"
+      continue
+    fi
+    if [[ "${precheck_status}" == "2" ]]; then
+      stale_candidate_count="$((stale_candidate_count + 1))"
+      continue
+    fi
+    return 1
+  done <<< "${candidate_pair_ids}"
+
+  if (( pair_count == 0 )); then
+    clear_funding_arb_startup_block_report
+    echo "funding_arb_startup_precheck_ok reason=no_current_funding_arb_candidates"
+    return 0
+  elif (( ready_count > 0 )); then
+    clear_funding_arb_startup_block_report
+    echo "funding_arb_startup_precheck_ok reason=current_candidate_live_ready ready_candidate_count=${ready_count} stale_candidate_count=${stale_candidate_count}"
+    return 0
+  elif (( ready_count == 0 && stale_candidate_count > 0 )); then
+    clear_funding_arb_startup_block_report
+    echo "funding_arb_startup_precheck_ok reason=all_current_candidates_stale_after_revalidation stale_candidate_count=${stale_candidate_count}"
+    return 0
+  fi
+
+  clear_funding_arb_startup_block_report
+  echo "funding_arb_startup_precheck_ok reason=no_startup_blocking_candidate"
+  return 0
+}
+
 run_validation_job() {
   set +e
   local venue="$1"
@@ -2209,6 +3049,12 @@ FUNDING_ARB_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERV
 FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES:-1}"
 FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
 FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
+FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY="${BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY:-0}"
+FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE="${BASIS_OBSERVER_FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE:-1}"
+FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN="${BASIS_OBSERVER_FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN:-1}"
+FUNDING_ARB_STARTUP_DRY_RUN_CHECK="${BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_CHECK:-1}"
+FUNDING_ARB_STARTUP_DRY_RUN_LIMIT="${BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_LIMIT:-3}"
+FUNDING_ARB_STARTUP_PRECHECK_DIR="${BASIS_OBSERVER_FUNDING_ARB_STARTUP_PRECHECK_OUT:-${RUN_ROOT}/startup-precheck/cross-exchange-funding-arb}"
 FUNDING_SETTLEMENT_LEDGER="${BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER:-${FUNDING_SETTLEMENT_LEDGER:-}}"
 FUNDING_SETTLEMENT_RAW_SNAPSHOT="${BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT:-${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}}"
 DYNAMIC_TARGET_WSS="${BASIS_OBSERVER_DYNAMIC_TARGET_WSS:-0}"
@@ -2249,6 +3095,30 @@ case "${FUNDING_ARB_MODE}" in
   resident|auto-once) ;;
   *) die "BASIS_OBSERVER_FUNDING_ARB_MODE must be resident or auto-once" ;;
 esac
+
+case "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY must be 0 or 1" ;;
+esac
+
+case "${FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE must be 0 or 1" ;;
+esac
+
+case "${FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN must be 0 or 1" ;;
+esac
+
+case "${FUNDING_ARB_STARTUP_DRY_RUN_CHECK}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_CHECK must be 0 or 1" ;;
+esac
+
+if ! [[ "${FUNDING_ARB_STARTUP_DRY_RUN_LIMIT}" =~ ^[0-9]+$ ]] || (( FUNDING_ARB_STARTUP_DRY_RUN_LIMIT < 1 )); then
+  die "BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_LIMIT must be a positive integer"
+fi
 
 if [[ -n "${FUNDING_SETTLEMENT_LEDGER}" && -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" ]]; then
   die "cannot combine BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER and BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT"
@@ -2300,6 +3170,7 @@ if [[ -s "${PID_FILE}" ]]; then
   done < "${PID_FILE}"
 fi
 cleanup_safe_stale_resident_locks
+
 : > "${PID_FILE}"
 
 cd "${REPO_ROOT}"
@@ -2307,6 +3178,17 @@ echo "building arb-runtime with live-exec feature..."
 cargo build -p arb-runtime --features live-exec --manifest-path "${REPO_ROOT}/Cargo.toml"
 echo "building arb-wallet-signer..."
 cargo build -p arb-wallet-signer --manifest-path "${REPO_ROOT}/Cargo.toml"
+
+if strategy_enabled "cross-exchange-funding-arb" && [[ "${FUNDING_ARB_MODE}" == "resident" ]]; then
+  if ! check_funding_arb_resident_unknown_startup_risk; then
+    rm -f "${PID_FILE}"
+    exit 1
+  fi
+  if ! run_funding_arb_startup_unknown_recovery_once; then
+    rm -f "${PID_FILE}"
+    exit 1
+  fi
+fi
 
 COMMON_ARGS=(
   --interval-secs "${INTERVAL_SECS}"
@@ -2415,6 +3297,7 @@ start_funding_arb_resident_live() {
 
   if [[ "${EXECUTE_LIVE}" == "1" ]]; then
     args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-funding-arb-live-orders)
+    [[ "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" == "1" ]] && args+=(--allow-unknown-recovery)
     [[ -n "${HYPERLIQUID_USER:-}" ]] && args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
     [[ -n "${HYPERLIQUID_SOURCE:-}" ]] && args+=(--hyperliquid-source "${HYPERLIQUID_SOURCE}")
     [[ -n "${HYPERLIQUID_VAULT_ADDRESS:-}" ]] && args+=(--hyperliquid-vault-address "${HYPERLIQUID_VAULT_ADDRESS}")
@@ -2525,6 +3408,14 @@ if [[ "${STARTUP_CHECK}" == "1" ]]; then
       rm -f "${PID_FILE}"
       exit 1
     fi
+  fi
+fi
+
+if strategy_enabled "cross-exchange-funding-arb" && [[ "${FUNDING_ARB_MODE}" == "resident" ]]; then
+  if ! check_funding_arb_resident_startup_risk; then
+    stop_started_processes
+    rm -f "${PID_FILE}"
+    exit 1
   fi
 fi
 

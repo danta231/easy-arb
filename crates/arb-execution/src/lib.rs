@@ -4289,6 +4289,14 @@ mod tests {
             short.basis_leg_role.as_ref().expect("short role").as_str(),
             "perp_short"
         );
+        assert_eq!(
+            long.client_order_id.as_ref().map(|id| id.as_str()),
+            Some("rvfLbtcunit000001")
+        );
+        assert_eq!(
+            short.client_order_id.as_ref().map(|id| id.as_str()),
+            Some("rvfSbtcunit000001")
+        );
         assert_eq!(long.quantity.as_ref().expect("long qty").as_str(), "1");
         assert_eq!(short.quantity.as_ref().expect("short qty").as_str(), "1");
     }
@@ -5498,6 +5506,7 @@ mod tests {
           "asset_flows": [],
           "constraints": {
             "basis_leg_role": "perp_long",
+            "client_order_id": "rvfLbtcunit000001",
             "notional_usd": "100.00",
             "reference_best_ask": "100.00",
             "reference_best_bid": "99.95",
@@ -5515,6 +5524,7 @@ mod tests {
           "asset_flows": [],
           "constraints": {
             "basis_leg_role": "perp_short",
+            "client_order_id": "rvfSbtcunit000001",
             "notional_usd": "100.00",
             "reference_best_ask": "100.10",
             "reference_best_bid": "100.05",

@@ -11,6 +11,7 @@ STATE_DIR="${PREREQ_ROOT}/state"
 WSS_PID_FILE="${STATE_DIR}/wss-book-ticker.pids"
 LIVE_PID_FILE="${STATE_DIR}/arb-runtime-live.pid"
 PORTFOLIO_PID_FILE="${STATE_DIR}/portfolio-dashboard.pid"
+PORTFOLIO_PRIVATE_READONLY_PID_FILE="${STATE_DIR}/portfolio-private-readonly.pid"
 STOP_GRACE_SECS="${ARB_RUNTIME_LIVE_STOP_GRACE_SECS:-3}"
 
 usage() {
@@ -95,6 +96,24 @@ stop_portfolio_dashboard() {
   mv "${PORTFOLIO_PID_FILE}" "${PORTFOLIO_PID_FILE}.stopped.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
 }
 
+stop_portfolio_private_readonly_snapshot() {
+  if [[ ! -s "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}" ]]; then
+    return 0
+  fi
+  local pid
+  pid="$(sed -n '1p' "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}")"
+  if is_alive "${pid}"; then
+    echo "TERM portfolio-private-readonly pid=${pid}"
+    kill -TERM "${pid}" 2>/dev/null || true
+    sleep "${STOP_GRACE_SECS}"
+    if is_alive "${pid}"; then
+      echo "KILL portfolio-private-readonly pid=${pid}"
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
+  fi
+  mv "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}" "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}.stopped.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -105,6 +124,7 @@ BASIS_OBSERVER_ROOT="${RUN_ROOT}" "${SCRIPT_DIR}/stop-basis-opportunity-observer
 
 stop_live_parent
 stop_portfolio_dashboard
+stop_portfolio_private_readonly_snapshot
 stop_wss_monitors
 
 echo "stopped arb-runtime live stack."

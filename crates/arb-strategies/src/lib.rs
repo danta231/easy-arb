@@ -1002,7 +1002,8 @@ impl SpotPerpBasisStrategy {
             opportunity.premium.next_funding_time_ms
         );
         let liquidity_summary = format!(
-            "Top-of-book depth checked before candidate emission: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}.",
+            "Depth/VWAP liquidity checked before candidate emission: liquidity_model={}, spot_ask_depth_usd={}, perp_bid_depth_usd={}, spot_ask_vwap={}, perp_bid_vwap={}, required_notional_usd={}.",
+            opportunity.signal.liquidity_model,
             opportunity
                 .signal
                 .spot_ask_depth_usd
@@ -1011,6 +1012,16 @@ impl SpotPerpBasisStrategy {
             opportunity
                 .signal
                 .perp_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity
+                .signal
+                .spot_ask_vwap
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity
+                .signal
+                .perp_bid_vwap
                 .as_deref()
                 .unwrap_or("missing"),
             opportunity.signal.liquidity_required_usd
@@ -1354,9 +1365,11 @@ impl Strategy for SpotPerpBasisStrategy {
             spot_best_bid: spot.best_bid.format_trimmed(),
             spot_best_ask: spot.best_ask.format_trimmed(),
             spot_ask_size: Some(spot.ask_size.format_trimmed()),
+            spot_ask_depth: spot.ask_depth.clone(),
             perp_best_bid: perp.best_bid.format_trimmed(),
             perp_best_ask: perp.best_ask.format_trimmed(),
             perp_bid_size: Some(perp.bid_size.format_trimmed()),
+            perp_bid_depth: perp.bid_depth.clone(),
             last_funding_rate: premium.last_funding_rate.clone(),
             notional_usd: self.config.economics.notional_usd.clone(),
             spot_taker_fee_bps: self.config.economics.spot_taker_fee_bps,
@@ -1508,9 +1521,35 @@ impl CrossExchangeFundingArbStrategy {
         let config = &self.config;
         let input_event_refs = source_event_refs(context);
         let input_event_refs_json = json_string_array(&input_event_refs);
+        let created_at = context.time().now_rfc3339_z();
         let expected_profit_bps = opportunity.signal.net_funding_bps.to_string();
         let gross_spread_bps = opportunity.signal.gross_funding_spread_bps.to_string();
         let entry_price_divergence_bps = opportunity.signal.entry_price_divergence_bps.to_string();
+        let source_ref_seed = input_event_refs.join("|");
+        let long_client_order_id = funding_client_order_id(
+            &opportunity.long_leg.venue_id,
+            "L",
+            &format!(
+                "{}:{}:{}:{}:{}:perp_long",
+                config.output.transition_id,
+                config.symbol.symbol,
+                opportunity.long_leg.leg_id,
+                created_at,
+                source_ref_seed
+            ),
+        );
+        let short_client_order_id = funding_client_order_id(
+            &opportunity.short_leg.venue_id,
+            "S",
+            &format!(
+                "{}:{}:{}:{}:{}:perp_short",
+                config.output.transition_id,
+                config.symbol.symbol,
+                opportunity.short_leg.leg_id,
+                created_at,
+                source_ref_seed
+            ),
+        );
         let funding_summary = format!(
             "Cross-exchange funding spread: long {} rate={}, short {} rate={}, normalized_gross_spread_bps={}, net_funding_bps={}, interval_hours={}.",
             opportunity.long_leg.venue_label,
@@ -1522,7 +1561,8 @@ impl CrossExchangeFundingArbStrategy {
             opportunity.funding_interval_hours
         );
         let liquidity_summary = format!(
-            "Top-of-book depth checked before candidate emission: long_ask_depth_usd={}, short_bid_depth_usd={}, required_notional_usd={}.",
+            "Depth/VWAP liquidity checked before candidate emission: liquidity_model={}, long_ask_depth_usd={}, short_bid_depth_usd={}, long_ask_vwap={}, short_bid_vwap={}, required_notional_usd={}.",
+            opportunity.signal.liquidity_model,
             opportunity
                 .signal
                 .long_ask_depth_usd
@@ -1531,6 +1571,16 @@ impl CrossExchangeFundingArbStrategy {
             opportunity
                 .signal
                 .short_bid_depth_usd
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity
+                .signal
+                .long_ask_vwap
+                .as_deref()
+                .unwrap_or("missing"),
+            opportunity
+                .signal
+                .short_bid_vwap
                 .as_deref()
                 .unwrap_or("missing"),
             opportunity.signal.liquidity_required_usd
@@ -1570,6 +1620,7 @@ impl CrossExchangeFundingArbStrategy {
       "asset_flows": [],
       "constraints": {{
         "basis_leg_role": "perp_long",
+        "client_order_id": {},
         "entry_price_divergence_bps": {},
         "funding_interval_hours": {},
         "funding_rate": {},
@@ -1600,6 +1651,7 @@ impl CrossExchangeFundingArbStrategy {
       "asset_flows": [],
       "constraints": {{
         "basis_leg_role": "perp_short",
+        "client_order_id": {},
         "entry_price_divergence_bps": {},
         "funding_interval_hours": {},
         "funding_rate": {},
@@ -1694,13 +1746,14 @@ impl CrossExchangeFundingArbStrategy {
             json_string(self.metadata.strategy_version()),
             json_string(self.metadata.code_version()),
             json_string(context.config().config_version()),
-            json_string(&context.time().now_rfc3339_z()),
+            json_string(&created_at),
             input_event_refs_json,
             json_string(context.snapshot().portfolio_state_id()),
             json_string(&opportunity.long_leg.leg_id),
             json_string(&opportunity.long_leg.venue_id),
             json_string(&opportunity.long_leg.instrument_id),
             json_string(&opportunity.long_leg.account_id),
+            json_string(&long_client_order_id),
             json_string(&entry_price_divergence_bps),
             json_string(&opportunity.funding_interval_hours),
             json_string(&opportunity.long_premium.last_funding_rate),
@@ -1719,6 +1772,7 @@ impl CrossExchangeFundingArbStrategy {
             json_string(&opportunity.short_leg.venue_id),
             json_string(&opportunity.short_leg.instrument_id),
             json_string(&opportunity.short_leg.account_id),
+            json_string(&short_client_order_id),
             json_string(&entry_price_divergence_bps),
             json_string(&opportunity.funding_interval_hours),
             json_string(&opportunity.short_premium.last_funding_rate),
@@ -1988,9 +2042,11 @@ impl Strategy for CrossExchangeFundingArbStrategy {
                 long_best_bid: long_book.best_bid.format_trimmed(),
                 long_best_ask: long_book.best_ask.format_trimmed(),
                 long_ask_size: Some(long_book.ask_size.format_trimmed()),
+                long_ask_depth: long_book.ask_depth.clone(),
                 short_best_bid: short_book.best_bid.format_trimmed(),
                 short_best_ask: short_book.best_ask.format_trimmed(),
                 short_bid_size: Some(short_book.bid_size.format_trimmed()),
+                short_bid_depth: short_book.bid_depth.clone(),
                 long_funding_rate: long_signal_funding_rate,
                 short_funding_rate: short_signal_funding_rate,
                 funding_interval_hours: "8".to_owned(),
@@ -2081,6 +2137,16 @@ pub fn cross_exchange_funding_arb_strategy() -> StrategyApiResult<CrossExchangeF
     CrossExchangeFundingArbStrategy::new()
 }
 
+/// 订单簿单档深度。
+///
+/// 中文说明：`price` 是该档价格，`size` 是该档基础币数量。策略会按目标名义本金
+/// 逐档吃单并计算 VWAP（成交量加权平均价）。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalDepthLevel {
+    pub price: String,
+    pub size: String,
+}
+
 /// spot-perp basis 只读信号输入。
 ///
 /// 中文说明：这是给运行时监控批量复用的纯计算输入；它不包含账户、订单、签名
@@ -2091,9 +2157,11 @@ pub struct SpotPerpBasisSignalInput {
     pub spot_best_bid: String,
     pub spot_best_ask: String,
     pub spot_ask_size: Option<String>,
+    pub spot_ask_depth: Vec<SignalDepthLevel>,
     pub perp_best_bid: String,
     pub perp_best_ask: String,
     pub perp_bid_size: Option<String>,
+    pub perp_bid_depth: Vec<SignalDepthLevel>,
     pub last_funding_rate: String,
     pub notional_usd: String,
     pub spot_taker_fee_bps: i128,
@@ -2121,6 +2189,13 @@ pub struct SpotPerpBasisSignal {
     pub liquidity_required_usd: String,
     pub spot_ask_depth_usd: Option<String>,
     pub perp_bid_depth_usd: Option<String>,
+    pub spot_ask_vwap: Option<String>,
+    pub perp_bid_vwap: Option<String>,
+    pub spot_ask_levels_used: usize,
+    pub perp_bid_levels_used: usize,
+    pub spot_ask_price_impact_bps: Option<i128>,
+    pub perp_bid_price_impact_bps: Option<i128>,
+    pub liquidity_model: String,
     pub is_candidate: bool,
     pub reason: Option<String>,
 }
@@ -2137,9 +2212,11 @@ pub struct CrossExchangeFundingArbSignalInput {
     pub long_best_bid: String,
     pub long_best_ask: String,
     pub long_ask_size: Option<String>,
+    pub long_ask_depth: Vec<SignalDepthLevel>,
     pub short_best_bid: String,
     pub short_best_ask: String,
     pub short_bid_size: Option<String>,
+    pub short_bid_depth: Vec<SignalDepthLevel>,
     pub long_funding_rate: String,
     pub short_funding_rate: String,
     pub funding_interval_hours: String,
@@ -2166,6 +2243,13 @@ pub struct CrossExchangeFundingArbSignal {
     pub liquidity_required_usd: String,
     pub long_ask_depth_usd: Option<String>,
     pub short_bid_depth_usd: Option<String>,
+    pub long_ask_vwap: Option<String>,
+    pub short_bid_vwap: Option<String>,
+    pub long_ask_levels_used: usize,
+    pub short_bid_levels_used: usize,
+    pub long_ask_price_impact_bps: Option<i128>,
+    pub short_bid_price_impact_bps: Option<i128>,
+    pub liquidity_model: String,
     pub is_candidate: bool,
     pub reason: Option<String>,
 }
@@ -2180,13 +2264,41 @@ pub fn evaluate_spot_perp_basis_signal(
     ensure_non_negative_signal_bps("min_net_bps", input.min_net_bps)?;
     let spot_ask = FixedDecimal::parse_non_negative("spot_best_ask", &input.spot_best_ask)?;
     let perp_bid = FixedDecimal::parse_non_negative("perp_best_bid", &input.perp_best_bid)?;
+    if spot_ask.raw <= 0 || perp_bid.raw <= 0 {
+        return Err("entry top-of-book prices must be greater than zero".to_owned());
+    }
     let notional = FixedDecimal::parse_non_negative("notional_usd", &input.notional_usd)?;
     if notional.is_zero() {
         return Err("notional_usd must be greater than zero".to_owned());
     }
     let funding_rate =
         FixedDecimal::parse_signed_rate("last_funding_rate", &input.last_funding_rate)?;
-    let gross_bps = gross_basis_bps(perp_bid, spot_ask)?;
+    let (spot_ask_levels, spot_model) = depth_levels_or_top_of_book(
+        &input.spot_ask_depth,
+        spot_ask,
+        input.spot_ask_size.as_deref(),
+        "spot_ask_size",
+    )?;
+    let (perp_bid_levels, perp_model) = depth_levels_or_top_of_book(
+        &input.perp_bid_depth,
+        perp_bid,
+        input.perp_bid_size.as_deref(),
+        "perp_bid_size",
+    )?;
+    let spot_execution =
+        depth_execution_for_notional(DepthSide::Ask, spot_ask_levels, notional, spot_model)?;
+    let perp_execution =
+        depth_execution_for_notional(DepthSide::Bid, perp_bid_levels, notional, perp_model)?;
+    let execution_spot_ask = depth_execution_price(&spot_execution, spot_ask);
+    let execution_perp_bid = depth_execution_price(&perp_execution, perp_bid);
+    let liquidity_model =
+        if spot_execution.model == "order_book_vwap" || perp_execution.model == "order_book_vwap" {
+            "order_book_vwap"
+        } else {
+            "top_of_book_as_single_level"
+        }
+        .to_owned();
+    let gross_bps = gross_basis_bps(execution_perp_bid, execution_spot_ask)?;
     let total_cost_bps =
         input.spot_taker_fee_bps + input.perp_taker_fee_bps + input.slippage_buffer_bps;
     let net_bps = gross_bps - total_cost_bps;
@@ -2194,7 +2306,12 @@ pub fn evaluate_spot_perp_basis_signal(
     let expected_profit_bps = net_bps
         .checked_add(funding_bps)
         .ok_or_else(|| "expected profit bps calculation overflowed".to_owned())?;
-    let quantity = FixedDecimal::quantity_for_notional(notional, spot_ask)?;
+    let quantity = spot_execution
+        .quantity
+        .unwrap_or(FixedDecimal::quantity_for_notional(
+            notional,
+            execution_spot_ask,
+        )?);
     let basis_profit_usd = FixedDecimal::usd_from_bps(notional, net_bps)?;
     let funding_impact_usd = FixedDecimal::usd_from_rate(notional, funding_rate)?;
     let expected_profit_usd = basis_profit_usd.checked_add(
@@ -2206,47 +2323,28 @@ pub fn evaluate_spot_perp_basis_signal(
         input.spot_taker_fee_bps + input.perp_taker_fee_bps,
     )?;
     let slippage_estimate_usd = FixedDecimal::usd_from_bps(notional, input.slippage_buffer_bps)?;
-    let spot_ask_depth_usd = input
-        .spot_ask_size
-        .as_deref()
-        .map(|value| {
-            FixedDecimal::parse_non_negative_depth("spot_ask_size", value).and_then(|size| {
-                spot_ask.checked_mul_decimal(size, "spot ask depth calculation overflowed")
-            })
-        })
-        .transpose()?;
-    let perp_bid_depth_usd = input
-        .perp_bid_size
-        .as_deref()
-        .map(|value| {
-            FixedDecimal::parse_non_negative_depth("perp_bid_size", value).and_then(|size| {
-                perp_bid.checked_mul_decimal(size, "perp bid depth calculation overflowed")
-            })
-        })
-        .transpose()?;
-    let depth_is_sufficient = match (spot_ask_depth_usd, perp_bid_depth_usd) {
-        (Some(spot_depth), Some(perp_depth)) => {
-            spot_depth.raw >= notional.raw && perp_depth.raw >= notional.raw
-        }
-        _ => true,
-    };
+    let spot_ask_depth_usd = spot_execution.depth_usd;
+    let perp_bid_depth_usd = perp_execution.depth_usd;
+    let depth_is_sufficient = spot_execution.covered_notional_usd.raw >= notional.raw
+        && perp_execution.covered_notional_usd.raw >= notional.raw;
     let threshold_is_satisfied = expected_profit_bps >= input.min_net_bps;
     let is_candidate = depth_is_sufficient && threshold_is_satisfied;
     let reason = if !depth_is_sufficient {
         Some(format!(
-            "insufficient top-of-book depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}",
-            spot_ask_depth_usd
-                .map(FixedDecimal::format_trimmed)
-                .unwrap_or_else(|| "missing".to_owned()),
-            perp_bid_depth_usd
-                .map(FixedDecimal::format_trimmed)
-                .unwrap_or_else(|| "missing".to_owned()),
-            notional.format_trimmed()
+            "insufficient order-book depth: spot_ask_depth_usd={}, perp_bid_depth_usd={}, required_notional_usd={}, spot_ask_levels_used={}, perp_bid_levels_used={}, liquidity_model={}",
+            spot_ask_depth_usd.format_trimmed(),
+            perp_bid_depth_usd.format_trimmed(),
+            notional.format_trimmed(),
+            spot_execution.levels_used,
+            perp_execution.levels_used,
+            liquidity_model
         ))
     } else if !threshold_is_satisfied {
         Some(format!(
-            "basis expected_profit_bps={expected_profit_bps} below minimum {}; gross_bps={gross_bps}, total_cost_bps={total_cost_bps}, net_basis_bps={net_bps}, funding_bps={funding_bps}",
-            input.min_net_bps
+            "basis expected_profit_bps={expected_profit_bps} below minimum {}; gross_bps={gross_bps}, total_cost_bps={total_cost_bps}, net_basis_bps={net_bps}, funding_bps={funding_bps}, spot_ask_vwap={}, perp_bid_vwap={}",
+            input.min_net_bps,
+            execution_spot_ask.format_trimmed(),
+            execution_perp_bid.format_trimmed()
         ))
     } else {
         None
@@ -2265,8 +2363,15 @@ pub fn evaluate_spot_perp_basis_signal(
         fee_estimate_usd: fee_estimate_usd.format_trimmed(),
         slippage_estimate_usd: slippage_estimate_usd.format_trimmed(),
         liquidity_required_usd: notional.format_trimmed(),
-        spot_ask_depth_usd: spot_ask_depth_usd.map(FixedDecimal::format_trimmed),
-        perp_bid_depth_usd: perp_bid_depth_usd.map(FixedDecimal::format_trimmed),
+        spot_ask_depth_usd: Some(spot_ask_depth_usd.format_trimmed()),
+        perp_bid_depth_usd: Some(perp_bid_depth_usd.format_trimmed()),
+        spot_ask_vwap: spot_execution.vwap.map(FixedDecimal::format_trimmed),
+        perp_bid_vwap: perp_execution.vwap.map(FixedDecimal::format_trimmed),
+        spot_ask_levels_used: spot_execution.levels_used,
+        perp_bid_levels_used: perp_execution.levels_used,
+        spot_ask_price_impact_bps: Some(ask_price_impact_bps(execution_spot_ask, spot_ask)?),
+        perp_bid_price_impact_bps: Some(bid_price_impact_bps(execution_perp_bid, perp_bid)?),
+        liquidity_model,
         is_candidate,
         reason,
     })
@@ -2299,6 +2404,32 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
     if notional.is_zero() {
         return Err("notional_usd must be greater than zero".to_owned());
     }
+    let (long_ask_levels, long_model) = depth_levels_or_top_of_book(
+        &input.long_ask_depth,
+        long_ask,
+        input.long_ask_size.as_deref(),
+        "long_ask_size",
+    )?;
+    let (short_bid_levels, short_model) = depth_levels_or_top_of_book(
+        &input.short_bid_depth,
+        short_bid,
+        input.short_bid_size.as_deref(),
+        "short_bid_size",
+    )?;
+    let long_execution =
+        depth_execution_for_notional(DepthSide::Ask, long_ask_levels, notional, long_model)?;
+    let short_execution =
+        depth_execution_for_notional(DepthSide::Bid, short_bid_levels, notional, short_model)?;
+    let execution_long_ask = depth_execution_price(&long_execution, long_ask);
+    let execution_short_bid = depth_execution_price(&short_execution, short_bid);
+    let liquidity_model = if long_execution.model == "order_book_vwap"
+        || short_execution.model == "order_book_vwap"
+    {
+        "order_book_vwap"
+    } else {
+        "top_of_book_as_single_level"
+    }
+    .to_owned();
     let interval_hours =
         parse_positive_u64("funding_interval_hours", &input.funding_interval_hours)?;
     let long_rate = FixedDecimal::parse_signed_rate("long_funding_rate", &input.long_funding_rate)?;
@@ -2318,48 +2449,42 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
     let total_cost_bps =
         input.long_taker_fee_bps + input.short_taker_fee_bps + input.slippage_buffer_bps;
     let net_funding_bps = gross_funding_spread_bps - total_cost_bps;
-    let entry_price_divergence_bps = price_divergence_bps(long_ask, short_bid)?;
-    let quantity = FixedDecimal::quantity_for_notional(notional, long_ask)?;
+    let entry_price_divergence_bps = price_divergence_bps(execution_long_ask, execution_short_bid)?;
+    let quantity = long_execution
+        .quantity
+        .unwrap_or(FixedDecimal::quantity_for_notional(
+            notional,
+            execution_long_ask,
+        )?);
     let expected_funding_usd = FixedDecimal::usd_from_bps(notional, net_funding_bps)?;
     let fee_estimate_usd = FixedDecimal::usd_from_bps(
         notional,
         input.long_taker_fee_bps + input.short_taker_fee_bps,
     )?;
     let slippage_estimate_usd = FixedDecimal::usd_from_bps(notional, input.slippage_buffer_bps)?;
-    let long_ask_depth_usd = input
-        .long_ask_size
-        .as_deref()
-        .ok_or_else(|| "long_ask_size is required for fail-closed liquidity checks".to_owned())
-        .and_then(|value| {
-            FixedDecimal::parse_non_negative_depth("long_ask_size", value).and_then(|size| {
-                long_ask.checked_mul_decimal(size, "long ask depth calculation overflowed")
-            })
-        })?;
-    let short_bid_depth_usd = input
-        .short_bid_size
-        .as_deref()
-        .ok_or_else(|| "short_bid_size is required for fail-closed liquidity checks".to_owned())
-        .and_then(|value| {
-            FixedDecimal::parse_non_negative_depth("short_bid_size", value).and_then(|size| {
-                short_bid.checked_mul_decimal(size, "short bid depth calculation overflowed")
-            })
-        })?;
-    let depth_is_sufficient =
-        long_ask_depth_usd.raw >= notional.raw && short_bid_depth_usd.raw >= notional.raw;
+    let long_ask_depth_usd = long_execution.depth_usd;
+    let short_bid_depth_usd = short_execution.depth_usd;
+    let depth_is_sufficient = long_execution.covered_notional_usd.raw >= notional.raw
+        && short_execution.covered_notional_usd.raw >= notional.raw;
     let divergence_is_allowed = entry_price_divergence_bps <= input.max_entry_price_divergence_bps;
     let threshold_is_satisfied = net_funding_bps >= input.min_net_funding_bps;
     let is_candidate = depth_is_sufficient && divergence_is_allowed && threshold_is_satisfied;
     let reason = if !depth_is_sufficient {
         Some(format!(
-            "insufficient top-of-book depth: long_ask_depth_usd={}, short_bid_depth_usd={}, required_notional_usd={}",
+            "insufficient order-book depth: long_ask_depth_usd={}, short_bid_depth_usd={}, required_notional_usd={}, long_ask_levels_used={}, short_bid_levels_used={}, liquidity_model={}",
             long_ask_depth_usd.format_trimmed(),
             short_bid_depth_usd.format_trimmed(),
-            notional.format_trimmed()
+            notional.format_trimmed(),
+            long_execution.levels_used,
+            short_execution.levels_used,
+            liquidity_model
         ))
     } else if !divergence_is_allowed {
         Some(format!(
-            "entry_price_divergence_bps={entry_price_divergence_bps} exceeds maximum {}",
-            input.max_entry_price_divergence_bps
+            "entry_price_divergence_bps={entry_price_divergence_bps} exceeds maximum {}; long_ask_vwap={}, short_bid_vwap={}",
+            input.max_entry_price_divergence_bps,
+            execution_long_ask.format_trimmed(),
+            execution_short_bid.format_trimmed()
         ))
     } else if !threshold_is_satisfied {
         Some(format!(
@@ -2383,6 +2508,13 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         liquidity_required_usd: notional.format_trimmed(),
         long_ask_depth_usd: Some(long_ask_depth_usd.format_trimmed()),
         short_bid_depth_usd: Some(short_bid_depth_usd.format_trimmed()),
+        long_ask_vwap: long_execution.vwap.map(FixedDecimal::format_trimmed),
+        short_bid_vwap: short_execution.vwap.map(FixedDecimal::format_trimmed),
+        long_ask_levels_used: long_execution.levels_used,
+        short_bid_levels_used: short_execution.levels_used,
+        long_ask_price_impact_bps: Some(ask_price_impact_bps(execution_long_ask, long_ask)?),
+        short_bid_price_impact_bps: Some(bid_price_impact_bps(execution_short_bid, short_bid)?),
+        liquidity_model,
         is_candidate,
         reason,
     })
@@ -2724,7 +2856,7 @@ fn is_sample_market_quote_event(event: &NormalizedEvent) -> bool {
         && payload_string(event, "kind").is_some_and(|kind| kind == "MarketQuote")
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FixedDecimal {
     raw: i128,
 }
@@ -2813,6 +2945,22 @@ impl FixedDecimal {
         Ok(Self { raw })
     }
 
+    fn price_for_notional_quantity(
+        notional: Self,
+        quantity: Self,
+        message: &'static str,
+    ) -> Result<Self, String> {
+        if quantity.raw <= 0 {
+            return Err(message.to_owned());
+        }
+        let raw = notional
+            .raw
+            .checked_mul(FIXED_SCALE)
+            .and_then(|value| value.checked_div(quantity.raw))
+            .ok_or_else(|| message.to_owned())?;
+        Ok(Self { raw })
+    }
+
     fn checked_add(self, other: Self, message: &'static str) -> Result<Self, String> {
         let raw = self
             .raw
@@ -2873,6 +3021,157 @@ impl FixedDecimal {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DepthSide {
+    Ask,
+    Bid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedDepthLevel {
+    price: FixedDecimal,
+    size: FixedDecimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DepthExecution {
+    depth_usd: FixedDecimal,
+    covered_notional_usd: FixedDecimal,
+    vwap: Option<FixedDecimal>,
+    quantity: Option<FixedDecimal>,
+    levels_used: usize,
+    model: &'static str,
+}
+
+fn depth_levels_or_top_of_book(
+    levels: &[SignalDepthLevel],
+    fallback_price: FixedDecimal,
+    fallback_size: Option<&str>,
+    fallback_size_field: &'static str,
+) -> Result<(Vec<ParsedDepthLevel>, &'static str), String> {
+    if !levels.is_empty() {
+        let parsed = levels
+            .iter()
+            .map(|level| {
+                let price = FixedDecimal::parse_non_negative("depth_price", &level.price)?;
+                if price.raw <= 0 {
+                    return Err("depth_price must be greater than zero".to_owned());
+                }
+                let size = FixedDecimal::parse_non_negative_depth("depth_size", &level.size)?;
+                Ok(ParsedDepthLevel { price, size })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((parsed, "order_book_vwap"));
+    }
+
+    let size = fallback_size
+        .ok_or_else(|| format!("{fallback_size_field} is required for fail-closed depth checks"))
+        .and_then(|value| FixedDecimal::parse_non_negative_depth(fallback_size_field, value))?;
+    Ok((
+        vec![ParsedDepthLevel {
+            price: fallback_price,
+            size,
+        }],
+        "top_of_book_as_single_level",
+    ))
+}
+
+fn depth_execution_for_notional(
+    side: DepthSide,
+    mut levels: Vec<ParsedDepthLevel>,
+    notional: FixedDecimal,
+    model: &'static str,
+) -> Result<DepthExecution, String> {
+    match side {
+        DepthSide::Ask => levels.sort_by(|left, right| left.price.cmp(&right.price)),
+        DepthSide::Bid => levels.sort_by(|left, right| right.price.cmp(&left.price)),
+    }
+
+    let mut depth_usd = FixedDecimal { raw: 0 };
+    for level in &levels {
+        let level_notional = level
+            .price
+            .checked_mul_decimal(level.size, "depth notional calculation overflowed")?;
+        depth_usd = depth_usd.checked_add(level_notional, "depth notional sum overflowed")?;
+    }
+
+    let mut remaining = notional;
+    let mut covered = FixedDecimal { raw: 0 };
+    let mut quantity = FixedDecimal { raw: 0 };
+    let mut levels_used = 0_usize;
+    for level in levels {
+        if remaining.raw <= 0 {
+            break;
+        }
+        let level_notional = level
+            .price
+            .checked_mul_decimal(level.size, "depth notional calculation overflowed")?;
+        if level_notional.raw <= 0 {
+            continue;
+        }
+        let consumed_notional = if level_notional.raw >= remaining.raw {
+            remaining
+        } else {
+            level_notional
+        };
+        let consumed_quantity =
+            FixedDecimal::quantity_for_notional(consumed_notional, level.price)?;
+        quantity = quantity.checked_add(consumed_quantity, "depth quantity sum overflowed")?;
+        covered = covered.checked_add(consumed_notional, "depth covered notional overflowed")?;
+        remaining.raw = remaining
+            .raw
+            .checked_sub(consumed_notional.raw)
+            .ok_or_else(|| "depth remaining notional underflowed".to_owned())?;
+        levels_used += 1;
+    }
+
+    let vwap = if quantity.raw > 0 {
+        Some(FixedDecimal::price_for_notional_quantity(
+            covered,
+            quantity,
+            "depth VWAP calculation overflowed",
+        )?)
+    } else {
+        None
+    };
+
+    Ok(DepthExecution {
+        depth_usd,
+        covered_notional_usd: covered,
+        vwap,
+        quantity: (quantity.raw > 0).then_some(quantity),
+        levels_used,
+        model,
+    })
+}
+
+fn depth_execution_price(execution: &DepthExecution, fallback_price: FixedDecimal) -> FixedDecimal {
+    execution.vwap.unwrap_or(fallback_price)
+}
+
+fn ask_price_impact_bps(vwap: FixedDecimal, best_ask: FixedDecimal) -> Result<i128, String> {
+    if best_ask.raw <= 0 {
+        return Err("best ask price must be greater than zero".to_owned());
+    }
+    vwap.raw
+        .checked_sub(best_ask.raw)
+        .and_then(|value| value.checked_mul(10_000))
+        .and_then(|value| value.checked_div(best_ask.raw))
+        .ok_or_else(|| "ask price impact calculation overflowed".to_owned())
+}
+
+fn bid_price_impact_bps(vwap: FixedDecimal, best_bid: FixedDecimal) -> Result<i128, String> {
+    if best_bid.raw <= 0 {
+        return Err("best bid price must be greater than zero".to_owned());
+    }
+    best_bid
+        .raw
+        .checked_sub(vwap.raw)
+        .and_then(|value| value.checked_mul(10_000))
+        .and_then(|value| value.checked_div(best_bid.raw))
+        .ok_or_else(|| "bid price impact calculation overflowed".to_owned())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BasisBookTickerInput {
     event_id: String,
@@ -2880,6 +3179,8 @@ struct BasisBookTickerInput {
     best_ask: FixedDecimal,
     bid_size: FixedDecimal,
     ask_size: FixedDecimal,
+    bid_depth: Vec<SignalDepthLevel>,
+    ask_depth: Vec<SignalDepthLevel>,
     is_stale: bool,
 }
 
@@ -2927,6 +3228,8 @@ fn latest_basis_book_ticker(
         best_ask: required_payload_fixed_decimal(event, "best_ask")?,
         bid_size: required_payload_fixed_decimal(event, "bid_size")?,
         ask_size: required_payload_fixed_decimal(event, "ask_size")?,
+        bid_depth: payload_depth_levels(event, "bid_depth_levels")?,
+        ask_depth: payload_depth_levels(event, "ask_depth_levels")?,
         is_stale: payload_string(event, "risk_reason_code") == Some("DATA_STALE"),
     })
 }
@@ -3115,6 +3418,48 @@ fn payload_string<'a>(event: &'a NormalizedEvent, field: &'static str) -> Option
     }
 }
 
+fn payload_depth_levels(
+    event: &NormalizedEvent,
+    field: &'static str,
+) -> Result<Vec<SignalDepthLevel>, String> {
+    let Some(value) = event.payload.get(field) else {
+        return Ok(Vec::new());
+    };
+    let JsonValue::Array(values) = value else {
+        return Err(format!(
+            "market quote event {} payload field `{field}` must be an array",
+            event.event_id.as_str()
+        ));
+    };
+    values
+        .iter()
+        .map(|value| {
+            let JsonValue::Object(fields) = value else {
+                return Err(format!(
+                    "market quote event {} payload field `{field}` contains a non-object level",
+                    event.event_id.as_str()
+                ));
+            };
+            let Some(JsonValue::String(price)) = fields.get("price") else {
+                return Err(format!(
+                    "market quote event {} payload field `{field}` level is missing string `price`",
+                    event.event_id.as_str()
+                ));
+            };
+            let Some(JsonValue::String(size)) = fields.get("size") else {
+                return Err(format!(
+                    "market quote event {} payload field `{field}` level is missing string `size`",
+                    event.event_id.as_str()
+                ));
+            };
+            Ok(SignalDepthLevel {
+                price: price.clone(),
+                size: size.clone(),
+            })
+        })
+        .collect()
+}
+
 fn validate_market_decimal(field: &'static str, value: &str) -> Result<(), String> {
     validate_decimal_string(field, value, false)
 }
@@ -3181,6 +3526,25 @@ fn source_event_refs(context: &dyn StrategyReadContext) -> Vec<String> {
         .iter()
         .map(|event_ref| event_ref.as_str().to_owned())
         .collect()
+}
+
+fn funding_client_order_id(venue_id: &str, role_tag: &str, seed: &str) -> String {
+    if venue_id.to_ascii_uppercase().contains("HYPERLIQUID") {
+        let high = stable_client_order_hash(seed);
+        let low = stable_client_order_hash(&format!("{seed}:hyperliquid-cloid"));
+        return format!("0x{high:016x}{low:016x}");
+    }
+
+    format!("rvf{role_tag}{:016x}", stable_client_order_hash(seed))
+}
+
+fn stable_client_order_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn json_string_array(values: &[String]) -> String {
@@ -3497,6 +3861,21 @@ mod tests {
             leg_constraint(candidate, 1, "basis_leg_role"),
             Some("perp_short")
         );
+        let long_client_order_id =
+            leg_constraint(candidate, 0, "client_order_id").expect("long client order id");
+        let short_client_order_id =
+            leg_constraint(candidate, 1, "client_order_id").expect("short client order id");
+        assert!(long_client_order_id.starts_with("rvfL"));
+        assert!(short_client_order_id.starts_with("rvfS"));
+        assert_ne!(long_client_order_id, short_client_order_id);
+        assert!(long_client_order_id.len() <= 32);
+        assert!(short_client_order_id.len() <= 32);
+        assert!(long_client_order_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric()));
+        assert!(short_client_order_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric()));
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
             "14"
@@ -3507,6 +3886,22 @@ mod tests {
         );
         assert!(candidate.margin_impact.is_some());
         assert!(candidate.risk_flags.is_empty());
+    }
+
+    #[test]
+    fn funding_client_order_id_uses_venue_safe_shapes() {
+        let okx_id = funding_client_order_id("venue:OKX-SWAP", "S", "seed:okx");
+        assert!(okx_id.starts_with("rvfS"));
+        assert!(okx_id.len() <= 32);
+        assert!(okx_id.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+
+        let hyperliquid_id =
+            funding_client_order_id("venue:HYPERLIQUID-PERP", "L", "seed:hyperliquid");
+        assert!(hyperliquid_id.starts_with("0x"));
+        assert_eq!(hyperliquid_id.len(), 34);
+        assert!(hyperliquid_id[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -3946,9 +4341,11 @@ mod tests {
             spot_best_bid: "99.90".to_owned(),
             spot_best_ask: "100.00".to_owned(),
             spot_ask_size: Some("2.0".to_owned()),
+            spot_ask_depth: Vec::new(),
             perp_best_bid: "101.00".to_owned(),
             perp_best_ask: "101.10".to_owned(),
             perp_bid_size: Some("1.5".to_owned()),
+            perp_bid_depth: Vec::new(),
             last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
             spot_taker_fee_bps: 10,
@@ -3977,9 +4374,11 @@ mod tests {
             spot_best_bid: "99.90".to_owned(),
             spot_best_ask: "100.00".to_owned(),
             spot_ask_size: Some("2.000000009".to_owned()),
+            spot_ask_depth: Vec::new(),
             perp_best_bid: "101.00".to_owned(),
             perp_best_ask: "101.10".to_owned(),
             perp_bid_size: Some("1.500000009".to_owned()),
+            perp_bid_depth: Vec::new(),
             last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
             spot_taker_fee_bps: 10,
@@ -4001,9 +4400,11 @@ mod tests {
             spot_best_bid: "99.90".to_owned(),
             spot_best_ask: "100.00".to_owned(),
             spot_ask_size: Some("0.5".to_owned()),
+            spot_ask_depth: Vec::new(),
             perp_best_bid: "101.00".to_owned(),
             perp_best_ask: "101.10".to_owned(),
             perp_bid_size: Some("1.5".to_owned()),
+            perp_bid_depth: Vec::new(),
             last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
             spot_taker_fee_bps: 10,
@@ -4019,7 +4420,58 @@ mod tests {
             .reason
             .as_deref()
             .expect("reason")
-            .contains("insufficient top-of-book depth"));
+            .contains("insufficient order-book depth"));
+    }
+
+    #[test]
+    fn spot_perp_basis_signal_uses_depth_vwap_for_candidate_math() {
+        let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
+            symbol: "BTCUSDT".to_owned(),
+            spot_best_bid: "99.90".to_owned(),
+            spot_best_ask: "100.00".to_owned(),
+            spot_ask_size: Some("0.5".to_owned()),
+            spot_ask_depth: vec![
+                SignalDepthLevel {
+                    price: "100.00".to_owned(),
+                    size: "0.5".to_owned(),
+                },
+                SignalDepthLevel {
+                    price: "100.50".to_owned(),
+                    size: "1.0".to_owned(),
+                },
+            ],
+            perp_best_bid: "102.00".to_owned(),
+            perp_best_ask: "102.10".to_owned(),
+            perp_bid_size: Some("0.5".to_owned()),
+            perp_bid_depth: vec![
+                SignalDepthLevel {
+                    price: "102.00".to_owned(),
+                    size: "0.5".to_owned(),
+                },
+                SignalDepthLevel {
+                    price: "101.50".to_owned(),
+                    size: "1.0".to_owned(),
+                },
+            ],
+            last_funding_rate: "0.00010000".to_owned(),
+            notional_usd: "100.00".to_owned(),
+            spot_taker_fee_bps: 10,
+            perp_taker_fee_bps: 5,
+            slippage_buffer_bps: 5,
+            min_net_bps: 5,
+        })
+        .expect("signal");
+
+        assert!(signal.is_candidate);
+        assert_eq!(signal.liquidity_model, "order_book_vwap");
+        assert_eq!(signal.spot_ask_depth_usd.as_deref(), Some("150.5"));
+        assert_eq!(signal.perp_bid_depth_usd.as_deref(), Some("152.5"));
+        assert_eq!(signal.spot_ask_levels_used, 2);
+        assert_eq!(signal.perp_bid_levels_used, 2);
+        assert_eq!(signal.spot_ask_vwap.as_deref(), Some("100.24937734"));
+        assert_eq!(signal.perp_bid_vwap.as_deref(), Some("101.75438603"));
+        assert_eq!(signal.gross_bps, 150);
+        assert_eq!(signal.net_bps, 130);
     }
 
     #[test]
@@ -4094,7 +4546,7 @@ mod tests {
             .reason
             .as_deref()
             .expect("reason")
-            .contains("insufficient top-of-book depth"));
+            .contains("insufficient order-book depth"));
     }
 
     #[test]
@@ -4532,9 +4984,11 @@ mod tests {
             long_best_bid: "99.95".to_owned(),
             long_best_ask: "100.00".to_owned(),
             long_ask_size: Some("2.0".to_owned()),
+            long_ask_depth: Vec::new(),
             short_best_bid: "100.05".to_owned(),
             short_best_ask: "100.10".to_owned(),
             short_bid_size: Some("2.0".to_owned()),
+            short_bid_depth: Vec::new(),
             long_funding_rate: "0.00010000".to_owned(),
             short_funding_rate: "0.00300000".to_owned(),
             funding_interval_hours: "8".to_owned(),

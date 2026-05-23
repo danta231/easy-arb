@@ -47,6 +47,9 @@ usage() {
   ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL=ALL_USDT # Aster perp WSS monitor 订阅范围；ALL_USDT 表示全部 USDT 合约；启动不阻塞，策略侧按数据新鲜度 fail-closed。
   ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL=ALL_USDT # Hyperliquid perp WSS monitor 订阅范围；ALL_USDT 表示全部永续合约；启动不阻塞，策略侧按数据新鲜度 fail-closed。
   ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805 # portfolio dashboard 监听地址。
+  ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_ENABLED=1 # 是否启动全账户私有只读采集器；只读仓位和余额，不下单、不撤单、不转账。
+  ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS=60 # 全账户私有只读采集间隔秒数。
+  ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_VENUES= # 可选覆盖采集交易所，逗号分隔；留空表示所有支持 funding-arb 的交易所。
   BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60 # spot-perp-basis 常驻 runner 扫描间隔秒数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
@@ -299,12 +302,17 @@ STATE_DIR="${PREREQ_ROOT}/state"
 WSS_PID_FILE="${STATE_DIR}/wss-book-ticker.pids"
 LIVE_PID_FILE="${STATE_DIR}/arb-runtime-live.pid"
 PORTFOLIO_PID_FILE="${STATE_DIR}/portfolio-dashboard.pid"
+PORTFOLIO_PRIVATE_READONLY_PID_FILE="${STATE_DIR}/portfolio-private-readonly.pid"
 PRECHECK_LOG="${LOG_DIR}/arb-runtime-live-precheck.log"
 RUNTIME_BIN="${ARB_RUNTIME_LIVE_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
 WSS_READY_TIMEOUT_SECS="${ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS:-120}"
 WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_WSS_RECONNECT_DELAY_SECS:-2}"
 RECLAIM_STALE_MONITOR_PORTS="${ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS:-1}"
 PORTFOLIO_BIND="${ARB_RUNTIME_LIVE_PORTFOLIO_BIND:-127.0.0.1:8805}"
+PORTFOLIO_PRIVATE_READONLY_ENABLED="${ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_ENABLED:-1}"
+PORTFOLIO_PRIVATE_READONLY_OUT="${ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_OUT:-${RUN_ROOT}/portfolio-private-readonly}"
+PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS="${ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS:-60}"
+PORTFOLIO_PRIVATE_READONLY_VENUES="${ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_VENUES:-}"
 LIVE_CONFIG="${ARB_RUNTIME_LIVE_CONFIG:-${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}}"
 LIVE_INTERVAL_SECS="${ARB_RUNTIME_LIVE_INTERVAL_SECS:-${BASIS_OBSERVER_INTERVAL_SECS:-5}}"
 LIVE_MIN_NET_BPS="${ARB_RUNTIME_LIVE_MIN_NET_BPS:-${BASIS_OBSERVER_MIN_NET_BPS:-5}}"
@@ -320,6 +328,13 @@ case "${LIVE_DERISK_ONLY}" in
   0|1) ;;
   *) die "ARB_RUNTIME_LIVE_DERISK_ONLY must be 0 or 1" ;;
 esac
+case "${PORTFOLIO_PRIVATE_READONLY_ENABLED}" in
+  0|1) ;;
+  *) die "ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_ENABLED must be 0 or 1" ;;
+esac
+if ! [[ "${PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS}" =~ ^[0-9]+$ ]] || (( PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS < 1 )); then
+  die "ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS must be a positive integer"
+fi
 if [[ "${LIVE_DERISK_ONLY}" == "1" ]]; then
   LIVE_STRATEGIES="cross-exchange-funding-arb"
   LIVE_SPOT_PERP_BASIS_MODE="auto-once"
@@ -560,12 +575,58 @@ start_portfolio_dashboard() {
   echo "  pid=${pid} log=${log_file}"
 }
 
+start_portfolio_private_readonly_snapshot() {
+  [[ "${PORTFOLIO_PRIVATE_READONLY_ENABLED}" == "1" ]] || return 0
+  local log_file="${LOG_DIR}/portfolio-private-readonly.log"
+  local pid
+  local -a args
+  local venue
+  local -a venues
+
+  args=(
+    "${RUNTIME_BIN}" portfolio-private-readonly-snapshot
+    --config "${LIVE_CONFIG}"
+    --out "${PORTFOLIO_PRIVATE_READONLY_OUT}"
+    --interval-secs "${PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS}"
+  )
+  if [[ -n "${PORTFOLIO_PRIVATE_READONLY_VENUES}" ]]; then
+    args+=(--clear-venues)
+    IFS=',' read -r -a venues <<< "${PORTFOLIO_PRIVATE_READONLY_VENUES}"
+    for venue in "${venues[@]}"; do
+      venue="${venue//[[:space:]]/}"
+      [[ -n "${venue}" ]] || continue
+      args+=(--venue "${venue}")
+    done
+  fi
+  [[ -n "${HYPERLIQUID_USER:-}" ]] && args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
+  [[ -n "${ASTER_USER:-}" ]] && args+=(--aster-user "${ASTER_USER}")
+  [[ -n "${ASTER_SIGNER:-}" ]] && args+=(--aster-signer "${ASTER_SIGNER}")
+  [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && args+=(--aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
+
+  mkdir -p "${PORTFOLIO_PRIVATE_READONLY_OUT}"
+  echo "starting portfolio private read-only snapshotter: out=${PORTFOLIO_PRIVATE_READONLY_OUT}"
+  nohup env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${args[@]}" >> "${log_file}" 2>&1 &
+  pid="$!"
+  printf '%s\n' "${pid}" > "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}"
+  echo "  pid=${pid} log=${log_file}"
+}
+
 stop_portfolio_dashboard() {
   [[ -s "${PORTFOLIO_PID_FILE}" ]] || return 0
   local pid
   pid="$(sed -n '1p' "${PORTFOLIO_PID_FILE}")"
   if is_alive "${pid}"; then
     echo "TERM portfolio-dashboard pid=${pid}"
+    kill -TERM "${pid}" 2>/dev/null || true
+  fi
+}
+
+stop_portfolio_private_readonly_snapshot() {
+  [[ -s "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}" ]] || return 0
+  local pid
+  pid="$(sed -n '1p' "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}")"
+  if is_alive "${pid}"; then
+    echo "TERM portfolio-private-readonly pid=${pid}"
     kill -TERM "${pid}" 2>/dev/null || true
   fi
 }
@@ -756,9 +817,10 @@ cleanup_safe_stale_resident_locks() {
 cleanup_safe_stale_resident_locks
 
 if [[ "${DETACH}" != "1" ]]; then
-  trap 'stop_portfolio_dashboard; stop_wss_monitors' EXIT
+  trap 'stop_portfolio_dashboard; stop_portfolio_private_readonly_snapshot; stop_wss_monitors' EXIT
 fi
 
+start_portfolio_private_readonly_snapshot
 start_portfolio_dashboard
 
 start_wss_monitor binance-spot binance-wss-book-ticker "${BINANCE_SPOT_WSS_BIND}" "${BINANCE_WSS_SYMBOL}" spot /api/binance-wss-book-ticker "" 0
@@ -827,7 +889,11 @@ print_dashboards() {
 
 实时日志:
   tail -f ${PREREQ_ROOT}/logs/arb-runtime-live-precheck.log
+  tail -f ${PREREQ_ROOT}/logs/portfolio-private-readonly.log
   tail -f ${RUN_ROOT}/logs/realtime-feedback.log
+
+全账户私有只读快照:
+  ${PORTFOLIO_PRIVATE_READONLY_OUT}
 
 spot-perp-basis 常驻产物:
   ${RUN_ROOT}/resident-live/spot-perp-basis
