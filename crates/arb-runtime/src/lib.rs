@@ -23,9 +23,7 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "live-exec")]
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-#[cfg(feature = "live-exec")]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arb_config::ExecutionMode as ConfigExecutionMode;
 use arb_contracts::{
@@ -104,7 +102,6 @@ use arb_signing::real::{
     BybitSigningPayloadKind, EnvBinanceCredentialProvider,
     LiteralAsterExternalSignerCommandProvider, OkxHmacSigningInput, OkxRealSigningProvider,
     OkxRealSigningProviderFromEnv, OkxRestMethod, RealSigningProvider, SystemAsterNonceProvider,
-    SystemBinanceTimestampProvider,
 };
 #[cfg(feature = "live-exec")]
 use arb_signing::{
@@ -187,7 +184,9 @@ const HYPERLIQUID_AGENT_ENV_NAMES: &[&str] = &[
 #[cfg(feature = "live-exec")]
 const ARB_WALLET_SIGNER_PATH_ENV_DEFAULT: &str = "ARB_WALLET_SIGNER_PATH";
 #[cfg(feature = "live-exec")]
-const BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS: u64 = 10_000;
+const BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS: u64 = 30_000;
+#[cfg(feature = "live-exec")]
+const BYBIT_PRIVATE_READONLY_RECV_WINDOW_MS: u64 = 30_000;
 #[cfg(feature = "live-exec")]
 const BINANCE_PRIVATE_SIGNED_GET_MAX_ATTEMPTS: u32 = 3;
 #[cfg(feature = "live-exec")]
@@ -198,6 +197,8 @@ const BINANCE_SERVER_TIME_CURL_MAX_TIME_SECS: u64 = 5;
 const BINANCE_SIGNING_TIMESTAMP_SAFETY_MARGIN_MS: i128 = 500;
 #[cfg(feature = "live-exec")]
 const BINANCE_PRIVATE_RECV_WINDOW_ENV: &str = "ARB_RUNTIME_BINANCE_RECV_WINDOW_MS";
+#[cfg(feature = "live-exec")]
+const BYBIT_PRIVATE_RECV_WINDOW_ENV: &str = "ARB_RUNTIME_BYBIT_RECV_WINDOW_MS";
 #[cfg(feature = "live-exec")]
 const BINANCE_PRIVATE_ACCOUNT_MODE_ENV: &str = "BASIS_OBSERVER_BINANCE_ACCOUNT_MODE";
 #[cfg(feature = "live-exec")]
@@ -210,8 +211,6 @@ const OKX_POSITION_MODE_ENV: &str = "BASIS_OBSERVER_OKX_POSITION_MODE";
 const BITGET_POSITION_MODE_ENV: &str = "BASIS_OBSERVER_BITGET_POSITION_MODE";
 #[cfg(feature = "live-exec")]
 const ASTER_POSITION_MODE_ENV: &str = "BASIS_OBSERVER_ASTER_POSITION_MODE";
-const FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT_ENV: &str =
-    "BASIS_OBSERVER_FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT";
 const FUNDING_ARB_TRADFI_PERP_SYMBOLS_ENV: &str = "BASIS_OBSERVER_TRADFI_PERP_SYMBOLS";
 const FUNDING_ARB_STOCK_PERP_SYMBOLS_ENV: &str = "BASIS_OBSERVER_STOCK_PERP_SYMBOLS";
 const FUNDING_ARB_COMMODITY_PERP_SYMBOLS_ENV: &str = "BASIS_OBSERVER_COMMODITY_PERP_SYMBOLS";
@@ -237,6 +236,20 @@ const PRIVATE_CURL_DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const PRIVATE_CURL_MAX_ATTEMPTS_LIMIT: u32 = 8;
 #[cfg(feature = "live-exec")]
 const PRIVATE_CURL_RETRY_BASE_DELAY_MS: u64 = 750;
+#[cfg(feature = "live-exec")]
+const RUNTIME_JSONL_ROTATE_BYTES_ENV: &str = "ARB_RUNTIME_JSONL_ROTATE_BYTES";
+#[cfg(feature = "live-exec")]
+const RUNTIME_JSONL_ROTATE_KEEP_ENV: &str = "ARB_RUNTIME_JSONL_ROTATE_KEEP";
+#[cfg(feature = "live-exec")]
+const RUNTIME_JSONL_ROTATE_DEFAULT_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(feature = "live-exec")]
+const RUNTIME_JSONL_ROTATE_DEFAULT_KEEP: usize = 4;
+#[cfg(feature = "live-exec")]
+const RUNTIME_JSONL_ROTATE_KEEP_LIMIT: usize = 32;
+#[cfg(feature = "live-exec")]
+const RESIDENT_RETRYABLE_ERROR_BACKOFF_BASE_MS: u64 = 1_000;
+#[cfg(feature = "live-exec")]
+const RESIDENT_RETRYABLE_ERROR_BACKOFF_MAX_MS: u64 = 30_000;
 const FUNDING_ARB_MAX_MARK_INDEX_DIVERGENCE_BPS: i128 = 100;
 const RAW_TICKER_FILE: &str = "raw/binance_ticker_24hr.redacted.json";
 const RAW_TICKER_REF: &str = "raw/binance_ticker_24hr.redacted.json";
@@ -343,6 +356,16 @@ const BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS: i128 = 10;
 const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
+const OKX_FUNDING_RATE_CACHE_TTL_ENV: &str = "ARB_RUNTIME_OKX_FUNDING_RATE_CACHE_TTL_SECS";
+const OKX_FUNDING_RATE_CACHE_TTL_DEFAULT_SECS: u64 = 60;
+const BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_ENV: &str =
+    "ARB_RUNTIME_BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_SECS";
+const BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_DEFAULT_SECS: u64 = 300;
+const ASTER_SPOT_PERP_SPOT_SCAN_ENV: &str = "ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED";
+const HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV: &str =
+    "ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED";
+const BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS: i128 = 5;
+const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
 const ARB_RUNTIME_LEGACY_COMMANDS_ENV: &str = "ARB_RUNTIME_ENABLE_LEGACY_COMMANDS";
 const UNIFIED_RUNTIME_DEFAULT_CONFIG: &str = "templates/personal_guarded_live.preflight.yaml";
 const UNIFIED_RUNTIME_PAPER_DEFAULT_OUT: &str = "target/arb-runtime/paper";
@@ -354,6 +377,7 @@ const UNIFIED_RUNTIME_DEFAULT_MONITORS: &str = "binance bybit okx bitget aster h
 const FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD: &str = "0.01";
 #[cfg(feature = "live-exec")]
 const FUNDING_SETTLEMENT_RAW_SNAPSHOT_LOOKBACK_MS: u64 = 36 * 60 * 60 * 1_000;
+const FUNDING_SETTLEMENT_TIMESTAMP_BUCKET_MS: u64 = 60_000;
 const FUNDING_PRIVATE_ACCOUNT_MIN_COLLATERAL_RATIO_BPS: i128 = 1_000;
 const FUNDING_ARB_PRIVATE_SNAPSHOT_MAX_AGE_MS: i128 = 60_000;
 #[cfg(feature = "live-exec")]
@@ -1547,6 +1571,19 @@ impl FundingSettlementReconciliationSummary {
 
     fn is_matched(&self) -> bool {
         self.status == "Matched"
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn is_observed_complete(&self) -> bool {
+        matches!(self.status.as_str(), "Matched" | "Mismatch")
+            && self.actual_funding_usd.is_some()
+            && self.difference_usd.is_some()
+            && self.checked_entry_count > 0
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn is_observed_mismatch(&self) -> bool {
+        self.is_observed_complete() && !self.is_matched()
     }
 }
 
@@ -2889,6 +2926,7 @@ pub struct FundingArbResidentLiveOptions {
     pub execute_live: bool,
     pub acknowledge_funding_arb_live_orders: bool,
     pub allow_unknown_recovery: bool,
+    pub exit_only: bool,
     pub hyperliquid_user: Option<String>,
     pub hyperliquid_source: String,
     pub hyperliquid_vault_address: Option<String>,
@@ -4880,10 +4918,6 @@ type RuntimeBinanceSigningProvider = BinanceHmacSha256SigningProvider<
 >;
 
 #[cfg(feature = "live-exec")]
-type RuntimeBinanceSystemTimeSigningProvider =
-    BinanceHmacSha256SigningProvider<EnvBinanceCredentialProvider, SystemBinanceTimestampProvider>;
-
-#[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BinanceServerTimeTimestampProvider {
     base_url: String,
@@ -4893,10 +4927,16 @@ struct BinanceServerTimeTimestampProvider {
 #[cfg(feature = "live-exec")]
 impl BinanceTimestampProvider for BinanceServerTimeTimestampProvider {
     fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64> {
-        let offset_ms = binance_server_time_offset_millis(&self.base_url, &self.time_endpoint)
-            .map_err(|_| SigningError::ClockUnavailable {
-                audit_ref: audit_ref.clone(),
-            })?;
+        let offset_ms = match binance_server_time_offset_millis(&self.base_url, &self.time_endpoint)
+        {
+            Ok(offset_ms) => offset_ms,
+            Err(_) => {
+                let local_ms = system_unix_millis_for_binance_signing(audit_ref)?;
+                let safety_margin_ms =
+                    u64::try_from(BINANCE_SIGNING_TIMESTAMP_SAFETY_MARGIN_MS).unwrap_or(0);
+                return Ok(local_ms.saturating_sub(safety_margin_ms));
+            }
+        };
         let local_ms = system_unix_millis_for_binance_signing(audit_ref)?;
         let timestamp = i128::from(local_ms).checked_add(offset_ms).ok_or_else(|| {
             SigningError::ClockUnavailable {
@@ -4924,19 +4964,9 @@ fn runtime_binance_signing_provider(
 }
 
 #[cfg(feature = "live-exec")]
-fn runtime_binance_system_time_signing_provider(
-) -> RuntimeResult<RuntimeBinanceSystemTimeSigningProvider> {
-    Ok(BinanceHmacSha256SigningProvider::new(
-        EnvBinanceCredentialProvider::from_default_env()?,
-        SystemBinanceTimestampProvider,
-    ))
-}
-
-#[cfg(feature = "live-exec")]
 #[derive(Debug)]
 enum RuntimeBinanceExecutionSigningProvider {
     ServerTime(RuntimeBinanceSigningProvider),
-    SystemTime(RuntimeBinanceSystemTimeSigningProvider),
 }
 
 #[cfg(feature = "live-exec")]
@@ -4948,7 +4978,6 @@ impl RealSigningProvider for RuntimeBinanceExecutionSigningProvider {
     ) -> SigningResult<BinanceSignedEndpoint> {
         match self {
             Self::ServerTime(provider) => provider.sign_binance_hmac(input, policy),
-            Self::SystemTime(provider) => provider.sign_binance_hmac(input, policy),
         }
     }
 }
@@ -4959,8 +4988,8 @@ fn runtime_binance_execution_signing_provider(
 ) -> RuntimeResult<RuntimeBinanceExecutionSigningProvider> {
     match mode {
         BinancePrivateAccountMode::PortfolioMargin => {
-            Ok(RuntimeBinanceExecutionSigningProvider::SystemTime(
-                runtime_binance_system_time_signing_provider()?,
+            Ok(RuntimeBinanceExecutionSigningProvider::ServerTime(
+                runtime_binance_signing_provider(BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/time")?,
             ))
         }
         BinancePrivateAccountMode::UsdmFutures => {
@@ -4982,7 +5011,6 @@ struct BinanceServerTimeSource<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BinancePrivateTimestampSource<'a> {
     ServerTime(BinanceServerTimeSource<'a>),
-    SystemTime,
 }
 
 #[cfg(feature = "live-exec")]
@@ -4996,7 +5024,10 @@ fn binance_private_timestamp_source_for_private_endpoint<'a>(
             time_endpoint: "/api/v3/time",
         })
     } else if endpoint.starts_with("/papi/") && base_url == BINANCE_PORTFOLIO_MARGIN_BASE_URL {
-        BinancePrivateTimestampSource::SystemTime
+        BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
+            base_url: BINANCE_USDM_FUTURES_BASE_URL,
+            time_endpoint: "/fapi/v1/time",
+        })
     } else {
         BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
             base_url,
@@ -5075,20 +5106,39 @@ fn system_unix_millis_for_binance_signing(audit_ref: &SigningAuditRef) -> Signin
 
 #[cfg(feature = "live-exec")]
 fn binance_private_readonly_recv_window_ms() -> RuntimeResult<u64> {
-    let Ok(raw) = std::env::var(BINANCE_PRIVATE_RECV_WINDOW_ENV) else {
-        return Ok(BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS);
+    private_readonly_recv_window_ms(
+        BINANCE_PRIVATE_RECV_WINDOW_ENV,
+        BINANCE_PRIVATE_READONLY_RECV_WINDOW_MS,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn bybit_private_readonly_recv_window_ms() -> RuntimeResult<u64> {
+    private_readonly_recv_window_ms(
+        BYBIT_PRIVATE_RECV_WINDOW_ENV,
+        BYBIT_PRIVATE_READONLY_RECV_WINDOW_MS,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn private_readonly_recv_window_ms(env_name: &'static str, default_ms: u64) -> RuntimeResult<u64> {
+    let Ok(raw) = std::env::var(env_name) else {
+        return Ok(default_ms);
     };
+    parse_private_readonly_recv_window_ms(env_name, &raw)
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_private_readonly_recv_window_ms(env_name: &'static str, raw: &str) -> RuntimeResult<u64> {
     let value = raw
         .trim()
         .parse::<u64>()
         .map_err(|_| RuntimeError::UnsafeConfig {
-            message: format!(
-                "{BINANCE_PRIVATE_RECV_WINDOW_ENV} must be an integer milliseconds value"
-            ),
+            message: format!("{env_name} must be an integer milliseconds value"),
         })?;
     if !(1..=60_000).contains(&value) {
         return Err(RuntimeError::UnsafeConfig {
-            message: format!("{BINANCE_PRIVATE_RECV_WINDOW_ENV} must be between 1 and 60000"),
+            message: format!("{env_name} must be between 1 and 60000"),
         });
     }
     Ok(value)
@@ -5109,19 +5159,6 @@ fn sign_and_fetch_binance_private_get_with_retry(
         BinancePrivateTimestampSource::ServerTime(time_source) => {
             let signer =
                 runtime_binance_signing_provider(time_source.base_url, time_source.time_endpoint)?;
-            sign_and_fetch_binance_private_get_with_signer_retry(
-                &signer,
-                base_url,
-                endpoint,
-                request_id_base,
-                signing_policy,
-                venue_id,
-                account_id,
-                params,
-            )
-        }
-        BinancePrivateTimestampSource::SystemTime => {
-            let signer = runtime_binance_system_time_signing_provider()?;
             sign_and_fetch_binance_private_get_with_signer_retry(
                 &signer,
                 base_url,
@@ -5470,6 +5507,7 @@ fn fetch_bybit_funding_private_readonly_snapshots(
 ) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
     let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
     let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
+    let recv_window_ms = bybit_private_readonly_recv_window_ms()?;
     let account_signed = signer.sign_bybit_hmac(
         BybitHmacSigningInput::new(
             SigningRequestId::new(format!(
@@ -5479,7 +5517,7 @@ fn fetch_bybit_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            recv_window_ms,
             BybitSigningPayloadKind::QueryString,
             "accountType=UNIFIED",
         )?,
@@ -5505,7 +5543,7 @@ fn fetch_bybit_funding_private_readonly_snapshots(
                         SigningPurpose::QueryAccount,
                         VenueId::new(venue_id)?,
                         AccountId::new(account_id)?,
-                        live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+                        recv_window_ms,
                         BybitSigningPayloadKind::QueryString,
                         &position_mode_query,
                     )?,
@@ -5529,7 +5567,7 @@ fn fetch_bybit_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            recv_window_ms,
             BybitSigningPayloadKind::QueryString,
             &position_query,
         )?,
@@ -5557,7 +5595,7 @@ fn fetch_bybit_funding_private_readonly_snapshots(
             SigningPurpose::QueryAccount,
             VenueId::new(venue_id)?,
             AccountId::new(account_id)?,
-            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            recv_window_ms,
             BybitSigningPayloadKind::QueryString,
             &settlement_query,
         )?,
@@ -11650,6 +11688,7 @@ fn append_binance_basis_resident_position_jsonl(
 
 #[cfg(feature = "live-exec")]
 fn append_line_to_jsonl(path: PathBuf, line: &str) -> RuntimeResult<()> {
+    rotate_append_jsonl_if_needed(&path)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -11664,6 +11703,103 @@ fn append_line_to_jsonl(path: PathBuf, line: &str) -> RuntimeResult<()> {
             path,
             message: error.to_string(),
         })
+}
+
+#[cfg(feature = "live-exec")]
+fn runtime_jsonl_rotate_bytes() -> RuntimeResult<u64> {
+    let Ok(raw) = std::env::var(RUNTIME_JSONL_ROTATE_BYTES_ENV) else {
+        return Ok(RUNTIME_JSONL_ROTATE_DEFAULT_BYTES);
+    };
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|_| RuntimeError::UnsafeConfig {
+            message: format!("{RUNTIME_JSONL_ROTATE_BYTES_ENV} must be a non-negative integer"),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn runtime_jsonl_rotate_keep() -> RuntimeResult<usize> {
+    let Ok(raw) = std::env::var(RUNTIME_JSONL_ROTATE_KEEP_ENV) else {
+        return Ok(RUNTIME_JSONL_ROTATE_DEFAULT_KEEP);
+    };
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| RuntimeError::UnsafeConfig {
+            message: format!("{RUNTIME_JSONL_ROTATE_KEEP_ENV} must be a non-negative integer"),
+        })?;
+    if value > RUNTIME_JSONL_ROTATE_KEEP_LIMIT {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "{RUNTIME_JSONL_ROTATE_KEEP_ENV} must be between 0 and {RUNTIME_JSONL_ROTATE_KEEP_LIMIT}"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "live-exec")]
+fn rotate_append_jsonl_if_needed(path: &Path) -> RuntimeResult<()> {
+    rotate_append_jsonl_if_needed_with_limits(
+        path,
+        runtime_jsonl_rotate_bytes()?,
+        runtime_jsonl_rotate_keep()?,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn rotate_append_jsonl_if_needed_with_limits(
+    path: &Path,
+    max_bytes: u64,
+    keep: usize,
+) -> RuntimeResult<()> {
+    if max_bytes == 0 || keep == 0 {
+        return Ok(());
+    }
+    let len = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(RuntimeError::Io {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if len < max_bytes {
+        return Ok(());
+    }
+
+    let oldest = rotated_append_jsonl_path(path, keep);
+    if oldest.exists() {
+        fs::remove_file(&oldest).map_err(|error| RuntimeError::Io {
+            path: oldest.clone(),
+            message: error.to_string(),
+        })?;
+    }
+    for index in (1..keep).rev() {
+        let from = rotated_append_jsonl_path(path, index);
+        if from.exists() {
+            let to = rotated_append_jsonl_path(path, index + 1);
+            fs::rename(&from, &to).map_err(|error| RuntimeError::Io {
+                path: from,
+                message: error.to_string(),
+            })?;
+        }
+    }
+    let rotated = rotated_append_jsonl_path(path, 1);
+    fs::rename(path, &rotated).map_err(|error| RuntimeError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn rotated_append_jsonl_path(path: &Path, index: usize) -> PathBuf {
+    let mut rotated = path.as_os_str().to_os_string();
+    rotated.push(format!(".{index}"));
+    PathBuf::from(rotated)
 }
 
 #[cfg(feature = "live-exec")]
@@ -11709,6 +11845,7 @@ fn run_multi_venue_basis_resident_live_inner(
     let mut entry_dispatch_attempted = false;
     let mut exit_dispatch_attempted = false;
     let mut halt_reason = None;
+    let mut retryable_entry_error_streaks: BTreeMap<BasisLiveVenue, u32> = BTreeMap::new();
     loop {
         if output_root.join("STOP").exists() {
             halt_reason = Some("STOP file observed; multi-venue resident live halted".to_owned());
@@ -11879,6 +12016,7 @@ fn run_multi_venue_basis_resident_live_inner(
                         .join(resident_cycle_dir_name(cycles)?);
                     match run_multi_venue_basis_resident_entry_cycle(&options, *venue, &cycle_dir) {
                         Ok(report) => {
+                            retryable_entry_error_streaks.remove(venue);
                             append_binance_basis_resident_entry_event(
                                 &venue_dir, cycles, &cycle_dir, &report,
                             )?;
@@ -11935,8 +12073,32 @@ fn run_multi_venue_basis_resident_live_inner(
                                 &cycle_dir,
                                 &error.to_string(),
                             )?;
-                            if options.execute_live && !resident_entry_cycle_error_can_retry(&error)
-                            {
+                            let retryable = resident_entry_cycle_error_can_retry(&error);
+                            if retryable {
+                                let streak = {
+                                    let entry =
+                                        retryable_entry_error_streaks.entry(*venue).or_insert(0);
+                                    *entry = entry.saturating_add(1);
+                                    *entry
+                                };
+                                let backoff = resident_retryable_error_backoff(streak);
+                                append_multi_venue_basis_resident_event(
+                                    &output_root,
+                                    "entry_retry_backoff",
+                                    &format!(
+                                        "\"cycle\":{},\"reason_class\":{},\"retryable_error_streak\":{},\"sleep_ms\":{},\"venue\":{}",
+                                        cycles,
+                                        json_string(resident_retryable_error_class(&error)),
+                                        streak,
+                                        backoff.as_millis(),
+                                        json_string(venue.as_str())
+                                    ),
+                                )?;
+                                thread::sleep(backoff);
+                            } else {
+                                retryable_entry_error_streaks.remove(venue);
+                            }
+                            if options.execute_live && !retryable {
                                 halt_reason = Some(format!(
                                     "{} entry cycle failed; multi-venue resident live stopped: {error}",
                                     venue.label()
@@ -11953,6 +12115,7 @@ fn run_multi_venue_basis_resident_live_inner(
                     }
                 }
                 ResidentEntryCapacity::Blocked(reason) => {
+                    retryable_entry_error_streaks.remove(venue);
                     append_multi_venue_basis_resident_event(
                         &output_root,
                         "entry_capacity_blocked",
@@ -12027,6 +12190,40 @@ fn resident_entry_cycle_error_can_retry(error: &RuntimeError) -> bool {
         }
         _ => false,
     }
+}
+
+#[cfg(feature = "live-exec")]
+fn resident_retryable_error_class(error: &RuntimeError) -> &'static str {
+    if !resident_entry_cycle_error_can_retry(error) {
+        return "non_retryable";
+    }
+    match error {
+        RuntimeError::LiveMarketData { message } => {
+            if message.starts_with("Public WSS monitor ") {
+                "wss_monitor_unavailable"
+            } else if message.starts_with("public market data GET failed")
+                || message.starts_with("public market data POST failed")
+            {
+                "public_rest_unavailable"
+            } else if message.starts_with("OKX returned code=50011") {
+                "okx_rate_limit"
+            } else if message == "top-of-book prices must be greater than zero" {
+                "invalid_top_of_book"
+            } else {
+                "live_market_data"
+            }
+        }
+        _ => "non_retryable",
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn resident_retryable_error_backoff(streak: u32) -> Duration {
+    let multiplier = 1_u64 << streak.saturating_sub(1).min(5);
+    let millis = RESIDENT_RETRYABLE_ERROR_BACKOFF_BASE_MS
+        .saturating_mul(multiplier)
+        .min(RESIDENT_RETRYABLE_ERROR_BACKOFF_MAX_MS);
+    Duration::from_millis(millis)
 }
 
 #[cfg(feature = "live-exec")]
@@ -21098,6 +21295,7 @@ fn fetch_bybit_linear_private_position_snapshot(
     state: &BasisExitSupervisorPositionState,
 ) -> RuntimeResult<Vec<VenuePosition>> {
     let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
+    let recv_window_ms = bybit_private_readonly_recv_window_ms()?;
     let query = format!("category=linear&symbol={}", state.symbol);
     let signed = signer.sign_bybit_hmac(
         BybitHmacSigningInput::new(
@@ -21109,7 +21307,7 @@ fn fetch_bybit_linear_private_position_snapshot(
             SigningPurpose::QueryAccount,
             VenueId::new(&state.perp_venue_id)?,
             AccountId::new(&state.perp_account_id)?,
-            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            recv_window_ms,
             BybitSigningPayloadKind::QueryString,
             &query,
         )?,
@@ -21927,6 +22125,7 @@ pub fn run_binance_wss_book_ticker_monitor(
     }
 
     let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
     loop {
         let cycle = run_binance_wss_book_ticker_monitor_cycle(
             &options,
@@ -21936,12 +22135,18 @@ pub fn run_binance_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(error) if options.once => return Err(error),
-            Err(error) => eprintln!("binance-wss-book-ticker cycle failed: {error}"),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!("binance-wss-book-ticker cycle failed: {error}");
+            }
         }
         rebuild_from_rest = true;
-        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
     }
 }
 
@@ -22166,6 +22371,7 @@ pub fn run_bybit_wss_book_ticker_monitor(
     }
 
     let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
     loop {
         let cycle = run_bybit_wss_book_ticker_monitor_cycle(
             &options,
@@ -22175,12 +22381,18 @@ pub fn run_bybit_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(error) if options.once => return Err(error),
-            Err(error) => eprintln!("bybit-wss-book-ticker cycle failed: {error}"),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!("bybit-wss-book-ticker cycle failed: {error}");
+            }
         }
         rebuild_from_rest = true;
-        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
     }
 }
 
@@ -22327,6 +22539,7 @@ pub fn run_okx_wss_book_ticker_monitor(
     }
 
     let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
     loop {
         let cycle = run_okx_wss_book_ticker_monitor_cycle(
             &options,
@@ -22336,12 +22549,18 @@ pub fn run_okx_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(error) if options.once => return Err(error),
-            Err(error) => eprintln!("okx-wss-book-ticker cycle failed: {error}"),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!("okx-wss-book-ticker cycle failed: {error}");
+            }
         }
         rebuild_from_rest = true;
-        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
     }
 }
 
@@ -22486,6 +22705,7 @@ pub fn run_bitget_wss_book_ticker_monitor(
     }
 
     let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
     loop {
         let cycle = run_bitget_wss_book_ticker_monitor_cycle(
             &options,
@@ -22495,12 +22715,18 @@ pub fn run_bitget_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(error) if options.once => return Err(error),
-            Err(error) => eprintln!("bitget-wss-book-ticker cycle failed: {error}"),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!("bitget-wss-book-ticker cycle failed: {error}");
+            }
         }
         rebuild_from_rest = true;
-        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
     }
 }
 
@@ -22647,6 +22873,7 @@ pub fn run_aster_wss_book_ticker_monitor(
     }
 
     let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
     loop {
         let cycle = run_aster_wss_book_ticker_monitor_cycle(
             &options,
@@ -22656,12 +22883,18 @@ pub fn run_aster_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(error) if options.once => return Err(error),
-            Err(error) => eprintln!("aster-wss-book-ticker cycle failed: {error}"),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!("aster-wss-book-ticker cycle failed: {error}");
+            }
         }
         rebuild_from_rest = true;
-        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
     }
 }
 
@@ -22806,6 +23039,7 @@ pub fn run_hyperliquid_wss_book_ticker_monitor(
     }
 
     let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
     loop {
         let cycle = run_hyperliquid_wss_book_ticker_monitor_cycle(
             &options,
@@ -22815,12 +23049,18 @@ pub fn run_hyperliquid_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(error) if options.once => return Err(error),
-            Err(error) => eprintln!("hyperliquid-wss-book-ticker cycle failed: {error}"),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                eprintln!("hyperliquid-wss-book-ticker cycle failed: {error}");
+            }
         }
         rebuild_from_rest = true;
-        thread::sleep(Duration::from_secs(options.reconnect_delay_secs));
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
     }
 }
 
@@ -24646,8 +24886,9 @@ pub fn run_bybit_basis_monitor(options: BybitBasisMonitorOptions) -> RuntimeResu
         );
     }
 
+    let mut instrument_cache = BybitLinearInstrumentPageCache::default();
     loop {
-        match fetch_bybit_basis_monitor_snapshot(&options) {
+        match fetch_bybit_basis_monitor_snapshot_with_cache(&options, &mut instrument_cache) {
             Ok(snapshot) => {
                 if let Some(dir) = &options.output_dir {
                     write_bybit_basis_monitor_snapshot(dir, &snapshot)?;
@@ -24690,8 +24931,9 @@ pub fn run_okx_basis_monitor(options: OkxBasisMonitorOptions) -> RuntimeResult<(
         );
     }
 
+    let mut funding_cache = OkxFundingRatePageCache::default();
     loop {
-        match fetch_okx_basis_monitor_snapshot(&options) {
+        match fetch_okx_basis_monitor_snapshot_with_cache(&options, &mut funding_cache) {
             Ok(snapshot) => {
                 if let Some(dir) = &options.output_dir {
                     write_okx_basis_monitor_snapshot(dir, &snapshot)?;
@@ -25083,6 +25325,87 @@ fn validate_basis_monitor_values(
     Ok(())
 }
 
+fn public_wss_reconnect_backoff(base_secs: u64, consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(5);
+    let multiplier = 1_u64.checked_shl(shift).unwrap_or(32);
+    let seconds = base_secs
+        .saturating_mul(multiplier)
+        .min(PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS);
+    Duration::from_secs(seconds.max(1))
+}
+
+fn runtime_non_negative_u64_env(env_name: &'static str, default_value: u64) -> RuntimeResult<u64> {
+    let Ok(raw) = std::env::var(env_name) else {
+        return Ok(default_value);
+    };
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|_| RuntimeError::UnsafeConfig {
+            message: format!("{env_name} must be a non-negative integer"),
+        })
+}
+
+fn runtime_bool_env(env_name: &'static str, default_value: bool) -> RuntimeResult<bool> {
+    let Ok(raw) = std::env::var(env_name) else {
+        return Ok(default_value);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(RuntimeError::UnsafeConfig {
+            message: format!("{env_name} must be 0/1 or true/false"),
+        }),
+    }
+}
+
+fn okx_funding_rate_cache_ttl() -> RuntimeResult<Duration> {
+    runtime_non_negative_u64_env(
+        OKX_FUNDING_RATE_CACHE_TTL_ENV,
+        OKX_FUNDING_RATE_CACHE_TTL_DEFAULT_SECS,
+    )
+    .map(Duration::from_secs)
+}
+
+fn bybit_linear_instrument_cache_ttl() -> RuntimeResult<Duration> {
+    runtime_non_negative_u64_env(
+        BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_ENV,
+        BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_DEFAULT_SECS,
+    )
+    .map(Duration::from_secs)
+}
+
+fn aster_spot_perp_spot_scan_enabled() -> RuntimeResult<bool> {
+    runtime_bool_env(ASTER_SPOT_PERP_SPOT_SCAN_ENV, false)
+}
+
+fn hyperliquid_spot_perp_spot_scan_enabled() -> RuntimeResult<bool> {
+    runtime_bool_env(HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV, false)
+}
+
+fn basis_monitor_signal_should_fetch_depth(
+    signal: &SpotPerpBasisSignal,
+    min_net_bps: i128,
+) -> bool {
+    signal.is_candidate
+        || signal
+            .expected_profit_bps
+            .saturating_add(BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS)
+            >= min_net_bps
+}
+
+#[derive(Clone, Debug, Default)]
+struct BybitLinearInstrumentPageCache {
+    fetched_at: Option<Instant>,
+    pages: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct OkxFundingRatePageCache {
+    fetched_at: Option<Instant>,
+    inst_ids: Vec<String>,
+    report: Option<OkxFundingRateFetchReport>,
+}
+
 fn fetch_binance_basis_monitor_snapshot(
     options: &BinanceBasisMonitorOptions,
 ) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
@@ -25408,6 +25731,9 @@ fn binance_basis_monitor_depth_symbols_with_limit(
         }) else {
             continue;
         };
+        if !basis_monitor_signal_should_fetch_depth(&signal, options.min_net_bps) {
+            continue;
+        }
         scored_symbols.push((
             signal.expected_profit_bps,
             signal.net_bps,
@@ -25441,14 +25767,18 @@ fn fetch_aster_basis_monitor_snapshot(
     options: &AsterBasisMonitorOptions,
 ) -> RuntimeResult<AsterBasisMonitorSnapshot> {
     let mut warnings = Vec::new();
-    let spot_json = match fetch_public_json_with_curl(&aster_spot_book_ticker_all_url()) {
-        Ok(json) => Some(json),
-        Err(error) => {
-            warnings.push(format!(
-                "Aster spot REST unavailable; continuing with perp-only funding data: {error}"
-            ));
-            None
+    let spot_json = if aster_spot_perp_spot_scan_enabled()? {
+        match fetch_public_json_with_curl(&aster_spot_book_ticker_all_url()) {
+            Ok(json) => Some(json),
+            Err(error) => {
+                warnings.push(format!(
+                    "Aster spot REST unavailable; continuing with perp-only funding data: {error}"
+                ));
+                None
+            }
         }
+    } else {
+        None
     };
     let perp_json = fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&aster_futures_premium_index_all_url())?;
@@ -25860,6 +26190,9 @@ fn aster_basis_monitor_depth_symbols_with_limit(
         }) else {
             continue;
         };
+        if !basis_monitor_signal_should_fetch_depth(&signal, options.min_net_bps) {
+            continue;
+        }
         scored_symbols.push((
             signal.expected_profit_bps,
             signal.net_bps,
@@ -25870,12 +26203,13 @@ fn aster_basis_monitor_depth_symbols_with_limit(
     Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
 }
 
-fn fetch_bybit_basis_monitor_snapshot(
+fn fetch_bybit_basis_monitor_snapshot_with_cache(
     options: &BybitBasisMonitorOptions,
+    instrument_cache: &mut BybitLinearInstrumentPageCache,
 ) -> RuntimeResult<BybitBasisMonitorSnapshot> {
     let spot_json = fetch_public_json_with_curl(&bybit_spot_tickers_url())?;
     let linear_json = fetch_public_json_with_curl(&bybit_linear_tickers_url())?;
-    let instrument_pages = fetch_bybit_linear_instrument_pages()?;
+    let instrument_pages = fetch_bybit_linear_instrument_pages_cached(instrument_cache)?;
     let depth_symbols =
         bybit_basis_monitor_depth_symbols(&spot_json, &linear_json, &instrument_pages, options)?;
     let spot_depths =
@@ -25916,6 +26250,27 @@ fn fetch_bybit_linear_instrument_pages() -> RuntimeResult<Vec<String>> {
             });
         }
         cursor = Some(next_cursor);
+    }
+    Ok(pages)
+}
+
+fn fetch_bybit_linear_instrument_pages_cached(
+    cache: &mut BybitLinearInstrumentPageCache,
+) -> RuntimeResult<Vec<String>> {
+    let ttl = bybit_linear_instrument_cache_ttl()?;
+    let now = Instant::now();
+    if ttl > Duration::ZERO {
+        if let Some(fetched_at) = cache.fetched_at {
+            if now.duration_since(fetched_at) < ttl && !cache.pages.is_empty() {
+                return Ok(cache.pages.clone());
+            }
+        }
+    }
+
+    let pages = fetch_bybit_linear_instrument_pages()?;
+    if ttl > Duration::ZERO && !pages.is_empty() {
+        cache.fetched_at = Some(now);
+        cache.pages = pages.clone();
     }
     Ok(pages)
 }
@@ -26219,6 +26574,9 @@ fn bybit_basis_monitor_depth_symbols_with_limit(
         }) else {
             continue;
         };
+        if !basis_monitor_signal_should_fetch_depth(&signal, options.min_net_bps) {
+            continue;
+        }
         scored_symbols.push((
             signal.expected_profit_bps,
             signal.net_bps,
@@ -26229,15 +26587,16 @@ fn bybit_basis_monitor_depth_symbols_with_limit(
     Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
 }
 
-fn fetch_okx_basis_monitor_snapshot(
+fn fetch_okx_basis_monitor_snapshot_with_cache(
     options: &OkxBasisMonitorOptions,
+    funding_cache: &mut OkxFundingRatePageCache,
 ) -> RuntimeResult<OkxBasisMonitorSnapshot> {
     let spot_json = fetch_public_json_with_curl(&okx_tickers_url("SPOT"))?;
     let swap_json = fetch_public_json_with_curl(&okx_tickers_url("SWAP"))?;
     let mark_json = fetch_public_json_with_curl(&okx_mark_price_url())?;
     let index_json = fetch_public_json_with_curl(&okx_index_tickers_url())?;
     let swap_rows = parse_okx_ticker_rows(&swap_json, "okx swap tickers")?;
-    let funding_pages = fetch_okx_usdt_swap_funding_rate_pages(&swap_rows);
+    let funding_pages = fetch_okx_usdt_swap_funding_rate_pages_cached(&swap_rows, funding_cache)?;
     let depth_symbols =
         okx_basis_monitor_depth_symbols(&spot_json, &swap_json, &funding_pages.pages, options)?;
     let spot_depths =
@@ -26273,6 +26632,7 @@ fn fetch_okx_basis_monitor_snapshot(
     Ok(snapshot)
 }
 
+#[derive(Clone, Debug)]
 struct OkxFundingRateFetchReport {
     pages: Vec<String>,
     warnings: Vec<String>,
@@ -26283,15 +26643,43 @@ struct OkxBasisMonitorDepthSymbols {
     swap: BTreeSet<String>,
 }
 
-fn fetch_okx_usdt_swap_funding_rate_pages(swap_rows: &[OkxTickerRow]) -> OkxFundingRateFetchReport {
+fn fetch_okx_usdt_swap_funding_rate_pages_cached(
+    swap_rows: &[OkxTickerRow],
+    cache: &mut OkxFundingRatePageCache,
+) -> RuntimeResult<OkxFundingRateFetchReport> {
+    let inst_ids = okx_usdt_swap_funding_inst_ids(swap_rows);
+    let ttl = okx_funding_rate_cache_ttl()?;
+    let now = Instant::now();
+    if ttl > Duration::ZERO {
+        if let (Some(fetched_at), Some(report)) = (cache.fetched_at, cache.report.as_ref()) {
+            if now.duration_since(fetched_at) < ttl && cache.inst_ids == inst_ids {
+                return Ok(report.clone());
+            }
+        }
+    }
+
+    let report = fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids(&inst_ids);
+    if ttl > Duration::ZERO && !report.pages.is_empty() {
+        cache.fetched_at = Some(now);
+        cache.inst_ids = inst_ids;
+        cache.report = Some(report.clone());
+    }
+    Ok(report)
+}
+
+fn okx_usdt_swap_funding_inst_ids(swap_rows: &[OkxTickerRow]) -> Vec<String> {
     let mut inst_ids = BTreeSet::new();
     for row in swap_rows {
         if okx_spot_inst_id_from_swap(&row.inst_id).is_some() {
             inst_ids.insert(row.inst_id.clone());
         }
     }
-    let inst_ids = inst_ids.into_iter().collect::<Vec<_>>();
+    inst_ids.into_iter().collect::<Vec<_>>()
+}
 
+fn fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids(
+    inst_ids: &[String],
+) -> OkxFundingRateFetchReport {
     let mut pages = Vec::new();
     let mut errors = Vec::<(String, String)>::new();
     for chunk in inst_ids.chunks(OKX_FUNDING_RATE_FETCH_CONCURRENCY) {
@@ -26662,6 +27050,9 @@ fn okx_basis_monitor_depth_symbols_with_limit(
         }) else {
             continue;
         };
+        if !basis_monitor_signal_should_fetch_depth(&signal, options.min_net_bps) {
+            continue;
+        }
         scored_symbols.push((
             signal.expected_profit_bps,
             signal.net_bps,
@@ -27009,6 +27400,9 @@ fn bitget_basis_monitor_depth_symbols_with_limit(
         }) else {
             continue;
         };
+        if !basis_monitor_signal_should_fetch_depth(&signal, options.min_net_bps) {
+            continue;
+        }
         scored_symbols.push((
             signal.expected_profit_bps,
             signal.net_bps,
@@ -27022,29 +27416,53 @@ fn bitget_basis_monitor_depth_symbols_with_limit(
 fn fetch_hyperliquid_basis_monitor_snapshot(
     options: &HyperliquidBasisMonitorOptions,
 ) -> RuntimeResult<HyperliquidBasisMonitorSnapshot> {
-    let spot_json = fetch_public_json_post_with_curl(
-        HYPERLIQUID_INFO_URL,
-        &hyperliquid_info_request_body("spotMetaAndAssetCtxs"),
-    )?;
+    let spot_json = if hyperliquid_spot_perp_spot_scan_enabled()? {
+        Some(fetch_public_json_post_with_curl(
+            HYPERLIQUID_INFO_URL,
+            &hyperliquid_info_request_body("spotMetaAndAssetCtxs"),
+        )?)
+    } else {
+        None
+    };
     let perp_json = fetch_public_json_post_with_curl(
         HYPERLIQUID_INFO_URL,
         &hyperliquid_info_request_body("metaAndAssetCtxs"),
     )?;
-    build_hyperliquid_basis_monitor_snapshot_from_json(&spot_json, &perp_json, options)
+    build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
+        spot_json.as_deref(),
+        &perp_json,
+        options,
+    )
 }
 
+#[cfg(test)]
 fn build_hyperliquid_basis_monitor_snapshot_from_json(
     spot_json: &str,
+    perp_json: &str,
+    options: &HyperliquidBasisMonitorOptions,
+) -> RuntimeResult<HyperliquidBasisMonitorSnapshot> {
+    build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
+        Some(spot_json),
+        perp_json,
+        options,
+    )
+}
+
+fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
+    spot_json: Option<&str>,
     perp_json: &str,
     options: &HyperliquidBasisMonitorOptions,
 ) -> RuntimeResult<HyperliquidBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_hyperliquid_spot_context_rows(spot_json)?
-        .into_iter()
-        .map(|row| (row.coin.clone(), row))
-        .collect::<BTreeMap<_, _>>();
+    let spot_books = match spot_json {
+        Some(spot_json) => parse_hyperliquid_spot_context_rows(spot_json)?
+            .into_iter()
+            .map(|row| (row.coin.clone(), row))
+            .collect::<BTreeMap<_, _>>(),
+        None => BTreeMap::new(),
+    };
     let perp_contexts = parse_hyperliquid_perp_context_rows(perp_json)?;
     let mut warnings = Vec::new();
     let perp_wss_quotes = match options.perp_wss_monitor_url.as_deref() {
@@ -31748,6 +32166,7 @@ struct FundingSettlementLedgerEntry {
     symbol: String,
     account_id: String,
     amount_usd: String,
+    timestamp_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32375,7 +32794,6 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
                 .collect::<Vec<_>>(),
             funding_arb_live_readiness(FundingArbLiveReadinessInput {
                 spec,
-                observed_at: ingested_at,
                 portfolio_state: &portfolio_state,
                 signal_allowed: true,
                 risk_decision: Some(&decision),
@@ -32418,7 +32836,6 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
             Vec::new(),
             funding_arb_live_readiness(FundingArbLiveReadinessInput {
                 spec,
-                observed_at: ingested_at,
                 portfolio_state: &portfolio_state,
                 signal_allowed: false,
                 risk_decision: None,
@@ -33103,10 +33520,6 @@ fn funding_arb_product_tags_for_symbol(symbol: &str) -> Vec<String> {
     tags.into_iter().collect()
 }
 
-fn funding_arb_product_tags_for_spec(spec: &CrossExchangeFundingArbPipelineSpec) -> Vec<String> {
-    funding_arb_product_tags_for_symbol(&spec.strategy_config.symbol.symbol)
-}
-
 fn normalize_funding_arb_product_tag(raw: &str) -> Option<String> {
     let tag = raw.trim().to_ascii_lowercase().replace('-', "_");
     matches!(
@@ -33141,216 +33554,8 @@ fn normalize_funding_arb_product_symbol(symbol: &str) -> String {
     basis_identifier_component(&funding_base_asset_from_symbol(symbol)).to_ascii_uppercase()
 }
 
-fn funding_arb_restricted_product_preflight_readiness_check(
-    spec: &CrossExchangeFundingArbPipelineSpec,
-    observed_at: UtcTimestamp,
-    product_tags: &[String],
-) -> FundingArbLiveReadinessCheck {
-    let path = std::env::var_os(FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT_ENV).map(PathBuf::from);
-    funding_arb_restricted_product_preflight_readiness_check_with_path(
-        spec,
-        observed_at,
-        product_tags,
-        path.as_deref(),
-    )
-}
-
-fn funding_arb_restricted_product_preflight_readiness_check_with_path(
-    spec: &CrossExchangeFundingArbPipelineSpec,
-    observed_at: UtcTimestamp,
-    product_tags: &[String],
-    preflight_path: Option<&Path>,
-) -> FundingArbLiveReadinessCheck {
-    if product_tags.is_empty() {
-        return funding_arb_live_readiness_observation_check_owned(
-            "restricted_product_preflight",
-            "NotRequired",
-            Some("RESTRICTED_PRODUCT_NOT_DETECTED".to_owned()),
-            Some("funding-arb candidate has no restricted product tags".to_owned()),
-        );
-    }
-    let Some(path) = preflight_path else {
-        return funding_arb_live_readiness_check_owned(
-            "restricted_product_preflight",
-            false,
-            Some("RESTRICTED_PRODUCT_PREFLIGHT_REQUIRED".to_owned()),
-            Some(format!(
-                "restricted funding-arb product tags {} require account preflight evidence in {FUNDING_ARB_RESTRICTED_PRODUCT_PREFLIGHT_ENV}; confirm account_enabled, agreement_accepted, jurisdiction_allowed, and symbol_tradable before live dispatch",
-                product_tags.join(",")
-            )),
-        );
-    };
-    match validate_funding_arb_restricted_product_preflight(spec, observed_at, product_tags, path) {
-        Ok(()) => funding_arb_live_readiness_check_owned(
-            "restricted_product_preflight",
-            true,
-            Some("RESTRICTED_PRODUCT_PREFLIGHT_NOT_CONFIRMED".to_owned()),
-            None,
-        ),
-        Err(reason) => funding_arb_live_readiness_check_owned(
-            "restricted_product_preflight",
-            false,
-            Some("RESTRICTED_PRODUCT_PREFLIGHT_NOT_CONFIRMED".to_owned()),
-            Some(reason),
-        ),
-    }
-}
-
-fn validate_funding_arb_restricted_product_preflight(
-    spec: &CrossExchangeFundingArbPipelineSpec,
-    observed_at: UtcTimestamp,
-    product_tags: &[String],
-    path: &Path,
-) -> Result<(), String> {
-    let input = read_utf8(path).map_err(|error| {
-        format!(
-            "restricted product preflight file `{}` could not be read: {error}",
-            path.display()
-        )
-    })?;
-    let records = json_object_slices(&input).map_err(|error| {
-        format!(
-            "restricted product preflight file `{}` is not a JSON object or object array: {error}",
-            path.display()
-        )
-    })?;
-    let mut errors = Vec::new();
-    for record in records {
-        let fields = match parse_json_object_value_slices(record) {
-            Ok(fields) => fields,
-            Err(error) => {
-                errors.push(error.to_string());
-                continue;
-            }
-        };
-        match validate_funding_arb_restricted_product_preflight_fields(
-            spec,
-            observed_at,
-            product_tags,
-            &fields,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(error) => errors.push(error),
-        }
-    }
-    Err(format!(
-        "restricted product preflight did not contain a confirmed record for symbol {} venues {} tags {}; checked {} record(s); {}",
-        spec.strategy_config.symbol.symbol,
-        funding_arb_spec_venue_families(spec).join(","),
-        product_tags.join(","),
-        errors.len(),
-        errors.last().cloned().unwrap_or_else(|| "no record matched".to_owned())
-    ))
-}
-
-fn validate_funding_arb_restricted_product_preflight_fields(
-    spec: &CrossExchangeFundingArbPipelineSpec,
-    observed_at: UtcTimestamp,
-    product_tags: &[String],
-    fields: &BTreeMap<String, &str>,
-) -> Result<(), String> {
-    let source = "restricted product preflight";
-    let status =
-        required_json_value_string(fields, "status", source).map_err(|error| error.to_string())?;
-    if status != "confirmed" {
-        return Err(format!("status is `{status}`, expected `confirmed`"));
-    }
-    let symbol =
-        required_json_value_string(fields, "symbol", source).map_err(|error| error.to_string())?;
-    if !funding_arb_preflight_symbol_matches(&spec.strategy_config.symbol.symbol, &symbol) {
-        return Err(format!(
-            "symbol `{symbol}` does not match candidate `{}`",
-            spec.strategy_config.symbol.symbol
-        ));
-    }
-    let venues = optional_json_value_string_array(fields, "venues", source)
-        .map_err(|error| error.to_string())?;
-    if !funding_arb_preflight_venues_match(spec, &venues) {
-        return Err(format!(
-            "venues [{}] do not cover candidate venues {}",
-            venues.join(","),
-            funding_arb_spec_venue_families(spec).join(",")
-        ));
-    }
-    let confirmed_tags = optional_json_value_string_array(fields, "product_tags", source)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter_map(|tag| normalize_funding_arb_product_tag(&tag))
-        .collect::<BTreeSet<_>>();
-    for tag in product_tags {
-        if !confirmed_tags.contains(tag) {
-            return Err(format!("product_tags do not include required tag `{tag}`"));
-        }
-    }
-    for field in [
-        "account_enabled",
-        "agreement_accepted",
-        "jurisdiction_allowed",
-        "symbol_tradable",
-    ] {
-        let value = optional_json_bool(fields, field, source)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("{field} is missing"))?;
-        if !value {
-            return Err(format!("{field} is false"));
-        }
-    }
-    let checked_at = required_json_value_string(fields, "checked_at", source)
-        .map_err(|error| error.to_string())?;
-    UtcTimestamp::from_str(&checked_at)
-        .map_err(|error| format!("checked_at is not strict UTC: {error}"))?;
-    let expires_at = required_json_value_string(fields, "expires_at", source)
-        .map_err(|error| error.to_string())?;
-    let expires_at = UtcTimestamp::from_str(&expires_at)
-        .map_err(|error| format!("expires_at is not strict UTC: {error}"))?;
-    if !utc_timestamp_after(expires_at, observed_at) {
-        return Err("expires_at is not after the observed candidate timestamp".to_owned());
-    }
-    Ok(())
-}
-
-fn funding_arb_preflight_symbol_matches(candidate_symbol: &str, preflight_symbol: &str) -> bool {
-    preflight_symbol.trim() == "*"
-        || normalize_funding_arb_product_symbol(candidate_symbol)
-            == normalize_funding_arb_product_symbol(preflight_symbol)
-}
-
-fn funding_arb_preflight_venues_match(
-    spec: &CrossExchangeFundingArbPipelineSpec,
-    venues: &[String],
-) -> bool {
-    if venues.iter().any(|venue| venue.trim() == "*") {
-        return true;
-    }
-    let confirmed = venues
-        .iter()
-        .map(|venue| normalize_venue_family(venue))
-        .collect::<BTreeSet<_>>();
-    funding_arb_spec_venue_families(spec)
-        .iter()
-        .all(|venue| confirmed.contains(venue))
-}
-
-fn funding_arb_spec_venue_families(spec: &CrossExchangeFundingArbPipelineSpec) -> Vec<String> {
-    [
-        &spec.strategy_config.venues.venue_a.venue_label,
-        &spec.strategy_config.venues.venue_b.venue_label,
-    ]
-    .into_iter()
-    .map(|venue| normalize_venue_family(venue))
-    .collect::<BTreeSet<_>>()
-    .into_iter()
-    .collect()
-}
-
-fn utc_timestamp_after(left: UtcTimestamp, right: UtcTimestamp) -> bool {
-    left.unix_seconds() > right.unix_seconds()
-        || (left.unix_seconds() == right.unix_seconds() && left.nanoseconds() > right.nanoseconds())
-}
-
 struct FundingArbLiveReadinessInput<'a> {
     spec: &'a CrossExchangeFundingArbPipelineSpec,
-    observed_at: UtcTimestamp,
     portfolio_state: &'a PortfolioState,
     signal_allowed: bool,
     risk_decision: Option<&'a RiskDecision>,
@@ -33402,12 +33607,6 @@ fn funding_arb_live_readiness(
         risk_allowed,
         Some("RISK_DECISION_BLOCKED".to_owned()),
         Some(risk_detail),
-    ));
-    let product_tags = funding_arb_product_tags_for_spec(input.spec);
-    checks.push(funding_arb_restricted_product_preflight_readiness_check(
-        input.spec,
-        input.observed_at,
-        &product_tags,
     ));
     if input.execution_preflight.plan_preview_built() {
         checks.push(funding_arb_live_readiness_observation_check_owned(
@@ -33741,19 +33940,46 @@ fn funding_arb_live_blocking_reasons_from_readiness(
     reasons.into_iter().collect()
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FundingSettlementReconciliationScope<'a> {
+    target_timestamp_bucket_ms: Option<u64>,
+    minimum_timestamp_ms: Option<u64>,
+    expected_funding_usd_override: Option<&'a str>,
+}
+
 fn reconcile_funding_settlement_ledger_json(
     row: &FundingArbMarketRow,
     spec: &CrossExchangeFundingArbPipelineSpec,
     ledger_json: &str,
 ) -> RuntimeResult<FundingSettlementReconciliationSummary> {
     let snapshot = parse_funding_settlement_ledger_snapshot_json(ledger_json)?;
-    reconcile_funding_settlement_ledger_snapshot(row, spec, &snapshot, "funding settlement ledger")
+    reconcile_funding_settlement_ledger_snapshot(
+        row,
+        spec,
+        &snapshot,
+        "funding settlement ledger",
+        FundingSettlementReconciliationScope::default(),
+    )
 }
 
 fn reconcile_funding_settlement_raw_snapshot_json(
     row: &FundingArbMarketRow,
     spec: &CrossExchangeFundingArbPipelineSpec,
     raw_json: &str,
+) -> RuntimeResult<FundingSettlementReconciliationSummary> {
+    reconcile_funding_settlement_raw_snapshot_json_with_scope(
+        row,
+        spec,
+        raw_json,
+        FundingSettlementReconciliationScope::default(),
+    )
+}
+
+fn reconcile_funding_settlement_raw_snapshot_json_with_scope(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    raw_json: &str,
+    scope: FundingSettlementReconciliationScope<'_>,
 ) -> RuntimeResult<FundingSettlementReconciliationSummary> {
     let raw_snapshot = parse_funding_settlement_raw_snapshot_json(raw_json)?;
     let entries = funding_settlement_entries_from_raw_snapshot(&raw_snapshot)?;
@@ -33767,6 +33993,7 @@ fn reconcile_funding_settlement_raw_snapshot_json(
         spec,
         &ledger_snapshot,
         "funding settlement raw snapshot",
+        scope,
     )
 }
 
@@ -33775,13 +34002,14 @@ fn reconcile_funding_settlement_ledger_snapshot(
     spec: &CrossExchangeFundingArbPipelineSpec,
     snapshot: &FundingSettlementLedgerSnapshot,
     source_label: &str,
+    scope: FundingSettlementReconciliationScope<'_>,
 ) -> RuntimeResult<FundingSettlementReconciliationSummary> {
     if snapshot.status != "complete" && snapshot.status != "matched" && snapshot.status != "healthy"
     {
         return Ok(FundingSettlementReconciliationSummary {
             status: "Missing".to_owned(),
             snapshot_updated_at: snapshot.updated_at.clone(),
-            expected_funding_usd: expected_gross_funding_usd(row, spec)
+            expected_funding_usd: expected_funding_usd_with_scope(row, spec, scope)
                 .ok()
                 .map(MonitorDecimal::format_trimmed),
             actual_funding_usd: None,
@@ -33794,7 +34022,7 @@ fn reconcile_funding_settlement_ledger_snapshot(
         });
     }
 
-    let expected = match expected_gross_funding_usd(row, spec) {
+    let expected = match expected_funding_usd_with_scope(row, spec, scope) {
         Ok(expected) => expected,
         Err(error) if funding_arb_expected_funding_unavailable_can_hold(&error) => {
             return Ok(FundingSettlementReconciliationSummary {
@@ -33813,24 +34041,52 @@ fn reconcile_funding_settlement_ledger_snapshot(
     };
     let mut actual = MonitorDecimal { raw: 0 };
     let mut checked_entry_count = 0_usize;
+    let mut checked_accounts = BTreeSet::new();
     let venue_a_family = normalize_venue_family(&row.venue_a_family);
     let venue_b_family = normalize_venue_family(&row.venue_b_family);
     let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
-    for entry in &snapshot.entries {
-        let entry_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol));
-        let venue_matches = matches!(
-            normalize_venue_family(&entry.venue_family).as_str(),
-            family if family == venue_a_family || family == venue_b_family
-        );
-        let account_matches = entry.account_id == spec.strategy_config.venues.venue_a.account_id
-            || entry.account_id == spec.strategy_config.venues.venue_b.account_id;
-        if entry_symbol == expected_symbol && venue_matches && account_matches {
-            actual = actual.checked_add(
-                MonitorDecimal::parse("funding_settlement.amount_usd", &entry.amount_usd)?,
-                "funding settlement actual amount sum",
-            )?;
-            checked_entry_count += 1;
-        }
+    let matched_entries = snapshot
+        .entries
+        .iter()
+        .filter(|entry| {
+            let entry_symbol =
+                funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol));
+            let venue_matches = matches!(
+                normalize_venue_family(&entry.venue_family).as_str(),
+                family if family == venue_a_family || family == venue_b_family
+            );
+            let account_matches = entry.account_id
+                == spec.strategy_config.venues.venue_a.account_id
+                || entry.account_id == spec.strategy_config.venues.venue_b.account_id;
+            entry_symbol == expected_symbol
+                && venue_matches
+                && account_matches
+                && funding_settlement_entry_matches_scope(entry, scope)
+        })
+        .collect::<Vec<_>>();
+    let selected_timestamp_bucket_ms = scope
+        .target_timestamp_bucket_ms
+        .or_else(|| latest_funding_settlement_timestamp_bucket_ms(&matched_entries));
+    for entry in
+        matched_entries
+            .iter()
+            .copied()
+            .filter(|entry| match selected_timestamp_bucket_ms {
+                Some(bucket) => {
+                    entry
+                        .timestamp_ms
+                        .map(funding_settlement_timestamp_bucket_ms)
+                        == Some(bucket)
+                }
+                None => true,
+            })
+    {
+        actual = actual.checked_add(
+            MonitorDecimal::parse("funding_settlement.amount_usd", &entry.amount_usd)?,
+            "funding settlement actual amount sum",
+        )?;
+        checked_entry_count += 1;
+        checked_accounts.insert(entry.account_id.clone());
     }
 
     if checked_entry_count == 0 {
@@ -33846,6 +34102,29 @@ fn reconcile_funding_settlement_ledger_snapshot(
                 expected_symbol,
                 spec.strategy_config.venues.venue_a.account_id,
                 spec.strategy_config.venues.venue_b.account_id
+            )),
+        });
+    }
+    let required_accounts = [
+        spec.strategy_config.venues.venue_a.account_id.as_str(),
+        spec.strategy_config.venues.venue_b.account_id.as_str(),
+    ];
+    let missing_accounts = required_accounts
+        .iter()
+        .filter(|account_id| !checked_accounts.contains::<str>(*account_id))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_accounts.is_empty() {
+        return Ok(FundingSettlementReconciliationSummary {
+            status: "Missing".to_owned(),
+            snapshot_updated_at: snapshot.updated_at.clone(),
+            expected_funding_usd: Some(expected.format_trimmed()),
+            actual_funding_usd: Some(actual.format_trimmed()),
+            difference_usd: None,
+            checked_entry_count,
+            reason: Some(format!(
+                "{source_label} latest settlement bucket is missing active funding-arb accounts: {}",
+                missing_accounts.join(",")
             )),
         });
     }
@@ -33871,6 +34150,41 @@ fn reconcile_funding_settlement_ledger_snapshot(
             )
         }),
     })
+}
+
+fn latest_funding_settlement_timestamp_bucket_ms(
+    entries: &[&FundingSettlementLedgerEntry],
+) -> Option<u64> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .timestamp_ms
+                .map(funding_settlement_timestamp_bucket_ms)
+        })
+        .max()
+}
+
+fn funding_settlement_timestamp_bucket_ms(timestamp_ms: u64) -> u64 {
+    timestamp_ms - (timestamp_ms % FUNDING_SETTLEMENT_TIMESTAMP_BUCKET_MS)
+}
+
+fn funding_settlement_entry_matches_scope(
+    entry: &FundingSettlementLedgerEntry,
+    scope: FundingSettlementReconciliationScope<'_>,
+) -> bool {
+    if let Some(target_bucket) = scope.target_timestamp_bucket_ms {
+        return entry
+            .timestamp_ms
+            .map(funding_settlement_timestamp_bucket_ms)
+            == Some(target_bucket);
+    }
+    if let Some(minimum_timestamp_ms) = scope.minimum_timestamp_ms {
+        return entry
+            .timestamp_ms
+            .is_some_and(|timestamp_ms| timestamp_ms >= minimum_timestamp_ms);
+    }
+    true
 }
 
 fn funding_arb_expected_funding_unavailable_can_hold(error: &RuntimeError) -> bool {
@@ -33910,6 +34224,17 @@ fn expected_gross_funding_usd(
         .and_then(|value| value.checked_div_i128(10_000, "expected gross funding USD"))
 }
 
+fn expected_funding_usd_with_scope(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    scope: FundingSettlementReconciliationScope<'_>,
+) -> RuntimeResult<MonitorDecimal> {
+    if let Some(expected) = scope.expected_funding_usd_override {
+        return MonitorDecimal::parse("funding_settlement.expected_funding_usd", expected);
+    }
+    expected_gross_funding_usd(row, spec)
+}
+
 fn parse_funding_settlement_ledger_snapshot_json(
     input: &str,
 ) -> RuntimeResult<FundingSettlementLedgerSnapshot> {
@@ -33946,6 +34271,7 @@ fn parse_funding_settlement_ledger_snapshot_json(
                 "amount_usd",
                 "funding settlement ledger entry",
             )?,
+            timestamp_ms: funding_settlement_timestamp_ms_from_fields(&fields)?,
         });
     }
     Ok(FundingSettlementLedgerSnapshot {
@@ -33993,7 +34319,7 @@ fn parse_funding_settlement_raw_snapshot_json(
                 "account_id",
                 "funding settlement raw statement",
             )?,
-            payload_json: (*payload_json).to_owned(),
+            payload_json: raw_json_payload_string(payload_json, "funding settlement raw snapshot")?,
         });
     }
     Ok(FundingSettlementRawSnapshot {
@@ -34086,6 +34412,8 @@ fn funding_settlement_entry_from_raw_fields(
                     symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
                     account_id: statement.account_id.clone(),
                     amount_usd,
+                    timestamp_ms: funding_settlement_timestamp_ms_from_fields(&delta_fields)?
+                        .or(funding_settlement_timestamp_ms_from_fields(fields)?),
                 }));
             }
         }
@@ -34122,7 +34450,40 @@ fn funding_settlement_entry_from_raw_fields(
         symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
         account_id: statement.account_id.clone(),
         amount_usd,
+        timestamp_ms: funding_settlement_timestamp_ms_from_fields(fields)?,
     }))
+}
+
+fn funding_settlement_timestamp_ms_from_fields(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<u64>> {
+    for field in [
+        "timestamp_ms",
+        "timestampMs",
+        "timestamp",
+        "time",
+        "transactionTime",
+        "ts",
+        "createdTime",
+        "fundingTime",
+    ] {
+        let Some(raw_value) = fields.get(field) else {
+            continue;
+        };
+        let Some(value) =
+            json_value_to_optional_scalar_string(raw_value, field, "funding settlement entry")?
+        else {
+            continue;
+        };
+        return value.parse::<u64>().map(Some).map_err(|error| {
+            RuntimeError::LiveMarketData {
+                message: format!(
+                    "funding settlement timestamp field `{field}` is not an unsigned integer: {error}"
+                ),
+            }
+        });
+    }
+    Ok(None)
 }
 
 fn funding_settlement_raw_fields_are_funding(
@@ -36005,6 +36366,10 @@ struct FundingArbPositionState {
     plan_hash: Option<String>,
     notional_usd: String,
     entry_net_funding_bps: Option<i128>,
+    target_funding_time_ms: Option<u64>,
+    target_gross_funding_spread_bps: Option<i128>,
+    target_expected_gross_funding_usd: Option<String>,
+    target_expected_net_funding_usd: Option<String>,
     opened_at: String,
     private_order_events_dir: Option<String>,
     leg_a: FundingArbPositionLegState,
@@ -36127,7 +36492,6 @@ fn run_funding_arb_resident_live_inner(
             };
             let registry = load_funding_arb_resident_position_registry(&output_root)?;
             let active_positions = registry.active_positions();
-            let exit_position_count = active_positions.len();
             for position in active_positions {
                 let exit_dir = output_root
                     .join("exit")
@@ -36194,16 +36558,18 @@ fn run_funding_arb_resident_live_inner(
             if halt_reason.is_some() {
                 break;
             }
-            if recovered_unknown_positions > 0
-                || (options.allow_unknown_recovery && exit_position_count > 0)
-            {
-                halt_reason = Some(if recovered_unknown_positions > 0 {
+            if recovered_unknown_positions > 0 {
+                halt_reason = Some(
                     "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
-                        .to_owned()
-                } else {
-                    "funding arb existing position recovery cycle completed; resident live stopped before new entries"
-                        .to_owned()
-                });
+                        .to_owned(),
+                );
+                break;
+            }
+            if options.exit_only {
+                halt_reason = Some(
+                    "funding arb exit-only cycle completed; resident live stopped before new entries"
+                        .to_owned(),
+                );
                 break;
             }
         }
@@ -36791,12 +37157,20 @@ fn write_funding_arb_position_state_from_dispatch(
     opened_at: UtcTimestamp,
 ) -> RuntimeResult<PathBuf> {
     let [first, second] = funding_planned_legs(dispatch_plan)?;
+    let notional_usd = first.notional_usd.to_string();
     let state = FundingArbPositionState {
         pair_id: row.pair_id.clone(),
         symbol: row.symbol.clone(),
         plan_hash,
-        notional_usd: first.notional_usd.to_string(),
+        notional_usd: notional_usd.clone(),
         entry_net_funding_bps: funding_arb_row_net_funding_bps(row),
+        target_funding_time_ms: funding_arb_row_target_funding_time_ms(row),
+        target_gross_funding_spread_bps: funding_arb_row_gross_funding_spread_bps(row),
+        target_expected_gross_funding_usd: funding_arb_target_expected_gross_funding_usd(
+            row,
+            &notional_usd,
+        )?,
+        target_expected_net_funding_usd: row.expected_funding_usd.clone(),
         opened_at: opened_at.to_string(),
         private_order_events_dir: private_order_events_dir.map(|path| path.display().to_string()),
         leg_a: funding_arb_position_leg_state(first)?,
@@ -36865,9 +37239,20 @@ fn write_funding_arb_position_state(
 }
 
 #[cfg(feature = "live-exec")]
+fn write_funding_arb_position_state_path(
+    path: &Path,
+    state: &FundingArbPositionState,
+) -> RuntimeResult<()> {
+    write_utf8(
+        path.to_path_buf(),
+        &format!("{}\n", funding_arb_position_state_json(state)),
+    )
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_position_state_json(state: &FundingArbPositionState) -> String {
     format!(
-        "{{\"entry_net_funding_bps\":{},\"leg_a_account_id\":{},\"leg_a_entry_limit_price\":{},\"leg_a_instrument_id\":{},\"leg_a_quantity\":{},\"leg_a_role\":{},\"leg_a_side\":{},\"leg_a_venue_family\":{},\"leg_a_venue_id\":{},\"leg_b_account_id\":{},\"leg_b_entry_limit_price\":{},\"leg_b_instrument_id\":{},\"leg_b_quantity\":{},\"leg_b_role\":{},\"leg_b_side\":{},\"leg_b_venue_family\":{},\"leg_b_venue_id\":{},\"notional_usd\":{},\"opened_at\":{},\"pair_id\":{},\"plan_hash\":{},\"private_order_events_dir\":{},\"schema_version\":\"1.0.0\",\"symbol\":{}}}",
+        "{{\"entry_net_funding_bps\":{},\"leg_a_account_id\":{},\"leg_a_entry_limit_price\":{},\"leg_a_instrument_id\":{},\"leg_a_quantity\":{},\"leg_a_role\":{},\"leg_a_side\":{},\"leg_a_venue_family\":{},\"leg_a_venue_id\":{},\"leg_b_account_id\":{},\"leg_b_entry_limit_price\":{},\"leg_b_instrument_id\":{},\"leg_b_quantity\":{},\"leg_b_role\":{},\"leg_b_side\":{},\"leg_b_venue_family\":{},\"leg_b_venue_id\":{},\"notional_usd\":{},\"opened_at\":{},\"pair_id\":{},\"plan_hash\":{},\"private_order_events_dir\":{},\"schema_version\":\"1.0.0\",\"symbol\":{},\"target_expected_gross_funding_usd\":{},\"target_expected_net_funding_usd\":{},\"target_funding_time_ms\":{},\"target_gross_funding_spread_bps\":{}}}",
         optional_json_string(state.entry_net_funding_bps.map(|value| value.to_string()).as_deref()),
         json_string(&state.leg_a.account_id),
         json_string(&state.leg_a.entry_limit_price),
@@ -36891,6 +37276,20 @@ fn funding_arb_position_state_json(state: &FundingArbPositionState) -> String {
         optional_json_string(state.plan_hash.as_deref()),
         optional_json_string(state.private_order_events_dir.as_deref()),
         json_string(&state.symbol),
+        optional_json_string(state.target_expected_gross_funding_usd.as_deref()),
+        optional_json_string(state.target_expected_net_funding_usd.as_deref()),
+        optional_json_string(
+            state
+                .target_funding_time_ms
+                .map(|value| value.to_string())
+                .as_deref(),
+        ),
+        optional_json_string(
+            state
+                .target_gross_funding_spread_bps
+                .map(|value| value.to_string())
+                .as_deref(),
+        ),
     )
 }
 
@@ -36909,6 +37308,33 @@ fn parse_funding_arb_position_state_json(input: &str) -> RuntimeResult<FundingAr
                 })
             })
             .transpose()?,
+        target_funding_time_ms: json_optional_string_field(input, "target_funding_time_ms")?
+            .map(|value| {
+                value.parse::<u64>().map_err(|error| RuntimeError::Module {
+                    module: "arb-runtime",
+                    message: format!("target_funding_time_ms is not a u64: {error}"),
+                })
+            })
+            .transpose()?,
+        target_gross_funding_spread_bps: json_optional_string_field(
+            input,
+            "target_gross_funding_spread_bps",
+        )?
+        .map(|value| {
+            value.parse::<i128>().map_err(|error| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("target_gross_funding_spread_bps is not an i128: {error}"),
+            })
+        })
+        .transpose()?,
+        target_expected_gross_funding_usd: json_optional_string_field(
+            input,
+            "target_expected_gross_funding_usd",
+        )?,
+        target_expected_net_funding_usd: json_optional_string_field(
+            input,
+            "target_expected_net_funding_usd",
+        )?,
         opened_at: json_string_field(input, "opened_at")?,
         private_order_events_dir: json_optional_string_field(input, "private_order_events_dir")?,
         leg_a: parse_funding_arb_position_leg_state_json(input, "leg_a")?,
@@ -37087,6 +37513,11 @@ fn validate_funding_arb_resident_live_options(
             message:
                 "funding-arb resident live poll interval must be at least 10 seconds in live mode"
                     .to_owned(),
+        });
+    }
+    if options.exit_only && !options.execute_live {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live --exit-only requires --execute-live".to_owned(),
         });
     }
     if options.funding_settlement_ledger_path.is_some()
@@ -37292,6 +37723,62 @@ fn select_funding_arb_resident_candidate<'a>(
 #[cfg(feature = "live-exec")]
 fn funding_arb_row_net_funding_bps(row: &FundingArbMarketRow) -> Option<i128> {
     row.net_funding_bps.as_deref()?.parse::<i128>().ok()
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_gross_funding_spread_bps(row: &FundingArbMarketRow) -> Option<i128> {
+    row.gross_funding_spread_bps
+        .as_deref()?
+        .parse::<i128>()
+        .ok()
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_target_funding_time_ms(row: &FundingArbMarketRow) -> Option<u64> {
+    let long_family = normalize_venue_family(row.long_venue_family.as_ref()?);
+    let short_family = normalize_venue_family(row.short_venue_family.as_ref()?);
+    let venue_a_family = normalize_venue_family(&row.venue_a_family);
+    let venue_b_family = normalize_venue_family(&row.venue_b_family);
+    let (long_time, short_time) = if long_family == venue_a_family && short_family == venue_b_family
+    {
+        (
+            Some(row.venue_a_next_funding_time_ms.as_str()),
+            Some(row.venue_b_next_funding_time_ms.as_str()),
+        )
+    } else if long_family == venue_b_family && short_family == venue_a_family {
+        (
+            Some(row.venue_b_next_funding_time_ms.as_str()),
+            Some(row.venue_a_next_funding_time_ms.as_str()),
+        )
+    } else {
+        return None;
+    };
+    let long_time = long_time?.trim().parse::<u64>().ok()?;
+    let short_time = short_time?.trim().parse::<u64>().ok()?;
+    (long_time == short_time).then_some(long_time)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_expected_gross_funding_usd_for_notional(
+    notional_usd: &str,
+    gross_funding_spread_bps: i128,
+) -> RuntimeResult<String> {
+    MonitorDecimal::parse("funding_arb.notional_usd", notional_usd)?
+        .checked_mul_i128(gross_funding_spread_bps, "expected gross funding USD")?
+        .checked_div_i128(10_000, "expected gross funding USD")
+        .map(|value| value.format_trimmed())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_target_expected_gross_funding_usd(
+    row: &FundingArbMarketRow,
+    notional_usd: &str,
+) -> RuntimeResult<Option<String>> {
+    funding_arb_row_gross_funding_spread_bps(row)
+        .map(|gross_bps| {
+            funding_arb_expected_gross_funding_usd_for_notional(notional_usd, gross_bps)
+        })
+        .transpose()
 }
 
 #[cfg(feature = "live-exec")]
@@ -37672,12 +38159,20 @@ fn write_funding_arb_unknown_recovery_position_state(
             module: "arb-runtime",
             message: format!("unknown position recovery snapshot updated_at is invalid: {error}"),
         })?;
+    let notional_usd = funding_arb_recovery_notional_usdt(options, unknown);
     let state = FundingArbPositionState {
         pair_id: unknown.pair_id.clone(),
         symbol: unknown.symbol.clone(),
         plan_hash: None,
-        notional_usd: funding_arb_recovery_notional_usdt(options, unknown),
+        notional_usd: notional_usd.clone(),
         entry_net_funding_bps: funding_arb_row_net_funding_bps(row),
+        target_funding_time_ms: funding_arb_row_target_funding_time_ms(row),
+        target_gross_funding_spread_bps: funding_arb_row_gross_funding_spread_bps(row),
+        target_expected_gross_funding_usd: funding_arb_target_expected_gross_funding_usd(
+            row,
+            &notional_usd,
+        )?,
+        target_expected_net_funding_usd: row.expected_funding_usd.clone(),
         opened_at: opened_at.to_string(),
         private_order_events_dir: options
             .private_order_events_dir
@@ -37785,12 +38280,6 @@ fn funding_arb_resident_entry_capacity(
         return Ok(ResidentEntryCapacity::Blocked(
             "unknown funding arb resident position exists; new entries are blocked".to_owned(),
         ));
-    }
-    let active_count = registry.active_positions().len();
-    if active_count > 0 {
-        return Ok(ResidentEntryCapacity::Blocked(format!(
-            "active funding arb position count is {active_count}; new entries wait for exit supervisor"
-        )));
     }
     Ok(ResidentEntryCapacity::Allowed)
 }
@@ -38122,6 +38611,7 @@ fn run_funding_arb_resident_exit_cycle(
         options,
         row,
         &spec,
+        &state,
         Some(&private.settlement_raw_snapshot_path),
     )?;
     let mut leg_a = funding_arb_exit_leg_snapshot(
@@ -38147,15 +38637,27 @@ fn run_funding_arb_resident_exit_cycle(
         .into_iter()
         .filter(|required| *required)
         .count();
+    let rollover_allowed = settlement.is_observed_complete()
+        && funding_arb_exit_rollover_allowed(row, &state, options.min_net_funding_bps);
     let decision = funding_arb_exit_cycle_decision(
-        position_status.is_matched(),
-        position_status.reason.as_deref(),
-        settlement.is_matched(),
-        close_required_count,
-        options.allow_unknown_recovery && state.plan_hash.is_none(),
+        FundingArbExitCycleDecisionInput {
+            private_position_matched: position_status.is_matched(),
+            private_position_reason: position_status.reason.as_deref(),
+            settlement_matched: settlement.is_matched(),
+            settlement_observed_complete: settlement.is_observed_complete(),
+            settlement_observed_mismatch: settlement.is_observed_mismatch(),
+            rollover_allowed,
+            close_required_count,
+            unknown_recovery_exit: options.allow_unknown_recovery && state.plan_hash.is_none(),
+        },
         &mut reason_codes,
         &mut blocking_reasons,
     );
+    if decision == "rollover" {
+        let mut rollover_state = state.clone();
+        funding_arb_rollover_position_state_target(&mut rollover_state, row)?;
+        write_funding_arb_position_state_path(position_state_path, &rollover_state)?;
+    }
 
     if matches!(decision.as_str(), "close" | "emergency_de_risk") {
         if !options.acknowledge_funding_arb_live_orders {
@@ -38256,37 +38758,131 @@ fn funding_arb_exit_emergency_de_risk_slippage_bps(configured_slippage_bps: i128
 }
 
 #[cfg(feature = "live-exec")]
-fn funding_arb_exit_cycle_decision(
+fn funding_arb_exit_rollover_allowed(
+    row: &FundingArbMarketRow,
+    state: &FundingArbPositionState,
+    min_net_funding_bps: i128,
+) -> bool {
+    row.source_status == "complete"
+        && funding_arb_position_direction_matches_row(row, state)
+        && funding_arb_row_target_funding_time_ms(row).is_some()
+        && funding_arb_row_net_funding_bps(row).is_some_and(|net| net >= min_net_funding_bps)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_direction_matches_row(
+    row: &FundingArbMarketRow,
+    state: &FundingArbPositionState,
+) -> bool {
+    let Some(row_long) = row
+        .long_venue_family
+        .as_ref()
+        .map(|value| normalize_venue_family(value))
+    else {
+        return false;
+    };
+    let Some(row_short) = row
+        .short_venue_family
+        .as_ref()
+        .map(|value| normalize_venue_family(value))
+    else {
+        return false;
+    };
+    let Some(position_long) = funding_arb_position_leg_family_by_direction(state, "long") else {
+        return false;
+    };
+    let Some(position_short) = funding_arb_position_leg_family_by_direction(state, "short") else {
+        return false;
+    };
+    row_long == position_long && row_short == position_short
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_leg_family_by_direction(
+    state: &FundingArbPositionState,
+    direction: &str,
+) -> Option<String> {
+    [&state.leg_a, &state.leg_b]
+        .into_iter()
+        .find(|leg| {
+            let role = leg.role.to_ascii_lowercase();
+            role.contains(direction)
+                || (direction == "long" && leg.side == OrderSide::Buy)
+                || (direction == "short" && leg.side == OrderSide::Sell)
+        })
+        .map(|leg| normalize_venue_family(&leg.venue_family))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_rollover_position_state_target(
+    state: &mut FundingArbPositionState,
+    row: &FundingArbMarketRow,
+) -> RuntimeResult<()> {
+    state.target_funding_time_ms = funding_arb_row_target_funding_time_ms(row);
+    state.target_gross_funding_spread_bps = funding_arb_row_gross_funding_spread_bps(row);
+    state.target_expected_gross_funding_usd =
+        funding_arb_target_expected_gross_funding_usd(row, &state.notional_usd)?;
+    state.target_expected_net_funding_usd = row.expected_funding_usd.clone();
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy)]
+struct FundingArbExitCycleDecisionInput<'a> {
     private_position_matched: bool,
-    private_position_reason: Option<&str>,
+    private_position_reason: Option<&'a str>,
     settlement_matched: bool,
+    settlement_observed_complete: bool,
+    settlement_observed_mismatch: bool,
+    rollover_allowed: bool,
     close_required_count: usize,
     unknown_recovery_exit: bool,
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_cycle_decision(
+    input: FundingArbExitCycleDecisionInput<'_>,
     reason_codes: &mut Vec<String>,
     blocking_reasons: &mut Vec<String>,
 ) -> String {
-    if !private_position_matched {
+    if !input.private_position_matched {
         reason_codes.push("private_position_unknown".to_owned());
         blocking_reasons.push(
-            private_position_reason
+            input
+                .private_position_reason
                 .unwrap_or("funding arb exit private position snapshot is not matched")
                 .to_owned(),
         );
         return "blocked".to_owned();
     }
-    if close_required_count == 0 {
+    if input.close_required_count == 0 {
         reason_codes.push("already_flat".to_owned());
         return "closed".to_owned();
     }
-    if close_required_count != 2 {
+    if input.close_required_count != 2 {
         reason_codes.push("position_imbalance".to_owned());
         return "emergency_de_risk".to_owned();
     }
-    if settlement_matched {
+    if input.settlement_observed_mismatch {
+        reason_codes.push("funding_settlement_observed_mismatch".to_owned());
+    }
+    if input.settlement_observed_complete {
+        if input.rollover_allowed {
+            reason_codes.push("rollover_next_funding_still_profitable".to_owned());
+            return "rollover".to_owned();
+        }
+        if input.settlement_matched {
+            reason_codes.push("funding_settlement_matched".to_owned());
+        } else {
+            reason_codes.push("funding_settlement_observed_complete".to_owned());
+        }
+        return "close".to_owned();
+    }
+    if input.settlement_matched {
         reason_codes.push("funding_settlement_matched".to_owned());
         return "close".to_owned();
     }
-    if unknown_recovery_exit {
+    if input.unknown_recovery_exit {
         reason_codes.push("unknown_recovery_settlement_bypass".to_owned());
         return "emergency_de_risk".to_owned();
     }
@@ -38333,18 +38929,61 @@ fn funding_arb_resident_settlement_reconciliation(
     options: &FundingArbResidentLiveOptions,
     row: &FundingArbMarketRow,
     spec: &CrossExchangeFundingArbPipelineSpec,
+    state: &FundingArbPositionState,
     fallback_raw_snapshot_path: Option<&Path>,
 ) -> RuntimeResult<FundingSettlementReconciliationSummary> {
+    let scope = funding_arb_position_settlement_reconciliation_scope(state)?;
     if let Some(path) = &options.funding_settlement_ledger_path {
-        return reconcile_funding_settlement_ledger_json(row, spec, &read_utf8(path)?);
+        let snapshot = parse_funding_settlement_ledger_snapshot_json(&read_utf8(path)?)?;
+        return reconcile_funding_settlement_ledger_snapshot(
+            row,
+            spec,
+            &snapshot,
+            "funding settlement ledger",
+            scope,
+        );
     }
     if let Some(path) = &options.funding_settlement_raw_snapshot_path {
-        return reconcile_funding_settlement_raw_snapshot_json(row, spec, &read_utf8(path)?);
+        return reconcile_funding_settlement_raw_snapshot_json_with_scope(
+            row,
+            spec,
+            &read_utf8(path)?,
+            scope,
+        );
     }
     if let Some(path) = fallback_raw_snapshot_path {
-        return reconcile_funding_settlement_raw_snapshot_json(row, spec, &read_utf8(path)?);
+        return reconcile_funding_settlement_raw_snapshot_json_with_scope(
+            row,
+            spec,
+            &read_utf8(path)?,
+            scope,
+        );
     }
     Ok(FundingSettlementReconciliationSummary::not_provided())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_settlement_reconciliation_scope(
+    state: &FundingArbPositionState,
+) -> RuntimeResult<FundingSettlementReconciliationScope<'_>> {
+    let opened_at =
+        UtcTimestamp::from_str(&state.opened_at).map_err(|error| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("funding arb position opened_at is invalid: {error}"),
+        })?;
+    let opened_at_ms = u64::try_from(runtime_timestamp_millis(opened_at)?).map_err(|error| {
+        RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("funding arb position opened_at milliseconds are invalid: {error}"),
+        }
+    })?;
+    Ok(FundingSettlementReconciliationScope {
+        target_timestamp_bucket_ms: state
+            .target_funding_time_ms
+            .map(funding_settlement_timestamp_bucket_ms),
+        minimum_timestamp_ms: Some(opened_at_ms),
+        expected_funding_usd_override: state.target_expected_gross_funding_usd.as_deref(),
+    })
 }
 
 #[cfg(feature = "live-exec")]
@@ -39437,12 +40076,13 @@ fn write_funding_arb_resident_live_config(
     options: &FundingArbResidentLiveOptions,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_live_entries\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
+        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_live_entries\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
         options.allow_unknown_recovery,
         json_string(&options.aster_signer_cmd_env),
         optional_json_string(options.aster_user.as_deref()),
         json_string(&options.config_path.display().to_string()),
         options.execute_live,
+        options.exit_only,
         optional_json_string(options.funding_settlement_ledger_path.as_ref().map(|path| path.display().to_string()).as_deref()),
         optional_json_string(options.funding_settlement_raw_snapshot_path.as_ref().map(|path| path.display().to_string()).as_deref()),
         options.hyperliquid_asset_ids.len(),
@@ -44547,6 +45187,7 @@ fn fetch_bybit_unified_private_account_snapshot(
     scope: &str,
 ) -> RuntimeResult<BinancePrivateAccountSnapshot> {
     let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
+    let recv_window_ms = bybit_private_readonly_recv_window_ms()?;
     let signed = signer.sign_bybit_hmac(
         BybitHmacSigningInput::new(
             SigningRequestId::new(format!("signing-request/bybit-live/account/{scope}"))?,
@@ -44554,7 +45195,7 @@ fn fetch_bybit_unified_private_account_snapshot(
             SigningPurpose::QueryAccount,
             VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?,
             AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
-            live::DEFAULT_BYBIT_RECV_WINDOW_MS,
+            recv_window_ms,
             BybitSigningPayloadKind::QueryString,
             "accountType=UNIFIED",
         )?,
@@ -51592,7 +52233,7 @@ fn legacy_help_text() -> String {
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
         "  funding-arb-guarded-live-canary-once --snapshot file --pair-id id [dry-run snapshot options] [--private-order-events-dir dir] [--aster-user 0x...] [--aster-signer 0x...] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--execute-live --i-understand-funding-arb-live-orders]",
         "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the Aster USDT-settled and Hyperliquid USDC-settled perp legs; Hyperliquid asset id auto-resolves unless overridden",
-        "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders] [--allow-unknown-recovery]",
+        "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders] [--allow-unknown-recovery] [--exit-only]",
         "                                    Resident funding-arb scanner: refresh private read-only snapshots, run guarded entry cycles, register live positions, and supervise reduce-only exit/de-risk; Aster defaults to USDT and Hyperliquid defaults to USDC",
     ]
     .join("\n")
@@ -55944,6 +56585,7 @@ fn parse_funding_arb_resident_live_args(
     let mut execute_live = false;
     let mut acknowledge_funding_arb_live_orders = false;
     let mut allow_unknown_recovery = false;
+    let mut exit_only = false;
     let mut hyperliquid_user = None;
     let mut hyperliquid_source =
         std::env::var("HYPERLIQUID_SOURCE").unwrap_or_else(|_| "a".to_owned());
@@ -56152,6 +56794,7 @@ fn parse_funding_arb_resident_live_args(
             "--dry-run" => execute_live = false,
             "--i-understand-funding-arb-live-orders" => acknowledge_funding_arb_live_orders = true,
             "--allow-unknown-recovery" => allow_unknown_recovery = true,
+            "--exit-only" => exit_only = true,
             "--hyperliquid-user" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -56253,6 +56896,7 @@ fn parse_funding_arb_resident_live_args(
         execute_live,
         acknowledge_funding_arb_live_orders,
         allow_unknown_recovery,
+        exit_only,
         hyperliquid_user,
         hyperliquid_source,
         hyperliquid_vault_address,
@@ -59926,58 +60570,6 @@ mod tests {
     }
 
     #[test]
-    fn funding_arb_restricted_product_preflight_blocks_by_default_and_accepts_evidence() {
-        let observed_at = UtcTimestamp::from_str("2026-05-21T14:03:12Z").expect("time");
-        let mut strategy_config = CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt();
-        strategy_config.symbol.symbol = "PAYPUSDT".to_owned();
-        strategy_config.venues.venue_a =
-            funding_arb_leg_config("binance", "PAYPUSDT").expect("binance leg");
-        strategy_config.venues.venue_b =
-            funding_arb_leg_config("aster", "PAYPUSDT").expect("aster leg");
-        let mut venue_capabilities =
-            arb_venue_capability_descriptors("binance").expect("binance capabilities");
-        venue_capabilities
-            .extend(arb_venue_capability_descriptors("aster").expect("aster capabilities"));
-        let spec = CrossExchangeFundingArbPipelineSpec::new(
-            strategy_config,
-            venue_capabilities,
-            "state:funding-arb-binance-aster-paypusdt-readonly",
-            "hash:funding-arb-binance-aster-paypusdt-readonly",
-        )
-        .expect("funding spec");
-        let product_tags = funding_arb_product_tags_for_spec(&spec);
-
-        let blocked = funding_arb_restricted_product_preflight_readiness_check_with_path(
-            &spec,
-            observed_at,
-            &product_tags,
-            None,
-        );
-        assert!(blocked.blocking);
-        assert_eq!(
-            blocked.reason_code.as_deref(),
-            Some("RESTRICTED_PRODUCT_PREFLIGHT_REQUIRED")
-        );
-
-        let root = RuntimeTempDir::new().expect("temp dir");
-        let preflight_path = root.path().join("restricted-product-preflight.json");
-        write_utf8(
-            preflight_path.clone(),
-            r#"{"schema_version":"1.0.0","status":"confirmed","symbol":"PAYPUSDT","venues":["binance","aster"],"product_tags":["tradfi_perp","stock_perp"],"account_enabled":true,"agreement_accepted":true,"jurisdiction_allowed":true,"symbol_tradable":true,"checked_at":"2026-05-21T14:03:00Z","expires_at":"2026-05-21T14:08:00Z"}"#,
-        )
-        .expect("write preflight");
-
-        let passed = funding_arb_restricted_product_preflight_readiness_check_with_path(
-            &spec,
-            observed_at,
-            &product_tags,
-            Some(&preflight_path),
-        );
-        assert!(!passed.blocking);
-        assert_eq!(passed.status, "Passed");
-    }
-
-    #[test]
     fn funding_arb_monitor_rejects_mark_index_divergence() {
         let binance = funding_arb_test_venue_snapshot(
             "binance",
@@ -60396,7 +60988,7 @@ mod tests {
     #[test]
     fn funding_settlement_raw_snapshot_normalizes_exchange_specific_funding_entries() {
         let snapshot = parse_funding_settlement_raw_snapshot_json(
-            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"99.00","funding":"0.30"}]}}},{"venue_family":"okx","account_id":"acct:okx-funding-arb-readonly","payload":{"data":[{"instId":"BTC-USDT-SWAP","type":"8","balChg":"-0.01"}]}},{"venue_family":"hyperliquid","account_id":"acct:hyperliquid-funding-arb-readonly","payload":[{"time":1770000000000,"delta":{"type":"funding","coin":"BTC","usdc":"0.24"}}]}]}"#,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"99.00","funding":"0.30","transactionTime":"1770000001000"}]}}},{"venue_family":"okx","account_id":"acct:okx-funding-arb-readonly","payload":{"data":[{"instId":"BTC-USDT-SWAP","type":"8","balChg":"-0.01","ts":"1770000002000"}]}},{"venue_family":"hyperliquid","account_id":"acct:hyperliquid-funding-arb-readonly","payload":[{"time":1770000000000,"delta":{"type":"funding","coin":"BTC","usdc":"0.24"}}]}]}"#,
         )
         .expect("raw snapshot");
 
@@ -60406,10 +60998,193 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].symbol, "BTCUSDT");
         assert_eq!(entries[0].amount_usd, "0.30");
+        assert_eq!(entries[0].timestamp_ms, Some(1_770_000_001_000));
         assert_eq!(entries[1].symbol, "BTCUSDT");
         assert_eq!(entries[1].amount_usd, "-0.01");
+        assert_eq!(entries[1].timestamp_ms, Some(1_770_000_002_000));
         assert_eq!(entries[2].symbol, "BTCUSDT");
         assert_eq!(entries[2].amount_usd, "0.24");
+        assert_eq!(entries[2].timestamp_ms, Some(1_770_000_000_000));
+    }
+
+    #[test]
+    fn funding_settlement_raw_snapshot_decodes_quoted_exchange_payloads() {
+        let binance_payload = json_string(
+            r#"[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01","time":1770000004000}]"#,
+        );
+        let bybit_payload = json_string(
+            r#"{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30","transactionTime":"1770000000000"}]}}"#,
+        );
+        let snapshot_json = format!(
+            r#"{{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":{binance_payload}}},{{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{bybit_payload}}}]}}"#
+        );
+        let snapshot =
+            parse_funding_settlement_raw_snapshot_json(&snapshot_json).expect("raw snapshot");
+
+        let entries =
+            funding_settlement_entries_from_raw_snapshot(&snapshot).expect("settlement entries");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].symbol, "BTCUSDT");
+        assert_eq!(entries[0].amount_usd, "-0.01");
+        assert_eq!(entries[0].timestamp_ms, Some(1_770_000_004_000));
+        assert_eq!(entries[1].symbol, "BTCUSDT");
+        assert_eq!(entries[1].amount_usd, "0.30");
+        assert_eq!(entries[1].timestamp_ms, Some(1_770_000_000_000));
+    }
+
+    #[test]
+    fn funding_settlement_reconciliation_uses_latest_complete_timestamp_bucket() {
+        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("unused.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("funding arb spec");
+        let summary = reconcile_funding_settlement_raw_snapshot_json(
+            &row,
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"1.00","time":1779523204000},{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01","time":1779552004000}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"1.00","transactionTime":"1779523200000"},{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30","transactionTime":"1779552000000"}]}}}]}"#,
+        )
+        .expect("funding settlement reconciliation");
+
+        assert_eq!(summary.status, "Matched");
+        assert_eq!(summary.actual_funding_usd.as_deref(), Some("0.29"));
+        assert_eq!(summary.checked_entry_count, 2);
+    }
+
+    #[test]
+    fn funding_settlement_reconciliation_can_scope_to_target_bucket() {
+        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("unused.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("funding arb spec");
+        let summary = reconcile_funding_settlement_raw_snapshot_json_with_scope(
+            &row,
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01","time":1779552004000},{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"1.00","time":1779580804000}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30","transactionTime":"1779552000000"},{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"1.00","transactionTime":"1779580800000"}]}}}]}"#,
+            FundingSettlementReconciliationScope {
+                target_timestamp_bucket_ms: Some(1_779_552_000_000),
+                minimum_timestamp_ms: None,
+                expected_funding_usd_override: Some("0.29"),
+            },
+        )
+        .expect("funding settlement reconciliation");
+
+        assert_eq!(summary.status, "Matched");
+        assert_eq!(summary.actual_funding_usd.as_deref(), Some("0.29"));
+        assert_eq!(summary.checked_entry_count, 2);
+    }
+
+    #[test]
+    fn funding_settlement_reconciliation_ignores_pre_open_entries() {
+        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("unused.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("funding arb spec");
+        let summary = reconcile_funding_settlement_raw_snapshot_json_with_scope(
+            &row,
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01","time":1779523204000}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30","transactionTime":"1779523200000"}]}}}]}"#,
+            FundingSettlementReconciliationScope {
+                target_timestamp_bucket_ms: None,
+                minimum_timestamp_ms: Some(1_779_552_000_000),
+                expected_funding_usd_override: None,
+            },
+        )
+        .expect("funding settlement reconciliation");
+
+        assert_eq!(summary.status, "Missing");
+        assert_eq!(summary.checked_entry_count, 0);
+        assert_eq!(summary.actual_funding_usd, None);
+    }
+
+    #[test]
+    fn funding_settlement_reconciliation_reports_missing_latest_bucket_account() {
+        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("unused.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("funding arb spec");
+        let summary = reconcile_funding_settlement_raw_snapshot_json(
+            &row,
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01","time":1779552004000}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30","transactionTime":"1779523200000"}]}}}]}"#,
+        )
+        .expect("funding settlement reconciliation");
+
+        assert_eq!(summary.status, "Missing");
+        assert_eq!(summary.actual_funding_usd.as_deref(), Some("-0.01"));
+        assert_eq!(summary.checked_entry_count, 1);
+        assert!(summary.reason.as_deref().is_some_and(|reason| {
+            reason.contains("latest settlement bucket is missing active funding-arb accounts")
+                && reason.contains("acct:bybit-funding-arb-readonly")
+        }));
     }
 
     #[test]
@@ -61524,6 +62299,7 @@ mod tests {
             "--execute-live".to_owned(),
             "--i-understand-funding-arb-live-orders".to_owned(),
             "--allow-unknown-recovery".to_owned(),
+            "--exit-only".to_owned(),
             "--hyperliquid-user".to_owned(),
             "0x0000000000000000000000000000000000000000".to_owned(),
             "--hyperliquid-source".to_owned(),
@@ -61564,6 +62340,7 @@ mod tests {
         assert!(options.execute_live);
         assert!(options.acknowledge_funding_arb_live_orders);
         assert!(options.allow_unknown_recovery);
+        assert!(options.exit_only);
         assert_eq!(options.hyperliquid_source, "b");
         assert_eq!(options.hyperliquid_asset_ids.get("BTCUSDT"), Some(&0));
         assert_eq!(options.aster_signer_cmd_env, "ASTER_RESIDENT_SIGNER_CMD");
@@ -61578,6 +62355,10 @@ mod tests {
             plan_hash: Some("hash:funding-arb-test".to_owned()),
             notional_usd: "10.00".to_owned(),
             entry_net_funding_bps: Some(12),
+            target_funding_time_ms: Some(1_770_000_000_000),
+            target_gross_funding_spread_bps: Some(27),
+            target_expected_gross_funding_usd: Some("0.027".to_owned()),
+            target_expected_net_funding_usd: Some("0.012".to_owned()),
             opened_at: "2026-05-13T00:00:00Z".to_owned(),
             private_order_events_dir: Some("target/private-order-events".to_owned()),
             leg_a: FundingArbPositionLegState {
@@ -61612,7 +62393,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
-    fn funding_arb_resident_registry_blocks_open_and_unknown_positions() {
+    fn funding_arb_resident_registry_allows_open_positions_and_blocks_unknown_positions() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let registry_path = root.path().join("funding_arb_resident_positions.jsonl");
         let options = FundingArbResidentLiveOptions {
@@ -61636,6 +62417,7 @@ mod tests {
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
+            exit_only: false,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -61654,10 +62436,7 @@ mod tests {
 
         let active_capacity =
             funding_arb_resident_entry_capacity(&options, root.path()).expect("capacity");
-        assert!(matches!(
-            active_capacity,
-            ResidentEntryCapacity::Blocked(reason) if reason.contains("active funding arb position count")
-        ));
+        assert!(matches!(active_capacity, ResidentEntryCapacity::Allowed));
 
         write_utf8(
             registry_path.clone(),
@@ -61755,6 +62534,7 @@ mod tests {
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
+            exit_only: false,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -61829,6 +62609,7 @@ mod tests {
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: true,
+            exit_only: false,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -61898,11 +62679,16 @@ mod tests {
         let mut blocking_reasons = Vec::new();
 
         let decision = funding_arb_exit_cycle_decision(
-            true,
-            None,
-            false,
-            2,
-            true,
+            FundingArbExitCycleDecisionInput {
+                private_position_matched: true,
+                private_position_reason: None,
+                settlement_matched: false,
+                settlement_observed_complete: false,
+                settlement_observed_mismatch: false,
+                rollover_allowed: false,
+                close_required_count: 2,
+                unknown_recovery_exit: true,
+            },
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -61917,11 +62703,16 @@ mod tests {
         reason_codes.clear();
         blocking_reasons.clear();
         let normal_decision = funding_arb_exit_cycle_decision(
-            true,
-            None,
-            false,
-            2,
-            false,
+            FundingArbExitCycleDecisionInput {
+                private_position_matched: true,
+                private_position_reason: None,
+                settlement_matched: false,
+                settlement_observed_complete: false,
+                settlement_observed_mismatch: false,
+                rollover_allowed: false,
+                close_required_count: 2,
+                unknown_recovery_exit: false,
+            },
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -61930,6 +62721,70 @@ mod tests {
         assert_eq!(
             reason_codes,
             vec!["waiting_for_funding_settlement".to_owned()]
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_complete_settlement_mismatch_allows_close() {
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        let decision = funding_arb_exit_cycle_decision(
+            FundingArbExitCycleDecisionInput {
+                private_position_matched: true,
+                private_position_reason: None,
+                settlement_matched: false,
+                settlement_observed_complete: true,
+                settlement_observed_mismatch: true,
+                rollover_allowed: false,
+                close_required_count: 2,
+                unknown_recovery_exit: false,
+            },
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert_eq!(decision, "close");
+        assert_eq!(
+            reason_codes,
+            vec![
+                "funding_settlement_observed_mismatch".to_owned(),
+                "funding_settlement_observed_complete".to_owned()
+            ]
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_complete_settlement_rolls_over_when_next_cycle_profitable() {
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        let decision = funding_arb_exit_cycle_decision(
+            FundingArbExitCycleDecisionInput {
+                private_position_matched: true,
+                private_position_reason: None,
+                settlement_matched: false,
+                settlement_observed_complete: true,
+                settlement_observed_mismatch: true,
+                rollover_allowed: true,
+                close_required_count: 2,
+                unknown_recovery_exit: false,
+            },
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert_eq!(decision, "rollover");
+        assert_eq!(
+            reason_codes,
+            vec![
+                "funding_settlement_observed_mismatch".to_owned(),
+                "rollover_next_funding_still_profitable".to_owned()
+            ]
         );
         assert!(blocking_reasons.is_empty());
     }
@@ -63956,6 +64811,59 @@ mod tests {
         assert!(resident_entry_cycle_error_can_retry(&okx_rate_limit));
         assert!(!resident_entry_cycle_error_can_retry(&private_http));
         assert!(!resident_entry_cycle_error_can_retry(&unsafe_config));
+        assert_eq!(
+            resident_retryable_error_class(&market_data),
+            "wss_monitor_unavailable"
+        );
+        assert_eq!(
+            resident_retryable_error_class(&public_rest),
+            "public_rest_unavailable"
+        );
+        assert_eq!(
+            resident_retryable_error_class(&private_http),
+            "non_retryable"
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn resident_retryable_error_backoff_caps() {
+        assert_eq!(
+            resident_retryable_error_backoff(1),
+            Duration::from_millis(RESIDENT_RETRYABLE_ERROR_BACKOFF_BASE_MS)
+        );
+        assert_eq!(
+            resident_retryable_error_backoff(64),
+            Duration::from_millis(RESIDENT_RETRYABLE_ERROR_BACKOFF_MAX_MS)
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn append_jsonl_rotation_moves_current_file_and_keeps_limit() {
+        let temp = RuntimeTempDir::new().expect("tempdir");
+        let path = temp.path().join("resident_live_events.jsonl");
+        let first = rotated_append_jsonl_path(&path, 1);
+        let second = rotated_append_jsonl_path(&path, 2);
+
+        write_utf8(path.clone(), "line-one\n").expect("write current");
+        write_utf8(first.clone(), "line-old\n").expect("write first");
+        write_utf8(second.clone(), "line-drop\n").expect("write second");
+
+        rotate_append_jsonl_if_needed_with_limits(&path, 4, 2).expect("rotate");
+
+        assert!(!path.exists());
+        assert_eq!(read_utf8(&first).expect("read first rotated"), "line-one\n");
+        assert_eq!(
+            read_utf8(&second).expect("read second rotated"),
+            "line-old\n"
+        );
+
+        append_line_to_jsonl(path.clone(), "{\"event\":\"new\"}").expect("append new current");
+        assert_eq!(
+            read_utf8(&path).expect("read current"),
+            "{\"event\":\"new\"}\n"
+        );
     }
 
     #[cfg(all(feature = "live-exec", unix))]
@@ -64050,7 +64958,10 @@ mod tests {
                 BINANCE_PORTFOLIO_MARGIN_BASE_URL,
                 "/papi/v1/account",
             ),
-            BinancePrivateTimestampSource::SystemTime
+            BinancePrivateTimestampSource::ServerTime(BinanceServerTimeSource {
+                base_url: BINANCE_USDM_FUTURES_BASE_URL,
+                time_endpoint: "/fapi/v1/time",
+            })
         );
         assert_eq!(
             binance_private_timestamp_source_for_private_endpoint(
@@ -64072,6 +64983,20 @@ mod tests {
         };
 
         assert!(binance_recv_window_error_can_retry(&error));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bybit_private_readonly_recv_window_is_configurable_with_30000_default() {
+        assert_eq!(BYBIT_PRIVATE_READONLY_RECV_WINDOW_MS, 30_000);
+        assert_eq!(
+            parse_private_readonly_recv_window_ms(BYBIT_PRIVATE_RECV_WINDOW_ENV, "30000")
+                .expect("recvWindow"),
+            30_000
+        );
+        assert!(
+            parse_private_readonly_recv_window_ms(BYBIT_PRIVATE_RECV_WINDOW_ENV, "60001").is_err()
+        );
     }
 
     #[cfg(feature = "live-exec")]
@@ -64128,6 +65053,10 @@ mod tests {
             plan_hash: None,
             notional_usd: "90.00".to_owned(),
             entry_net_funding_bps: Some(20),
+            target_funding_time_ms: Some(1_779_552_000_000),
+            target_gross_funding_spread_bps: Some(35),
+            target_expected_gross_funding_usd: Some("0.315".to_owned()),
+            target_expected_net_funding_usd: Some("0.18".to_owned()),
             opened_at: "2026-05-23T11:27:10Z".to_owned(),
             private_order_events_dir: None,
             leg_a: FundingArbPositionLegState {

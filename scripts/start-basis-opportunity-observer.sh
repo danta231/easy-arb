@@ -77,7 +77,11 @@ usage() {
   BASIS_OBSERVER_TARGET_WSS_ROOT=target/arb-opportunity-observer/target-wss # 动态 target WSS 的日志和状态目录。
   BASIS_OBSERVER_TARGET_WSS_BASE_PORT=8830 # 动态 target WSS 从该本地端口开始分配。
   BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS=60 # 动态 target WSS 等待真实 WSS quote 就绪的最长秒数。
-  BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS=2 # 动态 target WSS 断线重连间隔秒数。
+  BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS=2 # 动态 target WSS 断线重连基础间隔秒数；runtime 会对连续失败做指数退避。
+  ARB_RUNTIME_OKX_FUNDING_RATE_CACHE_TTL_SECS=60 # OKX funding-rate 全市场逐合约请求缓存秒数；0 表示每轮都重新请求。
+  ARB_RUNTIME_BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_SECS=300 # Bybit linear instruments-info 元数据缓存秒数；0 表示每轮都重新请求。
+  ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
+  ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1 # auto-once 模式是否执行候选验证。
   BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60 # auto-once 两次触发之间的冷却秒数。
   BASIS_OBSERVER_EXECUTE_LIVE=0 # 是否允许正式实盘下单；1 表示允许。
@@ -87,6 +91,14 @@ usage() {
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1 # HTTP 重试间隔秒数。
   BASIS_OBSERVER_CURL_TIMEOUT_SECS=10 # 单次 HTTP 请求超时秒数。
   BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT=12 # health-events.jsonl 中保留的 blocking_path 前 N 条，取值 1-100，避免大快照触发系统参数长度限制。
+  BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS=60 # 成功 poll_ok 健康事件采样间隔；0 表示每轮都写入。
+  BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES=200 # 常驻 runner 健康摘要检查最近 N 条事件。
+  BASIS_OBSERVER_LOG_ROTATE_BYTES=134217728 # observer JSONL/log 单文件轮转阈值；0 表示禁用轮转。
+  BASIS_OBSERVER_LOG_ROTATE_KEEP=4 # observer JSONL/log 保留的轮转文件数量；0 表示禁用轮转。
+  ARB_RUNTIME_BINANCE_RECV_WINDOW_MS=30000 # Binance 私有只读请求默认 recvWindow，单位毫秒，允许 1-60000。
+  ARB_RUNTIME_BYBIT_RECV_WINDOW_MS=30000 # Bybit 私有只读请求默认 recvWindow，单位毫秒，允许 1-60000。
+  ARB_RUNTIME_JSONL_ROTATE_BYTES=134217728 # Rust 常驻 runner JSONL 单文件轮转阈值；0 表示禁用轮转。
+  ARB_RUNTIME_JSONL_ROTATE_KEEP=4 # Rust 常驻 runner JSONL 保留的轮转文件数量；0 表示禁用轮转。
   BASIS_OBSERVER_STARTUP_CHECK=1 # 启动后是否等待 monitor 健康检查通过。
   BASIS_OBSERVER_STARTUP_WAIT_SECS=180 # 启动健康检查最长等待秒数。
   BASIS_OBSERVER_STOP_DRAIN_SECS=15 # 停止时等待子进程自然收尾的秒数。
@@ -143,6 +155,28 @@ die() {
 validate_blocking_path_event_limit() {
   local value="$1"
   [[ "${value}" =~ ^([1-9]|[1-9][0-9]|100)$ ]] || die "BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT must be an integer between 1 and 100"
+}
+
+validate_non_negative_integer_env() {
+  local name="$1"
+  local value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${name} must be a non-negative integer"
+}
+
+validate_log_rotation_settings() {
+  validate_non_negative_integer_env "BASIS_OBSERVER_LOG_ROTATE_BYTES" "${LOG_ROTATE_BYTES}"
+  validate_non_negative_integer_env "BASIS_OBSERVER_LOG_ROTATE_KEEP" "${LOG_ROTATE_KEEP}"
+  if (( LOG_ROTATE_KEEP > 32 )); then
+    die "BASIS_OBSERVER_LOG_ROTATE_KEEP must be between 0 and 32"
+  fi
+}
+
+validate_health_sampling_settings() {
+  validate_non_negative_integer_env "BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS" "${HEALTH_EVENT_SAMPLE_SECS}"
+  validate_non_negative_integer_env "BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES" "${RESIDENT_HEALTH_TAIL_LINES}"
+  if (( RESIDENT_HEALTH_TAIL_LINES > 5000 )); then
+    die "BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES must be between 0 and 5000"
+  fi
 }
 
 local_log_timestamp() {
@@ -450,6 +484,7 @@ append_basis_resident_wss_args() {
 append_json_line() {
   local file="$1"
   shift
+  rotate_append_file_if_needed "${file}"
   jq -cn "$@" >> "${file}"
 }
 
@@ -457,7 +492,95 @@ append_json_line_from_body() {
   local file="$1"
   local body="$2"
   shift 2
+  rotate_append_file_if_needed "${file}"
   printf '%s\n' "${body}" | jq -c --argjson blocking_path_limit "${BLOCKING_PATH_EVENT_LIMIT:-12}" "$@" >> "${file}"
+}
+
+append_json_body_line() {
+  local file="$1"
+  local body="$2"
+  shift 2
+  rotate_append_file_if_needed "${file}"
+  printf '%s\n' "${body}" | jq -c "$@" >> "${file}"
+}
+
+append_jq_file_line() {
+  local file="$1"
+  local source_file="$2"
+  shift 2
+  rotate_append_file_if_needed "${file}"
+  jq -c "$@" "${source_file}" >> "${file}"
+}
+
+append_text_line() {
+  local file="$1"
+  local line="$2"
+  rotate_append_file_if_needed "${file}"
+  printf '%s\n' "${line}" >> "${file}"
+}
+
+rotated_append_path() {
+  local file="$1"
+  local index="$2"
+  printf '%s.%s' "${file}" "${index}"
+}
+
+rotate_append_file_if_needed() {
+  local file="$1"
+  local max_bytes="${LOG_ROTATE_BYTES:-${BASIS_OBSERVER_LOG_ROTATE_BYTES:-134217728}}"
+  local keep="${LOG_ROTATE_KEEP:-${BASIS_OBSERVER_LOG_ROTATE_KEEP:-4}}"
+  local size
+  local index
+  local from
+  local to
+
+  [[ "${max_bytes}" =~ ^[0-9]+$ ]] || return 0
+  [[ "${keep}" =~ ^[0-9]+$ ]] || return 0
+  (( max_bytes > 0 && keep > 0 )) || return 0
+  [[ -f "${file}" ]] || return 0
+  size="$(wc -c < "${file}" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "${size}" =~ ^[0-9]+$ ]] || return 0
+  (( size >= max_bytes )) || return 0
+
+  rm -f "$(rotated_append_path "${file}" "${keep}")"
+  for (( index = keep - 1; index >= 1; index-- )); do
+    from="$(rotated_append_path "${file}" "${index}")"
+    to="$(rotated_append_path "${file}" "$((index + 1))")"
+    [[ -e "${from}" ]] && mv "${from}" "${to}"
+  done
+  mv "${file}" "$(rotated_append_path "${file}" 1)"
+}
+
+health_sample_state_path() {
+  local source="$1"
+  local slug
+  slug="$(jq -rn --arg source "${source}" '$source | @uri')"
+  printf '%s/health-sample-%s.state' "${STATE_DIR}" "${slug}"
+}
+
+should_emit_health_event() {
+  local source="$1"
+  local key="$2"
+  local sample_secs="${HEALTH_EVENT_SAMPLE_SECS:-${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-60}}"
+  local now
+  local state_path
+  local last_ts="0"
+  local last_key=""
+
+  [[ "${sample_secs}" =~ ^[0-9]+$ ]] || sample_secs="60"
+  (( sample_secs > 0 )) || return 0
+  now="$(date +%s)"
+  state_path="$(health_sample_state_path "${source}")"
+  if [[ -f "${state_path}" ]]; then
+    last_ts="$(sed -n '1p' "${state_path}" 2>/dev/null || printf '0')"
+    last_key="$(sed -n '2p' "${state_path}" 2>/dev/null || true)"
+  fi
+  [[ "${last_ts}" =~ ^[0-9]+$ ]] || last_ts="0"
+  if [[ "${key}" != "${last_key}" || $((now - last_ts)) -ge sample_secs ]]; then
+    printf '%s\n%s\n' "${now}" "${key}" > "${state_path}"
+    return 0
+  fi
+  return 1
 }
 
 symbol_slug() {
@@ -1473,7 +1596,7 @@ funding_arb_open_positions_json() {
 }
 
 funding_arb_current_candidate_pair_ids() {
-  local snapshot_path="${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
+  local snapshot_path="${1:-${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json}"
 
   [[ -s "${snapshot_path}" ]] || return 1
   jq -r --argjson limit "${FUNDING_ARB_STARTUP_DRY_RUN_LIMIT}" '
@@ -1903,6 +2026,8 @@ funding_arb_startup_open_position_recovery_can_continue() {
     and ((.dispatch_attempted // false) == false)
     and (
       (.halt_reason // "") == "funding arb existing position recovery cycle completed; resident live stopped before new entries"
+      or (.halt_reason // "") == "funding arb exit-only cycle completed; resident live stopped before new entries"
+      or (.halt_reason // "") == "max cycles reached"
     )
   ' "${summary_path}" >/dev/null
 }
@@ -1952,6 +2077,7 @@ run_funding_arb_startup_unknown_recovery_once() {
     --execute-live
     --i-understand-funding-arb-live-orders
     --allow-unknown-recovery
+    --exit-only
   )
   [[ -n "${FUNDING_SETTLEMENT_LEDGER:-}" ]] && args+=(--funding-settlement-ledger "${FUNDING_SETTLEMENT_LEDGER}")
   [[ -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}" ]] && args+=(--funding-settlement-raw-snapshot "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}")
@@ -2014,7 +2140,7 @@ run_funding_arb_startup_unknown_recovery_once() {
 
 run_funding_arb_startup_dry_run_precheck_for_pair() {
   local pair_id="$1"
-  local snapshot_path="${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
+  local snapshot_path="${2:-${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json}"
   local safe_pair="${pair_id//[^A-Za-z0-9_.-]/_}"
   local run_id
   local pair_dir
@@ -2095,7 +2221,6 @@ run_funding_arb_startup_dry_run_precheck_for_pair() {
     echo "funding_arb_startup_precheck_skip_stale_candidate pair_id=${pair_id} report=${guarded_dir}/funding_arb_guarded_dry_run_report.json"
     return 2
   fi
-
   write_funding_arb_startup_block_report "guarded_dry_run_not_live_ready" "[]" "${pair_id}" "${guarded_dir}/funding_arb_guarded_dry_run_report.json" 0
   echo "error: funding-arb startup guarded dry-run is not live-ready for pair_id=${pair_id}" >&2
   jq -c '{
@@ -2120,6 +2245,8 @@ check_funding_arb_resident_startup_risk() {
   local ready_count=0
   local stale_candidate_count=0
   local precheck_status=0
+  local snapshot_path="${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
+  local precheck_snapshot_path
 
   [[ "${EXECUTE_LIVE}" == "1" ]] || return 0
   check_funding_arb_resident_unknown_startup_risk || return 1
@@ -2137,14 +2264,18 @@ check_funding_arb_resident_startup_risk() {
     return 0
   fi
 
-  if [[ ! -s "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" ]]; then
-    write_funding_arb_startup_block_report "missing_funding_arb_snapshot" "[]" "" "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" 0
-    echo "error: funding-arb startup precheck requires ${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" >&2
+  if [[ ! -s "${snapshot_path}" ]]; then
+    write_funding_arb_startup_block_report "missing_funding_arb_snapshot" "[]" "" "${snapshot_path}" 0
+    echo "error: funding-arb startup precheck requires ${snapshot_path}" >&2
     return 1
   fi
 
-  if ! candidate_pair_ids="$(funding_arb_current_candidate_pair_ids)"; then
-    write_funding_arb_startup_block_report "funding_arb_snapshot_candidate_parse_failed" "[]" "" "${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json" 0
+  mkdir -p "${FUNDING_ARB_STARTUP_PRECHECK_DIR}"
+  precheck_snapshot_path="${FUNDING_ARB_STARTUP_PRECHECK_DIR}/startup-precheck-snapshot-$(date -u +%Y%m%dT%H%M%SZ).json"
+  cp "${snapshot_path}" "${precheck_snapshot_path}"
+
+  if ! candidate_pair_ids="$(funding_arb_current_candidate_pair_ids "${precheck_snapshot_path}")"; then
+    write_funding_arb_startup_block_report "funding_arb_snapshot_candidate_parse_failed" "[]" "" "${precheck_snapshot_path}" 0
     echo "error: funding-arb startup precheck could not parse current candidate pair ids" >&2
     return 1
   fi
@@ -2153,7 +2284,7 @@ check_funding_arb_resident_startup_risk() {
     [[ -n "${pair_id}" ]] || continue
     pair_count="$((pair_count + 1))"
     precheck_status=0
-    run_funding_arb_startup_dry_run_precheck_for_pair "${pair_id}" || precheck_status="$?"
+    run_funding_arb_startup_dry_run_precheck_for_pair "${pair_id}" "${precheck_snapshot_path}" || precheck_status="$?"
     if [[ "${precheck_status}" == "0" ]]; then
       ready_count="$((ready_count + 1))"
       continue
@@ -2267,7 +2398,7 @@ run_validation_job() {
           "incomplete"
         end
       ' "${report_file}" 2>> "${LOG_DIR}/jq-errors.log")"
-      jq -c \
+      append_jq_file_line "${EXECUTION_REPORTS_JSONL}" "${report_file}" \
         --arg venue "${venue}" \
         --arg symbol "${symbol}" \
         --arg run_id "${run_id}" \
@@ -2290,7 +2421,7 @@ run_validation_job() {
           dry_run_output_dir: $out_dir,
           validation_output_dir: $out_dir,
           mutable_execution_started: $mutable_execution_started
-        }' "${report_file}" >> "${EXECUTION_REPORTS_JSONL}"
+        }'
     else
       append_json_line "${EXECUTION_REPORTS_JSONL}" \
         --arg venue "${venue}" \
@@ -2394,7 +2525,7 @@ run_funding_arb_validation_job() {
           "incomplete"
         end
       ' "${report_file}" 2>> "${LOG_DIR}/jq-errors.log")"
-      jq -c \
+      append_jq_file_line "${EXECUTION_REPORTS_JSONL}" "${report_file}" \
         --arg strategy "cross-exchange-funding-arb" \
         --arg pair_id "${pair_id}" \
         --arg symbol "${symbol}" \
@@ -2419,7 +2550,7 @@ run_funding_arb_validation_job() {
           dry_run_output_dir: $out_dir,
           validation_output_dir: $out_dir,
           mutable_execution_started: $mutable_execution_started
-        }' "${report_file}" >> "${EXECUTION_REPORTS_JSONL}"
+        }'
     else
       append_json_line "${EXECUTION_REPORTS_JSONL}" \
         --arg strategy "cross-exchange-funding-arb" \
@@ -2662,55 +2793,54 @@ poll_venue() {
   if ! [[ "${total_rows}" =~ ^[0-9]+$ ]]; then
     total_rows="0"
   fi
-  append_json_line_from_body "${HEALTH_EVENTS_JSONL}" "${body}" \
-    --arg recorded_at "${ts}" \
-    --arg venue "${venue}" \
-    --arg endpoint "${url}" \
-    --arg status "${snapshot_status}" \
-    --arg updated_at "${updated_at}" \
-    --argjson candidate_count "${count}" \
-    --argjson total_rows "${total_rows}" \
-    '
-    def bounded_string:
-      if type == "string" and length > 500 then .[0:500] + "...<truncated>" else . end;
-    def bounded_value:
-      if type == "object" then with_entries(.value |= bounded_string)
-      elif type == "string" then bounded_string
-      else .
-      end;
-    def blocking_path_metadata:
-      (.blocking_path // []) as $raw
-      | (if ($raw | type) == "array" then $raw else [] end) as $path
-      | {
-          entries: ($path[0:$blocking_path_limit] | map(bounded_value)),
-          total_count: ($path | length),
-          truncated: (($path | length) > $blocking_path_limit)
-        };
-    (blocking_path_metadata) as $blocking_path_metadata
-    | {recorded_at:$recorded_at,venue:$venue,strategy:"spot-perp-basis",event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,blocking_path:$blocking_path_metadata.entries,blocking_path_total_count:$blocking_path_metadata.total_count,blocking_path_truncated:$blocking_path_metadata.truncated,mutable_execution_started:false}'
+  if should_emit_health_event "spot-perp-basis:${venue}" "poll_ok|status=${snapshot_status}|candidate_count=${count}|total_rows=${total_rows}"; then
+    append_json_line_from_body "${HEALTH_EVENTS_JSONL}" "${body}" \
+      --arg recorded_at "${ts}" \
+      --arg venue "${venue}" \
+      --arg endpoint "${url}" \
+      --arg status "${snapshot_status}" \
+      --arg updated_at "${updated_at}" \
+      --argjson candidate_count "${count}" \
+      --argjson total_rows "${total_rows}" \
+      '
+      def bounded_string:
+        if type == "string" and length > 500 then .[0:500] + "...<truncated>" else . end;
+      def bounded_value:
+        if type == "object" then with_entries(.value |= bounded_string)
+        elif type == "string" then bounded_string
+        else .
+        end;
+      def blocking_path_metadata:
+        (.blocking_path // []) as $raw
+        | (if ($raw | type) == "array" then $raw else [] end) as $path
+        | {
+            entries: ($path[0:$blocking_path_limit] | map(bounded_value)),
+            total_count: ($path | length),
+            truncated: (($path | length) > $blocking_path_limit)
+          };
+      (blocking_path_metadata) as $blocking_path_metadata
+      | {recorded_at:$recorded_at,venue:$venue,strategy:"spot-perp-basis",event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,blocking_path:$blocking_path_metadata.entries,blocking_path_total_count:$blocking_path_metadata.total_count,blocking_path_truncated:$blocking_path_metadata.truncated,mutable_execution_started:false}'
+  fi
 
   if (( count > 0 )); then
-    printf '%s\n' "${body}" | jq -c \
+    append_json_body_line "${OPPORTUNITY_DIR}/${venue}-opportunities.jsonl" "${body}" \
       --arg recorded_at "${ts}" \
       --arg venue "${venue}" \
       --arg endpoint "${url}" \
-      '. + {recorded_at:$recorded_at,venue:$venue,endpoint:$endpoint,mutable_execution_started:false}' \
-      >> "${OPPORTUNITY_DIR}/${venue}-opportunities.jsonl"
-    printf '%s\n' "${body}" | jq -c \
+      '. + {recorded_at:$recorded_at,venue:$venue,endpoint:$endpoint,mutable_execution_started:false}'
+    append_json_body_line "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${body}" \
       --arg recorded_at "${ts}" \
       --arg venue "${venue}" \
       --arg endpoint "${url}" \
-      '. + {recorded_at:$recorded_at,venue:$venue,endpoint:$endpoint,mutable_execution_started:false}' \
-      >> "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl"
-    printf '%s\n' "${body}" | jq -c \
+      '. + {recorded_at:$recorded_at,venue:$venue,endpoint:$endpoint,mutable_execution_started:false}'
+    append_json_body_line "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${body}" \
       --arg recorded_at "${ts}" \
       --arg venue "${venue}" \
       --arg endpoint "${url}" \
-      '. + {recorded_at:$recorded_at,venue:$venue,endpoint:$endpoint,mutable_execution_started:false}' \
-      >> "${OPPORTUNITY_DIR}/all-opportunities.jsonl"
+      '. + {recorded_at:$recorded_at,venue:$venue,endpoint:$endpoint,mutable_execution_started:false}'
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.symbol):net=\(.net_basis_bps // "null")bps profit=\(.expected_profit_usd // "null")"] | join(", ")')"
-    echo "[$(local_log_timestamp)] opportunity venue=${venue} candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
+    append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] opportunity venue=${venue} candidate_count=${count} ${summary}"
     start_target_wss_warmups_for_candidates "${venue}" "${body}" "${ts}"
     if [[ "${SPOT_PERP_BASIS_MODE}" == "auto-once" ]]; then
       start_validations_for_candidates "${venue}" "${body}" "${ts}"
@@ -2720,7 +2850,7 @@ poll_venue() {
     if [[ -z "${summary}" ]]; then
       summary="blocking_path=[]"
     fi
-    echo "[$(local_log_timestamp)] opportunity venue=${venue} strategy=spot-perp-basis candidate_count=0 ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
+    append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] opportunity venue=${venue} strategy=spot-perp-basis candidate_count=0 ${summary}"
   fi
 }
 
@@ -2762,49 +2892,49 @@ poll_funding_arb() {
   if ! [[ "${total_rows}" =~ ^[0-9]+$ ]]; then
     total_rows="0"
   fi
-  append_json_line_from_body "${HEALTH_EVENTS_JSONL}" "${body}" \
-    --arg recorded_at "${ts}" \
-    --arg strategy "cross-exchange-funding-arb" \
-    --arg endpoint "${url}" \
-    --arg status "${snapshot_status}" \
-    --arg updated_at "${updated_at}" \
-    --argjson candidate_count "${count}" \
-    --argjson total_rows "${total_rows}" \
-    '
-    def bounded_string:
-      if type == "string" and length > 500 then .[0:500] + "...<truncated>" else . end;
-    def bounded_value:
-      if type == "object" then with_entries(.value |= bounded_string)
-      elif type == "string" then bounded_string
-      else .
-      end;
-    def blocking_path_metadata:
-      (.blocking_path // []) as $raw
-      | (if ($raw | type) == "array" then $raw else [] end) as $path
-      | {
-          entries: ($path[0:$blocking_path_limit] | map(bounded_value)),
-          total_count: ($path | length),
-          truncated: (($path | length) > $blocking_path_limit)
-        };
-    (blocking_path_metadata) as $blocking_path_metadata
-    | {recorded_at:$recorded_at,strategy:$strategy,event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,blocking_path:$blocking_path_metadata.entries,blocking_path_total_count:$blocking_path_metadata.total_count,blocking_path_truncated:$blocking_path_metadata.truncated,mutable_execution_started:false}'
+  if should_emit_health_event "cross-exchange-funding-arb" "poll_ok|status=${snapshot_status}|candidate_count=${count}|total_rows=${total_rows}"; then
+    append_json_line_from_body "${HEALTH_EVENTS_JSONL}" "${body}" \
+      --arg recorded_at "${ts}" \
+      --arg strategy "cross-exchange-funding-arb" \
+      --arg endpoint "${url}" \
+      --arg status "${snapshot_status}" \
+      --arg updated_at "${updated_at}" \
+      --argjson candidate_count "${count}" \
+      --argjson total_rows "${total_rows}" \
+      '
+      def bounded_string:
+        if type == "string" and length > 500 then .[0:500] + "...<truncated>" else . end;
+      def bounded_value:
+        if type == "object" then with_entries(.value |= bounded_string)
+        elif type == "string" then bounded_string
+        else .
+        end;
+      def blocking_path_metadata:
+        (.blocking_path // []) as $raw
+        | (if ($raw | type) == "array" then $raw else [] end) as $path
+        | {
+            entries: ($path[0:$blocking_path_limit] | map(bounded_value)),
+            total_count: ($path | length),
+            truncated: (($path | length) > $blocking_path_limit)
+          };
+      (blocking_path_metadata) as $blocking_path_metadata
+      | {recorded_at:$recorded_at,strategy:$strategy,event:"poll_ok",endpoint:$endpoint,status:$status,updated_at:$updated_at,candidate_count:$candidate_count,total_rows:$total_rows,blocking_path:$blocking_path_metadata.entries,blocking_path_total_count:$blocking_path_metadata.total_count,blocking_path_truncated:$blocking_path_metadata.truncated,mutable_execution_started:false}'
+  fi
 
   if (( count > 0 )); then
-    printf '%s\n' "${body}" | jq -c \
+    append_json_body_line "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl" "${body}" \
       --arg recorded_at "${ts}" \
       --arg strategy "cross-exchange-funding-arb" \
       --arg endpoint "${url}" \
-      '. + {recorded_at:$recorded_at,strategy:$strategy,endpoint:$endpoint,mutable_execution_started:false}' \
-      >> "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
-    printf '%s\n' "${body}" | jq -c \
+      '. + {recorded_at:$recorded_at,strategy:$strategy,endpoint:$endpoint,mutable_execution_started:false}'
+    append_json_body_line "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${body}" \
       --arg recorded_at "${ts}" \
       --arg strategy "cross-exchange-funding-arb" \
       --arg endpoint "${url}" \
-      '. + {recorded_at:$recorded_at,strategy:$strategy,endpoint:$endpoint,mutable_execution_started:false}' \
-      >> "${OPPORTUNITY_DIR}/all-opportunities.jsonl"
+      '. + {recorded_at:$recorded_at,strategy:$strategy,endpoint:$endpoint,mutable_execution_started:false}'
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.pair_id):net=\(.net_funding_bps // "null")bps funding=\(.expected_funding_usd // "null")"] | join(", ")')"
-    echo "[$(local_log_timestamp)] opportunity strategy=cross-exchange-funding-arb candidate_count=${count} ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
+    append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] opportunity strategy=cross-exchange-funding-arb candidate_count=${count} ${summary}"
     if [[ "${FUNDING_ARB_MODE}" == "auto-once" ]]; then
       start_funding_arb_validations_for_candidates "${body}" "${ts}"
     fi
@@ -2813,18 +2943,87 @@ poll_funding_arb() {
     if [[ -z "${summary}" ]]; then
       summary="blocking_path=[]"
     fi
-    echo "[$(local_log_timestamp)] opportunity strategy=cross-exchange-funding-arb candidate_count=0 ${summary}" | tee -a "${FEEDBACK_LOG}" >/dev/null
+    append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] opportunity strategy=cross-exchange-funding-arb candidate_count=0 ${summary}"
   fi
+}
+
+count_matching_lines() {
+  local pattern="$1"
+  local text="$2"
+  local count
+  count="$(grep -c -- "${pattern}" <<< "${text}" || true)"
+  printf '%s' "${count:-0}"
+}
+
+append_resident_tail_health() {
+  local strategy="$1"
+  local source="$2"
+  local event_file="$3"
+  local ts
+  local window
+  local cycle_errors
+  local blocked_decisions
+  local capacity_blocks
+  local status="healthy"
+  local key
+
+  [[ "${RESIDENT_HEALTH_TAIL_LINES:-200}" =~ ^[0-9]+$ ]] || return 0
+  (( RESIDENT_HEALTH_TAIL_LINES > 0 )) || return 0
+  [[ -f "${event_file}" ]] || return 0
+
+  window="$(tail -n "${RESIDENT_HEALTH_TAIL_LINES}" "${event_file}" 2>/dev/null || true)"
+  cycle_errors="$(count_matching_lines '"event_type":"cycle_error"' "${window}")"
+  blocked_decisions="$(count_matching_lines '"decision":"blocked"' "${window}")"
+  capacity_blocks="$(count_matching_lines '"event_type":"entry_capacity_blocked"' "${window}")"
+  if (( cycle_errors > 0 || blocked_decisions > 0 || capacity_blocks > 0 )); then
+    status="warning"
+  fi
+  key="resident_tail_health|status=${status}|cycle_errors=${cycle_errors}|blocked=${blocked_decisions}|capacity=${capacity_blocks}"
+  should_emit_health_event "resident:${source}" "${key}" || return 0
+
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  append_json_line "${HEALTH_EVENTS_JSONL}" \
+    --arg recorded_at "${ts}" \
+    --arg strategy "${strategy}" \
+    --arg source "${source}" \
+    --arg status "${status}" \
+    --arg event_file "${event_file}" \
+    --argjson tail_lines "${RESIDENT_HEALTH_TAIL_LINES}" \
+    --argjson cycle_error_count "${cycle_errors}" \
+    --argjson blocked_decision_count "${blocked_decisions}" \
+    --argjson entry_capacity_blocked_count "${capacity_blocks}" \
+    '{recorded_at:$recorded_at,strategy:$strategy,source:$source,event:"resident_tail_health",status:$status,event_file:$event_file,tail_lines:$tail_lines,cycle_error_count:$cycle_error_count,blocked_decision_count:$blocked_decision_count,entry_capacity_blocked_count:$entry_capacity_blocked_count,mutable_execution_started:false}'
+}
+
+append_resident_health_events() {
+  local basis_dir="${BASIS_RESIDENT_OUT_DIR:-${RUN_ROOT}/resident-live/spot-perp-basis}"
+  local funding_dir="${FUNDING_ARB_RESIDENT_OUT_DIR:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
+  local venue
+
+  append_resident_tail_health \
+    "spot-perp-basis" \
+    "spot-perp-basis:multi-venue" \
+    "${basis_dir}/multi_venue_resident_live_events.jsonl"
+  for venue in binance bybit okx bitget; do
+    append_resident_tail_health \
+      "spot-perp-basis" \
+      "spot-perp-basis:${venue}" \
+      "${basis_dir}/${venue}/resident_live_events.jsonl"
+  done
+  append_resident_tail_health \
+    "cross-exchange-funding-arb" \
+    "cross-exchange-funding-arb" \
+    "${funding_dir}/funding_arb_resident_live_events.jsonl"
 }
 
 run_recorder() {
   cd "${REPO_ROOT}"
-  trap 'echo "[$(local_log_timestamp)] recorder_stop" >> "${FEEDBACK_LOG}"; exit 0' INT TERM
+  trap 'append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] recorder_stop"; exit 0' INT TERM
   mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${OPPORTUNITY_DIR}" "${EXECUTION_DIR}" "${SNAPSHOT_DIR}" "${PRIVATE_ORDER_EVENTS_DIR}" "${TARGET_WSS_LOG_DIR}" "${TARGET_WSS_STATE_DIR}"
   touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
   touch "${VALIDATION_EVENTS_JSONL}" "${EXECUTION_REPORTS_JSONL}"
   IFS=' ' read -r -a RECORDER_MONITORS <<< "${EFFECTIVE_MONITORS}"
-  echo "[$(local_log_timestamp)] recorder_start mode=${EXECUTION_MODE} spot_perp_basis_mode=${SPOT_PERP_BASIS_MODE} funding_arb_mode=${FUNDING_ARB_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}" >> "${FEEDBACK_LOG}"
+  append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] recorder_start mode=${EXECUTION_MODE} spot_perp_basis_mode=${SPOT_PERP_BASIS_MODE} funding_arb_mode=${FUNDING_ARB_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}"
   append_json_line "${HEALTH_EVENTS_JSONL}" \
     --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg strategies "${EFFECTIVE_STRATEGIES}" \
@@ -2841,6 +3040,7 @@ run_recorder() {
     if strategy_enabled "cross-exchange-funding-arb"; then
       poll_funding_arb
     fi
+    append_resident_health_events
     sleep "${INTERVAL_SECS}"
   done
 }
@@ -2917,7 +3117,13 @@ if [[ "${1:-}" == "--recorder" ]]; then
   VALIDATE_AUTO_ONCE="${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}"
   AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
   SPOT_PERP_BASIS_MODE="${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-resident}"
+  BASIS_RESIDENT_OUT_DIR="${BASIS_OBSERVER_BASIS_RESIDENT_OUT:-${RUN_ROOT}/resident-live/spot-perp-basis}"
   FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+  FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
+  HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-60}"
+  RESIDENT_HEALTH_TAIL_LINES="${BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES:-200}"
+  LOG_ROTATE_BYTES="${BASIS_OBSERVER_LOG_ROTATE_BYTES:-134217728}"
+  LOG_ROTATE_KEEP="${BASIS_OBSERVER_LOG_ROTATE_KEEP:-4}"
   if [[ -n "${FUNDING_SETTLEMENT_LEDGER}" && -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" ]]; then
     die "cannot combine BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER and BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT"
   fi
@@ -2929,6 +3135,12 @@ if [[ "${1:-}" == "--recorder" ]]; then
   [[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
   [[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
   validate_blocking_path_event_limit "${BLOCKING_PATH_EVENT_LIMIT}"
+  validate_health_sampling_settings
+  validate_log_rotation_settings
+  export ARB_RUNTIME_JSONL_ROTATE_BYTES="${ARB_RUNTIME_JSONL_ROTATE_BYTES:-${LOG_ROTATE_BYTES}}"
+  export ARB_RUNTIME_JSONL_ROTATE_KEEP="${ARB_RUNTIME_JSONL_ROTATE_KEEP:-${LOG_ROTATE_KEEP}}"
+  export ARB_RUNTIME_BINANCE_RECV_WINDOW_MS="${ARB_RUNTIME_BINANCE_RECV_WINDOW_MS:-30000}"
+  export ARB_RUNTIME_BYBIT_RECV_WINDOW_MS="${ARB_RUNTIME_BYBIT_RECV_WINDOW_MS:-30000}"
   CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
   CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
   CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
@@ -3078,6 +3290,10 @@ CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
 CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
 CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
 BLOCKING_PATH_EVENT_LIMIT="${BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT:-12}"
+HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-60}"
+RESIDENT_HEALTH_TAIL_LINES="${BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES:-200}"
+LOG_ROTATE_BYTES="${BASIS_OBSERVER_LOG_ROTATE_BYTES:-134217728}"
+LOG_ROTATE_KEEP="${BASIS_OBSERVER_LOG_ROTATE_KEEP:-4}"
 STARTUP_CHECK="${BASIS_OBSERVER_STARTUP_CHECK:-1}"
 STARTUP_WAIT_SECS="${BASIS_OBSERVER_STARTUP_WAIT_SECS:-180}"
 STOP_DRAIN_SECS="${BASIS_OBSERVER_STOP_DRAIN_SECS:-15}"
@@ -3132,6 +3348,12 @@ esac
 [[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
 [[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
 validate_blocking_path_event_limit "${BLOCKING_PATH_EVENT_LIMIT}"
+validate_health_sampling_settings
+validate_log_rotation_settings
+export ARB_RUNTIME_JSONL_ROTATE_BYTES="${ARB_RUNTIME_JSONL_ROTATE_BYTES:-${LOG_ROTATE_BYTES}}"
+export ARB_RUNTIME_JSONL_ROTATE_KEEP="${ARB_RUNTIME_JSONL_ROTATE_KEEP:-${LOG_ROTATE_KEEP}}"
+export ARB_RUNTIME_BINANCE_RECV_WINDOW_MS="${ARB_RUNTIME_BINANCE_RECV_WINDOW_MS:-30000}"
+export ARB_RUNTIME_BYBIT_RECV_WINDOW_MS="${ARB_RUNTIME_BYBIT_RECV_WINDOW_MS:-30000}"
 
 if [[ "${#CLI_MONITORS[@]}" -eq 0 ]]; then
   if [[ -n "${BASIS_OBSERVER_MONITORS:-}" ]]; then
@@ -3442,7 +3664,9 @@ nohup env \
   BASIS_OBSERVER_EXECUTE_LIVE="${EXECUTE_LIVE}" \
   BASIS_OBSERVER_LIVE_ACK="${LIVE_ACK}" \
   BASIS_OBSERVER_SPOT_PERP_BASIS_MODE="${SPOT_PERP_BASIS_MODE}" \
+  BASIS_OBSERVER_BASIS_RESIDENT_OUT="${BASIS_RESIDENT_OUT_DIR}" \
   BASIS_OBSERVER_FUNDING_ARB_MODE="${FUNDING_ARB_MODE}" \
+  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT="${FUNDING_ARB_RESIDENT_OUT_DIR}" \
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER="${FUNDING_SETTLEMENT_LEDGER}" \
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT="${FUNDING_SETTLEMENT_RAW_SNAPSHOT}" \
   BASIS_OBSERVER_BINANCE_POSITION_MODE="${BASIS_OBSERVER_BINANCE_POSITION_MODE:-hedge}" \
@@ -3471,6 +3695,10 @@ nohup env \
   BASIS_OBSERVER_CURL_RETRIES="${CURL_RETRIES}" \
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS="${CURL_RETRY_SLEEP_SECS}" \
   BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT="${BLOCKING_PATH_EVENT_LIMIT}" \
+  BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS="${HEALTH_EVENT_SAMPLE_SECS}" \
+  BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES="${RESIDENT_HEALTH_TAIL_LINES}" \
+  BASIS_OBSERVER_LOG_ROTATE_BYTES="${LOG_ROTATE_BYTES}" \
+  BASIS_OBSERVER_LOG_ROTATE_KEEP="${LOG_ROTATE_KEEP}" \
   BASIS_OBSERVER_EFFECTIVE_MONITORS="${EFFECTIVE_MONITORS}" \
   BASIS_OBSERVER_EFFECTIVE_STRATEGIES="${STRATEGIES}" \
   BINANCE_BASIS_BIND="${BINANCE_BIND}" \

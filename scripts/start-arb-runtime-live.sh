@@ -39,6 +39,10 @@ usage() {
   ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE=1 # 是否运行候选 auto-once 验证。
   ARB_RUNTIME_LIVE_DERISK_ONLY=0 # 事故处理模式；1 表示只启动 funding arb resident 一轮恢复/减仓，不启动 spot-perp 实盘 resident。
   ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=all # Binance/Bybit/OKX/Bitget 全市场 WSS 覆盖范围；all 表示全部 USDT，target 表示只订阅 resident 实盘目标 symbol，custom 表示使用下面各交易所自定义值。
+  ARB_RUNTIME_OKX_FUNDING_RATE_CACHE_TTL_SECS=60 # OKX funding-rate 全市场逐合约请求缓存秒数；0 表示每轮都重新请求。
+  ARB_RUNTIME_BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_SECS=300 # Bybit linear instruments-info 元数据缓存秒数；0 表示每轮都重新请求。
+  ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
+  ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=1 # 是否额外启动实盘 guard 专用 target WSS；启动不阻塞，真实下单前仍强制校验 Fresh quote。
   ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bybit WSS monitor 订阅 symbol。
