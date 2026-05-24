@@ -2964,6 +2964,7 @@ append_resident_tail_health() {
   local cycle_errors
   local blocked_decisions
   local capacity_blocks
+  local scoped_window
   local status="healthy"
   local key
 
@@ -2972,9 +2973,17 @@ append_resident_tail_health() {
   [[ -f "${event_file}" ]] || return 0
 
   window="$(tail -n "${RESIDENT_HEALTH_TAIL_LINES}" "${event_file}" 2>/dev/null || true)"
-  cycle_errors="$(count_matching_lines '"event_type":"cycle_error"' "${window}")"
-  blocked_decisions="$(count_matching_lines '"decision":"blocked"' "${window}")"
-  capacity_blocks="$(count_matching_lines '"event_type":"entry_capacity_blocked"' "${window}")"
+  scoped_window="${window}"
+  if grep -q '"event_type":"resident_started"' <<< "${window}"; then
+    scoped_window="$(awk '
+      /"event_type":"resident_started"/ { buffer=$0 ORS; next }
+      buffer != "" { buffer=buffer $0 ORS }
+      END { printf "%s", buffer }
+    ' <<< "${window}")"
+  fi
+  cycle_errors="$(count_matching_lines '"event_type":"cycle_error"' "${scoped_window}")"
+  blocked_decisions="$(count_matching_lines '"decision":"blocked"' "${scoped_window}")"
+  capacity_blocks="$(count_matching_lines '"event_type":"entry_capacity_blocked"' "${scoped_window}")"
   if (( cycle_errors > 0 || blocked_decisions > 0 || capacity_blocks > 0 )); then
     status="warning"
   fi

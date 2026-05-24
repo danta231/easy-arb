@@ -1434,6 +1434,8 @@ pub struct FundingArbGuardedDryRunReport {
     pub signal_allowed: bool,
     pub risk_decision: String,
     pub risk_reason_codes: Vec<String>,
+    pub strategy_rejection_reason: Option<String>,
+    pub strategy_rejection_detail: Option<String>,
     pub funding_settlement: FundingSettlementReconciliationSummary,
     pub funding_settlement_ingestion: FundingSettlementIngestionSummary,
     pub private_accounts: FundingPrivateAccountReconciliationSummary,
@@ -29758,6 +29760,41 @@ impl MonitorDecimal {
             format!("{sign}{whole}.{fraction}")
         }
     }
+
+    fn format_trimmed_with_scale(self, scale_digits: usize) -> String {
+        if scale_digits >= Self::SCALE_DIGITS {
+            return self.format_trimmed();
+        }
+        let negative = self.raw < 0;
+        let raw = self.raw.unsigned_abs();
+        let drop_digits = Self::SCALE_DIGITS - scale_digits;
+        let divisor = 10_u128.pow(drop_digits as u32);
+        let raw = raw / divisor;
+        let scale = 10_u128.pow(scale_digits as u32);
+        let whole = raw / scale;
+        let mut fraction = if scale_digits == 0 {
+            String::new()
+        } else {
+            format!("{:0width$}", raw % scale, width = scale_digits)
+        };
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        let sign = if negative { "-" } else { "" };
+        if fraction.is_empty() {
+            format!("{sign}{whole}")
+        } else {
+            format!("{sign}{whole}.{fraction}")
+        }
+    }
+}
+
+const STRATEGY_FIXED_DECIMAL_SCALE_DIGITS: usize = 8;
+
+fn strategy_fixed_decimal_text(value: &str) -> String {
+    MonitorDecimal::parse("strategy_fixed_decimal", value)
+        .map(|decimal| decimal.format_trimmed_with_scale(STRATEGY_FIXED_DECIMAL_SCALE_DIGITS))
+        .unwrap_or_else(|_| value.trim().to_owned())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32749,6 +32786,12 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
         &ingested_at.to_string(),
         spec,
     )?;
+    let strategy_rejection_reason = evaluation
+        .rejection()
+        .map(|rejection| rejection.reason().as_str().to_owned());
+    let strategy_rejection_detail = evaluation
+        .rejection()
+        .and_then(|rejection| rejection.detail().map(str::to_owned));
     let candidate = evaluation.candidate().cloned();
     let dispatch_request_count = candidate
         .as_ref()
@@ -32807,6 +32850,7 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
                 exit_readiness: &exit_readiness,
                 snapshot_lineage: &snapshot_lineage,
                 execution_preflight: &execution_preflight,
+                signal_rejection_detail: None,
             }),
             execution_preflight,
             venue_execution_capability,
@@ -32849,6 +32893,7 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
                 exit_readiness: &exit_readiness,
                 snapshot_lineage: &snapshot_lineage,
                 execution_preflight: &execution_preflight,
+                signal_rejection_detail: strategy_rejection_detail.as_deref(),
             }),
             execution_preflight,
             venue_execution_capability,
@@ -32863,6 +32908,8 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
         signal_allowed: candidate.is_some(),
         risk_decision,
         risk_reason_codes,
+        strategy_rejection_reason,
+        strategy_rejection_detail,
         funding_settlement,
         funding_settlement_ingestion,
         private_accounts,
@@ -33569,17 +33616,23 @@ struct FundingArbLiveReadinessInput<'a> {
     exit_readiness: &'a FundingArbExitReadinessSummary,
     snapshot_lineage: &'a FundingArbSnapshotLineageSummary,
     execution_preflight: &'a FundingArbExecutionPreflightSummary,
+    signal_rejection_detail: Option<&'a str>,
 }
 
 fn funding_arb_live_readiness(
     input: FundingArbLiveReadinessInput<'_>,
 ) -> FundingArbLiveReadinessSummary {
     let mut checks = Vec::new();
-    checks.push(funding_arb_live_readiness_check(
+    let public_signal_detail = input
+        .signal_rejection_detail
+        .filter(|detail| !detail.trim().is_empty())
+        .unwrap_or("strategy did not emit a funding-arb candidate")
+        .to_owned();
+    checks.push(funding_arb_live_readiness_check_owned(
         "public_signal",
         input.signal_allowed,
-        "NO_FUNDING_ARB_CANDIDATE",
-        "strategy did not emit a funding-arb candidate",
+        Some("NO_FUNDING_ARB_CANDIDATE".to_owned()),
+        Some(public_signal_detail),
     ));
     let risk_allowed = input
         .risk_decision
@@ -36446,6 +36499,7 @@ fn run_funding_arb_resident_live_inner(
     let _lock = acquire_funding_arb_resident_live_lock(&output_root)?;
     write_funding_arb_resident_live_config(&output_root, &options)?;
     write_funding_arb_resident_live_state(&output_root, "running", 0, None)?;
+    append_funding_arb_resident_started_event(&output_root)?;
 
     let mut cycles = 0_u64;
     let mut last_pair_id = None;
@@ -36453,6 +36507,18 @@ fn run_funding_arb_resident_live_inner(
     let mut last_net_funding_bps = None;
     let mut dispatch_attempted = false;
     let mut halt_reason = None;
+    write_funding_arb_resident_live_progress_summary(
+        &output_root,
+        FundingArbResidentLiveProgressInput {
+            phase: "running",
+            cycles,
+            last_pair_id: &last_pair_id,
+            last_symbol: &last_symbol,
+            last_net_funding_bps,
+            dispatch_attempted,
+            halt_reason: None,
+        },
+    )?;
     loop {
         if output_root.join("STOP").exists() {
             halt_reason = Some(
@@ -36689,6 +36755,18 @@ fn run_funding_arb_resident_live_inner(
             halt_reason = Some("max cycles reached".to_owned());
             break;
         }
+        write_funding_arb_resident_live_progress_summary(
+            &output_root,
+            FundingArbResidentLiveProgressInput {
+                phase: "running",
+                cycles,
+                last_pair_id: &last_pair_id,
+                last_symbol: &last_symbol,
+                last_net_funding_bps,
+                dispatch_attempted,
+                halt_reason: None,
+            },
+        )?;
         thread::sleep(Duration::from_secs(options.poll_interval_secs));
     }
 
@@ -36715,6 +36793,7 @@ fn run_funding_arb_resident_live_inner(
         mutable_execution_started: dispatch_attempted,
     };
     write_funding_arb_resident_live_summary(&output_root, &report)?;
+    log_funding_arb_resident_live_heartbeat(&report);
     Ok(report)
 }
 
@@ -40272,6 +40351,17 @@ fn append_funding_arb_resident_error_event(
 }
 
 #[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_started_event(output_root: &Path) -> RuntimeResult<()> {
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"cycle\":0,\"event_type\":\"resident_started\",\"recorded_at\":{}}}",
+            json_string(&current_utc_timestamp_string()),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
 fn append_funding_arb_resident_event(output_root: &Path, line: &str) -> RuntimeResult<()> {
     append_line_to_jsonl(
         output_root.join("funding_arb_resident_live_events.jsonl"),
@@ -40288,6 +40378,58 @@ fn write_funding_arb_resident_live_summary(
         output_root.join("funding_arb_resident_live_summary.json"),
         &format!("{}\n", funding_arb_resident_live_report_json(report)),
     )
+}
+
+#[cfg(feature = "live-exec")]
+struct FundingArbResidentLiveProgressInput<'a> {
+    phase: &'a str,
+    cycles: u64,
+    last_pair_id: &'a Option<String>,
+    last_symbol: &'a Option<String>,
+    last_net_funding_bps: Option<i128>,
+    dispatch_attempted: bool,
+    halt_reason: Option<&'a str>,
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_resident_live_progress_summary(
+    output_root: &Path,
+    input: FundingArbResidentLiveProgressInput<'_>,
+) -> RuntimeResult<()> {
+    let registry = load_funding_arb_resident_position_registry(output_root)?;
+    let report = FundingArbResidentLiveReport {
+        phase: input.phase.to_owned(),
+        cycles: input.cycles,
+        last_pair_id: input.last_pair_id.clone(),
+        last_symbol: input.last_symbol.clone(),
+        last_net_funding_bps: input.last_net_funding_bps,
+        dispatch_attempted: input.dispatch_attempted,
+        live_entry_count: registry.live_entry_count() as u64,
+        open_position_count: registry.active_positions().len(),
+        closed_position_count: registry.closed_position_count(),
+        unknown_position_count: registry.unknown_position_count(),
+        halt_reason: input.halt_reason.map(str::to_owned),
+        output_dir: Some(output_root.to_path_buf()),
+        mutable_execution_started: input.dispatch_attempted,
+    };
+    write_funding_arb_resident_live_summary(output_root, &report)?;
+    log_funding_arb_resident_live_heartbeat(&report);
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn log_funding_arb_resident_live_heartbeat(report: &FundingArbResidentLiveReport) {
+    eprintln!(
+        "funding-arb-resident-live heartbeat phase={} cycles={} open_positions={} closed_positions={} unknown_positions={} live_entries={} last_pair_id={} dispatch_attempted={}",
+        report.phase,
+        report.cycles,
+        report.open_position_count,
+        report.closed_position_count,
+        report.unknown_position_count,
+        report.live_entry_count,
+        report.last_pair_id.as_deref().unwrap_or("none"),
+        report.dispatch_attempted,
+    );
 }
 
 #[cfg(feature = "live-exec")]
@@ -41049,8 +41191,8 @@ fn monitor_book_ticker_event_json_with_depth(
     bid_depth: &[SignalDepthLevel],
     ask_depth: &[SignalDepthLevel],
 ) -> String {
-    let bid_depth_json = signal_depth_levels_json(bid_depth);
-    let ask_depth_json = signal_depth_levels_json(ask_depth);
+    let bid_depth_json = signal_depth_levels_strategy_json(bid_depth);
+    let ask_depth_json = signal_depth_levels_strategy_json(ask_depth);
     format!(
         r#"{{"checksum":{},"correlation_id":{},"event_id":{},"event_type":"NormalizedMarketDataEvent","event_version":"1.0.0","instrument_id":{},"payload":{{"adapter":"basis-monitor","ask_depth_levels":{},"ask_size":{},"basis_role":{},"best_ask":{},"best_bid":{},"bid_depth_levels":{},"bid_size":{},"freshness":"Fresh","kind":"BookTicker","market":{},"risk_reason_code":"OK","venue_symbol":{}}},"schema_version":"1.0.0","source":"basis-monitor","source_sequence":{},"timestamp_event":{},"timestamp_ingested":{},"venue_id":{}}}"#,
         json_string(checksum),
@@ -41058,12 +41200,12 @@ fn monitor_book_ticker_event_json_with_depth(
         json_string(event_id),
         json_string(instrument_id),
         ask_depth_json,
-        json_string(ask_size),
+        json_string(&strategy_fixed_decimal_text(ask_size)),
         json_string(basis_role),
-        json_string(best_ask),
-        json_string(best_bid),
+        json_string(&strategy_fixed_decimal_text(best_ask)),
+        json_string(&strategy_fixed_decimal_text(best_bid)),
         bid_depth_json,
-        json_string(bid_size),
+        json_string(&strategy_fixed_decimal_text(bid_size)),
         json_string(market),
         json_string(venue_symbol),
         json_string(source_sequence),
@@ -41094,9 +41236,9 @@ fn monitor_premium_index_event_json(
         json_string(correlation_id),
         json_string(event_id),
         json_string(instrument_id),
-        json_string(index_price),
+        json_string(&strategy_fixed_decimal_text(index_price)),
         json_string(last_funding_rate),
-        json_string(mark_price),
+        json_string(&strategy_fixed_decimal_text(mark_price)),
         json_string(next_funding_time_ms),
         json_string(venue_symbol),
         json_string(source_sequence),
@@ -41129,9 +41271,9 @@ fn funding_monitor_premium_index_event_json(
         json_string(event_id),
         json_string(instrument_id),
         json_string(funding_interval_hours),
-        json_string(index_price),
+        json_string(&strategy_fixed_decimal_text(index_price)),
         json_string(last_funding_rate),
-        json_string(mark_price),
+        json_string(&strategy_fixed_decimal_text(mark_price)),
         json_string(next_funding_time_ms),
         json_string(venue_symbol),
         json_string(source_sequence),
@@ -48158,6 +48300,21 @@ fn signal_depth_levels_json(levels: &[SignalDepthLevel]) -> String {
     )
 }
 
+fn signal_depth_levels_strategy_json(levels: &[SignalDepthLevel]) -> String {
+    format!(
+        "[{}]",
+        levels
+            .iter()
+            .map(|level| format!(
+                "{{\"price\":{},\"size\":{}}}",
+                json_string(&strategy_fixed_decimal_text(&level.price)),
+                json_string(&strategy_fixed_decimal_text(&level.size))
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 impl BinanceBasisMarketRow {
     fn to_json(&self) -> String {
         format!(
@@ -49237,7 +49394,7 @@ fn funding_arb_guarded_dry_run_report_json(
             dispatch_attempted: report.dispatch_attempted,
         });
     format!(
-        "{{\"blocking_path\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_constraints\":{},\"execution_preflight\":{},\"exit_readiness\":{},\"expected_funding_usd\":{},\"funding_settlement\":{},\"funding_settlement_ingestion\":{},\"live_blocking_reasons\":{},\"live_readiness\":{},\"live_ready\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_accounts\":{},\"private_execution\":{},\"private_positions\":{},\"product_tags\":{},\"risk_decision\":{},\"risk_reason_codes\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"snapshot_lineage\":{},\"strategy_id\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{},\"venue_execution_capability\":{}}}",
+        "{{\"blocking_path\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_constraints\":{},\"execution_preflight\":{},\"exit_readiness\":{},\"expected_funding_usd\":{},\"funding_settlement\":{},\"funding_settlement_ingestion\":{},\"live_blocking_reasons\":{},\"live_readiness\":{},\"live_ready\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_accounts\":{},\"private_execution\":{},\"private_positions\":{},\"product_tags\":{},\"risk_decision\":{},\"risk_reason_codes\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"snapshot_lineage\":{},\"strategy_id\":{},\"strategy_rejection_detail\":{},\"strategy_rejection_reason\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{},\"venue_execution_capability\":{}}}",
         blocking_path_json,
         report.dispatch_attempted,
         report.dispatch_plan_built,
@@ -49264,6 +49421,8 @@ fn funding_arb_guarded_dry_run_report_json(
         report.signal_allowed,
         funding_arb_snapshot_lineage_json(&report.snapshot_lineage),
         json_string(&spec.strategy_config.instance.strategy_id),
+        json_option_string(&report.strategy_rejection_detail),
+        json_option_string(&report.strategy_rejection_reason),
         json_string(&row.symbol),
         json_string(&spec.strategy_config.output.transition_id),
         json_string(&row.venue_a_family),
@@ -65298,6 +65457,87 @@ mod tests {
             .candidate_transitions_jsonl
             .contains("\"basis_leg_role\":\"perp_short\""));
         assert!(artifacts.risk_decisions_jsonl.contains("\"Rejected\""));
+    }
+
+    #[test]
+    fn funding_arb_bybit_bitget_monitor_candidate_survives_guarded_dry_run_bridge() {
+        let replay = arb_replay::load_fixture(full_pipeline_fixture_root()).expect("fixture");
+        let ingested_at = UtcTimestamp::from_str("2026-05-24T14:59:32Z").expect("time");
+        let row = FundingArbMarketRow {
+            pair_id: "bybit:bitget:DRIFTUSDT:DRIFTUSDT".to_owned(),
+            symbol: "DRIFTUSDT".to_owned(),
+            venue_a_family: "bybit".to_owned(),
+            venue_b_family: "bitget".to_owned(),
+            venue_a_bid: "0.02731".to_owned(),
+            venue_a_ask: "0.02732".to_owned(),
+            venue_a_bid_qty: "10898".to_owned(),
+            venue_a_ask_qty: "5453".to_owned(),
+            venue_a_bid_depth: signal_depth_from_top_strings("0.02731", "10898"),
+            venue_a_ask_depth: signal_depth_from_top_strings("0.02732", "5453"),
+            venue_a_mark_price: "0.02731".to_owned(),
+            venue_a_index_price: "0.02742".to_owned(),
+            venue_a_funding_rate: "-0.00272114".to_owned(),
+            venue_a_funding_interval_hours: "8".to_owned(),
+            venue_a_next_funding_time_ms: "1779624000000".to_owned(),
+            venue_b_bid: "0.0273".to_owned(),
+            venue_b_ask: "0.0274".to_owned(),
+            venue_b_bid_qty: "26302".to_owned(),
+            venue_b_ask_qty: "59008".to_owned(),
+            venue_b_bid_depth: signal_depth_from_top_strings("0.0273", "26302"),
+            venue_b_ask_depth: signal_depth_from_top_strings("0.0274", "59008"),
+            venue_b_mark_price: "0.0273".to_owned(),
+            venue_b_index_price: "0.0272524900485994".to_owned(),
+            venue_b_funding_rate: "0.0001".to_owned(),
+            venue_b_funding_interval_hours: "8".to_owned(),
+            venue_b_next_funding_time_ms: "1779624000000".to_owned(),
+            funding_interval_hours: "8".to_owned(),
+            long_venue_family: Some("bybit".to_owned()),
+            short_venue_family: Some("bitget".to_owned()),
+            gross_funding_spread_bps: Some("28".to_owned()),
+            total_cost_bps: Some("15".to_owned()),
+            net_funding_bps: Some("13".to_owned()),
+            expected_funding_usd: Some("0.117".to_owned()),
+            is_candidate: true,
+            reason: None,
+            source_status: "complete".to_owned(),
+            product_tags: funding_arb_product_tags_for_symbol("DRIFTUSDT"),
+        };
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: "90.00".to_owned(),
+            taker_fee_bps: 5,
+            slippage_buffer_bps: 5,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: 5,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("bybit bitget spec");
+        let events = funding_arb_monitor_row_to_normalized_events(&spec, &row, ingested_at)
+            .expect("candidate row converts to normalized events");
+
+        let report = run_funding_arb_guarded_dry_run_from_normalized_events(
+            replay.config(),
+            &spec,
+            events,
+            ingested_at,
+        )
+        .expect("guarded dry-run report");
+
+        assert!(report.signal_allowed);
+        assert_ne!(report.risk_decision, "NoCandidate");
+        assert_eq!(report.dispatch_request_count, 2);
+        assert_eq!(report.strategy_rejection_reason, None);
+        assert_eq!(report.strategy_rejection_detail, None);
     }
 
     #[test]
