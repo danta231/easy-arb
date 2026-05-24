@@ -19181,6 +19181,22 @@ fn format_scaled_atoms_trimmed(atoms: i128, scale: u32) -> String {
 }
 
 #[cfg(feature = "live-exec")]
+fn push_funding_arb_live_pre_dispatch_blocking_reason(
+    blocking_reasons: &mut Vec<String>,
+    stage: &str,
+    result: RuntimeResult<()>,
+) -> RuntimeResult<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(RuntimeError::LiveMarketData { message }) => {
+            blocking_reasons.push(format!("{stage} blocked dispatch: {message}"));
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn build_funding_perp_live_adapter(
     planned: &PlannedSubmitOrder,
     options: &FundingArbGuardedLiveCanaryOnceOptions,
@@ -37060,58 +37076,72 @@ fn run_funding_arb_guarded_live_canary_once_live(
                 .ok_or_else(|| RuntimeError::UnsafeConfig {
                     message: "funding arb canary dispatch plan is missing".to_owned(),
                 })?;
-        align_funding_arb_dispatch_plan_quantities(dispatch_plan)?;
-        apply_funding_arb_binance_position_side(
-            dispatch_plan,
-            &row.symbol,
-            options
-                .dry_run
-                .private_position_raw_snapshot_path
-                .as_deref(),
+        push_funding_arb_live_pre_dispatch_blocking_reason(
+            &mut blocking_reasons,
+            "funding arb live quantity step guard",
+            align_funding_arb_dispatch_plan_quantities(dispatch_plan),
         )?;
-        apply_funding_arb_bybit_position_side(
-            dispatch_plan,
-            &row.symbol,
-            options
-                .dry_run
-                .private_position_raw_snapshot_path
-                .as_deref(),
-        )?;
-        apply_funding_arb_okx_position_side(
-            dispatch_plan,
-            &row.symbol,
-            options
-                .dry_run
-                .private_position_raw_snapshot_path
-                .as_deref(),
-        )?;
-        apply_funding_arb_bitget_position_side(
-            dispatch_plan,
-            &row.symbol,
-            options
-                .dry_run
-                .private_position_raw_snapshot_path
-                .as_deref(),
-        )?;
-        apply_funding_arb_aster_position_side(
-            dispatch_plan,
-            &row.symbol,
-            options
-                .dry_run
-                .private_position_raw_snapshot_path
-                .as_deref(),
-        )?;
-        apply_funding_arb_entry_time_in_force_ioc(
-            dispatch_plan,
-            options.dry_run.slippage_buffer_bps,
-        )?;
-        if let Some(reason) = funding_arb_live_dispatch_affordability_blocking_reason(
-            &dry_run.private_accounts,
-            dispatch_plan,
-            options.dry_run.taker_fee_bps,
-            options.dry_run.slippage_buffer_bps,
-        )? {
-            blocking_reasons.push(reason);
+        if blocking_reasons.is_empty() {
+            apply_funding_arb_binance_position_side(
+                dispatch_plan,
+                &row.symbol,
+                options
+                    .dry_run
+                    .private_position_raw_snapshot_path
+                    .as_deref(),
+            )?;
+            apply_funding_arb_bybit_position_side(
+                dispatch_plan,
+                &row.symbol,
+                options
+                    .dry_run
+                    .private_position_raw_snapshot_path
+                    .as_deref(),
+            )?;
+            apply_funding_arb_okx_position_side(
+                dispatch_plan,
+                &row.symbol,
+                options
+                    .dry_run
+                    .private_position_raw_snapshot_path
+                    .as_deref(),
+            )?;
+            apply_funding_arb_bitget_position_side(
+                dispatch_plan,
+                &row.symbol,
+                options
+                    .dry_run
+                    .private_position_raw_snapshot_path
+                    .as_deref(),
+            )?;
+            apply_funding_arb_aster_position_side(
+                dispatch_plan,
+                &row.symbol,
+                options
+                    .dry_run
+                    .private_position_raw_snapshot_path
+                    .as_deref(),
+            )?;
+        }
+        if blocking_reasons.is_empty() {
+            push_funding_arb_live_pre_dispatch_blocking_reason(
+                &mut blocking_reasons,
+                "funding arb live IOC price guard",
+                apply_funding_arb_entry_time_in_force_ioc(
+                    dispatch_plan,
+                    options.dry_run.slippage_buffer_bps,
+                ),
+            )?;
+        }
+        if blocking_reasons.is_empty() {
+            if let Some(reason) = funding_arb_live_dispatch_affordability_blocking_reason(
+                &dry_run.private_accounts,
+                dispatch_plan,
+                options.dry_run.taker_fee_bps,
+                options.dry_run.slippage_buffer_bps,
+            )? {
+                blocking_reasons.push(reason);
+            }
         }
         if blocking_reasons.is_empty() {
             let signing_policy = signing_policy_from_config(&config)?;
@@ -63265,6 +63295,48 @@ mod tests {
             dispatch_plan.requests[1].request.quantity.to_string(),
             "1870"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_live_pre_dispatch_market_data_error_blocks_dispatch() {
+        let mut blocking_reasons = Vec::new();
+
+        push_funding_arb_live_pre_dispatch_blocking_reason(
+            &mut blocking_reasons,
+            "funding arb live quantity step guard",
+            Err(RuntimeError::LiveMarketData {
+                message: "order quantity 0.97151307 is below venue quantity step 1".to_owned(),
+            }),
+        )
+        .expect("market data pre-dispatch errors become blocking reasons");
+
+        assert_eq!(
+            blocking_reasons,
+            vec![
+                "funding arb live quantity step guard blocked dispatch: order quantity 0.97151307 is below venue quantity step 1"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_live_pre_dispatch_config_error_remains_fatal() {
+        let mut blocking_reasons = Vec::new();
+        let result = push_funding_arb_live_pre_dispatch_blocking_reason(
+            &mut blocking_reasons,
+            "funding arb live quantity step guard",
+            Err(RuntimeError::UnsafeConfig {
+                message: "missing dispatch plan".to_owned(),
+            }),
+        );
+
+        assert!(blocking_reasons.is_empty());
+        assert!(matches!(
+            result,
+            Err(RuntimeError::UnsafeConfig { message }) if message == "missing dispatch plan"
+        ));
     }
 
     #[test]
