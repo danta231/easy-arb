@@ -14679,6 +14679,52 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bitget_usdt_futures_adapter_maps_hedge_close_without_reduce_only() {
+        let mut adapter = live::BitgetUsdtFuturesExecAdapter::new(
+            live::BitgetExecConfig::usdt_futures(
+                venue("venue:BITGET-USDT-FUTURES"),
+                account("account:bitget-unit"),
+                "https://api.bitget.com",
+                bitget_signing_policy("kms-policy/bitget-usdt-futures-submit-unit"),
+            )
+            .unwrap()
+            .with_trade_side("close")
+            .unwrap(),
+            bitget_test_signer(1_700_000_000_123),
+            RecordingBitgetTransport::ok(
+                200,
+                r#"{"code":"00000","msg":"success","requestTime":1700000000124,"data":{"orderId":"1234567894","clientOid":"bitgetCloseLong1"}}"#,
+            ),
+        )
+        .unwrap();
+
+        adapter
+            .submit_order(
+                SubmitOrderRequest::new(
+                    venue("venue:BITGET-USDT-FUTURES"),
+                    account("account:bitget-unit"),
+                    instrument("inst:BITGET:FIDAUSDT:USDT-FUTURES"),
+                    OrderSide::Buy,
+                    MutableOrderType::Limit,
+                    quantity("2457").unwrap(),
+                    Some(price("0.03679").unwrap()),
+                    Some(OrderId::new("bitgetCloseLong1").unwrap()),
+                    IdempotencyKey::new("idem:bitget:usdt-futures:close-long").unwrap(),
+                )
+                .with_time_in_force(MutableTimeInForce::Ioc)
+                .with_position_side(PerpPositionSide::Long),
+            )
+            .expect("signed Bitget hedge close order dispatches");
+
+        let call = &adapter.transport().calls[0];
+        assert!(call.body.contains(r#""side":"buy""#));
+        assert!(call.body.contains(r#""tradeSide":"close""#));
+        assert!(call.body.contains(r#""force":"ioc""#));
+        assert!(!call.body.contains(r#""reduceOnly":"#));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn bitget_usdt_futures_adapter_applies_symbol_quantity_step_without_trade_side() {
         let mut adapter = live::BitgetUsdtFuturesExecAdapter::new(
             live::BitgetExecConfig::usdt_futures(

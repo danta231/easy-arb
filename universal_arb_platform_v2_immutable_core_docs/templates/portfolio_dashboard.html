@@ -99,6 +99,100 @@
       font-variant-numeric: tabular-nums;
     }
     #positions-table { min-width: 1760px; }
+    .position-groups {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 330px));
+      gap: 12px;
+    }
+    .position-card {
+      min-width: 0;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: #141618;
+      overflow: hidden;
+    }
+    .position-card-head {
+      display: grid;
+      gap: 7px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line-soft);
+      background: #1a1d20;
+    }
+    .position-title {
+      min-width: 0;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 7px;
+    }
+    .position-title strong { font-size: 15px; font-weight: 650; }
+    .position-strategy {
+      max-width: 100%;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .venue-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .venue-tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 2px 7px;
+      border: 1px solid rgba(215, 178, 93, .35);
+      border-radius: 999px;
+      color: #ead18f;
+      background: rgba(215, 178, 93, .08);
+      font-size: 12px;
+    }
+    .position-pnl {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .position-pnl strong {
+      color: var(--text);
+      font-weight: 700;
+    }
+    .position-pnl .pnl-value.positive { color: var(--good); }
+    .position-pnl .pnl-value.negative { color: var(--bad); }
+    .position-lines {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .position-line {
+      display: grid;
+      grid-template-columns: 80px minmax(0, 1fr);
+      gap: 8px;
+      align-items: baseline;
+      min-width: 0;
+    }
+    .position-line dt {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .position-line dd {
+      margin: 0;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .leg-role {
+      color: var(--accent);
+      font-size: 12px;
+    }
     th, td {
       padding: 9px 10px;
       border-bottom: 1px solid var(--line-soft);
@@ -136,6 +230,13 @@
     .pill.stale_open, .pill.stale_unknown { color: var(--warn); border-color: rgba(228, 167, 83, .55); }
     .pill.unknown, .pill.missing { color: var(--bad); border-color: rgba(225, 109, 109, .55); }
     .empty { padding: 18px; color: var(--muted); }
+    .empty-card {
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: #141618;
+      padding: 18px;
+      color: var(--muted);
+    }
     #errors {
       display: none;
       margin-bottom: 14px;
@@ -152,6 +253,8 @@
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .toolbar { align-items: stretch; }
       label, button, input, select { width: 100%; }
+      .position-groups { grid-template-columns: 1fr; }
+      .position-line { grid-template-columns: 80px minmax(0, 1fr); }
     }
   </style>
 </head>
@@ -211,40 +314,16 @@
         <h2>所有仓位</h2>
         <span class="subtle" id="position-summary">0 行</span>
       </div>
-      <div class="table-wrap">
-        <table id="positions-table">
-          <thead>
-            <tr>
-              <th>币种</th>
-              <th>套利策略</th>
-              <th>交易所</th>
-              <th>手续费</th>
-              <th>累计持仓</th>
-              <th>开仓均价</th>
-              <th>清仓均价</th>
-              <th>开/清价差(%)</th>
-              <th>实时费率</th>
-              <th>费率结算时间(hh:mm:ss)</th>
-              <th>开/清条件</th>
-              <th>仓位状态</th>
-              <th>仓位数量</th>
-              <th>仓位限额</th>
-              <th>账户</th>
-              <th>来源</th>
-            </tr>
-          </thead>
-          <tbody id="portfolio-position-rows"></tbody>
-        </table>
-      </div>
+      <div id="portfolio-position-groups" class="position-groups"></div>
     </section>
   </main>
   <script>
-    const state = { balances: [], positions: [] };
+    const state = { balances: [], positions: [], payloadSignature: "", refreshing: false };
     const LOCAL_TIME_ZONE = "Asia/Shanghai";
     const LOCAL_TIME_ZONE_LABEL = "UTC+8";
+    const REFRESH_INTERVAL_MS = 15000;
     const fields = {
-      balances: ["venue_family", "account_id", "asset", "available", "margin_balance", "maintenance_margin", "margin_buffer", "free", "locked", "reserved", "unsettled", "source_status"],
-      positions: ["coin", "strategy", "venue_family", "fee", "accumulated_position", "open_average_price", "close_average_price", "open_close_spread_pct", "realtime_funding_rate", "funding_settlement_time", "open_close_condition", "position_status", "position_quantity", "position_limit", "account_id", "source"]
+      balances: ["venue_family", "account_id", "asset", "available", "margin_balance", "maintenance_margin", "margin_buffer", "free", "locked", "reserved", "unsettled", "source_status"]
     };
     function text(value) {
       if (value === null || value === undefined || value === "") return "-";
@@ -252,6 +331,46 @@
     }
     function escapeHtml(value) {
       return text(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    }
+    function parseNumeric(value) {
+      const raw = String(value ?? "").replace(/,/g, "").trim();
+      if (!raw || raw === "-") return null;
+      const match = raw.match(/[+-]?\d+(?:\.\d+)?/);
+      if (!match) return null;
+      const parsed = Number(match[0]);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    function formatNumber(value, digits = 4) {
+      if (!Number.isFinite(value)) return "-";
+      return value.toFixed(digits).replace(/\.?0+$/, "");
+    }
+    function formatDollar(value, digits = 4, signed = false) {
+      if (!Number.isFinite(value)) return "-";
+      const sign = signed ? (value >= 0 ? "+" : "-") : (value < 0 ? "-" : "");
+      return `${sign}$${formatNumber(Math.abs(value), digits)}`;
+    }
+    function dollarizeText(value) {
+      const raw = text(value);
+      if (raw === "-") return raw;
+      return raw
+        .replace(/([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*(USDT|USD)\b/gi, "$$$1")
+        .replace(/\b(USDT|USD)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))/gi, "$$$2")
+        .replace(/\b(USDT|USD)\b/gi, "$");
+    }
+    function formatSignedPercent(decimalRate) {
+      const value = decimalRate * 100;
+      return `${formatNumber(value, 4)}%`;
+    }
+    function legDirection(row) {
+      const role = String(row.position_leg_role || "").toLowerCase();
+      if (role.includes("short") || role.includes("sell")) return -1;
+      if (role.includes("long") || role.includes("buy")) return 1;
+      return null;
+    }
+    function applyLegDirection(row, notional, fallback) {
+      const direction = legDirection(row);
+      if (direction === null) return fallback;
+      return direction * Math.abs(notional);
     }
     function parsedTimestampMs(value) {
       const raw = String(value ?? "").trim();
@@ -274,11 +393,160 @@
       });
       return `${rendered} ${LOCAL_TIME_ZONE_LABEL}`;
     }
-    function rowMatches(row) {
+    async function requestJson(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const body = await response.text();
+      let data;
+      try {
+        data = JSON.parse(body);
+      } catch (error) {
+        throw new Error(`invalid json from ${url}: ${error.message}`);
+      }
+      if (!response.ok) {
+        throw new Error(data.error || `http ${response.status}`);
+      }
+      return data;
+    }
+    function showSourceErrors(messages) {
+      const errors = document.getElementById("errors");
+      if (messages && messages.length) {
+        errors.style.display = "block";
+        errors.innerHTML = messages.map(escapeHtml).join("<br>");
+      } else {
+        errors.style.display = "none";
+        errors.textContent = "";
+      }
+    }
+    function showRefreshError(error) {
+      document.getElementById("status").textContent = "unknown";
+      document.getElementById("status").className = "status-unknown";
+      showSourceErrors([`请求失败：${error.message}`]);
+    }
+    function nextLocalTimeTargetMs(value) {
+      const raw = String(value ?? "").trim();
+      const match = raw.match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+      if (!match) return null;
+      const now = new Date();
+      const rendered = new Intl.DateTimeFormat("en-CA", {
+        timeZone: LOCAL_TIME_ZONE,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+      }).format(now);
+      const [year, month, day] = rendered.split("-").map(Number);
+      const target = new Date(year, month - 1, day, Number(match[1]), Number(match[2]), Number(match[3] || 0));
+      if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+      return target.getTime();
+    }
+    function settlementTargetMs(value) {
+      const raw = String(value ?? "").trim();
+      if (!raw || raw === "-") return null;
+      if (/^\d{13}$/.test(raw)) return Number(raw);
+      if (/^\d{10}$/.test(raw)) return Number(raw) * 1000;
+      const labeledEpoch = raw.match(/(?:^|:)(\d{13})(?:$|\D)/);
+      if (labeledEpoch) return Number(labeledEpoch[1]);
+      const localTarget = nextLocalTimeTargetMs(raw);
+      if (localTarget !== null) return localTarget;
+      const parsed = parsedTimestampMs(raw);
+      return parsed;
+    }
+    function formatDuration(ms) {
+      const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      return [hours, minutes, seconds].map((part) => String(part).padStart(2, "0")).join(":");
+    }
+    function formatSettlement(row) {
+      const raw = row.funding_settlement_time;
+      const targetMs = settlementTargetMs(raw);
+      if (targetMs === null) return text(raw);
+      const target = new Date(targetMs).toLocaleTimeString("zh-CN", {
+        timeZone: LOCAL_TIME_ZONE,
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false
+      });
+      return target;
+    }
+    function openSignedNotional(row) {
+      const quantity = parseNumeric(row.position_quantity);
+      const price = parseNumeric(row.open_average_price);
+      if (quantity !== null && price !== null) {
+        const notional = quantity * price;
+        return applyLegDirection(row, notional, notional);
+      }
+      const notional = Math.abs(parseNumeric(row.accumulated_position) ?? 0);
+      if (!notional) return null;
+      return applyLegDirection(row, notional, null);
+    }
+    function feeAmount(row) {
+      const value = text(row.fee);
+      if (value !== "-" && !/%|\bbps\b/i.test(value)) {
+        const parsed = parseNumeric(value);
+        if (parsed !== null) return Math.abs(parsed);
+      }
+      if (value === "-" || /%|\bbps\b/i.test(value)) {
+        const feeBps = parseNumeric(row.fee_rate_bps);
+        const notional = Math.abs(openSignedNotional(row) ?? parseNumeric(row.accumulated_position) ?? 0);
+        if (feeBps !== null && notional > 0) {
+          return Math.abs(notional * feeBps / 10000);
+        }
+      }
+      return null;
+    }
+    function estimatedCloseFeeAmount(row) {
+      const feeBps = parseNumeric(row.fee_rate_bps);
+      const notional = Math.abs(signedNotional(row) ?? parseNumeric(row.accumulated_position) ?? 0);
+      if (feeBps === null || notional <= 0) return null;
+      return Math.abs(notional * feeBps / 10000);
+    }
+    function formatFee(row) {
+      const value = text(row.fee);
+      const amount = feeAmount(row);
+      if (amount !== null) {
+        const estimated = value === "-" || /%|\bbps\b/i.test(value);
+        return `${formatDollar(amount, estimated ? 6 : 8)}${estimated ? "(估)" : ""}`;
+      }
+      return dollarizeText(value);
+    }
+    function fundingRateDecimal(value) {
+      const raw = String(value ?? "").trim();
+      if (!raw || raw === "-") return null;
+      const numeric = parseNumeric(raw.includes(":") ? raw.split(":").pop() : raw);
+      if (numeric === null) return null;
+      if (raw.includes("%") || Math.abs(numeric) > 0.2) return numeric / 100;
+      return numeric;
+    }
+    function signedNotional(row) {
+      const quantity = parseNumeric(row.position_quantity);
+      const price = parseNumeric(row.close_average_price) ?? parseNumeric(row.open_average_price);
+      if (quantity !== null && price !== null) {
+        const notional = quantity * price;
+        return applyLegDirection(row, notional, notional);
+      }
+      const notional = Math.abs(parseNumeric(row.accumulated_position) ?? 0);
+      if (!notional) return null;
+      return applyLegDirection(row, notional, null);
+    }
+    function fundingCashflow(row) {
+      const decimalRate = fundingRateDecimal(row.realtime_funding_rate);
+      const notional = signedNotional(row);
+      if (decimalRate === null || notional === null) return null;
+      return -notional * decimalRate;
+    }
+    function formatFundingRate(row) {
+      const decimalRate = fundingRateDecimal(row.realtime_funding_rate);
+      if (decimalRate === null) return text(row.realtime_funding_rate);
+      const cashflow = fundingCashflow(row);
+      if (cashflow === null) return formatSignedPercent(decimalRate);
+      return `${formatSignedPercent(decimalRate)}(${formatDollar(cashflow, 4, true)})`;
+    }
+    function rowMatches(row, options = {}) {
       const venue = document.getElementById("venue-filter").value;
       const symbol = document.getElementById("symbol-filter").value.trim().toUpperCase();
       const openOnly = document.getElementById("open-only").checked;
-      if (venue && row.venue_family !== venue) return false;
+      if (!options.ignoreVenue && venue && row.venue_family !== venue) return false;
       if (symbol) {
         const haystack = `${row.coin || ""} ${row.symbol || ""} ${row.asset || ""}`.toUpperCase();
         if (!haystack.includes(symbol)) return false;
@@ -308,6 +576,161 @@
       }).join("");
       return filtered.length;
     }
+    function positionGroupKey(row, index) {
+      const groupId = row.position_group_id || row.position_group_label;
+      if (groupId) return `group:${groupId}`;
+      if (isFundingArbPosition(row) && (row.symbol || row.coin)) {
+        return `funding-arb:${row.strategy || ""}:${row.symbol || row.coin || ""}:${normalizedRiskStatus(row.position_status)}`;
+      }
+      return `single:${row.strategy || ""}:${row.symbol || row.coin || ""}:${row.venue_family || ""}:${row.account_id || ""}:${index}`;
+    }
+    function isFundingArbPosition(row) {
+      const value = `${row.strategy || ""} ${row.source || ""} ${row.account_id || ""} ${row.position_group_label || ""}`.toLowerCase();
+      return value.includes("funding-arb") || value.includes("funding arb");
+    }
+    function normalizedRiskStatus(status) {
+      return isOpenRiskStatus(status) ? "open" : text(status).toLowerCase();
+    }
+    function normalizedVenueName(value) {
+      return text(value).trim().toLowerCase();
+    }
+    function venueOrderFromGroupLabel(label) {
+      const parts = text(label).split(":").map(normalizedVenueName).filter(Boolean);
+      return parts.length >= 2 ? [parts[0], parts[1]] : [];
+    }
+    function compareGroupRows(group, left, right) {
+      const venueOrder = venueOrderFromGroupLabel(group.label);
+      const leftIndex = venueOrder.indexOf(normalizedVenueName(left.venue_family));
+      const rightIndex = venueOrder.indexOf(normalizedVenueName(right.venue_family));
+      if (leftIndex !== rightIndex) {
+        if (leftIndex === -1) return 1;
+        if (rightIndex === -1) return -1;
+        return leftIndex - rightIndex;
+      }
+      return text(left.venue_family).localeCompare(text(right.venue_family));
+    }
+    function groupedPositions(rows) {
+      const groups = new Map();
+      rows.forEach((row, index) => {
+        const key = positionGroupKey(row, index);
+        if (!groups.has(key)) {
+          groups.set(key, {
+            key,
+            label: row.position_group_label || row.position_group_id || "",
+            rows: []
+          });
+        }
+        groups.get(key).rows.push(row);
+      });
+      return Array.from(groups.values()).map((group) => {
+        group.rows.sort((left, right) => compareGroupRows(group, left, right));
+        return group;
+      });
+    }
+    function groupMatches(group) {
+      const venue = document.getElementById("venue-filter").value;
+      if (venue && !group.rows.some((row) => row.venue_family === venue)) return false;
+      return group.rows.some((row) => rowMatches(row, { ignoreVenue: true }));
+    }
+    function uniqueValues(rows, key) {
+      return Array.from(new Set(rows.map((row) => row[key]).filter(Boolean)));
+    }
+    function renderStatusPills(rows) {
+      return uniqueValues(rows, "position_status").map((status) => {
+        const klass = String(status || "unknown").toLowerCase();
+        return `<span class="pill ${escapeHtml(klass)}">${escapeHtml(status)}</span>`;
+      }).join("");
+    }
+    function renderVenueTags(rows) {
+      return uniqueValues(rows, "venue_family").map((venue) => `<span class="venue-tag">${escapeHtml(venue)}</span>`).join("");
+    }
+    function settledFundingAmount(row) {
+      return parseNumeric(row.settled_funding_usd);
+    }
+    function sumNumbers(values) {
+      return values.reduce((sum, value) => Number.isFinite(value) ? sum + value : sum, 0);
+    }
+    function groupPnl(rows) {
+      const settledFunding = rows.map(settledFundingAmount).filter((value) => value !== null);
+      const settledFundingTotal = sumNumbers(settledFunding);
+      const settledPaid = sumNumbers(settledFunding.map((value) => value < 0 ? Math.abs(value) : 0));
+      const openFees = sumNumbers(rows.map(feeAmount).filter((value) => value !== null));
+      const closeFees = sumNumbers(rows.map(estimatedCloseFeeAmount).filter((value) => value !== null));
+      const expectedFunding = sumNumbers(rows.map(fundingCashflow).filter((value) => value !== null));
+      return {
+        realized: settledFundingTotal - openFees,
+        projected: expectedFunding - settledPaid - openFees - closeFees
+      };
+    }
+    function pnlClass(value) {
+      if (value > 0) return "positive";
+      if (value < 0) return "negative";
+      return "";
+    }
+    function renderGroupPnl(rows) {
+      const pnl = groupPnl(rows);
+      return `<div class="position-pnl">
+        <span>当前币种已实现盈亏 <strong class="mono pnl-value ${pnlClass(pnl.realized)}">${escapeHtml(formatDollar(pnl.realized, 4, true))}</strong></span>
+        <span>预计盈亏 <strong class="mono pnl-value ${pnlClass(pnl.projected)}">${escapeHtml(formatDollar(pnl.projected, 4, true))}</strong></span>
+      </div>`;
+    }
+    function groupTitle(group) {
+      const first = group.rows[0] || {};
+      const symbol = first.symbol || first.coin || "unknown";
+      const legCount = group.rows.length;
+      return `${symbol} · ${legCount}腿`;
+    }
+    function legLabel(row) {
+      const raw = String(row.position_leg_role || "").trim().toLowerCase();
+      if (raw.includes("short") || raw === "sell") return "short";
+      if (raw.includes("long") || raw === "buy") return "long";
+      return text(row.position_leg_role).toLowerCase();
+    }
+    function joinedValue(rows, formatter) {
+      return rows.map(formatter).join(" / ");
+    }
+    function renderLine(label, value) {
+      return `<div class="position-line"><dt>${escapeHtml(label)}</dt><dd class="mono" title="${escapeHtml(value)}">${escapeHtml(value)}</dd></div>`;
+    }
+    function renderPositionLines(group) {
+      const rows = group.rows;
+      const lines = [
+        ["开仓方向", joinedValue(rows, legLabel)],
+        ["手续费", joinedValue(rows, formatFee)],
+        ["累计持仓", joinedValue(rows, (row) => dollarizeText(row.accumulated_position))],
+        ["开仓均价", joinedValue(rows, (row) => text(row.open_average_price))],
+        ["当前价", joinedValue(rows, (row) => text(row.close_average_price))],
+        ["价差(%)", joinedValue(rows, (row) => text(row.open_close_spread_pct))],
+        ["实时费率", joinedValue(rows, formatFundingRate)],
+        ["结算时间", joinedValue(rows, formatSettlement)],
+        ["仓位数量", joinedValue(rows, (row) => dollarizeText(row.position_quantity))],
+      ];
+      return `<dl class="position-lines">${lines.map(([label, value]) => renderLine(label, value)).join("")}</dl>`;
+    }
+    function renderPositionGroups(rows) {
+      const container = document.getElementById("portfolio-position-groups");
+      const groups = groupedPositions(rows).filter(groupMatches);
+      if (groups.length === 0) {
+        container.innerHTML = `<div class="empty-card">无数据</div>`;
+        return { groupCount: 0, legCount: 0 };
+      }
+      container.innerHTML = groups.map((group) => {
+        return `<article class="position-card">
+          <div class="position-card-head">
+            <div>
+              <div class="position-title">
+                <strong>${escapeHtml(groupTitle(group))}</strong>
+                ${renderStatusPills(group.rows)}
+              </div>
+              ${renderGroupPnl(group.rows)}
+            </div>
+            <div class="venue-tags">${renderVenueTags(group.rows)}</div>
+          </div>
+          <div class="position-card-body">${renderPositionLines(group)}</div>
+        </article>`;
+      }).join("");
+      return { groupCount: groups.length, legCount: groups.reduce((count, group) => count + group.rows.length, 0) };
+    }
     function updateVenueFilter(rows) {
       const select = document.getElementById("venue-filter");
       const current = select.value;
@@ -319,13 +742,23 @@
       const allRows = state.balances.concat(state.positions);
       updateVenueFilter(allRows);
       const balanceCount = renderTable("portfolio-balance-rows", state.balances, fields.balances);
-      const positionCount = renderTable("portfolio-position-rows", state.positions, fields.positions);
+      const positionCounts = renderPositionGroups(state.positions);
       document.getElementById("balance-summary").textContent = `${balanceCount} 行`;
-      document.getElementById("position-summary").textContent = `${positionCount} 行`;
+      document.getElementById("position-summary").textContent = `${positionCounts.groupCount} 批 / ${positionCounts.legCount} 腿`;
     }
-    async function refresh(endpoint = "/api/portfolio/status") {
-      const response = await fetch(endpoint, { cache: "no-store" });
-      const data = await response.json();
+    function snapshotSignature(data) {
+      return JSON.stringify({
+        status: data.status || "unknown",
+        updated_at: data.updated_at || "",
+        balance_count: data.balance_count ?? state.balances.length,
+        position_count: data.position_count ?? state.positions.length,
+        source_error_count: data.source_error_count ?? 0,
+        source_errors: data.source_errors || [],
+        balances: state.balances,
+        positions: state.positions
+      });
+    }
+    function applySnapshot(data) {
       if (data.balances) state.balances = data.balances;
       if (data.positions) state.positions = data.positions;
       document.getElementById("status").textContent = data.status || "unknown";
@@ -334,25 +767,33 @@
       document.getElementById("position-count").textContent = data.position_count ?? state.positions.length;
       document.getElementById("source-error-count").textContent = data.source_error_count ?? 0;
       document.getElementById("updated-at").textContent = localTimestamp(data.updated_at);
-      const errors = document.getElementById("errors");
-      if (data.source_errors && data.source_errors.length) {
-        errors.style.display = "block";
-        errors.innerHTML = data.source_errors.map(escapeHtml).join("<br>");
-      } else {
-        errors.style.display = "none";
-        errors.textContent = "";
-      }
+      showSourceErrors(data.source_errors || []);
+      const signature = snapshotSignature(data);
+      if (signature === state.payloadSignature) return;
+      state.payloadSignature = signature;
       render();
     }
-    document.getElementById("refresh").addEventListener("click", () => refresh());
+    async function refresh(endpoint = "/api/portfolio/status") {
+      if (state.refreshing) return;
+      state.refreshing = true;
+      try {
+        applySnapshot(await requestJson(endpoint));
+      } finally {
+        state.refreshing = false;
+      }
+    }
+    function refreshSafely(endpoint = "/api/portfolio/status") {
+      refresh(endpoint).catch(showRefreshError);
+    }
+    document.getElementById("refresh").addEventListener("click", () => refreshSafely());
     document.getElementById("venue-filter").addEventListener("change", render);
     document.getElementById("symbol-filter").addEventListener("input", render);
     document.getElementById("open-only").addEventListener("change", render);
     document.querySelectorAll("[data-endpoint]").forEach((button) => {
-      button.addEventListener("click", () => refresh(button.dataset.endpoint || "/api/portfolio/status"));
+      button.addEventListener("click", () => refreshSafely(button.dataset.endpoint || "/api/portfolio/status"));
     });
-    setInterval(() => refresh(), 3000);
-    refresh();
+    setInterval(refreshSafely, REFRESH_INTERVAL_MS);
+    refreshSafely();
   </script>
 </body>
 </html>

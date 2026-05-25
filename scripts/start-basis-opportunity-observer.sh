@@ -2011,27 +2011,15 @@ check_funding_arb_resident_unknown_startup_risk() {
   clear_funding_arb_startup_block_report
 }
 
-funding_arb_startup_open_position_recovery_can_continue() {
-  local summary_path="$1"
+funding_arb_startup_open_positions_are_supervisable() {
+  local open_positions_json="$1"
 
-  [[ -s "${summary_path}" ]] || return 1
-  jq -e '
-    def as_count:
-      if type == "number" then .
-      elif type == "string" then (tonumber? // 0)
-      elif type == "array" then length
-      else 0 end;
-
-    (.phase // "") == "halted"
-    and (((.unknown_position_count // 0) | as_count) == 0)
-    and (((.open_position_count // 0) | as_count) > 0)
-    and ((.dispatch_attempted // false) == false)
-    and (
-      (.halt_reason // "") == "funding arb existing position recovery cycle completed; resident live stopped before new entries"
-      or (.halt_reason // "") == "funding arb exit-only cycle completed; resident live stopped before new entries"
-      or (.halt_reason // "") == "max cycles reached"
-    )
-  ' "${summary_path}" >/dev/null
+  printf '%s\n' "${open_positions_json}" | jq -e '
+    (type == "array")
+    and (length > 0)
+    and all(.[]; ((.value.recovered_from_unknown // false) == false)
+      and (((.value.position_state_path // "") | tostring | length) > 0))
+  ' >/dev/null
 }
 
 run_funding_arb_startup_unknown_recovery_once() {
@@ -2043,6 +2031,8 @@ run_funding_arb_startup_unknown_recovery_once() {
   local unknown_count
   local initial_open_count
   local open_count=0
+  local summary_open_count=0
+  local report_open_count=0
   local -a args
   local -a hyperliquid_asset_id_args
   local asset_id_arg
@@ -2108,12 +2098,18 @@ run_funding_arb_startup_unknown_recovery_once() {
 
   unknowns_json="$(funding_arb_unresolved_unknowns_json)"
   unknown_count="$(printf '%s\n' "${unknowns_json}" | jq 'length')"
+  open_positions_json="$(funding_arb_open_positions_json)"
+  open_count="$(printf '%s\n' "${open_positions_json}" | jq 'length')"
   if [[ -s "${summary_path}" ]]; then
     refresh_funding_arb_summary_position_counts "${summary_path}"
-    open_count="$(jq -r '(.open_position_count // 0) | tonumber' "${summary_path}" 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+    summary_open_count="$(jq -r '(.open_position_count // 0) | tonumber' "${summary_path}" 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+  fi
+  report_open_count="${open_count}"
+  if (( summary_open_count > report_open_count )); then
+    report_open_count="${summary_open_count}"
   fi
 
-  if (( unknown_count == 0 && open_count == 0 )); then
+  if (( unknown_count == 0 && report_open_count == 0 )); then
     FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=0
     FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED=0
     FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED=0
@@ -2122,21 +2118,19 @@ run_funding_arb_startup_unknown_recovery_once() {
     return 0
   fi
 
-  if (( unknown_count == 0 && open_count > 0 )) \
-    && [[ "${FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED:-0}" == "1" ]] \
-    && [[ "${FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED:-0}" != "1" ]] \
-    && funding_arb_startup_open_position_recovery_can_continue "${summary_path}"; then
+  if (( unknown_count == 0 && report_open_count > 0 )) \
+    && funding_arb_startup_open_positions_are_supervisable "${open_positions_json}"; then
     FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=0
     FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED=0
     FUNDING_ARB_STARTUP_OPEN_POSITION_CONFIRMED=0
     FUNDING_ARB_STARTUP_OPEN_POSITION_CONTINUE=1
     clear_funding_arb_startup_block_report
-    echo "funding_arb_startup_open_position_supervision_continue open_count=${open_count} log=${log_file}"
+    echo "funding_arb_startup_open_position_supervision_continue open_count=${report_open_count} log=${log_file}"
     return 0
   fi
 
-  write_funding_arb_startup_block_report "unknown_recovery_left_residual_state" "${unknowns_json}" "" "${log_file}" "${unknown_count}" "${open_count}"
-  echo "error: funding-arb startup unknown recovery left residual state; unknown_count=${unknown_count} open_count=${open_count}; log=${log_file}" >&2
+  write_funding_arb_startup_block_report "unknown_recovery_left_residual_state" "${unknowns_json}" "" "${log_file}" "${unknown_count}" "${report_open_count}"
+  echo "error: funding-arb startup unknown recovery left residual state; unknown_count=${unknown_count} open_count=${report_open_count}; log=${log_file}" >&2
   return 1
 }
 

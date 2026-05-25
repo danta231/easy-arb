@@ -45,6 +45,7 @@ usage() {
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=1 # funding-arb 直接读取 perp/funding 公开源；0 表示复用 basis monitor status。
   ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=1 # 是否额外启动实盘 guard 专用 target WSS；启动不阻塞，真实下单前仍强制校验 Fresh quote。
+  ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE=1 # foreground live 失败时是否保留只读 dashboard/WSS 便于排查；停止用 scripts/stop-arb-runtime-live.sh。
   ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bybit WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL=BTC-USDT # CEX_WSS_SCOPE=custom 时的 OKX WSS monitor 订阅 symbol。
@@ -243,6 +244,7 @@ fi
 if [[ "${BUILD_FROM_CLI}" != "1" ]]; then
   BUILD="${ARB_RUNTIME_LIVE_BUILD:-${BUILD}}"
 fi
+KEEP_PREREQ_ON_LIVE_FAILURE="${ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE:-1}"
 case "${DETACH}" in
   0|1) ;;
   *) die "ARB_RUNTIME_LIVE_DETACH must be 0 or 1" ;;
@@ -250,6 +252,10 @@ esac
 case "${BUILD}" in
   0|1) ;;
   *) die "ARB_RUNTIME_LIVE_BUILD must be 0 or 1" ;;
+esac
+case "${KEEP_PREREQ_ON_LIVE_FAILURE}" in
+  0|1) ;;
+  *) die "ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE must be 0 or 1" ;;
 esac
 
 set_default_env() {
@@ -574,10 +580,16 @@ start_portfolio_dashboard() {
   reclaim_stale_runtime_port "portfolio-dashboard" "${PORTFOLIO_BIND}"
   echo "starting portfolio dashboard: http://${PORTFOLIO_BIND}/dashboard"
   echo "starting error logs dashboard: http://${PORTFOLIO_BIND}/errors"
-  nohup env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${args[@]}" >> "${log_file}" 2>&1 &
+  nohup "${args[@]}" >> "${log_file}" 2>&1 &
   pid="$!"
   printf '%s\n' "${pid}" > "${PORTFOLIO_PID_FILE}"
   echo "  pid=${pid} log=${log_file}"
+  sleep 1
+  if ! is_alive "${pid}"; then
+    echo "portfolio dashboard failed to stay running; last log lines:"
+    tail -n 40 "${log_file}" 2>/dev/null || true
+    die "portfolio dashboard failed to start"
+  fi
 }
 
 start_portfolio_private_readonly_snapshot() {
@@ -634,6 +646,12 @@ stop_portfolio_private_readonly_snapshot() {
     echo "TERM portfolio-private-readonly pid=${pid}"
     kill -TERM "${pid}" 2>/dev/null || true
   fi
+}
+
+cleanup_prereq_processes() {
+  stop_portfolio_dashboard
+  stop_portfolio_private_readonly_snapshot
+  stop_wss_monitors
 }
 
 refresh_funding_arb_summary_position_counts() {
@@ -822,7 +840,9 @@ cleanup_safe_stale_resident_locks() {
 cleanup_safe_stale_resident_locks
 
 if [[ "${DETACH}" != "1" ]]; then
-  trap 'stop_portfolio_dashboard; stop_portfolio_private_readonly_snapshot; stop_wss_monitors' EXIT
+  trap 'cleanup_prereq_processes' EXIT
+  trap 'cleanup_prereq_processes; exit 130' INT
+  trap 'cleanup_prereq_processes; exit 143' TERM
 fi
 
 start_portfolio_private_readonly_snapshot
@@ -995,4 +1015,16 @@ fi
 
 echo
 echo "starting arb-runtime live in foreground; press Ctrl-C to stop."
+set +e
 env "${LIVE_ENV[@]}" "${RUNTIME_BIN}" "${LIVE_ARGS[@]}"
+live_status="$?"
+set -e
+if [[ "${live_status}" != "0" && "${KEEP_PREREQ_ON_LIVE_FAILURE}" == "1" ]]; then
+  trap - EXIT INT TERM
+  echo
+  echo "arb-runtime live exited with status=${live_status}; keeping read-only dashboard/WSS processes running for inspection."
+  echo "stop them with:"
+  echo "  ARB_RUNTIME_LIVE_ROOT=${RUN_ROOT} ARB_RUNTIME_LIVE_PREREQ_ROOT=${PREREQ_ROOT} scripts/stop-arb-runtime-live.sh"
+  exit "${live_status}"
+fi
+exit "${live_status}"
