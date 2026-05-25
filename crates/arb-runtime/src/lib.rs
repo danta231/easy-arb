@@ -6667,7 +6667,7 @@ fn portfolio_positions_json(snapshot: &PortfolioDashboardSnapshot) -> String {
     )
 }
 
-const ERROR_LOG_MAX_ENTRIES: usize = 500;
+const ERROR_LOG_MAX_ENTRIES: usize = 10;
 const ERROR_LOG_MAX_ENTRIES_PER_SOURCE: usize = 120;
 const ERROR_LOG_MAX_SOURCE_FILES: usize = 80;
 const ERROR_LOG_MESSAGE_CHAR_LIMIT: usize = 2_000;
@@ -6718,11 +6718,15 @@ fn build_error_logs_snapshot(options: &PortfolioDashboardOptions) -> ErrorLogsSn
     }
 
     entries.sort_by(|left, right| {
-        right
-            .observed_at
-            .as_deref()
-            .unwrap_or("")
-            .cmp(left.observed_at.as_deref().unwrap_or(""))
+        error_log_timestamp_sort_key(right.observed_at.as_deref())
+            .cmp(&error_log_timestamp_sort_key(left.observed_at.as_deref()))
+            .then_with(|| {
+                right
+                    .observed_at
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(left.observed_at.as_deref().unwrap_or(""))
+            })
             .then_with(|| right.path.cmp(&left.path))
             .then_with(|| right.line_number.cmp(&left.line_number))
     });
@@ -7530,6 +7534,165 @@ fn timestamp_from_text_log_line(line: &str) -> Option<String> {
         .next()
         .filter(|value| value.contains('T') && value.contains(':'))
         .map(str::to_owned)
+}
+
+fn error_log_timestamp_sort_key(value: Option<&str>) -> Option<(i64, u32)> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(timestamp) = UtcTimestamp::parse_rfc3339_z(value) {
+        return Some((timestamp.unix_seconds(), timestamp.nanoseconds()));
+    }
+    parse_error_log_offset_timestamp(value)
+}
+
+fn parse_error_log_offset_timestamp(value: &str) -> Option<(i64, u32)> {
+    let (date_time, offset) = split_error_log_timestamp_offset(value)?;
+    let (date, time) = date_time.split_once('T')?;
+    let (year, month, day) = parse_error_log_date(date)?;
+    let (hour, minute, second, nanoseconds) = parse_error_log_time(time)?;
+    let offset_seconds = parse_error_log_offset_seconds(offset)?;
+
+    let local_seconds = error_log_days_from_civil(year, month, day)
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour * 3_600 + minute * 60 + second))?;
+    let utc_seconds = local_seconds.checked_sub(offset_seconds)?;
+    let timestamp = UtcTimestamp::from_unix_parts(utc_seconds, nanoseconds).ok()?;
+    Some((timestamp.unix_seconds(), timestamp.nanoseconds()))
+}
+
+fn split_error_log_timestamp_offset(value: &str) -> Option<(&str, &str)> {
+    let bytes = value.as_bytes();
+    if value.len() >= 6 {
+        let offset_start = value.len() - 6;
+        if matches!(bytes[offset_start], b'+' | b'-') && bytes[offset_start + 3] == b':' {
+            return Some(value.split_at(offset_start));
+        }
+    }
+    if value.len() >= 5 {
+        let offset_start = value.len() - 5;
+        if matches!(bytes[offset_start], b'+' | b'-') {
+            return Some(value.split_at(offset_start));
+        }
+    }
+    None
+}
+
+fn parse_error_log_offset_seconds(value: &str) -> Option<i64> {
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1_i64,
+        b'-' => -1_i64,
+        _ => return None,
+    };
+    let body = &value[1..];
+    let (hour, minute) = if body.len() == 5 && body.as_bytes()[2] == b':' {
+        (
+            parse_error_log_fixed_digits(&body[0..2])?,
+            parse_error_log_fixed_digits(&body[3..5])?,
+        )
+    } else if body.len() == 4 {
+        (
+            parse_error_log_fixed_digits(&body[0..2])?,
+            parse_error_log_fixed_digits(&body[2..4])?,
+        )
+    } else {
+        return None;
+    };
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(sign * i64::from(hour * 3_600 + minute * 60))
+}
+
+fn parse_error_log_date(value: &str) -> Option<(i32, u32, u32)> {
+    if value.len() != 10 || !value.is_ascii() {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year = parse_error_log_fixed_digits(&value[0..4])? as i32;
+    let month = parse_error_log_fixed_digits(&value[5..7])?;
+    let day = parse_error_log_fixed_digits(&value[8..10])?;
+    if month == 0 || month > 12 {
+        return None;
+    }
+    if day == 0 || day > error_log_days_in_month(year, month) {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn parse_error_log_time(value: &str) -> Option<(u32, u32, u32, u32)> {
+    if value.len() < 8 || !value.is_ascii() {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if bytes[2] != b':' || bytes[5] != b':' {
+        return None;
+    }
+    let hour = parse_error_log_fixed_digits(&value[0..2])?;
+    let minute = parse_error_log_fixed_digits(&value[3..5])?;
+    let second = parse_error_log_fixed_digits(&value[6..8])?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    let nanoseconds = if value.len() == 8 {
+        0
+    } else {
+        let fraction = value[8..].strip_prefix('.')?;
+        parse_error_log_fractional_nanos(fraction)?
+    };
+    Some((hour, minute, second, nanoseconds))
+}
+
+fn parse_error_log_fixed_digits(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok()
+}
+
+fn parse_error_log_fractional_nanos(value: &str) -> Option<u32> {
+    if value.is_empty() || value.len() > 9 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut nanoseconds = 0_u32;
+    for byte in value.bytes() {
+        nanoseconds = nanoseconds * 10 + u32::from(byte - b'0');
+    }
+    for _ in value.len()..9 {
+        nanoseconds *= 10;
+    }
+    Some(nanoseconds)
+}
+
+fn error_log_days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if error_log_is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn error_log_is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn error_log_days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn truncate_for_json(value: &str, max_chars: usize) -> String {
@@ -62470,6 +62633,35 @@ mod tests {
     }
 
     #[test]
+    fn error_logs_json_sorts_mixed_timezone_timestamps_by_instant() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("logs dir");
+        write_utf8(
+            logs_dir.join("realtime-feedback.log"),
+            "[2026-05-25T19:22:00+08:00] error older offset timestamp\n",
+        )
+        .expect("write text log");
+        write_utf8(
+            logs_dir.join("health-events.jsonl"),
+            r#"{"event":"error","recorded_at":"2026-05-25T14:19:35Z","error":"newer utc timestamp"}"#,
+        )
+        .expect("write jsonl log");
+
+        let snapshot = build_error_logs_snapshot(&PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            ..PortfolioDashboardOptions::default()
+        });
+
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries[0].message.as_str(), "newer utc timestamp");
+        assert_eq!(
+            snapshot.entries[1].observed_at.as_deref(),
+            Some("2026-05-25T19:22:00+08:00")
+        );
+    }
+
+    #[test]
     fn error_logs_json_collects_gate_passed_dispatch_failures() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let events_path = root
@@ -62665,7 +62857,7 @@ mod tests {
         });
         let json = error_logs_json(&snapshot);
 
-        assert_eq!(snapshot.entries.len(), ERROR_LOG_MAX_ENTRIES_PER_SOURCE);
+        assert_eq!(snapshot.entries.len(), ERROR_LOG_MAX_ENTRIES);
         assert!(snapshot.source_errors.is_empty());
         assert_eq!(snapshot.source_notices.len(), 1);
         assert!(!json.contains("old prefix error outside tail"));
