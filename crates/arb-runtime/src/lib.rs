@@ -356,7 +356,14 @@ const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
 const OKX_FUNDING_RATE_CACHE_TTL_ENV: &str = "ARB_RUNTIME_OKX_FUNDING_RATE_CACHE_TTL_SECS";
-const OKX_FUNDING_RATE_CACHE_TTL_DEFAULT_SECS: u64 = 60;
+const OKX_FUNDING_RATE_CACHE_TTL_DEFAULT_SECS: u64 = 300;
+const OKX_FUNDING_RATE_FETCH_CONCURRENCY_ENV: &str =
+    "ARB_RUNTIME_OKX_FUNDING_RATE_FETCH_CONCURRENCY";
+const OKX_FUNDING_RATE_REFRESH_PER_CYCLE_ENV: &str =
+    "ARB_RUNTIME_OKX_FUNDING_RATE_REFRESH_PER_CYCLE";
+const OKX_DEPTH_FETCH_CONCURRENCY_ENV: &str = "ARB_RUNTIME_OKX_DEPTH_FETCH_CONCURRENCY";
+const OKX_DEPTH_CACHE_TTL_ENV: &str = "ARB_RUNTIME_OKX_DEPTH_CACHE_TTL_SECS";
+const OKX_BASIS_TIMING_LOG_ENV: &str = "ARB_RUNTIME_OKX_BASIS_TIMING_LOG";
 const BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_ENV: &str =
     "ARB_RUNTIME_BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_SECS";
 const BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_DEFAULT_SECS: u64 = 300;
@@ -2878,6 +2885,11 @@ pub struct FundingArbGuardedLiveCanaryOnceOptions {
 pub struct FundingArbGuardedLiveCanaryOnceReport {
     pub pair_id: String,
     pub symbol: String,
+    pub venue_a_family: String,
+    pub venue_b_family: String,
+    pub source_status: String,
+    pub net_funding_bps: Option<String>,
+    pub expected_funding_usd: Option<String>,
     pub dry_run: FundingArbGuardedDryRunReport,
     pub plan_hash: Option<String>,
     pub approval_event_id: Option<String>,
@@ -25761,9 +25773,9 @@ pub fn run_okx_basis_monitor(options: OkxBasisMonitorOptions) -> RuntimeResult<(
         );
     }
 
-    let mut funding_cache = OkxFundingRatePageCache::default();
+    let mut cache = OkxBasisMonitorCache::default();
     loop {
-        match fetch_okx_basis_monitor_snapshot_with_cache(&options, &mut funding_cache) {
+        match fetch_okx_basis_monitor_snapshot_with_cache(&options, &mut cache) {
             Ok(snapshot) => {
                 if let Some(dir) = &options.output_dir {
                     write_okx_basis_monitor_snapshot(dir, &snapshot)?;
@@ -26169,11 +26181,40 @@ fn runtime_non_negative_u64_env(env_name: &'static str, default_value: u64) -> R
     let Ok(raw) = std::env::var(env_name) else {
         return Ok(default_value);
     };
+    parse_runtime_non_negative_u64(env_name, raw.trim())
+}
+
+fn parse_runtime_non_negative_u64(env_name: &'static str, raw: &str) -> RuntimeResult<u64> {
     raw.trim()
         .parse::<u64>()
         .map_err(|_| RuntimeError::UnsafeConfig {
             message: format!("{env_name} must be a non-negative integer"),
         })
+}
+
+fn runtime_positive_usize_env(
+    env_name: &'static str,
+    default_value: usize,
+) -> RuntimeResult<usize> {
+    let Ok(raw) = std::env::var(env_name) else {
+        return Ok(default_value);
+    };
+    parse_runtime_positive_usize(env_name, raw.trim())
+}
+
+fn parse_runtime_positive_usize(env_name: &'static str, raw: &str) -> RuntimeResult<usize> {
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| RuntimeError::UnsafeConfig {
+            message: format!("{env_name} must be a positive integer"),
+        })?;
+    if value == 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("{env_name} must be a positive integer"),
+        });
+    }
+    Ok(value)
 }
 
 fn runtime_bool_env(env_name: &'static str, default_value: bool) -> RuntimeResult<bool> {
@@ -26195,6 +26236,36 @@ fn okx_funding_rate_cache_ttl() -> RuntimeResult<Duration> {
         OKX_FUNDING_RATE_CACHE_TTL_DEFAULT_SECS,
     )
     .map(Duration::from_secs)
+}
+
+fn okx_funding_rate_fetch_concurrency() -> RuntimeResult<usize> {
+    runtime_positive_usize_env(
+        OKX_FUNDING_RATE_FETCH_CONCURRENCY_ENV,
+        OKX_FUNDING_RATE_FETCH_CONCURRENCY_DEFAULT,
+    )
+}
+
+fn okx_funding_rate_refresh_per_cycle() -> RuntimeResult<usize> {
+    runtime_positive_usize_env(
+        OKX_FUNDING_RATE_REFRESH_PER_CYCLE_ENV,
+        OKX_FUNDING_RATE_REFRESH_PER_CYCLE_DEFAULT,
+    )
+}
+
+fn okx_depth_fetch_concurrency() -> RuntimeResult<usize> {
+    runtime_positive_usize_env(
+        OKX_DEPTH_FETCH_CONCURRENCY_ENV,
+        OKX_DEPTH_FETCH_CONCURRENCY_DEFAULT,
+    )
+}
+
+fn okx_depth_cache_ttl() -> RuntimeResult<Duration> {
+    runtime_non_negative_u64_env(OKX_DEPTH_CACHE_TTL_ENV, OKX_DEPTH_CACHE_TTL_DEFAULT_SECS)
+        .map(Duration::from_secs)
+}
+
+fn okx_basis_timing_log_enabled() -> RuntimeResult<bool> {
+    runtime_bool_env(OKX_BASIS_TIMING_LOG_ENV, false)
 }
 
 fn bybit_linear_instrument_cache_ttl() -> RuntimeResult<Duration> {
@@ -26235,10 +26306,33 @@ struct BybitLinearInstrumentPageCache {
 }
 
 #[derive(Clone, Debug, Default)]
+struct OkxBasisMonitorCache {
+    funding_rates: OkxFundingRatePageCache,
+    spot_depths: PublicOrderBookDepthCache,
+    swap_depths: PublicOrderBookDepthCache,
+}
+
+#[derive(Clone, Debug, Default)]
 struct OkxFundingRatePageCache {
-    fetched_at: Option<Instant>,
-    inst_ids: Vec<String>,
-    report: Option<OkxFundingRateFetchReport>,
+    pages_by_inst_id: BTreeMap<String, OkxCachedFundingRatePage>,
+    refresh_cursor: usize,
+}
+
+#[derive(Clone, Debug)]
+struct OkxCachedFundingRatePage {
+    fetched_at: Instant,
+    page: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PublicOrderBookDepthCache {
+    depths_by_symbol: BTreeMap<String, CachedPublicOrderBookDepth>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedPublicOrderBookDepth {
+    fetched_at: Instant,
+    depth: PublicOrderBookDepth,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -26688,6 +26782,8 @@ fn fetch_aster_basis_monitor_snapshot(
         PublicOrderBookDepthFetchReport {
             depths: BTreeMap::new(),
             warnings: Vec::new(),
+            refreshed_count: 0,
+            cached_count: 0,
         }
     };
     let perp_depths = fetch_public_order_book_depth_map(
@@ -27493,14 +27589,35 @@ fn bybit_basis_monitor_depth_symbols_from_parsed_with_limit(
 
 fn fetch_okx_basis_monitor_snapshot_with_cache(
     options: &OkxBasisMonitorOptions,
-    funding_cache: &mut OkxFundingRatePageCache,
+    cache: &mut OkxBasisMonitorCache,
 ) -> RuntimeResult<OkxBasisMonitorSnapshot> {
+    let timing_log = okx_basis_timing_log_enabled()?;
+    let cycle_start = Instant::now();
+
+    let spot_start = Instant::now();
     let spot_json = fetch_public_json_with_curl(&okx_tickers_url("SPOT"))?;
+    let spot_ms = spot_start.elapsed().as_millis();
+
+    let swap_start = Instant::now();
     let swap_json = fetch_public_json_with_curl(&okx_tickers_url("SWAP"))?;
+    let swap_ms = swap_start.elapsed().as_millis();
+
+    let mark_start = Instant::now();
     let mark_json = fetch_public_json_with_curl(&okx_mark_price_url())?;
+    let mark_ms = mark_start.elapsed().as_millis();
+
+    let index_start = Instant::now();
     let index_json = fetch_public_json_with_curl(&okx_index_tickers_url())?;
+    let index_ms = index_start.elapsed().as_millis();
+
     let swap_rows = parse_okx_ticker_rows(&swap_json, "okx swap tickers")?;
-    let funding_pages = fetch_okx_usdt_swap_funding_rate_pages_cached(&swap_rows, funding_cache)?;
+
+    let funding_start = Instant::now();
+    let funding_pages =
+        fetch_okx_usdt_swap_funding_rate_pages_cached(&swap_rows, &mut cache.funding_rates)?;
+    let funding_ms = funding_start.elapsed().as_millis();
+
+    let parse_start = Instant::now();
     let parsed = parse_okx_basis_monitor_inputs_from_swap_rows(
         &spot_json,
         swap_rows,
@@ -27508,16 +27625,37 @@ fn fetch_okx_basis_monitor_snapshot_with_cache(
         &index_json,
         &funding_pages.pages,
     )?;
+    let parse_ms = parse_start.elapsed().as_millis();
+
     let depth_symbols = okx_basis_monitor_depth_symbols_from_parsed(&parsed, options)?;
-    let spot_depths =
-        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::Okx, &depth_symbols.spot);
-    let swap_depths =
-        fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::Okx, &depth_symbols.swap);
+    let depth_ttl = okx_depth_cache_ttl()?;
+    let depth_concurrency = okx_depth_fetch_concurrency()?;
+    let depth_start = Instant::now();
+    let spot_depths = fetch_public_order_book_depth_map_cached(
+        PublicOrderBookDepthVenue::Okx,
+        &depth_symbols.spot,
+        &mut cache.spot_depths,
+        depth_ttl,
+        depth_concurrency,
+    );
+    let swap_depths = fetch_public_order_book_depth_map_cached(
+        PublicOrderBookDepthVenue::Okx,
+        &depth_symbols.swap,
+        &mut cache.swap_depths,
+        depth_ttl,
+        depth_concurrency,
+    );
+    let depth_ms = depth_start.elapsed().as_millis();
+    let depth_cached_count = spot_depths.cached_count + swap_depths.cached_count;
+    let depth_refreshed_count = spot_depths.refreshed_count + swap_depths.refreshed_count;
+    let depth_symbol_count = depth_symbols.spot.len() + depth_symbols.swap.len();
     let depth_warnings = spot_depths
         .warnings
         .into_iter()
         .chain(swap_depths.warnings)
         .collect::<Vec<_>>();
+
+    let build_start = Instant::now();
     let mut snapshot = build_okx_basis_monitor_snapshot_from_parsed_with_depth(
         &parsed,
         options,
@@ -27525,6 +27663,7 @@ fn fetch_okx_basis_monitor_snapshot_with_cache(
         &swap_depths.depths,
         depth_warnings,
     )?;
+    let build_ms = build_start.elapsed().as_millis();
     if !funding_pages.warnings.is_empty() {
         snapshot.last_error = Some(
             snapshot
@@ -27533,6 +27672,28 @@ fn fetch_okx_basis_monitor_snapshot_with_cache(
                 .chain([funding_pages.warnings.join("; ")])
                 .collect::<Vec<_>>()
                 .join("; "),
+        );
+    }
+    if timing_log {
+        println!(
+            "okx_basis_cycle total_ms={} spot_ms={} swap_ms={} mark_ms={} index_ms={} funding_ms={} parse_ms={} depth_ms={} build_ms={} funding_requested={} funding_refreshed={} funding_cached={} depth_symbols={} depth_refreshed={} depth_cached={} rows={} candidates={}",
+            cycle_start.elapsed().as_millis(),
+            spot_ms,
+            swap_ms,
+            mark_ms,
+            index_ms,
+            funding_ms,
+            parse_ms,
+            depth_ms,
+            build_ms,
+            funding_pages.requested_count,
+            funding_pages.refreshed_count,
+            funding_pages.cached_count,
+            depth_symbol_count,
+            depth_refreshed_count,
+            depth_cached_count,
+            snapshot.total_rows,
+            snapshot.candidate_count
         );
     }
     Ok(snapshot)
@@ -27591,6 +27752,15 @@ fn parse_okx_basis_monitor_inputs_from_swap_rows(
 struct OkxFundingRateFetchReport {
     pages: Vec<String>,
     warnings: Vec<String>,
+    requested_count: usize,
+    refreshed_count: usize,
+    cached_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct OkxFundingRateFetchBatchReport {
+    pages_by_inst_id: Vec<(String, String)>,
+    warnings: Vec<String>,
 }
 
 struct OkxBasisMonitorDepthSymbols {
@@ -27604,22 +27774,64 @@ fn fetch_okx_usdt_swap_funding_rate_pages_cached(
 ) -> RuntimeResult<OkxFundingRateFetchReport> {
     let inst_ids = okx_usdt_swap_funding_inst_ids(swap_rows);
     let ttl = okx_funding_rate_cache_ttl()?;
+    let fetch_concurrency = okx_funding_rate_fetch_concurrency()?;
+    let refresh_per_cycle = okx_funding_rate_refresh_per_cycle()?;
     let now = Instant::now();
+    let refresh_ids = if ttl > Duration::ZERO {
+        okx_funding_rate_inst_ids_to_refresh(&inst_ids, cache, now, ttl, refresh_per_cycle)
+    } else {
+        cache.pages_by_inst_id.clear();
+        cache.refresh_cursor = 0;
+        inst_ids.clone()
+    };
+
+    let refreshed = fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids_with_concurrency(
+        &refresh_ids,
+        fetch_concurrency,
+    );
+    let OkxFundingRateFetchBatchReport {
+        pages_by_inst_id,
+        warnings,
+    } = refreshed;
+    let refreshed_count = pages_by_inst_id.len();
+
     if ttl > Duration::ZERO {
-        if let (Some(fetched_at), Some(report)) = (cache.fetched_at, cache.report.as_ref()) {
-            if now.duration_since(fetched_at) < ttl && cache.inst_ids == inst_ids {
-                return Ok(report.clone());
-            }
+        let fetched_at = Instant::now();
+        for (inst_id, page) in pages_by_inst_id {
+            cache
+                .pages_by_inst_id
+                .insert(inst_id, OkxCachedFundingRatePage { fetched_at, page });
         }
+        let pages = inst_ids
+            .iter()
+            .filter_map(|inst_id| {
+                cache
+                    .pages_by_inst_id
+                    .get(inst_id)
+                    .map(|cached| cached.page.clone())
+            })
+            .collect::<Vec<_>>();
+        let cached_count = pages.len().saturating_sub(refreshed_count);
+        return Ok(OkxFundingRateFetchReport {
+            pages,
+            warnings,
+            requested_count: inst_ids.len(),
+            refreshed_count,
+            cached_count,
+        });
     }
 
-    let report = fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids(&inst_ids);
-    if ttl > Duration::ZERO && !report.pages.is_empty() {
-        cache.fetched_at = Some(now);
-        cache.inst_ids = inst_ids;
-        cache.report = Some(report.clone());
-    }
-    Ok(report)
+    let pages = pages_by_inst_id
+        .into_iter()
+        .map(|(_, page)| page)
+        .collect::<Vec<_>>();
+    Ok(OkxFundingRateFetchReport {
+        pages,
+        warnings,
+        requested_count: inst_ids.len(),
+        refreshed_count,
+        cached_count: 0,
+    })
 }
 
 fn okx_usdt_swap_funding_inst_ids(swap_rows: &[OkxTickerRow]) -> Vec<String> {
@@ -27632,12 +27844,70 @@ fn okx_usdt_swap_funding_inst_ids(swap_rows: &[OkxTickerRow]) -> Vec<String> {
     inst_ids.into_iter().collect::<Vec<_>>()
 }
 
-fn fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids(
+fn okx_funding_rate_inst_ids_to_refresh(
     inst_ids: &[String],
-) -> OkxFundingRateFetchReport {
-    let mut pages = Vec::new();
+    cache: &mut OkxFundingRatePageCache,
+    now: Instant,
+    ttl: Duration,
+    refresh_per_cycle: usize,
+) -> Vec<String> {
+    if inst_ids.is_empty() {
+        cache.pages_by_inst_id.clear();
+        cache.refresh_cursor = 0;
+        return Vec::new();
+    }
+
+    let live_inst_ids = inst_ids.iter().cloned().collect::<BTreeSet<_>>();
+    cache
+        .pages_by_inst_id
+        .retain(|inst_id, _| live_inst_ids.contains(inst_id));
+    cache.refresh_cursor %= inst_ids.len();
+
+    let missing = inst_ids
+        .iter()
+        .filter(|inst_id| !cache.pages_by_inst_id.contains_key(*inst_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if cache.pages_by_inst_id.is_empty() || missing.len() == inst_ids.len() {
+        cache.refresh_cursor = 0;
+        return inst_ids.to_vec();
+    }
+    if !missing.is_empty() {
+        return missing;
+    }
+
+    let mut selected = Vec::new();
+    let start = cache.refresh_cursor;
+    let limit = refresh_per_cycle.max(1).min(inst_ids.len());
+    let mut next_cursor = start;
+    for offset in 0..inst_ids.len() {
+        let index = (start + offset) % inst_ids.len();
+        let inst_id = &inst_ids[index];
+        let Some(cached) = cache.pages_by_inst_id.get(inst_id) else {
+            continue;
+        };
+        if now.duration_since(cached.fetched_at) < ttl {
+            continue;
+        }
+        selected.push(inst_id.clone());
+        next_cursor = (index + 1) % inst_ids.len();
+        if selected.len() >= limit {
+            break;
+        }
+    }
+    if !selected.is_empty() {
+        cache.refresh_cursor = next_cursor;
+    }
+    selected
+}
+
+fn fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids_with_concurrency(
+    inst_ids: &[String],
+    concurrency: usize,
+) -> OkxFundingRateFetchBatchReport {
+    let mut pages_by_inst_id = Vec::new();
     let mut errors = Vec::<(String, String)>::new();
-    for chunk in inst_ids.chunks(OKX_FUNDING_RATE_FETCH_CONCURRENCY) {
+    for chunk in inst_ids.chunks(concurrency.max(1)) {
         let batch_results = thread::scope(|scope| {
             let mut handles = Vec::with_capacity(chunk.len());
             for inst_id in chunk {
@@ -27645,6 +27915,7 @@ fn fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids(
                 handles.push(scope.spawn(move || {
                     let url = okx_funding_rate_url(&inst_id);
                     fetch_public_json_with_curl_max_time(&url, OKX_FUNDING_RATE_CURL_MAX_TIME_SECS)
+                        .map(|page| (inst_id.clone(), page))
                         .map_err(|error| (inst_id, error.to_string()))
                 }));
             }
@@ -27655,7 +27926,7 @@ fn fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids(
         });
         for result in batch_results {
             match result {
-                Ok(Ok(page)) => pages.push(page),
+                Ok(Ok(page)) => pages_by_inst_id.push(page),
                 Ok(Err(error)) => errors.push(error),
                 Err(_) => errors.push((
                     "unknown".to_owned(),
@@ -27667,7 +27938,10 @@ fn fetch_okx_usdt_swap_funding_rate_pages_for_inst_ids(
     let warnings = okx_funding_rate_fetch_warning(&errors)
         .into_iter()
         .collect::<Vec<_>>();
-    OkxFundingRateFetchReport { pages, warnings }
+    OkxFundingRateFetchBatchReport {
+        pages_by_inst_id,
+        warnings,
+    }
 }
 
 fn okx_funding_rate_fetch_warning(errors: &[(String, String)]) -> Option<String> {
@@ -30449,10 +30723,106 @@ fn fetch_public_order_book_depth_map(
     venue: PublicOrderBookDepthVenue,
     symbols: &BTreeSet<String>,
 ) -> PublicOrderBookDepthFetchReport {
+    let symbols = symbols.iter().cloned().collect::<Vec<_>>();
+    fetch_public_order_book_depth_map_with_concurrency(
+        venue,
+        &symbols,
+        BASIS_MONITOR_DEPTH_FETCH_CONCURRENCY,
+    )
+}
+
+fn fetch_public_order_book_depth_map_cached(
+    venue: PublicOrderBookDepthVenue,
+    symbols: &BTreeSet<String>,
+    cache: &mut PublicOrderBookDepthCache,
+    ttl: Duration,
+    concurrency: usize,
+) -> PublicOrderBookDepthFetchReport {
+    let now = Instant::now();
+    let symbols = symbols.iter().cloned().collect::<Vec<_>>();
+    if symbols.is_empty() {
+        cache.depths_by_symbol.clear();
+        return PublicOrderBookDepthFetchReport {
+            depths: BTreeMap::new(),
+            warnings: Vec::new(),
+            refreshed_count: 0,
+            cached_count: 0,
+        };
+    }
+
+    let live_symbols = symbols.iter().cloned().collect::<BTreeSet<_>>();
+    cache
+        .depths_by_symbol
+        .retain(|symbol, _| live_symbols.contains(symbol));
+
+    if ttl == Duration::ZERO {
+        cache.depths_by_symbol.clear();
+    }
+
+    let symbols_to_fetch = symbols
+        .iter()
+        .filter(|symbol| {
+            if ttl == Duration::ZERO {
+                return true;
+            }
+            cache
+                .depths_by_symbol
+                .get(*symbol)
+                .is_none_or(|cached| now.duration_since(cached.fetched_at) >= ttl)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let fetched =
+        fetch_public_order_book_depth_map_with_concurrency(venue, &symbols_to_fetch, concurrency);
+    let PublicOrderBookDepthFetchReport {
+        depths: fetched_depths,
+        warnings,
+        ..
+    } = fetched;
+    let refreshed_count = fetched_depths.len();
+
+    if ttl > Duration::ZERO {
+        let fetched_at = Instant::now();
+        for (symbol, depth) in fetched_depths {
+            cache
+                .depths_by_symbol
+                .insert(symbol, CachedPublicOrderBookDepth { fetched_at, depth });
+        }
+        let depths = symbols
+            .iter()
+            .filter_map(|symbol| {
+                cache
+                    .depths_by_symbol
+                    .get(symbol)
+                    .map(|cached| (symbol.clone(), cached.depth.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let cached_count = depths.len().saturating_sub(refreshed_count);
+        return PublicOrderBookDepthFetchReport {
+            depths,
+            warnings,
+            refreshed_count,
+            cached_count,
+        };
+    }
+
+    PublicOrderBookDepthFetchReport {
+        depths: fetched_depths,
+        warnings,
+        refreshed_count,
+        cached_count: 0,
+    }
+}
+
+fn fetch_public_order_book_depth_map_with_concurrency(
+    venue: PublicOrderBookDepthVenue,
+    symbols: &[String],
+    concurrency: usize,
+) -> PublicOrderBookDepthFetchReport {
     let mut depths = BTreeMap::new();
     let mut warnings = Vec::new();
-    let symbols = symbols.iter().cloned().collect::<Vec<_>>();
-    for chunk in symbols.chunks(BASIS_MONITOR_DEPTH_FETCH_CONCURRENCY) {
+    for chunk in symbols.chunks(concurrency.max(1)) {
         let batch_results = thread::scope(|scope| {
             let handles = chunk
                 .iter()
@@ -30494,8 +30864,10 @@ fn fetch_public_order_book_depth_map(
         }
     }
     PublicOrderBookDepthFetchReport {
+        refreshed_count: depths.len(),
         depths,
         warnings: summarize_public_order_book_depth_warnings(warnings),
+        cached_count: 0,
     }
 }
 
@@ -30695,9 +31067,12 @@ fn parse_order_book_depth_level(
 const PUBLIC_MARKET_CURL_ATTEMPTS: usize = 3;
 const PUBLIC_MARKET_CURL_RETRY_SLEEP_MS: u64 = 250;
 const PUBLIC_MARKET_CURL_MAX_TIME_SECS: u64 = 10;
-const OKX_FUNDING_RATE_FETCH_CONCURRENCY: usize = 32;
+const OKX_FUNDING_RATE_FETCH_CONCURRENCY_DEFAULT: usize = 8;
+const OKX_FUNDING_RATE_REFRESH_PER_CYCLE_DEFAULT: usize = 64;
 const OKX_FUNDING_RATE_CURL_MAX_TIME_SECS: u64 = 3;
 const BASIS_MONITOR_DEPTH_FETCH_CONCURRENCY: usize = 12;
+const OKX_DEPTH_FETCH_CONCURRENCY_DEFAULT: usize = 6;
+const OKX_DEPTH_CACHE_TTL_DEFAULT_SECS: u64 = 10;
 const BASIS_MONITOR_DEPTH_SYMBOL_LIMIT: usize = 12;
 const BASIS_MONITOR_DEPTH_WARNING_LIMIT: usize = 8;
 const BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS: u64 = 5;
@@ -30726,6 +31101,8 @@ struct PublicOrderBookDepth {
 struct PublicOrderBookDepthFetchReport {
     depths: BTreeMap<String, PublicOrderBookDepth>,
     warnings: Vec<String>,
+    refreshed_count: usize,
+    cached_count: usize,
 }
 
 fn fetch_public_json_with_curl(url: &str) -> RuntimeResult<String> {
@@ -39914,6 +40291,11 @@ fn run_funding_arb_guarded_live_canary_once_live(
     let report = FundingArbGuardedLiveCanaryOnceReport {
         pair_id: row.pair_id.clone(),
         symbol: row.symbol.clone(),
+        venue_a_family: row.venue_a_family.clone(),
+        venue_b_family: row.venue_b_family.clone(),
+        source_status: row.source_status.clone(),
+        net_funding_bps: row.net_funding_bps.clone(),
+        expected_funding_usd: row.expected_funding_usd.clone(),
         dry_run,
         plan_hash,
         approval_event_id,
@@ -43344,9 +43726,16 @@ fn append_funding_arb_resident_candidate_event(
     outcome: &FundingArbResidentCycleOutcome,
 ) -> RuntimeResult<()> {
     let blocking_path_json =
-        funding_arb_execution_blocking_path_json(FundingArbExecutionBlockingPathInput {
+        funding_arb_execution_blocking_path_json(&FundingArbExecutionBlockingPathInput {
             pair_id: &outcome.pair_id,
             symbol: &outcome.symbol,
+            venue_a_family: Some(&outcome.canary.venue_a_family),
+            venue_b_family: Some(&outcome.canary.venue_b_family),
+            source_status: Some(&outcome.canary.source_status),
+            net_funding_bps: outcome.canary.net_funding_bps.as_deref(),
+            expected_funding_usd: outcome.canary.expected_funding_usd.as_deref(),
+            risk_decision: Some(&outcome.canary.dry_run.risk_decision),
+            risk_reason_codes: &outcome.canary.dry_run.risk_reason_codes,
             blocking_reasons: &outcome.canary.blocking_reasons,
             live_blocking_reasons: &outcome.canary.dry_run.live_blocking_reasons,
             no_dispatch_reasons: &outcome.canary.blocking_reasons,
@@ -43367,7 +43756,7 @@ fn append_funding_arb_resident_candidate_event(
     append_funding_arb_resident_event(
         output_root,
         &format!(
-            "{{\"blocking_path\":{},\"blocking_reason_details\":{},\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"dry_run_live_blocking_reasons\":{},\"dry_run_live_ready\":{},\"event_type\":\"candidate_cycle\",\"execute_live\":{},\"execution_report_status\":{},\"flat_after_cancel\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_account_raw_snapshot_path\":{},\"private_confirmation_count\":{},\"private_position_raw_snapshot_path\":{},\"protection_attempted\":{},\"recorded_at\":{},\"residual_risk\":{},\"snapshot_path\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
+            "{{\"blocking_path\":{},\"blocking_reason_details\":{},\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"dry_run_live_blocking_reasons\":{},\"dry_run_live_ready\":{},\"dry_run_risk_decision\":{},\"dry_run_risk_reason_codes\":{},\"event_type\":\"candidate_cycle\",\"execute_live\":{},\"execution_report_status\":{},\"expected_funding_usd\":{},\"flat_after_cancel\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_account_raw_snapshot_path\":{},\"private_confirmation_count\":{},\"private_position_raw_snapshot_path\":{},\"protection_attempted\":{},\"recorded_at\":{},\"residual_risk\":{},\"snapshot_path\":{},\"source_status\":{},\"submitted_receipt_count\":{},\"symbol\":{},\"venue_a_family\":{},\"venue_b_family\":{}}}",
             blocking_path_json,
             json_string_array(&outcome.canary.blocking_reasons),
             outcome.canary.blocking_reasons.len(),
@@ -43379,8 +43768,11 @@ fn append_funding_arb_resident_candidate_event(
             outcome.canary.dispatch_request_count,
             json_string_array(&outcome.canary.dry_run.live_blocking_reasons),
             outcome.canary.dry_run.live_ready,
+            json_string(&outcome.canary.dry_run.risk_decision),
+            json_string_array(&outcome.canary.dry_run.risk_reason_codes),
             outcome.canary.execute_live,
             optional_json_string(outcome.canary.execution_report_status.as_deref()),
+            json_option_string(&outcome.canary.expected_funding_usd),
             outcome.canary.flat_after_cancel,
             outcome.canary.manual_gate_released,
             outcome.canary.mutable_execution_started,
@@ -43396,8 +43788,11 @@ fn append_funding_arb_resident_candidate_event(
             json_string(&current_utc_timestamp_string()),
             optional_json_string(outcome.canary.residual_risk.as_deref()),
             json_string(&outcome.snapshot_path.display().to_string()),
+            json_string(&outcome.canary.source_status),
             outcome.canary.submitted_receipt_count,
             json_string(&outcome.symbol),
+            json_string(&outcome.canary.venue_a_family),
+            json_string(&outcome.canary.venue_b_family),
         ),
     )
 }
@@ -49369,9 +49764,16 @@ fn funding_arb_guarded_live_canary_report_json(
     report: &FundingArbGuardedLiveCanaryOnceReport,
 ) -> String {
     let blocking_path_json =
-        funding_arb_execution_blocking_path_json(FundingArbExecutionBlockingPathInput {
+        funding_arb_execution_blocking_path_json(&FundingArbExecutionBlockingPathInput {
             pair_id: &report.pair_id,
             symbol: &report.symbol,
+            venue_a_family: Some(&report.venue_a_family),
+            venue_b_family: Some(&report.venue_b_family),
+            source_status: Some(&report.source_status),
+            net_funding_bps: report.net_funding_bps.as_deref(),
+            expected_funding_usd: report.expected_funding_usd.as_deref(),
+            risk_decision: Some(&report.dry_run.risk_decision),
+            risk_reason_codes: &report.dry_run.risk_reason_codes,
             blocking_reasons: &report.blocking_reasons,
             live_blocking_reasons: &report.dry_run.live_blocking_reasons,
             no_dispatch_reasons: &report.blocking_reasons,
@@ -51967,6 +52369,27 @@ fn parse_funding_arb_execution_status_report_fields(
                 "funding arb execution report",
             )?,
         );
+    let risk_decision =
+        optional_json_value_string(fields, "risk_decision", "funding arb execution report")?.or(
+            optional_json_value_string(
+                fields,
+                "dry_run_risk_decision",
+                "funding arb execution report",
+            )?,
+        );
+    let venue_a_family =
+        optional_json_value_string(fields, "venue_a_family", "funding arb execution report")?;
+    let venue_b_family =
+        optional_json_value_string(fields, "venue_b_family", "funding arb execution report")?;
+    let source_status =
+        optional_json_value_string(fields, "source_status", "funding arb execution report")?;
+    let net_funding_bps =
+        optional_json_value_string(fields, "net_funding_bps", "funding arb execution report")?;
+    let expected_funding_usd = optional_json_value_string(
+        fields,
+        "expected_funding_usd",
+        "funding arb execution report",
+    )?;
     let observed_at = optional_json_value_string(
         fields,
         "validation_finished_at",
@@ -52011,26 +52434,35 @@ fn parse_funding_arb_execution_status_report_fields(
             dispatch_request_count,
             dispatch_attempted,
         });
-    let blocking_path_json =
-        optional_json_array_raw(fields, "blocking_path", "funding arb execution report")?
-            .unwrap_or_else(|| {
-                funding_arb_execution_blocking_path_json(FundingArbExecutionBlockingPathInput {
-                    pair_id: &pair_id,
-                    symbol: &symbol,
-                    blocking_reasons: &blocking_reasons,
-                    live_blocking_reasons: &live_blocking_reasons,
-                    no_dispatch_reasons: &no_dispatch_reasons,
-                    execution_mode: execution_mode.as_deref(),
-                    execute_live,
-                    validation_result_class: validation_result_class.as_deref(),
-                    signal_allowed,
-                    live_ready,
-                    manual_gate_released,
-                    dispatch_plan_built,
-                    dispatch_request_count,
-                    dispatch_attempted,
-                })
-            });
+    let blocking_path_json = {
+        let blocking_path_input = FundingArbExecutionBlockingPathInput {
+            pair_id: &pair_id,
+            symbol: &symbol,
+            venue_a_family: venue_a_family.as_deref(),
+            venue_b_family: venue_b_family.as_deref(),
+            source_status: source_status.as_deref(),
+            net_funding_bps: net_funding_bps.as_deref(),
+            expected_funding_usd: expected_funding_usd.as_deref(),
+            risk_decision: risk_decision.as_deref(),
+            risk_reason_codes: &risk_reason_codes,
+            blocking_reasons: &blocking_reasons,
+            live_blocking_reasons: &live_blocking_reasons,
+            no_dispatch_reasons: &no_dispatch_reasons,
+            execution_mode: execution_mode.as_deref(),
+            execute_live,
+            validation_result_class: validation_result_class.as_deref(),
+            signal_allowed,
+            live_ready,
+            manual_gate_released,
+            dispatch_plan_built,
+            dispatch_request_count,
+            dispatch_attempted,
+        };
+        match optional_json_array_raw(fields, "blocking_path", "funding arb execution report")? {
+            Some(raw) => funding_arb_enrich_blocking_path_json(&raw, &blocking_path_input)?,
+            None => funding_arb_execution_blocking_path_json(&blocking_path_input),
+        }
+    };
     let dispatch_status = funding_arb_execution_dispatch_status(
         dispatch_attempted,
         dispatch_allowed,
@@ -52107,6 +52539,27 @@ fn parse_funding_arb_resident_status_event_fields(
         "funding arb resident event",
     )?;
     let execute_live = optional_json_bool(fields, "execute_live", "funding arb resident event")?;
+    let execution_mode = execute_live.map(|value| if value { "live" } else { "dry-run" });
+    let risk_decision = optional_json_value_string(
+        fields,
+        "dry_run_risk_decision",
+        "funding arb resident event",
+    )?;
+    let risk_reason_codes = optional_json_value_string_array(
+        fields,
+        "dry_run_risk_reason_codes",
+        "funding arb resident event",
+    )?;
+    let venue_a_family =
+        optional_json_value_string(fields, "venue_a_family", "funding arb resident event")?;
+    let venue_b_family =
+        optional_json_value_string(fields, "venue_b_family", "funding arb resident event")?;
+    let source_status =
+        optional_json_value_string(fields, "source_status", "funding arb resident event")?;
+    let net_funding_bps =
+        optional_json_value_string(fields, "net_funding_bps", "funding arb resident event")?;
+    let expected_funding_usd =
+        optional_json_value_string(fields, "expected_funding_usd", "funding arb resident event")?;
     let cycle_dir = optional_json_value_string(fields, "cycle_dir", "funding arb resident event")?;
     let output_dir = optional_json_value_string(
         fields,
@@ -52118,7 +52571,7 @@ fn parse_funding_arb_resident_status_event_fields(
         funding_arb_no_dispatch_reasons_from_report(FundingArbNoDispatchReasonInputs {
             blocking_reasons: &blocking_reasons,
             live_blocking_reasons: &live_blocking_reasons,
-            execution_mode: None,
+            execution_mode,
             execute_live,
             validation_result_class: None,
             signal_allowed: None,
@@ -52140,26 +52593,35 @@ fn parse_funding_arb_resident_status_event_fields(
             ),
         );
     }
-    let blocking_path_json =
-        optional_json_array_raw(fields, "blocking_path", "funding arb resident event")?
-            .unwrap_or_else(|| {
-                funding_arb_execution_blocking_path_json(FundingArbExecutionBlockingPathInput {
-                    pair_id: &pair_id,
-                    symbol: &symbol,
-                    blocking_reasons: &blocking_reasons,
-                    live_blocking_reasons: &live_blocking_reasons,
-                    no_dispatch_reasons: &no_dispatch_reasons,
-                    execution_mode: None,
-                    execute_live,
-                    validation_result_class: None,
-                    signal_allowed: None,
-                    live_ready,
-                    manual_gate_released,
-                    dispatch_plan_built,
-                    dispatch_request_count,
-                    dispatch_attempted,
-                })
-            });
+    let blocking_path_json = {
+        let blocking_path_input = FundingArbExecutionBlockingPathInput {
+            pair_id: &pair_id,
+            symbol: &symbol,
+            venue_a_family: venue_a_family.as_deref(),
+            venue_b_family: venue_b_family.as_deref(),
+            source_status: source_status.as_deref(),
+            net_funding_bps: net_funding_bps.as_deref(),
+            expected_funding_usd: expected_funding_usd.as_deref(),
+            risk_decision: risk_decision.as_deref(),
+            risk_reason_codes: &risk_reason_codes,
+            blocking_reasons: &blocking_reasons,
+            live_blocking_reasons: &live_blocking_reasons,
+            no_dispatch_reasons: &no_dispatch_reasons,
+            execution_mode,
+            execute_live,
+            validation_result_class: None,
+            signal_allowed: None,
+            live_ready,
+            manual_gate_released,
+            dispatch_plan_built,
+            dispatch_request_count,
+            dispatch_attempted,
+        };
+        match optional_json_array_raw(fields, "blocking_path", "funding arb resident event")? {
+            Some(raw) => funding_arb_enrich_blocking_path_json(&raw, &blocking_path_input)?,
+            None => funding_arb_execution_blocking_path_json(&blocking_path_input),
+        }
+    };
     let observed_at =
         optional_json_value_string(fields, "recorded_at", "funding arb resident event")?.or(
             optional_json_value_string(fields, "cycle", "funding arb resident event")?
@@ -52175,13 +52637,7 @@ fn parse_funding_arb_resident_status_event_fields(
         symbol,
         source: "resident_event".to_owned(),
         observed_at,
-        execution_mode: execute_live.map(|value| {
-            if value {
-                "live".to_owned()
-            } else {
-                "dry-run".to_owned()
-            }
-        }),
+        execution_mode: execution_mode.map(str::to_owned),
         validation_result_class: None,
         dispatch_status,
         dispatch_allowed,
@@ -52195,7 +52651,7 @@ fn parse_funding_arb_resident_status_event_fields(
         no_dispatch_reasons,
         blocking_reasons,
         live_blocking_reasons,
-        risk_reason_codes: Vec::new(),
+        risk_reason_codes,
         blocking_path_json,
     }))
 }
@@ -52269,6 +52725,13 @@ struct FundingArbNoDispatchReasonInputs<'a> {
 struct FundingArbExecutionBlockingPathInput<'a> {
     pair_id: &'a str,
     symbol: &'a str,
+    venue_a_family: Option<&'a str>,
+    venue_b_family: Option<&'a str>,
+    source_status: Option<&'a str>,
+    net_funding_bps: Option<&'a str>,
+    expected_funding_usd: Option<&'a str>,
+    risk_decision: Option<&'a str>,
+    risk_reason_codes: &'a [String],
     blocking_reasons: &'a [String],
     live_blocking_reasons: &'a [String],
     no_dispatch_reasons: &'a [String],
@@ -52350,127 +52813,270 @@ fn funding_arb_no_dispatch_reasons_from_report(
 }
 
 fn funding_arb_execution_blocking_path_json(
-    input: FundingArbExecutionBlockingPathInput<'_>,
+    input: &FundingArbExecutionBlockingPathInput<'_>,
 ) -> String {
     let mut entries = Vec::new();
     if input.dispatch_attempted {
         return "[]".to_owned();
     }
     if matches!(input.signal_allowed, Some(false)) {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "opportunity_source",
-                "candidate_count=0",
-                "阻断点：candidate_count=0；阻断原因：策略没有产出 funding-arb 候选",
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "opportunity_source",
+            "candidate_count=0",
+            "阻断点：candidate_count=0；阻断原因：策略没有产出 funding-arb 候选",
+        ));
     }
     for reason in input.blocking_reasons {
-        entries.push(
-            FundingArbBlockingPathEntry::new("guarded_canary", "blocking_reason", reason.clone())
-                .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "guarded_canary",
+            "blocking_reason",
+            reason.clone(),
+        ));
     }
     for reason in input.live_blocking_reasons {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "live_readiness",
-                funding_arb_reason_blocker(reason),
-                reason.clone(),
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "live_readiness",
+            funding_arb_reason_blocker(reason),
+            reason.clone(),
+        ));
     }
     if matches!(input.live_ready, Some(false)) && input.live_blocking_reasons.is_empty() {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "live_readiness",
-                "live_ready=false",
-                "阻断原因：live readiness 未通过，但报告没有给出具体阻断项",
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "live_readiness",
+            "live_ready=false",
+            "阻断原因：live readiness 未通过，但报告没有给出具体阻断项",
+        ));
     }
     if matches!(input.manual_gate_released, Some(false)) {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "manual_gate",
-                "manual_gate_released=false",
-                "阻断原因：人工审批门禁未释放",
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "manual_gate",
+            "manual_gate_released=false",
+            "阻断原因：人工审批门禁未释放",
+        ));
     }
     if matches!(input.dispatch_plan_built, Some(false)) {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "dispatch_plan",
-                "dispatch_plan_built=false",
-                "阻断原因：未生成真实下单计划",
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "dispatch_plan",
+            "dispatch_plan_built=false",
+            "阻断原因：未生成真实下单计划",
+        ));
     }
     if let Some(count) = input.dispatch_request_count.filter(|count| *count != 2) {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "dispatch_shape",
-                "dispatch_request_count!=2",
-                format!("阻断原因：双腿下单计划数量不等于 2，当前为 {count}"),
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "dispatch_shape",
+            "dispatch_request_count!=2",
+            format!("阻断原因：双腿下单计划数量不等于 2，当前为 {count}"),
+        ));
     }
     if matches!(input.execute_live, Some(false)) {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "execution_mode",
-                "execute_live=false",
-                "阻断原因：当前运行未启用 execute_live，真实下单被显式关闭",
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "execution_mode",
+            "execute_live=false",
+            "阻断原因：当前运行未启用 execute_live，真实下单被显式关闭",
+        ));
     }
     if let Some(mode) = input
         .execution_mode
         .filter(|mode| *mode != "live" && *mode != "guarded-live")
     {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "execution_mode",
-                "execution_mode_not_live",
-                format!("阻断原因：当前 execution_mode={mode}，不是真实下单模式"),
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "execution_mode",
+            "execution_mode_not_live",
+            format!("阻断原因：当前 execution_mode={mode}，不是真实下单模式"),
+        ));
     }
     if matches!(input.validation_result_class, Some("report_missing")) {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "validation_report",
-                "report_missing",
-                "阻断原因：下单校验报告缺失",
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "validation_report",
+            "report_missing",
+            "阻断原因：下单校验报告缺失",
+        ));
     } else if matches!(input.validation_result_class, Some("command_failed")) {
-        entries.push(
-            FundingArbBlockingPathEntry::new(
-                "validation_report",
-                "command_failed",
-                "阻断原因：下单校验命令失败",
-            )
-            .with_pair(input.pair_id.to_owned(), input.symbol.to_owned()),
-        );
+        entries.push(funding_arb_execution_blocking_path_entry(
+            input,
+            "validation_report",
+            "command_failed",
+            "阻断原因：下单校验命令失败",
+        ));
     }
     if entries.is_empty() {
         entries.extend(input.no_dispatch_reasons.iter().map(|reason| {
-            FundingArbBlockingPathEntry::new("dispatch", "no_dispatch_reason", reason.clone())
-                .with_pair(input.pair_id.to_owned(), input.symbol.to_owned())
+            funding_arb_execution_blocking_path_entry(
+                input,
+                "dispatch",
+                "no_dispatch_reason",
+                reason.clone(),
+            )
         }));
     }
     funding_arb_blocking_path_json(&entries)
+}
+
+fn funding_arb_execution_blocking_path_entry(
+    input: &FundingArbExecutionBlockingPathInput<'_>,
+    stage: impl Into<String>,
+    blocker: impl Into<String>,
+    reason: impl Into<String>,
+) -> FundingArbBlockingPathEntry {
+    let mut entry = FundingArbBlockingPathEntry::new(stage, blocker, reason)
+        .with_pair(input.pair_id.to_owned(), input.symbol.to_owned());
+    let (venue_a_family, venue_b_family) = funding_arb_execution_context_venue_families(input);
+    if let (Some(venue_a_family), Some(venue_b_family)) = (venue_a_family, venue_b_family) {
+        entry = entry.with_venues(venue_a_family, venue_b_family);
+    }
+    if let Some(source_status) = input
+        .source_status
+        .map(str::trim)
+        .filter(|source_status| !source_status.is_empty())
+    {
+        entry = entry.with_source_status(source_status.to_owned());
+    }
+    if let Some(evidence) = funding_arb_execution_blocking_evidence(input) {
+        entry = entry.with_evidence(evidence);
+    }
+    entry
+}
+
+fn funding_arb_enrich_blocking_path_json(
+    raw: &str,
+    input: &FundingArbExecutionBlockingPathInput<'_>,
+) -> RuntimeResult<String> {
+    let entries = json_array_value_slices(raw)?
+        .into_iter()
+        .map(|item| {
+            let fields =
+                parse_json_object_value_slices(item).map_err(|error| RuntimeError::Module {
+                    module: "arb-runtime",
+                    message: format!("failed to parse funding arb blocking_path entry: {error}"),
+                })?;
+            let stage = optional_json_value_string(&fields, "stage", "funding arb blocking path")?
+                .unwrap_or_else(|| "unknown".to_owned());
+            let blocker =
+                optional_json_value_string(&fields, "blocker", "funding arb blocking path")?
+                    .unwrap_or_else(|| "unknown".to_owned());
+            let reason =
+                optional_json_value_string(&fields, "reason", "funding arb blocking path")?
+                    .unwrap_or_else(|| "阻断原因：旧 blocking_path 条目缺少 reason".to_owned());
+            let pair_id =
+                optional_json_value_string(&fields, "pair_id", "funding arb blocking path")?
+                    .unwrap_or_else(|| input.pair_id.to_owned());
+            let symbol =
+                optional_json_value_string(&fields, "symbol", "funding arb blocking path")?
+                    .unwrap_or_else(|| input.symbol.to_owned());
+            let raw_venue_a =
+                optional_json_value_string(&fields, "venue_a_family", "funding arb blocking path")?;
+            let raw_venue_b =
+                optional_json_value_string(&fields, "venue_b_family", "funding arb blocking path")?;
+            let (context_venue_a, context_venue_b) =
+                funding_arb_execution_context_venue_families(input);
+            let venue_a_family = raw_venue_a.or(context_venue_a);
+            let venue_b_family = raw_venue_b.or(context_venue_b);
+            let source_status =
+                optional_json_value_string(&fields, "source_status", "funding arb blocking path")?
+                    .or_else(|| input.source_status.map(str::to_owned));
+            let evidence =
+                optional_json_value_string(&fields, "evidence", "funding arb blocking path")?
+                    .or_else(|| funding_arb_execution_blocking_evidence(input));
+            let mut entry =
+                FundingArbBlockingPathEntry::new(stage, blocker, reason).with_pair(pair_id, symbol);
+            if let (Some(venue_a_family), Some(venue_b_family)) = (venue_a_family, venue_b_family) {
+                entry = entry.with_venues(venue_a_family, venue_b_family);
+            }
+            if let Some(source_status) = source_status {
+                entry = entry.with_source_status(source_status);
+            }
+            if let Some(evidence) = evidence {
+                entry = entry.with_evidence(evidence);
+            }
+            Ok(entry)
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    Ok(funding_arb_blocking_path_json(&entries))
+}
+
+fn funding_arb_execution_context_venue_families(
+    input: &FundingArbExecutionBlockingPathInput<'_>,
+) -> (Option<String>, Option<String>) {
+    let parsed = funding_arb_pair_id_venue_families(input.pair_id);
+    let venue_a_family = input
+        .venue_a_family
+        .map(str::trim)
+        .filter(|venue| !venue.is_empty())
+        .map(normalize_venue_family)
+        .or_else(|| parsed.as_ref().map(|(venue_a, _)| venue_a.clone()));
+    let venue_b_family = input
+        .venue_b_family
+        .map(str::trim)
+        .filter(|venue| !venue.is_empty())
+        .map(normalize_venue_family)
+        .or_else(|| parsed.as_ref().map(|(_, venue_b)| venue_b.clone()));
+    (venue_a_family, venue_b_family)
+}
+
+fn funding_arb_pair_id_venue_families(pair_id: &str) -> Option<(String, String)> {
+    let mut parts = pair_id.split(':');
+    let venue_a = parts.next()?.trim();
+    let venue_b = parts.next()?.trim();
+    if venue_a.is_empty() || venue_b.is_empty() {
+        return None;
+    }
+    Some((
+        normalize_venue_family(venue_a),
+        normalize_venue_family(venue_b),
+    ))
+}
+
+fn funding_arb_execution_blocking_evidence(
+    input: &FundingArbExecutionBlockingPathInput<'_>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for (key, value) in [
+        ("source_status", input.source_status),
+        ("net_funding_bps", input.net_funding_bps),
+        ("expected_funding_usd", input.expected_funding_usd),
+        ("risk_decision", input.risk_decision),
+        ("execution_mode", input.execution_mode),
+        ("validation_result_class", input.validation_result_class),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    if !input.risk_reason_codes.is_empty() {
+        parts.push(format!(
+            "risk_reason_codes={}",
+            input.risk_reason_codes.join("|")
+        ));
+    }
+    if let Some(execute_live) = input.execute_live {
+        parts.push(format!("execute_live={execute_live}"));
+    }
+    if let Some(signal_allowed) = input.signal_allowed {
+        parts.push(format!("signal_allowed={signal_allowed}"));
+    }
+    if let Some(live_ready) = input.live_ready {
+        parts.push(format!("live_ready={live_ready}"));
+    }
+    if let Some(manual_gate_released) = input.manual_gate_released {
+        parts.push(format!("manual_gate_released={manual_gate_released}"));
+    }
+    if let Some(dispatch_plan_built) = input.dispatch_plan_built {
+        parts.push(format!("dispatch_plan_built={dispatch_plan_built}"));
+    }
+    if let Some(dispatch_request_count) = input.dispatch_request_count {
+        parts.push(format!("dispatch_request_count={dispatch_request_count}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn funding_arb_reason_blocker(reason: &str) -> String {
@@ -52598,9 +53204,16 @@ fn funding_arb_guarded_dry_run_report_json(
     report: &FundingArbGuardedDryRunReport,
 ) -> String {
     let blocking_path_json =
-        funding_arb_execution_blocking_path_json(FundingArbExecutionBlockingPathInput {
+        funding_arb_execution_blocking_path_json(&FundingArbExecutionBlockingPathInput {
             pair_id: &row.pair_id,
             symbol: &row.symbol,
+            venue_a_family: Some(&row.venue_a_family),
+            venue_b_family: Some(&row.venue_b_family),
+            source_status: Some(&row.source_status),
+            net_funding_bps: row.net_funding_bps.as_deref(),
+            expected_funding_usd: row.expected_funding_usd.as_deref(),
+            risk_decision: Some(&report.risk_decision),
+            risk_reason_codes: &report.risk_reason_codes,
             blocking_reasons: &report.execution_preflight.blocking_reasons,
             live_blocking_reasons: &report.live_blocking_reasons,
             no_dispatch_reasons: &report.live_blocking_reasons,
@@ -62502,6 +63115,36 @@ mod tests {
         assert!(json.contains("PRIVATE_BALANCE_UNAVAILABLE"));
         assert!(json.contains("手动审批门禁未释放"));
         assert!(json.contains("execution_mode=dry-run"));
+        assert!(json.contains("\"venue_a_family\":\"binance\""));
+        assert!(json.contains("\"venue_b_family\":\"bybit\""));
+        assert!(json.contains("risk_reason_codes=PRIVATE_BALANCE_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn funding_arb_execution_status_enriches_legacy_blocking_path_context() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let report_path = root.path().join("legacy-live-canary-reports.jsonl");
+        write_utf8(
+            report_path.clone(),
+            concat!(
+                r#"{"blocking_path":[{"blocker":"blocking_reason","evidence":null,"pair_id":"binance:aster:ESPORTSUSDT:ESPORTSUSDT","reason":"risk decision is Rejected; no funding-arb dispatch may be built","source_status":null,"stage":"guarded_canary","symbol":"ESPORTSUSDT","venue_a_family":null,"venue_b_family":null}],"blocking_reasons":["risk decision is Rejected; no funding-arb dispatch may be built"],"dispatch_attempted":false,"dispatch_plan_built":false,"dispatch_request_count":0,"dry_run_live_blocking_reasons":["funding-arb manual approval plan preview status is NotAttempted"],"dry_run_live_ready":false,"dry_run_risk_decision":"Rejected","dry_run_risk_reason_codes":["INSUFFICIENT_BALANCE"],"execute_live":true,"manual_gate_released":false,"mutable_execution_started":false,"pair_id":"binance:aster:ESPORTSUSDT:ESPORTSUSDT","source_status":"complete","strategy":"cross-exchange-funding-arb","symbol":"ESPORTSUSDT"}"#,
+                "\n"
+            ),
+        )
+        .expect("write report");
+
+        let json = funding_arb_execution_status_json(&FundingArbDashboardContext {
+            execution_reports_path: Some(report_path),
+            resident_events_path: None,
+            opportunity_history_path: None,
+        });
+
+        assert!(json.contains("\"venue_a_family\":\"binance\""));
+        assert!(json.contains("\"venue_b_family\":\"aster\""));
+        assert!(json.contains("\"source_status\":\"complete\""));
+        assert!(json.contains("risk_decision=Rejected"));
+        assert!(json.contains("risk_reason_codes=INSUFFICIENT_BALANCE"));
+        assert!(!json.contains("\"evidence\":null"));
     }
 
     #[test]
@@ -64566,6 +65209,11 @@ mod tests {
         assert!(report_json.contains("\"status\":\"NotProvided\""));
         assert!(report_json.contains("\"live_ready\":false"));
         assert!(report_json.contains("\"mutable_execution_started\":false"));
+        assert!(report_json.contains("\"source_status\":\"complete\""));
+        assert!(report_json.contains("\"venue_a_family\":\"binance\""));
+        assert!(report_json.contains("\"venue_b_family\":\"bybit\""));
+        assert!(report_json.contains("risk_decision=Rejected"));
+        assert!(!report_json.contains("\"evidence\":null"));
         let readiness_json = read_utf8(&output_dir.join("funding_arb_live_readiness.json"))
             .expect("live readiness json");
         assert!(readiness_json.contains("\"status\":\"Blocked\""));
@@ -72940,6 +73588,108 @@ mod tests {
         assert!(warning.contains("2 instruments"));
         assert!(warning.contains("BTC-USDT-SWAP"));
         assert!(warning.contains("ETH-USDT-SWAP"));
+    }
+
+    #[test]
+    fn runtime_positive_usize_rejects_zero() {
+        let error =
+            parse_runtime_positive_usize("ARB_RUNTIME_OKX_FUNDING_RATE_FETCH_CONCURRENCY", "0")
+                .expect_err("zero should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("ARB_RUNTIME_OKX_FUNDING_RATE_FETCH_CONCURRENCY"));
+    }
+
+    #[test]
+    fn okx_funding_rate_refresh_selection_fetches_cold_start_all_symbols() {
+        let ids = vec![
+            "BTC-USDT-SWAP".to_owned(),
+            "ETH-USDT-SWAP".to_owned(),
+            "SOL-USDT-SWAP".to_owned(),
+        ];
+        let mut cache = OkxFundingRatePageCache::default();
+
+        let selected = okx_funding_rate_inst_ids_to_refresh(
+            &ids,
+            &mut cache,
+            Instant::now(),
+            Duration::from_secs(300),
+            1,
+        );
+
+        assert_eq!(selected, ids);
+    }
+
+    #[test]
+    fn okx_funding_rate_refresh_selection_rotates_stale_symbols() {
+        let ids = vec![
+            "BTC-USDT-SWAP".to_owned(),
+            "ETH-USDT-SWAP".to_owned(),
+            "SOL-USDT-SWAP".to_owned(),
+        ];
+        let now = Instant::now();
+        let stale_at = now
+            .checked_sub(Duration::from_secs(301))
+            .expect("stale instant");
+        let mut cache = OkxFundingRatePageCache::default();
+        for inst_id in &ids {
+            cache.pages_by_inst_id.insert(
+                inst_id.clone(),
+                OkxCachedFundingRatePage {
+                    fetched_at: stale_at,
+                    page: format!("page:{inst_id}"),
+                },
+            );
+        }
+
+        let first = okx_funding_rate_inst_ids_to_refresh(
+            &ids,
+            &mut cache,
+            now,
+            Duration::from_secs(300),
+            1,
+        );
+        let second = okx_funding_rate_inst_ids_to_refresh(
+            &ids,
+            &mut cache,
+            now,
+            Duration::from_secs(300),
+            1,
+        );
+
+        assert_eq!(first, vec!["BTC-USDT-SWAP".to_owned()]);
+        assert_eq!(second, vec!["ETH-USDT-SWAP".to_owned()]);
+    }
+
+    #[test]
+    fn okx_depth_cache_reuses_fresh_depth_without_fetching() {
+        let mut symbols = BTreeSet::new();
+        symbols.insert("BTC-USDT".to_owned());
+        let mut cache = PublicOrderBookDepthCache::default();
+        cache.depths_by_symbol.insert(
+            "BTC-USDT".to_owned(),
+            CachedPublicOrderBookDepth {
+                fetched_at: Instant::now(),
+                depth: PublicOrderBookDepth {
+                    bid_depth: signal_depth_from_top_strings("99.90", "1.0"),
+                    ask_depth: signal_depth_from_top_strings("100.00", "2.0"),
+                },
+            },
+        );
+
+        let report = fetch_public_order_book_depth_map_cached(
+            PublicOrderBookDepthVenue::Okx,
+            &symbols,
+            &mut cache,
+            Duration::from_secs(10),
+            1,
+        );
+
+        assert_eq!(report.depths.len(), 1);
+        assert_eq!(report.refreshed_count, 0);
+        assert_eq!(report.cached_count, 1);
+        assert!(report.warnings.is_empty());
     }
 
     #[test]
