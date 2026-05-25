@@ -28,3 +28,4 @@ arb-strategy-api = { path = "../arb-strategy-api" }
 arb-venue-data = { path = "../arb-venue-data" }
 arb-signing = { path = "../arb-signing", default-features = false, optional = true }
 arb-venue-exec = { path = "../arb-venue-exec", default-features = false, optional = true }
+native-tls = "0.2.18"

@@ -82,6 +82,7 @@ usage() {
   ARB_RUNTIME_BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_SECS=300 # Bybit linear instruments-info 元数据缓存秒数；0 表示每轮都重新请求。
   ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
+  ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED= # funding-arb 是否直接读取 perp/funding 公开源；留空时仅 funding-arb 单独运行才默认启用。
   BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1 # auto-once 模式是否执行候选验证。
   BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60 # auto-once 两次触发之间的冷却秒数。
   BASIS_OBSERVER_EXECUTE_LIVE=0 # 是否允许正式实盘下单；1 表示允许。
@@ -90,6 +91,7 @@ usage() {
   BASIS_OBSERVER_CURL_RETRIES=3 # 拉取本地/公开 HTTP 端点的重试次数。
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1 # HTTP 重试间隔秒数。
   BASIS_OBSERVER_CURL_TIMEOUT_SECS=10 # 单次 HTTP 请求超时秒数。
+  BASIS_OBSERVER_RUST_RECORDER_ENABLED=1 # resident 模式下用 Rust recorder 轮询本地机会接口，避免每轮生成 curl/jq 子进程；auto-once/动态 WSS 会自动回退 shell recorder。
   BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT=12 # health-events.jsonl 中保留的 blocking_path 前 N 条，取值 1-100，避免大快照触发系统参数长度限制。
   BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS=60 # 成功 poll_ok 健康事件采样间隔；0 表示每轮都写入。
   BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES=200 # 常驻 runner 健康摘要检查最近 N 条事件。
@@ -3025,6 +3027,63 @@ append_resident_health_events() {
     "${funding_dir}/funding_arb_resident_live_events.jsonl"
 }
 
+rust_recorder_disabled_reason() {
+  case "${RUST_RECORDER_ENABLED:-1}" in
+    1) ;;
+    0) printf 'disabled_by_env'; return 0 ;;
+    *) printf 'invalid_env'; return 0 ;;
+  esac
+  if strategy_enabled "spot-perp-basis" && [[ "${SPOT_PERP_BASIS_MODE}" != "resident" ]]; then
+    printf 'spot_perp_basis_mode_%s' "${SPOT_PERP_BASIS_MODE}"
+    return 0
+  fi
+  if strategy_enabled "cross-exchange-funding-arb" && [[ "${FUNDING_ARB_MODE}" != "resident" ]]; then
+    printf 'funding_arb_mode_%s' "${FUNDING_ARB_MODE}"
+    return 0
+  fi
+  if [[ "${DYNAMIC_TARGET_WSS}" != "0" ]]; then
+    printf 'dynamic_target_wss_enabled'
+    return 0
+  fi
+  return 1
+}
+
+run_rust_recorder() {
+  local -a args
+  local venue
+
+  args=(
+    "${RUNTIME_BIN}" opportunity-recorder
+    --root "${RUN_ROOT}"
+    --opportunity-dir "${OPPORTUNITY_DIR}"
+    --logs-dir "${LOG_DIR}"
+    --basis-resident-out "${BASIS_RESIDENT_OUT_DIR}"
+    --funding-arb-resident-out "${FUNDING_ARB_RESIDENT_OUT_DIR}"
+    --strategies "${EFFECTIVE_STRATEGIES}"
+    --execution-mode "${EXECUTION_MODE}"
+    --spot-perp-basis-mode "${SPOT_PERP_BASIS_MODE}"
+    --funding-arb-mode "${FUNDING_ARB_MODE}"
+    --interval-secs "${INTERVAL_SECS}"
+    --timeout-secs "${CURL_TIMEOUT_SECS}"
+    --retries "${CURL_RETRIES}"
+    --retry-sleep-secs "${CURL_RETRY_SLEEP_SECS}"
+    --blocking-path-event-limit "${BLOCKING_PATH_EVENT_LIMIT}"
+    --health-sample-secs "${HEALTH_EVENT_SAMPLE_SECS}"
+    --resident-health-tail-lines "${RESIDENT_HEALTH_TAIL_LINES}"
+    --clear-sources
+  )
+  for venue in "${RECORDER_MONITORS[@]}"; do
+    args+=(--source "${venue}=$(opportunities_url "${venue}")")
+  done
+  if strategy_enabled "cross-exchange-funding-arb"; then
+    args+=(--funding-arb-url "$(funding_arb_opportunities_url)")
+  else
+    args+=(--no-funding-arb-url)
+  fi
+
+  ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${args[@]}"
+}
+
 run_recorder() {
   cd "${REPO_ROOT}"
   trap 'append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] recorder_stop"; exit 0' INT TERM
@@ -3032,6 +3091,13 @@ run_recorder() {
   touch "${OPPORTUNITY_DIR}/all-opportunities.jsonl" "${OPPORTUNITY_DIR}/spot-perp-basis.jsonl" "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl"
   touch "${VALIDATION_EVENTS_JSONL}" "${EXECUTION_REPORTS_JSONL}"
   IFS=' ' read -r -a RECORDER_MONITORS <<< "${EFFECTIVE_MONITORS}"
+  local rust_recorder_reason=""
+  if rust_recorder_reason="$(rust_recorder_disabled_reason)"; then
+    append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] recorder_impl=shell reason=${rust_recorder_reason}"
+  else
+    run_rust_recorder
+    return "$?"
+  fi
   append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] recorder_start mode=${EXECUTION_MODE} spot_perp_basis_mode=${SPOT_PERP_BASIS_MODE} funding_arb_mode=${FUNDING_ARB_MODE} monitors=${EFFECTIVE_MONITORS} strategies=${EFFECTIVE_STRATEGIES} interval_secs=${INTERVAL_SECS} min_net_bps=${MIN_NET_BPS}"
   append_json_line "${HEALTH_EVENTS_JSONL}" \
     --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -3153,6 +3219,7 @@ if [[ "${1:-}" == "--recorder" ]]; then
   CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
   CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
   CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
+  RUST_RECORDER_ENABLED="${BASIS_OBSERVER_RUST_RECORDER_ENABLED:-1}"
   EFFECTIVE_MONITORS="${BASIS_OBSERVER_EFFECTIVE_MONITORS:-binance bybit okx bitget aster hyperliquid}"
   EFFECTIVE_STRATEGIES="${BASIS_OBSERVER_EFFECTIVE_STRATEGIES:-spot-perp-basis,cross-exchange-funding-arb}"
   BINANCE_BIND="${BINANCE_BASIS_BIND:-127.0.0.1:8796}"
@@ -3162,6 +3229,10 @@ if [[ "${1:-}" == "--recorder" ]]; then
   ASTER_BIND="${ASTER_BASIS_BIND:-127.0.0.1:8800}"
   HYPERLIQUID_BIND="${HYPERLIQUID_BASIS_BIND:-127.0.0.1:8799}"
   FUNDING_ARB_BIND="${FUNDING_ARB_BIND:-127.0.0.1:8804}"
+  case "${RUST_RECORDER_ENABLED}" in
+    0|1) ;;
+    *) die "BASIS_OBSERVER_RUST_RECORDER_ENABLED must be 0 or 1" ;;
+  esac
   run_recorder
   exit 0
 fi
@@ -3298,6 +3369,7 @@ AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
 CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
 CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
 CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
+RUST_RECORDER_ENABLED="${BASIS_OBSERVER_RUST_RECORDER_ENABLED:-1}"
 BLOCKING_PATH_EVENT_LIMIT="${BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT:-12}"
 HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-60}"
 RESIDENT_HEALTH_TAIL_LINES="${BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES:-200}"
@@ -3353,6 +3425,10 @@ case "${DYNAMIC_TARGET_WSS}" in
   0|1) ;;
   *) die "BASIS_OBSERVER_DYNAMIC_TARGET_WSS must be 0 or 1" ;;
 esac
+case "${RUST_RECORDER_ENABLED}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_RUST_RECORDER_ENABLED must be 0 or 1" ;;
+esac
 [[ "${TARGET_WSS_BASE_PORT}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_BASE_PORT must be numeric"
 [[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
 [[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
@@ -3363,6 +3439,14 @@ export ARB_RUNTIME_JSONL_ROTATE_BYTES="${ARB_RUNTIME_JSONL_ROTATE_BYTES:-${LOG_R
 export ARB_RUNTIME_JSONL_ROTATE_KEEP="${ARB_RUNTIME_JSONL_ROTATE_KEEP:-${LOG_ROTATE_KEEP}}"
 export ARB_RUNTIME_BINANCE_RECV_WINDOW_MS="${ARB_RUNTIME_BINANCE_RECV_WINDOW_MS:-30000}"
 export ARB_RUNTIME_BYBIT_RECV_WINDOW_MS="${ARB_RUNTIME_BYBIT_RECV_WINDOW_MS:-30000}"
+if [[ -z "${ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED:-}" ]]; then
+  if strategy_enabled "cross-exchange-funding-arb" && ! strategy_enabled "spot-perp-basis"; then
+    ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=1
+  else
+    ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=0
+  fi
+fi
+export ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED
 
 if [[ "${#CLI_MONITORS[@]}" -eq 0 ]]; then
   if [[ -n "${BASIS_OBSERVER_MONITORS:-}" ]]; then
@@ -3609,16 +3693,20 @@ start_spot_perp_basis_resident_live() {
   echo "  pid=${pid} log=${log_file}"
 }
 
-for monitor in "${MONITORS[@]}"; do
-  case "${monitor}" in
-    binance) start_monitor binance binance-basis-monitor "${BINANCE_BIND}" ;;
-    bybit) start_monitor bybit bybit-basis-monitor "${BYBIT_BIND}" ;;
-    okx) start_monitor okx okx-basis-monitor "${OKX_BIND}" ;;
-    bitget) start_monitor bitget bitget-basis-monitor "${BITGET_BIND}" ;;
-    aster) start_monitor aster aster-basis-monitor "${ASTER_BIND}" ;;
-    hyperliquid) start_monitor hyperliquid hyperliquid-basis-monitor "${HYPERLIQUID_BIND}" ;;
-  esac
-done
+if strategy_enabled "spot-perp-basis" || [[ "${ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}" != "1" ]]; then
+  for monitor in "${MONITORS[@]}"; do
+    case "${monitor}" in
+      binance) start_monitor binance binance-basis-monitor "${BINANCE_BIND}" ;;
+      bybit) start_monitor bybit bybit-basis-monitor "${BYBIT_BIND}" ;;
+      okx) start_monitor okx okx-basis-monitor "${OKX_BIND}" ;;
+      bitget) start_monitor bitget bitget-basis-monitor "${BITGET_BIND}" ;;
+      aster) start_monitor aster aster-basis-monitor "${ASTER_BIND}" ;;
+      hyperliquid) start_monitor hyperliquid hyperliquid-basis-monitor "${HYPERLIQUID_BIND}" ;;
+    esac
+  done
+else
+  echo "basis monitors skipped: funding-arb direct public sources enabled and spot-perp-basis strategy disabled"
+fi
 
 if strategy_enabled "cross-exchange-funding-arb"; then
   start_funding_arb_monitor
@@ -3626,13 +3714,15 @@ fi
 
 if [[ "${STARTUP_CHECK}" == "1" ]]; then
   echo "checking /opportunities endpoints before starting recorder..."
-  for monitor in "${MONITORS[@]}"; do
-    if ! wait_for_monitor_opportunities "${monitor}"; then
-      stop_started_processes
-      rm -f "${PID_FILE}"
-      exit 1
-    fi
-  done
+  if strategy_enabled "spot-perp-basis" || [[ "${ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}" != "1" ]]; then
+    for monitor in "${MONITORS[@]}"; do
+      if ! wait_for_monitor_opportunities "${monitor}"; then
+        stop_started_processes
+        rm -f "${PID_FILE}"
+        exit 1
+      fi
+    done
+  fi
   if strategy_enabled "cross-exchange-funding-arb"; then
     if ! wait_for_funding_arb_opportunities; then
       stop_started_processes
@@ -3703,6 +3793,7 @@ nohup env \
   BASIS_OBSERVER_CURL_TIMEOUT_SECS="${CURL_TIMEOUT_SECS}" \
   BASIS_OBSERVER_CURL_RETRIES="${CURL_RETRIES}" \
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS="${CURL_RETRY_SLEEP_SECS}" \
+  BASIS_OBSERVER_RUST_RECORDER_ENABLED="${RUST_RECORDER_ENABLED}" \
   BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT="${BLOCKING_PATH_EVENT_LIMIT}" \
   BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS="${HEALTH_EVENT_SAMPLE_SECS}" \
   BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES="${RESIDENT_HEALTH_TAIL_LINES}" \

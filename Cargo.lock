@@ -95,6 +95,7 @@ dependencies = [
  "arb-strategy-api",
  "arb-venue-data",
  "arb-venue-exec",
+ "native-tls",
 ]
 
 [[package]]

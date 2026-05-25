@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(feature = "live-exec")]
@@ -91,6 +91,7 @@ use arb_venue_data::{
     MarketDataReader, MarketDataTransport, MarketQuote, PublicJsonWssTextStreamClient,
     RestWssMarketDataCoordinator, WssQuoteUpdate,
 };
+use native_tls::TlsConnector;
 
 #[cfg(feature = "live-exec")]
 use arb_signing::real::{
@@ -364,6 +365,8 @@ const BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_DEFAULT_SECS: u64 = 300;
 const ASTER_SPOT_PERP_SPOT_SCAN_ENV: &str = "ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED";
 const HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV: &str =
     "ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED";
+const FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENV: &str =
+    "ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED";
 const BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS: i128 = 5;
 const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
 const ARB_RUNTIME_LEGACY_COMMANDS_ENV: &str = "ARB_RUNTIME_ENABLE_LEGACY_COMMANDS";
@@ -25136,11 +25139,12 @@ pub fn run_funding_arb_monitor(options: FundingArbMonitorOptions) -> RuntimeResu
         println!(
             "funding-arb-monitor: api=http://{} poll_interval_secs={} min_net_funding_bps={} mutable_execution_started=false",
             options.bind_addr, options.poll_interval_secs, options.min_net_funding_bps
-        );
+            );
     }
 
+    let mut direct_source_cache = FundingArbDirectSourceCache::default();
     loop {
-        match fetch_funding_arb_monitor_snapshot(&options) {
+        match fetch_funding_arb_monitor_snapshot_with_cache(&options, &mut direct_source_cache) {
             Ok(snapshot) => {
                 if let Some(dir) = &options.output_dir {
                     write_funding_arb_monitor_snapshot(dir, &snapshot)?;
@@ -25400,6 +25404,10 @@ fn hyperliquid_spot_perp_spot_scan_enabled() -> RuntimeResult<bool> {
     runtime_bool_env(HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV, false)
 }
 
+fn funding_arb_direct_public_sources_enabled() -> RuntimeResult<bool> {
+    runtime_bool_env(FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENV, false)
+}
+
 fn basis_monitor_signal_should_fetch_depth(
     signal: &SpotPerpBasisSignal,
     min_net_bps: i128,
@@ -25424,14 +25432,50 @@ struct OkxFundingRatePageCache {
     report: Option<OkxFundingRateFetchReport>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct FundingArbDirectSourceCache {
+    bybit_instruments: BybitLinearInstrumentPageCache,
+    okx_funding_rates: OkxFundingRatePageCache,
+}
+
+#[derive(Clone, Debug)]
+struct BinanceBasisMonitorParsedInputs {
+    spot_books: BTreeMap<String, MonitorBookTickerRow>,
+    perp_books: BTreeMap<String, MonitorBookTickerRow>,
+    premiums: Vec<MonitorPremiumIndexRow>,
+}
+
+#[derive(Clone, Debug)]
+struct BybitBasisMonitorParsedInputs {
+    spot_books: BTreeMap<String, MonitorBookTickerRow>,
+    linear_tickers: BTreeMap<String, BybitLinearTickerRow>,
+    linear_symbols: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct OkxBasisMonitorParsedInputs {
+    spot_books: BTreeMap<String, OkxTickerRow>,
+    swap_tickers: BTreeMap<String, OkxTickerRow>,
+    mark_prices: BTreeMap<String, OkxMarkPriceRow>,
+    index_prices: BTreeMap<String, OkxIndexTickerRow>,
+    funding_rates: BTreeMap<String, OkxFundingRateRow>,
+}
+
+#[derive(Clone, Debug)]
+struct BitgetBasisMonitorParsedInputs {
+    spot_books: BTreeMap<String, MonitorBookTickerRow>,
+    futures_tickers: Vec<BitgetUsdtFuturesTickerRow>,
+    funding_rates: BTreeMap<String, BitgetFundingRateRow>,
+}
+
 fn fetch_binance_basis_monitor_snapshot(
     options: &BinanceBasisMonitorOptions,
 ) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
     let spot_json = fetch_public_json_with_curl(&binance_spot_book_ticker_all_url())?;
     let perp_json = fetch_public_json_with_curl(&binance_usdm_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&binance_usdm_premium_index_all_url())?;
-    let depth_symbols =
-        binance_basis_monitor_depth_symbols(&spot_json, &perp_json, &premium_json, options)?;
+    let parsed = parse_binance_basis_monitor_inputs(&spot_json, &perp_json, &premium_json)?;
+    let depth_symbols = binance_basis_monitor_depth_symbols_from_parsed(&parsed, options)?;
     let spot_depths =
         fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BinanceSpot, &depth_symbols);
     let perp_depths = fetch_public_order_book_depth_map(
@@ -25443,15 +25487,31 @@ fn fetch_binance_basis_monitor_snapshot(
         .into_iter()
         .chain(perp_depths.warnings)
         .collect::<Vec<_>>();
-    build_binance_basis_monitor_snapshot_from_json_with_depth(
-        &spot_json,
-        &perp_json,
-        &premium_json,
+    build_binance_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
         options,
         &spot_depths.depths,
         &perp_depths.depths,
         warnings,
     )
+}
+
+fn parse_binance_basis_monitor_inputs(
+    spot_json: &str,
+    perp_json: &str,
+    premium_json: &str,
+) -> RuntimeResult<BinanceBasisMonitorParsedInputs> {
+    Ok(BinanceBasisMonitorParsedInputs {
+        spot_books: parse_book_ticker_rows(spot_json, "spot")?
+            .into_iter()
+            .map(|row| (row.symbol.clone(), row))
+            .collect(),
+        perp_books: parse_book_ticker_rows(perp_json, "usdm-perp")?
+            .into_iter()
+            .map(|row| (row.symbol.clone(), row))
+            .collect(),
+        premiums: parse_premium_index_rows(premium_json)?,
+    })
 }
 
 #[cfg(test)]
@@ -25472,6 +25532,7 @@ fn build_binance_basis_monitor_snapshot_from_json(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_binance_basis_monitor_snapshot_from_json_with_depth(
     spot_json: &str,
@@ -25482,25 +25543,33 @@ fn build_binance_basis_monitor_snapshot_from_json_with_depth(
     perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
     warnings: Vec<String>,
 ) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
+    let parsed = parse_binance_basis_monitor_inputs(spot_json, perp_json, premium_json)?;
+    build_binance_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
+        options,
+        spot_depths,
+        perp_depths,
+        warnings,
+    )
+}
+
+fn build_binance_basis_monitor_snapshot_from_parsed_with_depth(
+    parsed: &BinanceBasisMonitorParsedInputs,
+    options: &BinanceBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
+) -> RuntimeResult<BinanceBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_book_ticker_rows(spot_json, "spot")?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let perp_books = parse_book_ticker_rows(perp_json, "usdm-perp")?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let premiums = parse_premium_index_rows(premium_json)?;
 
     let mut rows = Vec::new();
     let mut filtered_funding_count = 0_usize;
     let mut missing_spot_count = 0_usize;
     let mut missing_perp_count = 0_usize;
 
-    for premium in premiums {
+    for premium in &parsed.premiums {
         if !premium.symbol.ends_with("USDT") {
             continue;
         }
@@ -25510,8 +25579,8 @@ fn build_binance_basis_monitor_snapshot_from_json_with_depth(
             continue;
         }
 
-        let spot = spot_books.get(&premium.symbol);
-        let perp = perp_books.get(&premium.symbol);
+        let spot = parsed.spot_books.get(&premium.symbol);
+        let perp = parsed.perp_books.get(&premium.symbol);
         let (mut source_status, reason) = match (spot, perp) {
             (Some(_), Some(_)) => ("complete".to_owned(), None),
             (None, Some(_)) => {
@@ -25589,7 +25658,7 @@ fn build_binance_basis_monitor_snapshot_from_json_with_depth(
             funding_interval_hours_or_default("binance", premium.funding_interval_hours.clone())?;
 
         rows.push(BinanceBasisMarketRow {
-            symbol: premium.symbol,
+            symbol: premium.symbol.clone(),
             spot_bid: spot.map(|row| row.bid_price.clone()),
             spot_ask: spot.map(|row| row.ask_price.clone()),
             spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
@@ -25638,11 +25707,11 @@ fn build_binance_basis_monitor_snapshot_from_json_with_depth(
                         })
                 })
                 .unwrap_or_default(),
-            mark_price: premium.mark_price,
-            index_price: premium.index_price,
-            last_funding_rate: premium.last_funding_rate,
+            mark_price: premium.mark_price.clone(),
+            index_price: premium.index_price.clone(),
+            last_funding_rate: premium.last_funding_rate.clone(),
             funding_interval_hours,
-            next_funding_time_ms: premium.next_funding_time_ms,
+            next_funding_time_ms: premium.next_funding_time_ms.clone(),
             gross_basis_bps: signal.as_ref().map(|signal| signal.gross_bps.to_string()),
             total_cost_bps: signal
                 .as_ref()
@@ -25680,25 +25749,31 @@ fn build_binance_basis_monitor_snapshot_from_json_with_depth(
     })
 }
 
-fn binance_basis_monitor_depth_symbols(
+#[cfg(test)]
+fn binance_basis_monitor_depth_symbols_with_limit(
     spot_json: &str,
     perp_json: &str,
     premium_json: &str,
     options: &BinanceBasisMonitorOptions,
+    limit: usize,
 ) -> RuntimeResult<BTreeSet<String>> {
-    binance_basis_monitor_depth_symbols_with_limit(
-        spot_json,
-        perp_json,
-        premium_json,
+    let parsed = parse_binance_basis_monitor_inputs(spot_json, perp_json, premium_json)?;
+    binance_basis_monitor_depth_symbols_from_parsed_with_limit(&parsed, options, limit)
+}
+
+fn binance_basis_monitor_depth_symbols_from_parsed(
+    parsed: &BinanceBasisMonitorParsedInputs,
+    options: &BinanceBasisMonitorOptions,
+) -> RuntimeResult<BTreeSet<String>> {
+    binance_basis_monitor_depth_symbols_from_parsed_with_limit(
+        parsed,
         options,
         BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
     )
 }
 
-fn binance_basis_monitor_depth_symbols_with_limit(
-    spot_json: &str,
-    perp_json: &str,
-    premium_json: &str,
+fn binance_basis_monitor_depth_symbols_from_parsed_with_limit(
+    parsed: &BinanceBasisMonitorParsedInputs,
     options: &BinanceBasisMonitorOptions,
     limit: usize,
 ) -> RuntimeResult<BTreeSet<String>> {
@@ -25707,23 +25782,15 @@ fn binance_basis_monitor_depth_symbols_with_limit(
     }
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_book_ticker_rows(spot_json, "spot")?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let perp_books = parse_book_ticker_rows(perp_json, "usdm-perp")?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
     let mut scored_symbols = Vec::new();
-    for premium in parse_premium_index_rows(premium_json)? {
+    for premium in &parsed.premiums {
         if !premium.symbol.ends_with("USDT") {
             continue;
         }
-        let Some(spot) = spot_books.get(&premium.symbol) else {
+        let Some(spot) = parsed.spot_books.get(&premium.symbol) else {
             continue;
         };
-        let Some(perp) = perp_books.get(&premium.symbol) else {
+        let Some(perp) = parsed.perp_books.get(&premium.symbol) else {
             continue;
         };
         let funding_rate = MonitorDecimal::parse("lastFundingRate", &premium.last_funding_rate)?;
@@ -25740,7 +25807,7 @@ fn binance_basis_monitor_depth_symbols_with_limit(
             perp_best_ask: perp.ask_price.clone(),
             perp_bid_size: Some(perp.bid_qty.clone()),
             perp_bid_depth: perp.bid_depth.clone(),
-            last_funding_rate: premium.last_funding_rate,
+            last_funding_rate: premium.last_funding_rate.clone(),
             notional_usd: options.notional_usd.clone(),
             spot_taker_fee_bps: options.spot_taker_fee_bps,
             perp_taker_fee_bps: options.perp_taker_fee_bps,
@@ -25756,7 +25823,7 @@ fn binance_basis_monitor_depth_symbols_with_limit(
             signal.expected_profit_bps,
             signal.net_bps,
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
-            premium.symbol,
+            premium.symbol.clone(),
         ));
     }
     Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
@@ -26228,8 +26295,8 @@ fn fetch_bybit_basis_monitor_snapshot_with_cache(
     let spot_json = fetch_public_json_with_curl(&bybit_spot_tickers_url())?;
     let linear_json = fetch_public_json_with_curl(&bybit_linear_tickers_url())?;
     let instrument_pages = fetch_bybit_linear_instrument_pages_cached(instrument_cache)?;
-    let depth_symbols =
-        bybit_basis_monitor_depth_symbols(&spot_json, &linear_json, &instrument_pages, options)?;
+    let parsed = parse_bybit_basis_monitor_inputs(&spot_json, &linear_json, &instrument_pages)?;
+    let depth_symbols = bybit_basis_monitor_depth_symbols_from_parsed(&parsed, options)?;
     let spot_depths =
         fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BybitSpot, &depth_symbols);
     let linear_depths =
@@ -26239,15 +26306,31 @@ fn fetch_bybit_basis_monitor_snapshot_with_cache(
         .into_iter()
         .chain(linear_depths.warnings)
         .collect::<Vec<_>>();
-    build_bybit_basis_monitor_snapshot_from_json_with_depth(
-        &spot_json,
-        &linear_json,
-        &instrument_pages,
+    build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
         options,
         &spot_depths.depths,
         &linear_depths.depths,
         warnings,
     )
+}
+
+fn parse_bybit_basis_monitor_inputs(
+    spot_json: &str,
+    linear_json: &str,
+    instrument_pages: &[String],
+) -> RuntimeResult<BybitBasisMonitorParsedInputs> {
+    Ok(BybitBasisMonitorParsedInputs {
+        spot_books: parse_bybit_spot_ticker_rows(spot_json)?
+            .into_iter()
+            .map(|row| (row.symbol.clone(), row))
+            .collect(),
+        linear_tickers: parse_bybit_linear_ticker_rows(linear_json)?
+            .into_iter()
+            .map(|row| (row.symbol.clone(), row))
+            .collect(),
+        linear_symbols: parse_bybit_linear_perpetual_symbols(instrument_pages)?,
+    })
 }
 
 fn fetch_bybit_linear_instrument_pages() -> RuntimeResult<Vec<String>> {
@@ -26311,6 +26394,7 @@ fn build_bybit_basis_monitor_snapshot_from_json(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_bybit_basis_monitor_snapshot_from_json_with_depth(
     spot_json: &str,
@@ -26321,26 +26405,34 @@ fn build_bybit_basis_monitor_snapshot_from_json_with_depth(
     linear_depths: &BTreeMap<String, PublicOrderBookDepth>,
     warnings: Vec<String>,
 ) -> RuntimeResult<BybitBasisMonitorSnapshot> {
+    let parsed = parse_bybit_basis_monitor_inputs(spot_json, linear_json, instrument_pages)?;
+    build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
+        options,
+        spot_depths,
+        linear_depths,
+        warnings,
+    )
+}
+
+fn build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
+    parsed: &BybitBasisMonitorParsedInputs,
+    options: &BybitBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    linear_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
+) -> RuntimeResult<BybitBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_bybit_spot_ticker_rows(spot_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let linear_tickers = parse_bybit_linear_ticker_rows(linear_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let linear_symbols = parse_bybit_linear_perpetual_symbols(instrument_pages)?;
 
     let mut rows = Vec::new();
     let mut filtered_funding_count = 0_usize;
     let mut missing_spot_count = 0_usize;
     let mut missing_perp_count = 0_usize;
 
-    for symbol in linear_symbols {
-        let linear = linear_tickers.get(&symbol);
+    for symbol in &parsed.linear_symbols {
+        let linear = parsed.linear_tickers.get(symbol);
         if let Some(linear) = linear {
             let funding_rate = MonitorDecimal::parse("fundingRate", &linear.last_funding_rate)?;
             if funding_rate.abs_less_than(min_abs_funding_rate) {
@@ -26349,7 +26441,7 @@ fn build_bybit_basis_monitor_snapshot_from_json_with_depth(
             }
         }
 
-        let spot = spot_books.get(&symbol);
+        let spot = parsed.spot_books.get(symbol);
         let (mut source_status, reason) = match (spot, linear) {
             (Some(_), Some(_)) => ("complete".to_owned(), None),
             (None, Some(_)) => {
@@ -26380,13 +26472,13 @@ fn build_bybit_basis_monitor_snapshot_from_json_with_depth(
         let signal = match (spot, linear) {
             (Some(spot), Some(linear)) => {
                 let spot_ask_depth = spot_depths
-                    .get(&symbol)
+                    .get(symbol)
                     .map(|depth| depth.ask_depth.clone())
                     .unwrap_or_else(|| {
                         signal_depth_from_top_strings(&spot.ask_price, &spot.ask_qty)
                     });
                 let perp_bid_depth = linear_depths
-                    .get(&symbol)
+                    .get(symbol)
                     .map(|depth| depth.bid_depth.clone())
                     .unwrap_or_else(|| {
                         signal_depth_from_top_strings(&linear.bid_price, &linear.bid_qty)
@@ -26425,7 +26517,7 @@ fn build_bybit_basis_monitor_snapshot_from_json_with_depth(
             .or(reason);
 
         rows.push(BybitBasisMarketRow {
-            symbol,
+            symbol: symbol.clone(),
             spot_bid: spot.map(|row| row.bid_price.clone()),
             spot_ask: spot.map(|row| row.ask_price.clone()),
             spot_bid_qty: spot.map(|row| row.bid_qty.clone()),
@@ -26525,25 +26617,19 @@ fn build_bybit_basis_monitor_snapshot_from_json_with_depth(
     })
 }
 
-fn bybit_basis_monitor_depth_symbols(
-    spot_json: &str,
-    linear_json: &str,
-    instrument_pages: &[String],
+fn bybit_basis_monitor_depth_symbols_from_parsed(
+    parsed: &BybitBasisMonitorParsedInputs,
     options: &BybitBasisMonitorOptions,
 ) -> RuntimeResult<BTreeSet<String>> {
-    bybit_basis_monitor_depth_symbols_with_limit(
-        spot_json,
-        linear_json,
-        instrument_pages,
+    bybit_basis_monitor_depth_symbols_from_parsed_with_limit(
+        parsed,
         options,
         BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
     )
 }
 
-fn bybit_basis_monitor_depth_symbols_with_limit(
-    spot_json: &str,
-    linear_json: &str,
-    instrument_pages: &[String],
+fn bybit_basis_monitor_depth_symbols_from_parsed_with_limit(
+    parsed: &BybitBasisMonitorParsedInputs,
     options: &BybitBasisMonitorOptions,
     limit: usize,
 ) -> RuntimeResult<BTreeSet<String>> {
@@ -26552,21 +26638,12 @@ fn bybit_basis_monitor_depth_symbols_with_limit(
     }
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_bybit_spot_ticker_rows(spot_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let linear_tickers = parse_bybit_linear_ticker_rows(linear_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let linear_symbols = parse_bybit_linear_perpetual_symbols(instrument_pages)?;
     let mut scored_symbols = Vec::new();
-    for symbol in linear_symbols {
-        let Some(spot) = spot_books.get(&symbol) else {
+    for symbol in &parsed.linear_symbols {
+        let Some(spot) = parsed.spot_books.get(symbol) else {
             continue;
         };
-        let Some(linear) = linear_tickers.get(&symbol) else {
+        let Some(linear) = parsed.linear_tickers.get(symbol) else {
             continue;
         };
         let funding_rate = MonitorDecimal::parse("fundingRate", &linear.last_funding_rate)?;
@@ -26599,7 +26676,7 @@ fn bybit_basis_monitor_depth_symbols_with_limit(
             signal.expected_profit_bps,
             signal.net_bps,
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
-            symbol,
+            symbol.clone(),
         ));
     }
     Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
@@ -26615,8 +26692,14 @@ fn fetch_okx_basis_monitor_snapshot_with_cache(
     let index_json = fetch_public_json_with_curl(&okx_index_tickers_url())?;
     let swap_rows = parse_okx_ticker_rows(&swap_json, "okx swap tickers")?;
     let funding_pages = fetch_okx_usdt_swap_funding_rate_pages_cached(&swap_rows, funding_cache)?;
-    let depth_symbols =
-        okx_basis_monitor_depth_symbols(&spot_json, &swap_json, &funding_pages.pages, options)?;
+    let parsed = parse_okx_basis_monitor_inputs_from_swap_rows(
+        &spot_json,
+        swap_rows,
+        &mark_json,
+        &index_json,
+        &funding_pages.pages,
+    )?;
+    let depth_symbols = okx_basis_monitor_depth_symbols_from_parsed(&parsed, options)?;
     let spot_depths =
         fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::Okx, &depth_symbols.spot);
     let swap_depths =
@@ -26626,12 +26709,8 @@ fn fetch_okx_basis_monitor_snapshot_with_cache(
         .into_iter()
         .chain(swap_depths.warnings)
         .collect::<Vec<_>>();
-    let mut snapshot = build_okx_basis_monitor_snapshot_from_json_with_depth(
-        &spot_json,
-        &swap_json,
-        &mark_json,
-        &index_json,
-        &funding_pages.pages,
+    let mut snapshot = build_okx_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
         options,
         &spot_depths.depths,
         &swap_depths.depths,
@@ -26648,6 +26727,55 @@ fn fetch_okx_basis_monitor_snapshot_with_cache(
         );
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+fn parse_okx_basis_monitor_inputs(
+    spot_json: &str,
+    swap_json: &str,
+    mark_json: &str,
+    index_json: &str,
+    funding_pages: &[String],
+) -> RuntimeResult<OkxBasisMonitorParsedInputs> {
+    let swap_rows = parse_okx_ticker_rows(swap_json, "okx swap tickers")?;
+    parse_okx_basis_monitor_inputs_from_swap_rows(
+        spot_json,
+        swap_rows,
+        mark_json,
+        index_json,
+        funding_pages,
+    )
+}
+
+fn parse_okx_basis_monitor_inputs_from_swap_rows(
+    spot_json: &str,
+    swap_rows: Vec<OkxTickerRow>,
+    mark_json: &str,
+    index_json: &str,
+    funding_pages: &[String],
+) -> RuntimeResult<OkxBasisMonitorParsedInputs> {
+    Ok(OkxBasisMonitorParsedInputs {
+        spot_books: parse_okx_ticker_rows(spot_json, "okx spot tickers")?
+            .into_iter()
+            .map(|row| (row.inst_id.clone(), row))
+            .collect(),
+        swap_tickers: swap_rows
+            .into_iter()
+            .map(|row| (row.inst_id.clone(), row))
+            .collect(),
+        mark_prices: parse_okx_mark_price_rows(mark_json)?
+            .into_iter()
+            .map(|row| (row.inst_id.clone(), row))
+            .collect(),
+        index_prices: parse_okx_index_ticker_rows(index_json)?
+            .into_iter()
+            .map(|row| (row.inst_id.clone(), row))
+            .collect(),
+        funding_rates: parse_okx_funding_rate_pages(funding_pages)?
+            .into_iter()
+            .map(|row| (row.inst_id.clone(), row))
+            .collect(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -26771,6 +26899,7 @@ fn build_okx_basis_monitor_snapshot_from_json(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_okx_basis_monitor_snapshot_from_json_with_depth(
     spot_json: &str,
@@ -26783,40 +26912,38 @@ fn build_okx_basis_monitor_snapshot_from_json_with_depth(
     swap_depths: &BTreeMap<String, PublicOrderBookDepth>,
     warnings: Vec<String>,
 ) -> RuntimeResult<OkxBasisMonitorSnapshot> {
+    let parsed =
+        parse_okx_basis_monitor_inputs(spot_json, swap_json, mark_json, index_json, funding_pages)?;
+    build_okx_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
+        options,
+        spot_depths,
+        swap_depths,
+        warnings,
+    )
+}
+
+fn build_okx_basis_monitor_snapshot_from_parsed_with_depth(
+    parsed: &OkxBasisMonitorParsedInputs,
+    options: &OkxBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    swap_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
+) -> RuntimeResult<OkxBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_okx_ticker_rows(spot_json, "okx spot tickers")?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let swap_tickers = parse_okx_ticker_rows(swap_json, "okx swap tickers")?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let mark_prices = parse_okx_mark_price_rows(mark_json)?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let index_prices = parse_okx_index_ticker_rows(index_json)?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let funding_rates = parse_okx_funding_rate_pages(funding_pages)?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
 
     let mut rows = Vec::new();
     let mut filtered_funding_count = 0_usize;
     let mut missing_spot_count = 0_usize;
     let mut missing_perp_count = 0_usize;
 
-    for (swap_inst_id, swap) in swap_tickers {
-        let Some(spot_inst_id) = okx_spot_inst_id_from_swap(&swap_inst_id) else {
+    for (swap_inst_id, swap) in &parsed.swap_tickers {
+        let Some(spot_inst_id) = okx_spot_inst_id_from_swap(swap_inst_id) else {
             continue;
         };
-        let funding = funding_rates.get(&swap_inst_id);
+        let funding = parsed.funding_rates.get(swap_inst_id);
         if let Some(funding) = funding {
             let funding_rate = MonitorDecimal::parse("fundingRate", &funding.funding_rate)?;
             if funding_rate.abs_less_than(min_abs_funding_rate) {
@@ -26825,9 +26952,9 @@ fn build_okx_basis_monitor_snapshot_from_json_with_depth(
             }
         }
 
-        let spot = spot_books.get(&spot_inst_id);
-        let mark = mark_prices.get(&swap_inst_id);
-        let index = index_prices.get(&spot_inst_id);
+        let spot = parsed.spot_books.get(&spot_inst_id);
+        let mark = parsed.mark_prices.get(swap_inst_id);
+        let index = parsed.index_prices.get(&spot_inst_id);
         let (mut source_status, reason) = match (spot, funding) {
             (Some(_), Some(_)) => ("complete".to_owned(), None),
             (None, Some(_)) => {
@@ -26860,7 +26987,7 @@ fn build_okx_basis_monitor_snapshot_from_json_with_depth(
                         signal_depth_from_top_strings(&spot.ask_price, &spot.ask_qty)
                     });
                 let perp_bid_depth = swap_depths
-                    .get(&swap_inst_id)
+                    .get(swap_inst_id)
                     .map(|depth| depth.bid_depth.clone())
                     .unwrap_or_else(|| {
                         signal_depth_from_top_strings(&swap.bid_price, &swap.bid_qty)
@@ -26929,11 +27056,11 @@ fn build_okx_basis_monitor_snapshot_from_json_with_depth(
             perp_bid_qty: Some(swap.bid_qty.clone()),
             perp_ask_qty: Some(swap.ask_qty.clone()),
             perp_bid_depth: swap_depths
-                .get(&swap_inst_id)
+                .get(swap_inst_id)
                 .map(|depth| depth.bid_depth.clone())
                 .unwrap_or_else(|| signal_depth_from_top_strings(&swap.bid_price, &swap.bid_qty)),
             perp_ask_depth: swap_depths
-                .get(&swap_inst_id)
+                .get(swap_inst_id)
                 .map(|depth| depth.ask_depth.clone())
                 .unwrap_or_else(|| signal_depth_from_top_strings(&swap.ask_price, &swap.ask_qty)),
             mark_price: mark.map(|row| row.mark_price.clone()).unwrap_or_default(),
@@ -26963,8 +27090,9 @@ fn build_okx_basis_monitor_snapshot_from_json_with_depth(
         });
     }
 
-    if rows.is_empty() && !spot_books.is_empty() {
-        missing_perp_count = spot_books
+    if rows.is_empty() && !parsed.spot_books.is_empty() {
+        missing_perp_count = parsed
+            .spot_books
             .keys()
             .filter(|spot_inst_id| spot_inst_id.ends_with("-USDT"))
             .count();
@@ -26992,25 +27120,19 @@ fn build_okx_basis_monitor_snapshot_from_json_with_depth(
     })
 }
 
-fn okx_basis_monitor_depth_symbols(
-    spot_json: &str,
-    swap_json: &str,
-    funding_pages: &[String],
+fn okx_basis_monitor_depth_symbols_from_parsed(
+    parsed: &OkxBasisMonitorParsedInputs,
     options: &OkxBasisMonitorOptions,
 ) -> RuntimeResult<OkxBasisMonitorDepthSymbols> {
-    okx_basis_monitor_depth_symbols_with_limit(
-        spot_json,
-        swap_json,
-        funding_pages,
+    okx_basis_monitor_depth_symbols_from_parsed_with_limit(
+        parsed,
         options,
         BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
     )
 }
 
-fn okx_basis_monitor_depth_symbols_with_limit(
-    spot_json: &str,
-    swap_json: &str,
-    funding_pages: &[String],
+fn okx_basis_monitor_depth_symbols_from_parsed_with_limit(
+    parsed: &OkxBasisMonitorParsedInputs,
     options: &OkxBasisMonitorOptions,
     limit: usize,
 ) -> RuntimeResult<OkxBasisMonitorDepthSymbols> {
@@ -27022,27 +27144,15 @@ fn okx_basis_monitor_depth_symbols_with_limit(
     }
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_okx_ticker_rows(spot_json, "okx spot tickers")?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let swap_tickers = parse_okx_ticker_rows(swap_json, "okx swap tickers")?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let funding_rates = parse_okx_funding_rate_pages(funding_pages)?
-        .into_iter()
-        .map(|row| (row.inst_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
     let mut scored_symbols = Vec::new();
-    for (swap_inst_id, swap) in swap_tickers {
-        let Some(spot_inst_id) = okx_spot_inst_id_from_swap(&swap_inst_id) else {
+    for (swap_inst_id, swap) in &parsed.swap_tickers {
+        let Some(spot_inst_id) = okx_spot_inst_id_from_swap(swap_inst_id) else {
             continue;
         };
-        let Some(spot) = spot_books.get(&spot_inst_id) else {
+        let Some(spot) = parsed.spot_books.get(&spot_inst_id) else {
             continue;
         };
-        let Some(funding) = funding_rates.get(&swap_inst_id) else {
+        let Some(funding) = parsed.funding_rates.get(swap_inst_id) else {
             continue;
         };
         let funding_rate = MonitorDecimal::parse("fundingRate", &funding.funding_rate)?;
@@ -27076,7 +27186,7 @@ fn okx_basis_monitor_depth_symbols_with_limit(
             signal.net_bps,
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
             spot_inst_id,
-            swap_inst_id,
+            swap_inst_id.clone(),
         ));
     }
     scored_symbols.sort_by(|left, right| {
@@ -27103,8 +27213,8 @@ fn fetch_bitget_basis_monitor_snapshot(
     let spot_json = fetch_public_json_with_curl(&bitget_spot_tickers_url())?;
     let futures_json = fetch_public_json_with_curl(&bitget_usdt_futures_tickers_url())?;
     let funding_json = fetch_public_json_with_curl(&bitget_usdt_futures_funding_rate_url())?;
-    let depth_symbols =
-        bitget_basis_monitor_depth_symbols(&spot_json, &futures_json, &funding_json, options)?;
+    let parsed = parse_bitget_basis_monitor_inputs(&spot_json, &futures_json, &funding_json)?;
+    let depth_symbols = bitget_basis_monitor_depth_symbols_from_parsed(&parsed, options)?;
     let spot_depths =
         fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BitgetSpot, &depth_symbols);
     let futures_depths = fetch_public_order_book_depth_map(
@@ -27116,15 +27226,31 @@ fn fetch_bitget_basis_monitor_snapshot(
         .into_iter()
         .chain(futures_depths.warnings)
         .collect::<Vec<_>>();
-    build_bitget_basis_monitor_snapshot_from_json_with_depth(
-        &spot_json,
-        &futures_json,
-        &funding_json,
+    build_bitget_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
         options,
         &spot_depths.depths,
         &futures_depths.depths,
         warnings,
     )
+}
+
+fn parse_bitget_basis_monitor_inputs(
+    spot_json: &str,
+    futures_json: &str,
+    funding_json: &str,
+) -> RuntimeResult<BitgetBasisMonitorParsedInputs> {
+    Ok(BitgetBasisMonitorParsedInputs {
+        spot_books: parse_bitget_spot_ticker_rows(spot_json)?
+            .into_iter()
+            .map(|row| (row.symbol.clone(), row))
+            .collect(),
+        futures_tickers: parse_bitget_usdt_futures_ticker_rows(futures_json)?,
+        funding_rates: parse_bitget_funding_rate_rows(funding_json)?
+            .into_iter()
+            .map(|row| (row.symbol.clone(), row))
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -27145,6 +27271,7 @@ fn build_bitget_basis_monitor_snapshot_from_json(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_bitget_basis_monitor_snapshot_from_json_with_depth(
     spot_json: &str,
@@ -27155,29 +27282,37 @@ fn build_bitget_basis_monitor_snapshot_from_json_with_depth(
     futures_depths: &BTreeMap<String, PublicOrderBookDepth>,
     warnings: Vec<String>,
 ) -> RuntimeResult<BitgetBasisMonitorSnapshot> {
+    let parsed = parse_bitget_basis_monitor_inputs(spot_json, futures_json, funding_json)?;
+    build_bitget_basis_monitor_snapshot_from_parsed_with_depth(
+        &parsed,
+        options,
+        spot_depths,
+        futures_depths,
+        warnings,
+    )
+}
+
+fn build_bitget_basis_monitor_snapshot_from_parsed_with_depth(
+    parsed: &BitgetBasisMonitorParsedInputs,
+    options: &BitgetBasisMonitorOptions,
+    spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    futures_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    warnings: Vec<String>,
+) -> RuntimeResult<BitgetBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_bitget_spot_ticker_rows(spot_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let futures_tickers = parse_bitget_usdt_futures_ticker_rows(futures_json)?;
-    let funding_rates = parse_bitget_funding_rate_rows(funding_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
 
     let mut rows = Vec::new();
     let mut filtered_funding_count = 0_usize;
     let mut missing_spot_count = 0_usize;
     let missing_perp_count = 0_usize;
 
-    for futures in futures_tickers {
+    for futures in &parsed.futures_tickers {
         if !futures.symbol.ends_with("USDT") {
             continue;
         }
-        let funding = funding_rates.get(&futures.symbol);
+        let funding = parsed.funding_rates.get(&futures.symbol);
         if let Some(funding) = funding {
             let funding_rate = MonitorDecimal::parse("fundingRate", &funding.funding_rate)?;
             if funding_rate.abs_less_than(min_abs_funding_rate) {
@@ -27186,7 +27321,7 @@ fn build_bitget_basis_monitor_snapshot_from_json_with_depth(
             }
         }
 
-        let spot = spot_books.get(&futures.symbol);
+        let spot = parsed.spot_books.get(&futures.symbol);
         let (mut source_status, reason) = match (spot, funding) {
             (Some(_), Some(_)) => ("complete".to_owned(), None),
             (None, Some(_)) => {
@@ -27299,8 +27434,8 @@ fn build_bitget_basis_monitor_snapshot_from_json_with_depth(
                 .unwrap_or_else(|| {
                     signal_depth_from_top_strings(&futures.ask_price, &futures.ask_qty)
                 }),
-            mark_price: futures.mark_price,
-            index_price: futures.index_price,
+            mark_price: futures.mark_price.clone(),
+            index_price: futures.index_price.clone(),
             last_funding_rate: funding
                 .map(|row| row.funding_rate.clone())
                 .unwrap_or_default(),
@@ -27348,25 +27483,19 @@ fn build_bitget_basis_monitor_snapshot_from_json_with_depth(
     })
 }
 
-fn bitget_basis_monitor_depth_symbols(
-    spot_json: &str,
-    futures_json: &str,
-    funding_json: &str,
+fn bitget_basis_monitor_depth_symbols_from_parsed(
+    parsed: &BitgetBasisMonitorParsedInputs,
     options: &BitgetBasisMonitorOptions,
 ) -> RuntimeResult<BTreeSet<String>> {
-    bitget_basis_monitor_depth_symbols_with_limit(
-        spot_json,
-        futures_json,
-        funding_json,
+    bitget_basis_monitor_depth_symbols_from_parsed_with_limit(
+        parsed,
         options,
         BASIS_MONITOR_DEPTH_SYMBOL_LIMIT,
     )
 }
 
-fn bitget_basis_monitor_depth_symbols_with_limit(
-    spot_json: &str,
-    futures_json: &str,
-    funding_json: &str,
+fn bitget_basis_monitor_depth_symbols_from_parsed_with_limit(
+    parsed: &BitgetBasisMonitorParsedInputs,
     options: &BitgetBasisMonitorOptions,
     limit: usize,
 ) -> RuntimeResult<BTreeSet<String>> {
@@ -27375,24 +27504,15 @@ fn bitget_basis_monitor_depth_symbols_with_limit(
     }
     let min_abs_funding_rate =
         MonitorDecimal::parse("min_abs_funding_rate", &options.min_abs_funding_rate)?;
-    let spot_books = parse_bitget_spot_ticker_rows(spot_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    let futures_tickers = parse_bitget_usdt_futures_ticker_rows(futures_json)?;
-    let funding_rates = parse_bitget_funding_rate_rows(funding_json)?
-        .into_iter()
-        .map(|row| (row.symbol.clone(), row))
-        .collect::<BTreeMap<_, _>>();
     let mut scored_symbols = Vec::new();
-    for futures in futures_tickers {
+    for futures in &parsed.futures_tickers {
         if !futures.symbol.ends_with("USDT") {
             continue;
         }
-        let Some(spot) = spot_books.get(&futures.symbol) else {
+        let Some(spot) = parsed.spot_books.get(&futures.symbol) else {
             continue;
         };
-        let Some(funding) = funding_rates.get(&futures.symbol) else {
+        let Some(funding) = parsed.funding_rates.get(&futures.symbol) else {
             continue;
         };
         let funding_rate = MonitorDecimal::parse("fundingRate", &funding.funding_rate)?;
@@ -27425,7 +27545,7 @@ fn bitget_basis_monitor_depth_symbols_with_limit(
             signal.expected_profit_bps,
             signal.net_bps,
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
-            futures.symbol,
+            futures.symbol.clone(),
         ));
     }
     Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
@@ -27662,7 +27782,25 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
     })
 }
 
+#[cfg(feature = "live-exec")]
 fn fetch_funding_arb_monitor_snapshot(
+    options: &FundingArbMonitorOptions,
+) -> RuntimeResult<FundingArbMonitorSnapshot> {
+    let mut cache = FundingArbDirectSourceCache::default();
+    fetch_funding_arb_monitor_snapshot_with_cache(options, &mut cache)
+}
+
+fn fetch_funding_arb_monitor_snapshot_with_cache(
+    options: &FundingArbMonitorOptions,
+    direct_source_cache: &mut FundingArbDirectSourceCache,
+) -> RuntimeResult<FundingArbMonitorSnapshot> {
+    if funding_arb_direct_public_sources_enabled()? {
+        return fetch_funding_arb_direct_public_snapshot(options, direct_source_cache);
+    }
+    fetch_funding_arb_basis_status_snapshot(options)
+}
+
+fn fetch_funding_arb_basis_status_snapshot(
     options: &FundingArbMonitorOptions,
 ) -> RuntimeResult<FundingArbMonitorSnapshot> {
     let mut snapshots = Vec::new();
@@ -27685,6 +27823,311 @@ fn fetch_funding_arb_monitor_snapshot(
         });
     }
     build_funding_arb_monitor_snapshot_from_sources(snapshots, source_errors, options)
+}
+
+fn fetch_funding_arb_direct_public_snapshot(
+    options: &FundingArbMonitorOptions,
+    cache: &mut FundingArbDirectSourceCache,
+) -> RuntimeResult<FundingArbMonitorSnapshot> {
+    let mut snapshots = Vec::new();
+    let mut source_errors = Vec::new();
+    for source in &options.sources {
+        match fetch_funding_arb_direct_public_venue_snapshot(source, cache) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => source_errors.push(format!("{}: {error}", source.venue_family)),
+        }
+    }
+
+    if snapshots.len() < 2 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "funding arb direct observer requires at least two healthy public source snapshots; errors={}",
+                source_errors.join("; ")
+            ),
+        });
+    }
+    build_funding_arb_monitor_snapshot_from_sources(snapshots, source_errors, options)
+}
+
+fn fetch_funding_arb_direct_public_venue_snapshot(
+    source: &FundingArbVenueSource,
+    cache: &mut FundingArbDirectSourceCache,
+) -> RuntimeResult<FundingArbVenueSnapshot> {
+    match normalize_venue_family(&source.venue_family).as_str() {
+        "binance" => fetch_binance_funding_arb_public_venue_snapshot(),
+        "bybit" => fetch_bybit_funding_arb_public_venue_snapshot(cache),
+        "okx" => fetch_okx_funding_arb_public_venue_snapshot(cache),
+        "bitget" => fetch_bitget_funding_arb_public_venue_snapshot(),
+        "aster" => fetch_aster_funding_arb_public_venue_snapshot(),
+        "hyperliquid" => fetch_hyperliquid_funding_arb_public_venue_snapshot(),
+        other => Err(RuntimeError::LiveMarketData {
+            message: format!("unsupported funding arb direct public source `{other}`"),
+        }),
+    }
+}
+
+fn fetch_binance_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
+    let book_json = fetch_public_json_with_curl(&binance_usdm_book_ticker_all_url())?;
+    let premium_json = fetch_public_json_with_curl(&binance_usdm_premium_index_all_url())?;
+    let books = parse_book_ticker_rows(&book_json, "binance usdm bookTicker")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let rows = parse_premium_index_rows(&premium_json)?
+        .into_iter()
+        .filter(|row| row.symbol.ends_with("USDT") && !row.last_funding_rate.trim().is_empty())
+        .filter_map(|premium| {
+            let book = books.get(&premium.symbol)?;
+            Some(funding_arb_market_from_top_of_book(
+                "binance",
+                premium.symbol,
+                book.bid_price.clone(),
+                book.bid_qty.clone(),
+                book.ask_price.clone(),
+                book.ask_qty.clone(),
+                premium.mark_price,
+                premium.index_price,
+                premium.last_funding_rate,
+                funding_interval_hours_or_default("binance", premium.funding_interval_hours)
+                    .ok()?,
+                Some(premium.next_funding_time_ms),
+            ))
+        })
+        .collect::<Vec<_>>();
+    Ok(FundingArbVenueSnapshot {
+        status: "healthy".to_owned(),
+        rows,
+    })
+}
+
+fn fetch_bybit_funding_arb_public_venue_snapshot(
+    cache: &mut FundingArbDirectSourceCache,
+) -> RuntimeResult<FundingArbVenueSnapshot> {
+    let ticker_json = fetch_public_json_with_curl(&bybit_linear_tickers_url())?;
+    let instrument_pages =
+        fetch_bybit_linear_instrument_pages_cached(&mut cache.bybit_instruments)?;
+    let linear_symbols = parse_bybit_linear_perpetual_symbols(&instrument_pages)?;
+    let rows = parse_bybit_linear_ticker_rows(&ticker_json)?
+        .into_iter()
+        .filter(|row| linear_symbols.contains(&row.symbol))
+        .filter(|row| !row.last_funding_rate.trim().is_empty())
+        .map(|row| {
+            Ok(funding_arb_market_from_top_of_book(
+                "bybit",
+                row.symbol,
+                row.bid_price,
+                row.bid_qty,
+                row.ask_price,
+                row.ask_qty,
+                row.mark_price,
+                row.index_price,
+                row.last_funding_rate,
+                funding_interval_hours_or_default("bybit", row.funding_interval_hours)?,
+                Some(row.next_funding_time_ms),
+            ))
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    Ok(FundingArbVenueSnapshot {
+        status: "healthy".to_owned(),
+        rows,
+    })
+}
+
+fn fetch_okx_funding_arb_public_venue_snapshot(
+    cache: &mut FundingArbDirectSourceCache,
+) -> RuntimeResult<FundingArbVenueSnapshot> {
+    let swap_json = fetch_public_json_with_curl(&okx_tickers_url("SWAP"))?;
+    let mark_json = fetch_public_json_with_curl(&okx_mark_price_url())?;
+    let index_json = fetch_public_json_with_curl(&okx_index_tickers_url())?;
+    let swap_rows = parse_okx_ticker_rows(&swap_json, "okx swap tickers")?;
+    let funding_report =
+        fetch_okx_usdt_swap_funding_rate_pages_cached(&swap_rows, &mut cache.okx_funding_rates)?;
+    let mark_prices = parse_okx_mark_price_rows(&mark_json)?
+        .into_iter()
+        .map(|row| (row.inst_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let index_prices = parse_okx_index_ticker_rows(&index_json)?
+        .into_iter()
+        .map(|row| (row.inst_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let funding_rates = parse_okx_funding_rate_pages(&funding_report.pages)?
+        .into_iter()
+        .map(|row| (row.inst_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let rows = swap_rows
+        .into_iter()
+        .filter_map(|swap| {
+            let spot_inst_id = okx_spot_inst_id_from_swap(&swap.inst_id)?;
+            let funding = funding_rates.get(&swap.inst_id)?;
+            if funding.funding_rate.trim().is_empty() {
+                return None;
+            }
+            let mark = mark_prices.get(&swap.inst_id)?;
+            let index = index_prices.get(&spot_inst_id)?;
+            Some(funding_arb_market_from_top_of_book(
+                "okx",
+                spot_inst_id,
+                swap.bid_price,
+                swap.bid_qty,
+                swap.ask_price,
+                swap.ask_qty,
+                mark.mark_price.clone(),
+                index.index_price.clone(),
+                funding.funding_rate.clone(),
+                funding_interval_hours_or_default("okx", funding.funding_interval_hours.clone())
+                    .ok()?,
+                Some(funding.next_funding_time_ms.clone()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let status = if funding_report.warnings.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    };
+    Ok(FundingArbVenueSnapshot {
+        status: status.to_owned(),
+        rows,
+    })
+}
+
+fn fetch_bitget_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
+    let futures_json = fetch_public_json_with_curl(&bitget_usdt_futures_tickers_url())?;
+    let funding_json = fetch_public_json_with_curl(&bitget_usdt_futures_funding_rate_url())?;
+    let funding_rates = parse_bitget_funding_rate_rows(&funding_json)?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let rows = parse_bitget_usdt_futures_ticker_rows(&futures_json)?
+        .into_iter()
+        .filter_map(|ticker| {
+            let funding = funding_rates.get(&ticker.symbol)?;
+            if funding.funding_rate.trim().is_empty() {
+                return None;
+            }
+            Some(funding_arb_market_from_top_of_book(
+                "bitget",
+                ticker.symbol.clone(),
+                ticker.bid_price,
+                ticker.bid_qty,
+                ticker.ask_price,
+                ticker.ask_qty,
+                ticker.mark_price,
+                ticker.index_price,
+                funding.funding_rate.clone(),
+                funding_interval_hours_or_default("bitget", funding.funding_interval_hours.clone())
+                    .ok()?,
+                Some(funding.next_funding_time_ms.clone()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    Ok(FundingArbVenueSnapshot {
+        status: "healthy".to_owned(),
+        rows,
+    })
+}
+
+fn fetch_aster_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
+    let book_json = fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?;
+    let premium_json = fetch_public_json_with_curl(&aster_futures_premium_index_all_url())?;
+    let books = parse_book_ticker_rows(&book_json, "aster futures bookTicker")?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let rows = parse_premium_index_rows(&premium_json)?
+        .into_iter()
+        .filter(|row| {
+            row.symbol.ends_with("USDT")
+                && !row.symbol.starts_with("TEST")
+                && !row.last_funding_rate.trim().is_empty()
+        })
+        .filter_map(|premium| {
+            let book = books.get(&premium.symbol)?;
+            Some(funding_arb_market_from_top_of_book(
+                "aster",
+                premium.symbol,
+                book.bid_price.clone(),
+                book.bid_qty.clone(),
+                book.ask_price.clone(),
+                book.ask_qty.clone(),
+                premium.mark_price,
+                premium.index_price,
+                premium.last_funding_rate,
+                funding_interval_hours_or_default("aster", premium.funding_interval_hours).ok()?,
+                Some(premium.next_funding_time_ms),
+            ))
+        })
+        .collect::<Vec<_>>();
+    Ok(FundingArbVenueSnapshot {
+        status: "healthy".to_owned(),
+        rows,
+    })
+}
+
+fn fetch_hyperliquid_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
+    let perp_json = fetch_public_json_post_with_curl(
+        HYPERLIQUID_INFO_URL,
+        &hyperliquid_info_request_body("metaAndAssetCtxs"),
+    )?;
+    let rows = parse_hyperliquid_perp_context_rows(&perp_json)?
+        .into_iter()
+        .filter(|row| !row.funding_rate.trim().is_empty())
+        .map(|row| FundingArbVenueMarket {
+            venue_family: "hyperliquid".to_owned(),
+            symbol: funding_display_symbol(&row.coin),
+            base_asset: funding_base_asset_from_symbol(&row.coin),
+            perp_bid: Some(row.price.clone()),
+            perp_ask: Some(row.price),
+            perp_bid_qty: None,
+            perp_ask_qty: None,
+            perp_bid_depth: Vec::new(),
+            perp_ask_depth: Vec::new(),
+            mark_price: Some(row.mark_price),
+            index_price: Some(row.oracle_price),
+            funding_rate: row.funding_rate,
+            funding_interval_hours: funding_interval_hours_string_for_venue("hyperliquid")
+                .unwrap_or_else(|_| "1".to_owned()),
+            next_funding_time_ms: None,
+            source_status: "missing_top_of_book_size".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    Ok(FundingArbVenueSnapshot {
+        status: "healthy".to_owned(),
+        rows,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn funding_arb_market_from_top_of_book(
+    venue_family: &'static str,
+    symbol: String,
+    perp_bid: String,
+    perp_bid_qty: String,
+    perp_ask: String,
+    perp_ask_qty: String,
+    mark_price: String,
+    index_price: String,
+    funding_rate: String,
+    funding_interval_hours: String,
+    next_funding_time_ms: Option<String>,
+) -> FundingArbVenueMarket {
+    FundingArbVenueMarket {
+        venue_family: venue_family.to_owned(),
+        base_asset: funding_base_asset_from_symbol(&symbol),
+        symbol,
+        perp_bid: Some(perp_bid.clone()),
+        perp_ask: Some(perp_ask.clone()),
+        perp_bid_qty: Some(perp_bid_qty.clone()),
+        perp_ask_qty: Some(perp_ask_qty.clone()),
+        perp_bid_depth: signal_depth_from_top_strings(&perp_bid, &perp_bid_qty),
+        perp_ask_depth: signal_depth_from_top_strings(&perp_ask, &perp_ask_qty),
+        mark_price: Some(mark_price),
+        index_price: Some(index_price),
+        funding_rate,
+        funding_interval_hours,
+        next_funding_time_ms,
+        source_status: "complete".to_owned(),
+    }
 }
 
 fn parse_funding_arb_basis_status_snapshot(
@@ -29476,20 +29919,291 @@ struct PublicOrderBookDepthFetchReport {
     warnings: Vec<String>,
 }
 
-fn public_market_curl_body(
-    output: std::process::Output,
-    command_label: &str,
-) -> Result<String, String> {
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "{command_label} returned {}; stderr={}",
-            output.status,
-            stderr.trim()
-        ));
-    }
+fn fetch_public_json_with_curl(url: &str) -> RuntimeResult<String> {
+    fetch_public_json_with_curl_max_time(url, PUBLIC_MARKET_CURL_MAX_TIME_SECS)
+}
 
-    let body = String::from_utf8(output.stdout)
+fn fetch_public_json_with_curl_max_time(url: &str, max_time_secs: u64) -> RuntimeResult<String> {
+    fetch_public_json_with_http("GET", url, None, max_time_secs)
+}
+
+fn fetch_public_json_post_with_curl(url: &str, body: &str) -> RuntimeResult<String> {
+    fetch_public_json_with_http("POST", url, Some(body), PUBLIC_MARKET_CURL_MAX_TIME_SECS)
+}
+
+fn fetch_public_json_with_http(
+    method: &'static str,
+    url: &str,
+    body: Option<&str>,
+    max_time_secs: u64,
+) -> RuntimeResult<String> {
+    fetch_public_json_with_http_with_retries(
+        method,
+        url,
+        body,
+        max_time_secs,
+        PUBLIC_MARKET_CURL_ATTEMPTS,
+        PUBLIC_MARKET_CURL_RETRY_SLEEP_MS,
+    )
+}
+
+fn fetch_public_json_with_http_with_retries(
+    method: &'static str,
+    url: &str,
+    body: Option<&str>,
+    max_time_secs: u64,
+    attempts: usize,
+    retry_sleep_ms: u64,
+) -> RuntimeResult<String> {
+    let mut last_error = None;
+    let attempts = attempts.max(1);
+    for attempt in 1..=attempts {
+        match public_http_request_once(method, url, body, max_time_secs) {
+            Ok(response) => return Ok(response),
+            Err(message) => last_error = Some(message),
+        }
+        if attempt < attempts {
+            thread::sleep(Duration::from_millis(retry_sleep_ms));
+        }
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: public_market_get_failure_message(
+            method,
+            url,
+            attempts,
+            &last_error.unwrap_or_else(|| "unknown curl error".to_owned()),
+        ),
+    })
+}
+
+trait RuntimeHttpStream: Read + Write {}
+
+impl<T: Read + Write> RuntimeHttpStream for T {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicHttpUrl {
+    scheme: String,
+    host: String,
+    port: u16,
+    host_header: String,
+    path_and_query: String,
+}
+
+fn public_http_request_once(
+    method: &'static str,
+    url: &str,
+    body: Option<&str>,
+    max_time_secs: u64,
+) -> Result<String, String> {
+    let parsed = parse_public_http_url(url)?;
+    let timeout = Duration::from_secs(max_time_secs.max(1));
+    let stream = public_http_tcp_connect(&parsed, timeout)?;
+    let mut stream: Box<dyn RuntimeHttpStream> = if parsed.scheme == "https" {
+        let connector =
+            TlsConnector::new().map_err(|error| format!("cannot create TLS connector: {error}"))?;
+        Box::new(
+            connector
+                .connect(&parsed.host, stream)
+                .map_err(|error| format!("TLS connect failed: {error}"))?,
+        )
+    } else {
+        Box::new(stream)
+    };
+    let request = public_http_request_bytes(&parsed, method, body)?;
+    stream
+        .write_all(&request)
+        .map_err(|error| format!("cannot write HTTP request: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("cannot flush HTTP request: {error}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("cannot read HTTP response: {error}"))?;
+    public_http_response_body(&response)
+}
+
+fn public_http_tcp_connect(parsed: &PublicHttpUrl, timeout: Duration) -> Result<TcpStream, String> {
+    let addrs = (parsed.host.as_str(), parsed.port)
+        .to_socket_addrs()
+        .map_err(|error| format!("cannot resolve {}: {error}", parsed.host))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(format!("cannot resolve {}: no addresses", parsed.host));
+    }
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .map_err(|error| format!("cannot set HTTP read timeout: {error}"))?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .map_err(|error| format!("cannot set HTTP write timeout: {error}"))?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(format!("{addr}: {error}")),
+        }
+    }
+    Err(format!(
+        "cannot connect to {}:{}: {}",
+        parsed.host,
+        parsed.port,
+        last_error.unwrap_or_else(|| "unknown error".to_owned())
+    ))
+}
+
+fn parse_public_http_url(url: &str) -> Result<PublicHttpUrl, String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("public HTTP URL lacks scheme: {url}"))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("unsupported public HTTP URL scheme `{scheme}`"));
+    }
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return Err("public HTTP URL authority is empty or contains userinfo".to_owned());
+    }
+    let raw_path = &rest[authority_end..];
+    let path_and_query = if raw_path.is_empty() {
+        "/".to_owned()
+    } else if raw_path.starts_with('?') {
+        format!("/{raw_path}")
+    } else {
+        raw_path.to_owned()
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let (host, port) = parse_public_http_authority(authority, default_port)?;
+    let host_header = if port == default_port {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(PublicHttpUrl {
+        scheme,
+        host,
+        port,
+        host_header,
+        path_and_query,
+    })
+}
+
+fn parse_public_http_authority(
+    authority: &str,
+    default_port: u16,
+) -> Result<(String, u16), String> {
+    if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return Err(format!("malformed IPv6 authority `{authority}`"));
+        };
+        let host = authority[1..end].to_owned();
+        if host.is_empty() {
+            return Err("public HTTP URL host is empty".to_owned());
+        }
+        let suffix = &authority[end + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| format!("malformed authority `{authority}`"))?
+                .parse::<u16>()
+                .map_err(|_| format!("malformed port in authority `{authority}`"))?
+        };
+        return Ok((host, port));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, raw_port)) if raw_port.chars().all(|ch| ch.is_ascii_digit()) => {
+            let port = raw_port
+                .parse::<u16>()
+                .map_err(|_| format!("malformed port in authority `{authority}`"))?;
+            (host.to_owned(), port)
+        }
+        _ => (authority.to_owned(), default_port),
+    };
+    if host.is_empty() {
+        return Err("public HTTP URL host is empty".to_owned());
+    }
+    Ok((host, port))
+}
+
+fn public_http_request_bytes(
+    parsed: &PublicHttpUrl,
+    method: &'static str,
+    body: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    if method != "GET" && method != "POST" {
+        return Err(format!("unsupported public HTTP method `{method}`"));
+    }
+    if method == "GET" && body.is_some() {
+        return Err("GET public HTTP request cannot include a body".to_owned());
+    }
+    let body = body.unwrap_or("");
+    let mut request = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: easy-arb-runtime/0.1\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
+        parsed.path_and_query, parsed.host_header
+    );
+    if method == "POST" {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    let mut bytes = request.into_bytes();
+    if method == "POST" {
+        bytes.extend_from_slice(body.as_bytes());
+    }
+    Ok(bytes)
+}
+
+fn public_http_response_body(response: &[u8]) -> Result<String, String> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Err("HTTP response lacked header terminator".to_owned());
+    };
+    let header = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| format!("HTTP response headers were not UTF-8: {error}"))?;
+    let mut lines = header.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| "HTTP response lacked status line".to_owned())?;
+    let status = parse_public_http_status(status_line)?;
+    let mut transfer_encoding = None::<String>;
+    let mut content_encoding = None::<String>;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "transfer-encoding" => transfer_encoding = Some(value.trim().to_ascii_lowercase()),
+            "content-encoding" => content_encoding = Some(value.trim().to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    let mut body = response[header_end + 4..].to_vec();
+    if transfer_encoding
+        .as_deref()
+        .is_some_and(|encoding| encoding.contains("chunked"))
+    {
+        body = decode_public_http_chunked_body(&body)?;
+    }
+    if let Some(encoding) = content_encoding {
+        if !encoding.is_empty() && encoding != "identity" {
+            return Err(format!("unsupported HTTP content-encoding `{encoding}`"));
+        }
+    }
+    if !(200..300).contains(&status) {
+        let preview = String::from_utf8_lossy(&body);
+        let preview = preview.trim();
+        let preview = if preview.len() > 500 {
+            format!("{}...<truncated>", &preview[..500])
+        } else {
+            preview.to_owned()
+        };
+        return Err(format!("HTTP status {status}; body={preview}"));
+    }
+    let body = String::from_utf8(body)
         .map_err(|error| format!("public market data response was not UTF-8: {error}"))?;
     if body.trim().is_empty() {
         return Err("public market data response was empty".to_owned());
@@ -29497,42 +30211,68 @@ fn public_market_curl_body(
     Ok(body)
 }
 
-fn fetch_public_json_with_curl(url: &str) -> RuntimeResult<String> {
-    fetch_public_json_with_curl_max_time(url, PUBLIC_MARKET_CURL_MAX_TIME_SECS)
-}
-
-fn fetch_public_json_with_curl_max_time(url: &str, max_time_secs: u64) -> RuntimeResult<String> {
-    let max_time_secs = max_time_secs.to_string();
-    let mut last_error = None;
-    for attempt in 1..=PUBLIC_MARKET_CURL_ATTEMPTS {
-        match Command::new("curl")
-            .args(["-fsS", "--max-time", max_time_secs.as_str(), url])
-            .output()
-        {
-            Ok(output) => match public_market_curl_body(output, "curl") {
-                Ok(body) => return Ok(body),
-                Err(message) => last_error = Some(message),
-            },
-            Err(error) => {
-                last_error = Some(format!("cannot run curl for public market data: {error}"));
-            }
-        }
-        if attempt < PUBLIC_MARKET_CURL_ATTEMPTS {
-            thread::sleep(Duration::from_millis(PUBLIC_MARKET_CURL_RETRY_SLEEP_MS));
-        }
+fn parse_public_http_status(status_line: &str) -> Result<u16, String> {
+    let mut parts = status_line.split_whitespace();
+    let version = parts
+        .next()
+        .ok_or_else(|| "HTTP response status line lacked version".to_owned())?;
+    if !version.starts_with("HTTP/") {
+        return Err(format!(
+            "malformed HTTP response status line `{status_line}`"
+        ));
     }
-    Err(RuntimeError::LiveMarketData {
-        message: public_market_get_failure_message(
-            url,
-            &last_error.unwrap_or_else(|| "unknown curl error".to_owned()),
-        ),
-    })
+    parts
+        .next()
+        .ok_or_else(|| "HTTP response status line lacked status code".to_owned())?
+        .parse::<u16>()
+        .map_err(|_| format!("malformed HTTP response status code in `{status_line}`"))
 }
 
-fn public_market_get_failure_message(url: &str, detail: &str) -> String {
+fn decode_public_http_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoded = Vec::new();
+    let mut offset = 0_usize;
+    loop {
+        let size_line_end = find_crlf(body, offset)
+            .ok_or_else(|| "chunked HTTP response lacked chunk size terminator".to_owned())?;
+        let size_line = std::str::from_utf8(&body[offset..size_line_end])
+            .map_err(|error| format!("chunked HTTP size line was not UTF-8: {error}"))?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| format!("malformed chunked HTTP size `{size_hex}`"))?;
+        offset = size_line_end + 2;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        let chunk_end = offset
+            .checked_add(size)
+            .ok_or_else(|| "chunked HTTP size overflow".to_owned())?;
+        if chunk_end + 2 > body.len() {
+            return Err("chunked HTTP response body ended inside a chunk".to_owned());
+        }
+        decoded.extend_from_slice(&body[offset..chunk_end]);
+        if &body[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err("chunked HTTP chunk lacked trailing CRLF".to_owned());
+        }
+        offset = chunk_end + 2;
+    }
+}
+
+fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
+    bytes
+        .get(start..)?
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|position| start + position)
+}
+
+fn public_market_get_failure_message(
+    method: &'static str,
+    url: &str,
+    attempts: usize,
+    detail: &str,
+) -> String {
     format!(
-        "public market data GET failed after {} attempts; url={}: {}",
-        PUBLIC_MARKET_CURL_ATTEMPTS,
+        "public market data {method} failed after {attempts} attempts; url={}: {}",
         redact_public_market_url_for_log(url),
         detail
     )
@@ -29567,50 +30307,928 @@ fn public_market_query_name_is_sensitive(name: &str) -> bool {
         || lower.contains("token")
 }
 
-fn fetch_public_json_post_with_curl(url: &str, body: &str) -> RuntimeResult<String> {
-    let mut last_error = None;
-    for attempt in 1..=PUBLIC_MARKET_CURL_ATTEMPTS {
-        match Command::new("curl")
-            .args(public_json_post_curl_args(url, body))
-            .output()
-        {
-            Ok(output) => match public_market_curl_body(output, "curl POST") {
-                Ok(response) => return Ok(response),
-                Err(message) => last_error = Some(message),
-            },
-            Err(error) => {
-                last_error = Some(format!(
-                    "cannot run curl POST for public market data: {error}"
-                ));
-            }
-        }
-        if attempt < PUBLIC_MARKET_CURL_ATTEMPTS {
-            thread::sleep(Duration::from_millis(PUBLIC_MARKET_CURL_RETRY_SLEEP_MS));
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpportunityRecorderSource {
+    venue: String,
+    url: String,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug)]
+struct OpportunityRecorderOptions {
+    root: PathBuf,
+    opportunity_dir: PathBuf,
+    logs_dir: PathBuf,
+    feedback_log: PathBuf,
+    health_events_jsonl: PathBuf,
+    basis_resident_out_dir: PathBuf,
+    funding_arb_resident_out_dir: PathBuf,
+    spot_sources: Vec<OpportunityRecorderSource>,
+    funding_arb_url: Option<String>,
+    strategies: BTreeSet<String>,
+    execution_mode: String,
+    spot_perp_basis_mode: String,
+    funding_arb_mode: String,
+    interval_secs: u64,
+    timeout_secs: u64,
+    retries: usize,
+    retry_sleep_ms: u64,
+    blocking_path_limit: usize,
+    health_sample_secs: u64,
+    resident_health_tail_lines: usize,
+    once: bool,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OpportunityRecorderReport {
+    cycles: usize,
+    spot_source_count: usize,
+    funding_arb_enabled: bool,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OpportunityRecorderSnapshot {
+    candidate_count: usize,
+    total_rows: usize,
+    status: String,
+    updated_at: String,
+    blocking_path_json: String,
+    blocking_path_total_count: usize,
+    blocking_path_truncated: bool,
+    candidate_rows: Vec<OpportunityRecorderCandidateRow>,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OpportunityRecorderCandidateRow {
+    symbol: String,
+    pair_id: Option<String>,
+    net_basis_bps: Option<String>,
+    expected_profit_usd: Option<String>,
+    net_funding_bps: Option<String>,
+    expected_funding_usd: Option<String>,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Debug)]
+struct OpportunityRecorderHealthSampler {
+    sample_secs: u64,
+    last_by_source: BTreeMap<String, (u64, String)>,
+}
+
+#[cfg(feature = "live-exec")]
+impl OpportunityRecorderHealthSampler {
+    fn new(sample_secs: u64) -> Self {
+        Self {
+            sample_secs,
+            last_by_source: BTreeMap::new(),
         }
     }
-    Err(RuntimeError::LiveMarketData {
-        message: format!(
-            "public market data POST failed after {} attempts: {}",
-            PUBLIC_MARKET_CURL_ATTEMPTS,
-            last_error.unwrap_or_else(|| "unknown curl error".to_owned())
+
+    fn should_emit(&mut self, source: &str, key: &str) -> bool {
+        if self.sample_secs == 0 {
+            return true;
+        }
+        let now = current_unix_secs_runtime().unwrap_or(0);
+        match self.last_by_source.get(source) {
+            Some((last_ts, last_key))
+                if last_key == key && now.saturating_sub(*last_ts) < self.sample_secs =>
+            {
+                false
+            }
+            _ => {
+                self.last_by_source
+                    .insert(source.to_owned(), (now, key.to_owned()));
+                true
+            }
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn run_opportunity_recorder(
+    options: OpportunityRecorderOptions,
+) -> RuntimeResult<OpportunityRecorderReport> {
+    fs::create_dir_all(&options.logs_dir).map_err(|error| RuntimeError::Io {
+        path: options.logs_dir.clone(),
+        message: error.to_string(),
+    })?;
+    fs::create_dir_all(&options.opportunity_dir).map_err(|error| RuntimeError::Io {
+        path: options.opportunity_dir.clone(),
+        message: error.to_string(),
+    })?;
+    touch_runtime_file(&options.opportunity_dir.join("all-opportunities.jsonl"))?;
+    touch_runtime_file(&options.opportunity_dir.join("spot-perp-basis.jsonl"))?;
+    touch_runtime_file(
+        &options
+            .opportunity_dir
+            .join("cross-exchange-funding-arb.jsonl"),
+    )?;
+    touch_runtime_file(&options.health_events_jsonl)?;
+    touch_runtime_file(&options.feedback_log)?;
+
+    append_text_line_to_file(
+        options.feedback_log.clone(),
+        &format!(
+            "[{}] recorder_start impl=rust root={} mode={} spot_perp_basis_mode={} funding_arb_mode={} monitors={} strategies={} interval_secs={}",
+            opportunity_recorder_log_timestamp(),
+            options.root.display(),
+            options.execution_mode,
+            options.spot_perp_basis_mode,
+            options.funding_arb_mode,
+            options
+                .spot_sources
+                .iter()
+                .map(|source| source.venue.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            opportunity_recorder_strategy_list(&options),
+            options.interval_secs
         ),
+    )?;
+    append_line_to_jsonl(
+        options.health_events_jsonl.clone(),
+        &opportunity_recorder_configured_event_json(&options),
+    )?;
+
+    let mut sampler = OpportunityRecorderHealthSampler::new(options.health_sample_secs);
+    let mut cycles = 0_usize;
+    loop {
+        run_opportunity_recorder_cycle(&options, &mut sampler)?;
+        cycles = cycles.saturating_add(1);
+        if options.once {
+            break;
+        }
+        thread::sleep(Duration::from_secs(options.interval_secs));
+    }
+
+    append_text_line_to_file(
+        options.feedback_log.clone(),
+        &format!(
+            "[{}] recorder_stop impl=rust cycles={cycles}",
+            opportunity_recorder_log_timestamp()
+        ),
+    )?;
+    Ok(OpportunityRecorderReport {
+        cycles,
+        spot_source_count: options.spot_sources.len(),
+        funding_arb_enabled: options.funding_arb_url.is_some(),
     })
 }
 
-fn public_json_post_curl_args<'a>(url: &'a str, body: &'a str) -> [&'a str; 11] {
-    [
-        "-fsS",
-        "--http1.1",
-        "--max-time",
-        "10",
-        "-X",
-        "POST",
+#[cfg(feature = "live-exec")]
+fn run_opportunity_recorder_cycle(
+    options: &OpportunityRecorderOptions,
+    sampler: &mut OpportunityRecorderHealthSampler,
+) -> RuntimeResult<()> {
+    if options
+        .strategies
+        .contains(SPOT_PERP_BASIS_OBSERVER_STRATEGY)
+    {
+        for source in &options.spot_sources {
+            poll_opportunity_recorder_spot_source(options, source, sampler)?;
+        }
+    }
+    if options
+        .strategies
+        .contains(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY)
+    {
+        if let Some(url) = &options.funding_arb_url {
+            poll_opportunity_recorder_funding_arb(options, url, sampler)?;
+        }
+    }
+    append_opportunity_recorder_resident_health_events(options, sampler)
+}
+
+#[cfg(feature = "live-exec")]
+fn poll_opportunity_recorder_spot_source(
+    options: &OpportunityRecorderOptions,
+    source: &OpportunityRecorderSource,
+    sampler: &mut OpportunityRecorderHealthSampler,
+) -> RuntimeResult<()> {
+    let ts = current_utc_timestamp_string();
+    let body = match opportunity_recorder_fetch_url(options, &source.url) {
+        Ok(body) => body,
+        Err(error) => {
+            append_line_to_jsonl(
+                options.health_events_jsonl.clone(),
+                &format!(
+                    "{{\"recorded_at\":{},\"venue\":{},\"event\":\"poll_failed\",\"endpoint\":{},\"retries\":{},\"mutable_execution_started\":false,\"error\":{}}}",
+                    json_string(&ts),
+                    json_string(&source.venue),
+                    json_string(&source.url),
+                    options.retries,
+                    json_string(&error.to_string())
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let snapshot = match parse_opportunity_recorder_snapshot(
+        &body,
+        &["updated_at", "refreshed_at"],
+        options.blocking_path_limit,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            append_line_to_jsonl(
+                options.health_events_jsonl.clone(),
+                &format!(
+                    "{{\"recorded_at\":{},\"venue\":{},\"event\":\"poll_parse_failed\",\"endpoint\":{},\"mutable_execution_started\":false,\"error\":{}}}",
+                    json_string(&ts),
+                    json_string(&source.venue),
+                    json_string(&source.url),
+                    json_string(&error.to_string())
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let health_key = format!(
+        "poll_ok|status={}|candidate_count={}|total_rows={}",
+        snapshot.status, snapshot.candidate_count, snapshot.total_rows
+    );
+    if sampler.should_emit(&format!("spot-perp-basis:{}", source.venue), &health_key) {
+        append_line_to_jsonl(
+            options.health_events_jsonl.clone(),
+            &format!(
+                "{{\"recorded_at\":{},\"venue\":{},\"strategy\":\"spot-perp-basis\",\"event\":\"poll_ok\",\"endpoint\":{},\"status\":{},\"updated_at\":{},\"candidate_count\":{},\"total_rows\":{},\"blocking_path\":{},\"blocking_path_total_count\":{},\"blocking_path_truncated\":{},\"mutable_execution_started\":false}}",
+                json_string(&ts),
+                json_string(&source.venue),
+                json_string(&source.url),
+                json_string(&snapshot.status),
+                json_string(&snapshot.updated_at),
+                snapshot.candidate_count,
+                snapshot.total_rows,
+                snapshot.blocking_path_json,
+                snapshot.blocking_path_total_count,
+                snapshot.blocking_path_truncated
+            ),
+        )?;
+    }
+
+    if snapshot.candidate_count > 0 {
+        let line = json_object_with_extra_fields(
+            &body,
+            &[
+                ("recorded_at", json_string(&ts)),
+                ("venue", json_string(&source.venue)),
+                ("endpoint", json_string(&source.url)),
+                ("mutable_execution_started", "false".to_owned()),
+            ],
+        )?;
+        append_line_to_jsonl(
+            options
+                .opportunity_dir
+                .join(format!("{}-opportunities.jsonl", source.venue)),
+            &line,
+        )?;
+        append_line_to_jsonl(options.opportunity_dir.join("spot-perp-basis.jsonl"), &line)?;
+        append_line_to_jsonl(
+            options.opportunity_dir.join("all-opportunities.jsonl"),
+            &line,
+        )?;
+        append_text_line_to_file(
+            options.feedback_log.clone(),
+            &format!(
+                "[{}] opportunity venue={} candidate_count={} {}",
+                opportunity_recorder_log_timestamp(),
+                source.venue,
+                snapshot.candidate_count,
+                spot_opportunity_recorder_summary(&snapshot)
+            ),
+        )?;
+    } else {
+        let feedback_key = format!("no_candidate|{health_key}");
+        if sampler.should_emit(
+            &format!("feedback:spot-perp-basis:{}", source.venue),
+            &feedback_key,
+        ) {
+            append_text_line_to_file(
+                options.feedback_log.clone(),
+                &format!(
+                    "[{}] opportunity venue={} strategy=spot-perp-basis candidate_count=0 {}",
+                    opportunity_recorder_log_timestamp(),
+                    source.venue,
+                    opportunity_recorder_blocking_summary(&snapshot)
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn poll_opportunity_recorder_funding_arb(
+    options: &OpportunityRecorderOptions,
+    url: &str,
+    sampler: &mut OpportunityRecorderHealthSampler,
+) -> RuntimeResult<()> {
+    let ts = current_utc_timestamp_string();
+    let body = match opportunity_recorder_fetch_url(options, url) {
+        Ok(body) => body,
+        Err(error) => {
+            append_line_to_jsonl(
+                options.health_events_jsonl.clone(),
+                &format!(
+                    "{{\"recorded_at\":{},\"strategy\":\"cross-exchange-funding-arb\",\"event\":\"poll_failed\",\"endpoint\":{},\"retries\":{},\"mutable_execution_started\":false,\"error\":{}}}",
+                    json_string(&ts),
+                    json_string(url),
+                    options.retries,
+                    json_string(&error.to_string())
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let snapshot = match parse_opportunity_recorder_snapshot(
+        &body,
+        &["updated_at"],
+        options.blocking_path_limit,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            append_line_to_jsonl(
+                options.health_events_jsonl.clone(),
+                &format!(
+                    "{{\"recorded_at\":{},\"strategy\":\"cross-exchange-funding-arb\",\"event\":\"poll_parse_failed\",\"endpoint\":{},\"mutable_execution_started\":false,\"error\":{}}}",
+                    json_string(&ts),
+                    json_string(url),
+                    json_string(&error.to_string())
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let health_key = format!(
+        "poll_ok|status={}|candidate_count={}|total_rows={}",
+        snapshot.status, snapshot.candidate_count, snapshot.total_rows
+    );
+    if sampler.should_emit(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY, &health_key) {
+        append_line_to_jsonl(
+            options.health_events_jsonl.clone(),
+            &format!(
+                "{{\"recorded_at\":{},\"strategy\":\"cross-exchange-funding-arb\",\"event\":\"poll_ok\",\"endpoint\":{},\"status\":{},\"updated_at\":{},\"candidate_count\":{},\"total_rows\":{},\"blocking_path\":{},\"blocking_path_total_count\":{},\"blocking_path_truncated\":{},\"mutable_execution_started\":false}}",
+                json_string(&ts),
+                json_string(url),
+                json_string(&snapshot.status),
+                json_string(&snapshot.updated_at),
+                snapshot.candidate_count,
+                snapshot.total_rows,
+                snapshot.blocking_path_json,
+                snapshot.blocking_path_total_count,
+                snapshot.blocking_path_truncated
+            ),
+        )?;
+    }
+
+    if snapshot.candidate_count > 0 {
+        let line = json_object_with_extra_fields(
+            &body,
+            &[
+                ("recorded_at", json_string(&ts)),
+                (
+                    "strategy",
+                    json_string(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY),
+                ),
+                ("endpoint", json_string(url)),
+                ("mutable_execution_started", "false".to_owned()),
+            ],
+        )?;
+        append_line_to_jsonl(
+            options
+                .opportunity_dir
+                .join("cross-exchange-funding-arb.jsonl"),
+            &line,
+        )?;
+        append_line_to_jsonl(
+            options.opportunity_dir.join("all-opportunities.jsonl"),
+            &line,
+        )?;
+        append_text_line_to_file(
+            options.feedback_log.clone(),
+            &format!(
+                "[{}] opportunity strategy=cross-exchange-funding-arb candidate_count={} {}",
+                opportunity_recorder_log_timestamp(),
+                snapshot.candidate_count,
+                funding_arb_opportunity_recorder_summary(&snapshot)
+            ),
+        )?;
+    } else {
+        let feedback_key = format!("no_candidate|{health_key}");
+        if sampler.should_emit("feedback:cross-exchange-funding-arb", &feedback_key) {
+            append_text_line_to_file(
+                options.feedback_log.clone(),
+                &format!(
+                    "[{}] opportunity strategy=cross-exchange-funding-arb candidate_count=0 {}",
+                    opportunity_recorder_log_timestamp(),
+                    opportunity_recorder_blocking_summary(&snapshot)
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_fetch_url(
+    options: &OpportunityRecorderOptions,
+    url: &str,
+) -> RuntimeResult<String> {
+    fetch_public_json_with_http_with_retries(
+        "GET",
         url,
-        "-H",
-        "Content-Type: application/json",
-        "--data",
-        body,
-    ]
+        None,
+        options.timeout_secs,
+        options.retries,
+        options.retry_sleep_ms,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_opportunity_recorder_snapshot(
+    body: &str,
+    updated_at_fields: &[&'static str],
+    blocking_path_limit: usize,
+) -> RuntimeResult<OpportunityRecorderSnapshot> {
+    let fields = parse_json_object_value_slices(body)?;
+    let candidate_count =
+        opportunity_recorder_usize_field(&fields, "candidate_count")?.unwrap_or(0);
+    let row_values = json_object_array_field_slices(&fields, "rows")?;
+    let mut candidate_rows = Vec::new();
+    for row in &row_values {
+        let row_fields = parse_json_object_value_slices(row)?;
+        if !json_field_is_true(&row_fields, "is_candidate")? {
+            continue;
+        }
+        candidate_rows.push(OpportunityRecorderCandidateRow {
+            symbol: opportunity_recorder_optional_field(&row_fields, "symbol").unwrap_or_default(),
+            pair_id: opportunity_recorder_optional_field(&row_fields, "pair_id"),
+            net_basis_bps: opportunity_recorder_optional_field(&row_fields, "net_basis_bps"),
+            expected_profit_usd: opportunity_recorder_optional_field(
+                &row_fields,
+                "expected_profit_usd",
+            ),
+            net_funding_bps: opportunity_recorder_optional_field(&row_fields, "net_funding_bps"),
+            expected_funding_usd: opportunity_recorder_optional_field(
+                &row_fields,
+                "expected_funding_usd",
+            ),
+        });
+    }
+    let status = opportunity_recorder_optional_field(&fields, "status")
+        .unwrap_or_else(|| "unknown".to_owned());
+    let updated_at = updated_at_fields
+        .iter()
+        .find_map(|field| opportunity_recorder_optional_field(&fields, field))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let blocking_path =
+        opportunity_recorder_blocking_path_json(&fields, "blocking_path", blocking_path_limit)?;
+    Ok(OpportunityRecorderSnapshot {
+        candidate_count,
+        total_rows: row_values.len(),
+        status,
+        updated_at,
+        blocking_path_json: blocking_path.0,
+        blocking_path_total_count: blocking_path.1,
+        blocking_path_truncated: blocking_path.2,
+        candidate_rows,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn json_object_array_field_slices<'a>(
+    fields: &'a BTreeMap<String, &'a str>,
+    field: &'static str,
+) -> RuntimeResult<Vec<&'a str>> {
+    match fields.get(field) {
+        Some(value) if value.trim() != "null" => json_array_value_slices(value),
+        _ => Ok(Vec::new()),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_usize_field(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+) -> RuntimeResult<Option<usize>> {
+    let Some(value) = opportunity_recorder_optional_field(fields, field) else {
+        return Ok(None);
+    };
+    value
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: format!("opportunity recorder field `{field}` is not a non-negative integer"),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_optional_field(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+) -> Option<String> {
+    optional_json_value_string_dynamic(fields, field, "opportunity recorder").ok()?
+}
+
+#[cfg(feature = "live-exec")]
+fn json_field_is_true(fields: &BTreeMap<String, &str>, field: &'static str) -> RuntimeResult<bool> {
+    let Some(value) = fields.get(field) else {
+        return Ok(false);
+    };
+    Ok(json_value_to_string_dynamic(value, field, "opportunity recorder")? == "true")
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_blocking_path_json(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    limit: usize,
+) -> RuntimeResult<(String, usize, bool)> {
+    let Some(value) = fields.get(field) else {
+        return Ok(("[]".to_owned(), 0, false));
+    };
+    if value.trim() == "null" {
+        return Ok(("[]".to_owned(), 0, false));
+    }
+    let values = json_array_value_slices(value)?;
+    let total = values.len();
+    let entries = values
+        .iter()
+        .take(limit)
+        .map(|value| bounded_log_json_value(value))
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    Ok((format!("[{}]", entries.join(",")), total, total > limit))
+}
+
+#[cfg(feature = "live-exec")]
+fn bounded_log_json_value(value: &str) -> RuntimeResult<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('{') {
+        let fields = parse_json_object_value_slices(trimmed)?;
+        let mut items = Vec::new();
+        for (key, value) in fields {
+            let bounded = if value.trim().starts_with('"') {
+                json_string(&truncate_log_string(&json_value_to_string_dynamic(
+                    value,
+                    &key,
+                    "opportunity recorder blocking path",
+                )?))
+            } else {
+                value.to_owned()
+            };
+            items.push(format!("{}:{bounded}", json_string(&key)));
+        }
+        return Ok(format!("{{{}}}", items.join(",")));
+    }
+    if trimmed.starts_with('"') {
+        return Ok(json_string(&truncate_log_string(
+            &json_value_to_string_dynamic(trimmed, "value", "opportunity recorder blocking path")?,
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn truncate_log_string(value: &str) -> String {
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(500).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...<truncated>")
+    } else {
+        value.to_owned()
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn json_object_with_extra_fields(
+    body: &str,
+    extras: &[(&'static str, String)],
+) -> RuntimeResult<String> {
+    parse_json_object_value_slices(body)?;
+    let trimmed = body.trim();
+    let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
+    let mut out = String::with_capacity(trimmed.len() + extras.len() * 32);
+    out.push_str(&trimmed[..trimmed.len() - 1]);
+    if !inner.trim().is_empty() && !extras.is_empty() {
+        out.push(',');
+    }
+    for (index, (key, value)) in extras.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_string(key));
+        out.push(':');
+        out.push_str(value);
+    }
+    out.push('}');
+    Ok(out)
+}
+
+#[cfg(feature = "live-exec")]
+fn spot_opportunity_recorder_summary(snapshot: &OpportunityRecorderSnapshot) -> String {
+    snapshot
+        .candidate_rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}:net={}bps profit={}",
+                non_empty_or(&row.symbol, "unknown"),
+                row.net_basis_bps.as_deref().unwrap_or("null"),
+                row.expected_profit_usd.as_deref().unwrap_or("null")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_opportunity_recorder_summary(snapshot: &OpportunityRecorderSnapshot) -> String {
+    snapshot
+        .candidate_rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}:net={}bps funding={}",
+                row.pair_id.as_deref().unwrap_or("unknown"),
+                row.net_funding_bps.as_deref().unwrap_or("null"),
+                row.expected_funding_usd.as_deref().unwrap_or("null")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(feature = "live-exec")]
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_blocking_summary(snapshot: &OpportunityRecorderSnapshot) -> String {
+    if snapshot.blocking_path_json == "[]" {
+        return "blocking_path=[]".to_owned();
+    }
+    let Ok(entries) = json_array_value_slices(&snapshot.blocking_path_json) else {
+        return "blocking_path=[]".to_owned();
+    };
+    let summary = entries
+        .iter()
+        .take(6)
+        .filter_map(|entry| {
+            let fields = parse_json_object_value_slices(entry).ok()?;
+            let blocker = opportunity_recorder_optional_field(&fields, "blocker")?;
+            let reason = opportunity_recorder_optional_field(&fields, "reason")?;
+            Some(format!("{blocker}:{reason}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if summary.is_empty() {
+        "blocking_path=[]".to_owned()
+    } else {
+        summary
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn append_opportunity_recorder_resident_health_events(
+    options: &OpportunityRecorderOptions,
+    sampler: &mut OpportunityRecorderHealthSampler,
+) -> RuntimeResult<()> {
+    append_opportunity_recorder_resident_tail_health(
+        options,
+        sampler,
+        SPOT_PERP_BASIS_OBSERVER_STRATEGY,
+        "spot-perp-basis:multi-venue",
+        &options
+            .basis_resident_out_dir
+            .join("multi_venue_resident_live_events.jsonl"),
+    )?;
+    for venue in ["binance", "bybit", "okx", "bitget"] {
+        append_opportunity_recorder_resident_tail_health(
+            options,
+            sampler,
+            SPOT_PERP_BASIS_OBSERVER_STRATEGY,
+            &format!("spot-perp-basis:{venue}"),
+            &options
+                .basis_resident_out_dir
+                .join(venue)
+                .join("resident_live_events.jsonl"),
+        )?;
+    }
+    append_opportunity_recorder_resident_tail_health(
+        options,
+        sampler,
+        CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
+        "cross-exchange-funding-arb",
+        &options
+            .funding_arb_resident_out_dir
+            .join("funding_arb_resident_live_events.jsonl"),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_opportunity_recorder_resident_tail_health(
+    options: &OpportunityRecorderOptions,
+    sampler: &mut OpportunityRecorderHealthSampler,
+    strategy: &str,
+    source: &str,
+    event_file: &Path,
+) -> RuntimeResult<()> {
+    let max_tail_bytes =
+        opportunity_recorder_resident_tail_max_bytes(options.resident_health_tail_lines);
+    let Ok(Some(contents)) = read_file_tail_lossy(event_file, max_tail_bytes) else {
+        return Ok(());
+    };
+    if contents.trim().is_empty() {
+        return Ok(());
+    }
+    let lines = tail_lines(&contents, options.resident_health_tail_lines);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let start = lines
+        .iter()
+        .rposition(|line| line.contains("\"event_type\":\"resident_started\""))
+        .unwrap_or(0);
+    let scoped_lines = &lines[start..];
+    let cycle_error_count = count_lines_containing(scoped_lines, "\"event_type\":\"cycle_error\"");
+    let blocked_decision_count = count_lines_containing(scoped_lines, "\"decision\":\"blocked\"");
+    let entry_capacity_blocked_count =
+        count_lines_containing(scoped_lines, "\"event_type\":\"entry_capacity_blocked\"");
+    let status = if cycle_error_count > 0
+        || blocked_decision_count > 0
+        || entry_capacity_blocked_count > 0
+    {
+        "warning"
+    } else {
+        "healthy"
+    };
+    let key = format!(
+        "resident_tail_health|status={status}|cycle_errors={cycle_error_count}|blocked={blocked_decision_count}|capacity={entry_capacity_blocked_count}"
+    );
+    if !sampler.should_emit(&format!("resident:{source}"), &key) {
+        return Ok(());
+    }
+    append_line_to_jsonl(
+        options.health_events_jsonl.clone(),
+        &format!(
+            "{{\"recorded_at\":{},\"strategy\":{},\"source\":{},\"event\":\"resident_tail_health\",\"status\":{},\"event_file\":{},\"tail_lines\":{},\"cycle_error_count\":{},\"blocked_decision_count\":{},\"entry_capacity_blocked_count\":{},\"mutable_execution_started\":false}}",
+            json_string(&current_utc_timestamp_string()),
+            json_string(strategy),
+            json_string(source),
+            json_string(status),
+            json_string(&event_file.display().to_string()),
+            options.resident_health_tail_lines,
+            cycle_error_count,
+            blocked_decision_count,
+            entry_capacity_blocked_count
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn tail_lines(input: &str, limit: usize) -> Vec<&str> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut lines = input.lines().rev().take(limit).collect::<Vec<_>>();
+    lines.reverse();
+    lines
+}
+
+#[cfg(feature = "live-exec")]
+fn count_lines_containing(lines: &[&str], pattern: &str) -> usize {
+    lines.iter().filter(|line| line.contains(pattern)).count()
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_tail_max_bytes(tail_lines: usize) -> u64 {
+    let estimated = u64::try_from(tail_lines)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1024);
+    estimated.clamp(64 * 1024, 1024 * 1024)
+}
+
+#[cfg(feature = "live-exec")]
+fn read_file_tail_lossy(path: &Path, max_bytes: u64) -> RuntimeResult<Option<String>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RuntimeError::Io {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if metadata.len() == 0 {
+        return Ok(Some(String::new()));
+    }
+    let start = metadata.len().saturating_sub(max_bytes.max(1));
+    let mut file = fs::File::open(path).map_err(|error| RuntimeError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| RuntimeError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| RuntimeError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    if start > 0 {
+        if let Some(index) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=index);
+        }
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_configured_event_json(options: &OpportunityRecorderOptions) -> String {
+    format!(
+        "{{\"recorded_at\":{},\"event\":\"observer_strategies_configured\",\"execution_mode\":{},\"strategies\":{},\"spot_perp_basis_mode\":{},\"funding_arb_mode\":{},\"mutable_execution_started\":false}}",
+        json_string(&current_utc_timestamp_string()),
+        json_string(&options.execution_mode),
+        json_string(&opportunity_recorder_strategy_list(options)),
+        json_string(&options.spot_perp_basis_mode),
+        json_string(&options.funding_arb_mode)
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_strategy_list(options: &OpportunityRecorderOptions) -> String {
+    options
+        .strategies
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(feature = "live-exec")]
+fn append_text_line_to_file(path: PathBuf, line: &str) -> RuntimeResult<()> {
+    rotate_append_jsonl_if_needed(&path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|error| RuntimeError::Io {
+            path,
+            message: error.to_string(),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn touch_runtime_file(path: &Path) -> RuntimeResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| RuntimeError::Io {
+            path: parent.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|error| RuntimeError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_log_timestamp() -> String {
+    current_utc_timestamp_string()
+}
+
+#[cfg(feature = "live-exec")]
+fn current_unix_secs_runtime() -> RuntimeResult<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("system time is before Unix epoch: {error}"),
+        })?;
+    Ok(duration.as_secs())
 }
 
 fn current_utc_timestamp() -> RuntimeResult<UtcTimestamp> {
@@ -52236,6 +53854,15 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    #[cfg(feature = "live-exec")]
+    if args[0] == "opportunity-recorder" {
+        let options = parse_opportunity_recorder_args(&args[1..])?;
+        let report = run_opportunity_recorder(options)?;
+        return Ok(format!(
+            "ok: opportunity recorder completed; cycles={}; spot_sources={}; funding_arb_enabled={}; mutable_execution_started=false",
+            report.cycles, report.spot_source_count, report.funding_arb_enabled
+        ));
+    }
     if args[0] == "health" {
         let fixture_root = args.get(1).map_or_else(
             || PathBuf::from(DEFAULT_FULL_PIPELINE_FIXTURE),
@@ -52277,7 +53904,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live, opportunity-recorder",
                 args[0]
             ),
         });
@@ -52424,6 +54051,8 @@ fn legacy_help_text() -> String {
         "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the Aster USDT-settled and Hyperliquid USDC-settled perp legs; Hyperliquid asset id auto-resolves unless overridden",
         "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders] [--allow-unknown-recovery] [--exit-only]",
         "                                    Resident funding-arb scanner: refresh private read-only snapshots, run guarded entry cycles, register live positions, and supervise reduce-only exit/de-risk; Aster defaults to USDT and Hyperliquid defaults to USDC",
+        "  opportunity-recorder [--root dir] [--source venue=url] [--funding-arb-url url] [--strategies list] [--interval-secs 5] [--once]",
+        "                                    Resident observer recorder implemented in Rust: poll local opportunity APIs and write JSONL/health logs without per-poll curl+jq subprocesses",
     ]
     .join("\n")
 }
@@ -57122,6 +58751,350 @@ fn parse_hyperliquid_asset_id_arg(value: &str) -> RuntimeResult<(String, u32)> {
     Ok((symbol.to_owned(), asset_id))
 }
 
+#[cfg(feature = "live-exec")]
+fn parse_opportunity_recorder_args(args: &[String]) -> RuntimeResult<OpportunityRecorderOptions> {
+    let mut root = PathBuf::from("target/arb-opportunity-observer");
+    let mut opportunity_dir = None::<PathBuf>;
+    let mut logs_dir = None::<PathBuf>;
+    let mut basis_resident_out_dir = None::<PathBuf>;
+    let mut funding_arb_resident_out_dir = None::<PathBuf>;
+    let mut spot_sources = Vec::<OpportunityRecorderSource>::new();
+    let mut funding_arb_url =
+        Some("http://127.0.0.1:8804/api/funding-arb/opportunities".to_owned());
+    let mut strategies =
+        parse_opportunity_recorder_strategy_list("spot-perp-basis,cross-exchange-funding-arb")?;
+    let mut execution_mode = "paper".to_owned();
+    let mut spot_perp_basis_mode = "resident".to_owned();
+    let mut funding_arb_mode = "resident".to_owned();
+    let mut interval_secs = 5_u64;
+    let mut timeout_secs = PUBLIC_MARKET_CURL_MAX_TIME_SECS;
+    let mut retries = PUBLIC_MARKET_CURL_ATTEMPTS;
+    let mut retry_sleep_ms = PUBLIC_MARKET_CURL_RETRY_SLEEP_MS;
+    let mut blocking_path_limit = 12_usize;
+    let mut health_sample_secs = 60_u64;
+    let mut resident_health_tail_lines = 200_usize;
+    let mut once = false;
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--root" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--root requires a directory"));
+                };
+                root = PathBuf::from(value);
+            }
+            "--opportunity-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--opportunity-dir requires a directory"));
+                };
+                opportunity_dir = Some(PathBuf::from(value));
+            }
+            "--logs-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--logs-dir requires a directory"));
+                };
+                logs_dir = Some(PathBuf::from(value));
+            }
+            "--basis-resident-out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--basis-resident-out requires a directory"));
+                };
+                basis_resident_out_dir = Some(PathBuf::from(value));
+            }
+            "--funding-arb-resident-out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--funding-arb-resident-out requires a directory",
+                    ));
+                };
+                funding_arb_resident_out_dir = Some(PathBuf::from(value));
+            }
+            "--source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--source requires venue=url"));
+                };
+                spot_sources.push(parse_opportunity_recorder_source(value)?);
+            }
+            "--clear-sources" => {
+                spot_sources.clear();
+            }
+            "--funding-arb-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--funding-arb-url requires a URL"));
+                };
+                funding_arb_url = Some(value.clone());
+            }
+            "--no-funding-arb-url" => {
+                funding_arb_url = None;
+            }
+            "--strategies" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--strategies requires a comma-separated list",
+                    ));
+                };
+                strategies = parse_opportunity_recorder_strategy_list(value)?;
+            }
+            "--execution-mode" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--execution-mode requires a value"));
+                };
+                execution_mode = value.clone();
+            }
+            "--spot-perp-basis-mode" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--spot-perp-basis-mode requires a value"));
+                };
+                spot_perp_basis_mode = value.clone();
+            }
+            "--funding-arb-mode" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--funding-arb-mode requires a value"));
+                };
+                funding_arb_mode = value.clone();
+            }
+            "--interval-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--interval-secs requires an integer"));
+                };
+                interval_secs = parse_positive_u64_cli("--interval-secs", value)?;
+            }
+            "--timeout-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--timeout-secs requires an integer"));
+                };
+                timeout_secs = parse_positive_u64_cli("--timeout-secs", value)?;
+            }
+            "--retries" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--retries requires an integer"));
+                };
+                retries = parse_positive_usize_cli("--retries", value)?;
+            }
+            "--retry-sleep-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--retry-sleep-secs requires an integer"));
+                };
+                retry_sleep_ms =
+                    parse_nonnegative_u64_cli("--retry-sleep-secs", value)?.saturating_mul(1000);
+            }
+            "--retry-sleep-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--retry-sleep-ms requires an integer"));
+                };
+                retry_sleep_ms = parse_nonnegative_u64_cli("--retry-sleep-ms", value)?;
+            }
+            "--blocking-path-event-limit" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--blocking-path-event-limit requires an integer",
+                    ));
+                };
+                blocking_path_limit =
+                    parse_nonnegative_usize_cli("--blocking-path-event-limit", value)?;
+            }
+            "--health-sample-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--health-sample-secs requires an integer"));
+                };
+                health_sample_secs = parse_nonnegative_u64_cli("--health-sample-secs", value)?;
+            }
+            "--resident-health-tail-lines" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--resident-health-tail-lines requires an integer",
+                    ));
+                };
+                resident_health_tail_lines =
+                    parse_nonnegative_usize_cli("--resident-health-tail-lines", value)?;
+            }
+            "--once" => {
+                once = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown opportunity-recorder option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected opportunity-recorder positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if spot_sources.is_empty() {
+        spot_sources = default_opportunity_recorder_sources();
+    }
+    let opportunity_dir = opportunity_dir.unwrap_or_else(|| root.join("opportunities"));
+    let logs_dir = logs_dir.unwrap_or_else(|| root.join("logs"));
+    let feedback_log = logs_dir.join("realtime-feedback.log");
+    let health_events_jsonl = logs_dir.join("health-events.jsonl");
+    let basis_resident_out_dir =
+        basis_resident_out_dir.unwrap_or_else(|| root.join("resident-live/spot-perp-basis"));
+    let funding_arb_resident_out_dir = funding_arb_resident_out_dir
+        .unwrap_or_else(|| root.join("resident-live/cross-exchange-funding-arb"));
+
+    Ok(OpportunityRecorderOptions {
+        root,
+        opportunity_dir,
+        logs_dir,
+        feedback_log,
+        health_events_jsonl,
+        basis_resident_out_dir,
+        funding_arb_resident_out_dir,
+        spot_sources,
+        funding_arb_url,
+        strategies,
+        execution_mode,
+        spot_perp_basis_mode,
+        funding_arb_mode,
+        interval_secs,
+        timeout_secs,
+        retries,
+        retry_sleep_ms,
+        blocking_path_limit,
+        health_sample_secs,
+        resident_health_tail_lines,
+        once,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_opportunity_recorder_source(value: &str) -> RuntimeResult<OpportunityRecorderSource> {
+    let Some((venue, url)) = value.split_once('=') else {
+        return Err(cli_arg_error("--source must be shaped as venue=url"));
+    };
+    let venue = venue.trim();
+    let url = url.trim();
+    if venue.is_empty() || url.is_empty() {
+        return Err(cli_arg_error("--source venue and URL cannot be empty"));
+    }
+    if venue
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+    {
+        return Err(cli_arg_error("--source venue contains an unsupported byte"));
+    }
+    parse_public_http_url(url)
+        .map_err(|message| cli_arg_error(format!("invalid --source URL: {message}")))?;
+    Ok(OpportunityRecorderSource {
+        venue: venue.to_owned(),
+        url: url.to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn default_opportunity_recorder_sources() -> Vec<OpportunityRecorderSource> {
+    [
+        ("binance", "http://127.0.0.1:8796/api/basis/opportunities"),
+        (
+            "bybit",
+            "http://127.0.0.1:8797/api/bybit-basis/opportunities",
+        ),
+        ("okx", "http://127.0.0.1:8798/api/okx-basis/opportunities"),
+        (
+            "bitget",
+            "http://127.0.0.1:8803/api/bitget-basis/opportunities",
+        ),
+        (
+            "aster",
+            "http://127.0.0.1:8800/api/aster-basis/opportunities",
+        ),
+        (
+            "hyperliquid",
+            "http://127.0.0.1:8799/api/hyperliquid-basis/opportunities",
+        ),
+    ]
+    .into_iter()
+    .map(|(venue, url)| OpportunityRecorderSource {
+        venue: venue.to_owned(),
+        url: url.to_owned(),
+    })
+    .collect()
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_opportunity_recorder_strategy_list(raw: &str) -> RuntimeResult<BTreeSet<String>> {
+    let mut strategies = BTreeSet::new();
+    for item in raw.split(',') {
+        let strategy = item.trim();
+        if strategy.is_empty() {
+            continue;
+        }
+        match strategy {
+            SPOT_PERP_BASIS_OBSERVER_STRATEGY | CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY => {
+                strategies.insert(strategy.to_owned());
+            }
+            _ => {
+                return Err(cli_arg_error(format!(
+                    "unknown opportunity-recorder strategy `{strategy}`"
+                )));
+            }
+        }
+    }
+    if strategies.is_empty() {
+        return Err(cli_arg_error(
+            "opportunity-recorder requires at least one strategy",
+        ));
+    }
+    Ok(strategies)
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_positive_u64_cli(name: &'static str, value: &str) -> RuntimeResult<u64> {
+    let parsed = parse_nonnegative_u64_cli(name, value)?;
+    if parsed == 0 {
+        return Err(cli_arg_error(format!("{name} must be greater than zero")));
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_nonnegative_u64_cli(name: &'static str, value: &str) -> RuntimeResult<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| cli_arg_error(format!("{name} must be a non-negative integer")))
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_positive_usize_cli(name: &'static str, value: &str) -> RuntimeResult<usize> {
+    let parsed = parse_nonnegative_usize_cli(name, value)?;
+    if parsed == 0 {
+        return Err(cli_arg_error(format!("{name} must be greater than zero")));
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_nonnegative_usize_cli(name: &'static str, value: &str) -> RuntimeResult<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| cli_arg_error(format!("{name} must be a non-negative integer")))
+}
+
 fn cli_arg_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Module {
         module: "arb-runtime",
@@ -58742,8 +60715,10 @@ mod tests {
     #[test]
     fn public_market_get_failure_message_reports_redacted_url() {
         let message = public_market_get_failure_message(
+            "GET",
             "https://example.test/api/v3/depth?symbol=BTCUSDT&apiKey=plain&signature=signed",
-            "curl returned exit status: 28",
+            3,
+            "HTTP status 429",
         );
 
         assert!(message.starts_with("public market data GET failed after 3 attempts"));
@@ -68138,15 +70113,124 @@ mod tests {
     }
 
     #[test]
-    fn public_json_post_curl_args_pin_http1_for_hyperliquid_info() {
-        let args = public_json_post_curl_args(
-            "https://api.hyperliquid.xyz/info",
-            r#"{"type":"metaAndAssetCtxs"}"#,
-        );
+    fn public_json_post_request_uses_http1_and_json_body() {
+        let parsed = parse_public_http_url("https://api.hyperliquid.xyz/info")
+            .expect("parse public HTTP URL");
+        let request =
+            public_http_request_bytes(&parsed, "POST", Some(r#"{"type":"metaAndAssetCtxs"}"#))
+                .expect("request bytes");
+        let request = String::from_utf8(request).expect("request utf8");
 
-        assert!(args.contains(&"--http1.1"));
-        assert_eq!(args[0], "-fsS");
-        assert_eq!(args[1], "--http1.1");
+        assert!(request.starts_with("POST /info HTTP/1.1\r\nHost: api.hyperliquid.xyz\r\n"));
+        assert!(request.contains("Content-Type: application/json\r\n"));
+        assert!(request.contains("Content-Length: 27\r\n"));
+        assert!(request.ends_with(r#"{"type":"metaAndAssetCtxs"}"#));
+    }
+
+    #[test]
+    fn public_http_response_decodes_chunked_json_body() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"ok\":1\r\n1\r\n}\r\n0\r\n\r\n";
+        let body = public_http_response_body(response).expect("response body");
+
+        assert_eq!(body, r#"{"ok":1}"#);
+    }
+
+    #[test]
+    fn parse_public_http_url_supports_default_and_explicit_ports() {
+        let https =
+            parse_public_http_url("https://example.test/api/v5/market/tickers?instType=SWAP")
+                .expect("https URL");
+        assert_eq!(https.scheme, "https");
+        assert_eq!(https.host, "example.test");
+        assert_eq!(https.port, 443);
+        assert_eq!(https.host_header, "example.test");
+        assert_eq!(https.path_and_query, "/api/v5/market/tickers?instType=SWAP");
+
+        let http =
+            parse_public_http_url("http://127.0.0.1:8798/api/okx-basis/status").expect("http URL");
+        assert_eq!(http.scheme, "http");
+        assert_eq!(http.host, "127.0.0.1");
+        assert_eq!(http.port, 8798);
+        assert_eq!(http.host_header, "127.0.0.1:8798");
+        assert_eq!(http.path_and_query, "/api/okx-basis/status");
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_snapshot_extracts_candidates_and_bounded_blocking_path() {
+        let body = r#"{
+          "status":"healthy",
+          "updated_at":"2026-05-21T00:00:00Z",
+          "candidate_count":1,
+          "rows":[
+            {"symbol":"BTCUSDT","is_candidate":true,"net_basis_bps":"12","expected_profit_usd":"0.23"},
+            {"symbol":"ETHUSDT","is_candidate":false,"net_basis_bps":"9"}
+          ],
+          "blocking_path":[
+            {"blocker":"candidate_count=0","reason":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"},
+            {"blocker":"later","reason":"not emitted"}
+          ]
+        }"#;
+
+        let snapshot =
+            parse_opportunity_recorder_snapshot(body, &["updated_at"], 1).expect("snapshot");
+
+        assert_eq!(snapshot.candidate_count, 1);
+        assert_eq!(snapshot.total_rows, 2);
+        assert_eq!(snapshot.candidate_rows.len(), 1);
+        assert_eq!(snapshot.candidate_rows[0].symbol, "BTCUSDT");
+        assert_eq!(snapshot.blocking_path_total_count, 2);
+        assert!(snapshot.blocking_path_truncated);
+        assert!(snapshot.blocking_path_json.contains("...<truncated>"));
+        assert!(!snapshot.blocking_path_json.contains("not emitted"));
+        assert_eq!(
+            spot_opportunity_recorder_summary(&snapshot),
+            "BTCUSDT:net=12bps profit=0.23"
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_adds_metadata_without_rewriting_payload() {
+        let line = json_object_with_extra_fields(
+            r#"{"candidate_count":1,"rows":[]}"#,
+            &[
+                ("recorded_at", json_string("2026-05-21T00:00:00Z")),
+                ("venue", json_string("okx")),
+                ("mutable_execution_started", "false".to_owned()),
+            ],
+        )
+        .expect("line");
+
+        assert_eq!(
+            line,
+            r#"{"candidate_count":1,"rows":[],"recorded_at":"2026-05-21T00:00:00Z","venue":"okx","mutable_execution_started":false}"#
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_tail_reader_limits_large_resident_event_files() {
+        let temp = RuntimeTempDir::new().expect("temp dir");
+        let path = temp.path().join("resident_live_events.jsonl");
+        write_utf8(
+            path.clone(),
+            &format!(
+                "{}\n{}\n{}",
+                "x".repeat(1024),
+                r#"{"event_type":"resident_started"}"#,
+                r#"{"event_type":"cycle_error"}"#
+            ),
+        )
+        .expect("write log");
+
+        let tail = read_file_tail_lossy(&path, 80)
+            .expect("tail read")
+            .expect("tail contents");
+
+        assert!(!tail.contains(&"x".repeat(128)));
+        assert!(tail.contains("\"event_type\":\"resident_started\""));
+        assert!(tail.contains("\"event_type\":\"cycle_error\""));
     }
 
     #[test]
