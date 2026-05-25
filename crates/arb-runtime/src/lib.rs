@@ -297,10 +297,10 @@ const BASIS_QUOTE_ASSET_ID: &str = "asset:USDT";
 const BASIS_SETTLEMENT_ASSET_ID: &str = "asset:USDT";
 const BINANCE_BASIS_PIPELINE_DEFAULT_OUT: &str = "target/binance-basis-pipeline";
 const BINANCE_GUARDED_LIVE_PREVIEW_DEFAULT_OUT: &str = "target/binance-guarded-live-preview";
-const BINANCE_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str = "target/binance-guarded-live-auto-once";
+const BINANCE_GUARDED_LIVE_CYCLE_DEFAULT_OUT: &str = "target/binance-guarded-live-cycle";
 #[cfg(feature = "live-exec")]
-const BINANCE_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
-    "target/binance-basis-guarded-live-auto-once";
+const BINANCE_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT: &str =
+    "target/binance-basis-guarded-live-cycle";
 #[cfg(feature = "live-exec")]
 const BINANCE_BASIS_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/binance-basis-resident-live";
 #[cfg(feature = "live-exec")]
@@ -310,14 +310,11 @@ const MULTI_VENUE_BASIS_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/multi-venue-ba
 #[cfg(feature = "live-exec")]
 const MULTI_VENUE_BASIS_LIVE_STACK_DEFAULT_OUT: &str = "target/multi-venue-basis-live-stack";
 #[cfg(feature = "live-exec")]
-const BYBIT_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
-    "target/bybit-basis-guarded-live-auto-once";
+const BYBIT_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT: &str = "target/bybit-basis-guarded-live-cycle";
 #[cfg(feature = "live-exec")]
-const OKX_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
-    "target/okx-basis-guarded-live-auto-once";
+const OKX_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT: &str = "target/okx-basis-guarded-live-cycle";
 #[cfg(feature = "live-exec")]
-const BITGET_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT: &str =
-    "target/bitget-basis-guarded-live-auto-once";
+const BITGET_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT: &str = "target/bitget-basis-guarded-live-cycle";
 const BINANCE_GUARDED_LIVE_ACCOUNT_REF: &str =
     "account:binance-isolated-personal-cex-subaccount-redacted";
 #[cfg(feature = "live-exec")]
@@ -375,7 +372,6 @@ const UNIFIED_RUNTIME_DEFAULT_CONFIG: &str = "templates/personal_guarded_live.pr
 const UNIFIED_RUNTIME_PAPER_DEFAULT_OUT: &str = "target/arb-runtime/paper";
 const UNIFIED_RUNTIME_LIVE_DEFAULT_OUT: &str = "target/arb-runtime/live";
 const UNIFIED_RUNTIME_DEFAULT_INTERVAL_SECS: u64 = 5;
-const UNIFIED_RUNTIME_DEFAULT_AUTO_ONCE_COOLDOWN_SECS: u64 = 60;
 const UNIFIED_RUNTIME_DEFAULT_STRATEGIES: &str = "spot-perp-basis,cross-exchange-funding-arb";
 const UNIFIED_RUNTIME_DEFAULT_MONITORS: &str = "binance bybit okx bitget aster hyperliquid";
 const FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD: &str = "0.01";
@@ -1859,7 +1855,7 @@ pub struct BinanceGuardedLiveDispatchReport {
 /// 中文说明：该入口每次从最新公开行情重新生成计划和审批事实。默认只 dry run；
 /// 只有 `execute_live` 和 `acknowledge_auto_live_orders` 同时为 true 才会进入真实下单。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceGuardedLiveAutoOnceOptions {
+pub struct BinanceGuardedLiveCycleOptions {
     pub config_path: PathBuf,
     pub output_dir: Option<PathBuf>,
     pub max_ask: Option<String>,
@@ -1869,7 +1865,7 @@ pub struct BinanceGuardedLiveAutoOnceOptions {
 
 /// Binance BTCUSDT 单周期自动链路结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceGuardedLiveAutoOnceReport {
+pub struct BinanceGuardedLiveCycleReport {
     pub symbol: String,
     pub strategy_id: String,
     pub source_event_id: Option<String>,
@@ -1894,7 +1890,7 @@ pub struct BinanceGuardedLiveAutoOnceReport {
 /// 和行情来源由上层 venue profile 或命令入口提供；真实下单必须显式设置
 /// `execute_live` 和确认标志。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BasisGuardedLiveAutoOnceOptions {
+pub struct BasisGuardedLiveCycleOptions {
     pub symbol: String,
     pub config_path: PathBuf,
     pub output_dir: Option<PathBuf>,
@@ -1920,7 +1916,7 @@ pub struct BasisGuardedLiveRiskDecisionSummary {
 
 /// spot-perp basis 双腿单周期自动链路结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BasisGuardedLiveAutoOnceReport {
+pub struct BasisGuardedLiveCycleReport {
     pub symbol: String,
     pub strategy_id: String,
     pub spot_event_id: Option<String>,
@@ -1957,37 +1953,37 @@ pub struct BasisGuardedLiveAutoOnceReport {
 }
 
 /// Binance spot-perp basis 双腿单周期自动链路选项。
-pub type BinanceBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
+pub type BinanceBasisGuardedLiveCycleOptions = BasisGuardedLiveCycleOptions;
 
 /// Binance spot-perp basis 双腿单周期自动链路结果。
-pub type BinanceBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
+pub type BinanceBasisGuardedLiveCycleReport = BasisGuardedLiveCycleReport;
 
 /// Bybit spot-linear basis 双腿单周期自动链路选项。
 ///
 /// 中文说明：字段语义与 Binance basis 自动链路一致；交易场所替换为 Bybit Spot
 /// 和 Bybit Linear，真实下单仍必须显式设置 `execute_live` 和确认标志。
-pub type BybitBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
+pub type BybitBasisGuardedLiveCycleOptions = BasisGuardedLiveCycleOptions;
 
 /// Bybit spot-linear basis 双腿单周期自动链路结果。
-pub type BybitBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
+pub type BybitBasisGuardedLiveCycleReport = BasisGuardedLiveCycleReport;
 
 /// OKX spot-swap basis 双腿单周期自动链路选项。
 ///
 /// 中文说明：字段语义与 Binance/Bybit basis 自动链路一致；交易场所替换为
 /// OKX Spot 和 OKX Swap，真实下单仍必须显式设置 `execute_live` 和确认标志。
-pub type OkxBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
+pub type OkxBasisGuardedLiveCycleOptions = BasisGuardedLiveCycleOptions;
 
 /// OKX spot-swap basis 双腿单周期自动链路结果。
-pub type OkxBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
+pub type OkxBasisGuardedLiveCycleReport = BasisGuardedLiveCycleReport;
 
 /// Bitget spot-USDT futures basis 双腿单周期自动链路选项。
 ///
 /// 中文说明：字段语义与 Binance/Bybit/OKX basis 自动链路一致；交易场所替换为
 /// Bitget Spot 和 Bitget USDT-FUTURES，真实下单仍必须显式设置确认标志。
-pub type BitgetBasisGuardedLiveAutoOnceOptions = BasisGuardedLiveAutoOnceOptions;
+pub type BitgetBasisGuardedLiveCycleOptions = BasisGuardedLiveCycleOptions;
 
 /// Bitget spot-USDT futures basis 双腿单周期自动链路结果。
-pub type BitgetBasisGuardedLiveAutoOnceReport = BasisGuardedLiveAutoOnceReport;
+pub type BitgetBasisGuardedLiveCycleReport = BasisGuardedLiveCycleReport;
 
 /// spot-perp basis 平仓监督器选项。
 ///
@@ -2060,7 +2056,6 @@ pub struct BinanceBasisResidentLiveOptions {
     pub position_state_path: Option<PathBuf>,
     pub poll_interval_secs: u64,
     pub max_cycles: Option<u64>,
-    pub max_live_entries: u64,
     pub max_concurrent_positions: usize,
     pub max_total_notional_usdt: String,
     pub execute_live: bool,
@@ -2106,7 +2101,6 @@ pub struct BinanceBasisLiveStackOptions {
     pub position_state_path: Option<PathBuf>,
     pub poll_interval_secs: u64,
     pub max_cycles: Option<u64>,
-    pub max_live_entries: u64,
     pub max_concurrent_positions: usize,
     pub max_total_notional_usdt: String,
     pub use_existing_monitors: bool,
@@ -2167,12 +2161,13 @@ impl BasisLiveVenue {
 
 /// 多交易所 basis 常驻实盘状态机选项。
 ///
-/// 中文说明：该入口按交易所轮询现有仓位退出监督和新增开仓机会，所有真实下单
-/// 仍走各交易所已有的 guarded live auto-once 链路，并受全局硬上限约束。
+/// 中文说明：该入口按交易所轮询现有仓位退出监督和新增全市场开仓机会，真实下单
+/// 仍走各交易所 guarded entry 链路，并受并发仓位、总名义本金和 unknown 状态风控约束。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultiVenueBasisResidentLiveOptions {
     pub venues: Vec<BasisLiveVenue>,
     pub symbols: BTreeMap<BasisLiveVenue, String>,
+    pub opportunity_urls: BTreeMap<BasisLiveVenue, String>,
     pub config_path: PathBuf,
     pub output_dir: Option<PathBuf>,
     pub min_net_bps: i128,
@@ -2183,7 +2178,6 @@ pub struct MultiVenueBasisResidentLiveOptions {
     pub adl_events_dir: Option<PathBuf>,
     pub poll_interval_secs: u64,
     pub max_cycles: Option<u64>,
-    pub max_live_entries: u64,
     pub max_concurrent_positions: usize,
     pub max_total_notional_usdt: String,
     pub execute_live: bool,
@@ -2214,6 +2208,7 @@ pub struct MultiVenueBasisResidentLiveReport {
 pub struct MultiVenueBasisLiveStackOptions {
     pub venues: Vec<BasisLiveVenue>,
     pub symbols: BTreeMap<BasisLiveVenue, String>,
+    pub opportunity_urls: BTreeMap<BasisLiveVenue, String>,
     pub config_path: PathBuf,
     pub output_dir: Option<PathBuf>,
     pub min_net_bps: i128,
@@ -2228,7 +2223,6 @@ pub struct MultiVenueBasisLiveStackOptions {
     pub adl_events_dir: Option<PathBuf>,
     pub poll_interval_secs: u64,
     pub max_cycles: Option<u64>,
-    pub max_live_entries: u64,
     pub max_concurrent_positions: usize,
     pub max_total_notional_usdt: String,
     pub use_existing_monitors: bool,
@@ -2925,7 +2919,6 @@ pub struct FundingArbResidentLiveOptions {
     pub private_order_events_dir: Option<PathBuf>,
     pub poll_interval_secs: u64,
     pub max_cycles: Option<u64>,
-    pub max_live_entries: u64,
     pub notional_usd: String,
     pub taker_fee_bps: i128,
     pub slippage_buffer_bps: i128,
@@ -9631,8 +9624,6 @@ fn portfolio_position_limit_from_config(dir: &Path) -> RuntimeResult<Option<Stri
             "max_concurrent_positions",
             "resident live config",
         )?;
-        let max_live_entries =
-            optional_json_value_string(&fields, "max_live_entries", "resident live config")?;
         let mut parts = Vec::new();
         if let Some(max_total) = max_total {
             parts.push(format!("总名义上限 {max_total} USDT"));
@@ -9642,9 +9633,6 @@ fn portfolio_position_limit_from_config(dir: &Path) -> RuntimeResult<Option<Stri
         }
         if let Some(max_concurrent) = max_concurrent {
             parts.push(format!("并发仓位上限 {max_concurrent}"));
-        }
-        if let Some(max_live_entries) = max_live_entries {
-            parts.push(format!("实盘入场次数上限 {max_live_entries}"));
         }
         if !parts.is_empty() {
             return Ok(Some(parts.join("；")));
@@ -11088,30 +11076,25 @@ pub fn run_binance_guarded_live_dispatch(
 ///
 /// 中文说明：该函数会读取一次最新公开 spot bookTicker，生成新的策略候选和计划，
 /// 自动生成同一 plan_hash 的受控审批事实，然后进入 dry-run 或显式实盘分发。
-pub fn run_binance_guarded_live_auto_once(
-    options: BinanceGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BinanceGuardedLiveAutoOnceReport> {
+pub fn run_binance_guarded_live_cycle(
+    options: BinanceGuardedLiveCycleOptions,
+) -> RuntimeResult<BinanceGuardedLiveCycleReport> {
     let source_url = binance_spot_book_ticker_url(BASIS_SYMBOL);
     let raw_spot_book = fetch_public_json_with_curl(&source_url)?;
     let ingested_at = current_utc_timestamp()?;
-    run_binance_guarded_live_auto_once_from_spot_json(
-        &raw_spot_book,
-        &source_url,
-        ingested_at,
-        options,
-    )
+    run_binance_guarded_live_cycle_from_spot_json(&raw_spot_book, &source_url, ingested_at, options)
 }
 
-fn run_binance_guarded_live_auto_once_from_spot_json(
+fn run_binance_guarded_live_cycle_from_spot_json(
     raw_spot_book: &str,
     raw_response_ref: &str,
     ingested_at: UtcTimestamp,
-    options: BinanceGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BinanceGuardedLiveAutoOnceReport> {
+    options: BinanceGuardedLiveCycleOptions,
+) -> RuntimeResult<BinanceGuardedLiveCycleReport> {
     let output_root = options
         .output_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from(BINANCE_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+        .unwrap_or_else(|| PathBuf::from(BINANCE_GUARDED_LIVE_CYCLE_DEFAULT_OUT));
     let output_dir = Some(output_root.clone());
     let market_dir = output_root.join("market");
     let preview_dir = output_root.join("preview");
@@ -11140,7 +11123,7 @@ fn run_binance_guarded_live_auto_once_from_spot_json(
     }
 
     if !blocking_reasons.is_empty() {
-        let report = BinanceGuardedLiveAutoOnceReport {
+        let report = BinanceGuardedLiveCycleReport {
             symbol: BASIS_SYMBOL.to_owned(),
             strategy_id: BINANCE_GUARDED_LIVE_STRATEGY_ID.to_owned(),
             source_event_id: Some(quote.event_id),
@@ -11158,7 +11141,7 @@ fn run_binance_guarded_live_auto_once_from_spot_json(
             blocking_reasons,
             output_dir,
         };
-        write_binance_guarded_live_auto_once_artifacts(&output_root, &report)?;
+        write_binance_guarded_live_cycle_artifacts(&output_root, &report)?;
         return Ok(report);
     }
 
@@ -11230,7 +11213,7 @@ fn run_binance_guarded_live_auto_once_from_spot_json(
 
     let mut report_reasons = Vec::new();
     report_reasons.append(&mut dispatch_reasons);
-    let report = BinanceGuardedLiveAutoOnceReport {
+    let report = BinanceGuardedLiveCycleReport {
         symbol: BASIS_SYMBOL.to_owned(),
         strategy_id: BINANCE_GUARDED_LIVE_STRATEGY_ID.to_owned(),
         source_event_id: Some(quote.event_id),
@@ -11248,17 +11231,17 @@ fn run_binance_guarded_live_auto_once_from_spot_json(
         blocking_reasons: report_reasons,
         output_dir,
     };
-    write_binance_guarded_live_auto_once_artifacts(&output_root, &report)?;
+    write_binance_guarded_live_cycle_artifacts(&output_root, &report)?;
     Ok(report)
 }
 
 /// 运行一次 Binance spot-perp basis 双腿自动套利链路。
-pub fn run_binance_basis_guarded_live_auto_once(
-    options: BasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
+pub fn run_binance_basis_guarded_live_cycle(
+    options: BasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BasisGuardedLiveCycleReport> {
     #[cfg(feature = "live-exec")]
     {
-        run_binance_basis_guarded_live_auto_once_live(options)
+        run_binance_basis_guarded_live_cycle_live(options)
     }
     #[cfg(not(feature = "live-exec"))]
     {
@@ -11272,12 +11255,12 @@ pub fn run_binance_basis_guarded_live_auto_once(
 }
 
 /// 运行一次 Bybit spot-linear basis 双腿自动套利链路。
-pub fn run_bybit_basis_guarded_live_auto_once(
-    options: BybitBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+pub fn run_bybit_basis_guarded_live_cycle(
+    options: BybitBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BybitBasisGuardedLiveCycleReport> {
     #[cfg(feature = "live-exec")]
     {
-        run_bybit_basis_guarded_live_auto_once_live(options)
+        run_bybit_basis_guarded_live_cycle_live(options)
     }
     #[cfg(not(feature = "live-exec"))]
     {
@@ -11291,12 +11274,12 @@ pub fn run_bybit_basis_guarded_live_auto_once(
 }
 
 /// 运行一次 OKX spot-swap basis 双腿自动套利链路。
-pub fn run_okx_basis_guarded_live_auto_once(
-    options: OkxBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceReport> {
+pub fn run_okx_basis_guarded_live_cycle(
+    options: OkxBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<OkxBasisGuardedLiveCycleReport> {
     #[cfg(feature = "live-exec")]
     {
-        run_okx_basis_guarded_live_auto_once_live(options)
+        run_okx_basis_guarded_live_cycle_live(options)
     }
     #[cfg(not(feature = "live-exec"))]
     {
@@ -11309,12 +11292,12 @@ pub fn run_okx_basis_guarded_live_auto_once(
 }
 
 /// 运行一次 Bitget spot-USDT futures basis 双腿自动套利链路。
-pub fn run_bitget_basis_guarded_live_auto_once(
-    options: BitgetBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BitgetBasisGuardedLiveAutoOnceReport> {
+pub fn run_bitget_basis_guarded_live_cycle(
+    options: BitgetBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BitgetBasisGuardedLiveCycleReport> {
     #[cfg(feature = "live-exec")]
     {
-        run_bitget_basis_guarded_live_auto_once_live(options)
+        run_bitget_basis_guarded_live_cycle_live(options)
     }
     #[cfg(not(feature = "live-exec"))]
     {
@@ -11707,11 +11690,6 @@ fn validate_binance_basis_resident_live_options(
                 .to_owned(),
         });
     }
-    if options.max_live_entries == 0 {
-        return Err(RuntimeError::UnsafeConfig {
-            message: "Binance resident live max live entries must be greater than zero".to_owned(),
-        });
-    }
     if options.max_concurrent_positions == 0 {
         return Err(RuntimeError::UnsafeConfig {
             message: "Binance resident live max concurrent positions must be greater than zero"
@@ -11837,13 +11815,6 @@ fn binance_basis_resident_entry_capacity(
             "unknown resident position exists; new entries are blocked".to_owned(),
         ));
     }
-    if registry.live_entry_count() >= options.max_live_entries as usize {
-        return Ok(ResidentEntryCapacity::Blocked(format!(
-            "max live entries reached: {} >= {}",
-            registry.live_entry_count(),
-            options.max_live_entries
-        )));
-    }
     let active_positions = registry.active_positions();
     if active_positions.len() >= options.max_concurrent_positions {
         return Ok(ResidentEntryCapacity::Blocked(format!(
@@ -11870,8 +11841,8 @@ fn binance_basis_resident_entry_capacity(
 fn run_binance_basis_resident_entry_cycle(
     options: &BinanceBasisResidentLiveOptions,
     cycle_dir: &Path,
-) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
-    run_binance_basis_guarded_live_auto_once(BasisGuardedLiveAutoOnceOptions {
+) -> RuntimeResult<BasisGuardedLiveCycleReport> {
+    run_binance_basis_guarded_live_cycle(BasisGuardedLiveCycleOptions {
         symbol: options.symbol.clone(),
         config_path: options.config_path.clone(),
         output_dir: Some(cycle_dir.to_path_buf()),
@@ -12002,7 +11973,7 @@ fn ensure_initial_resident_position_registered(
 
 #[cfg(feature = "live-exec")]
 fn binance_basis_resident_entry_cleanly_opened(
-    report: &BasisGuardedLiveAutoOnceReport,
+    report: &BasisGuardedLiveCycleReport,
     position_state_path: &Path,
 ) -> bool {
     position_state_path.exists()
@@ -12043,7 +12014,7 @@ fn write_binance_basis_resident_live_config(
     options: &BinanceBasisResidentLiveOptions,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"spot_wss_monitor_url\":{},\"perp_wss_monitor_url\":{},\"position_state_path\":{},\"symbol\":{}}}",
+        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"spot_wss_monitor_url\":{},\"perp_wss_monitor_url\":{},\"position_state_path\":{},\"symbol\":{}}}",
         optional_json_string(options.adl_events_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
         options
             .auto_price_guard_bps
@@ -12056,7 +12027,6 @@ fn write_binance_basis_resident_live_config(
             .max_cycles
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
-        options.max_live_entries,
         json_string(&options.max_total_notional_usdt),
         options.min_net_bps,
         optional_json_string(options.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
@@ -12120,7 +12090,7 @@ fn append_binance_basis_resident_entry_event(
     output_root: &Path,
     cycle: u64,
     cycle_dir: &Path,
-    report: &BasisGuardedLiveAutoOnceReport,
+    report: &BasisGuardedLiveCycleReport,
 ) -> RuntimeResult<()> {
     append_binance_basis_resident_jsonl(
         output_root,
@@ -12173,7 +12143,7 @@ fn append_binance_basis_resident_position_opened(
     cycle: u64,
     cycle_dir: &Path,
     position_state_path: &Path,
-    report: &BasisGuardedLiveAutoOnceReport,
+    report: &BasisGuardedLiveCycleReport,
 ) -> RuntimeResult<BinanceBasisResidentPosition> {
     let state_json = read_utf8(position_state_path)?;
     let state = parse_basis_exit_supervisor_state_json(&state_json)?;
@@ -12890,12 +12860,6 @@ fn validate_multi_venue_basis_resident_live_options(
                     .to_owned(),
         });
     }
-    if options.max_live_entries == 0 {
-        return Err(RuntimeError::UnsafeConfig {
-            message: "multi-venue resident live max live entries must be greater than zero"
-                .to_owned(),
-        });
-    }
     if options.max_concurrent_positions == 0 {
         return Err(RuntimeError::UnsafeConfig {
             message: "multi-venue resident live max concurrent positions must be greater than zero"
@@ -12911,6 +12875,21 @@ fn validate_multi_venue_basis_resident_live_options(
     }
     if let Some(bps) = options.auto_price_guard_bps {
         validate_basis_auto_price_guard_bps(bps)?;
+    }
+    for (venue, url) in &options.opportunity_urls {
+        if !options.venues.contains(venue) {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "{} opportunity URL was configured but the venue is not enabled",
+                    venue.label()
+                ),
+            });
+        }
+        if url.trim().is_empty() {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!("{} opportunity URL must not be empty", venue.label()),
+            });
+        }
     }
     for venue in &options.venues {
         let symbol = multi_venue_basis_symbol(options, *venue);
@@ -12987,6 +12966,14 @@ fn multi_venue_basis_symbol(
 }
 
 #[cfg(feature = "live-exec")]
+fn multi_venue_basis_opportunity_url(
+    options: &MultiVenueBasisResidentLiveOptions,
+    venue: BasisLiveVenue,
+) -> Option<String> {
+    options.opportunity_urls.get(&venue).cloned()
+}
+
+#[cfg(feature = "live-exec")]
 fn multi_venue_basis_spot_wss_monitor_url(
     options: &MultiVenueBasisResidentLiveOptions,
     venue: BasisLiveVenue,
@@ -13003,13 +12990,128 @@ fn multi_venue_basis_perp_wss_monitor_url(
 }
 
 #[cfg(feature = "live-exec")]
+fn normalize_multi_venue_basis_symbol(
+    venue: BasisLiveVenue,
+    symbol: &str,
+) -> RuntimeResult<String> {
+    match venue {
+        BasisLiveVenue::Binance | BasisLiveVenue::Bybit | BasisLiveVenue::Bitget => {
+            normalize_cex_usdt_basis_symbol(symbol, venue.label())
+        }
+        BasisLiveVenue::Okx => normalize_okx_usdt_basis_symbol(symbol),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn best_multi_venue_basis_candidate_symbol(
+    venue: BasisLiveVenue,
+    opportunities_json: &str,
+) -> RuntimeResult<Option<String>> {
+    let fields = parse_json_object_value_slices(opportunities_json)?;
+    let Some(rows_json) = fields.get("rows") else {
+        return Ok(None);
+    };
+    let mut best: Option<(String, i128)> = None;
+    for row_json in json_array_value_slices(rows_json)? {
+        let row_fields = parse_json_object_value_slices(row_json)?;
+        let is_candidate =
+            optional_json_bool(&row_fields, "is_candidate", "basis opportunities")?.unwrap_or(true);
+        if !is_candidate {
+            continue;
+        }
+        let symbol = normalize_multi_venue_basis_symbol(
+            venue,
+            &required_json_value_string(&row_fields, "symbol", "basis opportunities")?,
+        )?;
+        let net_bps = monitor_optional_i128(&optional_json_value_string(
+            &row_fields,
+            "net_basis_bps",
+            "basis opportunities",
+        )?);
+        let replace = best.as_ref().is_none_or(|(current_symbol, current_bps)| {
+            net_bps > *current_bps || (net_bps == *current_bps && symbol < *current_symbol)
+        });
+        if replace {
+            best = Some((symbol, net_bps));
+        }
+    }
+    Ok(best.map(|(symbol, _)| symbol))
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_multi_venue_basis_candidate_symbol(
+    venue: BasisLiveVenue,
+    url: &str,
+) -> RuntimeResult<Option<String>> {
+    let body = fetch_public_json_with_curl(url)?;
+    best_multi_venue_basis_candidate_symbol(venue, &body)
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_no_candidate_report(
+    venue: BasisLiveVenue,
+    fallback_symbol: String,
+    reason: String,
+) -> BasisGuardedLiveCycleReport {
+    BasisGuardedLiveCycleReport {
+        symbol: fallback_symbol,
+        strategy_id: format!("{}-basis-live", venue.as_str()),
+        spot_event_id: None,
+        perp_event_id: None,
+        premium_event_id: None,
+        spot_ask: None,
+        perp_bid: None,
+        max_spot_ask: None,
+        min_perp_bid: None,
+        auto_price_guard_bps: None,
+        net_bps: None,
+        signal_allowed: false,
+        risk_decision: None,
+        plan_hash: None,
+        approval_event_id: None,
+        manual_gate_released: false,
+        dispatch_attempted: false,
+        dispatch_allowed: false,
+        dispatch_plan_built: false,
+        dispatch_request_count: 0,
+        preview_manual_gate_count: 0,
+        preview_place_order_count: 0,
+        preview_plan_leg_count: 0,
+        planned_order_count: 0,
+        submitted_receipt_count: 0,
+        private_confirmation_count: 0,
+        protection_attempted: false,
+        protection_actions: Vec::new(),
+        protection_receipt_count: 0,
+        residual_risk: None,
+        execution_report_status: None,
+        blocking_reasons: vec![reason],
+        output_dir: None,
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn run_multi_venue_basis_resident_entry_cycle(
     options: &MultiVenueBasisResidentLiveOptions,
     venue: BasisLiveVenue,
     cycle_dir: &Path,
-) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
-    let once = BasisGuardedLiveAutoOnceOptions {
-        symbol: multi_venue_basis_symbol(options, venue),
+) -> RuntimeResult<BasisGuardedLiveCycleReport> {
+    let symbol = if let Some(url) = multi_venue_basis_opportunity_url(options, venue) {
+        match fetch_multi_venue_basis_candidate_symbol(venue, &url)? {
+            Some(symbol) => symbol,
+            None => {
+                return Ok(multi_venue_basis_no_candidate_report(
+                    venue,
+                    multi_venue_basis_symbol(options, venue),
+                    format!("no current {} spot-perp basis candidate", venue.label()),
+                ));
+            }
+        }
+    } else {
+        multi_venue_basis_symbol(options, venue)
+    };
+    let once = BasisGuardedLiveCycleOptions {
+        symbol,
         config_path: options.config_path.clone(),
         output_dir: Some(cycle_dir.to_path_buf()),
         min_net_bps: options.min_net_bps,
@@ -13023,10 +13125,10 @@ fn run_multi_venue_basis_resident_entry_cycle(
         acknowledge_basis_live_orders: options.acknowledge_basis_live_orders,
     };
     match venue {
-        BasisLiveVenue::Binance => run_binance_basis_guarded_live_auto_once(once),
-        BasisLiveVenue::Bybit => run_bybit_basis_guarded_live_auto_once(once),
-        BasisLiveVenue::Okx => run_okx_basis_guarded_live_auto_once(once),
-        BasisLiveVenue::Bitget => run_bitget_basis_guarded_live_auto_once(once),
+        BasisLiveVenue::Binance => run_binance_basis_guarded_live_cycle(once),
+        BasisLiveVenue::Bybit => run_bybit_basis_guarded_live_cycle(once),
+        BasisLiveVenue::Okx => run_okx_basis_guarded_live_cycle(once),
+        BasisLiveVenue::Bitget => run_bitget_basis_guarded_live_cycle(once),
     }
 }
 
@@ -13089,12 +13191,6 @@ fn multi_venue_basis_resident_entry_capacity(
             "unknown multi-venue resident position exists; new entries are blocked".to_owned(),
         ));
     }
-    if summary.live_entry_count >= options.max_live_entries as usize {
-        return Ok(ResidentEntryCapacity::Blocked(format!(
-            "max live entries reached: {} >= {}",
-            summary.live_entry_count, options.max_live_entries
-        )));
-    }
     if summary.active_position_count >= options.max_concurrent_positions {
         return Ok(ResidentEntryCapacity::Blocked(format!(
             "max concurrent positions reached: {} >= {}",
@@ -13127,7 +13223,7 @@ fn write_multi_venue_basis_resident_live_config(
         .collect::<Vec<_>>()
         .join(",");
     let contents = format!(
-        "{{\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"venues\":[{}]}}\n",
+        "{{\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"venues\":[{}]}}\n",
         options
             .auto_price_guard_bps
             .map(|value| value.to_string())
@@ -13139,7 +13235,6 @@ fn write_multi_venue_basis_resident_live_config(
             .max_cycles
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
-        options.max_live_entries,
         json_string(&options.max_total_notional_usdt),
         options.min_net_bps,
         json_string(&output_root.display().to_string()),
@@ -13219,7 +13314,7 @@ fn append_multi_venue_basis_resident_entry_event(
     cycle: u64,
     venue: BasisLiveVenue,
     cycle_dir: &Path,
-    report: &BasisGuardedLiveAutoOnceReport,
+    report: &BasisGuardedLiveCycleReport,
 ) -> RuntimeResult<()> {
     append_multi_venue_basis_resident_event(
         output_root,
@@ -13613,7 +13708,6 @@ fn validate_binance_basis_live_stack_options(
         position_state_path: options.position_state_path.clone(),
         poll_interval_secs: options.poll_interval_secs,
         max_cycles: options.max_cycles,
-        max_live_entries: options.max_live_entries,
         max_concurrent_positions: options.max_concurrent_positions,
         max_total_notional_usdt: options.max_total_notional_usdt.clone(),
         execute_live: options.execute_live,
@@ -13778,8 +13872,6 @@ fn binance_basis_live_stack_resident_args(
         private_order_events_dir.display().to_string(),
         "--adl-events-dir".to_owned(),
         adl_events_dir.display().to_string(),
-        "--max-live-entries".to_owned(),
-        options.max_live_entries.to_string(),
         "--max-concurrent-positions".to_owned(),
         options.max_concurrent_positions.to_string(),
         "--max-total-notional-usdt".to_owned(),
@@ -13841,7 +13933,7 @@ fn write_binance_basis_live_stack_config(
     adl_events_dir: &Path,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"monitor_reconnect_delay_secs\":{},\"monitor_symbol\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"perp_wss_bind_addr\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"readiness_timeout_secs\":{},\"resident_dir\":{},\"shutdown_grace_secs\":{},\"spot_wss_bind_addr\":{},\"symbol\":{},\"use_existing_monitors\":{}}}\n",
+        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"monitor_reconnect_delay_secs\":{},\"monitor_symbol\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"perp_wss_bind_addr\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"readiness_timeout_secs\":{},\"resident_dir\":{},\"shutdown_grace_secs\":{},\"spot_wss_bind_addr\":{},\"symbol\":{},\"use_existing_monitors\":{}}}\n",
         json_string(&adl_events_dir.display().to_string()),
         options
             .auto_price_guard_bps
@@ -13854,7 +13946,6 @@ fn write_binance_basis_live_stack_config(
             .max_cycles
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
-        options.max_live_entries,
         json_string(&options.max_total_notional_usdt),
         options.min_net_bps,
         options.monitor_reconnect_delay_secs,
@@ -14314,6 +14405,7 @@ fn multi_venue_basis_live_stack_resident_options(
     MultiVenueBasisResidentLiveOptions {
         venues: options.venues.clone(),
         symbols: options.symbols.clone(),
+        opportunity_urls: options.opportunity_urls.clone(),
         config_path: options.config_path.clone(),
         output_dir: resident_dir.map(Path::to_path_buf),
         min_net_bps: options.min_net_bps,
@@ -14324,7 +14416,6 @@ fn multi_venue_basis_live_stack_resident_options(
         adl_events_dir: adl_events_dir.map(Path::to_path_buf),
         poll_interval_secs: options.poll_interval_secs,
         max_cycles: options.max_cycles,
-        max_live_entries: options.max_live_entries,
         max_concurrent_positions: options.max_concurrent_positions,
         max_total_notional_usdt: options.max_total_notional_usdt.clone(),
         execute_live: options.execute_live,
@@ -14360,8 +14451,6 @@ fn multi_venue_basis_live_stack_resident_args(
         private_order_events_dir.display().to_string(),
         "--adl-events-dir".to_owned(),
         adl_events_dir.display().to_string(),
-        "--max-live-entries".to_owned(),
-        options.max_live_entries.to_string(),
         "--max-concurrent-positions".to_owned(),
         options.max_concurrent_positions.to_string(),
         "--max-total-notional-usdt".to_owned(),
@@ -14371,6 +14460,10 @@ fn multi_venue_basis_live_stack_resident_args(
         if let Some(symbol) = options.symbols.get(venue) {
             args.push(format!("--{}-symbol", venue.as_str()));
             args.push(symbol.clone());
+        }
+        if let Some(url) = options.opportunity_urls.get(venue) {
+            args.push(format!("--{}-opportunities-url", venue.as_str()));
+            args.push(url.clone());
         }
         args.push(format!("--{}-spot-wss-monitor-url", venue.as_str()));
         args.push(binance_basis_live_stack_monitor_base_url(
@@ -14601,7 +14694,7 @@ fn write_multi_venue_basis_live_stack_config(
         .collect::<Vec<_>>()
         .join(",");
     let contents = format!(
-        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_live_entries\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"monitor_reconnect_delay_secs\":{},\"monitor_symbol\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"readiness_timeout_secs\":{},\"resident_dir\":{},\"shutdown_grace_secs\":{},\"use_existing_monitors\":{},\"venues\":[{}]}}\n",
+        "{{\"adl_events_dir\":{},\"auto_price_guard_bps\":{},\"config_path\":{},\"execute_live\":{},\"max_concurrent_positions\":{},\"max_cycles\":{},\"max_total_notional_usdt\":{},\"min_net_bps\":{},\"monitor_reconnect_delay_secs\":{},\"monitor_symbol\":{},\"mutable_execution_started\":false,\"output_dir\":{},\"poll_interval_secs\":{},\"private_order_events_dir\":{},\"readiness_timeout_secs\":{},\"resident_dir\":{},\"shutdown_grace_secs\":{},\"use_existing_monitors\":{},\"venues\":[{}]}}\n",
         json_string(&adl_events_dir.display().to_string()),
         options
             .auto_price_guard_bps
@@ -14614,7 +14707,6 @@ fn write_multi_venue_basis_live_stack_config(
             .max_cycles
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
-        options.max_live_entries,
         json_string(&options.max_total_notional_usdt),
         options.min_net_bps,
         options.monitor_reconnect_delay_secs,
@@ -14694,17 +14786,10 @@ fn append_multi_venue_basis_live_stack_child_started(
 }
 
 #[cfg(feature = "live-exec")]
-fn run_binance_basis_guarded_live_auto_once_live(
-    options: BasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
+fn run_binance_basis_guarded_live_cycle_live(
+    options: BasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BasisGuardedLiveCycleReport> {
     let symbol = normalize_cex_usdt_basis_symbol(&options.symbol, "Binance")?;
-    if options.execute_live && symbol != BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 Binance basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
-            ),
-        });
-    }
     let spot_instrument_id = binance_basis_spot_instrument_id(&symbol)?;
     let perp_instrument_id = binance_basis_perp_instrument_id(&symbol)?;
     let spot_url = binance_spot_book_ticker_url(&symbol);
@@ -14763,7 +14848,7 @@ fn run_binance_basis_guarded_live_auto_once_live(
         };
     let raw_premium = fetch_public_json_with_curl(&premium_url)?;
     let ingested_at = current_utc_timestamp()?;
-    run_binance_basis_guarded_live_auto_once_from_json(
+    run_binance_basis_guarded_live_cycle_from_json(
         &symbol,
         &raw_spot,
         &spot_ref,
@@ -14777,17 +14862,10 @@ fn run_binance_basis_guarded_live_auto_once_live(
 }
 
 #[cfg(feature = "live-exec")]
-fn run_bybit_basis_guarded_live_auto_once_live(
-    options: BybitBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+fn run_bybit_basis_guarded_live_cycle_live(
+    options: BybitBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BybitBasisGuardedLiveCycleReport> {
     let symbol = normalize_cex_usdt_basis_symbol(&options.symbol, "Bybit")?;
-    if options.execute_live && symbol != BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 Bybit basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
-            ),
-        });
-    }
     let spot_instrument_id = bybit_basis_spot_instrument_id(&symbol)?;
     let perp_instrument_id = bybit_basis_perp_instrument_id(&symbol)?;
     let spot_url = bybit_spot_tickers_url();
@@ -14847,7 +14925,7 @@ fn run_bybit_basis_guarded_live_auto_once_live(
             )
         };
     let ingested_at = current_utc_timestamp()?;
-    run_bybit_basis_guarded_live_auto_once_from_json(
+    run_bybit_basis_guarded_live_cycle_from_json(
         &symbol,
         &raw_spot,
         &spot_ref,
@@ -14859,17 +14937,10 @@ fn run_bybit_basis_guarded_live_auto_once_live(
 }
 
 #[cfg(feature = "live-exec")]
-fn run_okx_basis_guarded_live_auto_once_live(
-    options: OkxBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceReport> {
+fn run_okx_basis_guarded_live_cycle_live(
+    options: OkxBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<OkxBasisGuardedLiveCycleReport> {
     let symbol = normalize_okx_usdt_basis_symbol(&options.symbol)?;
-    if options.execute_live && symbol != OKX_BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 OKX basis 自动下单仍只允许 {OKX_BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
-            ),
-        });
-    }
     let spot_instrument_id = okx_basis_spot_instrument_id(&symbol)?;
     let perp_instrument_id = okx_basis_perp_instrument_id(&symbol)?;
     let spot_url = okx_tickers_url("SPOT");
@@ -14932,7 +15003,7 @@ fn run_okx_basis_guarded_live_auto_once_live(
     let raw_index = fetch_public_json_with_curl(&index_url)?;
     let raw_funding = fetch_public_json_with_curl(&funding_url)?;
     let ingested_at = current_utc_timestamp()?;
-    run_okx_basis_guarded_live_auto_once_from_json(
+    run_okx_basis_guarded_live_cycle_from_json(
         OkxBasisRawInputs {
             symbol: &symbol,
             raw_spot_ticker: &raw_spot,
@@ -14952,17 +15023,10 @@ fn run_okx_basis_guarded_live_auto_once_live(
 }
 
 #[cfg(feature = "live-exec")]
-fn run_bitget_basis_guarded_live_auto_once_live(
-    options: BitgetBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BitgetBasisGuardedLiveAutoOnceReport> {
+fn run_bitget_basis_guarded_live_cycle_live(
+    options: BitgetBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BitgetBasisGuardedLiveCycleReport> {
     let symbol = normalize_cex_usdt_basis_symbol(&options.symbol, "Bitget")?;
-    if options.execute_live && symbol != BITGET_BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 Bitget basis 自动下单仍只允许 {BITGET_BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
-            ),
-        });
-    }
     let spot_url = bitget_spot_tickers_url();
     let usdt_futures_url = bitget_usdt_futures_tickers_url();
     let usdt_futures_funding_rate_url = bitget_usdt_futures_funding_rate_url();
@@ -15031,7 +15095,7 @@ fn run_bitget_basis_guarded_live_auto_once_live(
             )
         };
     let ingested_at = current_utc_timestamp()?;
-    run_bitget_basis_guarded_live_auto_once_from_json(
+    run_bitget_basis_guarded_live_cycle_from_json(
         BitgetBasisRawInputs {
             symbol: &symbol,
             raw_spot_ticker: &raw_spot,
@@ -15970,7 +16034,7 @@ struct BasisResolvedPriceGuards {
 
 #[cfg(feature = "live-exec")]
 fn resolve_basis_price_guards(
-    options: &BasisGuardedLiveAutoOnceOptions,
+    options: &BasisGuardedLiveCycleOptions,
     spot_ask: &str,
     perp_bid: &str,
 ) -> RuntimeResult<BasisResolvedPriceGuards> {
@@ -16047,7 +16111,7 @@ fn apply_basis_auto_price_guard(
 
 #[cfg(feature = "live-exec")]
 #[allow(clippy::too_many_arguments)]
-fn run_binance_basis_guarded_live_auto_once_from_json(
+fn run_binance_basis_guarded_live_cycle_from_json(
     symbol: &str,
     raw_spot: &str,
     spot_ref: &str,
@@ -16056,20 +16120,13 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
     raw_premium: &str,
     premium_ref: &str,
     ingested_at: UtcTimestamp,
-    options: BasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BasisGuardedLiveAutoOnceReport> {
+    options: BasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BasisGuardedLiveCycleReport> {
     let symbol = normalize_cex_usdt_basis_symbol(symbol, "Binance")?;
-    if options.execute_live && symbol != BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 Binance basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
-            ),
-        });
-    }
     let output_root = options
         .output_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from(BINANCE_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+        .unwrap_or_else(|| PathBuf::from(BINANCE_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT));
     let market_dir = output_root.join("market");
     let preview_dir = output_root.join("preview");
     let live_dir = output_root.join("live-dispatch");
@@ -16120,7 +16177,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
     }
     if !blocking_reasons.is_empty() {
-        let report = BasisGuardedLiveAutoOnceReport {
+        let report = BasisGuardedLiveCycleReport {
             symbol: context.symbol.clone(),
             strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
             spot_event_id: Some(context.spot_event_id),
@@ -16155,7 +16212,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
             blocking_reasons,
             output_dir,
         };
-        write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+        write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
         return Ok(report);
     }
 
@@ -16368,7 +16425,7 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         }
     }
 
-    let report = BasisGuardedLiveAutoOnceReport {
+    let report = BasisGuardedLiveCycleReport {
         symbol: context.symbol.clone(),
         strategy_id: BINANCE_BASIS_LIVE_STRATEGY_ID.to_owned(),
         spot_event_id: Some(context.spot_event_id),
@@ -16405,39 +16462,32 @@ fn run_binance_basis_guarded_live_auto_once_from_json(
         blocking_reasons: dispatch_blocking,
         output_dir,
     };
-    write_basis_guarded_live_auto_once_artifacts(
+    write_basis_guarded_live_cycle_artifacts(
         &live_dir,
         &report,
         &receipts,
         &confirmations,
         execution_report.as_ref(),
     )?;
-    write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
     Ok(report)
 }
 
 #[cfg(feature = "live-exec")]
-fn run_bybit_basis_guarded_live_auto_once_from_json(
+fn run_bybit_basis_guarded_live_cycle_from_json(
     symbol: &str,
     raw_spot: &str,
     spot_ref: &str,
     raw_linear: &str,
     linear_ref: &str,
     ingested_at: UtcTimestamp,
-    options: BybitBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceReport> {
+    options: BybitBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BybitBasisGuardedLiveCycleReport> {
     let symbol = normalize_cex_usdt_basis_symbol(symbol, "Bybit")?;
-    if options.execute_live && symbol != BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 Bybit basis 自动下单仍只允许 {BASIS_SYMBOL}；{symbol} 仅支持 dry-run 预下单验证"
-            ),
-        });
-    }
     let output_root = options
         .output_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from(BYBIT_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+        .unwrap_or_else(|| PathBuf::from(BYBIT_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT));
     let market_dir = output_root.join("market");
     let preview_dir = output_root.join("preview");
     let live_dir = output_root.join("live-dispatch");
@@ -16486,7 +16536,7 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
         blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
     }
     if !blocking_reasons.is_empty() {
-        let report = BybitBasisGuardedLiveAutoOnceReport {
+        let report = BybitBasisGuardedLiveCycleReport {
             symbol: context.symbol.clone(),
             strategy_id: BYBIT_BASIS_LIVE_STRATEGY_ID.to_owned(),
             spot_event_id: Some(context.spot_event_id),
@@ -16521,7 +16571,7 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
             blocking_reasons,
             output_dir,
         };
-        write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+        write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
         return Ok(report);
     }
 
@@ -16721,7 +16771,7 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
         }
     }
 
-    let report = BybitBasisGuardedLiveAutoOnceReport {
+    let report = BybitBasisGuardedLiveCycleReport {
         symbol: context.symbol.clone(),
         strategy_id: BYBIT_BASIS_LIVE_STRATEGY_ID.to_owned(),
         spot_event_id: Some(context.spot_event_id),
@@ -16758,27 +16808,27 @@ fn run_bybit_basis_guarded_live_auto_once_from_json(
         blocking_reasons: dispatch_blocking,
         output_dir,
     };
-    write_basis_guarded_live_auto_once_artifacts(
+    write_basis_guarded_live_cycle_artifacts(
         &live_dir,
         &report,
         &receipts,
         &confirmations,
         execution_report.as_ref(),
     )?;
-    write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
     Ok(report)
 }
 
 #[cfg(feature = "live-exec")]
-fn run_okx_basis_guarded_live_auto_once_from_json(
+fn run_okx_basis_guarded_live_cycle_from_json(
     inputs: OkxBasisRawInputs<'_>,
     ingested_at: UtcTimestamp,
-    options: OkxBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceReport> {
+    options: OkxBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<OkxBasisGuardedLiveCycleReport> {
     let output_root = options
         .output_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from(OKX_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+        .unwrap_or_else(|| PathBuf::from(OKX_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT));
     let market_dir = output_root.join("market");
     let preview_dir = output_root.join("preview");
     let live_dir = output_root.join("live-dispatch");
@@ -16789,14 +16839,6 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
         options.min_net_bps,
         &market_dir,
     )?;
-    if options.execute_live && context.symbol != OKX_BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 OKX basis 自动下单仍只允许 {OKX_BASIS_SYMBOL}；{} 仅支持 dry-run 预下单验证",
-                context.symbol
-            ),
-        });
-    }
     let mut blocking_reasons = Vec::new();
     if !context.signal.is_candidate {
         blocking_reasons.push(
@@ -16829,7 +16871,7 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
         blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
     }
     if !blocking_reasons.is_empty() {
-        let report = OkxBasisGuardedLiveAutoOnceReport {
+        let report = OkxBasisGuardedLiveCycleReport {
             symbol: context.symbol.clone(),
             strategy_id: OKX_BASIS_LIVE_STRATEGY_ID.to_owned(),
             spot_event_id: Some(context.spot_event_id),
@@ -16864,7 +16906,7 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
             blocking_reasons,
             output_dir,
         };
-        write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+        write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
         return Ok(report);
     }
 
@@ -17057,7 +17099,7 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
         }
     }
 
-    let report = OkxBasisGuardedLiveAutoOnceReport {
+    let report = OkxBasisGuardedLiveCycleReport {
         symbol: context.symbol.clone(),
         strategy_id: OKX_BASIS_LIVE_STRATEGY_ID.to_owned(),
         spot_event_id: Some(context.spot_event_id),
@@ -17094,27 +17136,27 @@ fn run_okx_basis_guarded_live_auto_once_from_json(
         blocking_reasons: dispatch_blocking,
         output_dir,
     };
-    write_basis_guarded_live_auto_once_artifacts(
+    write_basis_guarded_live_cycle_artifacts(
         &live_dir,
         &report,
         &receipts,
         &confirmations,
         execution_report.as_ref(),
     )?;
-    write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
     Ok(report)
 }
 
 #[cfg(feature = "live-exec")]
-fn run_bitget_basis_guarded_live_auto_once_from_json(
+fn run_bitget_basis_guarded_live_cycle_from_json(
     inputs: BitgetBasisRawInputs<'_>,
     ingested_at: UtcTimestamp,
-    options: BitgetBasisGuardedLiveAutoOnceOptions,
-) -> RuntimeResult<BitgetBasisGuardedLiveAutoOnceReport> {
+    options: BitgetBasisGuardedLiveCycleOptions,
+) -> RuntimeResult<BitgetBasisGuardedLiveCycleReport> {
     let output_root = options
         .output_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from(BITGET_BASIS_GUARDED_LIVE_AUTO_ONCE_DEFAULT_OUT));
+        .unwrap_or_else(|| PathBuf::from(BITGET_BASIS_GUARDED_LIVE_CYCLE_DEFAULT_OUT));
     let market_dir = output_root.join("market");
     let preview_dir = output_root.join("preview");
     let live_dir = output_root.join("live-dispatch");
@@ -17128,7 +17170,7 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
     let context = match context_result {
         Ok(context) => context,
         Err(error) => {
-            let report = BitgetBasisGuardedLiveAutoOnceReport {
+            let report = BitgetBasisGuardedLiveCycleReport {
                 symbol: inputs.symbol.to_owned(),
                 strategy_id: BITGET_BASIS_LIVE_STRATEGY_ID.to_owned(),
                 spot_event_id: None,
@@ -17163,18 +17205,10 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
                 blocking_reasons: vec![format!("input_parse_failed: {error}")],
                 output_dir,
             };
-            write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+            write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
             return Err(error);
         }
     };
-    if options.execute_live && context.symbol != BITGET_BASIS_SYMBOL {
-        return Err(RuntimeError::UnsafeConfig {
-            message: format!(
-                "真实 Bitget basis 自动下单仍只允许 {BITGET_BASIS_SYMBOL}；{} 仅支持 dry-run 预下单验证",
-                context.symbol
-            ),
-        });
-    }
     let mut blocking_reasons = Vec::new();
     if !context.signal.is_candidate {
         blocking_reasons.push(
@@ -17207,7 +17241,7 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
         blocking_reasons.push("live basis execution requires --min-perp-bid".to_owned());
     }
     if !blocking_reasons.is_empty() {
-        let report = BitgetBasisGuardedLiveAutoOnceReport {
+        let report = BitgetBasisGuardedLiveCycleReport {
             symbol: context.symbol.clone(),
             strategy_id: BITGET_BASIS_LIVE_STRATEGY_ID.to_owned(),
             spot_event_id: Some(context.spot_event_id),
@@ -17242,7 +17276,7 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
             blocking_reasons,
             output_dir,
         };
-        write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+        write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
         return Ok(report);
     }
 
@@ -17459,7 +17493,7 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
         }
     }
 
-    let report = BitgetBasisGuardedLiveAutoOnceReport {
+    let report = BitgetBasisGuardedLiveCycleReport {
         symbol: context.symbol.clone(),
         strategy_id: BITGET_BASIS_LIVE_STRATEGY_ID.to_owned(),
         spot_event_id: Some(context.spot_event_id),
@@ -17496,14 +17530,14 @@ fn run_bitget_basis_guarded_live_auto_once_from_json(
         blocking_reasons: dispatch_blocking,
         output_dir,
     };
-    write_basis_guarded_live_auto_once_artifacts(
+    write_basis_guarded_live_cycle_artifacts(
         &live_dir,
         &report,
         &receipts,
         &confirmations,
         execution_report.as_ref(),
     )?;
-    write_basis_guarded_live_auto_once_artifacts(&output_root, &report, &[], &[], None)?;
+    write_basis_guarded_live_cycle_artifacts(&output_root, &report, &[], &[], None)?;
     Ok(report)
 }
 
@@ -21063,7 +21097,7 @@ fn basis_exit_supervisor_state_from_open(
     context: &BinanceBasisGuardedLiveSignalContext,
     strategy_id: &str,
     dispatch_plan: &ExecutionDispatchPlan,
-    options: &BasisGuardedLiveAutoOnceOptions,
+    options: &BasisGuardedLiveCycleOptions,
     opened_at: &UtcTimestamp,
 ) -> RuntimeResult<BasisExitSupervisorPositionState> {
     let (spot, perp) = basis_planned_legs(
@@ -40114,12 +40148,6 @@ fn validate_funding_arb_resident_live_options(
             message: "funding-arb resident live max cycles must be greater than zero".to_owned(),
         });
     }
-    if options.max_live_entries == 0 {
-        return Err(RuntimeError::UnsafeConfig {
-            message: "funding-arb resident live max live entries must be greater than zero"
-                .to_owned(),
-        });
-    }
     if options.execute_live && !options.acknowledge_funding_arb_live_orders {
         return Err(RuntimeError::UnsafeConfig {
             message: "缺少 --i-understand-funding-arb-live-orders，拒绝启动 funding arb 常驻实盘"
@@ -43067,7 +43095,7 @@ fn write_funding_arb_resident_live_config(
     options: &FundingArbResidentLiveOptions,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_live_entries\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
+        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
         options.allow_unknown_recovery,
         json_string(&options.aster_signer_cmd_env),
         optional_json_string(options.aster_user.as_deref()),
@@ -43089,7 +43117,6 @@ fn write_funding_arb_resident_live_config(
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
         options.max_entry_price_divergence_bps,
-        options.max_live_entries,
         options.min_net_funding_bps,
         json_string(&options.notional_usd),
         optional_json_string(options.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
@@ -49037,25 +49064,25 @@ fn response_snippet(body: &str) -> String {
     }
 }
 
-fn write_binance_guarded_live_auto_once_artifacts(
+fn write_binance_guarded_live_cycle_artifacts(
     output_dir: &Path,
-    report: &BinanceGuardedLiveAutoOnceReport,
+    report: &BinanceGuardedLiveCycleReport,
 ) -> RuntimeResult<()> {
     fs::create_dir_all(output_dir).map_err(|error| RuntimeError::Io {
         path: output_dir.to_path_buf(),
         message: error.to_string(),
     })?;
     write_utf8(
-        output_dir.join("auto_once_report.json"),
-        &format!("{}\n", auto_once_report_json(report)),
+        output_dir.join("cycle_report.json"),
+        &format!("{}\n", cycle_report_json(report)),
     )?;
     write_utf8(
-        output_dir.join("auto_once_report.md"),
-        &auto_once_report_markdown(report),
+        output_dir.join("cycle_report.md"),
+        &cycle_report_markdown(report),
     )
 }
 
-fn auto_once_report_json(report: &BinanceGuardedLiveAutoOnceReport) -> String {
+fn cycle_report_json(report: &BinanceGuardedLiveCycleReport) -> String {
     format!(
         "{{\"approval_event_id\":{},\"best_ask\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"max_ask\":{},\"plan_hash\":{},\"private_confirmation_count\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"source_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
         optional_json_string_universal(report.approval_event_id.as_deref()),
@@ -49081,7 +49108,7 @@ fn auto_once_report_json(report: &BinanceGuardedLiveAutoOnceReport) -> String {
     )
 }
 
-fn auto_once_report_markdown(report: &BinanceGuardedLiveAutoOnceReport) -> String {
+fn cycle_report_markdown(report: &BinanceGuardedLiveCycleReport) -> String {
     let reasons = if report.blocking_reasons.is_empty() {
         "- none".to_owned()
     } else {
@@ -49093,7 +49120,7 @@ fn auto_once_report_markdown(report: &BinanceGuardedLiveAutoOnceReport) -> Strin
             .join("\n")
     };
     format!(
-        r#"# Binance BTCUSDT Auto Once
+        r#"# Binance BTCUSDT Cycle
 
 中文说明：本文件记录从最新公开行情到策略信号、审批事实和执行门禁的一次自动链路结果。密钥、签名 query 和原始私有账户响应不会写入本文件。
 
@@ -49342,9 +49369,9 @@ fn funding_arb_guarded_live_canary_report_markdown(
 }
 
 #[cfg(feature = "live-exec")]
-fn write_basis_guarded_live_auto_once_artifacts(
+fn write_basis_guarded_live_cycle_artifacts(
     output_dir: &Path,
-    report: &BasisGuardedLiveAutoOnceReport,
+    report: &BasisGuardedLiveCycleReport,
     receipts: &[MutableActionReceipt],
     confirmations: &[arb_execution::PrivateOrderConfirmation],
     execution_report: Option<&ExecutionReport>,
@@ -49354,12 +49381,12 @@ fn write_basis_guarded_live_auto_once_artifacts(
         message: error.to_string(),
     })?;
     write_utf8(
-        output_dir.join("basis_auto_once_report.json"),
-        &format!("{}\n", basis_auto_once_report_json(report)),
+        output_dir.join("basis_cycle_report.json"),
+        &format!("{}\n", basis_cycle_report_json(report)),
     )?;
     write_utf8(
-        output_dir.join("basis_auto_once_report.md"),
-        &basis_auto_once_report_markdown(report),
+        output_dir.join("basis_cycle_report.md"),
+        &basis_cycle_report_markdown(report),
     )?;
     write_utf8(
         output_dir.join("mutable_receipts.jsonl"),
@@ -49410,7 +49437,7 @@ fn basis_risk_decision_summary_json(
 }
 
 #[cfg(feature = "live-exec")]
-fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> String {
+fn basis_cycle_report_json(report: &BasisGuardedLiveCycleReport) -> String {
     format!(
         "{{\"approval_event_id\":{},\"auto_price_guard_bps\":{},\"blocking_reasons\":[{}],\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_report_status\":{},\"manual_gate_released\":{},\"max_spot_ask\":{},\"min_perp_bid\":{},\"net_bps\":{},\"perp_bid\":{},\"perp_event_id\":{},\"planned_order_count\":{},\"plan_hash\":{},\"premium_event_id\":{},\"preview_manual_gate_count\":{},\"preview_place_order_count\":{},\"preview_plan_leg_count\":{},\"private_confirmation_count\":{},\"protection_actions\":[{}],\"protection_attempted\":{},\"protection_receipt_count\":{},\"residual_risk\":{},\"risk_decision\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"spot_ask\":{},\"spot_event_id\":{},\"strategy_id\":{},\"submitted_receipt_count\":{},\"symbol\":{}}}",
         optional_json_string_universal(report.approval_event_id.as_deref()),
@@ -49465,22 +49492,22 @@ fn basis_auto_once_report_json(report: &BasisGuardedLiveAutoOnceReport) -> Strin
 }
 
 #[cfg(feature = "live-exec")]
-fn basis_auto_once_report_markdown(report: &BasisGuardedLiveAutoOnceReport) -> String {
+fn basis_cycle_report_markdown(report: &BasisGuardedLiveCycleReport) -> String {
     let (title, description) = match report.strategy_id.as_str() {
         BYBIT_BASIS_LIVE_STRATEGY_ID => (
-            "Bybit Basis GuardedLive Auto Once",
+            "Bybit Basis GuardedLive Cycle",
             "本文件记录 Bybit spot-linear basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 linear perp short，两腿下单需要显式实盘确认。",
         ),
         OKX_BASIS_LIVE_STRATEGY_ID => (
-            "OKX Basis GuardedLive Auto Once",
+            "OKX Basis GuardedLive Cycle",
             "本文件记录 OKX spot-swap basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 swap short，两腿下单需要显式实盘确认。",
         ),
         BITGET_BASIS_LIVE_STRATEGY_ID => (
-            "Bitget Basis GuardedLive Auto Once",
+            "Bitget Basis GuardedLive Cycle",
             "本文件记录 Bitget spot-USDT futures basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 USDT-FUTURES short，两腿下单需要显式实盘确认。",
         ),
         _ => (
-            "Binance Basis GuardedLive Auto Once",
+            "Binance Basis GuardedLive Cycle",
             "本文件记录 Binance spot-perp basis 双腿自动链路结果。套利候选必须同时包含 spot buy 和 USD-M perp short，两腿下单需要显式实盘确认。",
         ),
     };
@@ -52153,7 +52180,7 @@ fn funding_arb_no_dispatch_reasons_from_report(
     if reasons.is_empty() {
         push_unique_reason(
             &mut reasons,
-            "未看到 dispatch_attempted=true；请检查 resident/auto-once runner 是否已运行到该候选",
+            "未看到 dispatch_attempted=true；请检查 resident runner 是否已运行到该候选",
         );
     }
     reasons
@@ -54560,61 +54587,6 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
-    if args[0] == "binance-guarded-live-auto-once" {
-        let options = parse_binance_guarded_live_auto_once_args(&args[1..])?;
-        let report = run_binance_guarded_live_auto_once(options)?;
-        let output_note = report
-            .output_dir
-            .as_ref()
-            .map(|path| format!("; wrote artifacts to {}", path.display()))
-            .unwrap_or_else(|| {
-                "; no artifacts written, pass --out <dir> to persist them".to_owned()
-            });
-        return Ok(format!(
-            "ok: Binance BTCUSDT auto-once completed; signal_allowed={}; plan_hash={}; manual_gate_released={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; blocking_reasons={}{}",
-            report.signal_allowed,
-            report.plan_hash.as_deref().unwrap_or("none"),
-            report.manual_gate_released,
-            report.dispatch_attempted,
-            report.dispatch_allowed,
-            report.submitted_receipt_count,
-            report.private_confirmation_count,
-            report.blocking_reasons.len(),
-            output_note
-        ));
-    }
-    if args[0] == "binance-basis-guarded-live-auto-once" {
-        let options = parse_binance_basis_guarded_live_auto_once_args(&args[1..])?;
-        let report = run_binance_basis_guarded_live_auto_once(options)?;
-        let output_note = report
-            .output_dir
-            .as_ref()
-            .map(|path| format!("; wrote artifacts to {}", path.display()))
-            .unwrap_or_else(|| {
-                "; no artifacts written, pass --out <dir> to persist them".to_owned()
-            });
-        return Ok(format!(
-            "ok: Binance basis auto-once completed; signal_allowed={}; net_bps={}; preview_place_orders={}; dispatch_plan_built={}; dispatch_requests={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
-            report.signal_allowed,
-            report
-                .net_bps
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_owned()),
-            report.preview_place_order_count,
-            report.dispatch_plan_built,
-            report.dispatch_request_count,
-            report.planned_order_count,
-            report.dispatch_attempted,
-            report.dispatch_allowed,
-            report.submitted_receipt_count,
-            report.private_confirmation_count,
-            report.protection_attempted,
-            report.protection_receipt_count,
-            report.residual_risk.as_deref().unwrap_or("none"),
-            report.blocking_reasons.len(),
-            output_note
-        ));
-    }
     if args[0] == "binance-basis-live-stack" {
         let options = parse_binance_basis_live_stack_args(&args[1..])?;
         let report = run_binance_basis_live_stack(options)?;
@@ -54692,102 +54664,6 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             report.monitor_exit_statuses.len(),
             report.halt_reason.as_deref().unwrap_or("none"),
             report.output_dir.display()
-        ));
-    }
-    if args[0] == "bybit-basis-guarded-live-auto-once" {
-        let options = parse_bybit_basis_guarded_live_auto_once_args(&args[1..])?;
-        let report = run_bybit_basis_guarded_live_auto_once(options)?;
-        let output_note = report
-            .output_dir
-            .as_ref()
-            .map(|path| format!("; wrote artifacts to {}", path.display()))
-            .unwrap_or_else(|| {
-                "; no artifacts written, pass --out <dir> to persist them".to_owned()
-            });
-        return Ok(format!(
-            "ok: Bybit basis auto-once completed; signal_allowed={}; net_bps={}; preview_place_orders={}; dispatch_plan_built={}; dispatch_requests={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
-            report.signal_allowed,
-            report
-                .net_bps
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_owned()),
-            report.preview_place_order_count,
-            report.dispatch_plan_built,
-            report.dispatch_request_count,
-            report.planned_order_count,
-            report.dispatch_attempted,
-            report.dispatch_allowed,
-            report.submitted_receipt_count,
-            report.private_confirmation_count,
-            report.protection_attempted,
-            report.protection_receipt_count,
-            report.residual_risk.as_deref().unwrap_or("none"),
-            report.blocking_reasons.len(),
-            output_note
-        ));
-    }
-    if args[0] == "okx-basis-guarded-live-auto-once" {
-        let options = parse_okx_basis_guarded_live_auto_once_args(&args[1..])?;
-        let report = run_okx_basis_guarded_live_auto_once(options)?;
-        let output_note = report
-            .output_dir
-            .as_ref()
-            .map(|path| format!("; wrote artifacts to {}", path.display()))
-            .unwrap_or_else(|| {
-                "; no artifacts written, pass --out <dir> to persist them".to_owned()
-            });
-        return Ok(format!(
-            "ok: OKX basis auto-once completed; signal_allowed={}; net_bps={}; preview_place_orders={}; dispatch_plan_built={}; dispatch_requests={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
-            report.signal_allowed,
-            report
-                .net_bps
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_owned()),
-            report.preview_place_order_count,
-            report.dispatch_plan_built,
-            report.dispatch_request_count,
-            report.planned_order_count,
-            report.dispatch_attempted,
-            report.dispatch_allowed,
-            report.submitted_receipt_count,
-            report.private_confirmation_count,
-            report.protection_attempted,
-            report.protection_receipt_count,
-            report.residual_risk.as_deref().unwrap_or("none"),
-            report.blocking_reasons.len(),
-            output_note
-        ));
-    }
-    if args[0] == "bitget-basis-guarded-live-auto-once" {
-        let options = parse_bitget_basis_guarded_live_auto_once_args(&args[1..])?;
-        let report = run_bitget_basis_guarded_live_auto_once(options)?;
-        let output_note = report
-            .output_dir
-            .as_ref()
-            .map(|path| format!("; wrote artifacts to {}", path.display()))
-            .unwrap_or_else(|| {
-                "; no artifacts written, pass --out <dir> to persist them".to_owned()
-            });
-        return Ok(format!(
-            "ok: Bitget basis auto-once completed; signal_allowed={}; net_bps={}; preview_place_orders={}; dispatch_plan_built={}; dispatch_requests={}; planned_orders={}; dispatch_attempted={}; dispatch_allowed={}; submitted_receipts={}; private_confirmations={}; protection_attempted={}; protection_receipts={}; residual_risk={}; blocking_reasons={}{}",
-            report.signal_allowed,
-            report
-                .net_bps
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_owned()),
-            report.preview_place_order_count,
-            report.dispatch_plan_built,
-            report.dispatch_request_count,
-            report.planned_order_count,
-            report.dispatch_attempted,
-            report.dispatch_allowed,
-            report.submitted_receipt_count,
-            report.private_confirmation_count,
-            report.protection_attempted,
-            report.protection_receipt_count,
-            report.residual_risk.as_deref().unwrap_or("none"),
-            report.blocking_reasons.len(),
-            output_note
         ));
     }
     if args[0] == "basis-exit-supervisor" {
@@ -55274,7 +55150,7 @@ fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-guarded-live-auto-once, binance-basis-guarded-live-auto-once, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, bybit-basis-guarded-live-auto-once, okx-basis-guarded-live-auto-once, bitget-basis-guarded-live-auto-once, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live, opportunity-recorder",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live, opportunity-recorder",
                 args[0]
             ),
         });
@@ -55341,9 +55217,6 @@ fn public_help_text() -> String {
         "  --out dir                     输出目录；live 默认 target/arb-runtime/live，paper 默认 target/arb-runtime/paper",
         "  --interval-secs n             监控轮询间隔，默认 5",
         "  --min-net-bps n               最小净收益门槛，默认 5",
-        "  --auto-once-cooldown-secs n   同一机会触发下单检查的冷却秒数，默认 60",
-        "  --no-auto-validate            只监控和记录机会，不触发下单前检查",
-        "",
         "Live-only option:",
         "  --i-understand-live-orders    正式实盘必须显式提供；表示接受真实下单风险",
         "",
@@ -55385,24 +55258,14 @@ fn legacy_help_text() -> String {
         "                                    Run fail-closed pre-dispatch dry run after manual gate release preview",
         "  binance-guarded-live-dispatch [--preview-dir dir] [--config path] [--out dir] --i-understand-live-orders",
         "                                    live-exec only: submit the approved GuardedLive BTCUSDT order and query private confirmation",
-        "  binance-guarded-live-auto-once [--config path] [--out dir] [--max-ask price] [--execute-live --i-understand-auto-live-orders]",
-        "                                    Single-leg smoke path: fetch fresh Binance BTCUSDT spot quote, then dry-run or explicitly submit live",
-        "  binance-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
-        "                                    Two-leg basis path: buy Binance Spot and short Binance USD-M perp after guarded live gates; live mode requires WSS monitor quotes",
-        "  binance-basis-live-stack [--symbol BTCUSDT] [--config path] [--out dir] [--spot-wss-bind 127.0.0.1:8801 --perp-wss-bind 127.0.0.1:8802] [--monitor-symbol ALL_USDT|BTCUSDT] [--readiness-timeout-secs 60] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
+        "  binance-basis-live-stack [--symbol BTCUSDT] [--config path] [--out dir] [--spot-wss-bind 127.0.0.1:8801 --perp-wss-bind 127.0.0.1:8802] [--monitor-symbol ALL_USDT|BTCUSDT] [--readiness-timeout-secs 60] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
         "                                    Supervisor: launch Binance spot/perp WSS monitors with ALL_USDT default scope, verify readiness, run resident live runner, and record stack logs/events/summary under one RUN_ROOT",
-        "  binance-basis-resident-live [--symbol BTCUSDT] [--config path] [--out dir] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--adl-events-dir dir] [--position-state file] [--max-cycles n] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--execute-live --i-understand-basis-live-orders]",
-        "                                    Binance basis resident runner: supervise open positions, keep opening new entries when capacity allows, and stop on lock, STOP file, unknown state, or hard caps",
-        "  multi-venue-basis-resident-live [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--<venue>-spot-wss-monitor-url url --<venue>-perp-wss-monitor-url url] [--execute-live --i-understand-basis-live-orders]",
-        "                                    Multi-venue resident runner: reuse guarded auto-once per venue, enforce global hard caps, and halt fail-closed on unknown live state",
-        "  multi-venue-basis-live-stack [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--monitor-symbol ALL_USDT] [--readiness-timeout-secs 60] [--interval-secs 60] [--max-live-entries n --max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
+        "  binance-basis-resident-live [--symbol BTCUSDT] [--config path] [--out dir] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--adl-events-dir dir] [--position-state file] [--max-cycles n] [--max-concurrent-positions n --max-total-notional-usdt amount] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Binance basis resident runner: supervise open positions, keep opening new entries when capacity allows, and stop on lock, STOP file, unknown state, or risk caps",
+        "  multi-venue-basis-resident-live [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--interval-secs 60] [--min-net-bps 5] [--auto-price-guard-bps 2] [--max-concurrent-positions n --max-total-notional-usdt amount] [--<venue>-opportunities-url url] [--<venue>-spot-wss-monitor-url url --<venue>-perp-wss-monitor-url url] [--execute-live --i-understand-basis-live-orders]",
+        "                                    Multi-venue resident runner: use guarded entry per venue, enforce risk caps, and halt fail-closed on unknown live state",
+        "  multi-venue-basis-live-stack [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--monitor-symbol ALL_USDT] [--readiness-timeout-secs 60] [--interval-secs 60] [--max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
         "                                    Supervisor: launch managed Binance/Bybit/OKX/Bitget WSS monitors, run multi-venue resident, and record stack artifacts",
-        "  bybit-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
-        "                                    Two-leg basis path: buy Bybit Spot and short Bybit Linear perp after guarded live gates; live mode requires WSS monitor quotes",
-        "  okx-basis-guarded-live-auto-once [--symbol BTC-USDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
-        "                                    Two-leg basis path: buy OKX Spot and short OKX Swap after guarded live gates; live mode requires WSS monitor quotes",
-        "  bitget-basis-guarded-live-auto-once [--symbol BTCUSDT] [--config path] [--out dir] [--min-net-bps 5] [--max-spot-ask price --min-perp-bid price | --auto-price-guard-bps 2] [--spot-wss-monitor-url url --perp-wss-monitor-url url] [--private-order-events-dir dir] [--execute-live --i-understand-basis-live-orders]",
-        "                                    Two-leg basis path: buy Bitget Spot and short Bitget USDT-FUTURES after guarded live gates; live mode requires WSS monitor quotes",
         "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Binance public WSS bookTicker all-market monitor and serve /dashboard",
         "  bybit-wss-book-ticker [--bind 127.0.0.1:8802] [--symbol ALL_USDT|BTCUSDT] [--market spot|linear-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
@@ -55480,15 +55343,10 @@ struct BinancePreDispatchDryRunCliOptions {
     output_dir: Option<PathBuf>,
 }
 type BinanceGuardedLiveDispatchCliOptions = BinanceGuardedLiveDispatchOptions;
-type BinanceGuardedLiveAutoOnceCliOptions = BinanceGuardedLiveAutoOnceOptions;
-type BinanceBasisGuardedLiveAutoOnceCliOptions = BasisGuardedLiveAutoOnceOptions;
 type BinanceBasisLiveStackCliOptions = BinanceBasisLiveStackOptions;
 type BinanceBasisResidentLiveCliOptions = BinanceBasisResidentLiveOptions;
 type MultiVenueBasisResidentLiveCliOptions = MultiVenueBasisResidentLiveOptions;
 type MultiVenueBasisLiveStackCliOptions = MultiVenueBasisLiveStackOptions;
-type BybitBasisGuardedLiveAutoOnceCliOptions = BybitBasisGuardedLiveAutoOnceOptions;
-type OkxBasisGuardedLiveAutoOnceCliOptions = OkxBasisGuardedLiveAutoOnceOptions;
-type BitgetBasisGuardedLiveAutoOnceCliOptions = BitgetBasisGuardedLiveAutoOnceOptions;
 type BasisExitSupervisorCliOptions = BasisExitSupervisorOptions;
 type BinanceBasisMonitorCliOptions = BinanceBasisMonitorOptions;
 type BinanceWssBookTickerCliOptions = BinanceWssBookTickerMonitorOptions;
@@ -55557,8 +55415,6 @@ struct UnifiedRuntimeCliOptions {
     output_dir: PathBuf,
     interval_secs: u64,
     min_net_bps: i128,
-    auto_once_cooldown_secs: u64,
-    validate_auto_once: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -55576,8 +55432,6 @@ fn parse_unified_runtime_args(
     let mut output_dir = mode.default_output_dir();
     let mut interval_secs = UNIFIED_RUNTIME_DEFAULT_INTERVAL_SECS;
     let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
-    let mut auto_once_cooldown_secs = UNIFIED_RUNTIME_DEFAULT_AUTO_ONCE_COOLDOWN_SECS;
-    let mut validate_auto_once = true;
     let mut acknowledged_live_orders = false;
     let mut index = 0;
 
@@ -55621,18 +55475,6 @@ fn parse_unified_runtime_args(
                     return Err(cli_arg_error("--min-net-bps must be non-negative"));
                 }
             }
-            "--auto-once-cooldown-secs" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--auto-once-cooldown-secs requires a value"));
-                };
-                auto_once_cooldown_secs = value.parse::<u64>().map_err(|_| {
-                    cli_arg_error("--auto-once-cooldown-secs must be a non-negative integer")
-                })?;
-            }
-            "--no-auto-validate" => {
-                validate_auto_once = false;
-            }
             "--i-understand-live-orders" | "--i-understand-real-orders" => {
                 acknowledged_live_orders = true;
             }
@@ -55664,8 +55506,6 @@ fn parse_unified_runtime_args(
         output_dir,
         interval_secs,
         min_net_bps,
-        auto_once_cooldown_secs,
-        validate_auto_once,
     })
 }
 
@@ -55686,14 +55526,6 @@ fn run_unified_runtime(options: UnifiedRuntimeCliOptions) -> RuntimeResult<Unifi
         .env(
             "BASIS_OBSERVER_MIN_NET_BPS",
             options.min_net_bps.to_string(),
-        )
-        .env(
-            "BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS",
-            options.auto_once_cooldown_secs.to_string(),
-        )
-        .env(
-            "BASIS_OBSERVER_VALIDATE_AUTO_ONCE",
-            if options.validate_auto_once { "1" } else { "0" },
         )
         .env(
             "BASIS_OBSERVER_STRATEGIES",
@@ -56269,77 +56101,12 @@ fn parse_binance_guarded_live_dispatch_args(
     })
 }
 
-fn parse_binance_guarded_live_auto_once_args(
-    args: &[String],
-) -> RuntimeResult<BinanceGuardedLiveAutoOnceCliOptions> {
-    let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
-    let mut output_dir = None;
-    let mut max_ask = None;
-    let mut execute_live = false;
-    let mut acknowledge_auto_live_orders = false;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--config" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--config requires a config path"));
-                };
-                config_path = PathBuf::from(value);
-            }
-            "--out" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--out requires a directory"));
-                };
-                output_dir = Some(PathBuf::from(value));
-            }
-            "--max-ask" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--max-ask requires a price"));
-                };
-                Decimal::from_str(value)?;
-                max_ask = Some(value.clone());
-            }
-            "--execute-live" => {
-                execute_live = true;
-            }
-            "--dry-run" => {
-                execute_live = false;
-            }
-            "--i-understand-auto-live-orders" => {
-                acknowledge_auto_live_orders = true;
-            }
-            value if value.starts_with('-') => {
-                return Err(cli_arg_error(format!(
-                    "unknown binance-guarded-live-auto-once option `{value}`"
-                )));
-            }
-            value => {
-                return Err(cli_arg_error(format!(
-                    "unexpected binance-guarded-live-auto-once positional argument `{value}`"
-                )));
-            }
-        }
-        index += 1;
-    }
-
-    Ok(BinanceGuardedLiveAutoOnceOptions {
-        config_path,
-        output_dir,
-        max_ask,
-        execute_live,
-        acknowledge_auto_live_orders,
-    })
-}
-
-fn parse_basis_guarded_live_auto_once_args(
+#[cfg(test)]
+fn parse_basis_guarded_live_cycle_args(
     args: &[String],
     command_name: &'static str,
     default_symbol: &'static str,
-) -> RuntimeResult<BasisGuardedLiveAutoOnceOptions> {
+) -> RuntimeResult<BasisGuardedLiveCycleOptions> {
     let mut symbol = default_symbol.to_owned();
     let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
     let mut output_dir = None;
@@ -56470,7 +56237,7 @@ fn parse_basis_guarded_live_auto_once_args(
         ));
     }
 
-    Ok(BasisGuardedLiveAutoOnceOptions {
+    Ok(BasisGuardedLiveCycleOptions {
         symbol,
         config_path,
         output_dir,
@@ -56486,14 +56253,11 @@ fn parse_basis_guarded_live_auto_once_args(
     })
 }
 
-fn parse_binance_basis_guarded_live_auto_once_args(
+#[cfg(test)]
+fn parse_binance_basis_guarded_live_cycle_args(
     args: &[String],
-) -> RuntimeResult<BinanceBasisGuardedLiveAutoOnceCliOptions> {
-    parse_basis_guarded_live_auto_once_args(
-        args,
-        "binance-basis-guarded-live-auto-once",
-        BASIS_SYMBOL,
-    )
+) -> RuntimeResult<BasisGuardedLiveCycleOptions> {
+    parse_basis_guarded_live_cycle_args(args, "binance-basis-guarded-live-cycle", BASIS_SYMBOL)
 }
 
 fn parse_binance_basis_live_stack_args(
@@ -56515,7 +56279,6 @@ fn parse_binance_basis_live_stack_args(
     let mut position_state_path = None;
     let mut poll_interval_secs = 60_u64;
     let mut max_cycles = None;
-    let mut max_live_entries = 1_u64;
     let mut max_concurrent_positions = 1_usize;
     let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
     let mut use_existing_monitors = false;
@@ -56673,15 +56436,6 @@ fn parse_binance_basis_live_stack_args(
                 }
                 max_cycles = Some(parsed);
             }
-            "--max-live-entries" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--max-live-entries requires an integer"));
-                };
-                max_live_entries = value.parse::<u64>().map_err(|error| {
-                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
-                })?;
-            }
             "--max-concurrent-positions" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -56749,11 +56503,6 @@ fn parse_binance_basis_live_stack_args(
             "--monitor-reconnect-delay-secs must be greater than zero",
         ));
     }
-    if max_live_entries == 0 {
-        return Err(cli_arg_error(
-            "--max-live-entries must be greater than zero",
-        ));
-    }
     if max_concurrent_positions == 0 {
         return Err(cli_arg_error(
             "--max-concurrent-positions must be greater than zero",
@@ -56783,7 +56532,6 @@ fn parse_binance_basis_live_stack_args(
         position_state_path,
         poll_interval_secs,
         max_cycles,
-        max_live_entries,
         max_concurrent_positions,
         max_total_notional_usdt,
         use_existing_monitors,
@@ -56807,7 +56555,6 @@ fn parse_binance_basis_resident_live_args(
     let mut position_state_path = None;
     let mut poll_interval_secs = 60_u64;
     let mut max_cycles = None;
-    let mut max_live_entries = 1_u64;
     let mut max_concurrent_positions = 1_usize;
     let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
     let mut execute_live = false;
@@ -56922,15 +56669,6 @@ fn parse_binance_basis_resident_live_args(
                 }
                 max_cycles = Some(parsed);
             }
-            "--max-live-entries" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--max-live-entries requires an integer"));
-                };
-                max_live_entries = value.parse::<u64>().map_err(|error| {
-                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
-                })?;
-            }
             "--max-concurrent-positions" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -56980,11 +56718,6 @@ fn parse_binance_basis_resident_live_args(
     if poll_interval_secs == 0 {
         return Err(cli_arg_error("--interval-secs must be greater than zero"));
     }
-    if max_live_entries == 0 {
-        return Err(cli_arg_error(
-            "--max-live-entries must be greater than zero",
-        ));
-    }
     if max_concurrent_positions == 0 {
         return Err(cli_arg_error(
             "--max-concurrent-positions must be greater than zero",
@@ -57010,7 +56743,6 @@ fn parse_binance_basis_resident_live_args(
         position_state_path,
         poll_interval_secs,
         max_cycles,
-        max_live_entries,
         max_concurrent_positions,
         max_total_notional_usdt,
         execute_live,
@@ -57061,6 +56793,7 @@ fn parse_multi_venue_basis_resident_live_args(
 ) -> RuntimeResult<MultiVenueBasisResidentLiveCliOptions> {
     let mut venues = default_multi_venue_basis_live_venues();
     let mut symbols = BTreeMap::new();
+    let mut opportunity_urls = BTreeMap::new();
     let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
     let mut output_dir = None;
     let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
@@ -57071,7 +56804,6 @@ fn parse_multi_venue_basis_resident_live_args(
     let mut adl_events_dir = None;
     let mut poll_interval_secs = 60_u64;
     let mut max_cycles = None;
-    let mut max_live_entries = 1_u64;
     let mut max_concurrent_positions = 1_usize;
     let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
     let mut execute_live = false;
@@ -57116,6 +56848,34 @@ fn parse_multi_venue_basis_resident_live_args(
                     return Err(cli_arg_error("--bitget-symbol requires a value"));
                 };
                 symbols.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--binance-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--binance-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--bybit-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--okx-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--bitget-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bitget-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Bitget, value.clone());
             }
             "--config" => {
                 index += 1;
@@ -57259,15 +57019,6 @@ fn parse_multi_venue_basis_resident_live_args(
                 }
                 max_cycles = Some(parsed);
             }
-            "--max-live-entries" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--max-live-entries requires an integer"));
-                };
-                max_live_entries = value.parse::<u64>().map_err(|error| {
-                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
-                })?;
-            }
             "--max-concurrent-positions" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -57317,11 +57068,6 @@ fn parse_multi_venue_basis_resident_live_args(
     if poll_interval_secs == 0 {
         return Err(cli_arg_error("--interval-secs must be greater than zero"));
     }
-    if max_live_entries == 0 {
-        return Err(cli_arg_error(
-            "--max-live-entries must be greater than zero",
-        ));
-    }
     if max_concurrent_positions == 0 {
         return Err(cli_arg_error(
             "--max-concurrent-positions must be greater than zero",
@@ -57337,6 +57083,7 @@ fn parse_multi_venue_basis_resident_live_args(
     Ok(MultiVenueBasisResidentLiveOptions {
         venues,
         symbols,
+        opportunity_urls,
         config_path,
         output_dir,
         min_net_bps,
@@ -57347,7 +57094,6 @@ fn parse_multi_venue_basis_resident_live_args(
         adl_events_dir,
         poll_interval_secs,
         max_cycles,
-        max_live_entries,
         max_concurrent_positions,
         max_total_notional_usdt,
         execute_live,
@@ -57360,6 +57106,7 @@ fn parse_multi_venue_basis_live_stack_args(
 ) -> RuntimeResult<MultiVenueBasisLiveStackCliOptions> {
     let mut venues = default_multi_venue_basis_live_venues();
     let mut symbols = BTreeMap::new();
+    let mut opportunity_urls = BTreeMap::new();
     let mut config_path = PathBuf::from("templates/personal_guarded_live.preflight.yaml");
     let mut output_dir = None;
     let mut min_net_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
@@ -57374,7 +57121,6 @@ fn parse_multi_venue_basis_live_stack_args(
     let mut adl_events_dir = None;
     let mut poll_interval_secs = 60_u64;
     let mut max_cycles = None;
-    let mut max_live_entries = 1_u64;
     let mut max_concurrent_positions = 1_usize;
     let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned();
     let mut use_existing_monitors = false;
@@ -57420,6 +57166,34 @@ fn parse_multi_venue_basis_live_stack_args(
                     return Err(cli_arg_error("--bitget-symbol requires a value"));
                 };
                 symbols.insert(BasisLiveVenue::Bitget, value.clone());
+            }
+            "--binance-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--binance-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Binance, value.clone());
+            }
+            "--bybit-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bybit-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Bybit, value.clone());
+            }
+            "--okx-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--okx-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Okx, value.clone());
+            }
+            "--bitget-opportunities-url" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bitget-opportunities-url requires a URL"));
+                };
+                opportunity_urls.insert(BasisLiveVenue::Bitget, value.clone());
             }
             "--config" => {
                 index += 1;
@@ -57613,15 +57387,6 @@ fn parse_multi_venue_basis_live_stack_args(
                 }
                 max_cycles = Some(parsed);
             }
-            "--max-live-entries" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--max-live-entries requires an integer"));
-                };
-                max_live_entries = value.parse::<u64>().map_err(|error| {
-                    cli_arg_error(format!("--max-live-entries must be an integer: {error}"))
-                })?;
-            }
             "--max-concurrent-positions" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -57689,11 +57454,6 @@ fn parse_multi_venue_basis_live_stack_args(
             "--monitor-reconnect-delay-secs must be greater than zero",
         ));
     }
-    if max_live_entries == 0 {
-        return Err(cli_arg_error(
-            "--max-live-entries must be greater than zero",
-        ));
-    }
     if max_concurrent_positions == 0 {
         return Err(cli_arg_error(
             "--max-concurrent-positions must be greater than zero",
@@ -57709,6 +57469,7 @@ fn parse_multi_venue_basis_live_stack_args(
     Ok(MultiVenueBasisLiveStackOptions {
         venues,
         symbols,
+        opportunity_urls,
         config_path,
         output_dir,
         min_net_bps,
@@ -57723,43 +57484,12 @@ fn parse_multi_venue_basis_live_stack_args(
         adl_events_dir,
         poll_interval_secs,
         max_cycles,
-        max_live_entries,
         max_concurrent_positions,
         max_total_notional_usdt,
         use_existing_monitors,
         execute_live,
         acknowledge_basis_live_orders,
     })
-}
-
-fn parse_bybit_basis_guarded_live_auto_once_args(
-    args: &[String],
-) -> RuntimeResult<BybitBasisGuardedLiveAutoOnceCliOptions> {
-    parse_basis_guarded_live_auto_once_args(
-        args,
-        "bybit-basis-guarded-live-auto-once",
-        BASIS_SYMBOL,
-    )
-}
-
-fn parse_okx_basis_guarded_live_auto_once_args(
-    args: &[String],
-) -> RuntimeResult<OkxBasisGuardedLiveAutoOnceCliOptions> {
-    parse_basis_guarded_live_auto_once_args(
-        args,
-        "okx-basis-guarded-live-auto-once",
-        OKX_BASIS_SYMBOL,
-    )
-}
-
-fn parse_bitget_basis_guarded_live_auto_once_args(
-    args: &[String],
-) -> RuntimeResult<BitgetBasisGuardedLiveAutoOnceCliOptions> {
-    parse_basis_guarded_live_auto_once_args(
-        args,
-        "bitget-basis-guarded-live-auto-once",
-        BITGET_BASIS_SYMBOL,
-    )
 }
 
 fn parse_basis_exit_supervisor_args(
@@ -59788,7 +59518,6 @@ fn parse_funding_arb_resident_live_args(
     let mut private_order_events_dir = None;
     let mut poll_interval_secs = 60_u64;
     let mut max_cycles = None;
-    let mut max_live_entries = 1_u64;
     let mut notional_usd = BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned();
     let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS;
     let mut slippage_buffer_bps = BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS;
@@ -59948,15 +59677,6 @@ fn parse_funding_arb_resident_live_args(
                 }
                 max_cycles = Some(parsed);
             }
-            "--max-live-entries" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(cli_arg_error("--max-live-entries requires an integer"));
-                };
-                max_live_entries = value
-                    .parse::<u64>()
-                    .map_err(|_| cli_arg_error("--max-live-entries must be an integer"))?;
-            }
             "--notional-usd" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -60099,7 +59819,6 @@ fn parse_funding_arb_resident_live_args(
         private_order_events_dir,
         poll_interval_secs,
         max_cycles,
-        max_live_entries,
         notional_usd,
         taker_fee_bps,
         slippage_buffer_bps,
@@ -61292,7 +61011,6 @@ mod tests {
         );
         assert_eq!(options.interval_secs, UNIFIED_RUNTIME_DEFAULT_INTERVAL_SECS);
         assert_eq!(options.min_net_bps, BASIS_MONITOR_DEFAULT_MIN_NET_BPS);
-        assert!(options.validate_auto_once);
     }
 
     #[test]
@@ -63342,7 +63060,7 @@ mod tests {
         fs::create_dir_all(&funding_dir).expect("funding dir");
         write_utf8(
             resident_dir.join("funding_arb_resident_live_config.json"),
-            r#"{"max_live_entries":100,"notional_usd":"90.00","taker_fee_bps":5}"#,
+            r#"{"notional_usd":"90.00","taker_fee_bps":5}"#,
         )
         .expect("resident config");
         write_utf8(
@@ -63431,7 +63149,7 @@ mod tests {
         assert!(bitget
             .position_limit
             .as_deref()
-            .is_some_and(|value| value.contains("实盘入场次数上限 100")));
+            .is_some_and(|value| value.contains("单仓名义 90.00 USDT")));
     }
 
     #[test]
@@ -63446,7 +63164,7 @@ mod tests {
         fs::create_dir_all(&private_dir).expect("private dir");
         write_utf8(
             resident_dir.join("funding_arb_resident_live_config.json"),
-            r#"{"max_live_entries":100,"notional_usd":"90.00","taker_fee_bps":5}"#,
+            r#"{"notional_usd":"90.00","taker_fee_bps":5}"#,
         )
         .expect("resident config");
         write_utf8(
@@ -66193,8 +65911,6 @@ mod tests {
             "30".to_owned(),
             "--max-cycles".to_owned(),
             "2".to_owned(),
-            "--max-live-entries".to_owned(),
-            "1".to_owned(),
             "--notional-usd".to_owned(),
             "11.25".to_owned(),
             "--min-net-funding-bps".to_owned(),
@@ -66237,7 +65953,6 @@ mod tests {
         );
         assert_eq!(options.poll_interval_secs, 30);
         assert_eq!(options.max_cycles, Some(2));
-        assert_eq!(options.max_live_entries, 1);
         assert_eq!(options.notional_usd, "11.25");
         assert_eq!(options.min_net_funding_bps, 8);
         assert!(options.execute_live);
@@ -66311,7 +66026,6 @@ mod tests {
             private_order_events_dir: None,
             poll_interval_secs: 60,
             max_cycles: None,
-            max_live_entries: 2,
             notional_usd: "10.00".to_owned(),
             taker_fee_bps: 5,
             slippage_buffer_bps: 5,
@@ -66388,11 +66102,8 @@ mod tests {
             "{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:closed-history\",\"position_state_path\":\"target/position.json\",\"status\":\"open\",\"symbol\":\"BTCUSDT\"}\n{\"event_type\":\"position_closed\",\"position_id\":\"pos:closed-history\",\"status\":\"closed\"}\n",
         )
         .expect("write closed history registry");
-        let mut one_entry_options = options.clone();
-        one_entry_options.max_live_entries = 1;
-        let closed_history_capacity =
-            funding_arb_resident_entry_capacity(&one_entry_options, root.path())
-                .expect("closed history capacity");
+        let closed_history_capacity = funding_arb_resident_entry_capacity(&options, root.path())
+            .expect("closed history capacity");
         assert!(matches!(
             closed_history_capacity,
             ResidentEntryCapacity::Allowed
@@ -66428,7 +66139,6 @@ mod tests {
             private_order_events_dir: Some(root.path().join("private-order-events")),
             poll_interval_secs: 60,
             max_cycles: Some(1),
-            max_live_entries: 1,
             notional_usd: "10.00".to_owned(),
             taker_fee_bps: 5,
             slippage_buffer_bps: 5,
@@ -66503,7 +66213,6 @@ mod tests {
             private_order_events_dir: Some(root.path().join("private-order-events")),
             poll_interval_secs: 60,
             max_cycles: None,
-            max_live_entries: 1,
             notional_usd: "10.00".to_owned(),
             taker_fee_bps: 5,
             slippage_buffer_bps: 5,
@@ -68733,7 +68442,7 @@ mod tests {
     }
 
     #[test]
-    fn basis_guarded_live_auto_once_args_parse_auto_price_guard() {
+    fn basis_guarded_live_cycle_args_parse_auto_price_guard() {
         let args = vec![
             "--symbol".to_owned(),
             BASIS_SYMBOL.to_owned(),
@@ -68753,7 +68462,7 @@ mod tests {
             "--i-understand-basis-live-orders".to_owned(),
         ];
 
-        let options = parse_binance_basis_guarded_live_auto_once_args(&args).expect("options");
+        let options = parse_binance_basis_guarded_live_cycle_args(&args).expect("options");
 
         assert_eq!(options.auto_price_guard_bps, Some(2));
         assert_eq!(options.max_spot_ask, None);
@@ -68789,8 +68498,6 @@ mod tests {
             "target/live-dispatch/basis_exit_supervisor_state.json".to_owned(),
             "--max-cycles".to_owned(),
             "11".to_owned(),
-            "--max-live-entries".to_owned(),
-            "4".to_owned(),
             "--max-concurrent-positions".to_owned(),
             "2".to_owned(),
             "--max-total-notional-usdt".to_owned(),
@@ -68806,7 +68513,6 @@ mod tests {
         assert_eq!(options.auto_price_guard_bps, Some(3));
         assert_eq!(options.poll_interval_secs, 30);
         assert_eq!(options.max_cycles, Some(11));
-        assert_eq!(options.max_live_entries, 4);
         assert_eq!(options.max_concurrent_positions, 2);
         assert_eq!(options.max_total_notional_usdt, "40.00");
         assert_eq!(
@@ -68846,8 +68552,6 @@ mod tests {
             "7".to_owned(),
             "--auto-price-guard-bps".to_owned(),
             "3".to_owned(),
-            "--max-live-entries".to_owned(),
-            "4".to_owned(),
             "--max-concurrent-positions".to_owned(),
             "2".to_owned(),
             "--max-total-notional-usdt".to_owned(),
@@ -68873,7 +68577,6 @@ mod tests {
         assert_eq!(options.poll_interval_secs, 30);
         assert_eq!(options.min_net_bps, 7);
         assert_eq!(options.auto_price_guard_bps, Some(3));
-        assert_eq!(options.max_live_entries, 4);
         assert_eq!(options.max_concurrent_positions, 2);
         assert_eq!(options.max_total_notional_usdt, "40.00");
         assert!(options.use_existing_monitors);
@@ -68901,7 +68604,6 @@ mod tests {
             position_state_path: None,
             poll_interval_secs: 30,
             max_cycles: Some(5),
-            max_live_entries: 4,
             max_concurrent_positions: 2,
             max_total_notional_usdt: "40.00".to_owned(),
             use_existing_monitors: false,
@@ -68936,9 +68638,6 @@ mod tests {
         assert!(resident_args
             .windows(2)
             .any(|pair| pair[0] == "--perp-wss-monitor-url" && pair[1] == "http://127.0.0.1:8812"));
-        assert!(resident_args
-            .windows(2)
-            .any(|pair| pair[0] == "--max-live-entries" && pair[1] == "4"));
         assert!(resident_args.contains(&"--execute-live".to_owned()));
         assert!(resident_args.contains(&"--i-understand-basis-live-orders".to_owned()));
     }
@@ -68974,8 +68673,6 @@ mod tests {
             "30".to_owned(),
             "--min-net-bps".to_owned(),
             "7".to_owned(),
-            "--max-live-entries".to_owned(),
-            "4".to_owned(),
             "--max-concurrent-positions".to_owned(),
             "2".to_owned(),
             "--max-total-notional-usdt".to_owned(),
@@ -69002,7 +68699,6 @@ mod tests {
             Some("http://127.0.0.1:8809")
         );
         assert_eq!(options.poll_interval_secs, 30);
-        assert_eq!(options.max_live_entries, 4);
         assert_eq!(options.max_concurrent_positions, 2);
         assert_eq!(options.max_total_notional_usdt, "40.00");
         assert!(options.execute_live);
@@ -69020,6 +68716,7 @@ mod tests {
                 BasisLiveVenue::Bitget,
             ],
             symbols: BTreeMap::new(),
+            opportunity_urls: BTreeMap::new(),
             config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
             output_dir: Some(PathBuf::from("target/live-canary/multi-stack")),
             min_net_bps: 7,
@@ -69040,7 +68737,6 @@ mod tests {
             adl_events_dir: None,
             poll_interval_secs: 30,
             max_cycles: Some(5),
-            max_live_entries: 4,
             max_concurrent_positions: 2,
             max_total_notional_usdt: "40.00".to_owned(),
             use_existing_monitors: false,
@@ -69443,10 +69139,9 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn binance_basis_resident_capacity_blocks_hard_live_entry_limit() {
+    fn binance_basis_resident_capacity_allows_historical_entry_count() {
         let mut options =
             parse_binance_basis_resident_live_args(&[]).expect("default resident options");
-        options.max_live_entries = 1;
         options.max_concurrent_positions = 10;
         options.max_total_notional_usdt = "100.00".to_owned();
         let mut registry = BinanceBasisResidentPositionRegistry::default();
@@ -69463,10 +69158,7 @@ mod tests {
         let capacity =
             binance_basis_resident_entry_capacity(&options, &registry).expect("capacity");
 
-        assert_eq!(
-            capacity,
-            ResidentEntryCapacity::Blocked("max live entries reached: 1 >= 1".to_owned())
-        );
+        assert_eq!(capacity, ResidentEntryCapacity::Allowed);
     }
 
     #[cfg(feature = "live-exec")]
@@ -69474,7 +69166,6 @@ mod tests {
     fn binance_basis_resident_capacity_blocks_total_notional_before_next_entry() {
         let mut options =
             parse_binance_basis_resident_live_args(&[]).expect("default resident options");
-        options.max_live_entries = 10;
         options.max_concurrent_positions = 10;
         options.max_total_notional_usdt = "10.00".to_owned();
         let mut registry = BinanceBasisResidentPositionRegistry::default();
@@ -69528,7 +69219,7 @@ mod tests {
     }
 
     #[test]
-    fn basis_guarded_live_auto_once_args_reject_mixed_price_guards() {
+    fn basis_guarded_live_cycle_args_reject_mixed_price_guards() {
         let args = vec![
             "--max-spot-ask".to_owned(),
             "101.00".to_owned(),
@@ -69538,7 +69229,7 @@ mod tests {
             "2".to_owned(),
         ];
 
-        let error = parse_binance_basis_guarded_live_auto_once_args(&args)
+        let error = parse_binance_basis_guarded_live_cycle_args(&args)
             .expect_err("manual and auto price guards must not mix");
 
         assert!(error
@@ -69549,7 +69240,7 @@ mod tests {
     #[cfg(feature = "live-exec")]
     #[test]
     fn basis_auto_price_guard_resolves_from_current_quotes() {
-        let options = BasisGuardedLiveAutoOnceOptions {
+        let options = BasisGuardedLiveCycleOptions {
             symbol: BASIS_SYMBOL.to_owned(),
             config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
             output_dir: None,
@@ -69915,7 +69606,7 @@ mod tests {
     }
 
     #[test]
-    fn aster_basis_guarded_live_auto_once_fails_closed_without_spot_profile() {
+    fn aster_basis_guarded_live_cycle_fails_closed_without_spot_profile() {
         let mut strategy_config = SpotPerpBasisStrategyConfig::binance_btcusdt();
         strategy_config.instance.strategy_id = "strat:aster-spot-perp-basis".to_owned();
         strategy_config.symbol.spot.venue_id = "venue:ASTER-SPOT".to_owned();
@@ -70389,18 +70080,18 @@ mod tests {
     }
 
     #[test]
-    fn binance_guarded_live_auto_once_runs_fresh_signal_to_dry_run_gate() {
+    fn binance_guarded_live_cycle_runs_fresh_signal_to_dry_run_gate() {
         let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
         let root = RuntimeTempDir::new().expect("output dir");
         let config_path = root.path().join("guarded-live.yaml");
         fs::write(&config_path, guarded_live_blocked_by_kill_switch_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_binance_guarded_live_auto_once_from_spot_json(
+        let report = run_binance_guarded_live_cycle_from_spot_json(
             spot,
             "test:binance-spot-book",
             ingested_at,
-            BinanceGuardedLiveAutoOnceOptions {
+            BinanceGuardedLiveCycleOptions {
                 config_path,
                 output_dir: Some(root.path().join("auto")),
                 max_ask: Some("101.00".to_owned()),
@@ -70408,7 +70099,7 @@ mod tests {
                 acknowledge_auto_live_orders: false,
             },
         )
-        .expect("auto once dry run");
+        .expect("cycle dry run");
 
         assert!(report.signal_allowed);
         assert!(report
@@ -70431,22 +70122,22 @@ mod tests {
                 .expect("approval")
                 .contains("system:guarded-live-auto-strategy")
         );
-        assert!(read_utf8(&output_dir.join("auto_once_report.json"))
+        assert!(read_utf8(&output_dir.join("cycle_report.json"))
             .expect("auto report")
             .contains("\"signal_allowed\":true"));
     }
 
     #[test]
-    fn binance_guarded_live_auto_once_blocks_live_without_price_guard() {
+    fn binance_guarded_live_cycle_blocks_live_without_price_guard() {
         let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
         let root = RuntimeTempDir::new().expect("output dir");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_binance_guarded_live_auto_once_from_spot_json(
+        let report = run_binance_guarded_live_cycle_from_spot_json(
             spot,
             "test:binance-spot-book",
             ingested_at,
-            BinanceGuardedLiveAutoOnceOptions {
+            BinanceGuardedLiveCycleOptions {
                 config_path: root.path().join("unused.yaml"),
                 output_dir: Some(root.path().join("auto")),
                 max_ask: None,
@@ -70467,7 +70158,7 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn binance_basis_guarded_live_auto_once_builds_two_leg_dry_run() {
+    fn binance_basis_guarded_live_cycle_builds_two_leg_dry_run() {
         let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
         let perp = r#"{"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778630400000}"#;
         let premium = r#"{"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
@@ -70476,7 +70167,7 @@ mod tests {
         fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_binance_basis_guarded_live_auto_once_from_json(
+        let report = run_binance_basis_guarded_live_cycle_from_json(
             BASIS_SYMBOL,
             spot,
             "test:binance-spot-book",
@@ -70485,7 +70176,7 @@ mod tests {
             premium,
             "test:binance-usdm-premium",
             ingested_at,
-            BasisGuardedLiveAutoOnceOptions {
+            BasisGuardedLiveCycleOptions {
                 symbol: BASIS_SYMBOL.to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("basis-auto")),
@@ -70500,7 +70191,7 @@ mod tests {
                 acknowledge_basis_live_orders: false,
             },
         )
-        .expect("basis auto once dry run");
+        .expect("basis cycle dry run");
 
         assert!(report.signal_allowed);
         assert_eq!(
@@ -70531,7 +70222,7 @@ mod tests {
         assert!(plan_preview.contains("\"client_order_id\":\"rvbS"));
         assert!(plan_preview.contains("\"client_order_id\":\"rvbP"));
         let report_json =
-            read_utf8(&output_dir.join("basis_auto_once_report.json")).expect("auto report");
+            read_utf8(&output_dir.join("basis_cycle_report.json")).expect("auto report");
         assert!(report_json.contains("\"planned_order_count\":2"));
         assert!(report_json.contains("\"dispatch_plan_built\":true"));
         assert!(report_json.contains("\"preview_place_order_count\":2"));
@@ -70541,7 +70232,7 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn bybit_basis_guarded_live_auto_once_builds_two_leg_dry_run() {
+    fn bybit_basis_guarded_live_cycle_builds_two_leg_dry_run() {
         let spot = r#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"ETHUSDT","bid1Price":"49.90","bid1Size":"3.0","ask1Price":"50.00","ask1Size":"4.0"},{"symbol":"BTCUSDT","bid1Price":"99.90","bid1Size":"1.0","ask1Price":"100.00","ask1Size":"2.0"}]},"retExtInfo":{},"time":1778630400000}"#;
         let linear = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","bid1Price":"101.00","bid1Size":"1.5","ask1Price":"101.10","ask1Size":"2.5","markPrice":"101.00","indexPrice":"100.00","fundingRate":"0.00010000","nextFundingTime":"1778659200000"}]},"retExtInfo":{},"time":1778630400000}"#;
         let root = RuntimeTempDir::new().expect("output dir");
@@ -70549,14 +70240,14 @@ mod tests {
         fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_bybit_basis_guarded_live_auto_once_from_json(
+        let report = run_bybit_basis_guarded_live_cycle_from_json(
             BASIS_SYMBOL,
             spot,
             "test:bybit-spot-ticker",
             linear,
             "test:bybit-linear-ticker",
             ingested_at,
-            BybitBasisGuardedLiveAutoOnceOptions {
+            BybitBasisGuardedLiveCycleOptions {
                 symbol: BASIS_SYMBOL.to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("bybit-basis-auto")),
@@ -70571,7 +70262,7 @@ mod tests {
                 acknowledge_basis_live_orders: false,
             },
         )
-        .expect("Bybit basis auto once dry run");
+        .expect("Bybit basis cycle dry run");
 
         assert!(report.signal_allowed);
         assert_eq!(
@@ -70603,17 +70294,17 @@ mod tests {
         assert!(plan_preview.contains("\"basis_leg_role\":\"spot_buy\""));
         assert!(plan_preview.contains("\"basis_leg_role\":\"perp_short\""));
         let report_md =
-            read_utf8(&output_dir.join("basis_auto_once_report.md")).expect("auto report markdown");
-        assert!(report_md.contains("Bybit Basis GuardedLive Auto Once"));
+            read_utf8(&output_dir.join("basis_cycle_report.md")).expect("auto report markdown");
+        assert!(report_md.contains("Bybit Basis GuardedLive Cycle"));
         let report_json =
-            read_utf8(&output_dir.join("basis_auto_once_report.json")).expect("auto report json");
+            read_utf8(&output_dir.join("basis_cycle_report.json")).expect("auto report json");
         assert!(report_json.contains("\"risk_decision\":{"));
         assert!(report_json.contains("\"decision\":\"RequiresManualApproval\""));
     }
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn binance_basis_guarded_live_auto_once_builds_non_btc_dry_run() {
+    fn binance_basis_guarded_live_cycle_builds_non_btc_dry_run() {
         let spot = r#"{"symbol":"ETHUSDT","bidPrice":"49.90","bidQty":"3.0","askPrice":"50.00","askQty":"4.0"}"#;
         let perp = r#"{"symbol":"ETHUSDT","bidPrice":"51.00","bidQty":"3.5","askPrice":"51.10","askQty":"4.5","time":1778630400000}"#;
         let premium = r#"{"symbol":"ETHUSDT","markPrice":"51.00","indexPrice":"50.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
@@ -70622,7 +70313,7 @@ mod tests {
         fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_binance_basis_guarded_live_auto_once_from_json(
+        let report = run_binance_basis_guarded_live_cycle_from_json(
             "ETHUSDT",
             spot,
             "test:binance-spot-book",
@@ -70631,7 +70322,7 @@ mod tests {
             premium,
             "test:binance-usdm-premium",
             ingested_at,
-            BasisGuardedLiveAutoOnceOptions {
+            BasisGuardedLiveCycleOptions {
                 symbol: "ETHUSDT".to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("binance-eth-basis-auto")),
@@ -70646,7 +70337,7 @@ mod tests {
                 acknowledge_basis_live_orders: false,
             },
         )
-        .expect("Binance ETH basis auto once dry run");
+        .expect("Binance ETH basis cycle dry run");
 
         assert_eq!(report.symbol, "ETHUSDT");
         assert!(report.signal_allowed);
@@ -70671,7 +70362,7 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn binance_basis_guarded_live_auto_once_keeps_non_ascii_symbol_dry_run() {
+    fn binance_basis_guarded_live_cycle_keeps_non_ascii_symbol_dry_run() {
         let symbol = "中文USDT";
         let spot = format!(
             r#"{{"symbol":"{symbol}","bidPrice":"49.90","bidQty":"3.0","askPrice":"50.00","askQty":"4.0"}}"#
@@ -70687,7 +70378,7 @@ mod tests {
         fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_binance_basis_guarded_live_auto_once_from_json(
+        let report = run_binance_basis_guarded_live_cycle_from_json(
             symbol,
             &spot,
             "test:binance-spot-book",
@@ -70696,7 +70387,7 @@ mod tests {
             &premium,
             "test:binance-usdm-premium",
             ingested_at,
-            BasisGuardedLiveAutoOnceOptions {
+            BasisGuardedLiveCycleOptions {
                 symbol: symbol.to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("binance-non-ascii-basis-auto")),
@@ -70711,7 +70402,7 @@ mod tests {
                 acknowledge_basis_live_orders: false,
             },
         )
-        .expect("Binance non-ASCII symbol basis auto once dry run");
+        .expect("Binance non-ASCII symbol basis cycle dry run");
 
         assert_eq!(report.symbol, symbol);
         assert!(report.signal_allowed);
@@ -70731,7 +70422,7 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn bybit_basis_guarded_live_auto_once_builds_non_btc_dry_run() {
+    fn bybit_basis_guarded_live_cycle_builds_non_btc_dry_run() {
         let spot = r#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"ETHUSDT","bid1Price":"49.90","bid1Size":"3.0","ask1Price":"50.00","ask1Size":"4.0"}]},"retExtInfo":{},"time":1778630400000}"#;
         let linear = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"ETHUSDT","bid1Price":"51.00","bid1Size":"3.5","ask1Price":"51.10","ask1Size":"4.5","markPrice":"51.00","indexPrice":"50.00","fundingRate":"0.00010000","nextFundingTime":"1778659200000"}]},"retExtInfo":{},"time":1778630400000}"#;
         let root = RuntimeTempDir::new().expect("output dir");
@@ -70739,14 +70430,14 @@ mod tests {
         fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_bybit_basis_guarded_live_auto_once_from_json(
+        let report = run_bybit_basis_guarded_live_cycle_from_json(
             "ETHUSDT",
             spot,
             "test:bybit-spot-ticker",
             linear,
             "test:bybit-linear-ticker",
             ingested_at,
-            BybitBasisGuardedLiveAutoOnceOptions {
+            BybitBasisGuardedLiveCycleOptions {
                 symbol: "ETHUSDT".to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("bybit-eth-basis-auto")),
@@ -70761,7 +70452,7 @@ mod tests {
                 acknowledge_basis_live_orders: false,
             },
         )
-        .expect("Bybit ETH basis auto once dry run");
+        .expect("Bybit ETH basis cycle dry run");
 
         assert_eq!(report.symbol, "ETHUSDT");
         assert!(report.signal_allowed);
@@ -70779,7 +70470,7 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn okx_basis_guarded_live_auto_once_builds_non_btc_dry_run() {
+    fn okx_basis_guarded_live_cycle_builds_non_btc_dry_run() {
         let spot = r#"{"code":"0","data":[{"instType":"SPOT","instId":"ETH-USDT","bidPx":"49.90","bidSz":"3.0","askPx":"50.00","askSz":"4.0","ts":"1778630400000"}],"msg":""}"#;
         let swap = r#"{"code":"0","data":[{"instType":"SWAP","instId":"ETH-USDT-SWAP","bidPx":"51.00","bidSz":"3.5","askPx":"51.10","askSz":"4.5","ts":"1778630400000"}],"msg":""}"#;
         let mark = r#"{"code":"0","data":[{"instType":"SWAP","instId":"ETH-USDT-SWAP","markPx":"51.00","ts":"1778630400000"}],"msg":""}"#;
@@ -70790,7 +70481,7 @@ mod tests {
         fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_okx_basis_guarded_live_auto_once_from_json(
+        let report = run_okx_basis_guarded_live_cycle_from_json(
             OkxBasisRawInputs {
                 symbol: "ETH-USDT",
                 raw_spot_ticker: spot,
@@ -70805,7 +70496,7 @@ mod tests {
                 funding_rate_ref: "test:okx-funding-rate",
             },
             ingested_at,
-            OkxBasisGuardedLiveAutoOnceOptions {
+            OkxBasisGuardedLiveCycleOptions {
                 symbol: "ETH-USDT".to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("okx-eth-basis-auto")),
@@ -70820,7 +70511,7 @@ mod tests {
                 acknowledge_basis_live_orders: false,
             },
         )
-        .expect("OKX ETH basis auto once dry run");
+        .expect("OKX ETH basis cycle dry run");
 
         assert_eq!(report.symbol, "ETH-USDT");
         assert!(report.signal_allowed);
@@ -70840,14 +70531,14 @@ mod tests {
         assert!(plan_preview.contains("\"client_order_id\":\"rvoSethusdt"));
         assert!(plan_preview.contains("\"client_order_id\":\"rvoPethusdt"));
         let report_json =
-            read_utf8(&output_dir.join("basis_auto_once_report.json")).expect("auto report json");
+            read_utf8(&output_dir.join("basis_cycle_report.json")).expect("auto report json");
         assert!(report_json.contains("\"risk_decision\":{"));
         assert!(report_json.contains("\"decision\":\"RequiresManualApproval\""));
     }
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn bitget_basis_guarded_live_auto_once_builds_non_btc_dry_run() {
+    fn bitget_basis_guarded_live_cycle_builds_non_btc_dry_run() {
         let spot = r#"{"code":"00000","msg":"success","requestTime":1778630400000,"data":[{"symbol":"ETHUSDT","bidPr":"49.90","bidSz":"3.0","askPr":"50.00","askSz":"4.0","ts":"1778630400000"}]}"#;
         let futures = r#"{"code":"00000","msg":"success","requestTime":1778630400000,"data":[{"symbol":"ETHUSDT","bidPr":"51.00","bidSz":"3.5","askPr":"51.10","askSz":"4.5","markPrice":"51.00","indexPrice":"50.00","ts":"1778630400000"}]}"#;
         let funding = r#"{"code":"00000","msg":"success","requestTime":1778630400000,"data":[{"symbol":"ETHUSDT","fundingRate":"0.00010000","fundingRateInterval":"8","nextUpdate":"1778659200000"}]}"#;
@@ -70856,7 +70547,7 @@ mod tests {
         fs::write(&config_path, guarded_live_open_real_signing_yaml()).expect("write config");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_bitget_basis_guarded_live_auto_once_from_json(
+        let report = run_bitget_basis_guarded_live_cycle_from_json(
             BitgetBasisRawInputs {
                 symbol: "ETHUSDT",
                 raw_spot_ticker: spot,
@@ -70867,7 +70558,7 @@ mod tests {
                 usdt_futures_funding_rate_ref: "test:bitget-usdt-futures-funding-rate",
             },
             ingested_at,
-            BitgetBasisGuardedLiveAutoOnceOptions {
+            BitgetBasisGuardedLiveCycleOptions {
                 symbol: "ETHUSDT".to_owned(),
                 config_path,
                 output_dir: Some(root.path().join("bitget-eth-basis-auto")),
@@ -70882,7 +70573,7 @@ mod tests {
                 acknowledge_basis_live_orders: false,
             },
         )
-        .expect("Bitget ETH basis auto once dry run");
+        .expect("Bitget ETH basis cycle dry run");
 
         assert_eq!(report.symbol, "ETHUSDT");
         assert!(report.signal_allowed);
@@ -70903,8 +70594,8 @@ mod tests {
         assert!(plan_preview.contains("\"client_order_id\":\"rvgSethusdt"));
         assert!(plan_preview.contains("\"client_order_id\":\"rvgPethusdt"));
         let report_md =
-            read_utf8(&output_dir.join("basis_auto_once_report.md")).expect("auto report markdown");
-        assert!(report_md.contains("Bitget Basis GuardedLive Auto Once"));
+            read_utf8(&output_dir.join("basis_cycle_report.md")).expect("auto report markdown");
+        assert!(report_md.contains("Bitget Basis GuardedLive Cycle"));
     }
 
     #[cfg(feature = "live-exec")]
@@ -72142,14 +71833,14 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn binance_basis_guarded_live_auto_once_blocks_live_without_two_price_guards() {
+    fn binance_basis_guarded_live_cycle_blocks_live_without_two_price_guards() {
         let spot = r#"{"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0"}"#;
         let perp = r#"{"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778630400000}"#;
         let premium = r#"{"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778659200000,"time":1778630400000}"#;
         let root = RuntimeTempDir::new().expect("output dir");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
 
-        let report = run_binance_basis_guarded_live_auto_once_from_json(
+        let report = run_binance_basis_guarded_live_cycle_from_json(
             BASIS_SYMBOL,
             spot,
             "test:binance-spot-book",
@@ -72158,7 +71849,7 @@ mod tests {
             premium,
             "test:binance-usdm-premium",
             ingested_at,
-            BasisGuardedLiveAutoOnceOptions {
+            BasisGuardedLiveCycleOptions {
                 symbol: BASIS_SYMBOL.to_owned(),
                 config_path: root.path().join("unused.yaml"),
                 output_dir: Some(root.path().join("basis-auto")),
@@ -72191,10 +71882,10 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn okx_basis_guarded_live_auto_once_requires_wss_monitors_for_live_execution() {
+    fn okx_basis_guarded_live_cycle_requires_wss_monitors_for_live_execution() {
         let root = RuntimeTempDir::new().expect("output dir");
 
-        let err = run_okx_basis_guarded_live_auto_once(BasisGuardedLiveAutoOnceOptions {
+        let err = run_okx_basis_guarded_live_cycle(BasisGuardedLiveCycleOptions {
             symbol: OKX_BASIS_SYMBOL.to_owned(),
             config_path: root.path().join("unused.yaml"),
             output_dir: Some(root.path().join("okx-basis-auto")),
@@ -72208,7 +71899,7 @@ mod tests {
             execute_live: true,
             acknowledge_basis_live_orders: true,
         })
-        .expect_err("OKX live auto-once must fail before REST fetch without WSS monitors");
+        .expect_err("OKX live cycle must fail before REST fetch without WSS monitors");
 
         assert!(matches!(err, RuntimeError::UnsafeConfig { .. }));
         assert!(err.to_string().contains("--spot-wss-monitor-url"));
@@ -72217,10 +71908,10 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn bitget_basis_guarded_live_auto_once_requires_wss_monitors_for_live_execution() {
+    fn bitget_basis_guarded_live_cycle_requires_wss_monitors_for_live_execution() {
         let root = RuntimeTempDir::new().expect("output dir");
 
-        let err = run_bitget_basis_guarded_live_auto_once(BitgetBasisGuardedLiveAutoOnceOptions {
+        let err = run_bitget_basis_guarded_live_cycle(BitgetBasisGuardedLiveCycleOptions {
             symbol: BITGET_BASIS_SYMBOL.to_owned(),
             config_path: root.path().join("unused.yaml"),
             output_dir: Some(root.path().join("bitget-basis-auto")),
@@ -72234,7 +71925,7 @@ mod tests {
             execute_live: true,
             acknowledge_basis_live_orders: true,
         })
-        .expect_err("Bitget live auto-once must fail before REST fetch without WSS monitors");
+        .expect_err("Bitget live cycle must fail before REST fetch without WSS monitors");
 
         assert!(matches!(err, RuntimeError::UnsafeConfig { .. }));
         assert!(err.to_string().contains("--spot-wss-monitor-url"));

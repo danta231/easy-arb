@@ -18,8 +18,8 @@ usage() {
   2. 启动 Binance/Bybit/OKX/Bitget 的 spot/perp WSS，以及 Aster/Hyperliquid perp WSS monitor。
   3. 等待 WSS monitor 进入 streaming，且已收到真实 WSS 更新。
   4. 启动 arb-runtime live --i-understand-live-orders。
-  5. arb-runtime live 会默认用常驻 runner 管理 spot-perp-basis 和
-     cross-exchange-funding-arb，不再由 observer 反复触发 auto-once。
+  5. arb-runtime live 默认只启动 cross-exchange-funding-arb 常驻 runner；
+     spot-perp-basis 需要显式加入 ARB_RUNTIME_LIVE_STRATEGIES，避免无关策略限流拖垮 funding-arb。
   6. 打印所有实时 dashboard、日志和停止命令。
 
 常用环境变量:
@@ -35,16 +35,16 @@ usage() {
   ARB_RUNTIME_LIVE_INTERVAL_SECS=5 # observer 公开 monitor 轮询间隔秒数。
   ARB_RUNTIME_LIVE_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps。
   ARB_RUNTIME_LOCAL_TZ=Asia/Shanghai # 面向人读的日志展示时区；默认 UTC+8。
-  ARB_RUNTIME_LIVE_AUTO_ONCE_COOLDOWN_SECS=60 # 同一候选 auto-once 验证冷却秒数。
-  ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE=1 # 是否运行候选 auto-once 验证。
   ARB_RUNTIME_LIVE_DERISK_ONLY=0 # 事故处理模式；1 表示只启动 funding arb resident 一轮恢复/减仓，不启动 spot-perp 实盘 resident。
+  ARB_RUNTIME_LIVE_STRATEGIES=cross-exchange-funding-arb # live 默认只启用 funding-arb；需要 spot-perp 时显式改为 spot-perp-basis,cross-exchange-funding-arb。
+  ARB_RUNTIME_LIVE_SPOT_PERP_BASIS_MODE=auto-once # spot-perp-basis 默认不跑常驻 resident；需要实盘常驻时显式设为 resident。
   ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=all # Binance/Bybit/OKX/Bitget 全市场 WSS 覆盖范围；all 表示全部 USDT，target 表示只订阅 resident 实盘目标 symbol，custom 表示使用下面各交易所自定义值。
   ARB_RUNTIME_OKX_FUNDING_RATE_CACHE_TTL_SECS=60 # OKX funding-rate 全市场逐合约请求缓存秒数；0 表示每轮都重新请求。
   ARB_RUNTIME_BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_SECS=300 # Bybit linear instruments-info 元数据缓存秒数；0 表示每轮都重新请求。
   ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=1 # funding-arb 直接读取 perp/funding 公开源；0 表示复用 basis monitor status。
-  ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=1 # 是否额外启动实盘 guard 专用 target WSS；启动不阻塞，真实下单前仍强制校验 Fresh quote。
+  ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=0 # 是否额外启动实盘 guard 专用 target WSS；默认使用全市场 WSS monitor。
   ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE=1 # foreground live 失败时是否保留只读 dashboard/WSS 便于排查；停止用 scripts/stop-arb-runtime-live.sh。
   ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bybit WSS monitor 订阅 symbol。
@@ -57,7 +57,6 @@ usage() {
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS=60 # 全账户私有只读采集间隔秒数。
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_VENUES= # 可选覆盖采集交易所，逗号分隔；留空表示所有支持 funding-arb 的交易所。
   BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60 # spot-perp-basis 常驻 runner 扫描间隔秒数。
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00 # spot-perp-basis 总名义本金上限，单位 USDT。
   BASIS_OBSERVER_PERP_TARGET_LEVERAGE=1 # 所有永续交易所默认目标杠杆；实盘非 reduce-only 下单前会先设置该杠杆。
@@ -67,9 +66,7 @@ usage() {
   BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE=1 # 可选覆盖 Bitget USDT-FUTURES 目标杠杆。
   BASIS_OBSERVER_ASTER_PERP_LEVERAGE=1 # 可选覆盖 Aster USDT perp 目标杠杆。
   BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE=1 # 可选覆盖 Hyperliquid perp 目标杠杆。
-  BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻运行。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；启用 raw snapshot 时必须留空。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT= # 资金费率结算原始只读快照输出路径。
@@ -187,6 +184,65 @@ reclaim_stale_runtime_port() {
       die "cannot bind ${label} on ${bind_addr}: address already in use by pid=${pid}; not a managed ${REPO_ROOT}/target arb-runtime process"
     fi
   done < <(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true)
+}
+
+archive_pid_file_for_restart() {
+  local pid_file="$1"
+  [[ -e "${pid_file}" ]] || return 0
+  mv "${pid_file}" "${pid_file}.stopped.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+}
+
+stop_recorded_single_process_for_restart() {
+  local pid_file="$1"
+  local label="$2"
+  local pid
+
+  [[ -s "${pid_file}" ]] || return 0
+  pid="$(sed -n '1p' "${pid_file}" 2>/dev/null || true)"
+  if is_alive "${pid}"; then
+    [[ "${RECLAIM_STALE_MONITOR_PORTS:-1}" == "1" ]] || die "${label} already running: pid=${pid}; stop first with scripts/stop-arb-runtime-live.sh"
+    echo "stopping previous read-only ${label}: pid=${pid}"
+    kill -TERM "${pid}" 2>/dev/null || true
+    if ! wait_for_pid_exit "${pid}" 5; then
+      echo "previous read-only ${label} did not exit after TERM; sending KILL: pid=${pid}"
+      kill -KILL "${pid}" 2>/dev/null || true
+      wait_for_pid_exit "${pid}" 2 || true
+    fi
+  fi
+  archive_pid_file_for_restart "${pid_file}"
+}
+
+stop_recorded_wss_monitors_for_restart() {
+  local pid
+  local name
+  local _log
+  local _url
+  local _ready_symbol
+  local _required
+  local alive_count=0
+
+  [[ -s "${WSS_PID_FILE}" ]] || return 0
+  while IFS=$'\t' read -r pid name _log _url _ready_symbol _required; do
+    if is_alive "${pid}"; then
+      [[ "${RECLAIM_STALE_MONITOR_PORTS:-1}" == "1" ]] || die "WSS monitor already running: ${name} pid=${pid}; stop first with scripts/stop-arb-runtime-live.sh"
+      alive_count="$((alive_count + 1))"
+      echo "stopping previous read-only WSS monitor: name=${name} pid=${pid}"
+      kill -TERM "${pid}" 2>/dev/null || true
+    fi
+  done < "${WSS_PID_FILE}"
+
+  if (( alive_count > 0 )); then
+    sleep 1
+  fi
+
+  while IFS=$'\t' read -r pid name _log _url _ready_symbol _required; do
+    if is_alive "${pid}"; then
+      echo "previous read-only WSS monitor did not exit after TERM; sending KILL: name=${name} pid=${pid}"
+      kill -KILL "${pid}" 2>/dev/null || true
+      wait_for_pid_exit "${pid}" 2 || true
+    fi
+  done < "${WSS_PID_FILE}"
+  archive_pid_file_for_restart "${WSS_PID_FILE}"
 }
 
 tail_log_on_error() {
@@ -312,6 +368,7 @@ LOG_DIR="${PREREQ_ROOT}/logs"
 STATE_DIR="${PREREQ_ROOT}/state"
 WSS_PID_FILE="${STATE_DIR}/wss-book-ticker.pids"
 LIVE_PID_FILE="${STATE_DIR}/arb-runtime-live.pid"
+LIVE_OBSERVER_PID_FILE="${RUN_ROOT}/state/basis-observer.pids"
 PORTFOLIO_PID_FILE="${STATE_DIR}/portfolio-dashboard.pid"
 PORTFOLIO_PRIVATE_READONLY_PID_FILE="${STATE_DIR}/portfolio-private-readonly.pid"
 PRECHECK_LOG="${LOG_DIR}/arb-runtime-live-precheck.log"
@@ -327,13 +384,18 @@ PORTFOLIO_PRIVATE_READONLY_VENUES="${ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_VENU
 LIVE_CONFIG="${ARB_RUNTIME_LIVE_CONFIG:-${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}}"
 LIVE_INTERVAL_SECS="${ARB_RUNTIME_LIVE_INTERVAL_SECS:-${BASIS_OBSERVER_INTERVAL_SECS:-5}}"
 LIVE_MIN_NET_BPS="${ARB_RUNTIME_LIVE_MIN_NET_BPS:-${BASIS_OBSERVER_MIN_NET_BPS:-5}}"
-LIVE_AUTO_ONCE_COOLDOWN_SECS="${ARB_RUNTIME_LIVE_AUTO_ONCE_COOLDOWN_SECS:-${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}}"
-LIVE_VALIDATE_AUTO_ONCE="${ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE:-${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}}"
 LIVE_DERISK_ONLY="${ARB_RUNTIME_LIVE_DERISK_ONLY:-0}"
-LIVE_STRATEGIES="${BASIS_OBSERVER_STRATEGIES:-spot-perp-basis,cross-exchange-funding-arb}"
-LIVE_SPOT_PERP_BASIS_MODE="${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-resident}"
-LIVE_FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+LIVE_STRATEGIES="${ARB_RUNTIME_LIVE_STRATEGIES:-cross-exchange-funding-arb}"
+LIVE_SPOT_PERP_BASIS_MODE="${ARB_RUNTIME_LIVE_SPOT_PERP_BASIS_MODE:-auto-once}"
+LIVE_FUNDING_ARB_MODE="resident"
 LIVE_FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
+
+if [[ -n "${BASIS_OBSERVER_STRATEGIES:-}" && -z "${ARB_RUNTIME_LIVE_STRATEGIES:-}" ]]; then
+  echo "ignoring BASIS_OBSERVER_STRATEGIES for start-arb-runtime-live.sh default; set ARB_RUNTIME_LIVE_STRATEGIES to override live strategies"
+fi
+if [[ -n "${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-}" && -z "${ARB_RUNTIME_LIVE_SPOT_PERP_BASIS_MODE:-}" ]]; then
+  echo "ignoring BASIS_OBSERVER_SPOT_PERP_BASIS_MODE for start-arb-runtime-live.sh default; set ARB_RUNTIME_LIVE_SPOT_PERP_BASIS_MODE to override spot-perp live mode"
+fi
 
 case "${LIVE_DERISK_ONLY}" in
   0|1) ;;
@@ -382,7 +444,7 @@ OKX_BASIS_READY_SYMBOL="BTC-USDT"
 BITGET_BASIS_READY_SYMBOL="BTCUSDT"
 
 CEX_WSS_SCOPE="${ARB_RUNTIME_LIVE_CEX_WSS_SCOPE:-all}"
-TARGET_WSS_ENABLED="${ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED:-1}"
+TARGET_WSS_ENABLED="${ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED:-0}"
 case "${CEX_WSS_SCOPE}" in
   target)
     BINANCE_WSS_SYMBOL="${BINANCE_BASIS_READY_SYMBOL}"
@@ -410,10 +472,6 @@ case "${TARGET_WSS_ENABLED}" in
   0|1) ;;
   *) die "ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED must be 0 or 1" ;;
 esac
-case "${LIVE_VALIDATE_AUTO_ONCE}" in
-  0|1) ;;
-  *) die "ARB_RUNTIME_LIVE_VALIDATE_AUTO_ONCE must be 0 or 1" ;;
-esac
 ASTER_WSS_SYMBOL="${ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL:-ALL_USDT}"
 HYPERLIQUID_WSS_SYMBOL="${ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL:-ALL_USDT}"
 
@@ -426,26 +484,30 @@ if [[ "${ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED:-1}" != "0" ]]; then
     echo "repo_root=${REPO_ROOT}"
     echo "run_root=${RUN_ROOT}"
     echo "prereq_root=${PREREQ_ROOT}"
-    echo "detach=${DETACH} build=${BUILD} config=${LIVE_CONFIG} interval_secs=${LIVE_INTERVAL_SECS} min_net_bps=${LIVE_MIN_NET_BPS} strategies=${LIVE_STRATEGIES} derisk_only=${LIVE_DERISK_ONLY} cex_wss_scope=${CEX_WSS_SCOPE} target_wss_enabled=${TARGET_WSS_ENABLED}"
+    echo "detach=${DETACH} build=${BUILD} config=${LIVE_CONFIG} interval_secs=${LIVE_INTERVAL_SECS} min_net_bps=${LIVE_MIN_NET_BPS} strategies=${LIVE_STRATEGIES} spot_perp_basis_mode=${LIVE_SPOT_PERP_BASIS_MODE} funding_arb_mode=${LIVE_FUNDING_ARB_MODE} derisk_only=${LIVE_DERISK_ONLY} cex_wss_scope=${CEX_WSS_SCOPE} target_wss_enabled=${TARGET_WSS_ENABLED}"
   } >> "${PRECHECK_LOG}"
   exec > >(tee -a "${PRECHECK_LOG}") 2>&1
 fi
 
-if [[ -s "${WSS_PID_FILE}" ]]; then
-  while IFS=$'\t' read -r pid name _log _url; do
-    if is_alive "${pid}"; then
-      die "WSS monitor already running: ${name} pid=${pid}; stop first with scripts/stop-arb-runtime-live.sh"
-    fi
-  done < "${WSS_PID_FILE}"
-fi
-: > "${WSS_PID_FILE}"
-
-if [[ -s "${PORTFOLIO_PID_FILE}" ]]; then
-  portfolio_pid="$(sed -n '1p' "${PORTFOLIO_PID_FILE}")"
-  if is_alive "${portfolio_pid}"; then
-    die "portfolio dashboard already running: pid=${portfolio_pid}; stop first with scripts/stop-arb-runtime-live.sh"
+if [[ -s "${LIVE_PID_FILE}" ]]; then
+  live_pid="$(sed -n '1p' "${LIVE_PID_FILE}" 2>/dev/null || true)"
+  if is_alive "${live_pid}"; then
+    die "arb-runtime live already running: pid=${live_pid}; stop first with scripts/stop-arb-runtime-live.sh"
   fi
 fi
+if [[ -s "${LIVE_OBSERVER_PID_FILE}" ]]; then
+  while IFS=$'\t' read -r observer_pid observer_name _observer_log; do
+    if is_alive "${observer_pid}"; then
+      die "arb-runtime live observer already running: ${observer_name} pid=${observer_pid}; stop first with scripts/stop-arb-runtime-live.sh"
+    fi
+  done < "${LIVE_OBSERVER_PID_FILE}"
+fi
+
+stop_recorded_wss_monitors_for_restart
+: > "${WSS_PID_FILE}"
+
+stop_recorded_single_process_for_restart "${PORTFOLIO_PRIVATE_READONLY_PID_FILE}" "portfolio-private-readonly"
+stop_recorded_single_process_for_restart "${PORTFOLIO_PID_FILE}" "portfolio-dashboard"
 
 if [[ "${BUILD}" == "1" ]]; then
   echo "building arb-runtime with live-exec feature..."
@@ -920,7 +982,7 @@ print_dashboards() {
 全账户私有只读快照:
   ${PORTFOLIO_PRIVATE_READONLY_OUT}
 
-spot-perp-basis 常驻产物:
+spot-perp-basis 常驻产物（仅显式启用 resident 时）:
   ${RUN_ROOT}/resident-live/spot-perp-basis
 
 cross-exchange-funding-arb 常驻产物:
@@ -933,24 +995,14 @@ EOF
 
 print_dashboards
 
-BASIS_BINANCE_SPOT_WSS_BIND="${TARGET_BINANCE_SPOT_WSS_BIND}"
-BASIS_BINANCE_PERP_WSS_BIND="${TARGET_BINANCE_PERP_WSS_BIND}"
-BASIS_BYBIT_SPOT_WSS_BIND="${TARGET_BYBIT_SPOT_WSS_BIND}"
-BASIS_BYBIT_PERP_WSS_BIND="${TARGET_BYBIT_PERP_WSS_BIND}"
-BASIS_OKX_SPOT_WSS_BIND="${TARGET_OKX_SPOT_WSS_BIND}"
-BASIS_OKX_PERP_WSS_BIND="${TARGET_OKX_PERP_WSS_BIND}"
-BASIS_BITGET_SPOT_WSS_BIND="${TARGET_BITGET_SPOT_WSS_BIND}"
-BASIS_BITGET_PERP_WSS_BIND="${TARGET_BITGET_PERP_WSS_BIND}"
-if [[ "${TARGET_WSS_ENABLED}" != "1" ]]; then
-  BASIS_BINANCE_SPOT_WSS_BIND="${BINANCE_SPOT_WSS_BIND}"
-  BASIS_BINANCE_PERP_WSS_BIND="${BINANCE_PERP_WSS_BIND}"
-  BASIS_BYBIT_SPOT_WSS_BIND="${BYBIT_SPOT_WSS_BIND}"
-  BASIS_BYBIT_PERP_WSS_BIND="${BYBIT_PERP_WSS_BIND}"
-  BASIS_OKX_SPOT_WSS_BIND="${OKX_SPOT_WSS_BIND}"
-  BASIS_OKX_PERP_WSS_BIND="${OKX_PERP_WSS_BIND}"
-  BASIS_BITGET_SPOT_WSS_BIND="${BITGET_SPOT_WSS_BIND}"
-  BASIS_BITGET_PERP_WSS_BIND="${BITGET_PERP_WSS_BIND}"
-fi
+BASIS_BINANCE_SPOT_WSS_BIND="${BINANCE_SPOT_WSS_BIND}"
+BASIS_BINANCE_PERP_WSS_BIND="${BINANCE_PERP_WSS_BIND}"
+BASIS_BYBIT_SPOT_WSS_BIND="${BYBIT_SPOT_WSS_BIND}"
+BASIS_BYBIT_PERP_WSS_BIND="${BYBIT_PERP_WSS_BIND}"
+BASIS_OKX_SPOT_WSS_BIND="${OKX_SPOT_WSS_BIND}"
+BASIS_OKX_PERP_WSS_BIND="${OKX_PERP_WSS_BIND}"
+BASIS_BITGET_SPOT_WSS_BIND="${BITGET_SPOT_WSS_BIND}"
+BASIS_BITGET_PERP_WSS_BIND="${BITGET_PERP_WSS_BIND}"
 
 LIVE_ENV=(
   BASIS_OBSERVER_ROOT="${RUN_ROOT}"
@@ -959,7 +1011,6 @@ LIVE_ENV=(
   BASIS_OBSERVER_SPOT_PERP_BASIS_MODE="${LIVE_SPOT_PERP_BASIS_MODE}"
   BASIS_OBSERVER_FUNDING_ARB_MODE="${LIVE_FUNDING_ARB_MODE}"
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS:-60}"
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES:-1}"
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES="${LIVE_FUNDING_ARB_RESIDENT_MAX_CYCLES}"
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER="${BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER:-${FUNDING_SETTLEMENT_LEDGER:-}}"
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT="${BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT:-${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}}"
@@ -971,7 +1022,7 @@ LIVE_ENV=(
   BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE="${BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE}"
   BASIS_OBSERVER_ASTER_PERP_LEVERAGE="${BASIS_OBSERVER_ASTER_PERP_LEVERAGE}"
   BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE="${BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE}"
-  BASIS_OBSERVER_DYNAMIC_TARGET_WSS=1
+  BASIS_OBSERVER_DYNAMIC_TARGET_WSS=0
   BASIS_OBSERVER_TARGET_WSS_ROOT="${RUN_ROOT}/target-wss"
   BASIS_OBSERVER_TARGET_WSS_BASE_PORT="${BASIS_OBSERVER_TARGET_WSS_BASE_PORT:-8830}"
   BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS="${BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS:-60}"
@@ -994,12 +1045,8 @@ LIVE_ARGS=(
   --out "${RUN_ROOT}"
   --interval-secs "${LIVE_INTERVAL_SECS}"
   --min-net-bps "${LIVE_MIN_NET_BPS}"
-  --auto-once-cooldown-secs "${LIVE_AUTO_ONCE_COOLDOWN_SECS}"
   --i-understand-live-orders
 )
-if [[ "${LIVE_VALIDATE_AUTO_ONCE}" == "0" ]]; then
-  LIVE_ARGS+=(--no-auto-validate)
-fi
 
 if [[ "${DETACH}" == "1" ]]; then
   live_log="${LOG_DIR}/arb-runtime-live.log"

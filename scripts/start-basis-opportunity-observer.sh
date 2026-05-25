@@ -5,9 +5,8 @@ set -euo pipefail
 # 默认运行测试盘：公开行情监控 + 模拟下单验证，不提交订单、不撤单、不转账。
 # 只有 BASIS_OBSERVER_EXECUTE_LIVE=1 且 BASIS_OBSERVER_LIVE_ACK=1 时才进入正式实盘，
 # 并向底层 guarded live 命令传递真实下单确认参数。
-# 当前会主动轮询 spot-perp-basis monitor，并默认启动 spot-perp-basis 常驻
-# live runner；同时启动专用 funding-arb-monitor 聚合本机 basis status 快照，
-# 生成 cross-exchange-funding-arb 机会文件。
+# 默认轮询 spot-perp-basis 和 cross-exchange-funding-arb；正式实盘下两个策略
+# 都使用 resident 常驻运行。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -24,15 +23,15 @@ usage() {
 核心行为:
   1. 启动六条只读 basis monitor，持续刷新公开行情。
   2. 轮询 /opportunities，实时记录 candidate_count > 0 的 spot-perp-basis 机会。
-  3. 默认启动 multi-venue-basis-resident-live 常驻 runner 管理
-     Binance/Bybit/OKX/Bitget 的 spot-perp-basis 开仓和平仓。
+  3. 默认包含 spot-perp-basis 和 cross-exchange-funding-arb；正式实盘下
+     两个策略都以 resident 常驻方式消费全市场候选。
   4. 如果启用 cross-exchange-funding-arb，启动专用 funding-arb-monitor，
      聚合本机 basis /status 快照并记录真实候选，不伪造机会。
   5. 测试盘默认模拟下单；正式实盘必须显式设置 BASIS_OBSERVER_EXECUTE_LIVE=1 和 BASIS_OBSERVER_LIVE_ACK=1。
 
 常用环境变量:
   BASIS_OBSERVER_ROOT=target/arb-opportunity-observer # observer 主运行目录，保存日志、快照、机会和报告。
-  BASIS_OBSERVER_STRATEGIES=spot-perp-basis,cross-exchange-funding-arb # 启用策略列表。
+  BASIS_OBSERVER_STRATEGIES= # 启用策略列表；默认 spot-perp-basis,cross-exchange-funding-arb。
   BASIS_OBSERVER_MONITORS="binance bybit okx bitget aster hyperliquid" # 启用的交易所 monitor 列表。
   BASIS_OBSERVER_INTERVAL_SECS=5 # observer 轮询公开 monitor 的间隔秒数。
   BASIS_OBSERVER_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps。
@@ -43,9 +42,7 @@ usage() {
   BASIS_OBSERVER_PERP_FEE_BPS=5 # perp 腿手续费估算，单位 bps。
   BASIS_OBSERVER_SLIPPAGE_BPS=5 # 滑点估算，单位 bps。
   BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml # 风控和执行配置文件路径。
-  BASIS_OBSERVER_SPOT_PERP_BASIS_MODE=resident # spot-perp-basis 运行模式；resident 表示常驻运行。
   BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60 # spot-perp-basis 常驻 runner 扫描间隔秒数。
-  BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=10.00 # spot-perp-basis 总名义本金上限，单位 USDT。
   BASIS_OBSERVER_PERP_TARGET_LEVERAGE=1 # 所有永续交易所默认目标杠杆；实盘非 reduce-only 下单前会先设置该杠杆。
@@ -61,19 +58,17 @@ usage() {
   BASIS_OBSERVER_ASTER_POSITION_MODE=hedge # Aster USDT perp 持仓模式；默认 hedge（双向持仓），设为 one-way 可覆盖；留空且未传配置时才走只读接口查询。
   BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE=1 # 可选覆盖 Hyperliquid perp 目标杠杆。
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES= # spot-perp-basis 最大循环次数；留空表示长期运行。
-  BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻运行。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
-  BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
   BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=0 # 实盘启动时是否允许 resident 自动处理历史 unknown 仓位；默认 0 表示启动前失败。
   BASIS_OBSERVER_FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE=1 # 实盘启动时是否先用私有只读仓位快照自动关闭已确认双边为 0 的历史 unknown。
   BASIS_OBSERVER_FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN=1 # 只读快照确认历史 unknown 仍有非 0 仓位时，是否自动切入 resident reduce-only recovery。
-  BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_CHECK=1 # 实盘启动 resident 前是否对当前 funding-arb 候选跑只读 guarded dry-run 门禁。
+  BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_CHECK=1 # 实盘启动 resident 前是否对当前 funding-arb 候选跑只读 guarded dry-run；候选级风控拒绝只跳过，不阻断 resident 启动。
   BASIS_OBSERVER_FUNDING_ARB_STARTUP_DRY_RUN_LIMIT=3 # 启动前最多检查的 funding-arb 候选数量，按净 funding bps 排序。
   BASIS_OBSERVER_FUNDING_ARB_STARTUP_PRECHECK_OUT= # funding-arb 启动前拦截报告和 dry-run 预检产物目录。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；启用 raw snapshot 时必须留空。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT= # 资金费率结算原始只读快照输出路径。
-  BASIS_OBSERVER_DYNAMIC_TARGET_WSS=0 # candidate 触发 auto-once 验证时，是否按 symbol 动态启动专用 target WSS。
+  BASIS_OBSERVER_DYNAMIC_TARGET_WSS=0 # 是否按候选 symbol 动态启动专用 target WSS 预热。
   BASIS_OBSERVER_TARGET_WSS_ROOT=target/arb-opportunity-observer/target-wss # 动态 target WSS 的日志和状态目录。
   BASIS_OBSERVER_TARGET_WSS_BASE_PORT=8830 # 动态 target WSS 从该本地端口开始分配。
   BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS=60 # 动态 target WSS 等待真实 WSS quote 就绪的最长秒数。
@@ -83,15 +78,13 @@ usage() {
   ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED= # funding-arb 是否直接读取 perp/funding 公开源；留空时仅 funding-arb 单独运行才默认启用。
-  BASIS_OBSERVER_VALIDATE_AUTO_ONCE=1 # auto-once 模式是否执行候选验证。
-  BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS=60 # auto-once 两次触发之间的冷却秒数。
   BASIS_OBSERVER_EXECUTE_LIVE=0 # 是否允许正式实盘下单；1 表示允许。
   BASIS_OBSERVER_LIVE_ACK=0 # 正式实盘确认开关；进入 live 必须为 1。
   BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2 # 自动价格保护缓冲，单位 bps。
   BASIS_OBSERVER_CURL_RETRIES=3 # 拉取本地/公开 HTTP 端点的重试次数。
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1 # HTTP 重试间隔秒数。
   BASIS_OBSERVER_CURL_TIMEOUT_SECS=10 # 单次 HTTP 请求超时秒数。
-  BASIS_OBSERVER_RUST_RECORDER_ENABLED=1 # resident 模式下用 Rust recorder 轮询本地机会接口，避免每轮生成 curl/jq 子进程；auto-once/动态 WSS 会自动回退 shell recorder。
+  BASIS_OBSERVER_RUST_RECORDER_ENABLED=1 # resident 模式下用 Rust recorder 轮询本地机会接口，避免每轮生成 curl/jq 子进程；动态 WSS 会自动回退 shell recorder。
   ARB_RUNTIME_FUNDING_ARB_COMPACT_ARTIFACTS=1 # funding-arb resident/canary 每轮快照默认只保留本轮相关 pair；0 表示恢复完整快照。
   BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT=12 # health-events.jsonl 中保留的 blocking_path 前 N 条，取值 1-100，避免大快照触发系统参数长度限制。
   BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS=300 # 成功 poll_ok 健康事件采样间隔；0 表示每轮都写入。
@@ -341,24 +334,6 @@ strategy_enabled() {
   return 1
 }
 
-supports_auto_once_validation() {
-  case "$1" in
-    binance|bybit|okx|bitget) return 0 ;;
-    aster|hyperliquid) return 1 ;;
-    *) return 1 ;;
-  esac
-}
-
-auto_once_command() {
-  case "$1" in
-    binance) printf 'binance-basis-guarded-live-auto-once' ;;
-    bybit) printf 'bybit-basis-guarded-live-auto-once' ;;
-    okx) printf 'okx-basis-guarded-live-auto-once' ;;
-    bitget) printf 'bitget-basis-guarded-live-auto-once' ;;
-    *) return 1 ;;
-  esac
-}
-
 supports_basis_resident_live() {
   case "$1" in
     binance|bybit|okx|bitget) return 0 ;;
@@ -442,6 +417,7 @@ append_basis_resident_wss_args() {
   local perp_url=""
   local spot_option=""
   local perp_option=""
+  local opportunities_option=""
 
   case "${venue}" in
     binance)
@@ -449,24 +425,28 @@ append_basis_resident_wss_args() {
       perp_url="${BINANCE_PERP_WSS_MONITOR_URL:-}"
       spot_option="--binance-spot-wss-monitor-url"
       perp_option="--binance-perp-wss-monitor-url"
+      opportunities_option="--binance-opportunities-url"
       ;;
     bybit)
       spot_url="${BYBIT_SPOT_WSS_MONITOR_URL:-}"
       perp_url="${BYBIT_PERP_WSS_MONITOR_URL:-}"
       spot_option="--bybit-spot-wss-monitor-url"
       perp_option="--bybit-perp-wss-monitor-url"
+      opportunities_option="--bybit-opportunities-url"
       ;;
     okx)
       spot_url="${OKX_SPOT_WSS_MONITOR_URL:-}"
       perp_url="${OKX_PERP_WSS_MONITOR_URL:-}"
       spot_option="--okx-spot-wss-monitor-url"
       perp_option="--okx-perp-wss-monitor-url"
+      opportunities_option="--okx-opportunities-url"
       ;;
     bitget)
       spot_url="${BITGET_SPOT_WSS_MONITOR_URL:-}"
       perp_url="${BITGET_PERP_WSS_MONITOR_URL:-}"
       spot_option="--bitget-spot-wss-monitor-url"
       perp_option="--bitget-perp-wss-monitor-url"
+      opportunities_option="--bitget-opportunities-url"
       ;;
     *)
       return 0
@@ -482,6 +462,7 @@ append_basis_resident_wss_args() {
     fi
     BASIS_RESIDENT_ARGS+=("${spot_option}" "${spot_url}" "${perp_option}" "${perp_url}")
   fi
+  BASIS_RESIDENT_ARGS+=("${opportunities_option}" "$(opportunities_url "${venue}")")
 }
 
 append_json_line() {
@@ -971,13 +952,25 @@ log_for_name() {
   done < "${PID_FILE}" | tail -n 1
 }
 
+reap_started_process() {
+  local pid="$1"
+  wait "${pid}" 2>/dev/null || true
+}
+
 stop_started_processes() {
   local pid
   [[ -s "${PID_FILE}" ]] || return 0
   while IFS=$'\t' read -r pid _name _log; do
     if is_alive "${pid}"; then
-      kill "${pid}" 2>/dev/null || true
+      kill -TERM "${pid}" 2>/dev/null || true
     fi
+  done < "${PID_FILE}"
+  sleep "${STOP_GRACE_SECS:-3}"
+  while IFS=$'\t' read -r pid _name _log; do
+    if is_alive "${pid}"; then
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
+    reap_started_process "${pid}"
   done < "${PID_FILE}"
 }
 
@@ -1058,6 +1051,7 @@ kill_remaining_started_processes() {
     if is_alive "${pid}"; then
       kill -KILL "${pid}" 2>/dev/null || true
     fi
+    reap_started_process "${pid}"
   done < "${PID_FILE}"
 }
 
@@ -1309,10 +1303,31 @@ funding_arb_resident_exit_is_accepted() {
   ' "${summary_path}" >/dev/null 2>&1
 }
 
+spot_perp_basis_resident_exit_is_accepted() {
+  local summary_path="${BASIS_RESIDENT_OUT_DIR}/multi_venue_resident_live_summary.json"
+
+  strategy_enabled "cross-exchange-funding-arb" || return 1
+  [[ -s "${summary_path}" ]] || return 1
+  jq -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+    (.phase // "") == "halted"
+    and (((.open_position_count // 0) | as_count) == 0)
+    and (((.unknown_position_count // 0) | as_count) == 0)
+    and (((.live_entry_count // 0) | as_count) == 0)
+    and ((.entry_dispatch_attempted // false) == false)
+    and ((.exit_dispatch_attempted // false) == false)
+  ' "${summary_path}" >/dev/null 2>&1
+}
+
 resident_exit_is_accepted() {
   local name="$1"
 
   case "${name}" in
+    spot-perp-basis-resident-live) spot_perp_basis_resident_exit_is_accepted ;;
     funding-arb-resident-live) funding_arb_resident_exit_is_accepted ;;
     *) return 1 ;;
   esac
@@ -2060,7 +2075,6 @@ run_funding_arb_startup_unknown_recovery_once() {
     --out "${FUNDING_ARB_RESIDENT_OUT_DIR}"
     --interval-secs "${FUNDING_ARB_RESIDENT_INTERVAL_SECS}"
     --max-cycles "1"
-    --max-live-entries "${FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES}"
     --notional-usd "${NOTIONAL_USD}"
     --taker-fee-bps "${PERP_FEE_BPS}"
     --slippage-bps "${SLIPPAGE_BPS}"
@@ -2144,6 +2158,7 @@ run_funding_arb_startup_dry_run_precheck_for_pair() {
   local readonly_dir
   local guarded_dir
   local log_file
+  local report_path
   local -a readonly_args
   local -a dry_run_args
 
@@ -2203,23 +2218,29 @@ run_funding_arb_startup_dry_run_precheck_for_pair() {
     return 1
   fi
 
+  report_path="${guarded_dir}/funding_arb_guarded_dry_run_report.json"
+  if [[ ! -s "${report_path}" ]]; then
+    write_funding_arb_startup_block_report "guarded_dry_run_report_missing" "[]" "${pair_id}" "${guarded_dir}" 0
+    echo "error: funding-arb startup guarded dry-run did not write report for pair_id=${pair_id}; out=${guarded_dir}" >&2
+    return 1
+  fi
+
   if jq -e '
     (.signal_allowed == true)
     and (.live_ready == true)
     and (.dispatch_plan_built == true)
     and ((.dispatch_request_count // 0) == 2)
     and (((.live_blocking_reasons // []) | length) == 0)
-  ' "${guarded_dir}/funding_arb_guarded_dry_run_report.json" >/dev/null 2>&1; then
-    echo "funding_arb_startup_precheck_ok pair_id=${pair_id} report=${guarded_dir}/funding_arb_guarded_dry_run_report.json"
+  ' "${report_path}" >/dev/null 2>&1; then
+    echo "funding_arb_startup_precheck_ok pair_id=${pair_id} report=${report_path}"
     return 0
   fi
 
-  if funding_arb_guarded_dry_run_report_is_stale_candidate_skip "${guarded_dir}/funding_arb_guarded_dry_run_report.json"; then
-    echo "funding_arb_startup_precheck_skip_stale_candidate pair_id=${pair_id} report=${guarded_dir}/funding_arb_guarded_dry_run_report.json"
+  if funding_arb_guarded_dry_run_report_is_stale_candidate_skip "${report_path}"; then
+    echo "funding_arb_startup_precheck_skip_stale_candidate pair_id=${pair_id} report=${report_path}"
     return 2
   fi
-  write_funding_arb_startup_block_report "guarded_dry_run_not_live_ready" "[]" "${pair_id}" "${guarded_dir}/funding_arb_guarded_dry_run_report.json" 0
-  echo "error: funding-arb startup guarded dry-run is not live-ready for pair_id=${pair_id}" >&2
+  echo "funding_arb_startup_precheck_skip_not_live_ready pair_id=${pair_id} report=${report_path}" >&2
   jq -c '{
     pair_id,
     symbol,
@@ -2231,8 +2252,8 @@ run_funding_arb_startup_dry_run_precheck_for_pair() {
     private_account_status: (.private_accounts.status // null),
     private_position_status: (.private_positions.status // null),
     execution_preflight_status: (.execution_preflight.status // null)
-  }' "${guarded_dir}/funding_arb_guarded_dry_run_report.json" >&2 2>> "${LOG_DIR}/jq-errors.log" || true
-  return 1
+  }' "${report_path}" >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+  return 3
 }
 
 check_funding_arb_resident_startup_risk() {
@@ -2241,6 +2262,7 @@ check_funding_arb_resident_startup_risk() {
   local pair_count=0
   local ready_count=0
   local stale_candidate_count=0
+  local not_live_ready_candidate_count=0
   local precheck_status=0
   local snapshot_path="${SNAPSHOT_DIR}/funding-arb/funding_arb_monitor_snapshot.json"
   local precheck_snapshot_path
@@ -2290,6 +2312,10 @@ check_funding_arb_resident_startup_risk() {
       stale_candidate_count="$((stale_candidate_count + 1))"
       continue
     fi
+    if [[ "${precheck_status}" == "3" ]]; then
+      not_live_ready_candidate_count="$((not_live_ready_candidate_count + 1))"
+      continue
+    fi
     return 1
   done <<< "${candidate_pair_ids}"
 
@@ -2299,456 +2325,21 @@ check_funding_arb_resident_startup_risk() {
     return 0
   elif (( ready_count > 0 )); then
     clear_funding_arb_startup_block_report
-    echo "funding_arb_startup_precheck_ok reason=current_candidate_live_ready ready_candidate_count=${ready_count} stale_candidate_count=${stale_candidate_count}"
+    echo "funding_arb_startup_precheck_ok reason=current_candidate_live_ready ready_candidate_count=${ready_count} stale_candidate_count=${stale_candidate_count} not_live_ready_candidate_count=${not_live_ready_candidate_count}"
     return 0
   elif (( ready_count == 0 && stale_candidate_count > 0 )); then
     clear_funding_arb_startup_block_report
-    echo "funding_arb_startup_precheck_ok reason=all_current_candidates_stale_after_revalidation stale_candidate_count=${stale_candidate_count}"
+    echo "funding_arb_startup_precheck_ok reason=all_current_candidates_stale_after_revalidation stale_candidate_count=${stale_candidate_count} not_live_ready_candidate_count=${not_live_ready_candidate_count}"
+    return 0
+  elif (( ready_count == 0 && not_live_ready_candidate_count > 0 )); then
+    clear_funding_arb_startup_block_report
+    echo "funding_arb_startup_precheck_ok reason=current_candidates_not_live_ready not_live_ready_candidate_count=${not_live_ready_candidate_count} stale_candidate_count=${stale_candidate_count}"
     return 0
   fi
 
   clear_funding_arb_startup_block_report
   echo "funding_arb_startup_precheck_ok reason=no_startup_blocking_candidate"
   return 0
-}
-
-run_validation_job() {
-  set +e
-  local venue="$1"
-  local symbol="$2"
-  local run_id="$3"
-  local out_dir="$4"
-  local job_log="$5"
-  local started_at
-  local finished_at
-  local status
-  local command_name
-  local report_file
-  local validation_result_class="command_failed"
-  local spot_wss=""
-  local perp_wss=""
-  local wss_values
-  local args
-
-  command_name="$(auto_once_command "${venue}")"
-  report_file="${out_dir}/basis_auto_once_report.json"
-  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  mkdir -p "${out_dir}"
-
-  {
-    echo "[$(local_log_timestamp)] validation_start venue=${venue} symbol=${symbol} run_id=${run_id}"
-
-    args=(
-      "${RUNTIME_BIN}"
-      "${command_name}"
-      --symbol "${symbol}"
-      --config "${CONFIG_PATH}"
-      --out "${out_dir}"
-      --min-net-bps "${MIN_NET_BPS}"
-      --auto-price-guard-bps "${AUTO_PRICE_GUARD_BPS}"
-    )
-
-    if [[ "${EXECUTE_LIVE}" == "1" ]]; then
-      args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-basis-live-orders)
-    else
-      args+=(--dry-run)
-    fi
-
-    if ! wss_values="$(target_wss_args_for_venue_symbol "${venue}" "${symbol}")"; then
-      status=1
-      finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      append_json_line "${EXECUTION_REPORTS_JSONL}" \
-        --arg venue "${venue}" \
-        --arg symbol "${symbol}" \
-        --arg run_id "${run_id}" \
-        --arg started_at "${started_at}" \
-        --arg finished_at "${finished_at}" \
-        --arg out_dir "${out_dir}" \
-        --arg execution_mode "${EXECUTION_MODE}" \
-        --argjson exit_status "${status}" \
-        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-        '{execution_mode:$execution_mode,venue:$venue,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"target_wss_setup_failed",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,target_wss_setup_failed:true}'
-      echo "[$(local_log_timestamp)] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} result=target_wss_setup_failed out=${out_dir}"
-      return 0
-    fi
-    if [[ -n "${wss_values}" ]]; then
-      spot_wss="$(printf '%s\n' "${wss_values}" | sed -n '1p')"
-      perp_wss="$(printf '%s\n' "${wss_values}" | sed -n '2p')"
-      args+=(--spot-wss-monitor-url "${spot_wss}" --perp-wss-monitor-url "${perp_wss}")
-    fi
-
-    "${args[@]}"
-    status="$?"
-    finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-    if [[ -s "${report_file}" ]]; then
-      validation_result_class="$(jq -r --argjson exit_status "${status}" '
-        if $exit_status != 0 and any(.blocking_reasons[]?; startswith("input_parse_failed")) then
-          "input_parse_failed"
-        elif .dispatch_plan_built == true and (.dispatch_request_count // 0) == 2 then
-          "pre_trade_flow_complete"
-        elif .manual_gate_released == true then
-          "manual_gate_released_dispatch_plan_missing"
-        elif .signal_allowed == false then
-          "signal_blocked"
-        else
-          "incomplete"
-        end
-      ' "${report_file}" 2>> "${LOG_DIR}/jq-errors.log")"
-      append_jq_file_line "${EXECUTION_REPORTS_JSONL}" "${report_file}" \
-        --arg venue "${venue}" \
-        --arg symbol "${symbol}" \
-        --arg run_id "${run_id}" \
-        --arg started_at "${started_at}" \
-        --arg finished_at "${finished_at}" \
-        --arg out_dir "${out_dir}" \
-        --arg validation_result_class "${validation_result_class}" \
-        --arg execution_mode "${EXECUTION_MODE}" \
-        --argjson exit_status "${status}" \
-        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-        '. + {
-          execution_mode: $execution_mode,
-          venue: $venue,
-          symbol: $symbol,
-          run_id: $run_id,
-          validation_started_at: $started_at,
-          validation_finished_at: $finished_at,
-          validation_exit_status: $exit_status,
-          validation_result_class: $validation_result_class,
-          dry_run_output_dir: $out_dir,
-          validation_output_dir: $out_dir,
-          mutable_execution_started: $mutable_execution_started
-        }'
-    else
-      append_json_line "${EXECUTION_REPORTS_JSONL}" \
-        --arg venue "${venue}" \
-        --arg symbol "${symbol}" \
-        --arg run_id "${run_id}" \
-        --arg started_at "${started_at}" \
-        --arg finished_at "${finished_at}" \
-        --arg out_dir "${out_dir}" \
-        --arg execution_mode "${EXECUTION_MODE}" \
-        --argjson exit_status "${status}" \
-        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-        '{execution_mode:$execution_mode,venue:$venue,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,report_missing:true}'
-    fi
-
-    echo "[$(local_log_timestamp)] validation_end venue=${venue} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
-  } >> "${job_log}" 2>&1
-}
-
-run_funding_arb_validation_job() {
-  set +e
-  local pair_id="$1"
-  local symbol="$2"
-  local snapshot_file="$3"
-  local run_id="$4"
-  local out_dir="$5"
-  local job_log="$6"
-  local started_at
-  local finished_at
-  local status
-  local report_file
-  local command_name
-  local args
-  local asset_id_arg
-  local -a hyperliquid_asset_id_args
-  local validation_result_class="command_failed"
-
-  if [[ "${EXECUTE_LIVE}" == "1" ]]; then
-    command_name="funding-arb-guarded-live-canary-once"
-    report_file="${out_dir}/funding_arb_guarded_live_canary_report.json"
-  else
-    command_name="funding-arb-guarded-dry-run-once"
-    report_file="${out_dir}/funding_arb_guarded_dry_run_report.json"
-  fi
-  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  mkdir -p "${out_dir}"
-
-  {
-    echo "[$(local_log_timestamp)] funding_validation_start pair_id=${pair_id} symbol=${symbol} run_id=${run_id}"
-
-    args=(
-      "${RUNTIME_BIN}" "${command_name}"
-      --snapshot "${snapshot_file}" \
-      --pair-id "${pair_id}" \
-      --config "${CONFIG_PATH}" \
-      --out "${out_dir}" \
-      --notional-usd "${NOTIONAL_USD}" \
-      --taker-fee-bps "${PERP_FEE_BPS}" \
-      --slippage-bps "${SLIPPAGE_BPS}" \
-      --max-entry-price-divergence-bps "${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS}" \
-      --min-net-funding-bps "${MIN_NET_BPS}"
-    )
-
-    [[ -n "${FUNDING_SETTLEMENT_LEDGER:-}" ]] && args+=(--funding-settlement-ledger "${FUNDING_SETTLEMENT_LEDGER}")
-    [[ -n "${FUNDING_SETTLEMENT_RAW_SNAPSHOT:-}" ]] && args+=(--funding-settlement-raw-snapshot "${FUNDING_SETTLEMENT_RAW_SNAPSHOT}")
-
-    if [[ "${EXECUTE_LIVE}" == "1" ]]; then
-      args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-funding-arb-live-orders)
-      [[ -n "${HYPERLIQUID_USER:-}" ]] && args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
-      [[ -n "${HYPERLIQUID_SOURCE:-}" ]] && args+=(--hyperliquid-source "${HYPERLIQUID_SOURCE}")
-      [[ -n "${HYPERLIQUID_VAULT_ADDRESS:-}" ]] && args+=(--hyperliquid-vault-address "${HYPERLIQUID_VAULT_ADDRESS}")
-      [[ -n "${HYPERLIQUID_EXPIRES_AFTER_MS:-}" ]] && args+=(--hyperliquid-expires-after-ms "${HYPERLIQUID_EXPIRES_AFTER_MS}")
-      if [[ -n "${HYPERLIQUID_ASSET_IDS:-}" ]]; then
-        IFS=',' read -r -a hyperliquid_asset_id_args <<< "${HYPERLIQUID_ASSET_IDS}"
-        for asset_id_arg in "${hyperliquid_asset_id_args[@]}"; do
-          asset_id_arg="${asset_id_arg//[[:space:]]/}"
-          [[ -n "${asset_id_arg}" ]] && args+=(--hyperliquid-asset-id "${asset_id_arg}")
-        done
-      fi
-      [[ -n "${ASTER_USER:-}" ]] && args+=(--aster-user "${ASTER_USER}")
-      [[ -n "${ASTER_SIGNER:-}" ]] && args+=(--aster-signer "${ASTER_SIGNER}")
-      [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && args+=(--aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
-    else
-      args+=(--dry-run)
-    fi
-
-    "${args[@]}"
-    status="$?"
-    finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-    if [[ -s "${report_file}" ]]; then
-      validation_result_class="$(jq -r --argjson exit_status "${status}" '
-        if $exit_status != 0 then
-          "command_failed"
-        elif .dispatch_plan_built == true and (.dispatch_request_count // 0) == 2 then
-          "pre_trade_flow_complete"
-        elif .manual_gate_released == true then
-          "manual_gate_released_dispatch_plan_missing"
-        elif .signal_allowed == false then
-          "signal_blocked"
-        else
-          "incomplete"
-        end
-      ' "${report_file}" 2>> "${LOG_DIR}/jq-errors.log")"
-      append_jq_file_line "${EXECUTION_REPORTS_JSONL}" "${report_file}" \
-        --arg strategy "cross-exchange-funding-arb" \
-        --arg pair_id "${pair_id}" \
-        --arg symbol "${symbol}" \
-        --arg run_id "${run_id}" \
-        --arg started_at "${started_at}" \
-        --arg finished_at "${finished_at}" \
-        --arg out_dir "${out_dir}" \
-        --arg validation_result_class "${validation_result_class}" \
-        --arg execution_mode "${EXECUTION_MODE}" \
-        --argjson exit_status "${status}" \
-        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-        '. + {
-          execution_mode: $execution_mode,
-          strategy: $strategy,
-          pair_id: $pair_id,
-          symbol: $symbol,
-          run_id: $run_id,
-          validation_started_at: $started_at,
-          validation_finished_at: $finished_at,
-          validation_exit_status: $exit_status,
-          validation_result_class: $validation_result_class,
-          dry_run_output_dir: $out_dir,
-          validation_output_dir: $out_dir,
-          mutable_execution_started: $mutable_execution_started
-        }'
-    else
-      append_json_line "${EXECUTION_REPORTS_JSONL}" \
-        --arg strategy "cross-exchange-funding-arb" \
-        --arg pair_id "${pair_id}" \
-        --arg symbol "${symbol}" \
-        --arg run_id "${run_id}" \
-        --arg started_at "${started_at}" \
-        --arg finished_at "${finished_at}" \
-        --arg out_dir "${out_dir}" \
-        --arg execution_mode "${EXECUTION_MODE}" \
-        --argjson exit_status "${status}" \
-        --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-        '{execution_mode:$execution_mode,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,run_id:$run_id,validation_started_at:$started_at,validation_finished_at:$finished_at,validation_exit_status:$exit_status,validation_result_class:"report_missing",dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started,report_missing:true}'
-    fi
-
-    echo "[$(local_log_timestamp)] funding_validation_end pair_id=${pair_id} symbol=${symbol} run_id=${run_id} exit_status=${status} out=${out_dir}"
-  } >> "${job_log}" 2>&1
-}
-
-maybe_start_validation() {
-  local venue="$1"
-  local symbol="$2"
-  local ts="$3"
-  local now
-  local last_file
-  local last_value
-  local inflight_file
-  local inflight_pid
-  local run_id
-  local out_dir
-  local job_log
-  local slug
-  local pid
-
-  [[ "${VALIDATE_AUTO_ONCE}" == "1" ]] || return 0
-
-  [[ -n "${symbol}" ]] || return 0
-  if ! supports_auto_once_validation "${venue}"; then
-    append_json_line "${VALIDATION_EVENTS_JSONL}" \
-      --arg venue "${venue}" \
-      --arg symbol "${symbol}" \
-      --arg recorded_at "${ts}" \
-      --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-      '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,event:"validation_skipped",reason:"auto_once_not_supported",mutable_execution_started:$mutable_execution_started}'
-    return 0
-  fi
-
-  slug="$(symbol_slug "${symbol}")"
-
-  inflight_file="${STATE_DIR}/validation-${venue}-${slug}.pid"
-  if [[ -s "${inflight_file}" ]]; then
-    inflight_pid="$(sed -n '1p' "${inflight_file}")"
-    if is_alive "${inflight_pid}"; then
-      append_json_line "${VALIDATION_EVENTS_JSONL}" \
-        --arg venue "${venue}" \
-        --arg symbol "${symbol}" \
-        --arg recorded_at "${ts}" \
-        --argjson pid "${inflight_pid}" \
-        '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,event:"validation_skipped",reason:"validation_in_progress",pid:$pid}'
-      return 0
-    fi
-  fi
-
-  now="$(date -u +%s)"
-  last_file="${STATE_DIR}/last-validation-${venue}-${slug}.epoch"
-  if [[ "${AUTO_ONCE_COOLDOWN_SECS}" != "0" && -s "${last_file}" ]]; then
-    last_value="$(sed -n '1p' "${last_file}")"
-    if [[ "${last_value}" =~ ^[0-9]+$ ]] && (( now - last_value < AUTO_ONCE_COOLDOWN_SECS )); then
-      append_json_line "${VALIDATION_EVENTS_JSONL}" \
-        --arg venue "${venue}" \
-        --arg symbol "${symbol}" \
-        --arg recorded_at "${ts}" \
-        --argjson age "$((now - last_value))" \
-        --argjson cooldown "${AUTO_ONCE_COOLDOWN_SECS}" \
-        '{recorded_at:$recorded_at,venue:$venue,symbol:$symbol,event:"validation_skipped",reason:"cooldown",age_secs:$age,cooldown_secs:$cooldown}'
-      return 0
-    fi
-  fi
-  printf '%s\n' "${now}" > "${last_file}"
-
-  run_id="$(date -u +%Y%m%dT%H%M%SZ)-${venue}-${slug}-$$-${RANDOM}"
-  out_dir="${EXECUTION_DIR}/${run_id}"
-  job_log="${LOG_DIR}/${venue}-${EXECUTION_MODE}-${run_id}.log"
-  run_validation_job "${venue}" "${symbol}" "${run_id}" "${out_dir}" "${job_log}" &
-  pid="$!"
-  printf '%s\n' "${pid}" > "${inflight_file}"
-  printf '%s\t%s\t%s\n' "${pid}" "validation-${venue}-${slug}-${run_id}" "${job_log}" >> "${PID_FILE}"
-  append_json_line "${VALIDATION_EVENTS_JSONL}" \
-    --arg venue "${venue}" \
-    --arg symbol "${symbol}" \
-    --arg recorded_at "${ts}" \
-    --arg run_id "${run_id}" \
-    --arg out_dir "${out_dir}" \
-    --argjson pid "${pid}" \
-    --arg execution_mode "${EXECUTION_MODE}" \
-    --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-    '{recorded_at:$recorded_at,execution_mode:$execution_mode,venue:$venue,symbol:$symbol,event:"validation_started",run_id:$run_id,pid:$pid,dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started}'
-}
-
-maybe_start_funding_arb_validation() {
-  local pair_id="$1"
-  local symbol="$2"
-  local ts="$3"
-  local body="$4"
-  local now
-  local last_file
-  local last_value
-  local inflight_file
-  local inflight_pid
-  local run_id
-  local out_dir
-  local job_log
-  local pair_slug
-  local symbol_part
-  local snapshot_file
-  local pid
-
-  [[ "${VALIDATE_AUTO_ONCE}" == "1" ]] || return 0
-  [[ -n "${pair_id}" && -n "${symbol}" ]] || return 0
-
-  pair_slug="$(symbol_slug "${pair_id}")"
-  symbol_part="$(symbol_slug "${symbol}")"
-  inflight_file="${STATE_DIR}/validation-funding-arb-${pair_slug}.pid"
-  if [[ -s "${inflight_file}" ]]; then
-    inflight_pid="$(sed -n '1p' "${inflight_file}")"
-    if is_alive "${inflight_pid}"; then
-      append_json_line "${VALIDATION_EVENTS_JSONL}" \
-        --arg strategy "cross-exchange-funding-arb" \
-        --arg pair_id "${pair_id}" \
-        --arg symbol "${symbol}" \
-        --arg recorded_at "${ts}" \
-        --argjson pid "${inflight_pid}" \
-        '{recorded_at:$recorded_at,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,event:"validation_skipped",reason:"validation_in_progress",pid:$pid,mutable_execution_started:false}'
-      return 0
-    fi
-  fi
-
-  now="$(date -u +%s)"
-  last_file="${STATE_DIR}/last-validation-funding-arb-${pair_slug}.epoch"
-  if [[ "${AUTO_ONCE_COOLDOWN_SECS}" != "0" && -s "${last_file}" ]]; then
-    last_value="$(sed -n '1p' "${last_file}")"
-    if [[ "${last_value}" =~ ^[0-9]+$ ]] && (( now - last_value < AUTO_ONCE_COOLDOWN_SECS )); then
-      append_json_line "${VALIDATION_EVENTS_JSONL}" \
-        --arg strategy "cross-exchange-funding-arb" \
-        --arg pair_id "${pair_id}" \
-        --arg symbol "${symbol}" \
-        --arg recorded_at "${ts}" \
-        --argjson age "$((now - last_value))" \
-        --argjson cooldown "${AUTO_ONCE_COOLDOWN_SECS}" \
-        '{recorded_at:$recorded_at,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,event:"validation_skipped",reason:"cooldown",age_secs:$age,cooldown_secs:$cooldown,mutable_execution_started:false}'
-      return 0
-    fi
-  fi
-  printf '%s\n' "${now}" > "${last_file}"
-
-  run_id="$(date -u +%Y%m%dT%H%M%SZ)-funding-arb-${symbol_part}-$$-${RANDOM}"
-  out_dir="${EXECUTION_DIR}/${run_id}"
-  job_log="${LOG_DIR}/funding-arb-${EXECUTION_MODE}-${run_id}.log"
-  snapshot_file="${out_dir}/funding_arb_opportunities_snapshot.input.json"
-  mkdir -p "${out_dir}"
-  printf '%s\n' "${body}" > "${snapshot_file}"
-
-  run_funding_arb_validation_job "${pair_id}" "${symbol}" "${snapshot_file}" "${run_id}" "${out_dir}" "${job_log}" &
-  pid="$!"
-  printf '%s\n' "${pid}" > "${inflight_file}"
-  printf '%s\t%s\t%s\n' "${pid}" "validation-funding-arb-${pair_slug}-${run_id}" "${job_log}" >> "${PID_FILE}"
-  append_json_line "${VALIDATION_EVENTS_JSONL}" \
-    --arg strategy "cross-exchange-funding-arb" \
-    --arg pair_id "${pair_id}" \
-    --arg symbol "${symbol}" \
-    --arg recorded_at "${ts}" \
-    --arg run_id "${run_id}" \
-    --arg out_dir "${out_dir}" \
-    --argjson pid "${pid}" \
-    --arg execution_mode "${EXECUTION_MODE}" \
-    --argjson mutable_execution_started "${MUTABLE_EXECUTION_STARTED_JSON}" \
-    '{recorded_at:$recorded_at,execution_mode:$execution_mode,strategy:$strategy,pair_id:$pair_id,symbol:$symbol,event:"validation_started",run_id:$run_id,pid:$pid,dry_run_output_dir:$out_dir,validation_output_dir:$out_dir,mutable_execution_started:$mutable_execution_started}'
-}
-
-start_validations_for_candidates() {
-  local venue="$1"
-  local body="$2"
-  local ts="$3"
-  local symbol
-
-  printf '%s\n' "${body}" | jq -r '.rows[]? | select(.is_candidate == true) | .symbol' |
-    while IFS= read -r symbol; do
-      maybe_start_validation "${venue}" "${symbol}" "${ts}"
-    done
-}
-
-start_funding_arb_validations_for_candidates() {
-  local body="$1"
-  local ts="$2"
-  local pair_id
-  local symbol
-
-  printf '%s\n' "${body}" | jq -r '.rows[]? | select(.is_candidate == true) | [.pair_id, .symbol] | @tsv' |
-    while IFS=$'\t' read -r pair_id symbol; do
-      maybe_start_funding_arb_validation "${pair_id}" "${symbol}" "${ts}" "${body}"
-    done
 }
 
 poll_venue() {
@@ -2839,9 +2430,6 @@ poll_venue() {
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.symbol):net=\(.net_basis_bps // "null")bps profit=\(.expected_profit_usd // "null")"] | join(", ")')"
     append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] opportunity venue=${venue} candidate_count=${count} ${summary}"
     start_target_wss_warmups_for_candidates "${venue}" "${body}" "${ts}"
-    if [[ "${SPOT_PERP_BASIS_MODE}" == "auto-once" ]]; then
-      start_validations_for_candidates "${venue}" "${body}" "${ts}"
-    fi
   else
     summary="$(printf '%s\n' "${body}" | jq -r '(.blocking_path // []) | .[0:6] | map("\(.blocker):\(.reason)") | join(" | ")' 2>> "${LOG_DIR}/jq-errors.log" || true)"
     if [[ -z "${summary}" ]]; then
@@ -2932,9 +2520,6 @@ poll_funding_arb() {
 
     summary="$(printf '%s\n' "${body}" | jq -r '[.rows[]? | "\(.pair_id):net=\(.net_funding_bps // "null")bps funding=\(.expected_funding_usd // "null")"] | join(", ")')"
     append_text_line "${FEEDBACK_LOG}" "[$(local_log_timestamp)] opportunity strategy=cross-exchange-funding-arb candidate_count=${count} ${summary}"
-    if [[ "${FUNDING_ARB_MODE}" == "auto-once" ]]; then
-      start_funding_arb_validations_for_candidates "${body}" "${ts}"
-    fi
   else
     summary="$(printf '%s\n' "${body}" | jq -r '(.blocking_path // []) | .[0:6] | map("\(.blocker):\(.reason)") | join(" | ")' 2>> "${LOG_DIR}/jq-errors.log" || true)"
     if [[ -z "${summary}" ]]; then
@@ -3184,11 +2769,9 @@ if [[ "${1:-}" == "--recorder" ]]; then
   ASTER_USER="${BASIS_OBSERVER_ASTER_USER:-${ASTER_USER:-}}"
   ASTER_SIGNER="${BASIS_OBSERVER_ASTER_SIGNER:-${ASTER_SIGNER:-}}"
   ASTER_SIGNER_CMD_ENV="${BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV:-${ASTER_SIGNER_CMD_ENV:-}}"
-  VALIDATE_AUTO_ONCE="${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}"
-  AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
-  SPOT_PERP_BASIS_MODE="${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-resident}"
+  SPOT_PERP_BASIS_MODE="resident"
   BASIS_RESIDENT_OUT_DIR="${BASIS_OBSERVER_BASIS_RESIDENT_OUT:-${RUN_ROOT}/resident-live/spot-perp-basis}"
-  FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+  FUNDING_ARB_MODE="resident"
   FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
   HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-300}"
   RESIDENT_HEALTH_TAIL_LINES="${BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES:-200}"
@@ -3323,17 +2906,15 @@ FUNDING_ARB_BIND="${FUNDING_ARB_BIND:-127.0.0.1:8804}"
 FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS="${FUNDING_ARB_MAX_ENTRY_PRICE_DIVERGENCE_BPS:-20}"
 AUTO_PRICE_GUARD_BPS="${BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS:-2}"
 PRIVATE_ORDER_EVENTS_DIR="${BASIS_OBSERVER_PRIVATE_ORDER_EVENTS_DIR:-${RUN_ROOT}/private-order-events}"
-SPOT_PERP_BASIS_MODE="${BASIS_OBSERVER_SPOT_PERP_BASIS_MODE:-resident}"
+SPOT_PERP_BASIS_MODE="resident"
 BASIS_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS:-60}"
-BASIS_RESIDENT_MAX_LIVE_ENTRIES="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES:-1}"
 BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS:-1}"
 BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT:-10.00}"
 BASIS_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES:-}"
 BASIS_RESIDENT_OUT_DIR="${BASIS_OBSERVER_BASIS_RESIDENT_OUT:-${RUN_ROOT}/resident-live/spot-perp-basis}"
 BASIS_RESIDENT_ADL_EVENTS_DIR="${BASIS_OBSERVER_BASIS_RESIDENT_ADL_EVENTS_DIR:-}"
-FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
+FUNDING_ARB_MODE="resident"
 FUNDING_ARB_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS:-60}"
-FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES:-1}"
 FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
 FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
 FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY="${BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY:-0}"
@@ -3359,8 +2940,6 @@ HYPERLIQUID_ASSET_IDS="${BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS:-${HYPERLIQUID_ASS
 ASTER_USER="${BASIS_OBSERVER_ASTER_USER:-${ASTER_USER:-}}"
 ASTER_SIGNER="${BASIS_OBSERVER_ASTER_SIGNER:-${ASTER_SIGNER:-}}"
 ASTER_SIGNER_CMD_ENV="${BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV:-${ASTER_SIGNER_CMD_ENV:-}}"
-VALIDATE_AUTO_ONCE="${BASIS_OBSERVER_VALIDATE_AUTO_ONCE:-1}"
-AUTO_ONCE_COOLDOWN_SECS="${BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS:-60}"
 CURL_TIMEOUT_SECS="${BASIS_OBSERVER_CURL_TIMEOUT_SECS:-10}"
 CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
 CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
@@ -3376,17 +2955,13 @@ STOP_DRAIN_SECS="${BASIS_OBSERVER_STOP_DRAIN_SECS:-15}"
 STOP_GRACE_SECS="${BASIS_OBSERVER_STOP_GRACE_SECS:-3}"
 RECLAIM_STALE_MONITOR_PORTS="${BASIS_OBSERVER_RECLAIM_STALE_MONITOR_PORTS:-1}"
 FOREGROUND="${BASIS_OBSERVER_FOREGROUND:-0}"
-STRATEGIES="${CLI_STRATEGIES:-${BASIS_OBSERVER_STRATEGIES:-spot-perp-basis,cross-exchange-funding-arb}}"
-
-case "${SPOT_PERP_BASIS_MODE}" in
-  resident|auto-once) ;;
-  *) die "BASIS_OBSERVER_SPOT_PERP_BASIS_MODE must be resident or auto-once" ;;
-esac
-
-case "${FUNDING_ARB_MODE}" in
-  resident|auto-once) ;;
-  *) die "BASIS_OBSERVER_FUNDING_ARB_MODE must be resident or auto-once" ;;
-esac
+if [[ -n "${CLI_STRATEGIES}" ]]; then
+  STRATEGIES="${CLI_STRATEGIES}"
+elif [[ -n "${BASIS_OBSERVER_STRATEGIES:-}" ]]; then
+  STRATEGIES="${BASIS_OBSERVER_STRATEGIES}"
+else
+  STRATEGIES="spot-perp-basis,cross-exchange-funding-arb"
+fi
 
 case "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" in
   0|1) ;;
@@ -3593,7 +3168,6 @@ start_funding_arb_resident_live() {
     --config "${CONFIG_PATH}"
     --out "${out_dir}"
     --interval-secs "${FUNDING_ARB_RESIDENT_INTERVAL_SECS}"
-    --max-live-entries "${FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES}"
     --notional-usd "${NOTIONAL_USD}"
     --taker-fee-bps "${PERP_FEE_BPS}"
     --slippage-bps "${SLIPPAGE_BPS}"
@@ -3655,7 +3229,6 @@ start_spot_perp_basis_resident_live() {
     --interval-secs "${BASIS_RESIDENT_INTERVAL_SECS}"
     --min-net-bps "${MIN_NET_BPS}"
     --auto-price-guard-bps "${AUTO_PRICE_GUARD_BPS}"
-    --max-live-entries "${BASIS_RESIDENT_MAX_LIVE_ENTRIES}"
     --max-concurrent-positions "${BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS}"
     --max-total-notional-usdt "${BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT}"
   )
@@ -3783,8 +3356,6 @@ nohup env \
   BASIS_OBSERVER_ASTER_USER="${ASTER_USER}" \
   BASIS_OBSERVER_ASTER_SIGNER="${ASTER_SIGNER}" \
   BASIS_OBSERVER_ASTER_SIGNER_CMD_ENV="${ASTER_SIGNER_CMD_ENV}" \
-  BASIS_OBSERVER_VALIDATE_AUTO_ONCE="${VALIDATE_AUTO_ONCE}" \
-  BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS="${AUTO_ONCE_COOLDOWN_SECS}" \
   BASIS_OBSERVER_CURL_TIMEOUT_SECS="${CURL_TIMEOUT_SECS}" \
   BASIS_OBSERVER_CURL_RETRIES="${CURL_RETRIES}" \
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS="${CURL_RETRY_SLEEP_SECS}" \
