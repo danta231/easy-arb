@@ -92,8 +92,9 @@ usage() {
   BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS=1 # HTTP 重试间隔秒数。
   BASIS_OBSERVER_CURL_TIMEOUT_SECS=10 # 单次 HTTP 请求超时秒数。
   BASIS_OBSERVER_RUST_RECORDER_ENABLED=1 # resident 模式下用 Rust recorder 轮询本地机会接口，避免每轮生成 curl/jq 子进程；auto-once/动态 WSS 会自动回退 shell recorder。
+  ARB_RUNTIME_FUNDING_ARB_COMPACT_ARTIFACTS=1 # funding-arb resident/canary 每轮快照默认只保留本轮相关 pair；0 表示恢复完整快照。
   BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT=12 # health-events.jsonl 中保留的 blocking_path 前 N 条，取值 1-100，避免大快照触发系统参数长度限制。
-  BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS=60 # 成功 poll_ok 健康事件采样间隔；0 表示每轮都写入。
+  BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS=300 # 成功 poll_ok 健康事件采样间隔；0 表示每轮都写入。
   BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES=200 # 常驻 runner 健康摘要检查最近 N 条事件。
   BASIS_OBSERVER_LOG_ROTATE_BYTES=134217728 # observer JSONL/log 单文件轮转阈值；0 表示禁用轮转。
   BASIS_OBSERVER_LOG_ROTATE_KEEP=4 # observer JSONL/log 保留的轮转文件数量；0 表示禁用轮转。
@@ -563,13 +564,13 @@ health_sample_state_path() {
 should_emit_health_event() {
   local source="$1"
   local key="$2"
-  local sample_secs="${HEALTH_EVENT_SAMPLE_SECS:-${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-60}}"
+  local sample_secs="${HEALTH_EVENT_SAMPLE_SECS:-${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-300}}"
   local now
   local state_path
   local last_ts="0"
   local last_key=""
 
-  [[ "${sample_secs}" =~ ^[0-9]+$ ]] || sample_secs="60"
+  [[ "${sample_secs}" =~ ^[0-9]+$ ]] || sample_secs="300"
   (( sample_secs > 0 )) || return 0
   now="$(date +%s)"
   state_path="$(health_sample_state_path "${source}")"
@@ -3189,7 +3190,7 @@ if [[ "${1:-}" == "--recorder" ]]; then
   BASIS_RESIDENT_OUT_DIR="${BASIS_OBSERVER_BASIS_RESIDENT_OUT:-${RUN_ROOT}/resident-live/spot-perp-basis}"
   FUNDING_ARB_MODE="${BASIS_OBSERVER_FUNDING_ARB_MODE:-resident}"
   FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
-  HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-60}"
+  HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-300}"
   RESIDENT_HEALTH_TAIL_LINES="${BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES:-200}"
   LOG_ROTATE_BYTES="${BASIS_OBSERVER_LOG_ROTATE_BYTES:-134217728}"
   LOG_ROTATE_KEEP="${BASIS_OBSERVER_LOG_ROTATE_KEEP:-4}"
@@ -3365,7 +3366,7 @@ CURL_RETRIES="${BASIS_OBSERVER_CURL_RETRIES:-3}"
 CURL_RETRY_SLEEP_SECS="${BASIS_OBSERVER_CURL_RETRY_SLEEP_SECS:-1}"
 RUST_RECORDER_ENABLED="${BASIS_OBSERVER_RUST_RECORDER_ENABLED:-1}"
 BLOCKING_PATH_EVENT_LIMIT="${BASIS_OBSERVER_BLOCKING_PATH_EVENT_LIMIT:-12}"
-HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-60}"
+HEALTH_EVENT_SAMPLE_SECS="${BASIS_OBSERVER_HEALTH_EVENT_SAMPLE_SECS:-300}"
 RESIDENT_HEALTH_TAIL_LINES="${BASIS_OBSERVER_RESIDENT_HEALTH_TAIL_LINES:-200}"
 LOG_ROTATE_BYTES="${BASIS_OBSERVER_LOG_ROTATE_BYTES:-134217728}"
 LOG_ROTATE_KEEP="${BASIS_OBSERVER_LOG_ROTATE_KEEP:-4}"

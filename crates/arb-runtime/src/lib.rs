@@ -247,6 +247,7 @@ const RUNTIME_JSONL_ROTATE_DEFAULT_BYTES: u64 = 128 * 1024 * 1024;
 const RUNTIME_JSONL_ROTATE_DEFAULT_KEEP: usize = 4;
 #[cfg(feature = "live-exec")]
 const RUNTIME_JSONL_ROTATE_KEEP_LIMIT: usize = 32;
+const FUNDING_ARB_COMPACT_ARTIFACTS_ENV: &str = "ARB_RUNTIME_FUNDING_ARB_COMPACT_ARTIFACTS";
 #[cfg(feature = "live-exec")]
 const RESIDENT_RETRYABLE_ERROR_BACKOFF_BASE_MS: u64 = 1_000;
 #[cfg(feature = "live-exec")]
@@ -393,6 +394,7 @@ const PORTFOLIO_PRIVATE_READONLY_SNAPSHOT_DEFAULT_INTERVAL_SECS: u64 = 60;
 const FUNDING_ARB_RESIDENT_LIVE_DEFAULT_OUT: &str = "target/funding-arb-resident-live";
 const FUNDING_ARB_EXIT_DEFAULT_MIN_LIQUIDATION_BUFFER_BPS: i128 = 150;
 const FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS: i128 = 5;
+#[cfg(feature = "live-exec")]
 const FUNDING_ARB_EXIT_ADL_WARNING_RANK: i128 = 4;
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_EXIT_EMERGENCY_DE_RISK_SLIPPAGE_BPS: i128 = 100;
@@ -7066,13 +7068,13 @@ fn append_text_error_log_entries(
         let symbol = text_log_symbol(trimmed);
         source_entries.push(ErrorLogEntry {
             observed_at: timestamp_from_text_log_line(trimmed),
-            severity: severity_from_message(trimmed).to_owned(),
+            severity: severity_from_message(&compact_repeated_pipe_segments(trimmed)).to_owned(),
             category: "文本日志".to_owned(),
             source: source.source.clone(),
             strategy,
             pair_id,
             symbol,
-            message: trimmed.to_owned(),
+            message: compact_repeated_pipe_segments(trimmed),
             path: source.path.display().to_string(),
             line_number: line_index + 1,
             raw: truncate_for_json(trimmed, ERROR_LOG_RAW_CHAR_LIMIT),
@@ -7269,6 +7271,7 @@ fn error_log_entry_from_json_fields(
     let position_id_symbol = optional_json_value_string(fields, "position_id", "error log")?
         .and_then(|value| error_log_symbol_from_position_id(&value));
 
+    let message = compact_repeated_pipe_segments(&reasons.join(" | "));
     Ok(Some(ErrorLogEntry {
         observed_at: optional_first_json_value_string(
             fields,
@@ -7284,14 +7287,14 @@ fn error_log_entry_from_json_fields(
         severity: if gate_passed_then_failed {
             "error".to_owned()
         } else {
-            severity_from_message(&reasons.join(" | ")).to_owned()
+            severity_from_message(&message).to_owned()
         },
         category: category.to_owned(),
         source: source.source.clone(),
         strategy,
         pair_id: pair_id.or(blocking_path_pair_id),
         symbol: symbol.or(blocking_path_symbol).or(position_id_symbol),
-        message: truncate_for_json(&reasons.join(" | "), ERROR_LOG_MESSAGE_CHAR_LIMIT),
+        message: truncate_for_json(&message, ERROR_LOG_MESSAGE_CHAR_LIMIT),
         path: source.path.display().to_string(),
         line_number,
         raw: truncate_for_json(raw, ERROR_LOG_RAW_CHAR_LIMIT),
@@ -7328,7 +7331,7 @@ fn optional_json_blocking_path_reasons(
     for item in json_array_value_slices(trimmed)? {
         let item = item.trim();
         if item.starts_with('"') {
-            push_unique_reason(&mut reasons, json_value_to_string(item, field, source)?);
+            reasons.push(json_value_to_string(item, field, source)?);
             continue;
         }
         if !item.starts_with('{') {
@@ -7345,10 +7348,10 @@ fn optional_json_blocking_path_reasons(
                 (None, Some(blocker)) => blocker.to_owned(),
                 (None, None) => "blocking_path".to_owned(),
             };
-            push_unique_reason(&mut reasons, format!("{label}: {reason}"));
+            reasons.push(compact_blocking_summary_text(&label, &reason));
         }
     }
-    Ok(reasons)
+    Ok(compact_repeated_reasons(reasons))
 }
 
 fn optional_json_blocking_path_pair(
@@ -7542,6 +7545,123 @@ fn truncate_for_json(value: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+fn compact_repeated_pipe_segments(value: &str) -> String {
+    for marker in [" candidate_count=0 ", " blocking_path=", " blocking_path: "] {
+        if let Some(index) = value.find(marker) {
+            let split = index + marker.len();
+            if let Some(compacted) = compact_pipe_segment_tail(&value[split..]) {
+                return format!("{}{}", &value[..split], compacted);
+            }
+        }
+    }
+    compact_pipe_segment_tail(value).unwrap_or_else(|| value.to_owned())
+}
+
+fn compact_pipe_segment_tail(value: &str) -> Option<String> {
+    if !value.contains('|') {
+        return None;
+    }
+    let segments = value
+        .split('|')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(compact_feedback_log_segment)
+        .collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return None;
+    }
+    let compacted = compact_repeated_reasons(segments);
+    let joined = compacted.join(" | ");
+    (joined != value.trim()).then_some(joined)
+}
+
+fn compact_repeated_reasons(values: Vec<String>) -> Vec<String> {
+    let mut counted = Vec::<(String, usize)>::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if let Some((_, count)) = counted.iter_mut().find(|(existing, _)| existing == value) {
+            *count += 1;
+        } else {
+            counted.push((value.to_owned(), 1));
+        }
+    }
+    counted
+        .into_iter()
+        .map(|(value, count)| counted_reason_text(value, count))
+        .collect()
+}
+
+fn counted_reason_text(value: String, count: usize) -> String {
+    if count > 1 {
+        format!("{value} (x{count})")
+    } else {
+        value
+    }
+}
+
+fn compact_feedback_log_segment(segment: &str) -> String {
+    let trimmed = segment.trim();
+    if let Some(index) = trimmed.find(":阻断") {
+        let label = trimmed[..index].trim();
+        let reason = trimmed[index + 1..].trim();
+        return compact_blocking_summary_text(label, reason);
+    }
+    if trimmed.contains("阻断原因：") || trimmed.contains("阻断原因:") {
+        return format!("阻断原因：{}", compact_blocking_reason_for_summary(trimmed));
+    }
+    trimmed.to_owned()
+}
+
+fn compact_blocking_summary_text(label: &str, reason: &str) -> String {
+    let reason = compact_blocking_reason_for_summary(reason);
+    let label = label.trim();
+    if label == "candidate_count=0" || label.ends_with(":candidate_count=0") {
+        format!("阻断原因：{reason}")
+    } else if label.is_empty() {
+        reason
+    } else {
+        format!("{label}:{reason}")
+    }
+}
+
+fn compact_blocking_reason_for_summary(reason: &str) -> String {
+    let trimmed = reason.trim();
+    let mut summary = trimmed;
+    for marker in ["阻断原因：", "阻断原因:"] {
+        if let Some(index) = summary.find(marker) {
+            summary = &summary[index + marker.len()..];
+            break;
+        }
+    }
+    let detail_code = blocking_reason_code_after_summary(summary);
+    let summary = summary.split(['；', ';']).next().unwrap_or(summary).trim();
+    let summary = if summary.is_empty() { trimmed } else { summary };
+    match detail_code {
+        Some(code) if !summary.contains(&code) => format!("{summary}；{code}"),
+        _ => summary.to_owned(),
+    }
+}
+
+fn blocking_reason_code_after_summary(reason: &str) -> Option<String> {
+    let detail = reason
+        .split_once('；')
+        .map(|(_, detail)| detail)
+        .or_else(|| reason.split_once(';').map(|(_, detail)| detail))?;
+    detail
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '；' | ':' | ')'))
+        .map(|token| token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | '[' | ']')))
+        .find(|token| {
+            token.contains('_')
+                && token
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .map(str::to_owned)
 }
 
 fn error_logs_json(snapshot: &ErrorLogsSnapshot) -> String {
@@ -31348,12 +31468,72 @@ fn opportunity_recorder_blocking_path_json(
     }
     let values = json_array_value_slices(value)?;
     let total = values.len();
-    let entries = values
-        .iter()
-        .take(limit)
-        .map(|value| bounded_log_json_value(value))
-        .collect::<RuntimeResult<Vec<_>>>()?;
-    Ok((format!("[{}]", entries.join(",")), total, total > limit))
+    let compacted = compact_opportunity_recorder_blocking_path_values(&values)?;
+    let compacted_len = compacted.len();
+    let entries = compacted.into_iter().take(limit).collect::<Vec<_>>();
+    Ok((
+        format!("[{}]", entries.join(",")),
+        total,
+        compacted_len > limit,
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn compact_opportunity_recorder_blocking_path_values(
+    values: &[&str],
+) -> RuntimeResult<Vec<String>> {
+    let mut groups = Vec::<(String, String, usize)>::new();
+    for value in values {
+        let key = opportunity_recorder_blocking_path_group_key(value)?;
+        if let Some((_, _, count)) = groups
+            .iter_mut()
+            .find(|(existing_key, _, _)| existing_key == &key)
+        {
+            *count += 1;
+        } else {
+            groups.push((key, bounded_log_json_value(value)?, 1));
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(_, value, count)| add_repeat_count_to_log_json_value(value, count))
+        .collect())
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_blocking_path_group_key(value: &str) -> RuntimeResult<String> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('{') {
+        return Ok(trimmed.to_owned());
+    }
+    let fields = parse_json_object_value_slices(trimmed)?;
+    let stage = opportunity_recorder_optional_field(&fields, "stage").unwrap_or_default();
+    let blocker = opportunity_recorder_optional_field(&fields, "blocker").unwrap_or_default();
+    let reason = opportunity_recorder_optional_field(&fields, "reason").unwrap_or_default();
+    if stage.is_empty() && blocker.is_empty() && reason.is_empty() {
+        Ok(trimmed.to_owned())
+    } else {
+        Ok(format!(
+            "{stage}|{blocker}|{}",
+            compact_blocking_reason_for_summary(&reason)
+        ))
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn add_repeat_count_to_log_json_value(value: String, count: usize) -> String {
+    if count <= 1 {
+        return value;
+    }
+    let trimmed = value.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if inner.trim().is_empty() {
+            return format!("{{\"repeat_count\":{count}}}");
+        }
+        return format!("{{{inner},\"repeat_count\":{count}}}");
+    }
+    format!("{{\"repeat_count\":{count},\"value\":{value}}}")
 }
 
 #[cfg(feature = "live-exec")]
@@ -31364,11 +31544,15 @@ fn bounded_log_json_value(value: &str) -> RuntimeResult<String> {
         let mut items = Vec::new();
         for (key, value) in fields {
             let bounded = if value.trim().starts_with('"') {
-                json_string(&truncate_log_string(&json_value_to_string_dynamic(
+                let mut text = json_value_to_string_dynamic(
                     value,
                     &key,
                     "opportunity recorder blocking path",
-                )?))
+                )?;
+                if key == "reason" {
+                    text = compact_blocking_reason_for_summary(&text);
+                }
+                json_string(&truncate_log_string(&text))
             } else {
                 value.to_owned()
             };
@@ -31471,17 +31655,24 @@ fn opportunity_recorder_blocking_summary(snapshot: &OpportunityRecorderSnapshot)
     let Ok(entries) = json_array_value_slices(&snapshot.blocking_path_json) else {
         return "blocking_path=[]".to_owned();
     };
-    let summary = entries
+    let summary_parts = entries
         .iter()
         .take(6)
         .filter_map(|entry| {
             let fields = parse_json_object_value_slices(entry).ok()?;
             let blocker = opportunity_recorder_optional_field(&fields, "blocker")?;
             let reason = opportunity_recorder_optional_field(&fields, "reason")?;
-            Some(format!("{blocker}:{reason}"))
+            let repeat_count = opportunity_recorder_usize_field(&fields, "repeat_count")
+                .ok()
+                .flatten()
+                .unwrap_or(1);
+            Some(counted_reason_text(
+                compact_blocking_summary_text(&blocker, &reason),
+                repeat_count,
+            ))
         })
-        .collect::<Vec<_>>()
-        .join(" | ");
+        .collect::<Vec<_>>();
+    let summary = compact_repeated_reasons(summary_parts).join(" | ");
     if summary.is_empty() {
         "blocking_path=[]".to_owned()
     } else {
@@ -31673,6 +31864,7 @@ fn opportunity_recorder_strategy_list(options: &OpportunityRecorderOptions) -> S
 #[cfg(feature = "live-exec")]
 fn append_text_line_to_file(path: PathBuf, line: &str) -> RuntimeResult<()> {
     rotate_append_jsonl_if_needed(&path)?;
+    let compacted_line = compact_repeated_pipe_segments(line);
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -31681,7 +31873,7 @@ fn append_text_line_to_file(path: PathBuf, line: &str) -> RuntimeResult<()> {
             path: path.clone(),
             message: error.to_string(),
         })?;
-    file.write_all(line.as_bytes())
+    file.write_all(compacted_line.as_bytes())
         .and_then(|_| file.write_all(b"\n"))
         .map_err(|error| RuntimeError::Io {
             path,
@@ -38583,6 +38775,7 @@ pub fn run_funding_arb_guarded_dry_run_once(
     if let Some(output_dir) = &options.output_dir {
         write_funding_arb_guarded_dry_run_artifacts(
             output_dir,
+            &snapshot,
             &snapshot_json,
             row,
             &spec,
@@ -39149,9 +39342,20 @@ fn run_funding_arb_resident_cycle(
     })?;
     let snapshot = load_funding_arb_resident_snapshot(options)?;
     let snapshot_path = cycle_dir.join("funding_arb_monitor_snapshot.json");
-    write_utf8(snapshot_path.clone(), &snapshot.to_json())?;
+    let selected_row = select_funding_arb_resident_candidate(&snapshot, options).cloned();
+    let retained_rows = selected_row.iter().cloned().collect::<Vec<_>>();
+    write_funding_arb_monitor_snapshot_artifact(
+        snapshot_path.clone(),
+        &snapshot,
+        &retained_rows,
+        if selected_row.is_some() {
+            "compact_resident_entry_candidate"
+        } else {
+            "compact_resident_entry_no_candidate"
+        },
+    )?;
 
-    let Some(row) = select_funding_arb_resident_candidate(&snapshot, options) else {
+    let Some(row) = selected_row else {
         return Ok(FundingArbResidentCycleResult::NoCandidate {
             pair_id: None,
             symbol: None,
@@ -39160,6 +39364,7 @@ fn run_funding_arb_resident_cycle(
             snapshot_path,
         });
     };
+    let row = &row;
     let pair_id = row.pair_id.clone();
     let symbol = row.symbol.clone();
     let net_funding_bps = funding_arb_row_net_funding_bps(row);
@@ -40912,12 +41117,23 @@ fn run_funding_arb_resident_exit_cycle(
         Err(error) => return Err(error),
     };
     let snapshot_path = output_dir.join("funding_arb_monitor_snapshot.json");
-    write_utf8(snapshot_path.clone(), &snapshot.to_json())?;
-    let Some(row) = snapshot
+    let selected_row = snapshot
         .rows
         .iter()
         .find(|row| row.pair_id == state.pair_id)
-    else {
+        .cloned();
+    let retained_rows = selected_row.iter().cloned().collect::<Vec<_>>();
+    write_funding_arb_monitor_snapshot_artifact(
+        snapshot_path.clone(),
+        &snapshot,
+        &retained_rows,
+        if selected_row.is_some() {
+            "compact_resident_exit_active_pair"
+        } else {
+            "compact_resident_exit_missing_pair"
+        },
+    )?;
+    let Some(row) = selected_row else {
         return funding_arb_exit_cycle_blocked_before_dispatch(
             &state,
             output_dir,
@@ -40928,6 +41144,7 @@ fn run_funding_arb_resident_exit_cycle(
             ),
         );
     };
+    let row = &row;
     let spec = funding_arb_pipeline_spec_from_monitor_row(
         row,
         &funding_arb_resident_dry_run_options(
@@ -50009,6 +50226,71 @@ fn write_funding_arb_monitor_snapshot(
     )
 }
 
+fn funding_arb_compact_artifacts_enabled() -> RuntimeResult<bool> {
+    runtime_bool_env(FUNDING_ARB_COMPACT_ARTIFACTS_ENV, true)
+}
+
+fn funding_arb_monitor_snapshot_compact_json(
+    snapshot: &FundingArbMonitorSnapshot,
+    retained_rows: &[FundingArbMarketRow],
+    artifact_mode: &str,
+) -> String {
+    let compact_snapshot = FundingArbMonitorSnapshot {
+        rows: retained_rows.to_vec(),
+        ..snapshot.clone()
+    };
+    let blocking_path = funding_arb_monitor_blocking_path(&compact_snapshot);
+    format!(
+        "{{\"artifact_mode\":{},\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"retained_rows\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+        json_string(artifact_mode),
+        funding_arb_blocking_path_json(&blocking_path),
+        snapshot.candidate_count,
+        json_option_string(&snapshot.last_error),
+        json_string(&snapshot.min_net_funding_bps),
+        retained_rows.len(),
+        retained_rows
+            .iter()
+            .map(FundingArbMarketRow::to_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        snapshot.source_count,
+        snapshot.source_error_count,
+        json_string(&snapshot.status),
+        snapshot.total_rows,
+        json_string(&snapshot.updated_at),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_monitor_snapshot_artifact_json(
+    snapshot: &FundingArbMonitorSnapshot,
+    retained_rows: &[FundingArbMarketRow],
+    artifact_mode: &str,
+) -> RuntimeResult<String> {
+    if funding_arb_compact_artifacts_enabled()? {
+        Ok(funding_arb_monitor_snapshot_compact_json(
+            snapshot,
+            retained_rows,
+            artifact_mode,
+        ))
+    } else {
+        Ok(snapshot.to_json())
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_monitor_snapshot_artifact(
+    path: PathBuf,
+    snapshot: &FundingArbMonitorSnapshot,
+    retained_rows: &[FundingArbMarketRow],
+    artifact_mode: &str,
+) -> RuntimeResult<()> {
+    write_utf8(
+        path,
+        &funding_arb_monitor_snapshot_artifact_json(snapshot, retained_rows, artifact_mode)?,
+    )
+}
+
 fn parse_funding_arb_monitor_snapshot_json(
     input: &str,
 ) -> RuntimeResult<FundingArbMonitorSnapshot> {
@@ -50608,6 +50890,7 @@ fn basis_monitor_row_blocking_evidence(row: &BinanceBasisMarketRow) -> String {
 
 fn write_funding_arb_guarded_dry_run_artifacts(
     output_dir: &Path,
+    snapshot: &FundingArbMonitorSnapshot,
     snapshot_json: &str,
     row: &FundingArbMarketRow,
     spec: &CrossExchangeFundingArbPipelineSpec,
@@ -50617,9 +50900,40 @@ fn write_funding_arb_guarded_dry_run_artifacts(
         path: output_dir.to_path_buf(),
         message: error.to_string(),
     })?;
+    let compact_artifacts = funding_arb_compact_artifacts_enabled()?;
+    let artifact_mode = if compact_artifacts {
+        "compact_guarded_dry_run_candidate"
+    } else {
+        "full_snapshot"
+    };
+    let opportunities_snapshot_json = if compact_artifacts {
+        funding_arb_monitor_snapshot_compact_json(
+            snapshot,
+            std::slice::from_ref(row),
+            artifact_mode,
+        )
+    } else {
+        snapshot_json.to_owned()
+    };
+    let retained_rows = if compact_artifacts {
+        1
+    } else {
+        snapshot.rows.len()
+    };
     write_utf8(
         output_dir.join("funding_arb_opportunities_snapshot.json"),
-        snapshot_json,
+        &opportunities_snapshot_json,
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_opportunities_snapshot_meta.json"),
+        &funding_arb_opportunities_snapshot_meta_json(
+            snapshot_json,
+            snapshot,
+            row,
+            opportunities_snapshot_json.len(),
+            retained_rows,
+            artifact_mode,
+        ),
     )?;
     write_utf8(
         output_dir.join("funding_arb_candidate_row.json"),
@@ -50712,6 +51026,28 @@ fn write_funding_arb_guarded_dry_run_artifacts(
     write_utf8(
         output_dir.join("funding_arb_guarded_dry_run_report.md"),
         &funding_arb_guarded_dry_run_report_markdown(row, spec, report),
+    )
+}
+
+fn funding_arb_opportunities_snapshot_meta_json(
+    original_snapshot_json: &str,
+    snapshot: &FundingArbMonitorSnapshot,
+    row: &FundingArbMarketRow,
+    artifact_snapshot_bytes: usize,
+    retained_rows: usize,
+    artifact_mode: &str,
+) -> String {
+    format!(
+        "{{\"artifact_mode\":{},\"artifact_snapshot_bytes\":{},\"original_candidate_count\":{},\"original_snapshot_bytes\":{},\"original_total_rows\":{},\"pair_id\":{},\"retained_rows\":{},\"schema_version\":\"1.0.0\",\"symbol\":{},\"updated_at\":{}}}\n",
+        json_string(artifact_mode),
+        artifact_snapshot_bytes,
+        snapshot.candidate_count,
+        original_snapshot_json.len(),
+        snapshot.total_rows,
+        json_string(&row.pair_id),
+        retained_rows,
+        json_string(&row.symbol),
+        json_string(&snapshot.updated_at),
     )
 }
 
@@ -59829,7 +60165,7 @@ fn parse_opportunity_recorder_args(args: &[String]) -> RuntimeResult<Opportunity
     let mut retries = PUBLIC_MARKET_CURL_ATTEMPTS;
     let mut retry_sleep_ms = PUBLIC_MARKET_CURL_RETRY_SLEEP_MS;
     let mut blocking_path_limit = 12_usize;
-    let mut health_sample_secs = 60_u64;
+    let mut health_sample_secs = 300_u64;
     let mut resident_health_tail_lines = 200_usize;
     let mut once = false;
     let mut index = 0_usize;
@@ -62513,6 +62849,79 @@ mod tests {
     }
 
     #[test]
+    fn error_logs_json_compacts_repeated_blocking_reasons() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("logs dir");
+        write_utf8(
+            logs_dir.join("health-events.jsonl"),
+            concat!(
+                r#"{"blocking_path":[{"blocker":"missing_spot:is_candidate=false","reason":"阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT","symbol":"AAAUSDT"},{"blocker":"missing_spot:is_candidate=false","reason":"阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT","symbol":"BBBUSDT"},{"blocker":"missing_spot:is_candidate=false","reason":"阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT","symbol":"CCCUSDT"}],"candidate_count":0,"event":"poll_ok","mutable_execution_started":false,"recorded_at":"2026-05-21T00:00:00Z","status":"healthy","venue":"hyperliquid"}"#,
+                "\n"
+            ),
+        )
+        .expect("write health events");
+        write_utf8(
+            logs_dir.join("realtime-feedback.log"),
+            concat!(
+                "[2026-05-21T00:00:01Z] opportunity strategy=spot-perp-basis candidate_count=0 ",
+                "missing_spot:is_candidate=false:阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT | ",
+                "missing_spot:is_candidate=false:阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT | ",
+                "missing_spot:is_candidate=false:阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT\n"
+            ),
+        )
+        .expect("write feedback log");
+
+        let snapshot = build_error_logs_snapshot(&PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            ..PortfolioDashboardOptions::default()
+        });
+        let json = error_logs_json(&snapshot);
+
+        assert!(json.contains("MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT"));
+        assert!(snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.message.contains("(x3)")));
+        assert!(snapshot.entries.iter().all(|entry| !entry
+            .message
+            .contains("MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT | missing_spot")));
+    }
+
+    #[test]
+    fn error_logs_json_strips_verbose_row_level_blocking_details() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("logs dir");
+        write_utf8(
+            logs_dir.join("realtime-feedback.log"),
+            concat!(
+                "[2026-05-25T18:37:53+08:00] opportunity strategy=cross-exchange-funding-arb candidate_count=0 ",
+                "candidate_count=0:阻断点：candidate_count=0；阻断原因：所有 funding-arb pair 均未通过候选门槛 | ",
+                "complete:is_candidate=false:阻断原因：盘口深度不足；forward=entry_price_divergence_bps=81 exceeds maximum 20; long_ask_vwap=0.03327, short_bid_vwap=0.033 | ",
+                "complete:is_candidate=false:阻断原因：净 funding 收益低于最小阈值；reverse=net_funding_bps=-108 below minimum 5; gross_funding_spread_bps=-93, total_cost_bps=15 | ",
+                "complete:is_candidate=false:阻断原因：盘口深度不足；forward=insufficient order-book depth: long_ask_depth_usd=11.33615, short_bid_depth_usd=95.13288 | ",
+                "complete:is_candidate=false:阻断原因：净 funding 收益低于最小阈值；reverse=net_funding_bps=-99 below minimum 5; gross_funding_spread_bps=-84, total_cost_bps=15 | ",
+                "complete:is_candidate=false:阻断原因：盘口深度不足；forward=insufficient order-book depth: long_ask_depth_usd=80.619396, short_bid_depth_usd=110.717684\n"
+            ),
+        )
+        .expect("write feedback log");
+
+        let snapshot = build_error_logs_snapshot(&PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            ..PortfolioDashboardOptions::default()
+        });
+        let message = &snapshot.entries[0].message;
+
+        assert!(message.contains("阻断原因：所有 funding-arb pair 均未通过候选门槛"));
+        assert!(message.contains("complete:is_candidate=false:盘口深度不足 (x3)"));
+        assert!(message.contains("complete:is_candidate=false:净 funding 收益低于最小阈值 (x2)"));
+        assert!(!message.contains("long_ask_depth_usd"));
+        assert!(!message.contains("entry_price_divergence_bps"));
+        assert!(!message.contains("gross_funding_spread_bps"));
+    }
+
+    #[test]
     fn error_logs_snapshot_tails_large_sources_and_caps_entries() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let logs_dir = root.path().join("logs");
@@ -64125,6 +64534,36 @@ mod tests {
             .opportunity_history_path
             .as_deref()
             .is_some_and(|path| path.ends_with("cross-exchange-funding-arb.jsonl")));
+    }
+
+    #[test]
+    fn funding_arb_monitor_snapshot_compact_json_keeps_selected_row_and_counts() {
+        let selected = funding_arb_test_row("0.00010000", "0.00300000");
+        let mut other = funding_arb_test_row("0.00020000", "0.00400000");
+        other.pair_id = "binance:bybit:ETHUSDT:ETHUSDT".to_owned();
+        other.symbol = "ETHUSDT".to_owned();
+        other.product_tags = funding_arb_product_tags_for_symbol("ETHUSDT");
+        let selected_pair_id = selected.pair_id.clone();
+        let snapshot = funding_arb_test_snapshot(
+            vec![selected.clone(), other],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+
+        let compact_json = funding_arb_monitor_snapshot_compact_json(
+            &snapshot,
+            std::slice::from_ref(&selected),
+            "compact_test_selected_row",
+        );
+        let parsed =
+            parse_funding_arb_monitor_snapshot_json(&compact_json).expect("compact snapshot");
+
+        assert!(compact_json.contains("\"artifact_mode\":\"compact_test_selected_row\""));
+        assert!(compact_json.contains("\"retained_rows\":1"));
+        assert!(!compact_json.contains("ETHUSDT"));
+        assert_eq!(parsed.total_rows, 2);
+        assert_eq!(parsed.candidate_count, 2);
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].pair_id, selected_pair_id);
     }
 
     #[test]
@@ -71877,6 +72316,81 @@ mod tests {
             spot_opportunity_recorder_summary(&snapshot),
             "BTCUSDT:net=12bps profit=0.23"
         );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_blocking_summary_compacts_repeated_reasons() {
+        let body = r#"{
+          "status":"healthy",
+          "updated_at":"2026-05-21T00:00:00Z",
+          "candidate_count":0,
+          "rows":[],
+          "blocking_path":[
+            {"blocker":"missing_spot:is_candidate=false","reason":"阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT","symbol":"AAAUSDT"},
+            {"blocker":"missing_spot:is_candidate=false","reason":"阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT","symbol":"BBBUSDT"},
+            {"blocker":"missing_spot:is_candidate=false","reason":"阻断原因：现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT","symbol":"CCCUSDT"}
+          ]
+        }"#;
+
+        let snapshot =
+            parse_opportunity_recorder_snapshot(body, &["updated_at"], 12).expect("snapshot");
+
+        assert_eq!(snapshot.blocking_path_total_count, 3);
+        assert!(!snapshot.blocking_path_truncated);
+        assert!(snapshot.blocking_path_json.contains("\"repeat_count\":3"));
+        assert_eq!(
+            opportunity_recorder_blocking_summary(&snapshot),
+            "missing_spot:is_candidate=false:现货 top-of-book 缺失；MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT (x3)"
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_blocking_summary_strips_row_level_debug_details() {
+        let body = r#"{
+          "status":"healthy",
+          "updated_at":"2026-05-21T00:00:00Z",
+          "candidate_count":0,
+          "rows":[],
+          "blocking_path":[
+            {"blocker":"candidate_count=0","reason":"阻断点：candidate_count=0；阻断原因：所有 funding-arb pair 均未通过候选门槛"},
+            {"blocker":"complete:is_candidate=false","reason":"阻断原因：盘口深度不足；forward=entry_price_divergence_bps=81 exceeds maximum 20; long_ask_vwap=0.03327, short_bid_vwap=0.033"},
+            {"blocker":"complete:is_candidate=false","reason":"阻断原因：净 funding 收益低于最小阈值；reverse=net_funding_bps=-108 below minimum 5; gross_funding_spread_bps=-93, total_cost_bps=15"},
+            {"blocker":"complete:is_candidate=false","reason":"阻断原因：盘口深度不足；forward=insufficient order-book depth: long_ask_depth_usd=11.33615, short_bid_depth_usd=95.13288"},
+            {"blocker":"complete:is_candidate=false","reason":"阻断原因：净 funding 收益低于最小阈值；reverse=net_funding_bps=-99 below minimum 5; gross_funding_spread_bps=-84, total_cost_bps=15"},
+            {"blocker":"complete:is_candidate=false","reason":"阻断原因：盘口深度不足；forward=insufficient order-book depth: long_ask_depth_usd=80.619396, short_bid_depth_usd=110.717684"}
+          ]
+        }"#;
+
+        let snapshot =
+            parse_opportunity_recorder_snapshot(body, &["updated_at"], 12).expect("snapshot");
+        let summary = opportunity_recorder_blocking_summary(&snapshot);
+
+        assert_eq!(snapshot.blocking_path_total_count, 6);
+        assert!(summary.contains("阻断原因：所有 funding-arb pair 均未通过候选门槛"));
+        assert!(summary.contains("complete:is_candidate=false:盘口深度不足 (x3)"));
+        assert!(summary.contains("complete:is_candidate=false:净 funding 收益低于最小阈值 (x2)"));
+        assert!(!summary.contains("long_ask_depth_usd"));
+        assert!(!summary.contains("entry_price_divergence_bps"));
+        assert!(!summary.contains("gross_funding_spread_bps"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn append_text_line_to_file_compacts_future_feedback_log_lines() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let path = root.path().join("realtime-feedback.log");
+        append_text_line_to_file(
+            path.clone(),
+            "[2026-05-25T18:37:53+08:00] opportunity strategy=cross-exchange-funding-arb candidate_count=0 complete:is_candidate=false:阻断原因：盘口深度不足；forward=entry_price_divergence_bps=81 exceeds maximum 20 | complete:is_candidate=false:阻断原因：盘口深度不足；forward=insufficient order-book depth: long_ask_depth_usd=11.33615",
+        )
+        .expect("append feedback");
+
+        let output = read_utf8(&path).expect("feedback log");
+        assert!(output.contains("complete:is_candidate=false:盘口深度不足 (x2)"));
+        assert!(!output.contains("entry_price_divergence_bps"));
+        assert!(!output.contains("long_ask_depth_usd"));
     }
 
     #[cfg(feature = "live-exec")]
