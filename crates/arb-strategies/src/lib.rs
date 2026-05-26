@@ -2298,21 +2298,26 @@ pub fn evaluate_spot_perp_basis_signal(
             "top_of_book_as_single_level"
         }
         .to_owned();
-    let gross_bps = gross_basis_bps(execution_perp_bid, execution_spot_ask)?;
-    let total_cost_bps =
+    let single_leg_gross_bps = gross_basis_bps(execution_perp_bid, execution_spot_ask)?;
+    let single_leg_total_cost_bps =
         input.spot_taker_fee_bps + input.perp_taker_fee_bps + input.slippage_buffer_bps;
-    let net_bps = gross_bps - total_cost_bps;
-    let funding_bps = FixedDecimal::bps_from_rate(funding_rate)?;
-    let expected_profit_bps = net_bps
-        .checked_add(funding_bps)
+    let single_leg_net_bps = single_leg_gross_bps - single_leg_total_cost_bps;
+    let single_leg_funding_bps = FixedDecimal::bps_from_rate(funding_rate)?;
+    let single_leg_expected_profit_bps = single_leg_net_bps
+        .checked_add(single_leg_funding_bps)
         .ok_or_else(|| "expected profit bps calculation overflowed".to_owned())?;
+    let gross_bps = single_leg_gross_bps;
+    let total_cost_bps = single_leg_total_cost_bps;
+    let net_bps = two_leg_return_bps(single_leg_net_bps);
+    let funding_bps = single_leg_funding_bps;
+    let expected_profit_bps = two_leg_return_bps(single_leg_expected_profit_bps);
     let quantity = spot_execution
         .quantity
         .unwrap_or(FixedDecimal::quantity_for_notional(
             notional,
             execution_spot_ask,
         )?);
-    let basis_profit_usd = FixedDecimal::usd_from_bps(notional, net_bps)?;
+    let basis_profit_usd = FixedDecimal::usd_from_bps(notional, single_leg_net_bps)?;
     let funding_impact_usd = FixedDecimal::usd_from_rate(notional, funding_rate)?;
     let expected_profit_usd = basis_profit_usd.checked_add(
         funding_impact_usd,
@@ -2443,12 +2448,16 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         .checked_mul(8)
         .and_then(|value| value.checked_div(i128::from(interval_hours)))
         .ok_or_else(|| "funding interval normalization overflowed".to_owned())?;
-    let gross_funding_spread_bps = FixedDecimal::bps_from_rate(FixedDecimal {
+    let single_leg_gross_funding_spread_bps = FixedDecimal::bps_from_rate(FixedDecimal {
         raw: normalized_spread,
     })?;
-    let total_cost_bps =
+    let single_leg_total_cost_bps =
         input.long_taker_fee_bps + input.short_taker_fee_bps + input.slippage_buffer_bps;
-    let net_funding_bps = gross_funding_spread_bps - total_cost_bps;
+    let single_leg_net_funding_bps =
+        single_leg_gross_funding_spread_bps - single_leg_total_cost_bps;
+    let gross_funding_spread_bps = single_leg_gross_funding_spread_bps;
+    let total_cost_bps = single_leg_total_cost_bps;
+    let net_funding_bps = two_leg_return_bps(single_leg_net_funding_bps);
     let entry_price_divergence_bps = price_divergence_bps(execution_long_ask, execution_short_bid)?;
     let quantity = long_execution
         .quantity
@@ -2456,7 +2465,7 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
             notional,
             execution_long_ask,
         )?);
-    let expected_funding_usd = FixedDecimal::usd_from_bps(notional, net_funding_bps)?;
+    let expected_funding_usd = FixedDecimal::usd_from_bps(notional, single_leg_net_funding_bps)?;
     let fee_estimate_usd = FixedDecimal::usd_from_bps(
         notional,
         input.long_taker_fee_bps + input.short_taker_fee_bps,
@@ -2814,6 +2823,10 @@ fn signed_bps_abs(value: i128) -> Result<i128, String> {
     } else {
         Ok(value)
     }
+}
+
+fn two_leg_return_bps(single_leg_bps: i128) -> i128 {
+    single_leg_bps / 2
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3771,7 +3784,7 @@ mod tests {
         assert_eq!(candidate.legs.len(), 2);
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
-            "81"
+            "40"
         );
         assert_eq!(
             candidate
@@ -3794,7 +3807,7 @@ mod tests {
             candidate.expected_economics.slippage_estimate_usd.as_str(),
             "0.05"
         );
-        assert_eq!(payload_constraint(candidate, "net_basis_bps"), Some("80"));
+        assert_eq!(payload_constraint(candidate, "net_basis_bps"), Some("40"));
         assert_eq!(
             payload_constraint(candidate, "reference_ask_size"),
             Some("2")
@@ -3878,7 +3891,7 @@ mod tests {
             .all(|byte| byte.is_ascii_alphanumeric()));
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
-            "14"
+            "7"
         );
         assert_eq!(
             candidate.expected_economics.expected_profit_usd.as_str(),
@@ -3919,7 +3932,7 @@ mod tests {
         let candidate = evaluation.candidate().expect("candidate");
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
-            "24"
+            "12"
         );
     }
 
@@ -4357,9 +4370,9 @@ mod tests {
 
         assert!(signal.is_candidate);
         assert_eq!(signal.gross_bps, 100);
-        assert_eq!(signal.net_bps, 80);
+        assert_eq!(signal.net_bps, 40);
         assert_eq!(signal.funding_bps, 1);
-        assert_eq!(signal.expected_profit_bps, 81);
+        assert_eq!(signal.expected_profit_bps, 40);
         assert_eq!(signal.expected_profit_usd, "0.81");
         assert_eq!(signal.funding_impact_usd, "0.01");
         assert_eq!(signal.spot_ask_depth_usd.as_deref(), Some("200"));
@@ -4471,7 +4484,7 @@ mod tests {
         assert_eq!(signal.spot_ask_vwap.as_deref(), Some("100.24937734"));
         assert_eq!(signal.perp_bid_vwap.as_deref(), Some("101.75438603"));
         assert_eq!(signal.gross_bps, 150);
-        assert_eq!(signal.net_bps, 130);
+        assert_eq!(signal.net_bps, 65);
     }
 
     #[test]
@@ -4483,7 +4496,7 @@ mod tests {
         assert!(signal.is_candidate);
         assert_eq!(signal.gross_funding_spread_bps, 29);
         assert_eq!(signal.total_cost_bps, 15);
-        assert_eq!(signal.net_funding_bps, 14);
+        assert_eq!(signal.net_funding_bps, 7);
         assert_eq!(signal.expected_funding_usd, "0.14");
         assert_eq!(signal.fee_estimate_usd, "0.11");
         assert_eq!(signal.slippage_estimate_usd, "0.04");
@@ -4559,7 +4572,7 @@ mod tests {
 
         assert!(signal.is_candidate);
         assert_eq!(signal.gross_funding_spread_bps, 32);
-        assert_eq!(signal.net_funding_bps, 17);
+        assert_eq!(signal.net_funding_bps, 8);
     }
 
     #[test]

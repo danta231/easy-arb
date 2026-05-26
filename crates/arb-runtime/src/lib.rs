@@ -61244,7 +61244,7 @@ mod tests {
             short_venue_family: Some("bybit".to_owned()),
             gross_funding_spread_bps: Some("29".to_owned()),
             total_cost_bps: Some("10".to_owned()),
-            net_funding_bps: Some("19".to_owned()),
+            net_funding_bps: Some("9".to_owned()),
             expected_funding_usd: Some("0.19".to_owned()),
             is_candidate: true,
             reason: None,
@@ -64594,7 +64594,7 @@ mod tests {
         assert_eq!(snapshot.filtered_funding_count, 1);
         assert_eq!(snapshot.candidate_count, 1);
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
     }
 
     #[test]
@@ -66344,7 +66344,7 @@ mod tests {
         row.venue_b_funding_interval_hours = "1".to_owned();
         row.funding_interval_hours = "1".to_owned();
         row.gross_funding_spread_bps = Some("24".to_owned());
-        row.net_funding_bps = Some("14".to_owned());
+        row.net_funding_bps = Some("7".to_owned());
         row.expected_funding_usd = Some("0.24".to_owned());
         let pair_id = row.pair_id.clone();
         let snapshot = funding_arb_test_snapshot(vec![row], "2026-05-13T00:00:00Z".to_owned());
@@ -66438,7 +66438,7 @@ mod tests {
         row.long_venue_family = Some("bitget".to_owned());
         row.short_venue_family = Some("aster".to_owned());
         row.gross_funding_spread_bps = Some("24".to_owned());
-        row.net_funding_bps = Some("14".to_owned());
+        row.net_funding_bps = Some("7".to_owned());
         row.expected_funding_usd = Some("0.24".to_owned());
         let pair_id = row.pair_id.clone();
         let snapshot = funding_arb_test_snapshot(vec![row], "2026-05-13T00:00:00Z".to_owned());
@@ -70238,7 +70238,7 @@ mod tests {
             short_venue_family: Some("bitget".to_owned()),
             gross_funding_spread_bps: Some("28".to_owned()),
             total_cost_bps: Some("15".to_owned()),
-            net_funding_bps: Some("13".to_owned()),
+            net_funding_bps: Some("6".to_owned()),
             expected_funding_usd: Some("0.117".to_owned()),
             is_candidate: true,
             reason: None,
@@ -70530,7 +70530,7 @@ mod tests {
             .contains("trans:hyperliquid-funding-arb-btcusdt-001"));
         assert!(artifacts
             .candidate_transitions_jsonl
-            .contains("\"expected_profit_bps\":\"24\""));
+            .contains("\"expected_profit_bps\":\"12\""));
     }
 
     #[test]
@@ -70594,9 +70594,9 @@ mod tests {
             next_funding_time_ms: "1778659200000".to_owned(),
             gross_basis_bps: Some("100".to_owned()),
             total_cost_bps: Some("20".to_owned()),
-            net_basis_bps: Some("80".to_owned()),
+            net_basis_bps: Some("40".to_owned()),
             quantity: Some("1".to_owned()),
-            expected_profit_usd: Some("0.8".to_owned()),
+            expected_profit_usd: Some("0.81".to_owned()),
             is_candidate: true,
             reason: None,
             source_status: "complete".to_owned(),
@@ -70793,9 +70793,9 @@ mod tests {
                 next_funding_time_ms: String::new(),
                 gross_basis_bps: Some("100".to_owned()),
                 total_cost_bps: Some("20".to_owned()),
-                net_basis_bps: Some("80".to_owned()),
+                net_basis_bps: Some("40".to_owned()),
                 quantity: Some("1".to_owned()),
-                expected_profit_usd: Some("0.8".to_owned()),
+                expected_profit_usd: Some("0.81".to_owned()),
                 is_candidate: true,
                 reason: None,
                 source_status: "missing_spot".to_owned(),
@@ -73250,7 +73250,7 @@ mod tests {
         assert_eq!(snapshot.filtered_funding_count, 1);
         assert_eq!(snapshot.candidate_count, 1);
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
     }
 
     #[cfg(feature = "live-exec")]
@@ -73509,7 +73509,7 @@ mod tests {
         assert_eq!(snapshot.rows[0].symbol, "BTC-USDT");
         assert_eq!(snapshot.rows[0].mark_price, "101.00");
         assert_eq!(snapshot.rows[0].index_price, "100.00");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
     }
 
     #[cfg(feature = "live-exec")]
@@ -73775,7 +73775,7 @@ mod tests {
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
         assert_eq!(snapshot.rows[0].mark_price, "101.00");
         assert_eq!(snapshot.rows[0].index_price, "100.00");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("80"));
+        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
     }
 
     #[cfg(feature = "live-exec")]
