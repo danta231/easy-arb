@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use arb_contracts::InstrumentKind;
 use arb_contracts::{
@@ -1619,9 +1619,10 @@ impl BybitPublicWssTextStreamClient {
                     ),
                 ))
             })?;
-        for subscribe in bybit_public_wss_subscribe_payloads(subscribe_args) {
+        let subscribe_payloads = bybit_public_wss_subscribe_payloads(subscribe_args);
+        for (index, subscribe) in subscribe_payloads.iter().enumerate() {
             socket
-                .send(tungstenite::Message::Text(subscribe))
+                .send(tungstenite::Message::Text(subscribe.to_owned()))
                 .map_err(|error| {
                     VenueDataError::External(ClassifiedExternalError::new(
                         self.venue_id.clone(),
@@ -1630,6 +1631,9 @@ impl BybitPublicWssTextStreamClient {
                         format!("Bybit public WSS subscribe send failed: {error}"),
                     ))
                 })?;
+            if index + 1 < subscribe_payloads.len() {
+                std::thread::sleep(Duration::from_millis(120));
+            }
         }
 
         let mut text_messages = 0_usize;
@@ -1780,7 +1784,7 @@ impl PublicJsonWssTextStreamClient {
                     ),
                 ))
             })?;
-        for subscribe_payload in subscribe_payloads {
+        for (index, subscribe_payload) in subscribe_payloads.iter().enumerate() {
             socket
                 .send(tungstenite::Message::Text(subscribe_payload.to_owned()))
                 .map_err(|error| {
@@ -1791,6 +1795,9 @@ impl PublicJsonWssTextStreamClient {
                         format!("{} public WSS subscribe send failed: {error}", self.label),
                     ))
                 })?;
+            if index + 1 < subscribe_payloads.len() {
+                std::thread::sleep(Duration::from_millis(120));
+            }
         }
 
         let mut text_messages = 0_usize;

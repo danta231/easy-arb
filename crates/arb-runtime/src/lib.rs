@@ -435,6 +435,10 @@ const OKX_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 const BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 const OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 const BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+const OKX_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES: usize = 4096;
+const OKX_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD: usize = 50;
+const BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES: usize = 4096;
+const BITGET_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD: usize = 50;
 const ASTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8794";
 const HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8795";
 const ASTER_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
@@ -23477,7 +23481,7 @@ fn run_okx_wss_book_ticker_monitor_cycle(
         market_state.stream_url.clone(),
         "OKX",
     )?;
-    let subscribe_payload = market_state.subscribe_args.join("");
+    let subscribe_payloads = market_state.subscribe_args.clone();
     let max_text_messages = if options.once {
         options.updates
     } else {
@@ -23485,8 +23489,8 @@ fn run_okx_wss_book_ticker_monitor_cycle(
     };
     let mut observed_wss_event = false;
     let mut observer_error = None;
-    let read_result = text_client.read_live_text_messages_observed(
-        &subscribe_payload,
+    let read_result = text_client.read_live_text_messages_observed_many(
+        &subscribe_payloads,
         max_text_messages,
         |raw_json, ingested_at| match apply_okx_wss_book_ticker_text(
             raw_json,
@@ -24289,7 +24293,7 @@ fn bootstrap_okx_wss_book_ticker(
     let mut coordinators = BTreeMap::new();
     let mut local_sequences = BTreeMap::new();
     let mut rest_updates = Vec::with_capacity(rows.len());
-    let mut subscribe_args = Vec::with_capacity(rows.len());
+    let mut subscribe_symbols = Vec::with_capacity(rows.len());
     for (symbol, row) in rows {
         let instrument_id = okx_public_wss_instrument_id(&symbol, market)?;
         let quote = okx_wss_rest_quote_from_row(
@@ -24309,12 +24313,12 @@ fn bootstrap_okx_wss_book_ticker(
         local_sequences.insert(symbol.clone(), 1_u64);
         coordinators.insert(symbol.clone(), coordinator);
         rest_updates.push(update);
-        subscribe_args.push(okx_wss_ticker_subscribe_payload(&symbol, market));
+        subscribe_symbols.push(symbol);
     }
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url: OKX_PUBLIC_WSS_URL.to_owned(),
-        subscribe_args,
+        subscribe_args: okx_wss_ticker_subscribe_payloads(&subscribe_symbols, market),
         all_symbols_scope,
         coordinators,
         local_sequences,
@@ -24366,7 +24370,7 @@ fn bootstrap_bitget_wss_book_ticker(
     let mut coordinators = BTreeMap::new();
     let mut local_sequences = BTreeMap::new();
     let mut rest_updates = Vec::with_capacity(rows.len());
-    let mut subscribe_args = Vec::with_capacity(rows.len());
+    let mut subscribe_symbols = Vec::with_capacity(rows.len());
     for row in rows {
         let symbol = row.symbol.clone();
         let instrument_id = bitget_public_wss_instrument_id(&symbol, market)?;
@@ -24387,12 +24391,12 @@ fn bootstrap_bitget_wss_book_ticker(
         local_sequences.insert(symbol.clone(), 1_u64);
         coordinators.insert(symbol.clone(), coordinator);
         rest_updates.push(update);
-        subscribe_args.push(bitget_wss_ticker_subscribe_payload(&symbol, market));
+        subscribe_symbols.push(symbol);
     }
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url: BITGET_PUBLIC_WSS_URL.to_owned(),
-        subscribe_args,
+        subscribe_args: bitget_wss_ticker_subscribe_payloads(&subscribe_symbols, market),
         all_symbols_scope,
         coordinators,
         local_sequences,
@@ -30492,19 +30496,113 @@ fn okx_public_wss_symbol_from_inst_id(
     }
 }
 
-fn okx_wss_ticker_subscribe_payload(symbol: &str, market: OkxPublicWssMarket) -> String {
+fn okx_wss_ticker_subscribe_payloads(
+    symbols: &[String],
+    market: OkxPublicWssMarket,
+) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let mut current_args = Vec::new();
+
+    for symbol in symbols {
+        let arg = okx_wss_ticker_subscribe_arg(symbol, market);
+        let would_exceed_count = current_args.len() >= OKX_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD;
+        let would_exceed_bytes = !current_args.is_empty()
+            && okx_wss_ticker_subscribe_payload_len(&current_args, Some(&arg))
+                > OKX_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES;
+
+        if would_exceed_count || would_exceed_bytes {
+            payloads.push(okx_wss_ticker_subscribe_payload_from_args(&current_args));
+            current_args.clear();
+        }
+        current_args.push(arg);
+    }
+
+    if !current_args.is_empty() {
+        payloads.push(okx_wss_ticker_subscribe_payload_from_args(&current_args));
+    }
+
+    payloads
+}
+
+fn okx_wss_ticker_subscribe_arg(symbol: &str, market: OkxPublicWssMarket) -> String {
     format!(
-        "{{\"op\":\"subscribe\",\"args\":[{{\"channel\":\"tickers\",\"instId\":{}}}]}}",
+        "{{\"channel\":\"tickers\",\"instId\":{}}}",
         json_string(&okx_public_wss_inst_id(symbol, market))
     )
 }
 
-fn bitget_wss_ticker_subscribe_payload(symbol: &str, market: BitgetPublicWssMarket) -> String {
+fn okx_wss_ticker_subscribe_payload_from_args(args: &[String]) -> String {
+    format!("{{\"op\":\"subscribe\",\"args\":[{}]}}", args.join(","))
+}
+
+fn okx_wss_ticker_subscribe_payload_len(args: &[String], extra_arg: Option<&String>) -> usize {
+    let mut len = "{\"op\":\"subscribe\",\"args\":[]}".len();
+    len += args.iter().map(String::len).sum::<usize>();
+    if !args.is_empty() {
+        len += args.len() - 1;
+    }
+    if let Some(arg) = extra_arg {
+        len += arg.len();
+        if !args.is_empty() {
+            len += 1;
+        }
+    }
+    len
+}
+
+fn bitget_wss_ticker_subscribe_payloads(
+    symbols: &[String],
+    market: BitgetPublicWssMarket,
+) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let mut current_args = Vec::new();
+
+    for symbol in symbols {
+        let arg = bitget_wss_ticker_subscribe_arg(symbol, market);
+        let would_exceed_count = current_args.len() >= BITGET_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD;
+        let would_exceed_bytes = !current_args.is_empty()
+            && bitget_wss_ticker_subscribe_payload_len(&current_args, Some(&arg))
+                > BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES;
+
+        if would_exceed_count || would_exceed_bytes {
+            payloads.push(bitget_wss_ticker_subscribe_payload_from_args(&current_args));
+            current_args.clear();
+        }
+        current_args.push(arg);
+    }
+
+    if !current_args.is_empty() {
+        payloads.push(bitget_wss_ticker_subscribe_payload_from_args(&current_args));
+    }
+
+    payloads
+}
+
+fn bitget_wss_ticker_subscribe_arg(symbol: &str, market: BitgetPublicWssMarket) -> String {
     format!(
-        "{{\"op\":\"subscribe\",\"args\":[{{\"instType\":{},\"channel\":\"ticker\",\"instId\":{}}}]}}",
+        "{{\"instType\":{},\"channel\":\"ticker\",\"instId\":{}}}",
         json_string(market.inst_type()),
         json_string(symbol)
     )
+}
+
+fn bitget_wss_ticker_subscribe_payload_from_args(args: &[String]) -> String {
+    format!("{{\"op\":\"subscribe\",\"args\":[{}]}}", args.join(","))
+}
+
+fn bitget_wss_ticker_subscribe_payload_len(args: &[String], extra_arg: Option<&String>) -> usize {
+    let mut len = "{\"op\":\"subscribe\",\"args\":[]}".len();
+    len += args.iter().map(String::len).sum::<usize>();
+    if !args.is_empty() {
+        len += args.len() - 1;
+    }
+    if let Some(arg) = extra_arg {
+        len += arg.len();
+        if !args.is_empty() {
+            len += 1;
+        }
+    }
+    len
 }
 
 fn bybit_wss_orderbook_topic(symbol: &str) -> String {
@@ -62177,6 +62275,19 @@ mod tests {
         );
         okx_snapshot.record_update(&okx_update);
         assert_eq!(okx_snapshot.rows[0].symbol, "BTC-USDT");
+        let okx_symbols = (0..123)
+            .map(|index| format!("SYM{index}-USDT"))
+            .collect::<Vec<_>>();
+        let okx_payloads =
+            okx_wss_ticker_subscribe_payloads(&okx_symbols, OkxPublicWssMarket::Swap);
+        assert_eq!(okx_payloads.len(), 3);
+        assert!(okx_payloads
+            .iter()
+            .all(|payload| payload.len() <= OKX_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES));
+        assert!(okx_payloads[0].matches("\"channel\":\"tickers\"").count() <= 50);
+        assert!(okx_payloads[0].contains("\"instId\":\"SYM0-USDT-SWAP\""));
+        assert!(okx_payloads[2].contains("\"instId\":\"SYM122-USDT-SWAP\""));
+        assert!(!okx_payloads[0].contains("}{"));
 
         let bitget_rows = vec![
             monitor_book_ticker_row_with_top_depth(
@@ -62222,6 +62333,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["BTCUSDT", "1INCHUSDT", "ETHUSDT"]
         );
+        let bitget_symbols = (0..123)
+            .map(|index| format!("SYM{index}USDT"))
+            .collect::<Vec<_>>();
+        let bitget_payloads =
+            bitget_wss_ticker_subscribe_payloads(&bitget_symbols, BitgetPublicWssMarket::Spot);
+        assert_eq!(bitget_payloads.len(), 3);
+        assert!(bitget_payloads
+            .iter()
+            .all(|payload| payload.len() <= BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES));
+        assert!(bitget_payloads[0].matches("\"channel\":\"ticker\"").count() <= 50);
+        assert!(bitget_payloads[0].contains("\"instId\":\"SYM0USDT\""));
+        assert!(bitget_payloads[2].contains("\"instId\":\"SYM122USDT\""));
     }
 
     #[test]

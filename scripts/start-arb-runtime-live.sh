@@ -113,6 +113,28 @@ bind_port() {
   printf '%s\n' "${port}"
 }
 
+listening_pids_for_port() {
+  local port="$1"
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true
+    return 0
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltnp "sport = :${port}" 2>/dev/null \
+      | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' \
+      | sort -u
+    return 0
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -n tcp "${port}" 2>/dev/null \
+      | tr ' ' '\n' \
+      | sed -n '/^[0-9][0-9]*$/p' \
+      | sort -u
+    return 0
+  fi
+}
+
 pid_is_recorded_by_live_prereq() {
   local needle="$1"
   local pid
@@ -135,8 +157,22 @@ pid_is_recorded_by_live_prereq() {
 
 pid_looks_like_repo_arb_runtime() {
   local pid="$1"
+  local exe_path
+  local cmdline
   local open_files
 
+  if [[ -e "/proc/${pid}/exe" ]]; then
+    exe_path="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
+    if [[ -n "${RUNTIME_BIN:-}" && "${exe_path}" == "${RUNTIME_BIN}" ]] || [[ "${exe_path}" == "${REPO_ROOT}/target/"*"arb-runtime"* ]]; then
+      return 0
+    fi
+  fi
+  if [[ -r "/proc/${pid}/cmdline" ]]; then
+    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+    if [[ -n "${RUNTIME_BIN:-}" && "${cmdline}" == *"${RUNTIME_BIN}"* ]] || [[ "${cmdline}" == *"${REPO_ROOT}/target/"*"arb-runtime"* ]]; then
+      return 0
+    fi
+  fi
   command -v lsof >/dev/null 2>&1 || return 1
   open_files="$(lsof -nP -p "${pid}" 2>/dev/null || true)"
   [[ -n "${open_files}" ]] || return 1
@@ -167,7 +203,6 @@ reclaim_stale_runtime_port() {
   local pid
 
   [[ "${RECLAIM_STALE_MONITOR_PORTS:-1}" == "1" ]] || return 0
-  command -v lsof >/dev/null 2>&1 || return 0
   port="$(bind_port "${bind_addr}")" || return 0
 
   while IFS= read -r pid; do
@@ -183,7 +218,7 @@ reclaim_stale_runtime_port() {
     else
       die "cannot bind ${label} on ${bind_addr}: address already in use by pid=${pid}; not a managed ${REPO_ROOT}/target arb-runtime process"
     fi
-  done < <(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true)
+  done < <(listening_pids_for_port "${port}")
 }
 
 archive_pid_file_for_restart() {
