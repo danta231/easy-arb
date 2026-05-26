@@ -7075,15 +7075,16 @@ fn append_text_error_log_entries(
         let strategy = text_log_field_value(trimmed, "strategy");
         let pair_id = text_log_pair_id(trimmed);
         let symbol = text_log_symbol(trimmed);
+        let message = compact_repeated_pipe_segments(trimmed);
         source_entries.push(ErrorLogEntry {
             observed_at: timestamp_from_text_log_line(trimmed),
-            severity: severity_from_message(&compact_repeated_pipe_segments(trimmed)).to_owned(),
+            severity: severity_from_text_log_message(&message).to_owned(),
             category: "文本日志".to_owned(),
             source: source.source.clone(),
             strategy,
             pair_id,
             symbol,
-            message: compact_repeated_pipe_segments(trimmed),
+            message,
             path: source.path.display().to_string(),
             line_number: line_index + 1,
             raw: truncate_for_json(trimmed, ERROR_LOG_RAW_CHAR_LIMIT),
@@ -7248,13 +7249,13 @@ fn error_log_entry_from_json_fields(
         && dispatch_plan_built == Some(true)
         && (dispatch_attempted == Some(true) || mutable_execution_started == Some(true))
         && (!reasons.is_empty() || dispatch_allowed == Some(false));
-    let category = if gate_passed_then_failed {
-        "门禁通过后下单失败"
-    } else if event_type
+    let candidate_unavailable = event_type
         .as_deref()
         .is_some_and(|event| event.contains("no_candidate"))
-        || candidate_count == Some(0)
-    {
+        || candidate_count == Some(0);
+    let category = if gate_passed_then_failed {
+        "门禁通过后下单失败"
+    } else if candidate_unavailable {
         "候选不可用"
     } else if dispatch_allowed == Some(false)
         || event_type
@@ -7276,11 +7277,22 @@ fn error_log_entry_from_json_fields(
     let pair_id = optional_json_value_string(fields, "pair_id", "error log")?;
     let symbol = optional_json_value_string(fields, "symbol", "error log")?;
     let (blocking_path_pair_id, blocking_path_symbol) =
-        optional_json_blocking_path_pair(fields, "blocking_path", "error log")?;
+        if candidate_count == Some(0) && pair_id.is_none() && symbol.is_none() {
+            (None, None)
+        } else {
+            optional_json_blocking_path_pair(fields, "blocking_path", "error log")?
+        };
     let position_id_symbol = optional_json_value_string(fields, "position_id", "error log")?
         .and_then(|value| error_log_symbol_from_position_id(&value));
 
     let message = compact_repeated_pipe_segments(&reasons.join(" | "));
+    let severity = if gate_passed_then_failed {
+        "error".to_owned()
+    } else if candidate_unavailable && !status_is_bad && !event_is_error {
+        "warning".to_owned()
+    } else {
+        severity_from_message(&message).to_owned()
+    };
     Ok(Some(ErrorLogEntry {
         observed_at: optional_first_json_value_string(
             fields,
@@ -7293,11 +7305,7 @@ fn error_log_entry_from_json_fields(
             ],
             "error log",
         )?,
-        severity: if gate_passed_then_failed {
-            "error".to_owned()
-        } else {
-            severity_from_message(&message).to_owned()
-        },
+        severity,
         category: category.to_owned(),
         source: source.source.clone(),
         strategy,
@@ -7533,6 +7541,14 @@ fn severity_from_message(message: &str) -> &'static str {
         "error"
     } else {
         "warning"
+    }
+}
+
+fn severity_from_text_log_message(message: &str) -> &'static str {
+    if message.contains("candidate_count=0") {
+        "warning"
+    } else {
+        severity_from_message(message)
     }
 }
 
@@ -63344,7 +63360,7 @@ mod tests {
         write_utf8(
             logs_dir.join("health-events.jsonl"),
             concat!(
-                r#"{"blocking_path":[{"blocker":"candidate_count=0","reason":"阻断点：candidate_count=0；阻断原因：上游 venue status 不完整","stage":"opportunity_source"},{"blocker":"complete:is_candidate=false","evidence":"symbol=CHIPUSDT net_funding_bps=4","pair_id":"aster:hyperliquid:CHIPUSDT:CHIP","reason":"阻断原因：预期收益低于最小阈值","stage":"opportunity_row","symbol":"CHIPUSDT"}],"candidate_count":0,"event":"poll_ok","mutable_execution_started":false,"recorded_at":"2026-05-21T00:00:00Z","status":"healthy","strategy":"cross-exchange-funding-arb"}"#,
+                r#"{"blocking_path":[{"blocker":"candidate_count=0","reason":"阻断点：candidate_count=0；阻断原因：所有 funding-arb pair 均未通过候选门槛","stage":"opportunity_source"},{"blocker":"complete:is_candidate=false","evidence":"symbol=CHIPUSDT net_funding_bps=4","pair_id":"aster:hyperliquid:CHIPUSDT:CHIP","reason":"阻断原因：预期收益低于最小阈值","stage":"opportunity_row","symbol":"CHIPUSDT"}],"candidate_count":0,"event":"poll_ok","mutable_execution_started":false,"recorded_at":"2026-05-21T00:00:00Z","status":"healthy","strategy":"cross-exchange-funding-arb"}"#,
                 "\n"
             ),
         )
@@ -63357,15 +63373,37 @@ mod tests {
         let json = error_logs_json(&snapshot);
 
         assert_eq!(snapshot.entries.len(), 1);
-        assert_eq!(
-            snapshot.entries[0].pair_id.as_deref(),
-            Some("aster:hyperliquid:CHIPUSDT:CHIP")
-        );
-        assert_eq!(snapshot.entries[0].symbol.as_deref(), Some("CHIPUSDT"));
+        assert_eq!(snapshot.entries[0].severity, "warning");
+        assert_eq!(snapshot.entries[0].pair_id.as_deref(), None);
+        assert_eq!(snapshot.entries[0].symbol.as_deref(), None);
         assert!(json.contains("候选不可用"));
         assert!(json.contains("candidate_count=0"));
-        assert!(json.contains("上游 venue status 不完整"));
-        assert!(json.contains("aster:hyperliquid:CHIPUSDT:CHIP"));
+        assert!(json.contains("所有 funding-arb pair 均未通过候选门槛"));
+    }
+
+    #[test]
+    fn error_logs_json_keeps_degraded_candidate_zero_as_error() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("logs dir");
+        write_utf8(
+            logs_dir.join("health-events.jsonl"),
+            concat!(
+                r#"{"blocking_path":[{"blocker":"source_error_count>0","reason":"阻断原因：上游 venue status 不完整或 source 报错","stage":"venue_status"},{"blocker":"candidate_count=0","reason":"阻断点：candidate_count=0；阻断原因：上游 venue status 不完整","stage":"opportunity_source"},{"blocker":"complete:is_candidate=false","pair_id":"aster:hyperliquid:CHIPUSDT:CHIP","reason":"阻断原因：预期收益低于最小阈值","stage":"opportunity_row","symbol":"CHIPUSDT"}],"candidate_count":0,"event":"poll_ok","mutable_execution_started":false,"recorded_at":"2026-05-21T00:00:00Z","status":"degraded","strategy":"cross-exchange-funding-arb"}"#,
+                "\n"
+            ),
+        )
+        .expect("write health events");
+
+        let snapshot = build_error_logs_snapshot(&PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            ..PortfolioDashboardOptions::default()
+        });
+
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].severity, "error");
+        assert_eq!(snapshot.entries[0].pair_id.as_deref(), None);
+        assert_eq!(snapshot.entries[0].symbol.as_deref(), None);
     }
 
     #[test]
@@ -63389,16 +63427,13 @@ mod tests {
         let json = error_logs_json(&snapshot);
 
         assert_eq!(snapshot.entries.len(), 1);
-        assert_eq!(
-            snapshot.entries[0].pair_id.as_deref(),
-            Some("spot-perp-basis:LABUSDT")
-        );
-        assert_eq!(snapshot.entries[0].symbol.as_deref(), Some("LABUSDT"));
+        assert_eq!(snapshot.entries[0].severity, "warning");
+        assert_eq!(snapshot.entries[0].pair_id.as_deref(), None);
+        assert_eq!(snapshot.entries[0].symbol.as_deref(), None);
         assert!(json.contains("候选不可用"));
         assert!(json.contains("spot-perp-basis"));
         assert!(json.contains("candidate_count=0"));
         assert!(json.contains("现货 top-of-book 缺失"));
-        assert!(json.contains("spot-perp-basis:LABUSDT"));
     }
 
     #[test]
@@ -63466,6 +63501,7 @@ mod tests {
         });
         let message = &snapshot.entries[0].message;
 
+        assert_eq!(snapshot.entries[0].severity, "warning");
         assert!(message.contains("阻断原因：所有 funding-arb pair 均未通过候选门槛"));
         assert!(message.contains("complete:is_candidate=false:盘口深度不足 (x3)"));
         assert!(message.contains("complete:is_candidate=false:净 funding 收益低于最小阈值 (x2)"));

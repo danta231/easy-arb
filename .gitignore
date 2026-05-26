@@ -6,6 +6,8 @@
 .vscode/
 
 target/
+server-backups/
+scripts/backup-server-runtime-logs.sh
 
 *.log
 *.tmp
