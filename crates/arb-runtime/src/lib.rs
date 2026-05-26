@@ -458,8 +458,19 @@ const BASIS_MONITOR_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8796";
 const BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE: &str = "0";
 const BASIS_MONITOR_DEFAULT_NOTIONAL_USD: &str = "100.00";
-const BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS: i128 = 10;
-const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: i128 = 5;
+const BINANCE_SPOT_TAKER_FEE_BPS: &str = "7.5";
+const BINANCE_PERP_TAKER_FEE_BPS: &str = "4.5";
+const BYBIT_SPOT_TAKER_FEE_BPS: &str = "10";
+const BYBIT_PERP_TAKER_FEE_BPS: &str = "5";
+const OKX_SPOT_TAKER_FEE_BPS: &str = "10";
+const OKX_PERP_TAKER_FEE_BPS: &str = "5";
+const BITGET_SPOT_TAKER_FEE_BPS: &str = "10";
+const BITGET_PERP_TAKER_FEE_BPS: &str = "6";
+const ASTER_SPOT_TAKER_FEE_BPS: &str = "4";
+const ASTER_PERP_TAKER_FEE_BPS: &str = "4";
+const HYPERLIQUID_SPOT_TAKER_FEE_BPS: &str = "7";
+const HYPERLIQUID_PERP_TAKER_FEE_BPS: &str = "4.5";
+const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: &str = BINANCE_PERP_TAKER_FEE_BPS;
 const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
 const OKX_FUNDING_RATE_CACHE_TTL_ENV: &str = "ARB_RUNTIME_OKX_FUNDING_RATE_CACHE_TTL_SECS";
@@ -1499,8 +1510,8 @@ pub struct BinanceBasisMonitorOptions {
     pub poll_interval_secs: u64,
     pub min_abs_funding_rate: String,
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
     pub once: bool,
@@ -1514,8 +1525,8 @@ impl Default for BinanceBasisMonitorOptions {
             poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
             min_abs_funding_rate: BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE.to_owned(),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-            perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            spot_taker_fee_bps: BINANCE_SPOT_TAKER_FEE_BPS.to_owned(),
+            perp_taker_fee_bps: BINANCE_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             min_net_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
             once: false,
@@ -1533,8 +1544,8 @@ pub struct BybitBasisMonitorOptions {
     pub poll_interval_secs: u64,
     pub min_abs_funding_rate: String,
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
     pub once: bool,
@@ -1548,8 +1559,8 @@ impl Default for BybitBasisMonitorOptions {
             poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
             min_abs_funding_rate: BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE.to_owned(),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-            perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            spot_taker_fee_bps: BYBIT_SPOT_TAKER_FEE_BPS.to_owned(),
+            perp_taker_fee_bps: BYBIT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             min_net_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
             once: false,
@@ -1568,8 +1579,8 @@ pub struct OkxBasisMonitorOptions {
     pub poll_interval_secs: u64,
     pub min_abs_funding_rate: String,
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
     pub once: bool,
@@ -1583,8 +1594,8 @@ impl Default for OkxBasisMonitorOptions {
             poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
             min_abs_funding_rate: BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE.to_owned(),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-            perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            spot_taker_fee_bps: OKX_SPOT_TAKER_FEE_BPS.to_owned(),
+            perp_taker_fee_bps: OKX_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             min_net_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
             once: false,
@@ -1603,8 +1614,8 @@ pub struct BitgetBasisMonitorOptions {
     pub poll_interval_secs: u64,
     pub min_abs_funding_rate: String,
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
     pub once: bool,
@@ -1618,8 +1629,8 @@ impl Default for BitgetBasisMonitorOptions {
             poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
             min_abs_funding_rate: BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE.to_owned(),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-            perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            spot_taker_fee_bps: BITGET_SPOT_TAKER_FEE_BPS.to_owned(),
+            perp_taker_fee_bps: BITGET_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             min_net_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
             once: false,
@@ -1638,8 +1649,8 @@ pub struct HyperliquidBasisMonitorOptions {
     pub poll_interval_secs: u64,
     pub min_abs_funding_rate: String,
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
     pub perp_wss_monitor_url: Option<String>,
@@ -1654,8 +1665,8 @@ impl Default for HyperliquidBasisMonitorOptions {
             poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
             min_abs_funding_rate: BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE.to_owned(),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-            perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            spot_taker_fee_bps: HYPERLIQUID_SPOT_TAKER_FEE_BPS.to_owned(),
+            perp_taker_fee_bps: HYPERLIQUID_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             min_net_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
             perp_wss_monitor_url: None,
@@ -1675,8 +1686,8 @@ pub struct AsterBasisMonitorOptions {
     pub poll_interval_secs: u64,
     pub min_abs_funding_rate: String,
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
     pub perp_wss_monitor_url: Option<String>,
@@ -1691,8 +1702,8 @@ impl Default for AsterBasisMonitorOptions {
             poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
             min_abs_funding_rate: BASIS_MONITOR_DEFAULT_MIN_ABS_FUNDING_RATE.to_owned(),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-            perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            spot_taker_fee_bps: ASTER_SPOT_TAKER_FEE_BPS.to_owned(),
+            perp_taker_fee_bps: ASTER_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             min_net_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
             perp_wss_monitor_url: None,
@@ -1711,7 +1722,7 @@ pub struct FundingArbMonitorOptions {
     pub bind_addr: String,
     pub poll_interval_secs: u64,
     pub notional_usd: String,
-    pub taker_fee_bps: i128,
+    pub taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
@@ -1729,7 +1740,7 @@ impl Default for FundingArbMonitorOptions {
             bind_addr: FUNDING_ARB_MONITOR_DEFAULT_BIND_ADDR.to_owned(),
             poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -1768,7 +1779,7 @@ pub struct FundingArbGuardedDryRunOnceOptions {
     pub private_execution_snapshot_path: Option<PathBuf>,
     pub output_dir: Option<PathBuf>,
     pub notional_usd: String,
-    pub taker_fee_bps: i128,
+    pub taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
@@ -1847,7 +1858,7 @@ pub struct FundingArbResidentLiveOptions {
     pub poll_interval_secs: u64,
     pub max_cycles: Option<u64>,
     pub notional_usd: String,
-    pub taker_fee_bps: i128,
+    pub taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
@@ -14480,12 +14491,37 @@ fn default_funding_arb_venue_sources() -> Vec<FundingArbVenueSource> {
     ]
 }
 
+pub(crate) fn default_perp_taker_fee_bps_for_venue_family(venue_family: &str) -> &'static str {
+    match normalize_venue_family(venue_family).as_str() {
+        "bybit" => BYBIT_PERP_TAKER_FEE_BPS,
+        "okx" => OKX_PERP_TAKER_FEE_BPS,
+        "bitget" => BITGET_PERP_TAKER_FEE_BPS,
+        "aster" => ASTER_PERP_TAKER_FEE_BPS,
+        "hyperliquid" => HYPERLIQUID_PERP_TAKER_FEE_BPS,
+        _ => BINANCE_PERP_TAKER_FEE_BPS,
+    }
+}
+
+pub(crate) fn funding_arb_perp_taker_fee_bps_for_venue_family(
+    venue_family: &str,
+    configured_taker_fee_bps: &str,
+) -> String {
+    if configured_taker_fee_bps == BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS {
+        default_perp_taker_fee_bps_for_venue_family(venue_family).to_owned()
+    } else {
+        configured_taker_fee_bps.to_owned()
+    }
+}
+
 fn validate_monitor_options(options: &BinanceBasisMonitorOptions) -> RuntimeResult<()> {
     validate_basis_monitor_values(
         options.poll_interval_secs,
         &options.min_abs_funding_rate,
         &options.notional_usd,
     )
+    .and_then(|()| {
+        validate_basis_monitor_fee_values(&options.spot_taker_fee_bps, &options.perp_taker_fee_bps)
+    })
 }
 
 fn validate_bybit_monitor_options(options: &BybitBasisMonitorOptions) -> RuntimeResult<()> {
@@ -14494,6 +14530,9 @@ fn validate_bybit_monitor_options(options: &BybitBasisMonitorOptions) -> Runtime
         &options.min_abs_funding_rate,
         &options.notional_usd,
     )
+    .and_then(|()| {
+        validate_basis_monitor_fee_values(&options.spot_taker_fee_bps, &options.perp_taker_fee_bps)
+    })
 }
 
 fn validate_okx_monitor_options(options: &OkxBasisMonitorOptions) -> RuntimeResult<()> {
@@ -14502,6 +14541,9 @@ fn validate_okx_monitor_options(options: &OkxBasisMonitorOptions) -> RuntimeResu
         &options.min_abs_funding_rate,
         &options.notional_usd,
     )
+    .and_then(|()| {
+        validate_basis_monitor_fee_values(&options.spot_taker_fee_bps, &options.perp_taker_fee_bps)
+    })
 }
 
 fn validate_bitget_monitor_options(options: &BitgetBasisMonitorOptions) -> RuntimeResult<()> {
@@ -14510,6 +14552,9 @@ fn validate_bitget_monitor_options(options: &BitgetBasisMonitorOptions) -> Runti
         &options.min_abs_funding_rate,
         &options.notional_usd,
     )
+    .and_then(|()| {
+        validate_basis_monitor_fee_values(&options.spot_taker_fee_bps, &options.perp_taker_fee_bps)
+    })
 }
 
 fn validate_hyperliquid_monitor_options(
@@ -14519,7 +14564,10 @@ fn validate_hyperliquid_monitor_options(
         options.poll_interval_secs,
         &options.min_abs_funding_rate,
         &options.notional_usd,
-    )?;
+    )
+    .and_then(|()| {
+        validate_basis_monitor_fee_values(&options.spot_taker_fee_bps, &options.perp_taker_fee_bps)
+    })?;
     if options
         .perp_wss_monitor_url
         .as_deref()
@@ -14535,7 +14583,10 @@ fn validate_aster_monitor_options(options: &AsterBasisMonitorOptions) -> Runtime
         options.poll_interval_secs,
         &options.min_abs_funding_rate,
         &options.notional_usd,
-    )?;
+    )
+    .and_then(|()| {
+        validate_basis_monitor_fee_values(&options.spot_taker_fee_bps, &options.perp_taker_fee_bps)
+    })?;
     if options
         .perp_wss_monitor_url
         .as_deref()
@@ -14556,7 +14607,8 @@ fn validate_funding_arb_monitor_options(options: &FundingArbMonitorOptions) -> R
         ));
     }
     MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
-    if options.taker_fee_bps < 0
+    let taker_fee_bps = MonitorDecimal::parse("taker_fee_bps", &options.taker_fee_bps)?;
+    if taker_fee_bps.raw < 0
         || options.slippage_buffer_bps < 0
         || options.max_entry_price_divergence_bps < 0
         || options.min_net_funding_bps < 0
@@ -14613,6 +14665,20 @@ fn validate_basis_monitor_values(
     }
     MonitorDecimal::parse("min_abs_funding_rate", min_abs_funding_rate)?;
     MonitorDecimal::parse("notional_usd", notional_usd)?;
+    Ok(())
+}
+
+fn validate_basis_monitor_fee_values(
+    spot_taker_fee_bps: &str,
+    perp_taker_fee_bps: &str,
+) -> RuntimeResult<()> {
+    let spot_fee = MonitorDecimal::parse("spot_taker_fee_bps", spot_taker_fee_bps)?;
+    let perp_fee = MonitorDecimal::parse("perp_taker_fee_bps", perp_taker_fee_bps)?;
+    if spot_fee.raw < 0 || perp_fee.raw < 0 {
+        return Err(cli_arg_error(
+            "basis monitor fee bps values must be non-negative",
+        ));
+    }
     Ok(())
 }
 
@@ -14731,11 +14797,26 @@ fn basis_monitor_signal_should_fetch_depth(
     signal: &SpotPerpBasisSignal,
     min_net_bps: i128,
 ) -> bool {
-    signal.is_candidate
-        || signal
-            .expected_profit_bps
-            .saturating_add(BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS)
-            >= min_net_bps
+    if signal.is_candidate {
+        return true;
+    }
+    let Ok(expected_profit_bps) =
+        MonitorDecimal::parse("expected_profit_bps", &signal.expected_profit_bps)
+    else {
+        return false;
+    };
+    let Ok(buffer_bps) = MonitorDecimal::parse(
+        "basis_depth_prefilter_buffer_bps",
+        &BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS.to_string(),
+    ) else {
+        return false;
+    };
+    let Ok(min_net_bps) = MonitorDecimal::parse("min_net_bps", &min_net_bps.to_string()) else {
+        return false;
+    };
+    expected_profit_bps
+        .checked_add(buffer_bps, "basis depth prefilter bps")
+        .is_ok_and(|value| value.raw >= min_net_bps.raw)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -14976,8 +15057,8 @@ fn build_binance_basis_monitor_snapshot_from_parsed_with_depth(
                     perp_bid_depth,
                     last_funding_rate: premium.last_funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
-                    spot_taker_fee_bps: options.spot_taker_fee_bps,
-                    perp_taker_fee_bps: options.perp_taker_fee_bps,
+                    spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+                    perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
                     slippage_buffer_bps: options.slippage_buffer_bps,
                     min_net_bps: options.min_net_bps,
                 }) {
@@ -15151,8 +15232,8 @@ fn binance_basis_monitor_depth_symbols_from_parsed_with_limit(
             perp_bid_depth: perp.bid_depth.clone(),
             last_funding_rate: premium.last_funding_rate.clone(),
             notional_usd: options.notional_usd.clone(),
-            spot_taker_fee_bps: options.spot_taker_fee_bps,
-            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+            perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
             slippage_buffer_bps: options.slippage_buffer_bps,
             min_net_bps: options.min_net_bps,
         }) else {
@@ -15162,8 +15243,8 @@ fn binance_basis_monitor_depth_symbols_from_parsed_with_limit(
             continue;
         }
         scored_symbols.push((
-            signal.expected_profit_bps,
-            signal.net_bps,
+            signal_bps_sort_key(&signal.expected_profit_bps),
+            signal_bps_sort_key(&signal.net_bps),
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
             premium.symbol.clone(),
         ));
@@ -15188,6 +15269,12 @@ fn top_scored_basis_depth_symbols(
         .take(limit)
         .map(|(_, _, _, symbol)| symbol)
         .collect()
+}
+
+fn signal_bps_sort_key(value: &str) -> i128 {
+    MonitorDecimal::parse("signal_bps", value)
+        .map(|decimal| decimal.raw)
+        .unwrap_or(i128::MIN)
 }
 
 fn fetch_aster_basis_monitor_snapshot(
@@ -15612,8 +15699,8 @@ fn aster_basis_monitor_depth_symbols_with_limit(
             perp_bid_depth: perp.bid_depth.clone(),
             last_funding_rate: premium.last_funding_rate,
             notional_usd: options.notional_usd.clone(),
-            spot_taker_fee_bps: options.spot_taker_fee_bps,
-            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+            perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
             slippage_buffer_bps: options.slippage_buffer_bps,
             min_net_bps: options.min_net_bps,
         }) else {
@@ -15623,8 +15710,8 @@ fn aster_basis_monitor_depth_symbols_with_limit(
             continue;
         }
         scored_symbols.push((
-            signal.expected_profit_bps,
-            signal.net_bps,
+            signal_bps_sort_key(&signal.expected_profit_bps),
+            signal_bps_sort_key(&signal.net_bps),
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
             premium.symbol,
         ));
@@ -15839,8 +15926,8 @@ fn build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
                     perp_bid_depth,
                     last_funding_rate: linear.last_funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
-                    spot_taker_fee_bps: options.spot_taker_fee_bps,
-                    perp_taker_fee_bps: options.perp_taker_fee_bps,
+                    spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+                    perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
                     slippage_buffer_bps: options.slippage_buffer_bps,
                     min_net_bps: options.min_net_bps,
                 }) {
@@ -16006,8 +16093,8 @@ fn bybit_basis_monitor_depth_symbols_from_parsed_with_limit(
             perp_bid_depth: linear.bid_depth.clone(),
             last_funding_rate: linear.last_funding_rate.clone(),
             notional_usd: options.notional_usd.clone(),
-            spot_taker_fee_bps: options.spot_taker_fee_bps,
-            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+            perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
             slippage_buffer_bps: options.slippage_buffer_bps,
             min_net_bps: options.min_net_bps,
         }) else {
@@ -16017,8 +16104,8 @@ fn bybit_basis_monitor_depth_symbols_from_parsed_with_limit(
             continue;
         }
         scored_symbols.push((
-            signal.expected_profit_bps,
-            signal.net_bps,
+            signal_bps_sort_key(&signal.expected_profit_bps),
+            signal_bps_sort_key(&signal.net_bps),
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
             symbol.clone(),
         ));
@@ -16526,8 +16613,8 @@ fn build_okx_basis_monitor_snapshot_from_parsed_with_depth(
                     perp_bid_depth,
                     last_funding_rate: funding.funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
-                    spot_taker_fee_bps: options.spot_taker_fee_bps,
-                    perp_taker_fee_bps: options.perp_taker_fee_bps,
+                    spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+                    perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
                     slippage_buffer_bps: options.slippage_buffer_bps,
                     min_net_bps: options.min_net_bps,
                 }) {
@@ -16693,8 +16780,8 @@ fn okx_basis_monitor_depth_symbols_from_parsed_with_limit(
             perp_bid_depth: swap.bid_depth.clone(),
             last_funding_rate: funding.funding_rate.clone(),
             notional_usd: options.notional_usd.clone(),
-            spot_taker_fee_bps: options.spot_taker_fee_bps,
-            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+            perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
             slippage_buffer_bps: options.slippage_buffer_bps,
             min_net_bps: options.min_net_bps,
         }) else {
@@ -16704,8 +16791,8 @@ fn okx_basis_monitor_depth_symbols_from_parsed_with_limit(
             continue;
         }
         scored_symbols.push((
-            signal.expected_profit_bps,
-            signal.net_bps,
+            signal_bps_sort_key(&signal.expected_profit_bps),
+            signal_bps_sort_key(&signal.net_bps),
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
             spot_inst_id,
             swap_inst_id.clone(),
@@ -16893,8 +16980,8 @@ fn build_bitget_basis_monitor_snapshot_from_parsed_with_depth(
                     perp_bid_depth,
                     last_funding_rate: funding.funding_rate.clone(),
                     notional_usd: options.notional_usd.clone(),
-                    spot_taker_fee_bps: options.spot_taker_fee_bps,
-                    perp_taker_fee_bps: options.perp_taker_fee_bps,
+                    spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+                    perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
                     slippage_buffer_bps: options.slippage_buffer_bps,
                     min_net_bps: options.min_net_bps,
                 }) {
@@ -17053,8 +17140,8 @@ fn bitget_basis_monitor_depth_symbols_from_parsed_with_limit(
             perp_bid_depth: futures.bid_depth.clone(),
             last_funding_rate: funding.funding_rate.clone(),
             notional_usd: options.notional_usd.clone(),
-            spot_taker_fee_bps: options.spot_taker_fee_bps,
-            perp_taker_fee_bps: options.perp_taker_fee_bps,
+            spot_taker_fee_bps: options.spot_taker_fee_bps.clone(),
+            perp_taker_fee_bps: options.perp_taker_fee_bps.clone(),
             slippage_buffer_bps: options.slippage_buffer_bps,
             min_net_bps: options.min_net_bps,
         }) else {
@@ -17064,8 +17151,8 @@ fn bitget_basis_monitor_depth_symbols_from_parsed_with_limit(
             continue;
         }
         scored_symbols.push((
-            signal.expected_profit_bps,
-            signal.net_bps,
+            signal_bps_sort_key(&signal.expected_profit_bps),
+            signal_bps_sort_key(&signal.net_bps),
             funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
             futures.symbol.clone(),
         ));
@@ -17992,8 +18079,14 @@ fn funding_arb_pair_row(
         short_funding_rate: rate_b_8h.clone(),
         funding_interval_hours: "8".to_owned(),
         notional_usd: options.notional_usd.clone(),
-        long_taker_fee_bps: options.taker_fee_bps,
-        short_taker_fee_bps: options.taker_fee_bps,
+        long_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            &venue_a.venue_family,
+            &options.taker_fee_bps,
+        ),
+        short_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            &venue_b.venue_family,
+            &options.taker_fee_bps,
+        ),
         slippage_buffer_bps: options.slippage_buffer_bps,
         max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
         min_net_funding_bps: options.min_net_funding_bps,
@@ -18015,8 +18108,14 @@ fn funding_arb_pair_row(
         short_funding_rate: rate_a_8h,
         funding_interval_hours: "8".to_owned(),
         notional_usd: options.notional_usd.clone(),
-        long_taker_fee_bps: options.taker_fee_bps,
-        short_taker_fee_bps: options.taker_fee_bps,
+        long_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            &venue_b.venue_family,
+            &options.taker_fee_bps,
+        ),
+        short_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            &venue_a.venue_family,
+            &options.taker_fee_bps,
+        ),
         slippage_buffer_bps: options.slippage_buffer_bps,
         max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
         min_net_funding_bps: options.min_net_funding_bps,
@@ -26843,7 +26942,7 @@ fn run_funding_arb_resident_cycle(
                 private_execution_snapshot_path: options.private_execution_snapshot_path.clone(),
                 output_dir: Some(cycle_dir.join("guarded-live-canary")),
                 notional_usd: options.notional_usd.clone(),
-                taker_fee_bps: options.taker_fee_bps,
+                taker_fee_bps: options.taker_fee_bps.clone(),
                 slippage_buffer_bps: options.slippage_buffer_bps,
                 max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
                 min_net_funding_bps: options.min_net_funding_bps,
@@ -27297,7 +27396,7 @@ fn validate_funding_arb_resident_live_options(
             bind_addr: FUNDING_ARB_MONITOR_DEFAULT_BIND_ADDR.to_owned(),
             poll_interval_secs: options.poll_interval_secs,
             notional_usd: options.notional_usd.clone(),
-            taker_fee_bps: options.taker_fee_bps,
+            taker_fee_bps: options.taker_fee_bps.clone(),
             slippage_buffer_bps: options.slippage_buffer_bps,
             max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
             min_net_funding_bps: options.min_net_funding_bps,
@@ -27310,7 +27409,8 @@ fn validate_funding_arb_resident_live_options(
         })?;
     }
     MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
-    if options.taker_fee_bps < 0
+    let taker_fee_bps = MonitorDecimal::parse("taker_fee_bps", &options.taker_fee_bps)?;
+    if taker_fee_bps.raw < 0
         || options.slippage_buffer_bps < 0
         || options.max_entry_price_divergence_bps < 0
         || options.min_net_funding_bps < 0
@@ -27419,7 +27519,7 @@ fn load_funding_arb_resident_snapshot(
         bind_addr: FUNDING_ARB_MONITOR_DEFAULT_BIND_ADDR.to_owned(),
         poll_interval_secs: options.poll_interval_secs,
         notional_usd: options.notional_usd.clone(),
-        taker_fee_bps: options.taker_fee_bps,
+        taker_fee_bps: options.taker_fee_bps.clone(),
         slippage_buffer_bps: options.slippage_buffer_bps,
         max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
         min_net_funding_bps: options.min_net_funding_bps,
@@ -28819,7 +28919,7 @@ fn funding_arb_resident_dry_run_options(
         private_execution_snapshot_path: options.private_execution_snapshot_path.clone(),
         output_dir,
         notional_usd: options.notional_usd.clone(),
-        taker_fee_bps: options.taker_fee_bps,
+        taker_fee_bps: options.taker_fee_bps.clone(),
         slippage_buffer_bps: options.slippage_buffer_bps,
         max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
         min_net_funding_bps: options.min_net_funding_bps,
@@ -30871,7 +30971,8 @@ fn validate_funding_arb_guarded_dry_run_once_options(
         ));
     }
     MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
-    if options.taker_fee_bps < 0
+    let taker_fee_bps = MonitorDecimal::parse("taker_fee_bps", &options.taker_fee_bps)?;
+    if taker_fee_bps.raw < 0
         || options.slippage_buffer_bps < 0
         || options.max_entry_price_divergence_bps < 0
         || options.min_net_funding_bps < 0
@@ -31210,8 +31311,8 @@ fn funding_arb_monitor_row_to_normalized_events(
             short_funding_rate: row.venue_b_funding_rate.clone(),
             funding_interval_hours: row.venue_a_funding_interval_hours.clone(),
             notional_usd: spec.strategy_config.economics.notional_usd.clone(),
-            long_taker_fee_bps: spec.strategy_config.economics.venue_a_taker_fee_bps,
-            short_taker_fee_bps: spec.strategy_config.economics.venue_b_taker_fee_bps,
+            long_taker_fee_bps: spec.strategy_config.economics.venue_a_taker_fee_bps.clone(),
+            short_taker_fee_bps: spec.strategy_config.economics.venue_b_taker_fee_bps.clone(),
             slippage_buffer_bps: spec.strategy_config.economics.slippage_buffer_bps,
             max_entry_price_divergence_bps: spec
                 .strategy_config
@@ -31240,8 +31341,8 @@ fn funding_arb_monitor_row_to_normalized_events(
             short_funding_rate: row.venue_a_funding_rate.clone(),
             funding_interval_hours: row.venue_b_funding_interval_hours.clone(),
             notional_usd: spec.strategy_config.economics.notional_usd.clone(),
-            long_taker_fee_bps: spec.strategy_config.economics.venue_b_taker_fee_bps,
-            short_taker_fee_bps: spec.strategy_config.economics.venue_a_taker_fee_bps,
+            long_taker_fee_bps: spec.strategy_config.economics.venue_b_taker_fee_bps.clone(),
+            short_taker_fee_bps: spec.strategy_config.economics.venue_a_taker_fee_bps.clone(),
             slippage_buffer_bps: spec.strategy_config.economics.slippage_buffer_bps,
             max_entry_price_divergence_bps: spec
                 .strategy_config
@@ -32289,8 +32390,8 @@ fn write_binance_basis_guarded_live_auto_market_artifacts(
         perp_bid_depth: perp_depth.bid_depth.clone(),
         last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
-        spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-        perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        spot_taker_fee_bps: BINANCE_SPOT_TAKER_FEE_BPS.to_owned(),
+        perp_taker_fee_bps: BINANCE_PERP_TAKER_FEE_BPS.to_owned(),
         slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
         min_net_bps,
     })
@@ -32379,8 +32480,8 @@ fn write_bybit_basis_guarded_live_auto_market_artifacts(
         perp_bid_depth: perp_depth.bid_depth.clone(),
         last_funding_rate: payload_string(premium, "last_funding_rate")?.to_owned(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
-        spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-        perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        spot_taker_fee_bps: BYBIT_SPOT_TAKER_FEE_BPS.to_owned(),
+        perp_taker_fee_bps: BYBIT_PERP_TAKER_FEE_BPS.to_owned(),
         slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
         min_net_bps,
     })
@@ -32486,8 +32587,8 @@ fn write_bitget_basis_guarded_live_auto_market_artifacts(
         perp_bid_depth: futures_depth.bid_depth.clone(),
         last_funding_rate: funding.funding_rate.clone(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
-        spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-        perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        spot_taker_fee_bps: BITGET_SPOT_TAKER_FEE_BPS.to_owned(),
+        perp_taker_fee_bps: BITGET_PERP_TAKER_FEE_BPS.to_owned(),
         slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
         min_net_bps,
     })
@@ -32685,8 +32786,8 @@ fn write_okx_basis_guarded_live_auto_market_artifacts(
         perp_bid_depth: swap_depth.bid_depth.clone(),
         last_funding_rate: funding.funding_rate.clone(),
         notional_usd: BINANCE_GUARDED_LIVE_NOTIONAL_USDT.to_owned(),
-        spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-        perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        spot_taker_fee_bps: OKX_SPOT_TAKER_FEE_BPS.to_owned(),
+        perp_taker_fee_bps: OKX_PERP_TAKER_FEE_BPS.to_owned(),
         slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
         min_net_bps,
     })
@@ -40606,10 +40707,10 @@ mod tests {
             funding_interval_hours: "8".to_owned(),
             long_venue_family: Some("binance".to_owned()),
             short_venue_family: Some("bybit".to_owned()),
-            gross_funding_spread_bps: Some("29".to_owned()),
-            total_cost_bps: Some("10".to_owned()),
-            net_funding_bps: Some("9".to_owned()),
-            expected_funding_usd: Some("0.19".to_owned()),
+            gross_funding_spread_bps: Some("59".to_owned()),
+            total_cost_bps: Some("25".to_owned()),
+            net_funding_bps: Some("17".to_owned()),
+            expected_funding_usd: Some("0.34".to_owned()),
             is_candidate: true,
             reason: None,
             source_status: "complete".to_owned(),
@@ -40702,7 +40803,7 @@ mod tests {
         let spec =
             CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         funding_arb_monitor_snapshot_candidate_events(
@@ -40732,6 +40833,8 @@ mod tests {
         );
         strategy_config.venues.venue_b.venue_label = venue_label.to_owned();
         strategy_config.venues.venue_b.instrument_label = "perp".to_owned();
+        strategy_config.economics.venue_b_taker_fee_bps =
+            default_perp_taker_fee_bps_for_venue_family(venue_family).to_owned();
         strategy_config.output.transition_id = transition_id.to_owned();
         let mut venue_capabilities =
             arb_venue_capability_descriptors("binance").expect("binance capabilities");
@@ -43983,7 +44086,10 @@ mod tests {
         assert_eq!(snapshot.filtered_funding_count, 1);
         assert_eq!(snapshot.candidate_count, 1);
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
+        assert_eq!(
+            snapshot.rows[0].net_basis_bps.as_deref(),
+            Some("35.5000505")
+        );
     }
 
     #[test]
@@ -44116,7 +44222,7 @@ mod tests {
             "hyperliquid",
             &funding_arb_basis_status_json(
                 "BTC",
-                "0.00040000",
+                "0.00070000",
                 "missing_spot",
                 Some("2.0"),
                 Some("2.0"),
@@ -44149,7 +44255,7 @@ mod tests {
         assert_eq!(snapshot.candidate_count, 1);
         let row = &snapshot.rows[0];
         assert_eq!(row.symbol, "BTCUSDT");
-        assert_eq!(row.venue_b_funding_rate, "0.0032");
+        assert_eq!(row.venue_b_funding_rate, "0.0056");
         assert_eq!(row.venue_b_funding_interval_hours, "8");
         assert_eq!(row.source_status, "complete");
         assert!(row
@@ -44161,7 +44267,7 @@ mod tests {
     #[test]
     fn funding_arb_monitor_uses_order_book_depth_levels_for_liquidity() {
         let binance_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"99.95","perp_ask":"100.00","perp_bid_qty":"0.5","perp_ask_qty":"0.5","perp_bid_depth_levels":[{"price":"99.95","size":"0.5"},{"price":"99.80","size":"1.0"}],"perp_ask_depth_levels":[{"price":"100.00","size":"0.5"},{"price":"100.25","size":"1.0"}],"mark_price":"100.00","index_price":"100.00","last_funding_rate":"0.00010000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
-        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"0.5","perp_ask_qty":"0.5","perp_bid_depth_levels":[{"price":"100.05","size":"0.5"},{"price":"99.95","size":"1.0"}],"perp_ask_depth_levels":[{"price":"100.10","size":"0.5"},{"price":"100.30","size":"1.0"}],"mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00300000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
+        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"0.5","perp_ask_qty":"0.5","perp_bid_depth_levels":[{"price":"100.05","size":"0.5"},{"price":"99.95","size":"1.0"}],"perp_ask_depth_levels":[{"price":"100.10","size":"0.5"},{"price":"100.30","size":"1.0"}],"mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00600000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
         let binance = funding_arb_test_venue_snapshot("binance", binance_status);
         let bybit = funding_arb_test_venue_snapshot("bybit", bybit_status);
         let options = FundingArbMonitorOptions {
@@ -44261,7 +44367,7 @@ mod tests {
             "hyperliquid",
             &funding_arb_basis_status_json_with_interval_and_next(
                 "PROVE",
-                "-0.0009100024",
+                "-0.0009435025",
                 "1",
                 "",
                 "missing_spot",
@@ -44317,7 +44423,7 @@ mod tests {
             "hyperliquid",
             &funding_arb_basis_status_json_with_interval_and_next(
                 "PROVE",
-                "-0.0009100024",
+                "-0.0009435025",
                 "1",
                 "1779436800000",
                 "missing_spot",
@@ -44350,7 +44456,7 @@ mod tests {
         let row = &snapshot.rows[0];
         assert_eq!(row.long_venue_family.as_deref(), Some("hyperliquid"));
         assert_eq!(row.short_venue_family.as_deref(), Some("aster"));
-        assert_eq!(row.venue_b_funding_rate, "-0.0072800192");
+        assert_eq!(row.venue_b_funding_rate, "-0.00754802");
         assert!(row
             .reason
             .as_deref()
@@ -44386,7 +44492,7 @@ mod tests {
                 Some("2.0"),
             ),
         );
-        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"120.00","index_price":"100.00","last_funding_rate":"0.00300000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
+        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"120.00","index_price":"100.00","last_funding_rate":"0.00600000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
         let bybit = funding_arb_test_venue_snapshot("bybit", bybit_status);
 
         let snapshot = build_funding_arb_monitor_snapshot_from_sources(
@@ -44418,7 +44524,7 @@ mod tests {
         );
         let bybit = funding_arb_test_venue_snapshot(
             "bybit",
-            &funding_arb_basis_status_json("BTCUSDT", "0.00300000", "complete", None, Some("2.0")),
+            &funding_arb_basis_status_json("BTCUSDT", "0.00600000", "complete", None, Some("2.0")),
         );
         let options = FundingArbMonitorOptions::default();
 
@@ -44454,7 +44560,7 @@ mod tests {
                 Some("2.0"),
             ),
         );
-        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"0","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00300000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
+        let bybit_status = r#"{"status":"healthy","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"0","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00600000","next_funding_time_ms":"1778659200000","source_status":"complete"}]}"#;
         let bybit = funding_arb_test_venue_snapshot("bybit", bybit_status);
 
         let snapshot = build_funding_arb_monitor_snapshot_from_sources(
@@ -44516,7 +44622,7 @@ mod tests {
 
     #[test]
     fn funding_arb_monitor_snapshot_compact_json_keeps_selected_row_and_counts() {
-        let selected = funding_arb_test_row("0.00010000", "0.00300000");
+        let selected = funding_arb_test_row("0.00010000", "0.00600000");
         let mut other = funding_arb_test_row("0.00020000", "0.00400000");
         other.pair_id = "binance:bybit:ETHUSDT:ETHUSDT".to_owned();
         other.symbol = "ETHUSDT".to_owned();
@@ -44546,7 +44652,7 @@ mod tests {
 
     #[test]
     fn funding_arb_monitor_snapshot_compact_json_groups_no_candidate_blocking_path() {
-        let mut below_min_one = funding_arb_test_row("0.00010000", "0.00300000");
+        let mut below_min_one = funding_arb_test_row("0.00010000", "0.00600000");
         below_min_one.is_candidate = false;
         below_min_one.net_funding_bps = Some("1".to_owned());
         below_min_one.reason = Some("net_funding_bps=1 below min_net_funding_bps=5".to_owned());
@@ -44583,7 +44689,7 @@ mod tests {
     #[cfg(feature = "live-exec")]
     #[test]
     fn funding_arb_monitor_snapshot_artifact_debug_mode_writes_full_snapshot() {
-        let selected = funding_arb_test_row("0.00010000", "0.00300000");
+        let selected = funding_arb_test_row("0.00010000", "0.00600000");
         let mut other = funding_arb_test_row("0.00020000", "0.00400000");
         other.pair_id = "binance:bybit:ETHUSDT:ETHUSDT".to_owned();
         other.symbol = "ETHUSDT".to_owned();
@@ -44620,7 +44726,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -44641,7 +44747,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -44741,7 +44847,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -44750,7 +44856,7 @@ mod tests {
         let settlement_path = root.path().join("funding-settlements.json");
         write_utf8(
             settlement_path.clone(),
-            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","entries":[{"venue_family":"binance","symbol":"BTCUSDT","account_id":"acct:binance-funding-arb-readonly","amount_usd":"-0.01"},{"venue_family":"bybit","symbol":"BTCUSDT","account_id":"acct:bybit-funding-arb-readonly","amount_usd":"0.30"}]}"#,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","entries":[{"venue_family":"binance","symbol":"BTCUSDT","account_id":"acct:binance-funding-arb-readonly","amount_usd":"-0.01"},{"venue_family":"bybit","symbol":"BTCUSDT","account_id":"acct:bybit-funding-arb-readonly","amount_usd":"0.60"}]}"#,
         )
         .expect("write settlement ledger");
         let output_dir = root.path().join("funding-dry-run");
@@ -44768,7 +44874,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -44780,11 +44886,11 @@ mod tests {
         assert_eq!(report.funding_settlement.status, "Matched");
         assert_eq!(
             report.funding_settlement.expected_funding_usd.as_deref(),
-            Some("0.29")
+            Some("0.59")
         );
         assert_eq!(
             report.funding_settlement.actual_funding_usd.as_deref(),
-            Some("0.29")
+            Some("0.59")
         );
         assert!(!report.live_ready);
         assert!(!report
@@ -44805,7 +44911,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -44814,7 +44920,7 @@ mod tests {
         let raw_settlement_path = root.path().join("funding-raw-settlements.json");
         write_utf8(
             raw_settlement_path.clone(),
-            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01"}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30"}]}}}]}"#,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01"}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.60"}]}}}]}"#,
         )
         .expect("write raw settlement snapshot");
         let output_dir = root.path().join("funding-dry-run");
@@ -44832,7 +44938,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -44844,7 +44950,7 @@ mod tests {
         assert_eq!(report.funding_settlement.status, "Matched");
         assert_eq!(
             report.funding_settlement.actual_funding_usd.as_deref(),
-            Some("0.29")
+            Some("0.59")
         );
         assert!(!report
             .live_blocking_reasons
@@ -44858,7 +44964,7 @@ mod tests {
 
     #[test]
     fn funding_settlement_reconciliation_missing_gross_spread_is_nonfatal() {
-        let mut row = funding_arb_test_row("0.00010000", "0.00300000");
+        let mut row = funding_arb_test_row("0.00010000", "0.00600000");
         row.gross_funding_spread_bps = None;
         let options = FundingArbGuardedDryRunOnceOptions {
             config_path: PathBuf::from("unused.yaml"),
@@ -44873,7 +44979,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -44945,7 +45051,7 @@ mod tests {
 
     #[test]
     fn funding_settlement_reconciliation_uses_latest_complete_timestamp_bucket() {
-        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let row = funding_arb_test_row("0.00010000", "0.00600000");
         let options = FundingArbGuardedDryRunOnceOptions {
             config_path: PathBuf::from("unused.yaml"),
             snapshot_path: PathBuf::from("unused.json"),
@@ -44959,7 +45065,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -44969,18 +45075,18 @@ mod tests {
         let summary = reconcile_funding_settlement_raw_snapshot_json(
             &row,
             &spec,
-            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"1.00","time":1779523204000},{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01","time":1779552004000}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"1.00","transactionTime":"1779523200000"},{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.30","transactionTime":"1779552000000"}]}}}]}"#,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"1.00","time":1779523204000},{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"-0.01","time":1779552004000}]},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"1.00","transactionTime":"1779523200000"},{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"0.60","transactionTime":"1779552000000"}]}}}]}"#,
         )
         .expect("funding settlement reconciliation");
 
         assert_eq!(summary.status, "Matched");
-        assert_eq!(summary.actual_funding_usd.as_deref(), Some("0.29"));
+        assert_eq!(summary.actual_funding_usd.as_deref(), Some("0.59"));
         assert_eq!(summary.checked_entry_count, 2);
     }
 
     #[test]
     fn funding_settlement_reconciliation_can_scope_to_target_bucket() {
-        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let row = funding_arb_test_row("0.00010000", "0.00600000");
         let options = FundingArbGuardedDryRunOnceOptions {
             config_path: PathBuf::from("unused.yaml"),
             snapshot_path: PathBuf::from("unused.json"),
@@ -44994,7 +45100,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45020,7 +45126,7 @@ mod tests {
 
     #[test]
     fn funding_settlement_reconciliation_scopes_bitget_ctime_to_target_bucket() {
-        let mut row = funding_arb_test_row("0.00010000", "0.00300000");
+        let mut row = funding_arb_test_row("0.00010000", "0.00600000");
         row.pair_id = "binance:bitget:BTCUSDT:BTCUSDT".to_owned();
         row.venue_b_family = "bitget".to_owned();
         row.short_venue_family = Some("bitget".to_owned());
@@ -45037,7 +45143,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45063,7 +45169,7 @@ mod tests {
 
     #[test]
     fn funding_settlement_reconciliation_ignores_pre_open_entries() {
-        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let row = funding_arb_test_row("0.00010000", "0.00600000");
         let options = FundingArbGuardedDryRunOnceOptions {
             config_path: PathBuf::from("unused.yaml"),
             snapshot_path: PathBuf::from("unused.json"),
@@ -45077,7 +45183,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45103,7 +45209,7 @@ mod tests {
 
     #[test]
     fn funding_settlement_reconciliation_reports_missing_latest_bucket_account() {
-        let row = funding_arb_test_row("0.00010000", "0.00300000");
+        let row = funding_arb_test_row("0.00010000", "0.00600000");
         let options = FundingArbGuardedDryRunOnceOptions {
             config_path: PathBuf::from("unused.yaml"),
             snapshot_path: PathBuf::from("unused.json"),
@@ -45117,7 +45223,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45146,7 +45252,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -45173,7 +45279,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45219,7 +45325,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -45251,7 +45357,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45279,7 +45385,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -45317,7 +45423,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45484,7 +45590,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -45511,7 +45617,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45547,7 +45653,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -45574,7 +45680,7 @@ mod tests {
             private_execution_snapshot_path: Some(private_execution_path),
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45613,7 +45719,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -45639,7 +45745,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45661,7 +45767,7 @@ mod tests {
         let config_path = root.path().join("guarded-live.yaml");
         write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -45687,7 +45793,7 @@ mod tests {
             private_execution_snapshot_path: Some(private_execution_path),
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45836,7 +45942,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: Some(output_dir.clone()),
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45929,7 +46035,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -45986,7 +46092,7 @@ mod tests {
         write_utf8(config_path.clone(), guarded_live_open_real_signing_yaml())
             .expect("write config");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00010000", "0.00300000")],
+            vec![funding_arb_test_row("0.00010000", "0.00600000")],
             "2026-05-13T00:00:00Z".to_owned(),
         );
         let pair_id = snapshot.rows[0].pair_id.clone();
@@ -46020,7 +46126,7 @@ mod tests {
                     private_execution_snapshot_path: None,
                     output_dir: Some(root.path().join("funding-canary")),
                     notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
-                    taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+                    taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
                     slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
                     max_entry_price_divergence_bps: 20,
                     min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
@@ -46363,7 +46469,7 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: None,
             notional_usd: "10.00".to_owned(),
-            taker_fee_bps: 5,
+            taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
@@ -46477,7 +46583,7 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: Some(1),
             notional_usd: "10.00".to_owned(),
-            taker_fee_bps: 5,
+            taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
@@ -46521,7 +46627,7 @@ mod tests {
             .join("cycles")
             .join(resident_cycle_dir_name(1).expect("cycle dir"));
         fs::create_dir_all(&previous_cycle).expect("create previous cycle");
-        let mut row = funding_arb_test_row("0.00300000", "0.00010000");
+        let mut row = funding_arb_test_row("0.00600000", "0.00010000");
         row.pair_id = "binance:bybit:CHIPUSDT:CHIPUSDT".to_owned();
         row.symbol = "CHIPUSDT".to_owned();
         row.long_venue_family = Some("bybit".to_owned());
@@ -46554,7 +46660,7 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: None,
             notional_usd: "10.00".to_owned(),
-            taker_fee_bps: 5,
+            taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
@@ -46683,7 +46789,7 @@ mod tests {
     #[cfg(feature = "live-exec")]
     fn funding_arb_unknown_position_recovery_closes_flat_private_snapshot() {
         let root = RuntimeTempDir::new().expect("temp dir");
-        let mut row = funding_arb_test_row("0.00300000", "0.00010000");
+        let mut row = funding_arb_test_row("0.00600000", "0.00010000");
         row.pair_id = "binance:bybit:CHIPUSDT:CHIPUSDT".to_owned();
         row.symbol = "CHIPUSDT".to_owned();
         row.long_venue_family = Some("bybit".to_owned());
@@ -50039,7 +50145,7 @@ mod tests {
         let spec =
             CrossExchangeFundingArbPipelineSpec::binance_bybit_btcusdt().expect("funding spec");
         let snapshot = funding_arb_test_snapshot(
-            vec![funding_arb_test_row("0.00300000", "0.00010000")],
+            vec![funding_arb_test_row("0.00600000", "0.00010000")],
             ingested_at.to_string(),
         );
         let events = funding_arb_monitor_snapshot_candidate_events(&spec, &snapshot, ingested_at)
@@ -50091,14 +50197,14 @@ mod tests {
             venue_b_ask_depth: signal_depth_from_top_strings("0.0274", "59008"),
             venue_b_mark_price: "0.0273".to_owned(),
             venue_b_index_price: "0.0272524900485994".to_owned(),
-            venue_b_funding_rate: "0.0001".to_owned(),
+            venue_b_funding_rate: "0.0013".to_owned(),
             venue_b_funding_interval_hours: "8".to_owned(),
             venue_b_next_funding_time_ms: "1779624000000".to_owned(),
             funding_interval_hours: "8".to_owned(),
             long_venue_family: Some("bybit".to_owned()),
             short_venue_family: Some("bitget".to_owned()),
-            gross_funding_spread_bps: Some("28".to_owned()),
-            total_cost_bps: Some("15".to_owned()),
+            gross_funding_spread_bps: Some("40".to_owned()),
+            total_cost_bps: Some("27".to_owned()),
             net_funding_bps: Some("6".to_owned()),
             expected_funding_usd: Some("0.117".to_owned()),
             is_candidate: true,
@@ -50119,7 +50225,7 @@ mod tests {
             private_execution_snapshot_path: None,
             output_dir: None,
             notional_usd: "90.00".to_owned(),
-            taker_fee_bps: 5,
+            taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
@@ -50230,7 +50336,7 @@ mod tests {
         let other_symbol_snapshot = funding_arb_test_snapshot(
             vec![FundingArbMarketRow {
                 symbol: "ETHUSDT".to_owned(),
-                ..funding_arb_test_row("0.00010000", "0.00300000")
+                ..funding_arb_test_row("0.00010000", "0.00600000")
             }],
             ingested_at.to_string(),
         );
@@ -50245,7 +50351,7 @@ mod tests {
         let incomplete_snapshot = FundingArbMonitorSnapshot {
             rows: vec![FundingArbMarketRow {
                 source_status: "missing_funding".to_owned(),
-                ..funding_arb_test_row("0.00010000", "0.00300000")
+                ..funding_arb_test_row("0.00010000", "0.00600000")
             }],
             ..other_symbol_snapshot
         };
@@ -50323,7 +50429,7 @@ mod tests {
             "Aster",
             "trans:aster-funding-arb-btcusdt-001",
         );
-        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00300000", "8");
+        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00600000", "8");
 
         let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
             &replay,
@@ -50373,7 +50479,7 @@ mod tests {
             "Hyperliquid",
             "trans:hyperliquid-funding-arb-btcusdt-001",
         );
-        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00050000", "1");
+        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00090000", "1");
 
         let artifacts = assemble_public_funding_arb_pipeline_from_normalized_events(
             &replay,
@@ -50391,7 +50497,7 @@ mod tests {
             .contains("trans:hyperliquid-funding-arb-btcusdt-001"));
         assert!(artifacts
             .candidate_transitions_jsonl
-            .contains("\"expected_profit_bps\":\"12\""));
+            .contains("\"expected_profit_bps\":\"24\""));
     }
 
     #[test]
@@ -50406,7 +50512,7 @@ mod tests {
             "Hyperliquid",
             "trans:hyperliquid-funding-arb-btcusdt-001",
         );
-        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00050000", "1");
+        let events = funding_arb_events_for_spec(&spec, "0.00010000", "8", "0.00090000", "1");
 
         let report = run_funding_arb_guarded_dry_run_from_normalized_events(
             replay.config(),
@@ -53111,7 +53217,10 @@ mod tests {
         assert_eq!(snapshot.filtered_funding_count, 1);
         assert_eq!(snapshot.candidate_count, 1);
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
+        assert_eq!(
+            snapshot.rows[0].net_basis_bps.as_deref(),
+            Some("32.5000505")
+        );
     }
 
     #[cfg(feature = "live-exec")]
@@ -53370,7 +53479,10 @@ mod tests {
         assert_eq!(snapshot.rows[0].symbol, "BTC-USDT");
         assert_eq!(snapshot.rows[0].mark_price, "101.00");
         assert_eq!(snapshot.rows[0].index_price, "100.00");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
+        assert_eq!(
+            snapshot.rows[0].net_basis_bps.as_deref(),
+            Some("32.5000505")
+        );
     }
 
     #[cfg(feature = "live-exec")]
@@ -53636,7 +53748,10 @@ mod tests {
         assert_eq!(snapshot.rows[0].symbol, "BTCUSDT");
         assert_eq!(snapshot.rows[0].mark_price, "101.00");
         assert_eq!(snapshot.rows[0].index_price, "100.00");
-        assert_eq!(snapshot.rows[0].net_basis_bps.as_deref(), Some("40"));
+        assert_eq!(
+            snapshot.rows[0].net_basis_bps.as_deref(),
+            Some("31.5000505")
+        );
     }
 
     #[cfg(feature = "live-exec")]

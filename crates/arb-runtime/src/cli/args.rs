@@ -2667,18 +2667,14 @@ pub(crate) fn parse_binance_basis_monitor_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--spot-fee-bps requires a value"));
                 };
-                options.spot_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--spot-fee-bps must be an integer"))?;
+                options.spot_taker_fee_bps = value.clone();
             }
             "--perp-fee-bps" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--perp-fee-bps requires a value"));
                 };
-                options.perp_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--perp-fee-bps must be an integer"))?;
+                options.perp_taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -2767,18 +2763,14 @@ pub(crate) fn parse_bybit_basis_monitor_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--spot-fee-bps requires a value"));
                 };
-                options.spot_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--spot-fee-bps must be an integer"))?;
+                options.spot_taker_fee_bps = value.clone();
             }
             "--perp-fee-bps" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--perp-fee-bps requires a value"));
                 };
-                options.perp_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--perp-fee-bps must be an integer"))?;
+                options.perp_taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -2867,18 +2859,14 @@ pub(crate) fn parse_okx_basis_monitor_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--spot-fee-bps requires a value"));
                 };
-                options.spot_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--spot-fee-bps must be an integer"))?;
+                options.spot_taker_fee_bps = value.clone();
             }
             "--perp-fee-bps" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--perp-fee-bps requires a value"));
                 };
-                options.perp_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--perp-fee-bps must be an integer"))?;
+                options.perp_taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -2967,18 +2955,14 @@ pub(crate) fn parse_bitget_basis_monitor_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--spot-fee-bps requires a value"));
                 };
-                options.spot_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--spot-fee-bps must be an integer"))?;
+                options.spot_taker_fee_bps = value.clone();
             }
             "--perp-fee-bps" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--perp-fee-bps requires a value"));
                 };
-                options.perp_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--perp-fee-bps must be an integer"))?;
+                options.perp_taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -3067,18 +3051,14 @@ pub(crate) fn parse_hyperliquid_basis_monitor_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--spot-fee-bps requires a value"));
                 };
-                options.spot_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--spot-fee-bps must be an integer"))?;
+                options.spot_taker_fee_bps = value.clone();
             }
             "--perp-fee-bps" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--perp-fee-bps requires a value"));
                 };
-                options.perp_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--perp-fee-bps must be an integer"))?;
+                options.perp_taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -3174,18 +3154,14 @@ pub(crate) fn parse_aster_basis_monitor_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--spot-fee-bps requires a value"));
                 };
-                options.spot_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--spot-fee-bps must be an integer"))?;
+                options.spot_taker_fee_bps = value.clone();
             }
             "--perp-fee-bps" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--perp-fee-bps requires a value"));
                 };
-                options.perp_taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--perp-fee-bps must be an integer"))?;
+                options.perp_taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -3265,9 +3241,7 @@ pub(crate) fn parse_funding_arb_monitor_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--taker-fee-bps requires a value"));
                 };
-                options.taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--taker-fee-bps must be an integer"))?;
+                options.taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -3819,7 +3793,7 @@ pub(crate) fn parse_funding_arb_guarded_dry_run_once_args(
     let mut private_execution_snapshot_path = None;
     let mut output_dir = None;
     let mut notional_usd = BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned();
-    let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS;
+    let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned();
     let mut slippage_buffer_bps = BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS;
     let mut max_entry_price_divergence_bps = 20;
     let mut min_net_funding_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
@@ -3930,9 +3904,7 @@ pub(crate) fn parse_funding_arb_guarded_dry_run_once_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--taker-fee-bps requires a value"));
                 };
-                taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--taker-fee-bps must be an integer"))?;
+                taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;
@@ -4135,7 +4107,7 @@ pub(crate) fn parse_funding_arb_resident_live_args(
     let mut poll_interval_secs = 60_u64;
     let mut max_cycles = None;
     let mut notional_usd = BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned();
-    let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS;
+    let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned();
     let mut slippage_buffer_bps = BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS;
     let mut max_entry_price_divergence_bps = 20;
     let mut min_net_funding_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
@@ -4306,9 +4278,7 @@ pub(crate) fn parse_funding_arb_resident_live_args(
                 let Some(value) = args.get(index) else {
                     return Err(cli_arg_error("--taker-fee-bps requires a value"));
                 };
-                taker_fee_bps = value
-                    .parse::<i128>()
-                    .map_err(|_| cli_arg_error("--taker-fee-bps must be an integer"))?;
+                taker_fee_bps = value.clone();
             }
             "--slippage-bps" => {
                 index += 1;

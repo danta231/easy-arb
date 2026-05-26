@@ -223,8 +223,10 @@ pub(crate) fn funding_arb_pipeline_spec_from_monitor_row(
     config.venues.venue_a = funding_arb_leg_config(&venue_a_family, &symbol)?;
     config.venues.venue_b = funding_arb_leg_config(&venue_b_family, &symbol)?;
     config.economics.notional_usd = options.notional_usd.clone();
-    config.economics.venue_a_taker_fee_bps = options.taker_fee_bps;
-    config.economics.venue_b_taker_fee_bps = options.taker_fee_bps;
+    config.economics.venue_a_taker_fee_bps =
+        funding_arb_perp_taker_fee_bps_for_venue_family(&venue_a_family, &options.taker_fee_bps);
+    config.economics.venue_b_taker_fee_bps =
+        funding_arb_perp_taker_fee_bps_for_venue_family(&venue_b_family, &options.taker_fee_bps);
     config.economics.slippage_buffer_bps = options.slippage_buffer_bps;
     config.economics.max_entry_price_divergence_bps = options.max_entry_price_divergence_bps;
     config.economics.min_net_funding_bps = options.min_net_funding_bps;

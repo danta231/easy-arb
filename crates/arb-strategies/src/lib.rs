@@ -28,8 +28,12 @@ const BINANCE_BASIS_SPOT_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:SPOT";
 const BINANCE_BASIS_PERP_INSTRUMENT_ID: &str = "inst:BINANCE:BTCUSDT:USDM-PERP";
 const BINANCE_BASIS_TRANSITION_ID: &str = "trans:binance-basis-btcusdt-001";
 const DEFAULT_BASIS_NOTIONAL_USD: &str = "100.00";
-const DEFAULT_BASIS_SPOT_TAKER_FEE_BPS: i128 = 10;
-const DEFAULT_BASIS_PERP_TAKER_FEE_BPS: i128 = 5;
+const BINANCE_BASIS_SPOT_TAKER_FEE_BPS: &str = "7.5";
+const BINANCE_BASIS_PERP_TAKER_FEE_BPS: &str = "4.5";
+const BYBIT_BASIS_SPOT_TAKER_FEE_BPS: &str = "10";
+const BYBIT_BASIS_PERP_TAKER_FEE_BPS: &str = "5";
+const OKX_BASIS_SPOT_TAKER_FEE_BPS: &str = "10";
+const OKX_BASIS_PERP_TAKER_FEE_BPS: &str = "5";
 const DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const DEFAULT_BASIS_MIN_NET_BPS: i128 = 5;
 const DEFAULT_BASIS_EXIT_POLICY_REF: &str = "exit-policy:spot-perp-basis-composite-v1";
@@ -358,8 +362,8 @@ impl SpotPerpBasisStrategyConfig {
             },
             economics: BasisEconomicsConfig {
                 notional_usd: DEFAULT_BASIS_NOTIONAL_USD.to_owned(),
-                spot_taker_fee_bps: DEFAULT_BASIS_SPOT_TAKER_FEE_BPS,
-                perp_taker_fee_bps: DEFAULT_BASIS_PERP_TAKER_FEE_BPS,
+                spot_taker_fee_bps: BINANCE_BASIS_SPOT_TAKER_FEE_BPS.to_owned(),
+                perp_taker_fee_bps: BINANCE_BASIS_PERP_TAKER_FEE_BPS.to_owned(),
                 slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
                 min_net_bps: DEFAULT_BASIS_MIN_NET_BPS,
             },
@@ -413,8 +417,8 @@ impl SpotPerpBasisStrategyConfig {
             },
             economics: BasisEconomicsConfig {
                 notional_usd: DEFAULT_BASIS_NOTIONAL_USD.to_owned(),
-                spot_taker_fee_bps: DEFAULT_BASIS_SPOT_TAKER_FEE_BPS,
-                perp_taker_fee_bps: DEFAULT_BASIS_PERP_TAKER_FEE_BPS,
+                spot_taker_fee_bps: BYBIT_BASIS_SPOT_TAKER_FEE_BPS.to_owned(),
+                perp_taker_fee_bps: BYBIT_BASIS_PERP_TAKER_FEE_BPS.to_owned(),
                 slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
                 min_net_bps: DEFAULT_BASIS_MIN_NET_BPS,
             },
@@ -468,8 +472,8 @@ impl SpotPerpBasisStrategyConfig {
             },
             economics: BasisEconomicsConfig {
                 notional_usd: DEFAULT_BASIS_NOTIONAL_USD.to_owned(),
-                spot_taker_fee_bps: DEFAULT_BASIS_SPOT_TAKER_FEE_BPS,
-                perp_taker_fee_bps: DEFAULT_BASIS_PERP_TAKER_FEE_BPS,
+                spot_taker_fee_bps: OKX_BASIS_SPOT_TAKER_FEE_BPS.to_owned(),
+                perp_taker_fee_bps: OKX_BASIS_PERP_TAKER_FEE_BPS.to_owned(),
                 slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
                 min_net_bps: DEFAULT_BASIS_MIN_NET_BPS,
             },
@@ -524,8 +528,8 @@ pub struct BasisLegConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BasisEconomicsConfig {
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
 }
@@ -589,9 +593,9 @@ impl CrossExchangeFundingArbStrategyConfig {
             },
             economics: CrossExchangeFundingEconomicsConfig {
                 notional_usd: "100.00".to_owned(),
-                venue_a_taker_fee_bps: 5,
-                venue_b_taker_fee_bps: 6,
-                slippage_buffer_bps: 4,
+                venue_a_taker_fee_bps: BINANCE_BASIS_PERP_TAKER_FEE_BPS.to_owned(),
+                venue_b_taker_fee_bps: BYBIT_BASIS_PERP_TAKER_FEE_BPS.to_owned(),
+                slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
                 max_entry_price_divergence_bps: 20,
                 min_net_funding_bps: 5,
             },
@@ -639,8 +643,8 @@ pub struct CrossExchangeFundingLegConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrossExchangeFundingEconomicsConfig {
     pub notional_usd: String,
-    pub venue_a_taker_fee_bps: i128,
-    pub venue_b_taker_fee_bps: i128,
+    pub venue_a_taker_fee_bps: String,
+    pub venue_b_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
@@ -671,13 +675,13 @@ fn validate_spot_perp_basis_config(config: &SpotPerpBasisStrategyConfig) -> Stra
             "notional must be greater than zero",
         ));
     }
-    ensure_non_negative_basis_bps(
+    parse_non_negative_basis_config_decimal(
         "economics.spot_taker_fee_bps",
-        config.economics.spot_taker_fee_bps,
+        &config.economics.spot_taker_fee_bps,
     )?;
-    ensure_non_negative_basis_bps(
+    parse_non_negative_basis_config_decimal(
         "economics.perp_taker_fee_bps",
-        config.economics.perp_taker_fee_bps,
+        &config.economics.perp_taker_fee_bps,
     )?;
     ensure_non_negative_basis_bps(
         "economics.slippage_buffer_bps",
@@ -732,13 +736,13 @@ fn validate_cross_exchange_funding_arb_config(
             "notional must be greater than zero",
         ));
     }
-    ensure_non_negative_basis_bps(
+    parse_non_negative_basis_config_decimal(
         "economics.venue_a_taker_fee_bps",
-        config.economics.venue_a_taker_fee_bps,
+        &config.economics.venue_a_taker_fee_bps,
     )?;
-    ensure_non_negative_basis_bps(
+    parse_non_negative_basis_config_decimal(
         "economics.venue_b_taker_fee_bps",
-        config.economics.venue_b_taker_fee_bps,
+        &config.economics.venue_b_taker_fee_bps,
     )?;
     ensure_non_negative_basis_bps(
         "economics.slippage_buffer_bps",
@@ -974,14 +978,14 @@ impl SpotPerpBasisStrategy {
         let config_version = context.config().config_version();
         let quantity = &opportunity.signal.quantity;
         let expected_profit_usd = &opportunity.signal.expected_profit_usd;
-        let expected_profit_bps = opportunity.signal.expected_profit_bps.to_string();
+        let expected_profit_bps = opportunity.signal.expected_profit_bps.clone();
         let funding_impact_usd = &opportunity.signal.funding_impact_usd;
         let fee_estimate_usd = &opportunity.signal.fee_estimate_usd;
         let slippage_estimate_usd = &opportunity.signal.slippage_estimate_usd;
-        let gross_bps = opportunity.signal.gross_bps.to_string();
-        let net_bps = opportunity.signal.net_bps.to_string();
-        let funding_bps = opportunity.signal.funding_bps.to_string();
-        let total_cost_bps = opportunity.signal.total_cost_bps.to_string();
+        let gross_bps = opportunity.signal.gross_bps.clone();
+        let net_bps = opportunity.signal.net_bps.clone();
+        let funding_bps = opportunity.signal.funding_bps.clone();
+        let total_cost_bps = opportunity.signal.total_cost_bps.clone();
         let assumption = format!(
             "Read-only {} public data signal: buy {} at {}, short {} at {}, gross_basis_bps={}, total_cost_bps={}, net_basis_bps={}. Static fee/slippage assumptions must be replaced with account-specific checks before any order path.",
             config.instance.venue_family_label,
@@ -1372,8 +1376,8 @@ impl Strategy for SpotPerpBasisStrategy {
             perp_bid_depth: perp.bid_depth.clone(),
             last_funding_rate: premium.last_funding_rate.clone(),
             notional_usd: self.config.economics.notional_usd.clone(),
-            spot_taker_fee_bps: self.config.economics.spot_taker_fee_bps,
-            perp_taker_fee_bps: self.config.economics.perp_taker_fee_bps,
+            spot_taker_fee_bps: self.config.economics.spot_taker_fee_bps.clone(),
+            perp_taker_fee_bps: self.config.economics.perp_taker_fee_bps.clone(),
             slippage_buffer_bps: self.config.economics.slippage_buffer_bps,
             min_net_bps: self.config.economics.min_net_bps,
         }) {
@@ -1522,8 +1526,8 @@ impl CrossExchangeFundingArbStrategy {
         let input_event_refs = source_event_refs(context);
         let input_event_refs_json = json_string_array(&input_event_refs);
         let created_at = context.time().now_rfc3339_z();
-        let expected_profit_bps = opportunity.signal.net_funding_bps.to_string();
-        let gross_spread_bps = opportunity.signal.gross_funding_spread_bps.to_string();
+        let expected_profit_bps = opportunity.signal.net_funding_bps.clone();
+        let gross_spread_bps = opportunity.signal.gross_funding_spread_bps.clone();
         let entry_price_divergence_bps = opportunity.signal.entry_price_divergence_bps.to_string();
         let source_ref_seed = input_event_refs.join("|");
         let long_client_order_id = funding_client_order_id(
@@ -2017,8 +2021,8 @@ impl Strategy for CrossExchangeFundingArbStrategy {
                 &premium_b,
                 normalized_rate_a.format_trimmed(),
                 normalized_rate_b.format_trimmed(),
-                self.config.economics.venue_a_taker_fee_bps,
-                self.config.economics.venue_b_taker_fee_bps,
+                self.config.economics.venue_a_taker_fee_bps.clone(),
+                self.config.economics.venue_b_taker_fee_bps.clone(),
             )
         } else {
             (
@@ -2030,8 +2034,8 @@ impl Strategy for CrossExchangeFundingArbStrategy {
                 &premium_a,
                 normalized_rate_b.format_trimmed(),
                 normalized_rate_a.format_trimmed(),
-                self.config.economics.venue_b_taker_fee_bps,
-                self.config.economics.venue_a_taker_fee_bps,
+                self.config.economics.venue_b_taker_fee_bps.clone(),
+                self.config.economics.venue_a_taker_fee_bps.clone(),
             )
         };
         let signal =
@@ -2164,8 +2168,8 @@ pub struct SpotPerpBasisSignalInput {
     pub perp_bid_depth: Vec<SignalDepthLevel>,
     pub last_funding_rate: String,
     pub notional_usd: String,
-    pub spot_taker_fee_bps: i128,
-    pub perp_taker_fee_bps: i128,
+    pub spot_taker_fee_bps: String,
+    pub perp_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub min_net_bps: i128,
 }
@@ -2176,11 +2180,11 @@ pub struct SpotPerpBasisSignalInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpotPerpBasisSignal {
     pub symbol: String,
-    pub gross_bps: i128,
-    pub total_cost_bps: i128,
-    pub net_bps: i128,
-    pub funding_bps: i128,
-    pub expected_profit_bps: i128,
+    pub gross_bps: String,
+    pub total_cost_bps: String,
+    pub net_bps: String,
+    pub funding_bps: String,
+    pub expected_profit_bps: String,
     pub quantity: String,
     pub expected_profit_usd: String,
     pub funding_impact_usd: String,
@@ -2221,8 +2225,8 @@ pub struct CrossExchangeFundingArbSignalInput {
     pub short_funding_rate: String,
     pub funding_interval_hours: String,
     pub notional_usd: String,
-    pub long_taker_fee_bps: i128,
-    pub short_taker_fee_bps: i128,
+    pub long_taker_fee_bps: String,
+    pub short_taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
@@ -2232,9 +2236,9 @@ pub struct CrossExchangeFundingArbSignalInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrossExchangeFundingArbSignal {
     pub symbol: String,
-    pub gross_funding_spread_bps: i128,
-    pub total_cost_bps: i128,
-    pub net_funding_bps: i128,
+    pub gross_funding_spread_bps: String,
+    pub total_cost_bps: String,
+    pub net_funding_bps: String,
     pub entry_price_divergence_bps: i128,
     pub quantity: String,
     pub expected_funding_usd: String,
@@ -2258,8 +2262,6 @@ pub struct CrossExchangeFundingArbSignal {
 pub fn evaluate_spot_perp_basis_signal(
     input: &SpotPerpBasisSignalInput,
 ) -> Result<SpotPerpBasisSignal, String> {
-    ensure_non_negative_signal_bps("spot_taker_fee_bps", input.spot_taker_fee_bps)?;
-    ensure_non_negative_signal_bps("perp_taker_fee_bps", input.perp_taker_fee_bps)?;
     ensure_non_negative_signal_bps("slippage_buffer_bps", input.slippage_buffer_bps)?;
     ensure_non_negative_signal_bps("min_net_bps", input.min_net_bps)?;
     let spot_ask = FixedDecimal::parse_non_negative("spot_best_ask", &input.spot_best_ask)?;
@@ -2273,6 +2275,12 @@ pub fn evaluate_spot_perp_basis_signal(
     }
     let funding_rate =
         FixedDecimal::parse_signed_rate("last_funding_rate", &input.last_funding_rate)?;
+    let spot_taker_fee_bps =
+        FixedDecimal::parse_non_negative("spot_taker_fee_bps", &input.spot_taker_fee_bps)?;
+    let perp_taker_fee_bps =
+        FixedDecimal::parse_non_negative("perp_taker_fee_bps", &input.perp_taker_fee_bps)?;
+    let slippage_buffer_bps = FixedDecimal::bps_from_i128(input.slippage_buffer_bps)?;
+    let min_net_bps = FixedDecimal::bps_from_i128(input.min_net_bps)?;
     let (spot_ask_levels, spot_model) = depth_levels_or_top_of_book(
         &input.spot_ask_depth,
         spot_ask,
@@ -2298,14 +2306,20 @@ pub fn evaluate_spot_perp_basis_signal(
             "top_of_book_as_single_level"
         }
         .to_owned();
-    let single_leg_gross_bps = gross_basis_bps(execution_perp_bid, execution_spot_ask)?;
-    let single_leg_total_cost_bps =
-        input.spot_taker_fee_bps + input.perp_taker_fee_bps + input.slippage_buffer_bps;
-    let single_leg_net_bps = single_leg_gross_bps - single_leg_total_cost_bps;
-    let single_leg_funding_bps = FixedDecimal::bps_from_rate(funding_rate)?;
-    let single_leg_expected_profit_bps = single_leg_net_bps
-        .checked_add(single_leg_funding_bps)
-        .ok_or_else(|| "expected profit bps calculation overflowed".to_owned())?;
+    let single_leg_gross_bps = gross_basis_bps_decimal(execution_perp_bid, execution_spot_ask)?;
+    let single_leg_round_trip_fee_bps =
+        round_trip_taker_fee_bps(spot_taker_fee_bps, perp_taker_fee_bps)?;
+    let single_leg_total_cost_bps = single_leg_round_trip_fee_bps
+        .checked_add(slippage_buffer_bps, "total cost bps calculation overflowed")?;
+    let single_leg_net_bps = single_leg_gross_bps.checked_sub(
+        single_leg_total_cost_bps,
+        "net basis bps calculation overflowed",
+    )?;
+    let single_leg_funding_bps = FixedDecimal::bps_from_rate_decimal(funding_rate)?;
+    let single_leg_expected_profit_bps = single_leg_net_bps.checked_add(
+        single_leg_funding_bps,
+        "expected profit bps calculation overflowed",
+    )?;
     let gross_bps = single_leg_gross_bps;
     let total_cost_bps = single_leg_total_cost_bps;
     let net_bps = two_leg_return_bps(single_leg_net_bps);
@@ -2317,22 +2331,20 @@ pub fn evaluate_spot_perp_basis_signal(
             notional,
             execution_spot_ask,
         )?);
-    let basis_profit_usd = FixedDecimal::usd_from_bps(notional, single_leg_net_bps)?;
+    let basis_profit_usd = FixedDecimal::usd_from_bps_decimal(notional, single_leg_net_bps)?;
     let funding_impact_usd = FixedDecimal::usd_from_rate(notional, funding_rate)?;
     let expected_profit_usd = basis_profit_usd.checked_add(
         funding_impact_usd,
         "expected profit USD calculation overflowed",
     )?;
-    let fee_estimate_usd = FixedDecimal::usd_from_bps(
-        notional,
-        input.spot_taker_fee_bps + input.perp_taker_fee_bps,
-    )?;
-    let slippage_estimate_usd = FixedDecimal::usd_from_bps(notional, input.slippage_buffer_bps)?;
+    let fee_estimate_usd =
+        FixedDecimal::usd_from_bps_decimal(notional, single_leg_round_trip_fee_bps)?;
+    let slippage_estimate_usd = FixedDecimal::usd_from_bps_decimal(notional, slippage_buffer_bps)?;
     let spot_ask_depth_usd = spot_execution.depth_usd;
     let perp_bid_depth_usd = perp_execution.depth_usd;
     let depth_is_sufficient = spot_execution.covered_notional_usd.raw >= notional.raw
         && perp_execution.covered_notional_usd.raw >= notional.raw;
-    let threshold_is_satisfied = expected_profit_bps >= input.min_net_bps;
+    let threshold_is_satisfied = expected_profit_bps.raw >= min_net_bps.raw;
     let is_candidate = depth_is_sufficient && threshold_is_satisfied;
     let reason = if !depth_is_sufficient {
         Some(format!(
@@ -2346,8 +2358,13 @@ pub fn evaluate_spot_perp_basis_signal(
         ))
     } else if !threshold_is_satisfied {
         Some(format!(
-            "basis expected_profit_bps={expected_profit_bps} below minimum {}; gross_bps={gross_bps}, total_cost_bps={total_cost_bps}, net_basis_bps={net_bps}, funding_bps={funding_bps}, spot_ask_vwap={}, perp_bid_vwap={}",
+            "basis expected_profit_bps={} below minimum {}; gross_bps={}, total_cost_bps={}, net_basis_bps={}, funding_bps={}, spot_ask_vwap={}, perp_bid_vwap={}",
+            expected_profit_bps.format_trimmed(),
             input.min_net_bps,
+            gross_bps.format_trimmed(),
+            total_cost_bps.format_trimmed(),
+            net_bps.format_trimmed(),
+            funding_bps.format_trimmed(),
             execution_spot_ask.format_trimmed(),
             execution_perp_bid.format_trimmed()
         ))
@@ -2357,11 +2374,11 @@ pub fn evaluate_spot_perp_basis_signal(
 
     Ok(SpotPerpBasisSignal {
         symbol: input.symbol.clone(),
-        gross_bps,
-        total_cost_bps,
-        net_bps,
-        funding_bps,
-        expected_profit_bps,
+        gross_bps: gross_bps.format_trimmed(),
+        total_cost_bps: total_cost_bps.format_trimmed(),
+        net_bps: net_bps.format_trimmed(),
+        funding_bps: funding_bps.format_trimmed(),
+        expected_profit_bps: expected_profit_bps.format_trimmed(),
         quantity: quantity.format_trimmed(),
         expected_profit_usd: expected_profit_usd.format_trimmed(),
         funding_impact_usd: funding_impact_usd.format_trimmed(),
@@ -2386,8 +2403,6 @@ pub fn evaluate_spot_perp_basis_signal(
 pub fn evaluate_cross_exchange_funding_arb_signal(
     input: &CrossExchangeFundingArbSignalInput,
 ) -> Result<CrossExchangeFundingArbSignal, String> {
-    ensure_non_negative_signal_bps("long_taker_fee_bps", input.long_taker_fee_bps)?;
-    ensure_non_negative_signal_bps("short_taker_fee_bps", input.short_taker_fee_bps)?;
     ensure_non_negative_signal_bps("slippage_buffer_bps", input.slippage_buffer_bps)?;
     ensure_non_negative_signal_bps(
         "max_entry_price_divergence_bps",
@@ -2409,6 +2424,12 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
     if notional.is_zero() {
         return Err("notional_usd must be greater than zero".to_owned());
     }
+    let long_taker_fee_bps =
+        FixedDecimal::parse_non_negative("long_taker_fee_bps", &input.long_taker_fee_bps)?;
+    let short_taker_fee_bps =
+        FixedDecimal::parse_non_negative("short_taker_fee_bps", &input.short_taker_fee_bps)?;
+    let slippage_buffer_bps = FixedDecimal::bps_from_i128(input.slippage_buffer_bps)?;
+    let min_net_funding_bps = FixedDecimal::bps_from_i128(input.min_net_funding_bps)?;
     let (long_ask_levels, long_model) = depth_levels_or_top_of_book(
         &input.long_ask_depth,
         long_ask,
@@ -2448,13 +2469,19 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         .checked_mul(8)
         .and_then(|value| value.checked_div(i128::from(interval_hours)))
         .ok_or_else(|| "funding interval normalization overflowed".to_owned())?;
-    let single_leg_gross_funding_spread_bps = FixedDecimal::bps_from_rate(FixedDecimal {
+    let single_leg_gross_funding_spread_bps = FixedDecimal::bps_from_rate_decimal(FixedDecimal {
         raw: normalized_spread,
     })?;
-    let single_leg_total_cost_bps =
-        input.long_taker_fee_bps + input.short_taker_fee_bps + input.slippage_buffer_bps;
-    let single_leg_net_funding_bps =
-        single_leg_gross_funding_spread_bps - single_leg_total_cost_bps;
+    let single_leg_round_trip_fee_bps =
+        round_trip_taker_fee_bps(long_taker_fee_bps, short_taker_fee_bps)?;
+    let single_leg_total_cost_bps = single_leg_round_trip_fee_bps.checked_add(
+        slippage_buffer_bps,
+        "total funding cost bps calculation overflowed",
+    )?;
+    let single_leg_net_funding_bps = single_leg_gross_funding_spread_bps.checked_sub(
+        single_leg_total_cost_bps,
+        "net funding bps calculation overflowed",
+    )?;
     let gross_funding_spread_bps = single_leg_gross_funding_spread_bps;
     let total_cost_bps = single_leg_total_cost_bps;
     let net_funding_bps = two_leg_return_bps(single_leg_net_funding_bps);
@@ -2465,18 +2492,17 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
             notional,
             execution_long_ask,
         )?);
-    let expected_funding_usd = FixedDecimal::usd_from_bps(notional, single_leg_net_funding_bps)?;
-    let fee_estimate_usd = FixedDecimal::usd_from_bps(
-        notional,
-        input.long_taker_fee_bps + input.short_taker_fee_bps,
-    )?;
-    let slippage_estimate_usd = FixedDecimal::usd_from_bps(notional, input.slippage_buffer_bps)?;
+    let expected_funding_usd =
+        FixedDecimal::usd_from_bps_decimal(notional, single_leg_net_funding_bps)?;
+    let fee_estimate_usd =
+        FixedDecimal::usd_from_bps_decimal(notional, single_leg_round_trip_fee_bps)?;
+    let slippage_estimate_usd = FixedDecimal::usd_from_bps_decimal(notional, slippage_buffer_bps)?;
     let long_ask_depth_usd = long_execution.depth_usd;
     let short_bid_depth_usd = short_execution.depth_usd;
     let depth_is_sufficient = long_execution.covered_notional_usd.raw >= notional.raw
         && short_execution.covered_notional_usd.raw >= notional.raw;
     let divergence_is_allowed = entry_price_divergence_bps <= input.max_entry_price_divergence_bps;
-    let threshold_is_satisfied = net_funding_bps >= input.min_net_funding_bps;
+    let threshold_is_satisfied = net_funding_bps.raw >= min_net_funding_bps.raw;
     let is_candidate = depth_is_sufficient && divergence_is_allowed && threshold_is_satisfied;
     let reason = if !depth_is_sufficient {
         Some(format!(
@@ -2497,8 +2523,11 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         ))
     } else if !threshold_is_satisfied {
         Some(format!(
-            "net_funding_bps={net_funding_bps} below minimum {}; gross_funding_spread_bps={gross_funding_spread_bps}, total_cost_bps={total_cost_bps}",
-            input.min_net_funding_bps
+            "net_funding_bps={} below minimum {}; gross_funding_spread_bps={}, total_cost_bps={}",
+            net_funding_bps.format_trimmed(),
+            input.min_net_funding_bps,
+            gross_funding_spread_bps.format_trimmed(),
+            total_cost_bps.format_trimmed()
         ))
     } else {
         None
@@ -2506,9 +2535,9 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
 
     Ok(CrossExchangeFundingArbSignal {
         symbol: input.symbol.clone(),
-        gross_funding_spread_bps,
-        total_cost_bps,
-        net_funding_bps,
+        gross_funding_spread_bps: gross_funding_spread_bps.format_trimmed(),
+        total_cost_bps: total_cost_bps.format_trimmed(),
+        net_funding_bps: net_funding_bps.format_trimmed(),
         entry_price_divergence_bps,
         quantity: quantity.format_trimmed(),
         expected_funding_usd: expected_funding_usd.format_trimmed(),
@@ -2825,8 +2854,22 @@ fn signed_bps_abs(value: i128) -> Result<i128, String> {
     }
 }
 
-fn two_leg_return_bps(single_leg_bps: i128) -> i128 {
-    single_leg_bps / 2
+fn two_leg_return_bps(single_leg_bps: FixedDecimal) -> FixedDecimal {
+    single_leg_bps
+        .checked_div_i128(2, "two-leg bps calculation overflowed")
+        .expect("dividing fixed decimal bps by two cannot overflow")
+}
+
+fn round_trip_taker_fee_bps(
+    first_leg_taker_fee_bps: FixedDecimal,
+    second_leg_taker_fee_bps: FixedDecimal,
+) -> Result<FixedDecimal, String> {
+    first_leg_taker_fee_bps
+        .checked_add(
+            second_leg_taker_fee_bps,
+            "round-trip taker fee bps calculation overflowed",
+        )?
+        .checked_mul_i128(2, "round-trip taker fee bps calculation overflowed")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2982,6 +3025,33 @@ impl FixedDecimal {
         Ok(Self { raw })
     }
 
+    fn checked_sub(self, other: Self, message: &'static str) -> Result<Self, String> {
+        let raw = self
+            .raw
+            .checked_sub(other.raw)
+            .ok_or_else(|| message.to_owned())?;
+        Ok(Self { raw })
+    }
+
+    fn checked_mul_i128(self, value: i128, message: &'static str) -> Result<Self, String> {
+        let raw = self
+            .raw
+            .checked_mul(value)
+            .ok_or_else(|| message.to_owned())?;
+        Ok(Self { raw })
+    }
+
+    fn checked_div_i128(self, value: i128, message: &'static str) -> Result<Self, String> {
+        if value == 0 {
+            return Err(message.to_owned());
+        }
+        let raw = self
+            .raw
+            .checked_div(value)
+            .ok_or_else(|| message.to_owned())?;
+        Ok(Self { raw })
+    }
+
     fn checked_mul_decimal(self, other: Self, message: &'static str) -> Result<Self, String> {
         let raw = self
             .raw
@@ -3000,15 +3070,29 @@ impl FixedDecimal {
         Ok(Self { raw })
     }
 
+    fn usd_from_bps_decimal(notional: Self, bps: Self) -> Result<Self, String> {
+        notional
+            .checked_mul_decimal(bps, "basis USD calculation overflowed")?
+            .checked_div_i128(10_000, "basis USD calculation overflowed")
+    }
+
     fn usd_from_rate(notional: Self, rate: Self) -> Result<Self, String> {
         notional.checked_mul_decimal(rate, "funding USD calculation overflowed")
     }
 
-    fn bps_from_rate(rate: Self) -> Result<i128, String> {
-        rate.raw
+    fn bps_from_i128(value: i128) -> Result<Self, String> {
+        let raw = value
+            .checked_mul(FIXED_SCALE)
+            .ok_or_else(|| "bps decimal calculation overflowed".to_owned())?;
+        Ok(Self { raw })
+    }
+
+    fn bps_from_rate_decimal(rate: Self) -> Result<Self, String> {
+        let raw = rate
+            .raw
             .checked_mul(10_000)
-            .and_then(|value| value.checked_div(FIXED_SCALE))
-            .ok_or_else(|| "funding bps calculation overflowed".to_owned())
+            .ok_or_else(|| "funding bps calculation overflowed".to_owned())?;
+        Ok(Self { raw })
     }
 
     fn format_trimmed(self) -> String {
@@ -3328,16 +3412,21 @@ fn required_payload_fixed_decimal(
     FixedDecimal::parse_non_negative(field, &value)
 }
 
-fn gross_basis_bps(perp_bid: FixedDecimal, spot_ask: FixedDecimal) -> Result<i128, String> {
+fn gross_basis_bps_decimal(
+    perp_bid: FixedDecimal,
+    spot_ask: FixedDecimal,
+) -> Result<FixedDecimal, String> {
     if spot_ask.raw <= 0 {
         return Err("spot ask price must be greater than zero".to_owned());
     }
-    perp_bid
+    let raw = perp_bid
         .raw
         .checked_sub(spot_ask.raw)
         .and_then(|value| value.checked_mul(10_000))
+        .and_then(|value| value.checked_mul(FIXED_SCALE))
         .and_then(|value| value.checked_div(spot_ask.raw))
-        .ok_or_else(|| "basis bps calculation overflowed".to_owned())
+        .ok_or_else(|| "basis bps calculation overflowed".to_owned())?;
+    Ok(FixedDecimal { raw })
 }
 
 fn price_divergence_bps(left: FixedDecimal, right: FixedDecimal) -> Result<i128, String> {
@@ -3784,7 +3873,7 @@ mod tests {
         assert_eq!(candidate.legs.len(), 2);
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
-            "40"
+            "36.0000505"
         );
         assert_eq!(
             candidate
@@ -3797,17 +3886,20 @@ mod tests {
         );
         assert_eq!(
             candidate.expected_economics.expected_profit_usd.as_str(),
-            "0.81"
+            "0.72000101"
         );
         assert_eq!(
             candidate.expected_economics.fee_estimate_usd.as_str(),
-            "0.15"
+            "0.24"
         );
         assert_eq!(
             candidate.expected_economics.slippage_estimate_usd.as_str(),
             "0.05"
         );
-        assert_eq!(payload_constraint(candidate, "net_basis_bps"), Some("40"));
+        assert_eq!(
+            payload_constraint(candidate, "net_basis_bps"),
+            Some("35.5000505")
+        );
         assert_eq!(
             payload_constraint(candidate, "reference_ask_size"),
             Some("2")
@@ -3845,7 +3937,7 @@ mod tests {
         let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
         let context = basis_test_context(cross_exchange_funding_events(
             "0.00010000",
-            "0.00300000",
+            "0.00600000",
             "8",
             "8",
         ));
@@ -3891,11 +3983,11 @@ mod tests {
             .all(|byte| byte.is_ascii_alphanumeric()));
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
-            "7"
+            "17.5"
         );
         assert_eq!(
             candidate.expected_economics.expected_profit_usd.as_str(),
-            "0.14"
+            "0.35"
         );
         assert!(candidate.margin_impact.is_some());
         assert!(candidate.risk_flags.is_empty());
@@ -3922,7 +4014,7 @@ mod tests {
         let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
         let context = basis_test_context(cross_exchange_funding_events(
             "0.00010000",
-            "0.00050000",
+            "0.00090000",
             "8",
             "1",
         ));
@@ -3932,14 +4024,14 @@ mod tests {
         let candidate = evaluation.candidate().expect("candidate");
         assert_eq!(
             candidate.expected_economics.expected_profit_bps.as_str(),
-            "12"
+            "23.5"
         );
     }
 
     #[test]
     fn cross_exchange_funding_strategy_rejects_mark_index_divergence() {
         let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
-        let mut events = cross_exchange_funding_events("0.00010000", "0.00300000", "8", "8");
+        let mut events = cross_exchange_funding_events("0.00010000", "0.00600000", "8", "8");
         events[2].payload.insert(
             "mark_price".to_owned(),
             JsonValue::String("120.00".to_owned()),
@@ -3965,7 +4057,7 @@ mod tests {
         let strategy = cross_exchange_funding_arb_strategy().expect("strategy");
         let mut context = basis_test_context(cross_exchange_funding_events(
             "0.00010000",
-            "0.00300000",
+            "0.00600000",
             "8",
             "8",
         ));
@@ -4361,19 +4453,19 @@ mod tests {
             perp_bid_depth: Vec::new(),
             last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
-            spot_taker_fee_bps: 10,
-            perp_taker_fee_bps: 5,
+            spot_taker_fee_bps: "10".to_owned(),
+            perp_taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             min_net_bps: 5,
         })
         .expect("signal");
 
         assert!(signal.is_candidate);
-        assert_eq!(signal.gross_bps, 100);
-        assert_eq!(signal.net_bps, 40);
-        assert_eq!(signal.funding_bps, 1);
-        assert_eq!(signal.expected_profit_bps, 40);
-        assert_eq!(signal.expected_profit_usd, "0.81");
+        assert_eq!(signal.gross_bps, "100.000101");
+        assert_eq!(signal.net_bps, "32.5000505");
+        assert_eq!(signal.funding_bps, "1");
+        assert_eq!(signal.expected_profit_bps, "33.0000505");
+        assert_eq!(signal.expected_profit_usd, "0.66000101");
         assert_eq!(signal.funding_impact_usd, "0.01");
         assert_eq!(signal.spot_ask_depth_usd.as_deref(), Some("200"));
         assert_eq!(signal.perp_bid_depth_usd.as_deref(), Some("151.5"));
@@ -4394,8 +4486,8 @@ mod tests {
             perp_bid_depth: Vec::new(),
             last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
-            spot_taker_fee_bps: 10,
-            perp_taker_fee_bps: 5,
+            spot_taker_fee_bps: "10".to_owned(),
+            perp_taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             min_net_bps: 5,
         })
@@ -4420,8 +4512,8 @@ mod tests {
             perp_bid_depth: Vec::new(),
             last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
-            spot_taker_fee_bps: 10,
-            perp_taker_fee_bps: 5,
+            spot_taker_fee_bps: "10".to_owned(),
+            perp_taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             min_net_bps: 5,
         })
@@ -4468,8 +4560,8 @@ mod tests {
             ],
             last_funding_rate: "0.00010000".to_owned(),
             notional_usd: "100.00".to_owned(),
-            spot_taker_fee_bps: 10,
-            perp_taker_fee_bps: 5,
+            spot_taker_fee_bps: "10".to_owned(),
+            perp_taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             min_net_bps: 5,
         })
@@ -4483,8 +4575,8 @@ mod tests {
         assert_eq!(signal.perp_bid_levels_used, 2);
         assert_eq!(signal.spot_ask_vwap.as_deref(), Some("100.24937734"));
         assert_eq!(signal.perp_bid_vwap.as_deref(), Some("101.75438603"));
-        assert_eq!(signal.gross_bps, 150);
-        assert_eq!(signal.net_bps, 65);
+        assert_eq!(signal.gross_bps, "150.12648755");
+        assert_eq!(signal.net_bps, "57.56324377");
     }
 
     #[test]
@@ -4494,12 +4586,12 @@ mod tests {
                 .expect("signal");
 
         assert!(signal.is_candidate);
-        assert_eq!(signal.gross_funding_spread_bps, 29);
-        assert_eq!(signal.total_cost_bps, 15);
-        assert_eq!(signal.net_funding_bps, 7);
-        assert_eq!(signal.expected_funding_usd, "0.14");
-        assert_eq!(signal.fee_estimate_usd, "0.11");
-        assert_eq!(signal.slippage_estimate_usd, "0.04");
+        assert_eq!(signal.gross_funding_spread_bps, "59");
+        assert_eq!(signal.total_cost_bps, "24");
+        assert_eq!(signal.net_funding_bps, "17.5");
+        assert_eq!(signal.expected_funding_usd, "0.35");
+        assert_eq!(signal.fee_estimate_usd, "0.19");
+        assert_eq!(signal.slippage_estimate_usd, "0.05");
         assert_eq!(signal.long_ask_depth_usd.as_deref(), Some("200"));
         assert_eq!(signal.short_bid_depth_usd.as_deref(), Some("200.1"));
         assert_eq!(signal.quantity, "1");
@@ -4565,14 +4657,14 @@ mod tests {
     #[test]
     fn cross_exchange_funding_signal_normalizes_hourly_funding_interval() {
         let mut input = cross_exchange_funding_signal_input();
-        input.short_funding_rate = "0.00050000".to_owned();
+        input.short_funding_rate = "0.00090000".to_owned();
         input.funding_interval_hours = "1".to_owned();
 
         let signal = evaluate_cross_exchange_funding_arb_signal(&input).expect("signal");
 
         assert!(signal.is_candidate);
-        assert_eq!(signal.gross_funding_spread_bps, 32);
-        assert_eq!(signal.net_funding_bps, 8);
+        assert_eq!(signal.gross_funding_spread_bps, "64");
+        assert_eq!(signal.net_funding_bps, "20");
     }
 
     #[test]
@@ -4599,7 +4691,7 @@ mod tests {
             .contains("notional_usd"));
 
         let mut input = cross_exchange_funding_signal_input();
-        input.long_taker_fee_bps = -1;
+        input.long_taker_fee_bps = "-1".to_owned();
         assert!(evaluate_cross_exchange_funding_arb_signal(&input)
             .expect_err("negative fee must fail")
             .contains("long_taker_fee_bps"));
@@ -5003,12 +5095,12 @@ mod tests {
             short_bid_size: Some("2.0".to_owned()),
             short_bid_depth: Vec::new(),
             long_funding_rate: "0.00010000".to_owned(),
-            short_funding_rate: "0.00300000".to_owned(),
+            short_funding_rate: "0.00600000".to_owned(),
             funding_interval_hours: "8".to_owned(),
             notional_usd: "100.00".to_owned(),
-            long_taker_fee_bps: 5,
-            short_taker_fee_bps: 6,
-            slippage_buffer_bps: 4,
+            long_taker_fee_bps: BINANCE_BASIS_PERP_TAKER_FEE_BPS.to_owned(),
+            short_taker_fee_bps: BYBIT_BASIS_PERP_TAKER_FEE_BPS.to_owned(),
+            slippage_buffer_bps: DEFAULT_BASIS_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
         }
