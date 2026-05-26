@@ -161,7 +161,7 @@ fn run() -> XtaskResult<()> {
             }
             run_guarded_live_preflight(&root, &config_path)
         }
-        "replay-full-pipeline" => run_cargo_command(
+        "replay-full-pipeline" => run_cargo_command_with_env(
             &root,
             &[
                 "run",
@@ -171,6 +171,7 @@ fn run() -> XtaskResult<()> {
                 "replay",
                 "fixtures/replay/full_pipeline_simulated",
             ],
+            &[("ARB_RUNTIME_ENABLE_LEGACY_COMMANDS", "1")],
         ),
         "quality-gate" => {
             check_schema(&root)?;
@@ -209,7 +210,7 @@ fn run_guarded_live_preflight(root: &Path, config_path: &str) -> XtaskResult<()>
     println!(
         "中文说明：该命令只读取本地配置并运行启动检查，不访问网络、不读取凭证、不提交真实账户动作。"
     );
-    run_cargo_command(
+    run_cargo_command_with_env(
         root,
         &[
             "run",
@@ -219,15 +220,23 @@ fn run_guarded_live_preflight(root: &Path, config_path: &str) -> XtaskResult<()>
             "health-config",
             config_path,
         ],
+        &[("ARB_RUNTIME_ENABLE_LEGACY_COMMANDS", "1")],
     )
 }
 
-fn run_cargo_command(root: &Path, args: &[&str]) -> XtaskResult<()> {
+fn run_cargo_command_with_env(
+    root: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> XtaskResult<()> {
     println!("cargo {}", args.join(" "));
     println!("中文说明：该命令只运行离线或只读检查，不访问真实交易 API 或真实凭证。");
-    let status = Command::new("cargo")
-        .args(args)
-        .current_dir(root)
+    let mut command = Command::new("cargo");
+    command.args(args).current_dir(root);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|error| format!("cannot run cargo {}: {error}", args.join(" ")))?;
     if status.success() {

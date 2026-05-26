@@ -144,6 +144,78 @@ impl From<DomainError> for VenueDataError {
     }
 }
 
+/// Parse Binance public server time response milliseconds.
+///
+/// 中文说明：该函数只解析 `/api/v3/time`、`/fapi/v1/time` 等公开 REST 响应中的
+/// `serverTime` 字段，不访问私有账户，也不表达签名或可变执行能力。
+pub fn parse_binance_server_time_millis(body: &str) -> VenueDataResult<u64> {
+    let value = json_scalar_field(body, "serverTime")?;
+    value
+        .parse::<u64>()
+        .map_err(|_| invalid_payload("serverTime", "expected unsigned integer milliseconds"))
+}
+
+fn json_scalar_field<'a>(body: &'a str, field: &'static str) -> VenueDataResult<&'a str> {
+    let trimmed = body.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(invalid_payload("body", "expected JSON object"));
+    }
+    let key = format!("\"{field}\"");
+    let key_start = trimmed
+        .find(&key)
+        .ok_or_else(|| invalid_payload(field, "missing field"))?;
+    let after_key = key_start + key.len();
+    let colon = after_key
+        + trimmed[after_key..]
+            .find(':')
+            .ok_or_else(|| invalid_payload(field, "missing ':' after field"))?;
+    let value_start = skip_json_ws(trimmed, colon + 1);
+    if trimmed[value_start..].starts_with('"') {
+        let value_end = json_string_end(trimmed, value_start)?;
+        return Ok(&trimmed[value_start + 1..value_end - 1]);
+    }
+    let value_end = trimmed[value_start..]
+        .find([',', '}'])
+        .map(|offset| value_start + offset)
+        .unwrap_or(trimmed.len());
+    let value = trimmed[value_start..value_end].trim();
+    if value.is_empty() {
+        Err(invalid_payload(field, "empty scalar value"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn skip_json_ws(input: &str, mut index: usize) -> usize {
+    while input
+        .as_bytes()
+        .get(index)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        index += 1;
+    }
+    index
+}
+
+fn json_string_end(input: &str, quote_start: usize) -> VenueDataResult<usize> {
+    let mut escaped = false;
+    for (offset, ch) in input[quote_start + 1..].char_indices() {
+        let absolute = quote_start + 1 + offset;
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Ok(absolute + 1);
+        }
+    }
+    Err(invalid_payload("serverTime", "unterminated JSON string"))
+}
+
+fn invalid_payload(field: &'static str, reason: &'static str) -> VenueDataError {
+    VenueDataError::InvalidQuery { field, reason }
+}
+
 /// 外部只读数据错误分类。
 ///
 /// 中文说明：适配器不能把网络、限频、字段缺失、乱序或重复消息静默吞掉；
@@ -10186,6 +10258,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::str::FromStr;
+
+    #[test]
+    fn binance_server_time_parser_reads_public_rest_millis() {
+        let body = r#"{"serverTime":1779274612345}"#;
+
+        let server_time = parse_binance_server_time_millis(body).expect("server time");
+
+        assert_eq!(server_time, 1_779_274_612_345);
+    }
+
+    #[test]
+    fn binance_server_time_parser_fails_closed_on_missing_or_invalid_field() {
+        assert!(parse_binance_server_time_millis("{}").is_err());
+        assert!(parse_binance_server_time_millis(r#"{"serverTime":"not-a-number"}"#).is_err());
+    }
 
     #[derive(Clone)]
     struct FixtureReadOnlyAdapter {
