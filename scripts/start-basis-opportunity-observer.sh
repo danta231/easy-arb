@@ -60,6 +60,7 @@ usage() {
   BASIS_OBSERVER_BASIS_RESIDENT_MAX_CYCLES= # spot-perp-basis 最大循环次数；留空表示长期运行。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 扫描间隔秒数。
   BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
+  BASIS_OBSERVER_FUNDING_ARB_AUTO_RESIDUAL_DE_RISK=1 # 实盘发现历史 unknown/残腿仓位时，是否自动进入 reduce-only 降风险恢复。
   BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=0 # 实盘启动时是否允许 resident 自动处理历史 unknown 仓位；默认 0 表示启动前失败。
   BASIS_OBSERVER_FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE=1 # 实盘启动时是否先用私有只读仓位快照自动关闭已确认双边为 0 的历史 unknown。
   BASIS_OBSERVER_FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN=1 # 只读快照确认历史 unknown 仍有非 0 仓位时，是否自动切入 resident reduce-only recovery。
@@ -1997,6 +1998,14 @@ check_funding_arb_resident_unknown_startup_risk() {
   fi
 
   if (( unknown_count > 0 || summary_unknown_count > 0 )); then
+    if [[ "${FUNDING_ARB_AUTO_RESIDUAL_DE_RISK}" == "1" ]]; then
+      FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY=1
+      FUNDING_ARB_STARTUP_AUTO_RESIDUAL_DERISK=1
+      clear_funding_arb_startup_block_report
+      echo "warning: funding-arb live startup found unresolved unknown positions; auto residual de-risk is enabled, resident will run reduce-only recovery before new entries" >&2
+      return 0
+    fi
+
     if [[ "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" == "1" ]]; then
       echo "warning: funding-arb live startup will allow unknown recovery; unresolved_unknown_positions=${unknown_count} summary_unknown_count=${summary_unknown_count}" >&2
       return 0
@@ -2306,6 +2315,10 @@ check_funding_arb_resident_startup_risk() {
   check_funding_arb_resident_unknown_startup_risk || return 1
   if [[ "${FUNDING_ARB_STARTUP_OPEN_POSITION_CONTINUE:-0}" == "1" ]]; then
     echo "funding_arb_startup_precheck_skipped reason=existing_open_position_supervision_continues"
+    return 0
+  fi
+  if [[ "${FUNDING_ARB_STARTUP_AUTO_RESIDUAL_DERISK:-0}" == "1" ]]; then
+    echo "funding_arb_startup_precheck_skipped reason=auto_residual_de_risk"
     return 0
   fi
   if [[ "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" == "1" && "${FUNDING_ARB_STARTUP_NONZERO_UNKNOWN_CONFIRMED:-0}" == "1" ]]; then
@@ -2954,6 +2967,7 @@ FUNDING_ARB_MODE="resident"
 FUNDING_ARB_RESIDENT_INTERVAL_SECS="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS:-60}"
 FUNDING_ARB_RESIDENT_MAX_CYCLES="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES:-}"
 FUNDING_ARB_RESIDENT_OUT_DIR="${BASIS_OBSERVER_FUNDING_ARB_RESIDENT_OUT:-${RUN_ROOT}/resident-live/cross-exchange-funding-arb}"
+FUNDING_ARB_AUTO_RESIDUAL_DE_RISK="${BASIS_OBSERVER_FUNDING_ARB_AUTO_RESIDUAL_DE_RISK:-1}"
 FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY="${BASIS_OBSERVER_FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY:-0}"
 FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE="${BASIS_OBSERVER_FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE:-1}"
 FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN="${BASIS_OBSERVER_FUNDING_ARB_AUTO_RECOVER_NONZERO_UNKNOWN:-1}"
@@ -2999,6 +3013,11 @@ elif [[ -n "${BASIS_OBSERVER_STRATEGIES:-}" ]]; then
 else
   STRATEGIES="spot-perp-basis,cross-exchange-funding-arb"
 fi
+
+case "${FUNDING_ARB_AUTO_RESIDUAL_DE_RISK}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_FUNDING_ARB_AUTO_RESIDUAL_DE_RISK must be 0 or 1" ;;
+esac
 
 case "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" in
   0|1) ;;
@@ -3219,6 +3238,7 @@ start_funding_arb_resident_live() {
   if [[ "${EXECUTE_LIVE}" == "1" ]]; then
     args+=(--private-order-events-dir "${PRIVATE_ORDER_EVENTS_DIR}" --execute-live --i-understand-funding-arb-live-orders)
     [[ "${FUNDING_ARB_ALLOW_UNKNOWN_RECOVERY}" == "1" ]] && args+=(--allow-unknown-recovery)
+    [[ "${FUNDING_ARB_AUTO_RESIDUAL_DE_RISK}" == "0" ]] && args+=(--disable-auto-residual-de-risk)
     [[ -n "${HYPERLIQUID_USER:-}" ]] && args+=(--hyperliquid-user "${HYPERLIQUID_USER}")
     [[ -n "${HYPERLIQUID_SOURCE:-}" ]] && args+=(--hyperliquid-source "${HYPERLIQUID_SOURCE}")
     [[ -n "${HYPERLIQUID_VAULT_ADDRESS:-}" ]] && args+=(--hyperliquid-vault-address "${HYPERLIQUID_VAULT_ADDRESS}")

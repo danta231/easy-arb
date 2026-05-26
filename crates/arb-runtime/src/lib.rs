@@ -2945,6 +2945,7 @@ pub struct FundingArbResidentLiveOptions {
     pub execute_live: bool,
     pub acknowledge_funding_arb_live_orders: bool,
     pub allow_unknown_recovery: bool,
+    pub auto_residual_de_risk: bool,
     pub exit_only: bool,
     pub hyperliquid_user: Option<String>,
     pub hyperliquid_source: String,
@@ -39690,6 +39691,7 @@ fn run_funding_arb_resident_live_inner(
     let mut last_net_funding_bps = None;
     let mut dispatch_attempted = false;
     let mut halt_reason = None;
+    let mut force_residual_de_risk_cycle = false;
     write_funding_arb_resident_live_progress_summary(
         &output_root,
         FundingArbResidentLiveProgressInput {
@@ -39709,19 +39711,23 @@ fn run_funding_arb_resident_live_inner(
             );
             break;
         }
-        if !binance_basis_resident_cycle_allowed(cycles, options.max_cycles) {
+        if !force_residual_de_risk_cycle
+            && !binance_basis_resident_cycle_allowed(cycles, options.max_cycles)
+        {
             halt_reason = Some("max cycles reached".to_owned());
             break;
         }
 
         cycles += 1;
+        force_residual_de_risk_cycle = false;
         write_funding_arb_resident_live_state(&output_root, "running", cycles, None)?;
         let cycle_dir = output_root
             .join("cycles")
             .join(resident_cycle_dir_name(cycles)?);
 
         if options.execute_live {
-            let recovered_unknown_positions = if options.allow_unknown_recovery {
+            let unknown_recovery_enabled = funding_arb_unknown_recovery_enabled(&options);
+            let recovered_unknown_positions = if unknown_recovery_enabled {
                 recover_funding_arb_unknown_positions_for_exit(
                     &options,
                     &output_root,
@@ -39732,7 +39738,7 @@ fn run_funding_arb_resident_live_inner(
                 let unknowns = load_funding_arb_unknown_position_recovery_records(&output_root)?;
                 if !unknowns.is_empty() {
                     halt_reason = Some(format!(
-                        "{} unresolved funding arb unknown position(s) exist; startup recovery requires --allow-unknown-recovery",
+                        "{} unresolved funding arb unknown position(s) exist; startup recovery requires --allow-unknown-recovery or auto residual de-risk",
                         unknowns.len()
                     ));
                     break;
@@ -39741,6 +39747,7 @@ fn run_funding_arb_resident_live_inner(
             };
             let registry = load_funding_arb_resident_position_registry(&output_root)?;
             let active_positions = registry.active_positions();
+            let mut residual_de_risk_pending = false;
             for position in active_positions {
                 let exit_dir = output_root
                     .join("exit")
@@ -39782,10 +39789,20 @@ fn run_funding_arb_resident_live_inner(
                                 &report,
                                 "funding arb exit/de-risk dispatch left unknown or residual state",
                             )?;
-                            halt_reason = Some(
-                                "funding arb exit/de-risk dispatch left unknown or residual state; resident live stopped"
-                                    .to_owned(),
-                            );
+                            if unknown_recovery_enabled && recovered_unknown_positions == 0 {
+                                append_funding_arb_resident_error_event(
+                                    &output_root,
+                                    cycles,
+                                    &exit_dir,
+                                    "funding arb residual state detected; auto residual de-risk will retry from private position snapshot before new entries",
+                                )?;
+                                residual_de_risk_pending = true;
+                            } else {
+                                halt_reason = Some(
+                                    "funding arb exit/de-risk dispatch left unknown or residual state; resident live stopped"
+                                        .to_owned(),
+                                );
+                            }
                             break;
                         }
                     }
@@ -39806,6 +39823,22 @@ fn run_funding_arb_resident_live_inner(
             }
             if halt_reason.is_some() {
                 break;
+            }
+            if residual_de_risk_pending {
+                force_residual_de_risk_cycle = true;
+                write_funding_arb_resident_live_progress_summary(
+                    &output_root,
+                    FundingArbResidentLiveProgressInput {
+                        phase: "running",
+                        cycles,
+                        last_pair_id: &last_pair_id,
+                        last_symbol: &last_symbol,
+                        last_net_funding_bps,
+                        dispatch_attempted,
+                        halt_reason: None,
+                    },
+                )?;
+                continue;
             }
             if recovered_unknown_positions > 0 {
                 halt_reason = Some(
@@ -41982,7 +42015,8 @@ fn run_funding_arb_resident_exit_cycle(
             rollover_allowed,
             close_required_count,
             runtime_risk: Some(&runtime_risk),
-            unknown_recovery_exit: options.allow_unknown_recovery && state.plan_hash.is_none(),
+            unknown_recovery_exit: funding_arb_unknown_recovery_enabled(options)
+                && state.plan_hash.is_none(),
         },
         &mut reason_codes,
         &mut blocking_reasons,
@@ -42066,6 +42100,11 @@ fn run_funding_arb_resident_exit_cycle(
     };
     write_funding_arb_exit_cycle_artifacts(output_dir, &report, &receipts, &confirmations)?;
     Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_unknown_recovery_enabled(options: &FundingArbResidentLiveOptions) -> bool {
+    options.allow_unknown_recovery || options.auto_residual_de_risk
 }
 
 #[cfg(feature = "live-exec")]
@@ -43908,10 +43947,11 @@ fn write_funding_arb_resident_live_config(
     options: &FundingArbResidentLiveOptions,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
+        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"auto_residual_de_risk\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
         options.allow_unknown_recovery,
         json_string(&options.aster_signer_cmd_env),
         optional_json_string(options.aster_user.as_deref()),
+        options.auto_residual_de_risk,
         json_string(&options.config_path.display().to_string()),
         options.execute_live,
         options.exit_only,
@@ -56470,7 +56510,7 @@ fn legacy_help_text() -> String {
         "                                    Build a non-dispatching guarded dry-run report from one funding arb observer candidate",
         "  funding-arb-guarded-live-canary-once --snapshot file --pair-id id [dry-run snapshot options] [--private-order-events-dir dir] [--aster-user 0x...] [--aster-signer 0x...] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--execute-live --i-understand-funding-arb-live-orders]",
         "                                    Build a guarded funding-arb canary plan and, only with explicit live flags, submit/confirm the Aster USDT-settled and Hyperliquid USDC-settled perp legs; Hyperliquid asset id auto-resolves unless overridden",
-        "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders] [--allow-unknown-recovery] [--exit-only]",
+        "  funding-arb-resident-live [--snapshot file | --source venue=url] [--pair-id id] [--config file] [--funding-settlement-raw-snapshot file] [--private-order-events-dir dir] [--interval-secs 60] [--max-cycles n] [--hyperliquid-user 0x...] [--hyperliquid-source a|b] [--hyperliquid-asset-id BTCUSDT=0] [--aster-user 0x...] [--aster-signer 0x...] [--execute-live --i-understand-funding-arb-live-orders] [--allow-unknown-recovery] [--disable-auto-residual-de-risk] [--exit-only]",
         "                                    Resident funding-arb scanner: refresh private read-only snapshots, run guarded entry cycles, register live positions, and supervise reduce-only exit/de-risk; Aster defaults to USDT and Hyperliquid defaults to USDC",
         "  opportunity-recorder [--root dir] [--source venue=url] [--funding-arb-url url] [--strategies list] [--interval-secs 5] [--once]",
         "                                    Resident observer recorder implemented in Rust: poll local opportunity APIs and write JSONL/health logs without per-poll curl+jq subprocesses",
@@ -60690,6 +60730,7 @@ fn parse_funding_arb_resident_live_args(
     let mut execute_live = false;
     let mut acknowledge_funding_arb_live_orders = false;
     let mut allow_unknown_recovery = false;
+    let mut auto_residual_de_risk = true;
     let mut exit_only = false;
     let mut hyperliquid_user = None;
     let mut hyperliquid_source =
@@ -60890,6 +60931,10 @@ fn parse_funding_arb_resident_live_args(
             "--dry-run" => execute_live = false,
             "--i-understand-funding-arb-live-orders" => acknowledge_funding_arb_live_orders = true,
             "--allow-unknown-recovery" => allow_unknown_recovery = true,
+            "--auto-residual-de-risk" => auto_residual_de_risk = true,
+            "--disable-auto-residual-de-risk" | "--no-auto-residual-de-risk" => {
+                auto_residual_de_risk = false
+            }
             "--exit-only" => exit_only = true,
             "--hyperliquid-user" => {
                 index += 1;
@@ -60991,6 +61036,7 @@ fn parse_funding_arb_resident_live_args(
         execute_live,
         acknowledge_funding_arb_live_orders,
         allow_unknown_recovery,
+        auto_residual_de_risk,
         exit_only,
         hyperliquid_user,
         hyperliquid_source,
@@ -67301,6 +67347,7 @@ mod tests {
         assert!(options.execute_live);
         assert!(options.acknowledge_funding_arb_live_orders);
         assert!(options.allow_unknown_recovery);
+        assert!(options.auto_residual_de_risk);
         assert!(options.exit_only);
         assert_eq!(options.hyperliquid_source, "b");
         assert_eq!(options.hyperliquid_asset_ids.get("BTCUSDT"), Some(&0));
@@ -67377,6 +67424,7 @@ mod tests {
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
+            auto_residual_de_risk: true,
             exit_only: false,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
@@ -67455,7 +67503,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
-    fn funding_arb_resident_live_blocks_unknown_recovery_by_default() {
+    fn funding_arb_resident_live_can_disable_auto_residual_de_risk() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let previous_cycle = root
             .path()
@@ -67490,6 +67538,7 @@ mod tests {
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
+            auto_residual_de_risk: false,
             exit_only: false,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
@@ -67500,6 +67549,7 @@ mod tests {
             aster_signer: None,
             aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
         };
+        assert!(!funding_arb_unknown_recovery_enabled(&options));
 
         let report = run_funding_arb_resident_live_inner(options).expect("resident report");
 
@@ -67564,6 +67614,7 @@ mod tests {
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: true,
+            auto_residual_de_risk: true,
             exit_only: false,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
