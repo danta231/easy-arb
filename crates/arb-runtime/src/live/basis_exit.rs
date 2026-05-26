@@ -73,8 +73,14 @@ fn run_basis_exit_supervisor_once(
         entry_total_cost_bps: state.entry_total_cost_bps,
         accumulated_funding_bps: state.accumulated_funding_bps,
         expected_next_funding_bps: market.expected_next_funding_bps,
-        exit_spot_taker_fee_bps: BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
-        exit_perp_taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        exit_spot_taker_fee_bps: monitor_bps_ceil_i128(
+            "exit_spot_taker_fee_bps",
+            BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS,
+        )?,
+        exit_perp_taker_fee_bps: monitor_bps_ceil_i128(
+            "exit_perp_taker_fee_bps",
+            BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS,
+        )?,
         exit_slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
         target_profit_bps: BASIS_EXIT_DEFAULT_TARGET_PROFIT_BPS,
         convergence_buffer_bps: BASIS_EXIT_DEFAULT_CONVERGENCE_BUFFER_BPS,

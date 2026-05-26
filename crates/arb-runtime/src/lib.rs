@@ -470,6 +470,8 @@ const ASTER_SPOT_TAKER_FEE_BPS: &str = "4";
 const ASTER_PERP_TAKER_FEE_BPS: &str = "4";
 const HYPERLIQUID_SPOT_TAKER_FEE_BPS: &str = "7";
 const HYPERLIQUID_PERP_TAKER_FEE_BPS: &str = "4.5";
+#[cfg(feature = "live-exec")]
+const BASIS_MONITOR_DEFAULT_SPOT_TAKER_FEE_BPS: &str = BINANCE_SPOT_TAKER_FEE_BPS;
 const BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS: &str = BINANCE_PERP_TAKER_FEE_BPS;
 const BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS: i128 = 5;
 const BASIS_MONITOR_DEFAULT_MIN_NET_BPS: i128 = 5;
@@ -7885,7 +7887,7 @@ fn run_binance_basis_guarded_live_cycle_from_json(
             max_spot_ask: price_guards.max_spot_ask.clone(),
             min_perp_bid: price_guards.min_perp_bid.clone(),
             auto_price_guard_bps: price_guards.auto_price_guard_bps,
-            net_bps: Some(context.signal.net_bps),
+            net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
             signal_allowed: false,
             risk_decision: None,
             plan_hash: None,
@@ -8133,7 +8135,7 @@ fn run_binance_basis_guarded_live_cycle_from_json(
         max_spot_ask: price_guards.max_spot_ask.clone(),
         min_perp_bid: price_guards.min_perp_bid.clone(),
         auto_price_guard_bps: price_guards.auto_price_guard_bps,
-        net_bps: Some(context.signal.net_bps),
+        net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
         plan_hash: Some(plan_hash),
@@ -8244,7 +8246,7 @@ fn run_bybit_basis_guarded_live_cycle_from_json(
             max_spot_ask: price_guards.max_spot_ask.clone(),
             min_perp_bid: price_guards.min_perp_bid.clone(),
             auto_price_guard_bps: price_guards.auto_price_guard_bps,
-            net_bps: Some(context.signal.net_bps),
+            net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
             signal_allowed: false,
             risk_decision: None,
             plan_hash: None,
@@ -8479,7 +8481,7 @@ fn run_bybit_basis_guarded_live_cycle_from_json(
         max_spot_ask: price_guards.max_spot_ask.clone(),
         min_perp_bid: price_guards.min_perp_bid.clone(),
         auto_price_guard_bps: price_guards.auto_price_guard_bps,
-        net_bps: Some(context.signal.net_bps),
+        net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
         plan_hash: Some(plan_hash),
@@ -8579,7 +8581,7 @@ fn run_okx_basis_guarded_live_cycle_from_json(
             max_spot_ask: price_guards.max_spot_ask.clone(),
             min_perp_bid: price_guards.min_perp_bid.clone(),
             auto_price_guard_bps: price_guards.auto_price_guard_bps,
-            net_bps: Some(context.signal.net_bps),
+            net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
             signal_allowed: false,
             risk_decision: None,
             plan_hash: None,
@@ -8807,7 +8809,7 @@ fn run_okx_basis_guarded_live_cycle_from_json(
         max_spot_ask: price_guards.max_spot_ask.clone(),
         min_perp_bid: price_guards.min_perp_bid.clone(),
         auto_price_guard_bps: price_guards.auto_price_guard_bps,
-        net_bps: Some(context.signal.net_bps),
+        net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
         plan_hash: Some(plan_hash),
@@ -8949,7 +8951,7 @@ fn run_bitget_basis_guarded_live_cycle_from_json(
             max_spot_ask: price_guards.max_spot_ask.clone(),
             min_perp_bid: price_guards.min_perp_bid.clone(),
             auto_price_guard_bps: price_guards.auto_price_guard_bps,
-            net_bps: Some(context.signal.net_bps),
+            net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
             signal_allowed: false,
             risk_decision: None,
             plan_hash: None,
@@ -9201,7 +9203,7 @@ fn run_bitget_basis_guarded_live_cycle_from_json(
         max_spot_ask: price_guards.max_spot_ask.clone(),
         min_perp_bid: price_guards.min_perp_bid.clone(),
         auto_price_guard_bps: price_guards.auto_price_guard_bps,
-        net_bps: Some(context.signal.net_bps),
+        net_bps: Some(monitor_bps_floor_i128("net_bps", &context.signal.net_bps)?),
         signal_allowed: true,
         risk_decision: Some(basis_risk_decision_summary(&risk_decision)),
         plan_hash: Some(plan_hash),
@@ -12827,10 +12829,19 @@ fn basis_exit_supervisor_state_from_open(
         notional_usd: spot.notional_usd.to_string(),
         spot_quantity: spot.request.quantity.to_string(),
         perp_quantity: perp.request.quantity.to_string(),
-        entry_gross_basis_bps: context.signal.gross_bps,
-        entry_total_cost_bps: context.signal.total_cost_bps,
+        entry_gross_basis_bps: monitor_bps_floor_i128(
+            "entry_gross_basis_bps",
+            &context.signal.gross_bps,
+        )?,
+        entry_total_cost_bps: monitor_bps_ceil_i128(
+            "entry_total_cost_bps",
+            &context.signal.total_cost_bps,
+        )?,
         accumulated_funding_bps: 0,
-        expected_next_funding_bps: context.signal.funding_bps,
+        expected_next_funding_bps: monitor_bps_floor_i128(
+            "expected_next_funding_bps",
+            &context.signal.funding_bps,
+        )?,
         opened_at: opened_at.to_string(),
         spot_wss_monitor_url: options.spot_wss_monitor_url.clone(),
         perp_wss_monitor_url: options.perp_wss_monitor_url.clone(),
@@ -13047,7 +13058,7 @@ fn fetch_basis_exit_market_snapshot(
                 0,
                 &market_dir,
             )?;
-            Ok(basis_exit_market_snapshot_from_context(&context))
+            basis_exit_market_snapshot_from_context(&context)
         }
         BYBIT_BASIS_LIVE_STRATEGY_ID => {
             let spot_url = bybit_spot_tickers_url();
@@ -13097,7 +13108,7 @@ fn fetch_basis_exit_market_snapshot(
                 0,
                 &market_dir,
             )?;
-            Ok(basis_exit_market_snapshot_from_context(&context))
+            basis_exit_market_snapshot_from_context(&context)
         }
         OKX_BASIS_LIVE_STRATEGY_ID => {
             let spot_url = okx_tickers_url("SPOT");
@@ -13156,7 +13167,7 @@ fn fetch_basis_exit_market_snapshot(
                 0,
                 &market_dir,
             )?;
-            Ok(basis_exit_market_snapshot_from_context(&context))
+            basis_exit_market_snapshot_from_context(&context)
         }
         BITGET_BASIS_LIVE_STRATEGY_ID => {
             let spot_url = bitget_spot_tickers_url();
@@ -13216,7 +13227,7 @@ fn fetch_basis_exit_market_snapshot(
                 0,
                 &market_dir,
             )?;
-            Ok(basis_exit_market_snapshot_from_context(&context))
+            basis_exit_market_snapshot_from_context(&context)
         }
         other => Err(RuntimeError::UnsafeConfig {
             message: format!("unsupported basis exit strategy_id `{other}`"),
@@ -13227,15 +13238,18 @@ fn fetch_basis_exit_market_snapshot(
 #[cfg(feature = "live-exec")]
 fn basis_exit_market_snapshot_from_context(
     context: &BinanceBasisGuardedLiveSignalContext,
-) -> BasisExitMarketSnapshot {
-    BasisExitMarketSnapshot {
+) -> RuntimeResult<BasisExitMarketSnapshot> {
+    Ok(BasisExitMarketSnapshot {
         observed_at: context.observed_at.clone(),
         spot_bid: context.spot_bid.clone(),
         spot_ask: context.spot_ask.clone(),
         perp_bid: context.perp_bid.clone(),
         perp_ask: context.perp_ask.clone(),
-        expected_next_funding_bps: context.signal.funding_bps,
-    }
+        expected_next_funding_bps: monitor_bps_floor_i128(
+            "expected_next_funding_bps",
+            &context.signal.funding_bps,
+        )?,
+    })
 }
 
 #[cfg(feature = "live-exec")]
@@ -20668,6 +20682,46 @@ impl MonitorDecimal {
         } else {
             format!("{sign}{whole}.{fraction}")
         }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_bps_floor_i128(field: &'static str, value: &str) -> RuntimeResult<i128> {
+    monitor_bps_i128(field, value, false)
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_bps_ceil_i128(field: &'static str, value: &str) -> RuntimeResult<i128> {
+    monitor_bps_i128(field, value, true)
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_bps_i128(field: &'static str, value: &str, ceil: bool) -> RuntimeResult<i128> {
+    let decimal = MonitorDecimal::parse(field, value)?;
+    let scale = 10_i128.pow(MonitorDecimal::SCALE_DIGITS as u32);
+    let quotient = decimal.raw / scale;
+    let remainder = decimal.raw % scale;
+    if remainder == 0 {
+        return Ok(quotient);
+    }
+    if ceil {
+        if decimal.raw > 0 {
+            quotient
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("decimal field `{field}` overflowed while rounding up"),
+                })
+        } else {
+            Ok(quotient)
+        }
+    } else if decimal.raw < 0 {
+        quotient
+            .checked_sub(1)
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: format!("decimal field `{field}` overflowed while rounding down"),
+            })
+    } else {
+        Ok(quotient)
     }
 }
 

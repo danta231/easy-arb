@@ -1089,7 +1089,7 @@ pub(crate) fn run_funding_arb_guarded_live_canary_once_live(
             if let Some(reason) = funding_arb_live_dispatch_affordability_blocking_reason(
                 &dry_run.private_accounts,
                 dispatch_plan,
-                options.dry_run.taker_fee_bps,
+                monitor_bps_ceil_i128("taker_fee_bps", &options.dry_run.taker_fee_bps)?,
                 options.dry_run.slippage_buffer_bps,
             )? {
                 blocking_reasons.push(reason);
