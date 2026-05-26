@@ -10,6 +10,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUN_ROOT="${BASIS_OBSERVER_ROOT:-${REPO_ROOT}/target/arb-opportunity-observer}"
 STATE_DIR="${RUN_ROOT}/state"
 PID_FILE="${STATE_DIR}/basis-observer.pids"
+RUNTIME_BIN="${BASIS_OBSERVER_RUNTIME_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
 STOP_GRACE_SECS="${BASIS_OBSERVER_STOP_GRACE_SECS:-3}"
 STOP_DRAIN_SECS="${BASIS_OBSERVER_STOP_DRAIN_SECS:-15}"
 
@@ -55,6 +56,32 @@ append_pid_file_lines() {
   done < "${file}"
 }
 
+command_line_matches_rust_recorder() {
+  local command_line="$1"
+
+  [[ "${command_line}" == *" opportunity-recorder"* ]] || return 1
+  [[ "${command_line}" == *"--root ${RUN_ROOT} "* ||
+     "${command_line}" == *"--root ${RUN_ROOT}" ]] || return 1
+  if [[ -n "${RUNTIME_BIN}" && "${command_line}" == *"${RUNTIME_BIN} opportunity-recorder"* ]]; then
+    return 0
+  fi
+  [[ "${command_line}" == *"${REPO_ROOT}/target/debug/arb-runtime opportunity-recorder"* ||
+     "${command_line}" == *"${REPO_ROOT}/target/release/arb-runtime opportunity-recorder"* ]]
+}
+
+append_live_rust_recorder_pid_lines() {
+  local pid
+  local command_line
+
+  command -v ps >/dev/null 2>&1 || return 0
+  while read -r pid command_line; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    if command_line_matches_rust_recorder "${command_line}"; then
+      PID_LINES+=("${pid}"$'\t'"opportunity-recorder"$'\t'"${RUN_ROOT}/logs/recorder.log")
+    fi
+  done < <(ps axww -o pid= -o command= 2>/dev/null || true)
+}
+
 read_pid_lines() {
   PID_LINES=()
   append_pid_file_lines "${PID_FILE}"
@@ -81,6 +108,8 @@ read_rescue_pid_lines() {
     log_file="${RUN_ROOT}/logs/${name}.log"
     PID_LINES+=("${pid}"$'\t'"${name}"$'\t'"${log_file}")
   done
+
+  append_live_rust_recorder_pid_lines
 }
 
 managed_process_matches_name() {
@@ -93,7 +122,8 @@ managed_process_matches_name() {
 
   case "${name}" in
     opportunity-recorder)
-      [[ "${command_line}" == *"start-basis-opportunity-observer.sh --recorder"* ]]
+      [[ "${command_line}" == *"start-basis-opportunity-observer.sh --recorder"* ]] ||
+        command_line_matches_rust_recorder "${command_line}"
       ;;
     validation-*)
       [[ "${command_line}" == *"${REPO_ROOT}"* || "${command_line}" == *"arb-runtime"* ]]

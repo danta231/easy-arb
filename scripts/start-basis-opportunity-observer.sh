@@ -2661,7 +2661,9 @@ run_rust_recorder() {
     args+=(--no-funding-arb-url)
   fi
 
-  ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${args[@]}"
+  # 中文说明：用 exec 让 pid 文件记录的 --recorder 包装进程变成真正的 Rust
+  # recorder，停止脚本才能直接终止长期运行的子命令。
+  exec env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${args[@]}"
 }
 
 run_recorder() {

@@ -12,6 +12,7 @@ WSS_PID_FILE="${STATE_DIR}/wss-book-ticker.pids"
 LIVE_PID_FILE="${STATE_DIR}/arb-runtime-live.pid"
 PORTFOLIO_PID_FILE="${STATE_DIR}/portfolio-dashboard.pid"
 PORTFOLIO_PRIVATE_READONLY_PID_FILE="${STATE_DIR}/portfolio-private-readonly.pid"
+RUNTIME_BIN="${ARB_RUNTIME_LIVE_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
 STOP_GRACE_SECS="${ARB_RUNTIME_LIVE_STOP_GRACE_SECS:-3}"
 
 usage() {
@@ -120,7 +121,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 echo "stopping arb-runtime live observer..."
-BASIS_OBSERVER_ROOT="${RUN_ROOT}" "${SCRIPT_DIR}/stop-basis-opportunity-observer.sh" || true
+BASIS_OBSERVER_ROOT="${RUN_ROOT}" \
+  BASIS_OBSERVER_RUNTIME_BIN="${RUNTIME_BIN}" \
+  "${SCRIPT_DIR}/stop-basis-opportunity-observer.sh" || true
 
 stop_live_parent
 stop_portfolio_dashboard
