@@ -247,7 +247,9 @@ const RUNTIME_JSONL_ROTATE_DEFAULT_BYTES: u64 = 128 * 1024 * 1024;
 const RUNTIME_JSONL_ROTATE_DEFAULT_KEEP: usize = 4;
 #[cfg(feature = "live-exec")]
 const RUNTIME_JSONL_ROTATE_KEEP_LIMIT: usize = 32;
-const FUNDING_ARB_COMPACT_ARTIFACTS_ENV: &str = "ARB_RUNTIME_FUNDING_ARB_COMPACT_ARTIFACTS";
+const FUNDING_ARB_FULL_DEBUG_ARTIFACTS_ENV: &str = "ARB_RUNTIME_FUNDING_ARB_FULL_DEBUG_ARTIFACTS";
+const FUNDING_ARB_BLOCKING_PATH_GROUP_LIMIT: usize = 24;
+const FUNDING_ARB_BLOCKING_PATH_GROUP_SAMPLE_LIMIT: usize = 3;
 #[cfg(feature = "live-exec")]
 const RESIDENT_RETRYABLE_ERROR_BACKOFF_BASE_MS: u64 = 1_000;
 #[cfg(feature = "live-exec")]
@@ -41110,7 +41112,7 @@ fn funding_arb_resident_no_candidate_blocking_path(
     snapshot: &FundingArbMonitorSnapshot,
     options: &FundingArbResidentLiveOptions,
 ) -> Vec<FundingArbBlockingPathEntry> {
-    let mut entries = funding_arb_monitor_blocking_path(snapshot);
+    let mut entries = funding_arb_monitor_compact_blocking_path(snapshot);
     if let Some(pair_id) = &options.pair_id {
         let row_entries = snapshot
             .rows
@@ -51084,8 +51086,8 @@ fn write_funding_arb_monitor_snapshot(
     )
 }
 
-fn funding_arb_compact_artifacts_enabled() -> RuntimeResult<bool> {
-    runtime_bool_env(FUNDING_ARB_COMPACT_ARTIFACTS_ENV, true)
+fn funding_arb_full_debug_artifacts_enabled() -> RuntimeResult<bool> {
+    runtime_bool_env(FUNDING_ARB_FULL_DEBUG_ARTIFACTS_ENV, false)
 }
 
 fn funding_arb_monitor_snapshot_compact_json(
@@ -51093,11 +51095,7 @@ fn funding_arb_monitor_snapshot_compact_json(
     retained_rows: &[FundingArbMarketRow],
     artifact_mode: &str,
 ) -> String {
-    let compact_snapshot = FundingArbMonitorSnapshot {
-        rows: retained_rows.to_vec(),
-        ..snapshot.clone()
-    };
-    let blocking_path = funding_arb_monitor_blocking_path(&compact_snapshot);
+    let blocking_path = funding_arb_monitor_compact_blocking_path(snapshot);
     format!(
         "{{\"artifact_mode\":{},\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"retained_rows\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
         json_string(artifact_mode),
@@ -51120,20 +51118,31 @@ fn funding_arb_monitor_snapshot_compact_json(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_monitor_snapshot_artifact_json_with_debug_mode(
+    snapshot: &FundingArbMonitorSnapshot,
+    retained_rows: &[FundingArbMarketRow],
+    artifact_mode: &str,
+    full_debug_artifacts: bool,
+) -> String {
+    if full_debug_artifacts {
+        snapshot.to_json()
+    } else {
+        funding_arb_monitor_snapshot_compact_json(snapshot, retained_rows, artifact_mode)
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_monitor_snapshot_artifact_json(
     snapshot: &FundingArbMonitorSnapshot,
     retained_rows: &[FundingArbMarketRow],
     artifact_mode: &str,
 ) -> RuntimeResult<String> {
-    if funding_arb_compact_artifacts_enabled()? {
-        Ok(funding_arb_monitor_snapshot_compact_json(
-            snapshot,
-            retained_rows,
-            artifact_mode,
-        ))
-    } else {
-        Ok(snapshot.to_json())
-    }
+    Ok(funding_arb_monitor_snapshot_artifact_json_with_debug_mode(
+        snapshot,
+        retained_rows,
+        artifact_mode,
+        funding_arb_full_debug_artifacts_enabled()?,
+    ))
 }
 
 #[cfg(feature = "live-exec")]
@@ -51448,6 +51457,32 @@ fn funding_arb_blocking_path_json(entries: &[FundingArbBlockingPathEntry]) -> St
 fn funding_arb_monitor_blocking_path(
     snapshot: &FundingArbMonitorSnapshot,
 ) -> Vec<FundingArbBlockingPathEntry> {
+    let mut entries = funding_arb_monitor_root_blocking_path(snapshot);
+    if snapshot.candidate_count == 0 {
+        entries.extend(
+            snapshot
+                .rows
+                .iter()
+                .filter(|row| !row.is_candidate)
+                .map(funding_arb_monitor_row_blocking_path_entry),
+        );
+    }
+    entries
+}
+
+fn funding_arb_monitor_compact_blocking_path(
+    snapshot: &FundingArbMonitorSnapshot,
+) -> Vec<FundingArbBlockingPathEntry> {
+    let mut entries = funding_arb_monitor_root_blocking_path(snapshot);
+    if snapshot.candidate_count == 0 {
+        entries.extend(funding_arb_monitor_row_blocking_path_groups(snapshot));
+    }
+    entries
+}
+
+fn funding_arb_monitor_root_blocking_path(
+    snapshot: &FundingArbMonitorSnapshot,
+) -> Vec<FundingArbBlockingPathEntry> {
     let mut entries = Vec::new();
     if snapshot.source_error_count > 0
         || snapshot.status != "healthy"
@@ -51486,15 +51521,98 @@ fn funding_arb_monitor_blocking_path(
                 snapshot.min_net_funding_bps
             )),
         );
-        entries.extend(
-            snapshot
-                .rows
-                .iter()
-                .filter(|row| !row.is_candidate)
-                .map(funding_arb_monitor_row_blocking_path_entry),
-        );
     }
     entries
+}
+
+#[derive(Clone, Debug)]
+struct FundingArbBlockingPathGroup {
+    blocker: String,
+    reason: String,
+    source_status: String,
+    count: usize,
+    sample_pairs: Vec<String>,
+    venue_pairs: BTreeSet<String>,
+}
+
+impl FundingArbBlockingPathGroup {
+    fn new(row: &FundingArbMarketRow) -> Self {
+        Self {
+            blocker: format!("{}:is_candidate=false", row.source_status),
+            reason: funding_arb_monitor_row_blocking_summary(row).to_owned(),
+            source_status: row.source_status.clone(),
+            count: 0,
+            sample_pairs: Vec::new(),
+            venue_pairs: BTreeSet::new(),
+        }
+    }
+
+    fn observe(&mut self, row: &FundingArbMarketRow) {
+        self.count = self.count.saturating_add(1);
+        if self.sample_pairs.len() < FUNDING_ARB_BLOCKING_PATH_GROUP_SAMPLE_LIMIT {
+            self.sample_pairs
+                .push(format!("{}:{}", row.pair_id, row.symbol));
+        }
+        self.venue_pairs
+            .insert(format!("{}:{}", row.venue_a_family, row.venue_b_family));
+    }
+
+    fn into_entry(
+        self,
+        total_non_candidate_rows: usize,
+        total_groups: usize,
+        truncated: bool,
+    ) -> FundingArbBlockingPathEntry {
+        FundingArbBlockingPathEntry::new(
+            "opportunity_row_group",
+            self.blocker,
+            format!("{}；同类 pair_count={}", self.reason, self.count),
+        )
+        .with_source_status(self.source_status)
+        .with_evidence(format!(
+            "pair_count={} total_non_candidate_rows={} group_count={} group_limit={} groups_truncated={} sample_pairs={} venue_pairs={}",
+            self.count,
+            total_non_candidate_rows,
+            total_groups,
+            FUNDING_ARB_BLOCKING_PATH_GROUP_LIMIT,
+            truncated,
+            self.sample_pairs.join("|"),
+            self.venue_pairs.into_iter().collect::<Vec<_>>().join("|")
+        ))
+    }
+}
+
+fn funding_arb_monitor_row_blocking_path_groups(
+    snapshot: &FundingArbMonitorSnapshot,
+) -> Vec<FundingArbBlockingPathEntry> {
+    let mut groups = BTreeMap::<(String, String), FundingArbBlockingPathGroup>::new();
+    let mut total_non_candidate_rows = 0usize;
+    for row in snapshot.rows.iter().filter(|row| !row.is_candidate) {
+        total_non_candidate_rows = total_non_candidate_rows.saturating_add(1);
+        let key = (
+            row.source_status.clone(),
+            funding_arb_monitor_row_blocking_summary(row).to_owned(),
+        );
+        groups
+            .entry(key)
+            .or_insert_with(|| FundingArbBlockingPathGroup::new(row))
+            .observe(row);
+    }
+    let total_groups = groups.len();
+    let truncated = total_groups > FUNDING_ARB_BLOCKING_PATH_GROUP_LIMIT;
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.blocker.cmp(&right.blocker))
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    groups
+        .into_iter()
+        .take(FUNDING_ARB_BLOCKING_PATH_GROUP_LIMIT)
+        .map(|group| group.into_entry(total_non_candidate_rows, total_groups, truncated))
+        .collect()
 }
 
 fn funding_arb_candidate_count_zero_reason(snapshot: &FundingArbMonitorSnapshot) -> String {
@@ -51529,7 +51647,19 @@ fn funding_arb_monitor_row_blocking_path_entry(
 }
 
 fn funding_arb_monitor_row_blocking_reason(row: &FundingArbMarketRow) -> String {
-    let summary = match row.source_status.as_str() {
+    let summary = funding_arb_monitor_row_blocking_summary(row);
+    match row
+        .reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        Some(detail) => format!("{summary}；{detail}"),
+        None => summary.to_owned(),
+    }
+}
+
+fn funding_arb_monitor_row_blocking_summary(row: &FundingArbMarketRow) -> &'static str {
+    match row.source_status.as_str() {
         "source_not_ready" => "阻断原因：上游 venue status 不完整",
         "missing_perp_top_of_book" => {
             "阻断原因：上游 perp top-of-book、mark/index 或盘口数量字段缺失"
@@ -51552,14 +51682,6 @@ fn funding_arb_monitor_row_blocking_reason(row: &FundingArbMarketRow) -> String 
             _ => "阻断原因：策略信号未通过候选门槛",
         },
         _ => "阻断原因：该 pair 未通过 funding-arb 候选门槛",
-    };
-    match row
-        .reason
-        .as_deref()
-        .filter(|reason| !reason.trim().is_empty())
-    {
-        Some(detail) => format!("{summary}；{detail}"),
-        None => summary.to_owned(),
     }
 }
 
@@ -51758,25 +51880,25 @@ fn write_funding_arb_guarded_dry_run_artifacts(
         path: output_dir.to_path_buf(),
         message: error.to_string(),
     })?;
-    let compact_artifacts = funding_arb_compact_artifacts_enabled()?;
-    let artifact_mode = if compact_artifacts {
-        "compact_guarded_dry_run_candidate"
+    let full_debug_artifacts = funding_arb_full_debug_artifacts_enabled()?;
+    let artifact_mode = if full_debug_artifacts {
+        "full_debug_snapshot"
     } else {
-        "full_snapshot"
+        "compact_guarded_dry_run_candidate"
     };
-    let opportunities_snapshot_json = if compact_artifacts {
+    let opportunities_snapshot_json = if full_debug_artifacts {
+        snapshot_json.to_owned()
+    } else {
         funding_arb_monitor_snapshot_compact_json(
             snapshot,
             std::slice::from_ref(row),
             artifact_mode,
         )
-    } else {
-        snapshot_json.to_owned()
     };
-    let retained_rows = if compact_artifacts {
-        1
-    } else {
+    let retained_rows = if full_debug_artifacts {
         snapshot.rows.len()
+    } else {
+        1
     };
     write_utf8(
         output_dir.join("funding_arb_opportunities_snapshot.json"),
@@ -65428,6 +65550,76 @@ mod tests {
         assert_eq!(parsed.candidate_count, 2);
         assert_eq!(parsed.rows.len(), 1);
         assert_eq!(parsed.rows[0].pair_id, selected_pair_id);
+    }
+
+    #[test]
+    fn funding_arb_monitor_snapshot_compact_json_groups_no_candidate_blocking_path() {
+        let mut below_min_one = funding_arb_test_row("0.00010000", "0.00300000");
+        below_min_one.is_candidate = false;
+        below_min_one.net_funding_bps = Some("1".to_owned());
+        below_min_one.reason = Some("net_funding_bps=1 below min_net_funding_bps=5".to_owned());
+        let mut below_min_two = below_min_one.clone();
+        below_min_two.pair_id = "binance:bybit:ETHUSDT:ETHUSDT".to_owned();
+        below_min_two.symbol = "ETHUSDT".to_owned();
+        below_min_two.net_funding_bps = Some("2".to_owned());
+        below_min_two.reason = Some("net_funding_bps=2 below min_net_funding_bps=5".to_owned());
+        let mut missing_book = below_min_one.clone();
+        missing_book.pair_id = "binance:bybit:SOLUSDT:SOLUSDT".to_owned();
+        missing_book.symbol = "SOLUSDT".to_owned();
+        missing_book.source_status = "missing_perp_top_of_book".to_owned();
+        missing_book.reason = None;
+        let snapshot = funding_arb_test_snapshot(
+            vec![below_min_one, below_min_two, missing_book],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+
+        let compact_json =
+            funding_arb_monitor_snapshot_compact_json(&snapshot, &[], "compact_no_candidate");
+        let fields = parse_json_object_value_slices(&compact_json).expect("compact fields");
+        let blocking_path =
+            json_array_value_slices(fields.get("blocking_path").expect("compact blocking path"))
+                .expect("blocking path values");
+
+        assert!(compact_json.contains("\"retained_rows\":0"));
+        assert!(compact_json.contains("\"rows\":[]"));
+        assert!(compact_json.contains("\"stage\":\"opportunity_row_group\""));
+        assert!(compact_json.contains("pair_count=2"));
+        assert!(compact_json.contains("sample_pairs="));
+        assert_eq!(blocking_path.len(), 3);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_arb_monitor_snapshot_artifact_debug_mode_writes_full_snapshot() {
+        let selected = funding_arb_test_row("0.00010000", "0.00300000");
+        let mut other = funding_arb_test_row("0.00020000", "0.00400000");
+        other.pair_id = "binance:bybit:ETHUSDT:ETHUSDT".to_owned();
+        other.symbol = "ETHUSDT".to_owned();
+        let snapshot = funding_arb_test_snapshot(
+            vec![selected.clone(), other],
+            "2026-05-13T00:00:00Z".to_owned(),
+        );
+
+        let compact_json = funding_arb_monitor_snapshot_artifact_json_with_debug_mode(
+            &snapshot,
+            std::slice::from_ref(&selected),
+            "compact_test_selected_row",
+            false,
+        );
+        let full_json = funding_arb_monitor_snapshot_artifact_json_with_debug_mode(
+            &snapshot,
+            std::slice::from_ref(&selected),
+            "compact_test_selected_row",
+            true,
+        );
+        let parsed_full =
+            parse_funding_arb_monitor_snapshot_json(&full_json).expect("full debug snapshot");
+
+        assert!(compact_json.contains("\"artifact_mode\":\"compact_test_selected_row\""));
+        assert!(!compact_json.contains("ETHUSDT"));
+        assert!(!full_json.contains("\"artifact_mode\""));
+        assert!(full_json.contains("ETHUSDT"));
+        assert_eq!(parsed_full.rows.len(), 2);
     }
 
     #[test]
