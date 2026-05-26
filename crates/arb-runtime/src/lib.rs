@@ -41992,7 +41992,18 @@ fn run_funding_arb_resident_exit_cycle(
     }
 
     if matches!(decision.as_str(), "close" | "emergency_de_risk") {
-        if !options.acknowledge_funding_arb_live_orders {
+        let close_liquidity_blocking_reasons = if decision == "close" {
+            funding_arb_exit_close_liquidity_blocking_reasons(row, [&leg_a, &leg_b])?
+        } else {
+            Vec::new()
+        };
+        if !close_liquidity_blocking_reasons.is_empty() {
+            funding_arb_push_unique_reason_code(
+                &mut reason_codes,
+                "exit_close_liquidity_insufficient",
+            );
+            blocking_reasons.extend(close_liquidity_blocking_reasons);
+        } else if !options.acknowledge_funding_arb_live_orders {
             blocking_reasons.push(
                 "缺少 --i-understand-funding-arb-live-orders，拒绝提交 funding arb 退出订单"
                     .to_owned(),
@@ -42682,6 +42693,147 @@ fn funding_arb_exit_private_position_status(
                 missing_accounts.join(",")
             )
         }),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_liquidity_blocking_reasons(
+    row: &FundingArbMarketRow,
+    legs: [&FundingArbExitLegSnapshot; 2],
+) -> RuntimeResult<Vec<String>> {
+    let mut reasons = Vec::new();
+    for leg in legs {
+        if !leg.close_required {
+            continue;
+        }
+        let close_side = funding_arb_exit_economic_close_side(leg);
+        let (available, levels_used) =
+            funding_arb_exit_available_close_quantity(row, leg, close_side)?;
+        let required = MonitorDecimal::parse(
+            "funding_arb_exit.close_quantity",
+            &leg.close_quantity.to_string(),
+        )?;
+        if required.raw <= 0 {
+            continue;
+        }
+        if available.raw < required.raw {
+            reasons.push(format!(
+                "funding arb exit close liquidity is insufficient for {} {}: available_close_qty={} required_close_qty={} close_side={} limit_price={} levels_used={}; exit will retry before submitting live close orders",
+                leg.leg.venue_family,
+                leg.leg.role,
+                available.format_trimmed(),
+                required.format_trimmed(),
+                close_side.as_str(),
+                leg.close_price,
+                levels_used
+            ));
+        }
+    }
+    Ok(reasons)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_economic_close_side(leg: &FundingArbExitLegSnapshot) -> OrderSide {
+    if leg.signed_quantity.raw < 0 {
+        OrderSide::Buy
+    } else {
+        opposite_order_side(leg.leg.side)
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_available_close_quantity(
+    row: &FundingArbMarketRow,
+    leg: &FundingArbExitLegSnapshot,
+    close_side: OrderSide,
+) -> RuntimeResult<(MonitorDecimal, usize)> {
+    let (levels, fallback_price, fallback_size) =
+        funding_arb_exit_close_depth_for_leg(row, leg, close_side)?;
+    let limit_price = MonitorDecimal::parse(
+        "funding_arb_exit.close_limit_price",
+        &leg.close_price.to_string(),
+    )?;
+    let depth_levels = if levels.is_empty() {
+        vec![SignalDepthLevel {
+            price: fallback_price.to_owned(),
+            size: fallback_size.to_owned(),
+        }]
+    } else {
+        levels.to_vec()
+    };
+
+    let mut available = MonitorDecimal { raw: 0 };
+    let mut levels_used = 0_usize;
+    for level in depth_levels {
+        let price = MonitorDecimal::parse("funding_arb_exit.close_depth_price", &level.price)?;
+        if price.raw <= 0 {
+            return Err(RuntimeError::LiveMarketData {
+                message: "funding arb exit close depth price must be positive".to_owned(),
+            });
+        }
+        let is_marketable = match close_side {
+            OrderSide::Buy => price.raw <= limit_price.raw,
+            OrderSide::Sell => price.raw >= limit_price.raw,
+        };
+        if !is_marketable {
+            continue;
+        }
+        let size = MonitorDecimal::parse("funding_arb_exit.close_depth_size", &level.size)?;
+        if size.raw < 0 {
+            return Err(RuntimeError::LiveMarketData {
+                message: "funding arb exit close depth size must not be negative".to_owned(),
+            });
+        }
+        available = available.checked_add(size, "funding arb exit close available quantity")?;
+        levels_used = levels_used
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "funding arb exit close depth levels overflowed".to_owned(),
+            })?;
+    }
+    Ok((available, levels_used))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_depth_for_leg<'a>(
+    row: &'a FundingArbMarketRow,
+    leg: &FundingArbExitLegSnapshot,
+    close_side: OrderSide,
+) -> RuntimeResult<(&'a [SignalDepthLevel], &'a str, &'a str)> {
+    let family = normalize_venue_family(&leg.leg.venue_family);
+    if family == normalize_venue_family(&row.venue_a_family) {
+        return Ok(match close_side {
+            OrderSide::Buy => (
+                row.venue_a_ask_depth.as_slice(),
+                row.venue_a_ask.as_str(),
+                row.venue_a_ask_qty.as_str(),
+            ),
+            OrderSide::Sell => (
+                row.venue_a_bid_depth.as_slice(),
+                row.venue_a_bid.as_str(),
+                row.venue_a_bid_qty.as_str(),
+            ),
+        });
+    }
+    if family == normalize_venue_family(&row.venue_b_family) {
+        return Ok(match close_side {
+            OrderSide::Buy => (
+                row.venue_b_ask_depth.as_slice(),
+                row.venue_b_ask.as_str(),
+                row.venue_b_ask_qty.as_str(),
+            ),
+            OrderSide::Sell => (
+                row.venue_b_bid_depth.as_slice(),
+                row.venue_b_bid.as_str(),
+                row.venue_b_bid_qty.as_str(),
+            ),
+        });
+    }
+    Err(RuntimeError::UnsafeConfig {
+        message: format!(
+            "funding arb exit row does not contain venue family `{}`",
+            leg.leg.venue_family
+        ),
     })
 }
 
@@ -68842,6 +68994,69 @@ mod tests {
         )
         .expect("emergency buy close price");
         assert_eq!(emergency_buy.to_string(), "189.88");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_close_liquidity_blocks_thin_normal_close() {
+        let mut row = funding_arb_test_row("0.00010000", "-0.00005000");
+        row.pair_id = "bybit:bitget:INXUSDT:INXUSDT".to_owned();
+        row.symbol = "INXUSDT".to_owned();
+        row.venue_a_family = "bybit".to_owned();
+        row.venue_b_family = "bitget".to_owned();
+        row.venue_a_ask = "0.009525".to_owned();
+        row.venue_a_ask_qty = "10".to_owned();
+        row.venue_a_ask_depth = signal_depth_from_top_strings("0.009525", "10");
+        row.venue_b_bid = "0.009534".to_owned();
+        row.venue_b_bid_qty = "9434".to_owned();
+        row.venue_b_bid_depth = signal_depth_from_top_strings("0.009534", "9434");
+
+        let long_leg = FundingArbExitLegSnapshot {
+            leg: FundingArbPositionLegState {
+                role: "funding_perp_long".to_owned(),
+                venue_family: "bitget".to_owned(),
+                venue_id: BITGET_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BITGET:INXUSDT:USDT-FUTURES".to_owned(),
+                side: OrderSide::Buy,
+                quantity: "10550".to_owned(),
+                entry_limit_price: "0.00948".to_owned(),
+            },
+            signed_quantity: MonitorDecimal::parse("test.long_quantity", "10550")
+                .expect("quantity"),
+            close_quantity: Quantity::from_str("10550").expect("quantity"),
+            close_price: Price::from_str("0.009534").expect("price"),
+            close_required: true,
+        };
+        let short_leg = FundingArbExitLegSnapshot {
+            leg: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "bybit".to_owned(),
+                venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BYBIT:INXUSDT:LINEAR-PERP".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "10550".to_owned(),
+                entry_limit_price: "0.009454".to_owned(),
+            },
+            signed_quantity: MonitorDecimal::parse("test.short_quantity", "-10550")
+                .expect("quantity"),
+            close_quantity: Quantity::from_str("10550").expect("quantity"),
+            close_price: Price::from_str("0.009525").expect("price"),
+            close_required: true,
+        };
+
+        let reasons =
+            funding_arb_exit_close_liquidity_blocking_reasons(&row, [&long_leg, &short_leg])
+                .expect("liquidity gate");
+
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons[0].contains("bitget funding_perp_long"));
+        assert!(reasons[0].contains("available_close_qty=9434"));
+        assert!(reasons[0].contains("required_close_qty=10550"));
+        assert!(reasons[1].contains("bybit funding_perp_short"));
+        assert!(reasons[1].contains("available_close_qty=10"));
+        assert!(reasons[1].contains("required_close_qty=10550"));
     }
 
     #[test]
