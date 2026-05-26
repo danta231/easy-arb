@@ -375,6 +375,7 @@ const HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV: &str =
 const FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENV: &str =
     "ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED";
 const BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS: i128 = 5;
+const FUNDING_ARB_RESIDENT_NO_CANDIDATE_EVENT_BLOCKING_PATH_LIMIT: usize = 5;
 const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
 const ARB_RUNTIME_LEGACY_COMMANDS_ENV: &str = "ARB_RUNTIME_ENABLE_LEGACY_COMMANDS";
 const UNIFIED_RUNTIME_DEFAULT_CONFIG: &str = "templates/personal_guarded_live.preflight.yaml";
@@ -39669,6 +39670,13 @@ struct FundingArbResidentPosition {
 }
 
 #[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FundingArbUnknownRecoveryPositionStateOutcome {
+    Open { position_state_path: PathBuf },
+    Flat { reason: String },
+}
+
+#[cfg(feature = "live-exec")]
 #[derive(Default)]
 struct FundingArbResidentPositionRegistry {
     positions: BTreeMap<String, FundingArbResidentPosition>,
@@ -41418,7 +41426,9 @@ fn recover_funding_arb_unknown_positions_for_exit(
             .join("unknown-position-recovery")
             .join(basis_identifier_component(&unknown.position_id));
         match write_funding_arb_unknown_recovery_position_state(options, &unknown, &recovery_dir) {
-            Ok(position_state_path) => {
+            Ok(FundingArbUnknownRecoveryPositionStateOutcome::Open {
+                position_state_path,
+            }) => {
                 append_funding_arb_resident_recovered_position_opened(
                     output_root,
                     cycle,
@@ -41427,6 +41437,15 @@ fn recover_funding_arb_unknown_positions_for_exit(
                     &position_state_path,
                 )?;
                 recovered += 1;
+            }
+            Ok(FundingArbUnknownRecoveryPositionStateOutcome::Flat { reason }) => {
+                append_funding_arb_resident_recovered_position_closed(
+                    output_root,
+                    cycle,
+                    cycle_dir,
+                    &unknown,
+                    &reason,
+                )?;
             }
             Err(error) => {
                 append_funding_arb_resident_error_event(
@@ -41551,7 +41570,44 @@ fn write_funding_arb_unknown_recovery_position_state(
     options: &FundingArbResidentLiveOptions,
     unknown: &FundingArbUnknownPositionRecovery,
     output_dir: &Path,
-) -> RuntimeResult<PathBuf> {
+) -> RuntimeResult<FundingArbUnknownRecoveryPositionStateOutcome> {
+    let (snapshot_path, row, state) =
+        build_funding_arb_unknown_recovery_position_state_template(options, unknown)?;
+    let private = run_funding_arb_private_readonly_snapshot_once(
+        FundingArbPrivateReadonlySnapshotOnceOptions {
+            config_path: options.config_path.clone(),
+            snapshot_path,
+            pair_id: unknown.pair_id.clone(),
+            output_dir: Some(output_dir.join("private-readonly")),
+            funding_settlement_raw_snapshot_path: options
+                .funding_settlement_raw_snapshot_path
+                .clone(),
+            hyperliquid_user: options.hyperliquid_user.clone(),
+            aster_user: options.aster_user.clone(),
+            aster_signer: options.aster_signer.clone(),
+            aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
+        },
+    )?;
+    let position_raw_json = read_utf8(&private.position_raw_snapshot_path)?;
+    let position_raw = parse_funding_private_raw_snapshot_json(
+        &position_raw_json,
+        "funding arb unknown recovery private position raw snapshot",
+    )?;
+    let position_snapshot =
+        funding_private_position_snapshot_from_raw_snapshot(&row, &position_raw)?;
+    write_funding_arb_unknown_recovery_position_state_from_private_snapshot(
+        output_dir,
+        &row,
+        state,
+        &position_snapshot,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn build_funding_arb_unknown_recovery_position_state_template(
+    options: &FundingArbResidentLiveOptions,
+    unknown: &FundingArbUnknownPositionRecovery,
+) -> RuntimeResult<(PathBuf, FundingArbMarketRow, FundingArbPositionState)> {
     let snapshot_path = unknown.cycle_dir.join("funding_arb_monitor_snapshot.json");
     let snapshot_json = read_utf8(&snapshot_path)?;
     let snapshot = parse_funding_arb_monitor_snapshot_json(&snapshot_json)?;
@@ -41559,6 +41615,7 @@ fn write_funding_arb_unknown_recovery_position_state(
         .rows
         .iter()
         .find(|row| row.pair_id == unknown.pair_id)
+        .cloned()
         .ok_or_else(|| RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
@@ -41567,10 +41624,10 @@ fn write_funding_arb_unknown_recovery_position_state(
             ),
         })?;
     let spec = funding_arb_pipeline_spec_from_monitor_row(
-        row,
+        &row,
         &funding_arb_resident_dry_run_options(
             options,
-            snapshot_path,
+            snapshot_path.clone(),
             unknown.pair_id.clone(),
             None,
         ),
@@ -41586,11 +41643,11 @@ fn write_funding_arb_unknown_recovery_position_state(
         symbol: unknown.symbol.clone(),
         plan_hash: None,
         notional_usd: notional_usd.clone(),
-        entry_net_funding_bps: funding_arb_row_net_funding_bps(row),
-        target_funding_time_ms: funding_arb_row_target_funding_time_ms(row),
-        target_gross_funding_spread_bps: funding_arb_row_gross_funding_spread_bps(row),
+        entry_net_funding_bps: funding_arb_row_net_funding_bps(&row),
+        target_funding_time_ms: funding_arb_row_target_funding_time_ms(&row),
+        target_gross_funding_spread_bps: funding_arb_row_gross_funding_spread_bps(&row),
         target_expected_gross_funding_usd: funding_arb_target_expected_gross_funding_usd(
-            row,
+            &row,
             &notional_usd,
         )?,
         target_expected_net_funding_usd: row.expected_funding_usd.clone(),
@@ -41600,17 +41657,41 @@ fn write_funding_arb_unknown_recovery_position_state(
             .as_ref()
             .map(|path| path.display().to_string()),
         leg_a: funding_arb_recovery_position_leg_state(
-            row,
+            &row,
             &spec.strategy_config.venues.venue_a,
             "venue_a",
         )?,
         leg_b: funding_arb_recovery_position_leg_state(
-            row,
+            &row,
             &spec.strategy_config.venues.venue_b,
             "venue_b",
         )?,
     };
-    write_funding_arb_position_state(output_dir, &state)
+    Ok((snapshot_path, row, state))
+}
+
+#[cfg(feature = "live-exec")]
+fn write_funding_arb_unknown_recovery_position_state_from_private_snapshot(
+    output_dir: &Path,
+    row: &FundingArbMarketRow,
+    mut state: FundingArbPositionState,
+    position_snapshot: &FundingPrivatePositionSnapshot,
+) -> RuntimeResult<FundingArbUnknownRecoveryPositionStateOutcome> {
+    funding_arb_align_unknown_recovery_state_to_private_positions(
+        &mut state,
+        row,
+        position_snapshot,
+    )?;
+    if !funding_arb_position_state_has_nonzero_quantity(&state)? {
+        return Ok(FundingArbUnknownRecoveryPositionStateOutcome::Flat {
+            reason: "unknown recovery private snapshot has no non-zero legs; no reduce-only exit required"
+                .to_owned(),
+        });
+    }
+    let position_state_path = write_funding_arb_position_state(output_dir, &state)?;
+    Ok(FundingArbUnknownRecoveryPositionStateOutcome::Open {
+        position_state_path,
+    })
 }
 
 #[cfg(feature = "live-exec")]
@@ -41686,6 +41767,21 @@ fn funding_arb_recovery_position_leg_state(
         quantity: "0".to_owned(),
         entry_limit_price,
     })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_state_has_nonzero_quantity(
+    state: &FundingArbPositionState,
+) -> RuntimeResult<bool> {
+    Ok(funding_arb_position_leg_quantity_is_nonzero(&state.leg_a)?
+        || funding_arb_position_leg_quantity_is_nonzero(&state.leg_b)?)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_leg_quantity_is_nonzero(
+    leg: &FundingArbPositionLegState,
+) -> RuntimeResult<bool> {
+    Ok(MonitorDecimal::parse("funding arb position leg quantity", &leg.quantity)?.raw != 0)
 }
 
 #[cfg(feature = "live-exec")]
@@ -41817,6 +41913,28 @@ fn append_funding_arb_resident_recovered_position_opened(
         json_string(&unknown.pair_id),
         json_string(&unknown.position_id),
         json_string(&position_state_path.display().to_string()),
+        json_string(&unknown.symbol),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_recovered_position_closed(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    unknown: &FundingArbUnknownPositionRecovery,
+    reason: &str,
+) -> RuntimeResult<()> {
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_unknown\":true,\"source\":\"unknown-position-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&unknown.notional_usdt),
+        json_string(&unknown.pair_id),
+        json_string(&unknown.position_id),
+        json_string(reason),
         json_string(&unknown.symbol),
     );
     append_funding_arb_resident_position_jsonl(output_root, &line)?;
@@ -44188,23 +44306,47 @@ fn append_funding_arb_resident_exit_event(
     cycle_dir: &Path,
     report: &FundingArbExitCycleReport,
 ) -> RuntimeResult<()> {
-    append_funding_arb_resident_event(
-        output_root,
-        &format!(
-            "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"funding_settlement_status\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"residual_risk\":{},\"submitted_receipt_count\":{}}}",
-            report.blocking_reasons.len(),
-            cycle,
-            json_string(&cycle_dir.display().to_string()),
-            json_string(&report.decision),
-            report.dispatch_attempted,
-            json_string(&report.funding_settlement_status),
-            json_string(position_id),
-            report.private_confirmation_count,
-            json_string(&report.private_position_status),
-            optional_json_string(report.residual_risk.as_deref()),
-            report.submitted_receipt_count,
-        ),
-    )
+    let recorded_at = current_utc_timestamp_string();
+    let line = format!(
+        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"funding_settlement_status\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"residual_risk\":{},\"submitted_receipt_count\":{}}}",
+        report.blocking_reasons.len(),
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&report.decision),
+        report.dispatch_attempted,
+        json_string(&report.funding_settlement_status),
+        json_string(position_id),
+        report.private_confirmation_count,
+        json_string(&report.private_position_status),
+        json_string(&recorded_at),
+        optional_json_string(report.residual_risk.as_deref()),
+        report.submitted_receipt_count,
+    );
+    append_funding_arb_resident_event(output_root, &line)?;
+    if funding_arb_resident_exit_event_needs_global_audit(report) {
+        append_funding_arb_resident_global_audit_event(
+            output_root,
+            "resident_exit_cycle",
+            &format!(
+                "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event\":\"resident_exit_cycle\",\"funding_settlement_status\":{},\"mutable_execution_started\":{},\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"residual_risk\":{},\"strategy\":\"cross-exchange-funding-arb\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+                cycle,
+                json_string(&cycle_dir.display().to_string()),
+                json_string(&report.decision),
+                report.dispatch_attempted,
+                json_string(&report.funding_settlement_status),
+                report.dispatch_attempted,
+                json_string(&report.pair_id),
+                json_string(position_id),
+                report.private_confirmation_count,
+                json_string(&report.private_position_status),
+                json_string(&recorded_at),
+                optional_json_string(report.residual_risk.as_deref()),
+                report.submitted_receipt_count,
+                json_string(&report.symbol),
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "live-exec")]
@@ -44327,48 +44469,76 @@ fn append_funding_arb_resident_candidate_event(
             dispatch_request_count: Some(outcome.canary.dispatch_request_count),
             dispatch_attempted: outcome.canary.dispatch_attempted,
         });
-    append_funding_arb_resident_event(
-        output_root,
-        &format!(
-            "{{\"blocking_path\":{},\"blocking_reason_details\":{},\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"dry_run_live_blocking_reasons\":{},\"dry_run_live_ready\":{},\"dry_run_risk_decision\":{},\"dry_run_risk_reason_codes\":{},\"event_type\":\"candidate_cycle\",\"execute_live\":{},\"execution_report_status\":{},\"expected_funding_usd\":{},\"flat_after_cancel\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_account_raw_snapshot_path\":{},\"private_confirmation_count\":{},\"private_position_raw_snapshot_path\":{},\"protection_attempted\":{},\"recorded_at\":{},\"residual_risk\":{},\"snapshot_path\":{},\"source_status\":{},\"submitted_receipt_count\":{},\"symbol\":{},\"venue_a_family\":{},\"venue_b_family\":{}}}",
-            blocking_path_json,
-            json_string_array(&outcome.canary.blocking_reasons),
-            outcome.canary.blocking_reasons.len(),
-            cycle,
-            json_string(&cycle_dir.display().to_string()),
-            outcome.canary.dispatch_allowed,
-            outcome.canary.dispatch_attempted,
-            outcome.canary.dispatch_plan_built,
-            outcome.canary.dispatch_request_count,
-            json_string_array(&outcome.canary.dry_run.live_blocking_reasons),
-            outcome.canary.dry_run.live_ready,
-            json_string(&outcome.canary.dry_run.risk_decision),
-            json_string_array(&outcome.canary.dry_run.risk_reason_codes),
-            outcome.canary.execute_live,
-            optional_json_string(outcome.canary.execution_report_status.as_deref()),
-            json_option_string(&outcome.canary.expected_funding_usd),
-            outcome.canary.flat_after_cancel,
-            outcome.canary.manual_gate_released,
-            outcome.canary.mutable_execution_started,
-            outcome
-                .net_funding_bps
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "null".to_owned()),
-            json_string(&outcome.pair_id),
-            json_string(&outcome.private_account_raw_snapshot_path.display().to_string()),
-            outcome.canary.private_confirmation_count,
-            json_string(&outcome.private_position_raw_snapshot_path.display().to_string()),
-            outcome.canary.protection_attempted,
-            json_string(&current_utc_timestamp_string()),
-            optional_json_string(outcome.canary.residual_risk.as_deref()),
-            json_string(&outcome.snapshot_path.display().to_string()),
-            json_string(&outcome.canary.source_status),
-            outcome.canary.submitted_receipt_count,
-            json_string(&outcome.symbol),
-            json_string(&outcome.canary.venue_a_family),
-            json_string(&outcome.canary.venue_b_family),
-        ),
-    )
+    let recorded_at = current_utc_timestamp_string();
+    let net_funding_bps = outcome
+        .net_funding_bps
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_owned());
+    let line = format!(
+        "{{\"blocking_path\":{},\"blocking_reason_details\":{},\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"dry_run_live_blocking_reasons\":{},\"dry_run_live_ready\":{},\"dry_run_risk_decision\":{},\"dry_run_risk_reason_codes\":{},\"event_type\":\"candidate_cycle\",\"execute_live\":{},\"execution_report_status\":{},\"expected_funding_usd\":{},\"flat_after_cancel\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_account_raw_snapshot_path\":{},\"private_confirmation_count\":{},\"private_position_raw_snapshot_path\":{},\"protection_attempted\":{},\"recorded_at\":{},\"residual_risk\":{},\"snapshot_path\":{},\"source_status\":{},\"submitted_receipt_count\":{},\"symbol\":{},\"venue_a_family\":{},\"venue_b_family\":{}}}",
+        blocking_path_json,
+        json_string_array(&outcome.canary.blocking_reasons),
+        outcome.canary.blocking_reasons.len(),
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        outcome.canary.dispatch_allowed,
+        outcome.canary.dispatch_attempted,
+        outcome.canary.dispatch_plan_built,
+        outcome.canary.dispatch_request_count,
+        json_string_array(&outcome.canary.dry_run.live_blocking_reasons),
+        outcome.canary.dry_run.live_ready,
+        json_string(&outcome.canary.dry_run.risk_decision),
+        json_string_array(&outcome.canary.dry_run.risk_reason_codes),
+        outcome.canary.execute_live,
+        optional_json_string(outcome.canary.execution_report_status.as_deref()),
+        json_option_string(&outcome.canary.expected_funding_usd),
+        outcome.canary.flat_after_cancel,
+        outcome.canary.manual_gate_released,
+        outcome.canary.mutable_execution_started,
+        net_funding_bps,
+        json_string(&outcome.pair_id),
+        json_string(&outcome.private_account_raw_snapshot_path.display().to_string()),
+        outcome.canary.private_confirmation_count,
+        json_string(&outcome.private_position_raw_snapshot_path.display().to_string()),
+        outcome.canary.protection_attempted,
+        json_string(&recorded_at),
+        optional_json_string(outcome.canary.residual_risk.as_deref()),
+        json_string(&outcome.snapshot_path.display().to_string()),
+        json_string(&outcome.canary.source_status),
+        outcome.canary.submitted_receipt_count,
+        json_string(&outcome.symbol),
+        json_string(&outcome.canary.venue_a_family),
+        json_string(&outcome.canary.venue_b_family),
+    );
+    append_funding_arb_resident_event(output_root, &line)?;
+    if funding_arb_resident_candidate_event_needs_global_audit(outcome) {
+        append_funding_arb_resident_global_audit_event(
+            output_root,
+            "resident_candidate_cycle",
+            &format!(
+                "{{\"cycle\":{},\"cycle_dir\":{},\"dispatch_allowed\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"event\":\"resident_candidate_cycle\",\"execution_report_status\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_confirmation_count\":{},\"recorded_at\":{},\"residual_risk\":{},\"strategy\":\"cross-exchange-funding-arb\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+                cycle,
+                json_string(&cycle_dir.display().to_string()),
+                outcome.canary.dispatch_allowed,
+                outcome.canary.dispatch_attempted,
+                outcome.canary.dispatch_plan_built,
+                outcome.canary.dispatch_request_count,
+                optional_json_string(outcome.canary.execution_report_status.as_deref()),
+                outcome.canary.mutable_execution_started,
+                outcome
+                    .net_funding_bps
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+                json_string(&outcome.pair_id),
+                outcome.canary.private_confirmation_count,
+                json_string(&recorded_at),
+                optional_json_string(outcome.canary.residual_risk.as_deref()),
+                outcome.canary.submitted_receipt_count,
+                json_string(&outcome.symbol),
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "live-exec")]
@@ -44387,11 +44557,17 @@ fn append_funding_arb_resident_no_candidate_event(
     output_root: &Path,
     input: FundingArbResidentNoCandidateEventInput<'_>,
 ) -> RuntimeResult<()> {
+    let blocking_path_total_count = input.blocking_path.len();
+    let blocking_path_shown_count =
+        blocking_path_total_count.min(FUNDING_ARB_RESIDENT_NO_CANDIDATE_EVENT_BLOCKING_PATH_LIMIT);
+    let blocking_path = &input.blocking_path[..blocking_path_shown_count];
     append_funding_arb_resident_event(
         output_root,
         &format!(
-            "{{\"blocking_path\":{},\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"no_candidate\",\"pair_id\":{},\"reason\":{},\"recorded_at\":{},\"snapshot_path\":{},\"symbol\":{}}}",
-            funding_arb_blocking_path_json(input.blocking_path),
+            "{{\"blocking_path\":{},\"blocking_path_total_count\":{},\"blocking_path_truncated\":{},\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"no_candidate\",\"pair_id\":{},\"reason\":{},\"recorded_at\":{},\"snapshot_path\":{},\"symbol\":{}}}",
+            funding_arb_blocking_path_json(blocking_path),
+            blocking_path_total_count,
+            blocking_path_total_count > blocking_path_shown_count,
             input.cycle,
             json_string(&input.cycle_dir.display().to_string()),
             optional_json_string(input.pair_id),
@@ -44456,6 +44632,57 @@ fn append_funding_arb_resident_event(output_root: &Path, line: &str) -> RuntimeR
         output_root.join("funding_arb_resident_live_events.jsonl"),
         line,
     )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_candidate_event_needs_global_audit(
+    outcome: &FundingArbResidentCycleOutcome,
+) -> bool {
+    outcome.canary.mutable_execution_started
+        || outcome.canary.dispatch_attempted
+        || outcome.canary.submitted_receipt_count > 0
+        || outcome.canary.private_confirmation_count > 0
+        || outcome.canary.residual_risk.is_some()
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_exit_event_needs_global_audit(report: &FundingArbExitCycleReport) -> bool {
+    report.dispatch_attempted
+        || report.submitted_receipt_count > 0
+        || report.private_confirmation_count > 0
+        || report.residual_risk.is_some()
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_global_audit_event(
+    output_root: &Path,
+    validation_event: &str,
+    line: &str,
+) -> RuntimeResult<()> {
+    let Some(live_dir) = funding_arb_resident_global_live_dir(output_root) else {
+        return Ok(());
+    };
+    fs::create_dir_all(&live_dir).map_err(|error| RuntimeError::Io {
+        path: live_dir.clone(),
+        message: error.to_string(),
+    })?;
+    append_line_to_jsonl(live_dir.join("live-reports.jsonl"), line)?;
+    let validation_line = format!(
+        "{{\"event\":{},\"source\":\"funding_arb_resident\",\"validation_report\":{}}}",
+        json_string(validation_event),
+        line
+    );
+    append_line_to_jsonl(live_dir.join("validation-events.jsonl"), &validation_line)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_global_live_dir(output_root: &Path) -> Option<PathBuf> {
+    let strategy_dir = output_root.file_name()?.to_string_lossy();
+    let resident_dir = output_root.parent()?.file_name()?.to_string_lossy();
+    if strategy_dir != "cross-exchange-funding-arb" || resident_dir != "resident-live" {
+        return None;
+    }
+    Some(output_root.parent()?.parent()?.join("live"))
 }
 
 #[cfg(feature = "live-exec")]
@@ -49177,10 +49404,7 @@ fn build_bybit_spot_live_adapter(
             AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
             BYBIT_REST_BASE_URL,
             signing_policy.clone(),
-        )?
-        .with_target_leverage(resolve_perp_target_leverage(
-            "BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE",
-        )?)?,
+        )?,
         BybitRealSigningProviderFromEnv::from_default_env()?,
         live::BybitCurlExecTransport::default(),
     )?)
@@ -49198,7 +49422,10 @@ fn build_bybit_linear_live_adapter(
             AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
             BYBIT_REST_BASE_URL,
             signing_policy.clone(),
-        )?,
+        )?
+        .with_target_leverage(resolve_perp_target_leverage(
+            "BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE",
+        )?)?,
         BybitRealSigningProviderFromEnv::from_default_env()?,
         live::BybitCurlExecTransport::default(),
     )?)
@@ -49216,10 +49443,7 @@ fn build_okx_spot_live_adapter(
             AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?,
             OKX_REST_BASE_URL,
             signing_policy.clone(),
-        )?
-        .with_target_leverage(resolve_perp_target_leverage(
-            "BASIS_OBSERVER_OKX_SWAP_LEVERAGE",
-        )?)?,
+        )?,
         OkxRealSigningProviderFromEnv::from_default_env()?,
         live::OkxCurlExecTransport::default(),
     )?)
@@ -49237,7 +49461,10 @@ fn build_okx_swap_live_adapter(
             AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?,
             OKX_REST_BASE_URL,
             signing_policy.clone(),
-        )?,
+        )?
+        .with_target_leverage(resolve_perp_target_leverage(
+            "BASIS_OBSERVER_OKX_SWAP_LEVERAGE",
+        )?)?,
         OkxRealSigningProviderFromEnv::from_default_env()?,
         live::OkxCurlExecTransport::default(),
     )?)
@@ -49255,10 +49482,7 @@ fn build_bitget_spot_live_adapter(
             AccountId::new(BITGET_GUARDED_LIVE_ACCOUNT_REF)?,
             BITGET_REST_BASE_URL,
             signing_policy.clone(),
-        )?
-        .with_target_leverage(resolve_perp_target_leverage(
-            "BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE",
-        )?)?,
+        )?,
         BitgetRealSigningProviderFromEnv::from_default_env()?,
         live::BitgetCurlExecTransport::default(),
     )?)
@@ -49279,7 +49503,10 @@ fn build_bitget_usdt_futures_live_adapter(
             AccountId::new(BITGET_GUARDED_LIVE_ACCOUNT_REF)?,
             BITGET_REST_BASE_URL,
             signing_policy.clone(),
-        )?,
+        )?
+        .with_target_leverage(resolve_perp_target_leverage(
+            "BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE",
+        )?)?,
         BitgetRealSigningProviderFromEnv::from_default_env()?,
         live::BitgetCurlExecTransport::default(),
     )?)
@@ -57006,6 +57233,10 @@ fn run_unified_runtime(options: UnifiedRuntimeCliOptions) -> RuntimeResult<Unifi
     let script_path = repo_root
         .join("scripts")
         .join("start-basis-opportunity-observer.sh");
+    let strategies = std::env::var("BASIS_OBSERVER_STRATEGIES")
+        .unwrap_or_else(|_| UNIFIED_RUNTIME_DEFAULT_STRATEGIES.to_owned());
+    let monitors = std::env::var("BASIS_OBSERVER_MONITORS")
+        .unwrap_or_else(|_| UNIFIED_RUNTIME_DEFAULT_MONITORS.to_owned());
     let status = Command::new("bash")
         .arg(&script_path)
         .current_dir(&repo_root)
@@ -57019,11 +57250,8 @@ fn run_unified_runtime(options: UnifiedRuntimeCliOptions) -> RuntimeResult<Unifi
             "BASIS_OBSERVER_MIN_NET_BPS",
             options.min_net_bps.to_string(),
         )
-        .env(
-            "BASIS_OBSERVER_STRATEGIES",
-            UNIFIED_RUNTIME_DEFAULT_STRATEGIES,
-        )
-        .env("BASIS_OBSERVER_MONITORS", UNIFIED_RUNTIME_DEFAULT_MONITORS)
+        .env("BASIS_OBSERVER_STRATEGIES", strategies)
+        .env("BASIS_OBSERVER_MONITORS", monitors)
         .env("BASIS_OBSERVER_FOREGROUND", "1")
         .env(
             "BASIS_OBSERVER_EXECUTE_LIVE",
@@ -67855,7 +68083,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
-    fn funding_arb_unknown_position_recovery_reopens_state_for_exit_supervisor() {
+    fn funding_arb_unknown_position_recovery_reopens_nonzero_private_state_for_exit_supervisor() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let previous_cycle = root
             .path()
@@ -67918,15 +68146,69 @@ mod tests {
             .join("cycles")
             .join(resident_cycle_dir_name(2).expect("cycle dir"));
 
-        let recovered = recover_funding_arb_unknown_positions_for_exit(
-            &options,
+        let mut pending =
+            load_funding_arb_unknown_position_recovery_records(root.path()).expect("pending");
+        assert_eq!(pending.len(), 1);
+        let unknown = pending.remove(0);
+        let recovery_dir = current_cycle
+            .join("unknown-position-recovery")
+            .join(basis_identifier_component(&unknown.position_id));
+        let (_snapshot_path, recovery_row, recovery_state) =
+            build_funding_arb_unknown_recovery_position_state_template(&options, &unknown)
+                .expect("recovery state template");
+        let private_snapshot = FundingPrivatePositionSnapshot {
+            status: "complete".to_owned(),
+            updated_at: Some("2026-05-20T14:52:00Z".to_owned()),
+            positions: vec![
+                FundingPrivatePositionEntry {
+                    venue_family: "binance".to_owned(),
+                    symbol: "CHIPUSDT".to_owned(),
+                    account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                    quantity: "0".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Short),
+                    mark_price: Some("0.00300000".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+                FundingPrivatePositionEntry {
+                    venue_family: "bybit".to_owned(),
+                    symbol: "CHIPUSDT".to_owned(),
+                    account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                    quantity: "3333".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Long),
+                    mark_price: Some("0.00010000".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+            ],
+        };
+        let position_state_path =
+            match write_funding_arb_unknown_recovery_position_state_from_private_snapshot(
+                &recovery_dir,
+                &recovery_row,
+                recovery_state,
+                &private_snapshot,
+            )
+            .expect("write recovered state")
+            {
+                FundingArbUnknownRecoveryPositionStateOutcome::Open {
+                    position_state_path,
+                } => position_state_path,
+                FundingArbUnknownRecoveryPositionStateOutcome::Flat { reason } => {
+                    panic!("expected nonzero recovery state, got flat: {reason}")
+                }
+            };
+        append_funding_arb_resident_recovered_position_opened(
             root.path(),
             2,
             &current_cycle,
+            &unknown,
+            &position_state_path,
         )
-        .expect("recover unknown position");
+        .expect("append recovered position");
 
-        assert_eq!(recovered, 1);
         let registry =
             load_funding_arb_resident_position_registry(root.path()).expect("resident registry");
         let active = registry.active_positions();
@@ -67943,7 +68225,7 @@ mod tests {
         assert_eq!(state.leg_b.venue_family, "bybit");
         assert_eq!(state.leg_b.side, OrderSide::Buy);
         assert_eq!(state.leg_a.quantity, "0");
-        assert_eq!(state.leg_b.quantity, "0");
+        assert_eq!(state.leg_b.quantity, "3333");
         let pending =
             load_funding_arb_unknown_position_recovery_records(root.path()).expect("pending");
         assert!(pending.is_empty());
@@ -67964,6 +68246,163 @@ mod tests {
         assert_eq!(retry_pending.len(), 1);
         assert_eq!(retry_pending[0].pair_id, "binance:bybit:CHIPUSDT:CHIPUSDT");
         assert_eq!(retry_pending[0].symbol, "CHIPUSDT");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_unknown_position_recovery_closes_flat_private_snapshot() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let mut row = funding_arb_test_row("0.00300000", "0.00010000");
+        row.pair_id = "binance:bybit:CHIPUSDT:CHIPUSDT".to_owned();
+        row.symbol = "CHIPUSDT".to_owned();
+        row.long_venue_family = Some("bybit".to_owned());
+        row.short_venue_family = Some("binance".to_owned());
+        let state = FundingArbPositionState {
+            pair_id: row.pair_id.clone(),
+            symbol: row.symbol.clone(),
+            plan_hash: None,
+            notional_usd: "10.00".to_owned(),
+            entry_net_funding_bps: Some(17),
+            target_funding_time_ms: None,
+            target_gross_funding_spread_bps: None,
+            target_expected_gross_funding_usd: None,
+            target_expected_net_funding_usd: None,
+            opened_at: "2026-05-20T14:51:00Z".to_owned(),
+            private_order_events_dir: None,
+            leg_a: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "binance".to_owned(),
+                venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BINANCE:CHIPUSDT:USDM-PERP".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "0".to_owned(),
+                entry_limit_price: "0.00300000".to_owned(),
+            },
+            leg_b: FundingArbPositionLegState {
+                role: "funding_perp_long".to_owned(),
+                venue_family: "bybit".to_owned(),
+                venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BYBIT:CHIPUSDT:LINEAR-PERP".to_owned(),
+                side: OrderSide::Buy,
+                quantity: "0".to_owned(),
+                entry_limit_price: "0.00010000".to_owned(),
+            },
+        };
+        let private_snapshot = FundingPrivatePositionSnapshot {
+            status: "complete".to_owned(),
+            updated_at: Some("2026-05-20T14:52:00Z".to_owned()),
+            positions: vec![
+                FundingPrivatePositionEntry {
+                    venue_family: "binance".to_owned(),
+                    symbol: "CHIPUSDT".to_owned(),
+                    account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                    quantity: "0".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Short),
+                    mark_price: Some("0.00300000".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+                FundingPrivatePositionEntry {
+                    venue_family: "bybit".to_owned(),
+                    symbol: "CHIPUSDT".to_owned(),
+                    account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                    quantity: "0".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Long),
+                    mark_price: Some("0.00010000".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+            ],
+        };
+
+        let outcome = write_funding_arb_unknown_recovery_position_state_from_private_snapshot(
+            root.path(),
+            &row,
+            state,
+            &private_snapshot,
+        )
+        .expect("flat recovery outcome");
+
+        assert!(matches!(
+            outcome,
+            FundingArbUnknownRecoveryPositionStateOutcome::Flat { .. }
+        ));
+        assert!(!funding_arb_position_state_file(root.path()).exists());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_no_candidate_event_truncates_blocking_path() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let cycle_dir = root.path().join("cycle-1");
+        let snapshot_path = cycle_dir.join("funding_arb_monitor_snapshot.json");
+        let blocking_path = (0..7)
+            .map(|index| {
+                FundingArbBlockingPathEntry::new(
+                    "opportunity_row",
+                    format!("row-{index}"),
+                    format!("reason-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        append_funding_arb_resident_no_candidate_event(
+            root.path(),
+            FundingArbResidentNoCandidateEventInput {
+                cycle: 1,
+                cycle_dir: &cycle_dir,
+                snapshot_path: &snapshot_path,
+                pair_id: Some("binance:bybit:CHIPUSDT:CHIPUSDT"),
+                symbol: Some("CHIPUSDT"),
+                reason: "no candidate",
+                blocking_path: &blocking_path,
+            },
+        )
+        .expect("append no candidate");
+
+        let events = read_utf8(&root.path().join("funding_arb_resident_live_events.jsonl"))
+            .expect("events jsonl");
+        let fields = parse_json_object_value_slices(events.trim()).expect("event fields");
+        let entries = json_array_value_slices(fields.get("blocking_path").expect("blocking path"))
+            .expect("blocking path entries");
+        assert_eq!(entries.len(), 5);
+        assert_eq!(
+            optional_json_usize(&fields, "blocking_path_total_count", "no candidate event")
+                .expect("total count"),
+            Some(7)
+        );
+        assert_eq!(
+            optional_json_bool(&fields, "blocking_path_truncated", "no candidate event")
+                .expect("truncated"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_global_audit_event_writes_live_reports() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let output_root = root
+            .path()
+            .join("resident-live")
+            .join("cross-exchange-funding-arb");
+        let line = r#"{"event":"resident_exit_cycle","mutable_execution_started":true,"recorded_at":"2026-05-26T00:00:00Z"}"#;
+
+        append_funding_arb_resident_global_audit_event(&output_root, "resident_exit_cycle", line)
+            .expect("append global audit");
+
+        let live_reports =
+            read_utf8(&root.path().join("live").join("live-reports.jsonl")).expect("live reports");
+        let validation_events =
+            read_utf8(&root.path().join("live").join("validation-events.jsonl"))
+                .expect("validation events");
+        assert!(live_reports.contains("resident_exit_cycle"));
+        assert!(validation_events.contains("\"source\":\"funding_arb_resident\""));
+        assert!(validation_events.contains("\"validation_report\""));
     }
 
     #[test]
