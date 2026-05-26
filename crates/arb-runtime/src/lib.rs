@@ -39789,7 +39789,7 @@ fn run_funding_arb_resident_live_inner(
                                 &report,
                                 "funding arb exit/de-risk dispatch left unknown or residual state",
                             )?;
-                            if unknown_recovery_enabled && recovered_unknown_positions == 0 {
+                            if options.auto_residual_de_risk {
                                 append_funding_arb_resident_error_event(
                                     &output_root,
                                     cycles,
@@ -39838,6 +39838,7 @@ fn run_funding_arb_resident_live_inner(
                         halt_reason: None,
                     },
                 )?;
+                thread::sleep(Duration::from_secs(options.poll_interval_secs));
                 continue;
             }
             if recovered_unknown_positions > 0 {
