@@ -12973,6 +12973,15 @@ fn resident_entry_cycle_error_can_retry(error: &RuntimeError) -> bool {
                 || message.starts_with("OKX returned code=50011")
                 || message == "top-of-book prices must be greater than zero"
         }
+        RuntimeError::Module {
+            module: "arb-venue-data",
+            message,
+        } => {
+            message.contains("freshness.ingested_at")
+                || message.contains(
+                    "ingested timestamp must be greater than or equal to observed timestamp",
+                )
+        }
         _ => false,
     }
 }
@@ -12997,6 +13006,16 @@ fn resident_retryable_error_class(error: &RuntimeError) -> &'static str {
             } else {
                 "live_market_data"
             }
+        }
+        RuntimeError::Module {
+            module: "arb-venue-data",
+            message,
+        } if message.contains("freshness.ingested_at")
+            || message.contains(
+                "ingested timestamp must be greater than or equal to observed timestamp",
+            ) =>
+        {
+            "private_snapshot_timestamp_skew"
         }
         _ => "non_retryable",
     }
@@ -22090,7 +22109,7 @@ fn basis_position_imbalance_bps(spot_quantity: &str, perp_quantity: &str) -> Run
 #[cfg(feature = "live-exec")]
 fn fetch_binance_usdm_private_position_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     state: &BasisExitSupervisorPositionState,
 ) -> RuntimeResult<Vec<VenuePosition>> {
     let recv_window_ms = binance_private_readonly_recv_window_ms()?;
@@ -22121,17 +22140,18 @@ fn fetch_binance_usdm_private_position_snapshot(
         &state.perp_account_id,
         params,
     )?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = BinancePrivateAccountAdapter::new(
         VenueId::new(&state.perp_venue_id)?,
         AccountId::new(&state.perp_account_id)?,
         market,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let batch = adapter.ingest_usdm_position_risk_json(
         &raw_json,
         format!("binance-private-position:{}", state.symbol),
-        *ingested_at,
+        snapshot_ingested_at,
     )?;
     adapter
         .positions(
@@ -22156,7 +22176,7 @@ fn fetch_binance_usdm_private_position_snapshot(
 #[cfg(feature = "live-exec")]
 fn fetch_bybit_linear_private_position_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     state: &BasisExitSupervisorPositionState,
 ) -> RuntimeResult<Vec<VenuePosition>> {
     let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
@@ -22180,17 +22200,18 @@ fn fetch_bybit_linear_private_position_snapshot(
     )?;
     let endpoint = "/v5/position/list";
     let raw_json = fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, endpoint, &signed)?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = BybitPrivateAccountAdapter::new(
         VenueId::new(&state.perp_venue_id)?,
         AccountId::new(&state.perp_account_id)?,
         BybitPrivateAccountMarket::LinearPerpetual,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let batch = adapter.ingest_linear_position_list_json(
         &raw_json,
         format!("bybit-private-position:{}", state.symbol),
-        *ingested_at,
+        snapshot_ingested_at,
     )?;
     adapter
         .positions(
@@ -22215,7 +22236,7 @@ fn fetch_bybit_linear_private_position_snapshot(
 #[cfg(feature = "live-exec")]
 fn fetch_okx_swap_private_position_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     state: &BasisExitSupervisorPositionState,
 ) -> RuntimeResult<Vec<VenuePosition>> {
     let inst_id = okx_inst_id_from_public_monitor_instrument(&state.perp_instrument_id, "SWAP")?;
@@ -22238,17 +22259,18 @@ fn fetch_okx_swap_private_position_snapshot(
         signing_policy,
     )?;
     let raw_json = fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = OkxPrivateAccountAdapter::new(
         VenueId::new(&state.perp_venue_id)?,
         AccountId::new(&state.perp_account_id)?,
         OkxPrivateAccountMarket::TradingAccount,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let batch = adapter.ingest_account_positions_json(
         &raw_json,
         format!("okx-private-position:{inst_id}"),
-        *ingested_at,
+        snapshot_ingested_at,
     )?;
     adapter
         .positions(
@@ -22273,7 +22295,7 @@ fn fetch_okx_swap_private_position_snapshot(
 #[cfg(feature = "live-exec")]
 fn fetch_bitget_usdt_futures_private_position_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     state: &BasisExitSupervisorPositionState,
 ) -> RuntimeResult<Vec<VenuePosition>> {
     let symbol = bitget_symbol_from_runtime_instrument(&state.perp_instrument_id)?;
@@ -22296,17 +22318,18 @@ fn fetch_bitget_usdt_futures_private_position_snapshot(
         signing_policy,
     )?;
     let raw_json = fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = BitgetPrivateAccountAdapter::new(
         VenueId::new(&state.perp_venue_id)?,
         AccountId::new(&state.perp_account_id)?,
         BitgetPrivateAccountMarket::UsdtFuturesAccount,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let batch = adapter.ingest_usdt_futures_positions_json(
         &raw_json,
         format!("bitget-private-position:{symbol}"),
-        *ingested_at,
+        snapshot_ingested_at,
     )?;
     adapter
         .positions(
@@ -32434,10 +32457,13 @@ fn append_opportunity_recorder_resident_tail_health(
         .unwrap_or(0);
     let scoped_lines = &lines[start..];
     let cycle_error_count = count_lines_containing(scoped_lines, "\"event_type\":\"cycle_error\"");
+    let residual_de_risk_retry_count =
+        count_lines_containing(scoped_lines, "\"event_type\":\"residual_de_risk_retry\"");
     let blocked_decision_count = count_lines_containing(scoped_lines, "\"decision\":\"blocked\"");
     let entry_capacity_blocked_count =
         count_lines_containing(scoped_lines, "\"event_type\":\"entry_capacity_blocked\"");
     let status = if cycle_error_count > 0
+        || residual_de_risk_retry_count > 0
         || blocked_decision_count > 0
         || entry_capacity_blocked_count > 0
     {
@@ -32446,7 +32472,7 @@ fn append_opportunity_recorder_resident_tail_health(
         "healthy"
     };
     let key = format!(
-        "resident_tail_health|status={status}|cycle_errors={cycle_error_count}|blocked={blocked_decision_count}|capacity={entry_capacity_blocked_count}"
+        "resident_tail_health|status={status}|cycle_errors={cycle_error_count}|residual_retry={residual_de_risk_retry_count}|blocked={blocked_decision_count}|capacity={entry_capacity_blocked_count}"
     );
     if !sampler.should_emit(&format!("resident:{source}"), &key) {
         return Ok(());
@@ -32454,7 +32480,7 @@ fn append_opportunity_recorder_resident_tail_health(
     append_line_to_jsonl(
         options.health_events_jsonl.clone(),
         &format!(
-            "{{\"recorded_at\":{},\"strategy\":{},\"source\":{},\"event\":\"resident_tail_health\",\"status\":{},\"event_file\":{},\"tail_lines\":{},\"cycle_error_count\":{},\"blocked_decision_count\":{},\"entry_capacity_blocked_count\":{},\"mutable_execution_started\":false}}",
+            "{{\"recorded_at\":{},\"strategy\":{},\"source\":{},\"event\":\"resident_tail_health\",\"status\":{},\"event_file\":{},\"tail_lines\":{},\"cycle_error_count\":{},\"residual_de_risk_retry_count\":{},\"blocked_decision_count\":{},\"entry_capacity_blocked_count\":{},\"mutable_execution_started\":false}}",
             json_string(&current_utc_timestamp_string()),
             json_string(strategy),
             json_string(source),
@@ -32462,6 +32488,7 @@ fn append_opportunity_recorder_resident_tail_health(
             json_string(&event_file.display().to_string()),
             options.resident_health_tail_lines,
             cycle_error_count,
+            residual_de_risk_retry_count,
             blocked_decision_count,
             entry_capacity_blocked_count
         ),
@@ -35268,12 +35295,20 @@ struct FundingPrivatePositionSnapshot {
     positions: Vec<FundingPrivatePositionEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FundingPrivatePositionSide {
+    Both,
+    Long,
+    Short,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FundingPrivatePositionEntry {
     venue_family: String,
     symbol: String,
     account_id: String,
     quantity: String,
+    position_side: Option<FundingPrivatePositionSide>,
     mark_price: Option<String>,
     liquidation_price: Option<String>,
     adl_rank_indicator: Option<String>,
@@ -38654,11 +38689,13 @@ fn generic_private_position_entries_from_raw_statement(
         else {
             continue;
         };
+        let position_side = funding_private_position_side_from_fields(&fields)?;
         positions.push(FundingPrivatePositionEntry {
             venue_family: statement.venue_family.clone(),
             symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
             account_id: statement.account_id.clone(),
             quantity,
+            position_side,
             mark_price: first_non_empty_json_scalar_string(
                 &fields,
                 &["mark_price", "markPrice", "markPx", "mark"],
@@ -38709,6 +38746,7 @@ fn generic_private_position_entries_from_raw_statement(
             symbol: expected_symbol.to_owned(),
             account_id: statement.account_id.clone(),
             quantity: "0".to_owned(),
+            position_side: None,
             mark_price: None,
             liquidation_price: None,
             adl_rank_indicator: None,
@@ -38798,6 +38836,44 @@ fn private_position_statement_can_imply_missing_symbol_is_flat(
     Ok(success)
 }
 
+fn funding_private_position_side_from_fields(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<FundingPrivatePositionSide>> {
+    if let Some(raw) = first_non_empty_json_scalar_string(
+        fields,
+        &[
+            "position_side",
+            "positionSide",
+            "posSide",
+            "holdSide",
+            "side",
+        ],
+    )? {
+        if let Some(side) = funding_private_position_side_from_raw(&raw) {
+            return Ok(Some(side));
+        }
+    }
+    if let Some(raw) = first_non_empty_json_scalar_string(fields, &["position_idx", "positionIdx"])?
+    {
+        return Ok(match raw.trim() {
+            "0" => Some(FundingPrivatePositionSide::Both),
+            "1" => Some(FundingPrivatePositionSide::Long),
+            "2" => Some(FundingPrivatePositionSide::Short),
+            _ => None,
+        });
+    }
+    Ok(None)
+}
+
+fn funding_private_position_side_from_raw(raw: &str) -> Option<FundingPrivatePositionSide> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "long" | "buy" => Some(FundingPrivatePositionSide::Long),
+        "short" | "sell" => Some(FundingPrivatePositionSide::Short),
+        "both" | "net" | "oneway" | "one_way" | "one-way" => Some(FundingPrivatePositionSide::Both),
+        _ => None,
+    }
+}
+
 fn object_field_contains_array(
     fields: &BTreeMap<String, &str>,
     object_field: &'static str,
@@ -38846,11 +38922,13 @@ fn hyperliquid_private_position_entries_from_raw_statement(
         else {
             continue;
         };
+        let position_side = funding_private_position_side_from_fields(&position_fields)?;
         positions.push(FundingPrivatePositionEntry {
             venue_family: statement.venue_family.clone(),
             symbol: funding_settlement_display_symbol_from_raw(&raw_symbol),
             account_id: statement.account_id.clone(),
             quantity,
+            position_side,
             mark_price: first_non_empty_json_scalar_string(
                 &position_fields,
                 &["mark_price", "markPrice", "markPx", "mark"],
@@ -38901,6 +38979,7 @@ fn hyperliquid_private_position_entries_from_raw_statement(
             symbol: expected_symbol.to_owned(),
             account_id: statement.account_id.clone(),
             quantity: "0".to_owned(),
+            position_side: None,
             mark_price: None,
             liquidation_price: None,
             adl_rank_indicator: None,
@@ -38963,6 +39042,7 @@ fn parse_funding_private_position_snapshot_json(
                 &["quantity", "position_size", "size"],
                 "funding private position entry",
             )?,
+            position_side: funding_private_position_side_from_fields(&fields)?,
             mark_price: optional_first_json_value_string(
                 &fields,
                 &["mark_price", "markPrice", "markPx", "mark"],
@@ -39790,7 +39870,7 @@ fn run_funding_arb_resident_live_inner(
                                 "funding arb exit/de-risk dispatch left unknown or residual state",
                             )?;
                             if options.auto_residual_de_risk {
-                                append_funding_arb_resident_error_event(
+                                append_funding_arb_resident_residual_retry_event(
                                     &output_root,
                                     cycles,
                                     &exit_dir,
@@ -41824,7 +41904,7 @@ fn run_funding_arb_resident_exit_cycle(
         path: output_dir.to_path_buf(),
         message: error.to_string(),
     })?;
-    let state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
+    let mut state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
     let snapshot = match load_funding_arb_resident_snapshot(options) {
         Ok(snapshot) => snapshot,
         Err(error) if funding_arb_exit_pre_dispatch_error_can_retry(&error) => {
@@ -41967,6 +42047,17 @@ fn run_funding_arb_resident_exit_cycle(
         bitget: bitget_position_mode,
         aster: aster_position_mode,
     };
+    if funding_arb_unknown_recovery_enabled(options) && state.plan_hash.is_none() {
+        let mut aligned_state = state.clone();
+        if funding_arb_align_unknown_recovery_state_to_private_positions(
+            &mut aligned_state,
+            row,
+            &position_snapshot,
+        )? {
+            write_funding_arb_position_state_path(position_state_path, &aligned_state)?;
+        }
+        state = aligned_state;
+    }
     let settlement = funding_arb_resident_settlement_reconciliation(
         options,
         row,
@@ -42508,6 +42599,12 @@ fn funding_arb_exit_leg_is_short(
     leg: &FundingArbPositionLegState,
     entry: &FundingPrivatePositionEntry,
 ) -> RuntimeResult<bool> {
+    let signed_quantity = funding_private_position_entry_signed_quantity(entry)?;
+    if let Some(position_side) =
+        funding_private_position_direction_from_entry(entry, signed_quantity)
+    {
+        return Ok(position_side == FundingPrivatePositionSide::Short);
+    }
     let role = leg.role.to_ascii_lowercase();
     if role.contains("short") {
         return Ok(true);
@@ -42518,8 +42615,7 @@ fn funding_arb_exit_leg_is_short(
     if leg.side == OrderSide::Sell {
         return Ok(true);
     }
-    let quantity = MonitorDecimal::parse("funding_arb_exit.position_quantity", &entry.quantity)?;
-    Ok(quantity.raw < 0)
+    Ok(signed_quantity.raw < 0)
 }
 
 #[cfg(feature = "live-exec")]
@@ -42880,6 +42976,95 @@ fn funding_arb_exit_close_depth_for_leg<'a>(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_align_unknown_recovery_state_to_private_positions(
+    state: &mut FundingArbPositionState,
+    row: &FundingArbMarketRow,
+    snapshot: &FundingPrivatePositionSnapshot,
+) -> RuntimeResult<bool> {
+    let mut changed = false;
+    changed |= funding_arb_align_unknown_recovery_leg_to_private_position(
+        row,
+        &mut state.leg_a,
+        snapshot,
+    )?;
+    changed |= funding_arb_align_unknown_recovery_leg_to_private_position(
+        row,
+        &mut state.leg_b,
+        snapshot,
+    )?;
+    Ok(changed)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_align_unknown_recovery_leg_to_private_position(
+    row: &FundingArbMarketRow,
+    leg: &mut FundingArbPositionLegState,
+    snapshot: &FundingPrivatePositionSnapshot,
+) -> RuntimeResult<bool> {
+    let Some((entry, signed_quantity)) =
+        funding_arb_current_private_position_entry_for_leg_identity(row, leg, snapshot)?
+    else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    let abs_raw =
+        signed_quantity
+            .raw
+            .checked_abs()
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "funding arb unknown recovery quantity absolute value overflowed"
+                    .to_owned(),
+            })?;
+    let abs_quantity = MonitorDecimal { raw: abs_raw }.format_trimmed();
+    if leg.quantity != abs_quantity {
+        leg.quantity = abs_quantity;
+        changed = true;
+    }
+    if signed_quantity.raw == 0 {
+        return Ok(changed);
+    }
+    let Some(position_side) = funding_private_position_direction_from_entry(entry, signed_quantity)
+    else {
+        return Ok(changed);
+    };
+    let (role, side) = funding_arb_role_and_entry_side_from_position_side(position_side);
+    if leg.role != role {
+        leg.role = role;
+        changed = true;
+    }
+    if leg.side != side {
+        leg.side = side;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_current_private_position_entry_for_leg_identity<'a>(
+    row: &FundingArbMarketRow,
+    leg: &FundingArbPositionLegState,
+    snapshot: &'a FundingPrivatePositionSnapshot,
+) -> RuntimeResult<Option<(&'a FundingPrivatePositionEntry, MonitorDecimal)>> {
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    let mut first_matching = None;
+    for entry in snapshot.positions.iter().filter(|entry| {
+        normalize_venue_family(&entry.venue_family) == normalize_venue_family(&leg.venue_family)
+            && funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol))
+                == expected_symbol
+            && entry.account_id == leg.account_id
+    }) {
+        let signed_quantity = funding_private_position_entry_signed_quantity(entry)?;
+        if signed_quantity.raw != 0 {
+            return Ok(Some((entry, signed_quantity)));
+        }
+        if first_matching.is_none() {
+            first_matching = Some((entry, signed_quantity));
+        }
+    }
+    Ok(first_matching)
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exit_leg_snapshot(
     row: &FundingArbMarketRow,
     leg: &FundingArbPositionLegState,
@@ -42887,7 +43072,7 @@ fn funding_arb_exit_leg_snapshot(
     slippage_buffer_bps: i128,
 ) -> RuntimeResult<FundingArbExitLegSnapshot> {
     let quantity = funding_arb_private_position_entry_for_leg(row, leg, snapshot)
-        .map(|entry| MonitorDecimal::parse("funding_arb_exit_leg.quantity", &entry.quantity))
+        .map(funding_private_position_entry_signed_quantity)
         .transpose()?
         .unwrap_or(MonitorDecimal { raw: 0 });
     let close_required = quantity.raw != 0;
@@ -42928,7 +43113,87 @@ fn funding_arb_private_position_entry_for_leg<'a>(
             && funding_display_symbol(&funding_base_asset_from_symbol(&entry.symbol))
                 == expected_symbol
             && entry.account_id == leg.account_id
+            && funding_private_position_entry_matches_leg_direction(entry, leg)
     })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_private_position_entry_matches_leg_direction(
+    entry: &FundingPrivatePositionEntry,
+    leg: &FundingArbPositionLegState,
+) -> bool {
+    let Some(actual) = entry.position_side else {
+        return true;
+    };
+    if actual == FundingPrivatePositionSide::Both {
+        return true;
+    }
+    funding_arb_expected_position_side_from_leg(leg).is_none_or(|expected| expected == actual)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_expected_position_side_from_leg(
+    leg: &FundingArbPositionLegState,
+) -> Option<FundingPrivatePositionSide> {
+    let role = leg.role.to_ascii_lowercase();
+    if role.contains("long") {
+        return Some(FundingPrivatePositionSide::Long);
+    }
+    if role.contains("short") {
+        return Some(FundingPrivatePositionSide::Short);
+    }
+    Some(match leg.side {
+        OrderSide::Buy => FundingPrivatePositionSide::Long,
+        OrderSide::Sell => FundingPrivatePositionSide::Short,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_private_position_entry_signed_quantity(
+    entry: &FundingPrivatePositionEntry,
+) -> RuntimeResult<MonitorDecimal> {
+    let quantity = MonitorDecimal::parse("funding_arb_exit_leg.quantity", &entry.quantity)?;
+    let abs_raw = quantity
+        .raw
+        .checked_abs()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "funding arb private position quantity absolute value overflowed".to_owned(),
+        })?;
+    Ok(match entry.position_side {
+        Some(FundingPrivatePositionSide::Long) => MonitorDecimal { raw: abs_raw },
+        Some(FundingPrivatePositionSide::Short) => MonitorDecimal { raw: -abs_raw },
+        Some(FundingPrivatePositionSide::Both) | None => quantity,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_private_position_direction_from_entry(
+    entry: &FundingPrivatePositionEntry,
+    signed_quantity: MonitorDecimal,
+) -> Option<FundingPrivatePositionSide> {
+    match entry.position_side {
+        Some(FundingPrivatePositionSide::Long) | Some(FundingPrivatePositionSide::Short) => {
+            entry.position_side
+        }
+        Some(FundingPrivatePositionSide::Both) | None if signed_quantity.raw > 0 => {
+            Some(FundingPrivatePositionSide::Long)
+        }
+        Some(FundingPrivatePositionSide::Both) | None if signed_quantity.raw < 0 => {
+            Some(FundingPrivatePositionSide::Short)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_role_and_entry_side_from_position_side(
+    position_side: FundingPrivatePositionSide,
+) -> (String, OrderSide) {
+    match position_side {
+        FundingPrivatePositionSide::Long => ("funding_perp_long".to_owned(), OrderSide::Buy),
+        FundingPrivatePositionSide::Short => ("funding_perp_short".to_owned(), OrderSide::Sell),
+        FundingPrivatePositionSide::Both => ("funding_perp_long".to_owned(), OrderSide::Buy),
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -44152,6 +44417,24 @@ fn append_funding_arb_resident_error_event(
             cycle,
             json_string(&cycle_dir.display().to_string()),
             json_string(error),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_residual_retry_event(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    reason: &str,
+) -> RuntimeResult<()> {
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"residual_de_risk_retry\",\"reason\":{}}}",
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(reason),
         ),
     )
 }
@@ -49031,7 +49314,7 @@ fn build_bitget_usdt_futures_close_live_adapter(
 #[allow(clippy::too_many_arguments)]
 fn fetch_binance_private_account_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     scope: &str,
     market: BinancePrivateAccountMarket,
     venue_id: &str,
@@ -49053,24 +49336,24 @@ fn fetch_binance_private_account_snapshot(
         BINANCE_GUARDED_LIVE_ACCOUNT_REF,
         params,
     )?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = BinancePrivateAccountAdapter::new(
         VenueId::new(venue_id)?,
         AccountId::new(BINANCE_GUARDED_LIVE_ACCOUNT_REF)?,
         market,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let raw_ref = format!("binance-private-account:{scope}:{endpoint}");
     let batch = match market {
         BinancePrivateAccountMarket::Spot => {
-            adapter.ingest_spot_account_json(&raw_json, raw_ref, *ingested_at)?
+            adapter.ingest_spot_account_json(&raw_json, raw_ref, snapshot_ingested_at)?
         }
         BinancePrivateAccountMarket::UsdmFutures => {
-            adapter.ingest_usdm_account_json(&raw_json, raw_ref, *ingested_at)?
+            adapter.ingest_usdm_account_json(&raw_json, raw_ref, snapshot_ingested_at)?
         }
-        BinancePrivateAccountMarket::PortfolioMargin => {
-            adapter.ingest_portfolio_margin_account_json(&raw_json, raw_ref, *ingested_at)?
-        }
+        BinancePrivateAccountMarket::PortfolioMargin => adapter
+            .ingest_portfolio_margin_account_json(&raw_json, raw_ref, snapshot_ingested_at)?,
     };
     let balances = adapter.balances(
         &BalanceQuery::new(VenueId::new(venue_id)?)
@@ -49131,7 +49414,7 @@ fn fetch_binance_spot_private_account_snapshot(
 #[cfg(feature = "live-exec")]
 fn fetch_bybit_unified_private_account_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     scope: &str,
 ) -> RuntimeResult<BinancePrivateAccountSnapshot> {
     let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
@@ -49151,15 +49434,17 @@ fn fetch_bybit_unified_private_account_snapshot(
     )?;
     let endpoint = "/v5/account/wallet-balance";
     let raw_json = fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, endpoint, &signed)?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = BybitPrivateAccountAdapter::new(
         VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?,
         AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?,
         BybitPrivateAccountMarket::UnifiedAccount,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let raw_ref = format!("bybit-private-account:{scope}:{endpoint}");
-    let batch = adapter.ingest_unified_wallet_balance_json(&raw_json, raw_ref, *ingested_at)?;
+    let batch =
+        adapter.ingest_unified_wallet_balance_json(&raw_json, raw_ref, snapshot_ingested_at)?;
     let balances = adapter.balances(
         &BalanceQuery::new(VenueId::new(BYBIT_BASIS_SPOT_VENUE_ID)?)
             .for_account(AccountId::new(BYBIT_GUARDED_LIVE_ACCOUNT_REF)?)
@@ -49174,7 +49459,7 @@ fn fetch_bybit_unified_private_account_snapshot(
 #[cfg(feature = "live-exec")]
 fn fetch_okx_private_account_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     scope: &str,
 ) -> RuntimeResult<BinancePrivateAccountSnapshot> {
     let signer = OkxRealSigningProviderFromEnv::from_default_env()?;
@@ -49193,15 +49478,16 @@ fn fetch_okx_private_account_snapshot(
         signing_policy,
     )?;
     let raw_json = fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = OkxPrivateAccountAdapter::new(
         VenueId::new(OKX_BASIS_SPOT_VENUE_ID)?,
         AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?,
         OkxPrivateAccountMarket::TradingAccount,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let raw_ref = format!("okx-private-account:{scope}:{endpoint}");
-    let batch = adapter.ingest_account_balance_json(&raw_json, raw_ref, *ingested_at)?;
+    let batch = adapter.ingest_account_balance_json(&raw_json, raw_ref, snapshot_ingested_at)?;
     let balances = adapter.balances(
         &BalanceQuery::new(VenueId::new(OKX_BASIS_SPOT_VENUE_ID)?)
             .for_account(AccountId::new(OKX_GUARDED_LIVE_ACCOUNT_REF)?)
@@ -49216,7 +49502,7 @@ fn fetch_okx_private_account_snapshot(
 #[cfg(feature = "live-exec")]
 fn fetch_bitget_private_account_snapshot(
     signing_policy: &SigningPolicy,
-    ingested_at: &UtcTimestamp,
+    _ingested_at: &UtcTimestamp,
     scope: &str,
     market: BitgetPrivateAccountMarket,
     venue_id: &str,
@@ -49237,20 +49523,21 @@ fn fetch_bitget_private_account_snapshot(
         signing_policy,
     )?;
     let raw_json = fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)?;
+    let snapshot_ingested_at = current_utc_timestamp()?;
     let mut adapter = BitgetPrivateAccountAdapter::new(
         VenueId::new(venue_id)?,
         AccountId::new(BITGET_GUARDED_LIVE_ACCOUNT_REF)?,
         market,
-        *ingested_at,
+        snapshot_ingested_at,
         MARKET_DATA_MAX_AGE_MS,
     )?;
     let raw_ref = format!("bitget-private-account:{scope}:{endpoint}");
     let batch = match market {
         BitgetPrivateAccountMarket::SpotAccount => {
-            adapter.ingest_spot_assets_json(&raw_json, raw_ref, *ingested_at)?
+            adapter.ingest_spot_assets_json(&raw_json, raw_ref, snapshot_ingested_at)?
         }
         BitgetPrivateAccountMarket::UsdtFuturesAccount => {
-            adapter.ingest_usdt_futures_accounts_json(&raw_json, raw_ref, *ingested_at)?
+            adapter.ingest_usdt_futures_accounts_json(&raw_json, raw_ref, snapshot_ingested_at)?
         }
     };
     let balances = adapter.balances(
@@ -67681,6 +67968,113 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_unknown_recovery_aligns_bitget_residual_long_from_private_snapshot() {
+        let mut row = funding_arb_test_row("0.00010000", "-0.00273000");
+        row.pair_id = "bybit:bitget:INXUSDT:INXUSDT".to_owned();
+        row.symbol = "INXUSDT".to_owned();
+        row.venue_a_family = "bybit".to_owned();
+        row.venue_b_family = "bitget".to_owned();
+        row.venue_b_bid = "0.009573".to_owned();
+        row.venue_b_ask = "0.009582".to_owned();
+        row.long_venue_family = Some("bybit".to_owned());
+        row.short_venue_family = Some("bitget".to_owned());
+
+        let mut state = FundingArbPositionState {
+            pair_id: row.pair_id.clone(),
+            symbol: row.symbol.clone(),
+            plan_hash: None,
+            notional_usd: "100.00".to_owned(),
+            entry_net_funding_bps: Some(-7),
+            target_funding_time_ms: Some(1779782400000),
+            target_gross_funding_spread_bps: Some(0),
+            target_expected_gross_funding_usd: Some("0".to_owned()),
+            target_expected_net_funding_usd: Some("-0.15".to_owned()),
+            opened_at: "2026-05-26T06:54:32Z".to_owned(),
+            private_order_events_dir: None,
+            leg_a: FundingArbPositionLegState {
+                role: "funding_perp_long".to_owned(),
+                venue_family: "bybit".to_owned(),
+                venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BYBIT:INXUSDT:LINEAR-PERP".to_owned(),
+                side: OrderSide::Buy,
+                quantity: "0".to_owned(),
+                entry_limit_price: "0.009565".to_owned(),
+            },
+            leg_b: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "bitget".to_owned(),
+                venue_id: BITGET_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:bitget-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BITGET:INXUSDT:USDT-FUTURES".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "0".to_owned(),
+                entry_limit_price: "0.009569".to_owned(),
+            },
+        };
+        let snapshot = FundingPrivatePositionSnapshot {
+            status: "complete".to_owned(),
+            updated_at: Some("2026-05-26T06:55:36Z".to_owned()),
+            positions: vec![
+                FundingPrivatePositionEntry {
+                    venue_family: "bybit".to_owned(),
+                    symbol: "INXUSDT".to_owned(),
+                    account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                    quantity: "0".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Short),
+                    mark_price: Some("0.009582".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: Some("0".to_owned()),
+                    adl_state: None,
+                },
+                FundingPrivatePositionEntry {
+                    venue_family: "bitget".to_owned(),
+                    symbol: "INXUSDT".to_owned(),
+                    account_id: "acct:bitget-funding-arb-readonly".to_owned(),
+                    quantity: "581".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Long),
+                    mark_price: Some("0.009573".to_owned()),
+                    liquidation_price: Some("-0.166494457621".to_owned()),
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+            ],
+        };
+
+        let changed = funding_arb_align_unknown_recovery_state_to_private_positions(
+            &mut state, &row, &snapshot,
+        )
+        .expect("align unknown recovery state");
+
+        assert!(changed);
+        assert_eq!(state.leg_b.role, "funding_perp_long");
+        assert_eq!(state.leg_b.side, OrderSide::Buy);
+        assert_eq!(state.leg_b.quantity, "581");
+        let leg_b =
+            funding_arb_exit_leg_snapshot(&row, &state.leg_b, &snapshot, 100).expect("exit leg");
+        assert!(leg_b.close_required);
+        assert_eq!(
+            leg_b.signed_quantity,
+            MonitorDecimal::parse("test", "581").unwrap()
+        );
+        assert_eq!(leg_b.close_quantity.to_string(), "581");
+
+        let planned = funding_arb_exit_close_planned_order(
+            &leg_b,
+            "1779778537",
+            FundingArbBinancePositionMode::OneWay,
+            FundingArbBybitPositionMode::OneWay,
+            FundingArbOkxPositionMode::Net,
+            FundingArbBitgetPositionMode::Hedge,
+            FundingArbAsterPositionMode::OneWay,
+        )
+        .expect("planned Bitget residual close");
+        assert_eq!(planned.request.side, OrderSide::Buy);
+        assert_eq!(planned.request.position_side, Some(PerpPositionSide::Long));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_unknown_recovery_exit_bypasses_settlement_wait() {
         let mut reason_codes = Vec::new();
         let mut blocking_reasons = Vec::new();
@@ -67940,6 +68334,7 @@ mod tests {
                     symbol: "DRAMUSDT".to_owned(),
                     account_id: "acct:bybit-funding-arb-readonly".to_owned(),
                     quantity: "1".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Short),
                     mark_price: Some("100".to_owned()),
                     liquidation_price: Some("101".to_owned()),
                     adl_rank_indicator: Some("5".to_owned()),
@@ -67950,6 +68345,7 @@ mod tests {
                     symbol: "DRAMUSDT".to_owned(),
                     account_id: "acct:aster-funding-arb-readonly".to_owned(),
                     quantity: "0.999".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Long),
                     mark_price: Some("100".to_owned()),
                     liquidation_price: Some("50".to_owned()),
                     adl_rank_indicator: None,
@@ -68044,6 +68440,7 @@ mod tests {
                     symbol: "DRAMUSDT".to_owned(),
                     account_id: "acct:bybit-funding-arb-readonly".to_owned(),
                     quantity: "1".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Short),
                     mark_price: Some("100".to_owned()),
                     liquidation_price: Some("300".to_owned()),
                     adl_rank_indicator: Some("5".to_owned()),
@@ -68054,6 +68451,7 @@ mod tests {
                     symbol: "DRAMUSDT".to_owned(),
                     account_id: "acct:aster-funding-arb-readonly".to_owned(),
                     quantity: "1".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Long),
                     mark_price: Some("100".to_owned()),
                     liquidation_price: Some("0".to_owned()),
                     adl_rank_indicator: None,
@@ -70286,6 +70684,10 @@ mod tests {
         let okx_rate_limit = RuntimeError::LiveMarketData {
             message: "OKX returned code=50011, msg=Rate limit reached. Please refer to API documentation and throttle requests accordingly.".to_owned(),
         };
+        let private_timestamp_skew = RuntimeError::Module {
+            module: "arb-venue-data",
+            message: "venue data query field `freshness.ingested_at` is invalid: ingested timestamp must be greater than or equal to observed timestamp".to_owned(),
+        };
         let private_http = RuntimeError::LiveMarketData {
             message: "curl failed before a reliable Bitget private HTTP response was available"
                 .to_owned(),
@@ -70298,6 +70700,9 @@ mod tests {
         assert!(resident_entry_cycle_error_can_retry(&public_rest));
         assert!(resident_entry_cycle_error_can_retry(&invalid_top_of_book));
         assert!(resident_entry_cycle_error_can_retry(&okx_rate_limit));
+        assert!(resident_entry_cycle_error_can_retry(
+            &private_timestamp_skew
+        ));
         assert!(!resident_entry_cycle_error_can_retry(&private_http));
         assert!(!resident_entry_cycle_error_can_retry(&unsafe_config));
         assert_eq!(
@@ -70307,6 +70712,10 @@ mod tests {
         assert_eq!(
             resident_retryable_error_class(&public_rest),
             "public_rest_unavailable"
+        );
+        assert_eq!(
+            resident_retryable_error_class(&private_timestamp_skew),
+            "private_snapshot_timestamp_skew"
         );
         assert_eq!(
             resident_retryable_error_class(&private_http),
