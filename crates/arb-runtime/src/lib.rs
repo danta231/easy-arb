@@ -20301,36 +20301,47 @@ fn append_opportunity_recorder_resident_health_events(
     options: &OpportunityRecorderOptions,
     sampler: &mut OpportunityRecorderHealthSampler,
 ) -> RuntimeResult<()> {
-    append_opportunity_recorder_resident_tail_health(
-        options,
-        sampler,
-        SPOT_PERP_BASIS_OBSERVER_STRATEGY,
-        "spot-perp-basis:multi-venue",
-        &options
-            .basis_resident_out_dir
-            .join("multi_venue_resident_live_events.jsonl"),
-    )?;
-    for venue in ["binance", "bybit", "okx", "bitget"] {
+    if options
+        .strategies
+        .contains(SPOT_PERP_BASIS_OBSERVER_STRATEGY)
+    {
         append_opportunity_recorder_resident_tail_health(
             options,
             sampler,
             SPOT_PERP_BASIS_OBSERVER_STRATEGY,
-            &format!("spot-perp-basis:{venue}"),
+            "spot-perp-basis:multi-venue",
             &options
                 .basis_resident_out_dir
-                .join(venue)
-                .join("resident_live_events.jsonl"),
+                .join("multi_venue_resident_live_events.jsonl"),
+        )?;
+        for venue in ["binance", "bybit", "okx", "bitget"] {
+            append_opportunity_recorder_resident_tail_health(
+                options,
+                sampler,
+                SPOT_PERP_BASIS_OBSERVER_STRATEGY,
+                &format!("spot-perp-basis:{venue}"),
+                &options
+                    .basis_resident_out_dir
+                    .join(venue)
+                    .join("resident_live_events.jsonl"),
+            )?;
+        }
+    }
+    if options
+        .strategies
+        .contains(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY)
+    {
+        append_opportunity_recorder_resident_tail_health(
+            options,
+            sampler,
+            CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
+            "cross-exchange-funding-arb",
+            &options
+                .funding_arb_resident_out_dir
+                .join("funding_arb_resident_live_events.jsonl"),
         )?;
     }
-    append_opportunity_recorder_resident_tail_health(
-        options,
-        sampler,
-        CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
-        "cross-exchange-funding-arb",
-        &options
-            .funding_arb_resident_out_dir
-            .join("funding_arb_resident_live_events.jsonl"),
-    )
+    Ok(())
 }
 
 #[cfg(feature = "live-exec")]
@@ -53165,6 +53176,68 @@ mod tests {
         assert!(!tail.contains(&"x".repeat(128)));
         assert!(tail.contains("\"event_type\":\"resident_started\""));
         assert!(tail.contains("\"event_type\":\"cycle_error\""));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_resident_health_skips_disabled_strategy_logs() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        let opportunity_dir = root.path().join("opportunities");
+        let basis_dir = root.path().join("resident-live/spot-perp-basis");
+        let funding_arb_dir = root.path().join("resident-live/cross-exchange-funding-arb");
+        ensure_dir(&logs_dir).expect("logs dir");
+        ensure_dir(&opportunity_dir).expect("opportunity dir");
+        ensure_dir(&basis_dir.join("bitget")).expect("basis dir");
+        ensure_dir(&funding_arb_dir).expect("funding arb dir");
+        write_utf8(
+            basis_dir.join("bitget").join("resident_live_events.jsonl"),
+            r#"{"event_type":"resident_started"}
+{"event_type":"cycle_error"}"#,
+        )
+        .expect("write disabled strategy event log");
+        write_utf8(
+            funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
+            r#"{"event_type":"resident_started"}
+{"event_type":"candidate_cycle","dispatch_attempted":false}"#,
+        )
+        .expect("write enabled strategy event log");
+
+        let mut strategies = BTreeSet::new();
+        strategies.insert(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY.to_owned());
+        let health_events_jsonl = logs_dir.join("health-events.jsonl");
+        let options = OpportunityRecorderOptions {
+            root: root.path().to_path_buf(),
+            opportunity_dir,
+            logs_dir: logs_dir.clone(),
+            feedback_log: logs_dir.join("realtime-feedback.log"),
+            health_events_jsonl: health_events_jsonl.clone(),
+            basis_resident_out_dir: basis_dir,
+            funding_arb_resident_out_dir: funding_arb_dir,
+            spot_sources: Vec::new(),
+            funding_arb_url: None,
+            strategies,
+            execution_mode: "live".to_owned(),
+            spot_perp_basis_mode: "resident".to_owned(),
+            funding_arb_mode: "resident".to_owned(),
+            interval_secs: 5,
+            timeout_secs: 1,
+            retries: 1,
+            retry_sleep_ms: 0,
+            blocking_path_limit: 12,
+            health_sample_secs: 0,
+            resident_health_tail_lines: 200,
+            once: true,
+        };
+        let mut sampler = OpportunityRecorderHealthSampler::new(0);
+
+        append_opportunity_recorder_resident_health_events(&options, &mut sampler)
+            .expect("append health events");
+
+        let health_events = read_utf8(&health_events_jsonl).expect("health events");
+        assert!(health_events.contains("\"source\":\"cross-exchange-funding-arb\""));
+        assert!(!health_events.contains("spot-perp-basis"));
+        assert!(!health_events.contains("\"cycle_error_count\":1"));
     }
 
     #[test]
