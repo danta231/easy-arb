@@ -24,12 +24,12 @@
 | --- | --- | --- |
 | Easy Tool runtime（运行时接口） | `0.0.0.0:8787` | 仅 Nginx 代理，不开放安全组端口 |
 | Easy Tool Web | `80/443` | 开放 |
-| easy-arb portfolio dashboard（组合看板） | `127.0.0.1:8805` | 可选 Nginx + Basic Auth，默认建议 SSH tunnel |
-| easy-arb WSS/basis/funding 内部看板 | `127.0.0.1:8786-8830+` | 不开放公网 |
+| easy-arb portfolio JSON API（组合状态接口） | `127.0.0.1:8805` | 默认不公开，建议由 Easy Tool 代理读取 |
+| easy-arb WSS/basis/funding 内部 JSON API | `127.0.0.1:8786-8830+` | 不开放公网 |
 | PostgreSQL（关系型数据库） | `127.0.0.1:5432` | 不开放公网 |
 | SSH（远程登录） | `22` 或自定义端口 | 只允许你的固定 IP |
 
-云安全组和本机防火墙只开放 `22`、`80`、`443`。不要开放 `8786-8830+`、`18787`、`5432`。
+云安全组和本机防火墙只开放 `22`、`80`、`443`。不要开放 `8786-8830+`、`8787`、`5432`。
 
 ## 目录与用户
 
@@ -108,11 +108,11 @@ curl -fsS http://127.0.0.1:8786/api/binance-wss-book-ticker/status | jq '{status
 
 ## Easy Tool 部署
 
-`Easy Tool` 已有 `deploy/systemd` 和 `deploy/nginx` 模板。同机运行时必须修改生产环境端口：
+`Easy Tool` 已有 `deploy/systemd` 和 `deploy/nginx` 模板。同机运行时可以保留默认运行时端口：
 
 ```bash
-RUNTIME_SERVER_PORT=18787
-EASY_TOOL_HEALTH_BASE_URL=http://127.0.0.1:18787
+RUNTIME_SERVER_PORT=8787
+EASY_TOOL_HEALTH_BASE_URL=http://127.0.0.1:8787
 RUNTIME_ALLOWED_ORIGIN=https://easy-tool.example.com
 HISTORY_DATABASE_URL=postgres://easy_tool:<password>@127.0.0.1:5432/easy_tool
 HISTORY_PG_POOL_MAX=4
@@ -131,7 +131,7 @@ sudo systemctl enable --now easy-tool-runtime
 sudo systemctl enable --now easy-tool-healthcheck.timer easy-tool-db-backup.timer
 ```
 
-`Easy Tool` 的 `server/runtime-server.mjs` 绑定 `0.0.0.0`，所以必须靠云安全组和防火墙阻断 `18787` 公网访问，只允许 Nginx 在本机代理。
+`Easy Tool` 的 `server/runtime-server.mjs` 绑定 `0.0.0.0`，所以必须靠云安全组和防火墙阻断 `8787` 公网访问，只允许 Nginx 在本机代理。
 
 ## Nginx 与 TLS
 
@@ -147,7 +147,7 @@ sudo systemctl reload nginx
 上线前替换：
 
 - `easy-tool.example.com` 为 Easy Tool 域名。
-- `easy-arb.example.com` 为 easy-arb 看板域名，或删除该 server block（服务块）并只用 SSH tunnel。
+- `easy-arb.example.com` 为 easy-arb 只读 JSON API 域名；默认建议删除该 server block（服务块），让 Easy Tool 在本机代理读取。
 - `/etc/nginx/.htpasswd-easy-tool` 和 `/etc/nginx/.htpasswd-easy-arb` 为 Basic Auth（基础认证）密码文件。
 
 配置 HTTPS：
@@ -156,13 +156,13 @@ sudo systemctl reload nginx
 sudo certbot --nginx -d easy-tool.example.com -d easy-arb.example.com
 ```
 
-如果不公开 easy-arb dashboard，使用 SSH tunnel：
+如果需要临时直连 easy-arb JSON API，使用 SSH tunnel：
 
 ```bash
 ssh -L 8805:127.0.0.1:8805 -L 8804:127.0.0.1:8804 user@server
 ```
 
-然后本地打开 `http://127.0.0.1:8805/nav`。
+然后本地访问 `http://127.0.0.1:8805/api/navigation/pages`。
 
 ## 资源与备份
 
@@ -180,7 +180,7 @@ ssh -L 8805:127.0.0.1:8805 -L 8804:127.0.0.1:8804 user@server
 2. 配好安全组，只开放 SSH、HTTP、HTTPS。
 3. 创建 `easyarb`、`easytool` 用户和目录。
 4. 部署 PostgreSQL，创建 `easy_tool` 数据库和最小权限用户。
-5. 部署 Easy Tool，确认 `18787` 本机健康检查通过。
+5. 部署 Easy Tool，确认 `8787` 本机健康检查通过。
 6. 部署 easy-arb，先使用 `target` 行情范围，确认 `8805` 和 WSS 状态。
 7. 安装 Nginx、TLS 和 Basic Auth，确认公网只看到预期域名。
 8. 开启 systemd（Linux 服务管理器）服务、timer（定时器）、云快照和日志监控。

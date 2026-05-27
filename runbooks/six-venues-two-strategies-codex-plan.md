@@ -374,7 +374,7 @@ cargo test -p arb-runtime aster_funding_arb
 - `crates/arb-venue-data/src/lib.rs`
 - `crates/arb-runtime/src/lib.rs`
 - `crates/arb-venue-exec/src/lib.rs`
-- monitor dashboard 和 opportunities API
+- monitor status API（监控状态接口）和 opportunities API（机会接口）
 
 ### Hyperliquid 验收测试
 

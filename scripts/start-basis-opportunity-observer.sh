@@ -3158,7 +3158,7 @@ start_monitor() {
   append_basis_monitor_wss_args "${venue}"
 
   reclaim_stale_monitor_port "${venue}-basis-monitor" "${bind_addr}"
-  echo "starting ${venue} monitor: http://${bind_addr}/dashboard"
+  echo "starting ${venue} monitor: $(status_url "${venue}")"
   nohup "${MONITOR_ARGS[@]}" >> "${log_file}" 2>&1 &
   pid="$!"
   printf '%s\t%s\t%s\n' "${pid}" "${venue}-basis-monitor" "${log_file}" >> "${PID_FILE}"
@@ -3180,7 +3180,7 @@ start_funding_arb_monitor() {
   done
 
   reclaim_stale_monitor_port "funding-arb-monitor" "${FUNDING_ARB_BIND}"
-  echo "starting funding arb monitor: http://${FUNDING_ARB_BIND}/dashboard"
+  echo "starting funding arb monitor: http://${FUNDING_ARB_BIND}/api/funding-arb/status"
   nohup "${RUNTIME_BIN}" funding-arb-monitor \
     --bind "${FUNDING_ARB_BIND}" \
     --interval-secs "${INTERVAL_SECS}" \
@@ -3443,14 +3443,14 @@ spot-perp-basis mode: ${SPOT_PERP_BASIS_MODE}
 cross-exchange-funding-arb mode: ${FUNDING_ARB_MODE}
 pid file: ${PID_FILE}
 
-dashboards:
-  Binance: http://${BINANCE_BIND}/dashboard
-  Bybit:   http://${BYBIT_BIND}/dashboard
-  OKX:     http://${OKX_BIND}/dashboard
-  Bitget:  http://${BITGET_BIND}/dashboard
-  Aster:   http://${ASTER_BIND}/dashboard
-  Hyperliquid: http://${HYPERLIQUID_BIND}/dashboard
-  Funding arb: http://${FUNDING_ARB_BIND}/dashboard
+JSON APIs:
+  Binance: $(status_url binance)
+  Bybit:   $(status_url bybit)
+  OKX:     $(status_url okx)
+  Bitget:  $(status_url bitget)
+  Aster:   $(status_url aster)
+  Hyperliquid: $(status_url hyperliquid)
+  Funding arb: http://${FUNDING_ARB_BIND}/api/funding-arb/status
 
 real-time feedback:
   tail -f ${LOG_DIR}/realtime-feedback.log

@@ -40534,8 +40534,16 @@ fn write_http_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::
     write_http_response(stream, status, "application/json; charset=utf-8", body)
 }
 
-fn write_http_html(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    write_http_response(stream, status, "text/html; charset=utf-8", body)
+fn static_dashboard_gone_json(page: &str) -> String {
+    format!(
+        concat!(
+            "{{\"error\":\"dashboard_migrated\",",
+            "\"status\":\"gone\",",
+            "\"page\":{},",
+            "\"message\":\"HTML dashboard 已迁移到 Easy Tool；easy-arb 仅保留只读 JSON API。\"}}"
+        ),
+        json_string(page),
+    )
 }
 
 fn write_http_response(
@@ -40546,6 +40554,7 @@ fn write_http_response(
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        410 => "Gone",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
@@ -41342,7 +41351,7 @@ mod tests {
         assert!(help.contains("portfolio-dashboard"));
         assert!(help.contains("正式实盘"));
         assert!(help.contains("测试盘"));
-        assert!(help.contains("只读组合余额与仓位看板"));
+        assert!(help.contains("只读组合余额、仓位、导航和错误日志 JSON API"));
         assert!(!help.contains("binance-basis-live-stack"));
         assert!(!help.contains("replay [fixture_root]"));
     }
@@ -41385,16 +41394,6 @@ mod tests {
             .expect_err("live must require acknowledgement");
 
         assert!(error.to_string().contains("--i-understand-live-orders"));
-    }
-
-    #[test]
-    fn basis_dashboard_html_requests_realtime_api_paths() {
-        let html = basis_dashboard_html();
-
-        assert!(html.contains("/api/basis/status"));
-        assert!(html.contains("/api/basis/opportunities"));
-        assert!(html.contains("id=\"basis-rows\""));
-        assert!(html.contains("fetch(url"));
     }
 
     #[test]
@@ -42572,47 +42571,6 @@ mod tests {
     }
 
     #[test]
-    fn binance_wss_book_ticker_dashboard_requests_realtime_api_paths() {
-        let html = binance_wss_book_ticker_dashboard_html();
-
-        assert!(html.contains("Binance public WSS"));
-        assert!(html.contains("/health"));
-        assert!(html.contains("/api/binance-wss-book-ticker/quote"));
-        assert!(html.contains("/api/binance-wss-book-ticker/status"));
-        assert!(html.contains("/api/binance-wss-book-ticker/quotes"));
-        assert!(html.contains("id=\"metric-rebuilds\""));
-        assert!(html.contains("id=\"quote-bid\""));
-        assert!(html.contains("id=\"quote-rows\""));
-    }
-
-    #[test]
-    fn bybit_wss_book_ticker_dashboard_requests_bybit_realtime_api_paths() {
-        let html = bybit_wss_book_ticker_dashboard_html();
-
-        assert!(html.contains("Bybit public WSS"));
-        assert!(html.contains("orderbook.1 实时行情"));
-        assert!(html.contains("/api/bybit-wss-book-ticker/quote"));
-        assert!(html.contains("/api/bybit-wss-book-ticker/status"));
-        assert!(html.contains("/api/bybit-wss-book-ticker/quotes"));
-        assert!(!html.contains("{{API_PREFIX}}"));
-    }
-
-    #[test]
-    fn public_wss_book_ticker_dashboard_requests_generic_api_paths() {
-        let okx = public_wss_book_ticker_dashboard_html_for_api("okx-wss-book-ticker");
-        let bitget = public_wss_book_ticker_dashboard_html_for_api("bitget-wss-book-ticker");
-
-        assert!(okx.contains("OKX public WSS"));
-        assert!(okx.contains("/api/okx-wss-book-ticker/status"));
-        assert!(okx.contains("/api/okx-wss-book-ticker/quote"));
-        assert!(okx.contains("/api/okx-wss-book-ticker/quotes"));
-        assert!(bitget.contains("Bitget public WSS"));
-        assert!(bitget.contains("/api/bitget-wss-book-ticker/status"));
-        assert!(bitget.contains("/api/bitget-wss-book-ticker/quote"));
-        assert!(bitget.contains("/api/bitget-wss-book-ticker/quotes"));
-    }
-
-    #[test]
     fn binance_wss_probe_instrument_maps_usdt_symbol_without_private_surface() {
         let instrument = binance_public_wss_instrument("ETHUSDT", BinancePublicMarket::Spot)
             .expect("instrument");
@@ -42656,80 +42614,6 @@ mod tests {
             .as_str()
             .starts_with("inst:BINANCE:sym"));
         assert!(instrument.base_asset_id.as_str().starts_with("asset:sym"));
-    }
-
-    #[test]
-    fn bybit_basis_dashboard_html_requests_bybit_realtime_api_paths() {
-        let html = bybit_basis_dashboard_html();
-
-        assert!(html.contains("Bybit public basis"));
-        assert!(html.contains("/api/bybit-basis/status"));
-        assert!(html.contains("/api/bybit-basis/opportunities"));
-        assert!(html.contains("id=\"basis-rows\""));
-    }
-
-    #[test]
-    fn okx_basis_dashboard_html_requests_okx_realtime_api_paths() {
-        let html = okx_basis_dashboard_html();
-
-        assert!(html.contains("OKX public basis"));
-        assert!(html.contains("/api/okx-basis/status"));
-        assert!(html.contains("/api/okx-basis/opportunities"));
-        assert!(html.contains("id=\"basis-rows\""));
-    }
-
-    #[test]
-    fn bitget_basis_dashboard_html_requests_bitget_realtime_api_paths() {
-        let html = bitget_basis_dashboard_html();
-
-        assert!(html.contains("Bitget public basis"));
-        assert!(html.contains("/api/bitget-basis/status"));
-        assert!(html.contains("/api/bitget-basis/opportunities"));
-        assert!(html.contains("id=\"basis-rows\""));
-    }
-
-    #[test]
-    fn hyperliquid_basis_dashboard_html_requests_hyperliquid_realtime_api_paths() {
-        let html = hyperliquid_basis_dashboard_html();
-
-        assert!(html.contains("Hyperliquid public basis"));
-        assert!(html.contains("/api/hyperliquid-basis/status"));
-        assert!(html.contains("/api/hyperliquid-basis/opportunities"));
-        assert!(html.contains("Spot Mid"));
-        assert!(html.contains("id=\"basis-rows\""));
-    }
-
-    #[test]
-    fn aster_basis_dashboard_html_requests_aster_realtime_api_paths() {
-        let html = aster_basis_dashboard_html();
-
-        assert!(html.contains("Aster public basis"));
-        assert!(html.contains("/api/aster-basis/status"));
-        assert!(html.contains("/api/aster-basis/opportunities"));
-        assert!(html.contains("id=\"basis-rows\""));
-    }
-
-    #[test]
-    fn funding_arb_dashboard_html_requests_realtime_api_paths() {
-        let html = funding_arb_dashboard_html();
-
-        assert!(html.contains("跨所资金费率套利观察器"));
-        assert!(html.contains("/api/funding-arb/status"));
-        assert!(html.contains("/api/funding-arb/opportunities"));
-        assert!(html.contains("/api/funding-arb/execution-status"));
-        assert!(html.contains("/api/funding-arb/history"));
-        assert!(html.contains("id=\"funding-rows\""));
-        assert!(html.contains("id=\"funding-history-rows\""));
-        assert!(html.contains("id=\"metric-gate-blocked\""));
-        assert!(html.contains("下单门禁"));
-        assert!(html.contains("历史记录"));
-        assert!(html.contains("validFundingTimeMs"));
-        assert!(html.contains("formatFundingReason"));
-        assert!(html.contains("私有余额不可用"));
-        assert!(html.contains("策略未产出资金费率套利候选"));
-        assert!(html.contains("私有账户可用余额和保证金缓冲不足"));
-        assert!(html.contains("最近门禁报告早于当前机会快照"));
-        assert!(html.contains("请求时间戳比服务器时间快 1000ms"));
     }
 
     #[test]
@@ -42844,42 +42728,6 @@ mod tests {
         assert!(json.contains("\"pair_id\":\"aster:hyperliquid:CHIPUSDT:CHIP\""));
         assert!(json.contains("\"venue_b_next_funding_time_ms\":\"\""));
         assert!(!json.contains("spot-perp-basis"));
-    }
-
-    #[test]
-    fn portfolio_dashboard_html_requests_realtime_api_paths() {
-        let html = portfolio_dashboard_html();
-
-        assert!(html.contains("组合余额与仓位看板"));
-        assert!(html.contains("/api/portfolio/status"));
-        assert!(html.contains("/api/portfolio/balances"));
-        assert!(html.contains("/api/portfolio/positions"));
-        assert!(html.contains("id=\"portfolio-balance-rows\""));
-        assert!(html.contains("id=\"portfolio-position-groups\""));
-        assert!(html.contains("position-lines"));
-        assert!(html.contains("formatFundingRate"));
-        assert!(html.contains("开仓方向"));
-        assert!(html.contains("fee_rate_bps"));
-        assert!(html.contains("position_group_id"));
-        assert!(html.contains("结算时间"));
-        assert!(html.contains("REFRESH_INTERVAL_MS = 15000"));
-        assert!(html.contains("if (!response.ok)"));
-        assert!(html.contains("payloadSignature"));
-        assert!(!html.contains("setInterval(render, 1000)"));
-        assert!(!html.contains("setInterval(() => refresh(), 3000)"));
-    }
-
-    #[test]
-    fn error_logs_dashboard_html_requests_error_api_path() {
-        let html = error_logs_dashboard_html();
-
-        assert!(html.contains("错误日志"));
-        assert!(html.contains("/api/errors/logs"));
-        assert!(html.contains("id=\"rows\""));
-        assert!(html.contains("<th class=\"pair\">交易对</th>"));
-        assert!(!html.contains("<th class=\"category\">类别</th>"));
-        assert!(!html.contains("<th class=\"source\">来源</th>"));
-        assert!(!html.contains("<th class=\"line\">行号</th>"));
     }
 
     #[test]
@@ -43197,20 +43045,17 @@ mod tests {
 
     #[test]
     fn navigation_dashboard_registers_system_pages() {
-        let html = navigation_dashboard_html();
         let json = system_navigation_pages_json();
 
-        assert!(html.contains("/api/navigation/pages"));
         assert!(json.contains("系统导航"));
         assert!(json.contains("组合余额与仓位"));
         assert!(json.contains("错误日志"));
         assert!(json.contains("Binance basis"));
         assert!(json.contains("Funding arb"));
         assert!(json.contains("Bitget futures WSS"));
-        assert!(json.contains("http://127.0.0.1:8805/nav"));
+        assert!(json.contains("http://127.0.0.1:8805/api/navigation/pages"));
+        assert!(json.contains("http://127.0.0.1:8804/api/funding-arb/status"));
         assert_eq!(system_navigation_entries().len(), 18);
-        assert!(html.contains("Promise.all"));
-        assert!(html.contains("new Set"));
     }
 
     #[test]

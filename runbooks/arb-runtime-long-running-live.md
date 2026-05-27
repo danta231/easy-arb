@@ -20,7 +20,7 @@ target/arb-runtime/live
 target/arb-runtime/live-prereq
 ```
 
-外层启动脚本会把 `ARB_RUNTIME_LIVE_ROOT` 显式传给 `arb-runtime live --out`，portfolio dashboard 的 `--resident-root` 和停止脚本也读取同一目录。自定义 `ARB_RUNTIME_LIVE_ROOT` 或 `ARB_RUNTIME_LIVE_PREREQ_ROOT` 后，仍建议先做一次短周期前台验证，确认 live artifacts、dashboard 和停止脚本读取的是同一组目录。
+外层启动脚本会把 `ARB_RUNTIME_LIVE_ROOT` 显式传给 `arb-runtime live --out`，portfolio JSON API 的 `--resident-root` 和停止脚本也读取同一目录。自定义 `ARB_RUNTIME_LIVE_ROOT` 或 `ARB_RUNTIME_LIVE_PREREQ_ROOT` 后，仍建议先做一次短周期前台验证，确认 live artifacts、只读 API 和停止脚本读取的是同一组目录。
 
 ## 启动前检查
 
@@ -91,8 +91,8 @@ BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最
 BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=target/arb-runtime/live/private-readonly/funding_settlement_raw_snapshot.json # 资金费率结算原始只读快照输出路径，当前推荐启用。
 BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；接 raw snapshot 时必须留空，不能同时启用。
 
-ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT= # portfolio dashboard 可选账户快照覆盖输入；留空时从 resident root 自动发现私有只读账户快照。
-ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT= # portfolio dashboard 可选仓位快照覆盖输入；留空时从 resident root 自动汇总常驻仓位。
+ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT= # portfolio JSON API 可选账户快照覆盖输入；留空时从 resident root 自动发现私有只读账户快照。
+ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT= # portfolio JSON API 可选仓位快照覆盖输入；留空时从 resident root 自动汇总常驻仓位。
 
 ASTER_USER=<aster-user-address> # Aster 账户/user 地址，用于账户归属、查询和订单归属。
 ASTER_SIGNER=<aster-signer-address> # Aster 实际签名/API 地址，必须与 signer 私钥匹配。
@@ -146,7 +146,7 @@ target/debug/arb-runtime live --i-understand-live-orders
 
 `scripts/start-arb-runtime-live.sh` 会把 `BASIS_OBSERVER_CONFIG`、`BASIS_OBSERVER_MIN_NET_BPS`、`BASIS_OBSERVER_INTERVAL_SECS`、`BASIS_OBSERVER_AUTO_ONCE_COOLDOWN_SECS` 和 `BASIS_OBSERVER_VALIDATE_AUTO_ONCE` 映射为 `arb-runtime live` 参数；也可以用同名 `ARB_RUNTIME_LIVE_*` 变量覆盖这些入口参数。改动阈值后先跑 dry-run 或小额实盘验证，不要直接切到大额长期运行。
 
-启动前脚本会默认回收本仓库 `target/.../arb-runtime` 残留进程占用的 dashboard、WSS 和 basis/funding monitor 端口，避免旧 monitor 占用 `127.0.0.1:8804` 这类端口导致新 live 进程启动失败。如果端口被非本仓库进程占用，脚本会提前报错并要求手动处理；如需禁用自动回收，设置 `ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS=0` 或 `BASIS_OBSERVER_RECLAIM_STALE_MONITOR_PORTS=0`。
+启动前脚本会默认回收本仓库 `target/.../arb-runtime` 残留进程占用的只读 API、WSS 和 basis/funding monitor 端口，避免旧 monitor 占用 `127.0.0.1:8804` 这类端口导致新 live 进程启动失败。如果端口被非本仓库进程占用，脚本会提前报错并要求手动处理；如需禁用自动回收，设置 `ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS=0` 或 `BASIS_OBSERVER_RECLAIM_STALE_MONITOR_PORTS=0`。
 
 ## 启动后健康检查
 
@@ -195,33 +195,33 @@ curl -fsS --max-time 10 http://127.0.0.1:8799/api/hyperliquid-basis/status | jq 
 curl -fsS --max-time 10 http://127.0.0.1:8804/api/funding-arb/status | jq '{status,total_rows,candidate_count,updated_at,last_error}'
 ```
 
-看 portfolio dashboard 的聚合状态：
+看 portfolio JSON API 的聚合状态：
 
 ```bash
 curl -fsS --max-time 10 http://127.0.0.1:8805/api/portfolio/status | jq '.'
 curl -fsS --max-time 10 http://127.0.0.1:8805/api/portfolio/positions | jq '.'
 ```
 
-浏览器入口：
+只读 JSON API 入口：
 
 ```text
-http://127.0.0.1:8805/nav
-http://127.0.0.1:8805/dashboard
-http://127.0.0.1:8805/errors
-http://127.0.0.1:8804/dashboard
+http://127.0.0.1:8805/api/navigation/pages
+http://127.0.0.1:8805/api/portfolio/status
+http://127.0.0.1:8805/api/errors/logs
+http://127.0.0.1:8804/api/funding-arb/status
 ```
 
 ## 实时查看下单门禁错误
 
-优先打开错误日志页面：
+优先查看错误日志 API：
 
 ```text
-http://127.0.0.1:8805/errors
+http://127.0.0.1:8805/api/errors/logs
 ```
 
-该页面会聚合本次运行目录中的 `logs/*.log`、`logs/*.jsonl`、`live/live-reports.jsonl`、`live/validation-events.jsonl` 和 resident event JSONL，展示所有已收集到的错误、阻断、未知状态和门禁通过后下单失败事件。
+该 API 会聚合本次运行目录中的 `logs/*.log`、`logs/*.jsonl`、`live/live-reports.jsonl`、`live/validation-events.jsonl` 和 resident event JSONL，返回所有已收集到的错误、阻断、未知状态和门禁通过后下单失败事件。
 
-`funding_arb_resident_live_events.jsonl` 是 `cross-exchange-funding-arb` 常驻 runner 的门禁和下单事件流。启动后如果 dashboard 显示“待校验”“下单阻断”或签名失败，先实时跟这个文件：
+`funding_arb_resident_live_events.jsonl` 是 `cross-exchange-funding-arb` 常驻 runner 的门禁和下单事件流。启动后如果 Easy Tool 页面或只读 API 显示“待校验”“下单阻断”或签名失败，先实时跟这个文件：
 
 运行方式：先按“启动”小节启动实盘进程，然后另开一个终端，在仓库根目录完整复制下面命令。默认运行目录是 `target/arb-runtime/live`；如果启动时设置了自定义 `ARB_RUNTIME_LIVE_ROOT`，把下面的 `RUN_ROOT` 改成同一个目录。不要把 `...` 省略号当作 jq 程序执行。
 
@@ -285,7 +285,7 @@ tail -F "$RUN_ROOT/resident-live/cross-exchange-funding-arb/funding_arb_resident
 '
 ```
 
-也可以直接轮询 funding arb 的下单门禁 API，确认 dashboard 当前读到的最新 `observed_at`、交易对和阻断原因：
+也可以直接轮询 funding arb 的下单门禁 API，确认当前读到的最新 `observed_at`、交易对和阻断原因：
 
 ```bash
 cd /Users/danta/WebstormProjects/easy-arb
@@ -347,7 +347,7 @@ target/arb-runtime/live/private-readonly/funding_settlement_raw_snapshot.json
 scripts/stop-arb-runtime-live.sh
 ```
 
-停止脚本会停止 live observer、portfolio dashboard 和 WSS monitor。它停止的是自动化进程，不保证交易所真实仓位已经平掉。停止后必须检查：
+停止脚本会停止 live observer、portfolio JSON API 和 WSS monitor。它停止的是自动化进程，不保证交易所真实仓位已经平掉。停止后必须检查：
 
 ```bash
 curl -fsS --max-time 10 http://127.0.0.1:8805/api/portfolio/positions | jq '.'
@@ -355,7 +355,7 @@ tail -n 20 target/arb-runtime/live/live/live-reports.jsonl
 tail -n 20 target/arb-runtime/live/resident-live/cross-exchange-funding-arb/funding_arb_resident_positions.jsonl
 ```
 
-如果 dashboard 已停止或状态未知，直接到交易所后台或只读私有快照确认仓位。存在真实持仓时，按 reduce-only 或交易所后台手动降风险，不要假设 stop 脚本已经完成平仓。
+如果只读 API 已停止或状态未知，直接到交易所后台或只读私有快照确认仓位。存在真实持仓时，按 reduce-only 或交易所后台手动降风险，不要假设 stop 脚本已经完成平仓。
 
 ## 释放 funding-arb unknown 仓位门禁
 
@@ -382,7 +382,7 @@ scripts/release-funding-arb-unknown-position.sh \
 - WSS 或 basis/funding arb monitor 进入 fail closed、停止更新或连续报错。
 - 订单 receipt、exchange confirmation、private position snapshot 三者无法互相印证。
 - funding arb 结算状态未知，且持仓已跨过预期资金费率结算窗口。
-- portfolio dashboard 显示 source error、unknown position 或无法读取 resident root。
+- portfolio JSON API 或 Easy Tool 页面显示 source error、unknown position 或无法读取 resident root。
 - 本地时间、交易所时间、结算时间窗口明显不一致。
 
 处理顺序：

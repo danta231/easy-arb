@@ -116,9 +116,10 @@ start_monitor() {
   local name="$1"
   local command="$2"
   local bind_addr="$3"
+  local status_path="$4"
   local log_file="${LOG_DIR}/${name}.log"
 
-  echo "starting ${name}: http://${bind_addr}/dashboard"
+  echo "starting ${name}: http://${bind_addr}${status_path}"
   "${RUNTIME_BIN}" "${command}" --bind "${bind_addr}" "${COMMON_ARGS[@]}" >>"${log_file}" 2>&1 &
   local pid="$!"
   PIDS+=("${pid}")
@@ -130,22 +131,22 @@ start_monitor() {
 for monitor in "${MONITORS[@]}"; do
   case "${monitor}" in
     binance)
-      start_monitor "binance-basis-monitor" "binance-basis-monitor" "${BINANCE_BIND}"
+      start_monitor "binance-basis-monitor" "binance-basis-monitor" "${BINANCE_BIND}" /api/basis/status
       ;;
     bybit)
-      start_monitor "bybit-basis-monitor" "bybit-basis-monitor" "${BYBIT_BIND}"
+      start_monitor "bybit-basis-monitor" "bybit-basis-monitor" "${BYBIT_BIND}" /api/bybit-basis/status
       ;;
     okx)
-      start_monitor "okx-basis-monitor" "okx-basis-monitor" "${OKX_BIND}"
+      start_monitor "okx-basis-monitor" "okx-basis-monitor" "${OKX_BIND}" /api/okx-basis/status
       ;;
     bitget)
-      start_monitor "bitget-basis-monitor" "bitget-basis-monitor" "${BITGET_BIND}"
+      start_monitor "bitget-basis-monitor" "bitget-basis-monitor" "${BITGET_BIND}" /api/bitget-basis/status
       ;;
     hyperliquid)
-      start_monitor "hyperliquid-basis-monitor" "hyperliquid-basis-monitor" "${HYPERLIQUID_BIND}"
+      start_monitor "hyperliquid-basis-monitor" "hyperliquid-basis-monitor" "${HYPERLIQUID_BIND}" /api/hyperliquid-basis/status
       ;;
     aster)
-      start_monitor "aster-basis-monitor" "aster-basis-monitor" "${ASTER_BIND}"
+      start_monitor "aster-basis-monitor" "aster-basis-monitor" "${ASTER_BIND}" /api/aster-basis/status
       ;;
   esac
 done

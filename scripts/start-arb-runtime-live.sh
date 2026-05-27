@@ -20,7 +20,7 @@ usage() {
   4. 启动 arb-runtime live --i-understand-live-orders。
   5. arb-runtime live 默认只启动 cross-exchange-funding-arb 常驻 runner；
      spot-perp-basis 需要显式加入 ARB_RUNTIME_LIVE_STRATEGIES，避免无关策略限流拖垮 funding-arb。
-  6. 打印所有实时 dashboard、日志和停止命令。
+  6. 打印所有实时 JSON API、日志和停止命令。
 
 常用环境变量:
   ARB_RUNTIME_LIVE_ROOT=target/arb-runtime/live # 实盘主运行目录，保存 resident 状态、机会和报告。
@@ -29,7 +29,7 @@ usage() {
   ARB_RUNTIME_LIVE_DETACH=0 # 是否后台运行 arb-runtime live；1 表示 detach。
   ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED=1 # 是否把启动脚本自身输出写入 live-prereq/logs/arb-runtime-live-precheck.log。
   ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120 # 等待 WSS monitor 就绪的最长秒数。
-  ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS=1 # 启动前是否回收本仓库 arb-runtime 残留 dashboard/WSS 端口；0 表示只报错。
+  ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS=1 # 启动前是否回收本仓库 arb-runtime 残留只读 API/WSS 端口；0 表示只报错。
   ARB_RUNTIME_LIVE_BUILD=1 # 启动前是否构建 arb-runtime 和 arb-wallet-signer。
   ARB_RUNTIME_LIVE_CONFIG=templates/personal_guarded_live.preflight.yaml # arb-runtime live 使用的风控和执行配置。
   ARB_RUNTIME_LIVE_INTERVAL_SECS=5 # observer 公开 monitor 轮询间隔秒数。
@@ -45,14 +45,14 @@ usage() {
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=0 # funding-arb 直接读取 perp/funding 公开源；0 表示复用 basis monitor status。
   ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=auto # 是否额外启动实盘 guard 专用 target WSS；auto 表示 spot-perp resident 启用时启动并作为 readiness gate。
-  ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE=1 # foreground live 失败时是否保留只读 dashboard/WSS 便于排查；停止用 scripts/stop-arb-runtime-live.sh。
+  ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE=1 # foreground live 失败时是否保留只读 API/WSS 便于排查；停止用 scripts/stop-arb-runtime-live.sh。
   ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bybit WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL=BTC-USDT # CEX_WSS_SCOPE=custom 时的 OKX WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bitget WSS monitor 订阅 symbol。
   ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL=ALL_USDT # Aster perp WSS monitor 订阅范围；ALL_USDT 表示全部 USDT 合约；启动不阻塞，策略侧按数据新鲜度 fail-closed。
   ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL=ALL_USDT # Hyperliquid perp WSS monitor 订阅范围；ALL_USDT 表示全部永续合约；启动不阻塞，策略侧按数据新鲜度 fail-closed。
-  ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805 # portfolio dashboard 监听地址。
+  ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805 # portfolio JSON API 监听地址。
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_ENABLED=1 # 是否启动全账户私有只读采集器；只读仓位和余额，不下单、不撤单、不转账。
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS=60 # 全账户私有只读采集间隔秒数。
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_VENUES= # 可选覆盖采集交易所，逗号分隔；留空表示所有支持 funding-arb 的交易所。
@@ -71,8 +71,8 @@ usage() {
   BASIS_OBSERVER_FUNDING_ARB_AUTO_RESIDUAL_DE_RISK=1 # funding-arb 实盘发现历史 unknown/残腿仓位时自动进入 reduce-only 降风险恢复。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；启用 raw snapshot 时必须留空。
   BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT= # 资金费率结算原始只读快照输出路径。
-  ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT=target/account_snapshot.json # portfolio dashboard 可选账户快照覆盖输入路径；留空时从 resident root 自动发现。
-  ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT=target/position_snapshot.json # portfolio dashboard 可选仓位快照覆盖输入路径；留空时从 resident root 自动汇总。
+  ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT=target/account_snapshot.json # portfolio JSON API 可选账户快照覆盖输入路径；留空时从 resident root 自动发现。
+  ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT=target/position_snapshot.json # portfolio JSON API 可选仓位快照覆盖输入路径；留空时从 resident root 自动汇总。
   ASTER_USER=0x... # Aster 账户/user 地址，用于账户归属、查询和订单归属。
   ASTER_SIGNER=0x... # Aster 实际签名/API 地址，必须与 signer 私钥匹配。
   ASTER_SIGNER_PRIVATE=<local-secret> # Aster signer/API 地址对应私钥，只放本机 env。
@@ -596,7 +596,7 @@ start_wss_monitor() {
   local pid
 
   reclaim_stale_runtime_port "${name}" "${bind_addr}"
-  echo "starting ${name}: http://${bind_addr}/dashboard"
+  echo "starting ${name}: ${status_url}"
   nohup env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${RUNTIME_BIN}" "${command_name}" \
     --bind "${bind_addr}" \
     --symbol "${symbol}" \
@@ -705,17 +705,17 @@ start_portfolio_dashboard() {
   [[ -n "${ARB_RUNTIME_PORTFOLIO_FUNDING_SNAPSHOT:-}" ]] && args+=(--funding-snapshot "${ARB_RUNTIME_PORTFOLIO_FUNDING_SNAPSHOT}")
 
   reclaim_stale_runtime_port "portfolio-dashboard" "${PORTFOLIO_BIND}"
-  echo "starting portfolio dashboard: http://${PORTFOLIO_BIND}/dashboard"
-  echo "starting error logs dashboard: http://${PORTFOLIO_BIND}/errors"
+  echo "starting portfolio JSON API: http://${PORTFOLIO_BIND}/api/portfolio/status"
+  echo "starting error logs JSON API: http://${PORTFOLIO_BIND}/api/errors/logs"
   nohup "${args[@]}" >> "${log_file}" 2>&1 &
   pid="$!"
   printf '%s\n' "${pid}" > "${PORTFOLIO_PID_FILE}"
   echo "  pid=${pid} log=${log_file}"
   sleep 1
   if ! is_alive "${pid}"; then
-    echo "portfolio dashboard failed to stay running; last log lines:"
+    echo "portfolio JSON API failed to stay running; last log lines:"
     tail -n 40 "${log_file}" 2>/dev/null || true
-    die "portfolio dashboard failed to start"
+    die "portfolio JSON API failed to start"
   fi
 }
 
@@ -1002,42 +1002,42 @@ while IFS=$'\t' read -r pid name log_file status_url ready_symbol required; do
   wait_for_wss_monitor "${name}" "${pid}" "${log_file}" "${status_url}" "${ready_symbol:-}" "${required:-1}"
 done < "${WSS_PID_FILE}"
 
-print_dashboards() {
+print_readonly_apis() {
   cat <<EOF
 
-正式实盘 dashboard:
-  系统导航:          http://${PORTFOLIO_BIND}/nav
-  总组合看板:        http://${PORTFOLIO_BIND}/dashboard
-  错误日志:          http://${PORTFOLIO_BIND}/errors
-  Binance basis:      http://127.0.0.1:8796/dashboard
-  Bybit basis:        http://127.0.0.1:8797/dashboard
-  OKX basis:          http://127.0.0.1:8798/dashboard
-  Bitget basis:       http://127.0.0.1:8803/dashboard
-  Aster basis:        http://127.0.0.1:8800/dashboard
-  Hyperliquid basis:  http://127.0.0.1:8799/dashboard
-  Funding arb:        http://127.0.0.1:8804/dashboard
+正式实盘只读 JSON API:
+  系统导航:          http://${PORTFOLIO_BIND}/api/navigation/pages
+  总组合状态:        http://${PORTFOLIO_BIND}/api/portfolio/status
+  错误日志:          http://${PORTFOLIO_BIND}/api/errors/logs
+  Binance basis:      http://127.0.0.1:8796/api/basis/status
+  Bybit basis:        http://127.0.0.1:8797/api/bybit-basis/status
+  OKX basis:          http://127.0.0.1:8798/api/okx-basis/status
+  Bitget basis:       http://127.0.0.1:8803/api/bitget-basis/status
+  Aster basis:        http://127.0.0.1:8800/api/aster-basis/status
+  Hyperliquid basis:  http://127.0.0.1:8799/api/hyperliquid-basis/status
+  Funding arb:        http://127.0.0.1:8804/api/funding-arb/status
 
-全市场 WSS 覆盖 dashboard:
-  Binance spot:       http://${BINANCE_SPOT_WSS_BIND}/dashboard
-  Binance perp:       http://${BINANCE_PERP_WSS_BIND}/dashboard
-  Bybit spot:         http://${BYBIT_SPOT_WSS_BIND}/dashboard
-  Bybit perp:         http://${BYBIT_PERP_WSS_BIND}/dashboard
-  OKX spot:           http://${OKX_SPOT_WSS_BIND}/dashboard
-  OKX perp:           http://${OKX_PERP_WSS_BIND}/dashboard
-  Bitget spot:        http://${BITGET_SPOT_WSS_BIND}/dashboard
-  Bitget perp:        http://${BITGET_PERP_WSS_BIND}/dashboard
-  Aster perp:         http://${ASTER_PERP_WSS_BIND}/dashboard
-  Hyperliquid perp:   http://${HYPERLIQUID_PERP_WSS_BIND}/dashboard
+全市场 WSS 覆盖 JSON API:
+  Binance spot:       http://${BINANCE_SPOT_WSS_BIND}/api/binance-wss-book-ticker/status
+  Binance perp:       http://${BINANCE_PERP_WSS_BIND}/api/binance-wss-book-ticker/status
+  Bybit spot:         http://${BYBIT_SPOT_WSS_BIND}/api/bybit-wss-book-ticker/status
+  Bybit perp:         http://${BYBIT_PERP_WSS_BIND}/api/bybit-wss-book-ticker/status
+  OKX spot:           http://${OKX_SPOT_WSS_BIND}/api/okx-wss-book-ticker/status
+  OKX perp:           http://${OKX_PERP_WSS_BIND}/api/okx-wss-book-ticker/status
+  Bitget spot:        http://${BITGET_SPOT_WSS_BIND}/api/bitget-wss-book-ticker/status
+  Bitget perp:        http://${BITGET_PERP_WSS_BIND}/api/bitget-wss-book-ticker/status
+  Aster perp:         http://${ASTER_PERP_WSS_BIND}/api/aster-wss-book-ticker/status
+  Hyperliquid perp:   http://${HYPERLIQUID_PERP_WSS_BIND}/api/hyperliquid-wss-book-ticker/status
 
-实盘 guard target WSS dashboard:
-  Binance spot:       http://${TARGET_BINANCE_SPOT_WSS_BIND}/dashboard
-  Binance perp:       http://${TARGET_BINANCE_PERP_WSS_BIND}/dashboard
-  Bybit spot:         http://${TARGET_BYBIT_SPOT_WSS_BIND}/dashboard
-  Bybit perp:         http://${TARGET_BYBIT_PERP_WSS_BIND}/dashboard
-  OKX spot:           http://${TARGET_OKX_SPOT_WSS_BIND}/dashboard
-  OKX perp:           http://${TARGET_OKX_PERP_WSS_BIND}/dashboard
-  Bitget spot:        http://${TARGET_BITGET_SPOT_WSS_BIND}/dashboard
-  Bitget perp:        http://${TARGET_BITGET_PERP_WSS_BIND}/dashboard
+实盘 guard target WSS JSON API:
+  Binance spot:       http://${TARGET_BINANCE_SPOT_WSS_BIND}/api/binance-wss-book-ticker/status
+  Binance perp:       http://${TARGET_BINANCE_PERP_WSS_BIND}/api/binance-wss-book-ticker/status
+  Bybit spot:         http://${TARGET_BYBIT_SPOT_WSS_BIND}/api/bybit-wss-book-ticker/status
+  Bybit perp:         http://${TARGET_BYBIT_PERP_WSS_BIND}/api/bybit-wss-book-ticker/status
+  OKX spot:           http://${TARGET_OKX_SPOT_WSS_BIND}/api/okx-wss-book-ticker/status
+  OKX perp:           http://${TARGET_OKX_PERP_WSS_BIND}/api/okx-wss-book-ticker/status
+  Bitget spot:        http://${TARGET_BITGET_SPOT_WSS_BIND}/api/bitget-wss-book-ticker/status
+  Bitget perp:        http://${TARGET_BITGET_PERP_WSS_BIND}/api/bitget-wss-book-ticker/status
 
 实时日志:
   tail -f ${PREREQ_ROOT}/logs/arb-runtime-live-precheck.log
@@ -1058,7 +1058,7 @@ cross-exchange-funding-arb 常驻产物:
 EOF
 }
 
-print_dashboards
+print_readonly_apis
 
 BASIS_BINANCE_SPOT_WSS_BIND="${BINANCE_SPOT_WSS_BIND}"
 BASIS_BINANCE_PERP_WSS_BIND="${BINANCE_PERP_WSS_BIND}"
@@ -1139,7 +1139,7 @@ set -e
 if [[ "${live_status}" != "0" && "${KEEP_PREREQ_ON_LIVE_FAILURE}" == "1" ]]; then
   trap - EXIT INT TERM
   echo
-  echo "arb-runtime live exited with status=${live_status}; keeping read-only dashboard/WSS processes running for inspection."
+  echo "arb-runtime live exited with status=${live_status}; keeping read-only API/WSS processes running for inspection."
   echo "stop them with:"
   echo "  ARB_RUNTIME_LIVE_ROOT=${RUN_ROOT} ARB_RUNTIME_LIVE_PREREQ_ROOT=${PREREQ_ROOT} scripts/stop-arb-runtime-live.sh"
   exit "${live_status}"

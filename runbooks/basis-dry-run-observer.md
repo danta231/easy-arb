@@ -55,16 +55,16 @@ scripts/start-basis-opportunity-observer.sh
 - 默认监听 Binance、Bybit、OKX、Bitget、Aster、Hyperliquid 六家。
 - 脚本启动时会先检查六家 basis `/opportunities` 和 funding arb `/opportunities`，检查失败不会误报启动成功。
 
-启动成功后会看到七个 dashboard 地址：
+启动成功后会看到七个只读 JSON API 地址：
 
 ```text
-http://127.0.0.1:8796/dashboard  # Binance
-http://127.0.0.1:8797/dashboard  # Bybit
-http://127.0.0.1:8798/dashboard  # OKX
-http://127.0.0.1:8803/dashboard  # Bitget
-http://127.0.0.1:8800/dashboard  # Aster
-http://127.0.0.1:8799/dashboard  # Hyperliquid
-http://127.0.0.1:8804/dashboard  # Funding arb
+http://127.0.0.1:8796/api/basis/status  # Binance
+http://127.0.0.1:8797/api/bybit-basis/status  # Bybit
+http://127.0.0.1:8798/api/okx-basis/status  # OKX
+http://127.0.0.1:8803/api/bitget-basis/status  # Bitget
+http://127.0.0.1:8800/api/aster-basis/status  # Aster
+http://127.0.0.1:8799/api/hyperliquid-basis/status  # Hyperliquid
+http://127.0.0.1:8804/api/funding-arb/status  # Funding arb
 ```
 
 ## 停止监听

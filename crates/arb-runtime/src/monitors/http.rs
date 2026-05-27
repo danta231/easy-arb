@@ -3,11 +3,6 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use crate::monitors::dashboard::{
-    aster_basis_dashboard_html, basis_dashboard_html, bitget_basis_dashboard_html,
-    bybit_basis_dashboard_html, funding_arb_dashboard_html, hyperliquid_basis_dashboard_html,
-    okx_basis_dashboard_html,
-};
 use crate::*;
 
 pub(crate) fn start_binance_basis_http_api(
@@ -157,7 +152,11 @@ fn handle_basis_http_connection(
         return;
     }
     if route == "/" || route == "/dashboard" {
-        let _ = write_http_html(&mut stream, 200, basis_dashboard_html());
+        let _ = write_http_json(
+            &mut stream,
+            410,
+            &static_dashboard_gone_json("Binance basis"),
+        );
         return;
     }
 
@@ -189,7 +188,7 @@ fn handle_basis_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/basis/status\",\"/api/basis/opportunities\",\"/api/basis/status/<SYMBOL>\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/basis/status\",\"/api/basis/opportunities\",\"/api/basis/status/<SYMBOL>\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -215,8 +214,7 @@ fn handle_bybit_basis_http_connection(
         return;
     }
     if route == "/" || route == "/dashboard" {
-        let html = bybit_basis_dashboard_html();
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("Bybit basis"));
         return;
     }
 
@@ -248,7 +246,7 @@ fn handle_bybit_basis_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/bybit-basis/status\",\"/api/bybit-basis/opportunities\",\"/api/bybit-basis/status/<SYMBOL>\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/bybit-basis/status\",\"/api/bybit-basis/opportunities\",\"/api/bybit-basis/status/<SYMBOL>\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -274,8 +272,7 @@ fn handle_okx_basis_http_connection(
         return;
     }
     if route == "/" || route == "/dashboard" {
-        let html = okx_basis_dashboard_html();
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("OKX basis"));
         return;
     }
 
@@ -307,7 +304,7 @@ fn handle_okx_basis_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/okx-basis/status\",\"/api/okx-basis/opportunities\",\"/api/okx-basis/status/<SYMBOL>\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/okx-basis/status\",\"/api/okx-basis/opportunities\",\"/api/okx-basis/status/<SYMBOL>\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -333,8 +330,11 @@ fn handle_bitget_basis_http_connection(
         return;
     }
     if route == "/" || route == "/dashboard" {
-        let html = bitget_basis_dashboard_html();
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(
+            &mut stream,
+            410,
+            &static_dashboard_gone_json("Bitget basis"),
+        );
         return;
     }
 
@@ -366,7 +366,7 @@ fn handle_bitget_basis_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/bitget-basis/status\",\"/api/bitget-basis/opportunities\",\"/api/bitget-basis/status/<SYMBOL>\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/bitget-basis/status\",\"/api/bitget-basis/opportunities\",\"/api/bitget-basis/status/<SYMBOL>\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -392,8 +392,11 @@ fn handle_hyperliquid_basis_http_connection(
         return;
     }
     if route == "/" || route == "/dashboard" {
-        let html = hyperliquid_basis_dashboard_html();
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(
+            &mut stream,
+            410,
+            &static_dashboard_gone_json("Hyperliquid basis"),
+        );
         return;
     }
 
@@ -425,7 +428,7 @@ fn handle_hyperliquid_basis_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/hyperliquid-basis/status\",\"/api/hyperliquid-basis/opportunities\",\"/api/hyperliquid-basis/status/<SYMBOL>\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/hyperliquid-basis/status\",\"/api/hyperliquid-basis/opportunities\",\"/api/hyperliquid-basis/status/<SYMBOL>\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -451,8 +454,7 @@ fn handle_aster_basis_http_connection(
         return;
     }
     if route == "/" || route == "/dashboard" {
-        let html = aster_basis_dashboard_html();
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("Aster basis"));
         return;
     }
 
@@ -484,7 +486,7 @@ fn handle_aster_basis_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/aster-basis/status\",\"/api/aster-basis/opportunities\",\"/api/aster-basis/status/<SYMBOL>\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/aster-basis/status\",\"/api/aster-basis/opportunities\",\"/api/aster-basis/status/<SYMBOL>\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -511,7 +513,7 @@ fn handle_funding_arb_http_connection(
         return;
     }
     if route == "/" || route == "/dashboard" {
-        let _ = write_http_html(&mut stream, 200, funding_arb_dashboard_html());
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("Funding arb"));
         return;
     }
 
@@ -536,7 +538,7 @@ fn handle_funding_arb_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/funding-arb/status\",\"/api/funding-arb/opportunities\",\"/api/funding-arb/execution-status\",\"/api/funding-arb/history\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/funding-arb/status\",\"/api/funding-arb/opportunities\",\"/api/funding-arb/execution-status\",\"/api/funding-arb/history\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);

@@ -30,11 +30,12 @@ use crate::{
     parse_bybit_spot_ticker_rows, parse_flat_json_object, parse_hyperliquid_perp_context_rows,
     parse_json_object_value_slices, parse_okx_ticker_rows,
     required_first_bitget_ticker_value_string, required_first_json_value_string,
-    required_json_string, required_json_value_string, runtime_timestamp_millis, write_http_html,
-    write_http_json, MonitorBookTickerRow, MonitorJsonScalar, OkxTickerRow, RuntimeError,
-    RuntimeResult, BASIS_SYMBOL, BITGET_BASIS_SYMBOL, BYBIT_BASIS_PERP_VENUE_ID,
-    BYBIT_BASIS_SPOT_VENUE_ID, HYPERLIQUID_INFO_URL, MARKET_DATA_MAX_AGE_MS,
-    MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR, MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
+    required_json_string, required_json_value_string, runtime_timestamp_millis,
+    static_dashboard_gone_json, write_http_json, MonitorBookTickerRow, MonitorJsonScalar,
+    OkxTickerRow, RuntimeError, RuntimeResult, BASIS_SYMBOL, BITGET_BASIS_SYMBOL,
+    BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID, HYPERLIQUID_INFO_URL,
+    MARKET_DATA_MAX_AGE_MS, MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR,
+    MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
 };
 
 pub(crate) const HYPERLIQUID_PUBLIC_WSS_URL: &str = "wss://api.hyperliquid.xyz/ws";
@@ -4188,13 +4189,12 @@ pub(crate) fn handle_binance_wss_book_ticker_http_connection(
     } else if route == "/api/binance-wss-book-ticker/quotes" {
         (200, snapshot.quotes_json())
     } else if route == "/" || route == "/dashboard" {
-        let html = binance_wss_book_ticker_dashboard_html();
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("Binance WSS"));
         return;
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/binance-wss-book-ticker/status\",\"/api/binance-wss-book-ticker/quote\",\"/api/binance-wss-book-ticker/quotes\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/binance-wss-book-ticker/status\",\"/api/binance-wss-book-ticker/quote\",\"/api/binance-wss-book-ticker/quotes\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -4251,13 +4251,12 @@ pub(crate) fn handle_bybit_wss_book_ticker_http_connection(
     } else if route == "/api/bybit-wss-book-ticker/quotes" {
         (200, snapshot.quotes_json())
     } else if route == "/" || route == "/dashboard" {
-        let html = bybit_wss_book_ticker_dashboard_html();
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("Bybit WSS"));
         return;
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/bybit-wss-book-ticker/status\",\"/api/bybit-wss-book-ticker/quote\",\"/api/bybit-wss-book-ticker/quotes\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/bybit-wss-book-ticker/status\",\"/api/bybit-wss-book-ticker/quote\",\"/api/bybit-wss-book-ticker/quotes\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
@@ -4402,99 +4401,15 @@ pub(crate) fn handle_public_wss_book_ticker_http_connection(
     } else if route == quotes_path {
         (200, snapshot.quotes_json())
     } else if route == "/" || route == "/dashboard" {
-        let html = public_wss_book_ticker_dashboard_html_for_api(api_name);
-        let _ = write_http_html(&mut stream, 200, &html);
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json(api_name));
         return;
     } else {
         (
             404,
             format!(
-                "{{\"error\":\"not_found\",\"paths\":[\"/\",\"/dashboard\",\"/health\",\"/api/{api_name}/status\",\"/api/{api_name}/quote\",\"/api/{api_name}/quotes\"]}}"
+                "{{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/{api_name}/status\",\"/api/{api_name}/quote\",\"/api/{api_name}/quotes\"]}}"
             ),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
-}
-
-pub(crate) fn public_wss_book_ticker_dashboard_template() -> &'static str {
-    include_str!(
-        "../../../../universal_arb_platform_v2_immutable_core_docs/templates/public_wss_book_ticker_dashboard.html"
-    )
-}
-
-pub(crate) fn public_wss_book_ticker_dashboard_html(
-    dashboard_title: &str,
-    venue_label: &str,
-    stream_label: &str,
-    api_prefix: &str,
-) -> String {
-    public_wss_book_ticker_dashboard_template()
-        .replace("{{DASHBOARD_TITLE}}", dashboard_title)
-        .replace("{{VENUE_LABEL}}", venue_label)
-        .replace("{{STREAM_LABEL}}", stream_label)
-        .replace("{{API_PREFIX}}", api_prefix)
-}
-
-pub(crate) fn binance_wss_book_ticker_dashboard_html() -> String {
-    public_wss_book_ticker_dashboard_html(
-        "Binance WSS bookTicker",
-        "Binance public WSS",
-        "bookTicker 实时行情",
-        "/api/binance-wss-book-ticker",
-    )
-}
-
-pub(crate) fn bybit_wss_book_ticker_dashboard_html() -> String {
-    public_wss_book_ticker_dashboard_html(
-        "Bybit WSS orderbook.1",
-        "Bybit public WSS",
-        "orderbook.1 实时行情",
-        "/api/bybit-wss-book-ticker",
-    )
-}
-
-pub(crate) fn okx_wss_book_ticker_dashboard_html() -> String {
-    public_wss_book_ticker_dashboard_html(
-        "OKX WSS tickers",
-        "OKX public WSS",
-        "tickers 实时行情",
-        "/api/okx-wss-book-ticker",
-    )
-}
-
-pub(crate) fn bitget_wss_book_ticker_dashboard_html() -> String {
-    public_wss_book_ticker_dashboard_html(
-        "Bitget WSS ticker",
-        "Bitget public WSS",
-        "ticker 实时行情",
-        "/api/bitget-wss-book-ticker",
-    )
-}
-
-pub(crate) fn aster_wss_book_ticker_dashboard_html() -> String {
-    public_wss_book_ticker_dashboard_html(
-        "Aster WSS bookTicker",
-        "Aster public WSS",
-        "bookTicker 实时行情",
-        "/api/aster-wss-book-ticker",
-    )
-}
-
-pub(crate) fn hyperliquid_wss_book_ticker_dashboard_html() -> String {
-    public_wss_book_ticker_dashboard_html(
-        "Hyperliquid WSS BBO",
-        "Hyperliquid public WSS",
-        "bbo 实时行情",
-        "/api/hyperliquid-wss-book-ticker",
-    )
-}
-
-pub(crate) fn public_wss_book_ticker_dashboard_html_for_api(api_name: &str) -> String {
-    match api_name {
-        "okx-wss-book-ticker" => okx_wss_book_ticker_dashboard_html(),
-        "bitget-wss-book-ticker" => bitget_wss_book_ticker_dashboard_html(),
-        "aster-wss-book-ticker" => aster_wss_book_ticker_dashboard_html(),
-        "hyperliquid-wss-book-ticker" => hyperliquid_wss_book_ticker_dashboard_html(),
-        _ => bybit_wss_book_ticker_dashboard_html(),
-    }
 }

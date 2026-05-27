@@ -7,10 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::monitors::dashboard::{
-    error_logs_dashboard_html, navigation_dashboard_html, portfolio_dashboard_html,
-    system_navigation_pages_json,
-};
+use crate::monitors::dashboard::system_navigation_pages_json;
 use crate::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4901,15 +4898,19 @@ fn handle_portfolio_dashboard_http_connection(
         return;
     }
     if route == "/" || route == "/nav" || route == "/navigation" {
-        let _ = write_http_html(&mut stream, 200, navigation_dashboard_html());
+        let _ = write_http_json(
+            &mut stream,
+            410,
+            &static_dashboard_gone_json("System navigation"),
+        );
         return;
     }
     if route == "/dashboard" {
-        let _ = write_http_html(&mut stream, 200, portfolio_dashboard_html());
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("Portfolio"));
         return;
     }
     if route == "/errors" || route == "/error-logs" {
-        let _ = write_http_html(&mut stream, 200, error_logs_dashboard_html());
+        let _ = write_http_json(&mut stream, 410, &static_dashboard_gone_json("Error logs"));
         return;
     }
     if route == "/api/navigation/pages" {
@@ -4947,7 +4948,7 @@ fn handle_portfolio_dashboard_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/\",\"/nav\",\"/dashboard\",\"/errors\",\"/health\",\"/api/navigation/pages\",\"/api/errors/logs\",\"/api/portfolio/status\",\"/api/portfolio/balances\",\"/api/portfolio/positions\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/navigation/pages\",\"/api/errors/logs\",\"/api/portfolio/status\",\"/api/portfolio/balances\",\"/api/portfolio/positions\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
