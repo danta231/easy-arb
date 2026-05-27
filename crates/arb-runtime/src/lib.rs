@@ -22757,10 +22757,31 @@ fn json_value_to_string_dynamic(value: &str, field: &str, source: &str) -> Runti
 }
 
 fn monitor_optional_i128(value: &Option<String>) -> i128 {
+    monitor_optional_decimal_raw(value).unwrap_or(i128::MIN)
+}
+
+fn monitor_optional_decimal_raw(value: &Option<String>) -> Option<i128> {
     value
         .as_deref()
-        .and_then(|value| value.parse::<i128>().ok())
-        .unwrap_or(i128::MIN)
+        .and_then(|value| MonitorDecimal::parse("monitor decimal", value).ok())
+        .map(|value| value.raw)
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_decimal_i128_scale() -> i128 {
+    10_i128.pow(MonitorDecimal::SCALE_DIGITS as u32)
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_decimal_from_i128(value: i128) -> Option<MonitorDecimal> {
+    monitor_decimal_i128_scale()
+        .checked_mul(value)
+        .map(|raw| MonitorDecimal { raw })
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_decimal_whole_i128(value: MonitorDecimal) -> i128 {
+    value.raw / monitor_decimal_i128_scale()
 }
 
 #[derive(Clone, Copy)]
@@ -27654,24 +27675,52 @@ fn select_funding_arb_resident_candidate<'a>(
         .rows
         .iter()
         .filter(|row| row.is_candidate)
-        .filter(|row| {
-            funding_arb_row_net_funding_bps(row)
-                .is_some_and(|net| net >= options.min_net_funding_bps)
-        })
-        .max_by_key(|row| funding_arb_row_net_funding_bps(row).unwrap_or(i128::MIN))
+        .filter(|row| funding_arb_row_net_funding_bps_meets_min(row, options.min_net_funding_bps))
+        .max_by_key(|row| funding_arb_row_net_funding_bps_sort_key(row).unwrap_or(i128::MIN))
 }
 
 #[cfg(feature = "live-exec")]
 fn funding_arb_row_net_funding_bps(row: &FundingArbMarketRow) -> Option<i128> {
-    row.net_funding_bps.as_deref()?.parse::<i128>().ok()
+    funding_arb_row_net_funding_bps_decimal(row).map(monitor_decimal_whole_i128)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_net_funding_bps_decimal(row: &FundingArbMarketRow) -> Option<MonitorDecimal> {
+    row.net_funding_bps
+        .as_deref()
+        .and_then(|value| MonitorDecimal::parse("funding_arb.net_funding_bps", value).ok())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_net_funding_bps_sort_key(row: &FundingArbMarketRow) -> Option<i128> {
+    funding_arb_row_net_funding_bps_decimal(row).map(|value| value.raw)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_net_funding_bps_meets_min(
+    row: &FundingArbMarketRow,
+    min_net_funding_bps: i128,
+) -> bool {
+    let Some(net) = funding_arb_row_net_funding_bps_decimal(row) else {
+        return false;
+    };
+    let Some(min) = monitor_decimal_from_i128(min_net_funding_bps) else {
+        return false;
+    };
+    net.raw >= min.raw
 }
 
 #[cfg(feature = "live-exec")]
 fn funding_arb_row_gross_funding_spread_bps(row: &FundingArbMarketRow) -> Option<i128> {
-    row.gross_funding_spread_bps
-        .as_deref()?
-        .parse::<i128>()
-        .ok()
+    funding_arb_row_gross_funding_spread_bps_decimal(row).map(monitor_decimal_whole_i128)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_gross_funding_spread_bps_decimal(
+    row: &FundingArbMarketRow,
+) -> Option<MonitorDecimal> {
+    let value = row.gross_funding_spread_bps.as_deref()?;
+    MonitorDecimal::parse("funding_arb.gross_funding_spread_bps", value).ok()
 }
 
 #[cfg(feature = "live-exec")]
@@ -28574,7 +28623,7 @@ fn funding_arb_exit_rollover_allowed(
     row.source_status == "complete"
         && funding_arb_position_direction_matches_row(row, state)
         && funding_arb_row_target_funding_time_ms(row).is_some()
-        && funding_arb_row_net_funding_bps(row).is_some_and(|net| net >= min_net_funding_bps)
+        && funding_arb_row_net_funding_bps_meets_min(row, min_net_funding_bps)
 }
 
 #[cfg(feature = "live-exec")]
@@ -44661,6 +44710,58 @@ mod tests {
         assert!(compact_json.contains("pair_count=2"));
         assert!(compact_json.contains("sample_pairs="));
         assert_eq!(blocking_path.len(), 3);
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_arb_resident_candidate_selection_accepts_decimal_net_bps() {
+        let mut lower = funding_arb_test_row("0.00010000", "0.00600000");
+        lower.net_funding_bps = Some("5.25".to_owned());
+        let mut higher = funding_arb_test_row("0.00010000", "0.00600000");
+        higher.pair_id = "binance:bybit:ETHUSDT:ETHUSDT".to_owned();
+        higher.symbol = "ETHUSDT".to_owned();
+        higher.net_funding_bps = Some("10.5135".to_owned());
+        higher.product_tags = funding_arb_product_tags_for_symbol("ETHUSDT");
+        let snapshot =
+            funding_arb_test_snapshot(vec![lower, higher], "2026-05-13T00:00:00Z".to_owned());
+        let options = FundingArbResidentLiveOptions {
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: None,
+            snapshot_path: None,
+            pair_id: None,
+            sources: Vec::new(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            private_order_events_dir: None,
+            poll_interval_secs: 60,
+            max_cycles: Some(1),
+            notional_usd: "10.00".to_owned(),
+            taker_fee_bps: "5".to_owned(),
+            slippage_buffer_bps: 5,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: 5,
+            execute_live: false,
+            acknowledge_funding_arb_live_orders: false,
+            allow_unknown_recovery: false,
+            auto_residual_de_risk: true,
+            exit_only: false,
+            hyperliquid_user: None,
+            hyperliquid_source: "a".to_owned(),
+            hyperliquid_vault_address: None,
+            hyperliquid_expires_after_ms: None,
+            hyperliquid_asset_ids: BTreeMap::new(),
+            aster_user: None,
+            aster_signer: None,
+            aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
+        };
+
+        let selected =
+            select_funding_arb_resident_candidate(&snapshot, &options).expect("selected candidate");
+
+        assert_eq!(selected.pair_id, "binance:bybit:ETHUSDT:ETHUSDT");
+        assert!(funding_arb_row_net_funding_bps_meets_min(selected, 10));
+        assert_eq!(funding_arb_row_net_funding_bps(selected), Some(10));
     }
 
     #[cfg(feature = "live-exec")]
