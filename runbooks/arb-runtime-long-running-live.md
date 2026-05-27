@@ -125,7 +125,7 @@ scripts/start-arb-runtime-live.sh --detach --env-file ~/easy-arb-live.env
 
 ```text
 127.0.0.1:8786  Binance spot WSS
-127.0.0.1:8787  Binance perp WSS
+127.0.0.1:8806  Binance perp WSS
 127.0.0.1:8788  Bybit spot WSS
 127.0.0.1:8789  Bybit perp WSS
 127.0.0.1:8790  OKX spot WSS
@@ -168,7 +168,7 @@ tail -f target/arb-runtime/live-prereq/logs/arb-runtime-live.log
 ```bash
 for url in \
   http://127.0.0.1:8786/api/binance-wss-book-ticker/status \
-  http://127.0.0.1:8787/api/binance-wss-book-ticker/status \
+  http://127.0.0.1:8806/api/binance-wss-book-ticker/status \
   http://127.0.0.1:8788/api/bybit-wss-book-ticker/status \
   http://127.0.0.1:8789/api/bybit-wss-book-ticker/status \
   http://127.0.0.1:8790/api/okx-wss-book-ticker/status \

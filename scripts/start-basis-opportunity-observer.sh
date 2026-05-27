@@ -122,7 +122,7 @@ Aster 默认按 USDT 结算；Hyperliquid 默认按 USDC 结算，并默认从 H
 
 可选 WSS monitor URL:
   BINANCE_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8786/api/binance-wss-book-ticker/status # Binance spot WSS monitor 状态接口。
-  BINANCE_PERP_WSS_MONITOR_URL=http://127.0.0.1:8787/api/binance-wss-book-ticker/status # Binance USDM perp WSS monitor 状态接口。
+  BINANCE_PERP_WSS_MONITOR_URL=http://127.0.0.1:8806/api/binance-wss-book-ticker/status # Binance USDM perp WSS monitor 状态接口。
   BYBIT_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8788/api/bybit-wss-book-ticker/status # Bybit spot WSS monitor 状态接口。
   BYBIT_PERP_WSS_MONITOR_URL=http://127.0.0.1:8789/api/bybit-wss-book-ticker/status # Bybit linear perp WSS monitor 状态接口。
   OKX_SPOT_WSS_MONITOR_URL=http://127.0.0.1:8790/api/okx-wss-book-ticker/status # OKX spot WSS monitor 状态接口。

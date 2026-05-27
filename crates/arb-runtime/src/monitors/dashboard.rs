@@ -168,8 +168,8 @@ pub(crate) fn system_navigation_entries() -> &'static [SystemNavigationEntry] {
             category: "WSS",
             title: "Binance perp WSS",
             description: "Binance USD-M perp bookTicker 实时前置行情。",
-            url: "http://127.0.0.1:8787/dashboard",
-            health_url: "http://127.0.0.1:8787/health",
+            url: "http://127.0.0.1:8806/dashboard",
+            health_url: "http://127.0.0.1:8806/health",
         },
         SystemNavigationEntry {
             category: "WSS",

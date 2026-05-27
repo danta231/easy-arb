@@ -18,11 +18,11 @@
 
 ## 端口规划
 
-同机部署的关键冲突是 `Easy Tool` 默认 `8787`，而 `easy-arb` 默认也使用 `127.0.0.1:8787` 作为 Binance perp WSS monitor（币安永续行情监听）。本方案固定：
+同机部署的关键冲突是 `Easy Tool` 默认 `8787`。本方案让 `Easy Tool runtime` 保留 `8787`，并把 `easy-arb` 的 Binance perp WSS monitor（币安永续行情监听）固定到 `127.0.0.1:8806`：
 
 | 服务 | 监听地址 | 对外暴露 |
 | --- | --- | --- |
-| Easy Tool runtime（运行时接口） | `0.0.0.0:18787` | 仅 Nginx 代理，不开放安全组端口 |
+| Easy Tool runtime（运行时接口） | `0.0.0.0:8787` | 仅 Nginx 代理，不开放安全组端口 |
 | Easy Tool Web | `80/443` | 开放 |
 | easy-arb portfolio dashboard（组合看板） | `127.0.0.1:8805` | 可选 Nginx + Basic Auth，默认建议 SSH tunnel |
 | easy-arb WSS/basis/funding 内部看板 | `127.0.0.1:8786-8830+` | 不开放公网 |
