@@ -14915,6 +14915,34 @@ struct CachedPublicOrderBookDepth {
 struct FundingArbDirectSourceCache {
     bybit_instruments: BybitLinearInstrumentPageCache,
     okx_funding_rates: OkxFundingRatePageCache,
+    depth_backfill: FundingArbDepthBackfillCache,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FundingArbDepthBackfillCache {
+    binance: PublicOrderBookDepthCache,
+    bybit: PublicOrderBookDepthCache,
+    okx: PublicOrderBookDepthCache,
+    bitget: PublicOrderBookDepthCache,
+    aster: PublicOrderBookDepthCache,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FundingArbDepthBackfillRequests {
+    binance: BTreeSet<String>,
+    bybit: BTreeSet<String>,
+    okx: BTreeSet<String>,
+    bitget: BTreeSet<String>,
+    aster: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FundingArbDepthBackfillMaps {
+    binance: BTreeMap<String, PublicOrderBookDepth>,
+    bybit: BTreeMap<String, PublicOrderBookDepth>,
+    okx: BTreeMap<String, PublicOrderBookDepth>,
+    bitget: BTreeMap<String, PublicOrderBookDepth>,
+    aster: BTreeMap<String, PublicOrderBookDepth>,
 }
 
 #[derive(Clone, Debug)]
@@ -17459,10 +17487,16 @@ fn fetch_funding_arb_monitor_snapshot_with_cache(
     options: &FundingArbMonitorOptions,
     direct_source_cache: &mut FundingArbDirectSourceCache,
 ) -> RuntimeResult<FundingArbMonitorSnapshot> {
-    if funding_arb_direct_public_sources_enabled()? {
-        return fetch_funding_arb_direct_public_snapshot(options, direct_source_cache);
-    }
-    fetch_funding_arb_basis_status_snapshot(options)
+    let snapshot = if funding_arb_direct_public_sources_enabled()? {
+        fetch_funding_arb_direct_public_snapshot(options, direct_source_cache)?
+    } else {
+        fetch_funding_arb_basis_status_snapshot(options)?
+    };
+    Ok(apply_funding_arb_depth_backfill(
+        snapshot,
+        options,
+        &mut direct_source_cache.depth_backfill,
+    ))
 }
 
 fn fetch_funding_arb_basis_status_snapshot(
@@ -17946,12 +17980,7 @@ fn build_funding_arb_monitor_snapshot_from_sources(
             }
         }
     }
-    rows.sort_by(|left, right| {
-        monitor_optional_i128(&right.net_funding_bps)
-            .cmp(&monitor_optional_i128(&left.net_funding_bps))
-            .then_with(|| left.pair_id.cmp(&right.pair_id))
-            .then_with(|| left.symbol.cmp(&right.symbol))
-    });
+    sort_funding_arb_monitor_rows(&mut rows);
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
     let source_error_count = source_errors.len()
         + snapshots
@@ -17975,6 +18004,322 @@ fn build_funding_arb_monitor_snapshot_from_sources(
         last_error: (!source_errors.is_empty()).then(|| source_errors.join("; ")),
         rows,
     })
+}
+
+fn sort_funding_arb_monitor_rows(rows: &mut [FundingArbMarketRow]) {
+    rows.sort_by(|left, right| {
+        monitor_optional_i128(&right.net_funding_bps)
+            .cmp(&monitor_optional_i128(&left.net_funding_bps))
+            .then_with(|| left.pair_id.cmp(&right.pair_id))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+}
+
+fn apply_funding_arb_depth_backfill(
+    mut snapshot: FundingArbMonitorSnapshot,
+    options: &FundingArbMonitorOptions,
+    cache: &mut FundingArbDepthBackfillCache,
+) -> FundingArbMonitorSnapshot {
+    let (requests, target_pair_ids, mut warnings) =
+        funding_arb_depth_backfill_requests(&snapshot.rows, FUNDING_ARB_DEPTH_BACKFILL_PAIR_LIMIT);
+    if target_pair_ids.is_empty() {
+        return snapshot;
+    }
+
+    let (depths, fetch_warnings) = fetch_funding_arb_depth_backfill_maps(&requests, cache);
+    warnings.extend(fetch_warnings);
+
+    for row in &mut snapshot.rows {
+        if !target_pair_ids.contains(&row.pair_id) {
+            continue;
+        }
+        match funding_arb_row_with_backfilled_depth(row, &depths, options) {
+            Ok(backfilled) => *row = backfilled,
+            Err(error) => warnings.push(format!(
+                "funding arb depth backfill failed for {}: {error}",
+                row.pair_id
+            )),
+        }
+    }
+
+    sort_funding_arb_monitor_rows(&mut snapshot.rows);
+    snapshot.candidate_count = snapshot.rows.iter().filter(|row| row.is_candidate).count();
+    append_funding_arb_depth_backfill_warnings(&mut snapshot, warnings);
+    snapshot
+}
+
+fn funding_arb_depth_backfill_requests(
+    rows: &[FundingArbMarketRow],
+    limit: usize,
+) -> (
+    FundingArbDepthBackfillRequests,
+    BTreeSet<String>,
+    Vec<String>,
+) {
+    let mut requests = FundingArbDepthBackfillRequests::default();
+    let mut target_pair_ids = BTreeSet::new();
+    let mut warnings = Vec::new();
+    if limit == 0 {
+        return (requests, target_pair_ids, warnings);
+    }
+
+    for row in rows
+        .iter()
+        .filter(|row| funding_arb_row_should_backfill_depth(row))
+        .take(limit)
+    {
+        let Some((venue_a_symbol, venue_b_symbol)) = funding_arb_row_venue_symbols(row) else {
+            warnings.push(format!(
+                "funding arb depth backfill skipped unparsable pair_id={}",
+                row.pair_id
+            ));
+            continue;
+        };
+        target_pair_ids.insert(row.pair_id.clone());
+        requests.insert(&row.venue_a_family, venue_a_symbol);
+        requests.insert(&row.venue_b_family, venue_b_symbol);
+    }
+
+    (requests, target_pair_ids, warnings)
+}
+
+fn funding_arb_row_should_backfill_depth(row: &FundingArbMarketRow) -> bool {
+    !row.is_candidate
+        && row.source_status == "complete"
+        && row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("insufficient order-book depth"))
+}
+
+impl FundingArbDepthBackfillRequests {
+    fn insert(&mut self, venue_family: &str, symbol: String) {
+        match normalize_venue_family(venue_family).as_str() {
+            "binance" => {
+                self.binance.insert(symbol);
+            }
+            "bybit" => {
+                self.bybit.insert(symbol);
+            }
+            "okx" => {
+                self.okx.insert(symbol);
+            }
+            "bitget" => {
+                self.bitget.insert(symbol);
+            }
+            "aster" => {
+                self.aster.insert(symbol);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn fetch_funding_arb_depth_backfill_maps(
+    requests: &FundingArbDepthBackfillRequests,
+    cache: &mut FundingArbDepthBackfillCache,
+) -> (FundingArbDepthBackfillMaps, Vec<String>) {
+    let mut warnings = Vec::new();
+    let (binance, binance_warnings) = fetch_funding_arb_depth_backfill_for_venue(
+        PublicOrderBookDepthVenue::BinanceUsdmPerp,
+        &requests.binance,
+        &mut cache.binance,
+    );
+    let (bybit, bybit_warnings) = fetch_funding_arb_depth_backfill_for_venue(
+        PublicOrderBookDepthVenue::BybitLinear,
+        &requests.bybit,
+        &mut cache.bybit,
+    );
+    let (okx, okx_warnings) = fetch_funding_arb_depth_backfill_for_venue(
+        PublicOrderBookDepthVenue::Okx,
+        &requests.okx,
+        &mut cache.okx,
+    );
+    let (bitget, bitget_warnings) = fetch_funding_arb_depth_backfill_for_venue(
+        PublicOrderBookDepthVenue::BitgetUsdtFutures,
+        &requests.bitget,
+        &mut cache.bitget,
+    );
+    let (aster, aster_warnings) = fetch_funding_arb_depth_backfill_for_venue(
+        PublicOrderBookDepthVenue::AsterUsdtFutures,
+        &requests.aster,
+        &mut cache.aster,
+    );
+    warnings.extend(binance_warnings);
+    warnings.extend(bybit_warnings);
+    warnings.extend(okx_warnings);
+    warnings.extend(bitget_warnings);
+    warnings.extend(aster_warnings);
+
+    (
+        FundingArbDepthBackfillMaps {
+            binance,
+            bybit,
+            okx,
+            bitget,
+            aster,
+        },
+        warnings,
+    )
+}
+
+fn fetch_funding_arb_depth_backfill_for_venue(
+    venue: PublicOrderBookDepthVenue,
+    symbols: &BTreeSet<String>,
+    cache: &mut PublicOrderBookDepthCache,
+) -> (BTreeMap<String, PublicOrderBookDepth>, Vec<String>) {
+    if symbols.is_empty() {
+        return (BTreeMap::new(), Vec::new());
+    }
+    let report = fetch_public_order_book_depth_map_cached(
+        venue,
+        symbols,
+        cache,
+        Duration::from_secs(FUNDING_ARB_DEPTH_BACKFILL_TTL_SECS),
+        BASIS_MONITOR_DEPTH_FETCH_CONCURRENCY,
+    );
+    (
+        report.depths,
+        report
+            .warnings
+            .into_iter()
+            .map(|warning| format!("funding arb depth backfill: {warning}"))
+            .collect(),
+    )
+}
+
+fn funding_arb_row_with_backfilled_depth(
+    row: &FundingArbMarketRow,
+    depths: &FundingArbDepthBackfillMaps,
+    options: &FundingArbMonitorOptions,
+) -> RuntimeResult<FundingArbMarketRow> {
+    let (venue_a_symbol, venue_b_symbol) =
+        funding_arb_row_venue_symbols(row).ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("cannot parse funding arb pair_id `{}`", row.pair_id),
+        })?;
+    let venue_a = funding_arb_market_from_monitor_row(row, true, &venue_a_symbol, depths);
+    let venue_b = funding_arb_market_from_monitor_row(row, false, &venue_b_symbol, depths);
+    funding_arb_pair_row(&venue_a, &venue_b, options)
+}
+
+fn funding_arb_row_venue_symbols(row: &FundingArbMarketRow) -> Option<(String, String)> {
+    let mut parts = row.pair_id.split(':');
+    let venue_a_family = parts.next()?;
+    let venue_b_family = parts.next()?;
+    let venue_a_symbol = parts.next()?;
+    let venue_b_symbol = parts.next()?;
+    if parts.next().is_some()
+        || venue_a_family != row.venue_a_family
+        || venue_b_family != row.venue_b_family
+    {
+        return None;
+    }
+    Some((venue_a_symbol.to_owned(), venue_b_symbol.to_owned()))
+}
+
+fn funding_arb_market_from_monitor_row(
+    row: &FundingArbMarketRow,
+    venue_a: bool,
+    venue_symbol: &str,
+    depths: &FundingArbDepthBackfillMaps,
+) -> FundingArbVenueMarket {
+    let venue_family = if venue_a {
+        row.venue_a_family.clone()
+    } else {
+        row.venue_b_family.clone()
+    };
+    let fetched_depth = funding_arb_depth_backfill_lookup(depths, &venue_family, venue_symbol);
+    let (perp_bid, perp_ask, perp_bid_qty, perp_ask_qty) = if venue_a {
+        (
+            row.venue_a_bid.clone(),
+            row.venue_a_ask.clone(),
+            row.venue_a_bid_qty.clone(),
+            row.venue_a_ask_qty.clone(),
+        )
+    } else {
+        (
+            row.venue_b_bid.clone(),
+            row.venue_b_ask.clone(),
+            row.venue_b_bid_qty.clone(),
+            row.venue_b_ask_qty.clone(),
+        )
+    };
+    let (perp_bid_depth, perp_ask_depth) = if let Some(depth) = fetched_depth {
+        (depth.bid_depth.clone(), depth.ask_depth.clone())
+    } else if venue_a {
+        (row.venue_a_bid_depth.clone(), row.venue_a_ask_depth.clone())
+    } else {
+        (row.venue_b_bid_depth.clone(), row.venue_b_ask_depth.clone())
+    };
+    let (mark_price, index_price, funding_rate, funding_interval_hours, next_funding_time_ms) =
+        if venue_a {
+            (
+                row.venue_a_mark_price.clone(),
+                row.venue_a_index_price.clone(),
+                row.venue_a_funding_rate.clone(),
+                row.venue_a_funding_interval_hours.clone(),
+                row.venue_a_next_funding_time_ms.clone(),
+            )
+        } else {
+            (
+                row.venue_b_mark_price.clone(),
+                row.venue_b_index_price.clone(),
+                row.venue_b_funding_rate.clone(),
+                row.venue_b_funding_interval_hours.clone(),
+                row.venue_b_next_funding_time_ms.clone(),
+            )
+        };
+
+    FundingArbVenueMarket {
+        venue_family,
+        symbol: venue_symbol.to_owned(),
+        base_asset: funding_base_asset_from_symbol(venue_symbol),
+        perp_bid: Some(perp_bid),
+        perp_ask: Some(perp_ask),
+        perp_bid_qty: Some(perp_bid_qty),
+        perp_ask_qty: Some(perp_ask_qty),
+        perp_bid_depth,
+        perp_ask_depth,
+        mark_price: Some(mark_price),
+        index_price: Some(index_price),
+        funding_rate,
+        funding_interval_hours,
+        next_funding_time_ms: Some(next_funding_time_ms),
+        source_status: "complete".to_owned(),
+    }
+}
+
+fn funding_arb_depth_backfill_lookup<'a>(
+    depths: &'a FundingArbDepthBackfillMaps,
+    venue_family: &str,
+    symbol: &str,
+) -> Option<&'a PublicOrderBookDepth> {
+    match normalize_venue_family(venue_family).as_str() {
+        "binance" => depths.binance.get(symbol),
+        "bybit" => depths.bybit.get(symbol),
+        "okx" => depths.okx.get(symbol),
+        "bitget" => depths.bitget.get(symbol),
+        "aster" => depths.aster.get(symbol),
+        _ => None,
+    }
+}
+
+fn append_funding_arb_depth_backfill_warnings(
+    snapshot: &mut FundingArbMonitorSnapshot,
+    warnings: Vec<String>,
+) {
+    if warnings.is_empty() {
+        return;
+    }
+    let warning = warnings.join("; ");
+    match &mut snapshot.last_error {
+        Some(existing) if !existing.is_empty() => {
+            existing.push_str("; ");
+            existing.push_str(&warning);
+        }
+        Some(existing) => *existing = warning,
+        None => snapshot.last_error = Some(warning),
+    }
 }
 
 fn funding_arb_pair_row(
@@ -19119,6 +19464,8 @@ const BASIS_MONITOR_DEPTH_SYMBOL_LIMIT: usize = 12;
 const BASIS_MONITOR_DEPTH_WARNING_LIMIT: usize = 8;
 const BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS: u64 = 5;
 const BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT: usize = 20;
+const FUNDING_ARB_DEPTH_BACKFILL_PAIR_LIMIT: usize = 12;
+const FUNDING_ARB_DEPTH_BACKFILL_TTL_SECS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicOrderBookDepthVenue {
@@ -44336,6 +44683,118 @@ mod tests {
             first_event.payload.get("ask_depth_levels"),
             Some(JsonValue::Array(levels)) if levels.len() == 2
         ));
+    }
+
+    #[test]
+    fn funding_arb_depth_backfill_can_promote_top_of_book_depth_rejection() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("0.5"),
+                Some("0.5"),
+            ),
+        );
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00600000",
+                "complete",
+                Some("0.5"),
+                Some("0.5"),
+            ),
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "binance".to_owned(),
+                    status_url: "http://127.0.0.1/binance/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "bybit".to_owned(),
+                    status_url: "http://127.0.0.1/bybit/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![binance, bybit], vec![], &options)
+                .expect("funding arb snapshot");
+        assert_eq!(snapshot.candidate_count, 0);
+        assert!(snapshot.rows[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("insufficient order-book depth")));
+
+        let (requests, target_pair_ids, warnings) =
+            funding_arb_depth_backfill_requests(&snapshot.rows, 1);
+        assert!(warnings.is_empty());
+        assert!(target_pair_ids.contains("binance:bybit:BTCUSDT:BTCUSDT"));
+        assert!(requests.binance.contains("BTCUSDT"));
+        assert!(requests.bybit.contains("BTCUSDT"));
+
+        let mut depths = FundingArbDepthBackfillMaps::default();
+        depths.binance.insert(
+            "BTCUSDT".to_owned(),
+            PublicOrderBookDepth {
+                bid_depth: vec![
+                    SignalDepthLevel {
+                        price: "99.95".to_owned(),
+                        size: "0.5".to_owned(),
+                    },
+                    SignalDepthLevel {
+                        price: "99.90".to_owned(),
+                        size: "0.6".to_owned(),
+                    },
+                ],
+                ask_depth: vec![
+                    SignalDepthLevel {
+                        price: "100.00".to_owned(),
+                        size: "0.5".to_owned(),
+                    },
+                    SignalDepthLevel {
+                        price: "100.02".to_owned(),
+                        size: "0.6".to_owned(),
+                    },
+                ],
+            },
+        );
+        depths.bybit.insert(
+            "BTCUSDT".to_owned(),
+            PublicOrderBookDepth {
+                bid_depth: vec![
+                    SignalDepthLevel {
+                        price: "100.05".to_owned(),
+                        size: "0.5".to_owned(),
+                    },
+                    SignalDepthLevel {
+                        price: "100.03".to_owned(),
+                        size: "0.6".to_owned(),
+                    },
+                ],
+                ask_depth: vec![
+                    SignalDepthLevel {
+                        price: "100.10".to_owned(),
+                        size: "0.5".to_owned(),
+                    },
+                    SignalDepthLevel {
+                        price: "100.12".to_owned(),
+                        size: "0.6".to_owned(),
+                    },
+                ],
+            },
+        );
+
+        let backfilled =
+            funding_arb_row_with_backfilled_depth(&snapshot.rows[0], &depths, &options)
+                .expect("backfilled row");
+        assert!(backfilled.is_candidate, "{:?}", backfilled.reason);
+        assert_eq!(backfilled.venue_a_ask_depth.len(), 2);
+        assert_eq!(backfilled.venue_b_bid_depth.len(), 2);
+        assert!(backfilled.reason.is_none());
     }
 
     #[test]
