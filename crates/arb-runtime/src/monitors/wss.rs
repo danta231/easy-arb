@@ -52,6 +52,7 @@ pub(crate) const OKX_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+pub(crate) const BITGET_WSS_TICKER_DEFAULT_INST_ID: &str = "default";
 pub(crate) const OKX_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES: usize = 4096;
 pub(crate) const OKX_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD: usize = 50;
 pub(crate) const BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES: usize = 4096;
@@ -1888,7 +1889,11 @@ pub(crate) fn bootstrap_bitget_wss_book_ticker(
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url: BITGET_PUBLIC_WSS_URL.to_owned(),
-        subscribe_args: bitget_wss_ticker_subscribe_payloads(&subscribe_symbols, market),
+        subscribe_args: bitget_wss_ticker_subscribe_payloads_for_scope(
+            &subscribe_symbols,
+            market,
+            all_symbols_scope,
+        ),
         all_symbols_scope,
         coordinators,
         local_sequences,
@@ -3816,6 +3821,19 @@ pub(crate) fn bitget_wss_ticker_subscribe_payloads(
     }
 
     payloads
+}
+
+pub(crate) fn bitget_wss_ticker_subscribe_payloads_for_scope(
+    symbols: &[String],
+    market: BitgetPublicWssMarket,
+    all_symbols_scope: bool,
+) -> Vec<String> {
+    if all_symbols_scope {
+        return vec![bitget_wss_ticker_subscribe_payload_from_args(&[
+            bitget_wss_ticker_subscribe_arg(BITGET_WSS_TICKER_DEFAULT_INST_ID, market),
+        ])];
+    }
+    bitget_wss_ticker_subscribe_payloads(symbols, market)
 }
 
 pub(crate) fn bitget_wss_ticker_subscribe_arg(

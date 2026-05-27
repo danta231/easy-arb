@@ -12000,27 +12000,69 @@ fn basis_planned_legs(
 ) -> RuntimeResult<(&PlannedSubmitOrder, &PlannedSubmitOrder)> {
     let expected_spot_venue = basis_private_order_market_venue_id(spot_market)?;
     let expected_perp_venue = basis_private_order_market_venue_id(perp_market)?;
-    let spot = dispatch_plan
-        .requests
-        .iter()
-        .find(|planned| {
-            planned.basis_leg_role.as_deref() == Some("spot_buy")
-                || planned.request.venue_id.as_str() == expected_spot_venue
-        })
-        .ok_or_else(|| RuntimeError::UnsafeConfig {
-            message: "双腿套利分发计划缺少 spot buy 腿".to_owned(),
-        })?;
-    let perp = dispatch_plan
-        .requests
-        .iter()
-        .find(|planned| {
-            planned.basis_leg_role.as_deref() == Some("perp_short")
-                || planned.request.venue_id.as_str() == expected_perp_venue
-        })
-        .ok_or_else(|| RuntimeError::UnsafeConfig {
-            message: "双腿套利分发计划缺少 perp short 腿".to_owned(),
-        })?;
+    let spot = basis_planned_leg(dispatch_plan, "spot_buy", expected_spot_venue, "spot buy")?;
+    let perp = basis_planned_leg(
+        dispatch_plan,
+        "perp_short",
+        expected_perp_venue,
+        "perp short",
+    )?;
+    if spot.plan_leg_id == perp.plan_leg_id {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "双腿套利分发计划 spot/perp 解析到同一条计划腿 `{}`",
+                spot.plan_leg_id
+            ),
+        });
+    }
     Ok((spot, perp))
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_planned_leg<'a>(
+    dispatch_plan: &'a ExecutionDispatchPlan,
+    role: &str,
+    expected_venue: &str,
+    label: &str,
+) -> RuntimeResult<&'a PlannedSubmitOrder> {
+    let mut role_matches = dispatch_plan
+        .requests
+        .iter()
+        .filter(|planned| planned.basis_leg_role.as_deref() == Some(role));
+    if let Some(planned) = role_matches.next() {
+        if role_matches.next().is_some() {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!("双腿套利分发计划存在多条 `{role}` 角色的 {label} 腿"),
+            });
+        }
+        let actual_venue = planned.request.venue_id.as_str();
+        if actual_venue != expected_venue {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "双腿套利分发计划 {label} 腿 role=`{role}` 的 venue_id=`{actual_venue}`，预期 `{expected_venue}`"
+                ),
+            });
+        }
+        return Ok(planned);
+    }
+
+    let mut venue_matches = dispatch_plan
+        .requests
+        .iter()
+        .filter(|planned| planned.request.venue_id.as_str() == expected_venue);
+    let Some(planned) = venue_matches.next() else {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "双腿套利分发计划缺少 {label} 腿；预期 role=`{role}` 或 venue_id=`{expected_venue}`"
+            ),
+        });
+    };
+    if venue_matches.next().is_some() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("双腿套利分发计划存在多条 venue_id=`{expected_venue}` 的 {label} 腿"),
+        });
+    }
+    Ok(planned)
 }
 
 #[cfg(feature = "live-exec")]
@@ -41590,6 +41632,14 @@ mod tests {
         assert_eq!(bitget_parsed.venue_symbol, "BTCUSDT");
         assert_eq!(bitget_parsed.ask_size.to_string(), "1.3");
 
+        let bitget_default_scope_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"default"},"data":[{"instId":"ETHUSDT","bidPr":"51.00","bidSz":"1.2","askPr":"51.10","askSz":"1.3","ts":"1778630400000"}]}"#;
+        let bitget_default_scope_parsed =
+            parse_bitget_wss_book_ticker_runtime_raw(bitget_default_scope_raw, ingested_at)
+                .expect("bitget default scope raw")
+                .expect("bitget default scope update");
+        assert_eq!(bitget_default_scope_parsed.symbol, "ETHUSDT");
+        assert_eq!(bitget_default_scope_parsed.venue_symbol, "ETHUSDT");
+
         let bitget_array_size_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":"101.00","bidSz":["1.2"],"askPr":"101.10","askSz":["1.3"],"ts":"1778630400000"}]}"#;
         let bitget_array_size_parsed =
             parse_bitget_wss_book_ticker_runtime_raw(bitget_array_size_raw, ingested_at)
@@ -41768,6 +41818,23 @@ mod tests {
         assert!(bitget_payloads[0].matches("\"channel\":\"ticker\"").count() <= 50);
         assert!(bitget_payloads[0].contains("\"instId\":\"SYM0USDT\""));
         assert!(bitget_payloads[2].contains("\"instId\":\"SYM122USDT\""));
+
+        let bitget_all_scope_payloads = bitget_wss_ticker_subscribe_payloads_for_scope(
+            &bitget_symbols,
+            BitgetPublicWssMarket::Spot,
+            true,
+        );
+        assert_eq!(bitget_all_scope_payloads.len(), 1);
+        assert!(bitget_all_scope_payloads[0].contains("\"instId\":\"default\""));
+        assert!(!bitget_all_scope_payloads[0].contains("\"instId\":\"SYM0USDT\""));
+
+        let bitget_scoped_payloads = bitget_wss_ticker_subscribe_payloads_for_scope(
+            &bitget_symbols,
+            BitgetPublicWssMarket::Spot,
+            false,
+        );
+        assert_eq!(bitget_scoped_payloads.len(), 3);
+        assert!(bitget_scoped_payloads[0].contains("\"instId\":\"SYM0USDT\""));
     }
 
     #[test]
@@ -52176,6 +52243,81 @@ mod tests {
             futures_adapter.confirmed[0].venue_id.as_str(),
             BITGET_BASIS_PERP_VENUE_ID
         );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn bitget_basis_live_dispatch_rejects_role_venue_mismatch_before_submit() {
+        let spot_with_perp_venue = test_basis_planned_order_for_account(
+            "spot_buy",
+            BITGET_BASIS_PERP_VENUE_ID,
+            BITGET_BASIS_PERP_INSTRUMENT_ID,
+            BITGET_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvgS1778630400",
+            "idem:test:bitget-basis:mismatch-spot",
+        );
+        let futures = test_basis_planned_order_for_account(
+            "perp_short",
+            BITGET_BASIS_PERP_VENUE_ID,
+            BITGET_BASIS_PERP_INSTRUMENT_ID,
+            BITGET_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvgP1778630400",
+            "idem:test:bitget-basis:mismatch-futures",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:bitget-basis-mismatch".to_owned(),
+            requests: vec![spot_with_perp_venue, futures],
+        };
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BITGET_BASIS_SPOT_VENUE_ID,
+                "bitget-spot-should-not-submit",
+            ))],
+            vec![],
+            vec![],
+        );
+        let mut futures_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BITGET_BASIS_PERP_VENUE_ID,
+                "bitget-futures-should-not-submit",
+            ))],
+            vec![],
+            vec![],
+        );
+
+        let error = match execute_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut futures_adapter,
+            BasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630400",
+                private_order_events: None,
+                spot_market: PrivateOrderMarket::BitgetSpot,
+                perp_market: PrivateOrderMarket::BitgetUsdtFutures,
+                order_query_event_prefix: "event:bitget:basis-order-query",
+            },
+        ) {
+            Ok(_) => panic!("role/venue mismatch must fail before live submit"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("spot buy"));
+        assert!(message.contains(BITGET_BASIS_SPOT_VENUE_ID));
+        assert!(message.contains(BITGET_BASIS_PERP_VENUE_ID));
+        assert!(spot_adapter.submitted.is_empty());
+        assert!(futures_adapter.submitted.is_empty());
     }
 
     #[cfg(feature = "live-exec")]
