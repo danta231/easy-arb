@@ -6190,6 +6190,7 @@ impl BitgetPrivateAccountAdapter {
                 detail,
             ))
         })?;
+        let observed_at = observed_at_not_after_ingested(observed_at, ingested_at);
         let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
         let source_sequence = request_time_ms.to_string();
         let balance_event_id =
@@ -6295,6 +6296,7 @@ impl BitgetPrivateAccountAdapter {
                 detail,
             ))
         })?;
+        let observed_at = observed_at_not_after_ingested(observed_at, ingested_at);
         let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
         let source_sequence = request_time_ms.to_string();
         let balance_event_id =
@@ -6426,6 +6428,7 @@ impl BitgetPrivateAccountAdapter {
                 detail,
             ))
         })?;
+        let observed_at = observed_at_not_after_ingested(observed_at, ingested_at);
         let freshness = DataFreshness::new(observed_at, ingested_at, self.max_age_ms)?;
         let source_sequence = max_update_time_ms.to_string();
         let position_event_id =
@@ -9664,6 +9667,17 @@ fn timestamp_from_unix_millis(value: u64) -> Result<UtcTimestamp, String> {
     UtcTimestamp::from_unix_parts(seconds, nanos).map_err(|error| error.to_string())
 }
 
+fn observed_at_not_after_ingested(
+    observed_at: UtcTimestamp,
+    ingested_at: UtcTimestamp,
+) -> UtcTimestamp {
+    if observed_at > ingested_at {
+        ingested_at
+    } else {
+        observed_at
+    }
+}
+
 fn timestamp_to_unix_millis(timestamp: UtcTimestamp) -> VenueDataResult<u64> {
     let seconds =
         u64::try_from(timestamp.unix_seconds()).map_err(|_| VenueDataError::InvalidQuery {
@@ -10788,6 +10802,37 @@ mod tests {
         assert!(!rendered.contains("43100.00"));
         assert!(!rendered.contains("api_key"));
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn bitget_private_clamps_future_exchange_timestamp_for_freshness() {
+        let venue_id = VenueId::new("venue:BITGET-USDT-FUTURES-PRIVATE").expect("venue id");
+        let account_id = AccountId::new("account:bitget-futures-unit").expect("account id");
+        let ingested_at = timestamp("2023-11-14T22:13:22Z");
+        let mut adapter = BitgetPrivateAccountAdapter::new(
+            venue_id,
+            account_id,
+            BitgetPrivateAccountMarket::UsdtFuturesAccount,
+            timestamp("2023-11-14T22:13:20Z"),
+            5_000,
+        )
+        .expect("adapter");
+
+        let batch = adapter
+            .ingest_usdt_futures_positions_json(
+                r#"{"code":"00000","msg":"success","requestTime":1700000005000,"data":[{"symbol":"BTCUSDT","marginCoin":"USDT","holdSide":"long","total":"1.000","openPriceAvg":"43100.00","unrealizedPL":"1.00","liquidationPrice":"0","markPrice":"43250.50","uTime":"1700000006000"}]}"#,
+                "test:bitget-futures-positions-future-time",
+                ingested_at,
+            )
+            .expect("future Bitget timestamp is clamped");
+
+        assert_eq!(batch.positions.len(), 1);
+        assert_eq!(batch.positions[0].freshness.observed_at, ingested_at);
+        assert_eq!(batch.positions[0].freshness.ingested_at, ingested_at);
+        assert_eq!(
+            payload_string(&batch.position_event, "risk_reason_code"),
+            "CHECK_PASSED"
+        );
     }
 
     #[test]

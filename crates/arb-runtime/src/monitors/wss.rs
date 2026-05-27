@@ -2305,6 +2305,9 @@ pub(crate) fn apply_binance_wss_book_ticker_text(
         Err(error) => return Err(error),
     };
     if !state.coordinators.contains_key(&raw.symbol) {
+        if state.all_symbols_scope {
+            return Ok(None);
+        }
         return Err(RuntimeError::LiveMarketData {
             message: format!(
                 "WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
@@ -2380,6 +2383,9 @@ pub(crate) fn apply_bybit_wss_book_ticker_text(
         Err(error) => return Err(error),
     };
     if !state.coordinators.contains_key(&raw.symbol) {
+        if state.all_symbols_scope {
+            return Ok(None);
+        }
         return Err(RuntimeError::LiveMarketData {
             message: format!(
                 "Bybit WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
@@ -2555,6 +2561,9 @@ pub(crate) fn apply_aster_wss_book_ticker_text(
         Err(error) => return Err(error),
     };
     if !state.coordinators.contains_key(&raw.symbol) {
+        if state.all_symbols_scope {
+            return Ok(None);
+        }
         return Err(RuntimeError::LiveMarketData {
             message: format!(
                 "Aster WSS symbol `{}` was not present in REST bootstrap; REST rebuild required",
@@ -2625,6 +2634,9 @@ pub(crate) fn apply_hyperliquid_wss_book_ticker_text(
         return Ok(None);
     };
     if !state.coordinators.contains_key(&raw.symbol) {
+        if state.all_symbols_scope {
+            return Ok(None);
+        }
         return Err(RuntimeError::LiveMarketData {
             message: format!(
                 "Hyperliquid WSS coin `{}` was not present in REST bootstrap; REST rebuild required",
@@ -2837,12 +2849,12 @@ pub(crate) fn parse_bitget_wss_book_ticker_runtime_raw(
         .transpose()?
         .unwrap_or(ingested_at);
     let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
-    let bid_price = required_first_json_value_string(
+    let bid_price = required_first_bitget_ticker_value_string(
         &fields,
         &["bidPr", "bidPx", "bidPrice"],
         "bitget wss ticker",
     )?;
-    let ask_price = required_first_json_value_string(
+    let ask_price = required_first_bitget_ticker_value_string(
         &fields,
         &["askPr", "askPx", "askPrice"],
         "bitget wss ticker",
@@ -3830,9 +3842,12 @@ pub(crate) fn bitget_wss_ticker_subscribe_payloads_for_scope(
     all_symbols_scope: bool,
 ) -> Vec<String> {
     if all_symbols_scope {
-        return vec![bitget_wss_ticker_subscribe_payload_from_args(&[
-            bitget_wss_ticker_subscribe_arg(BITGET_WSS_TICKER_DEFAULT_INST_ID, market),
-        ])];
+        if symbols.is_empty() {
+            return vec![bitget_wss_ticker_subscribe_payload_from_args(&[
+                bitget_wss_ticker_subscribe_arg(BITGET_WSS_TICKER_DEFAULT_INST_ID, market),
+            ])];
+        }
+        return bitget_wss_ticker_subscribe_payloads(symbols, market);
     }
     bitget_wss_ticker_subscribe_payloads(symbols, market)
 }
@@ -3937,6 +3952,28 @@ pub(crate) fn public_top_of_book_snapshot_symbol(quote: &MarketQuote) -> &str {
     }
 }
 
+fn public_wss_update_is_row_level_stale(update: &HybridMarketDataUpdate) -> bool {
+    update.fail_closed
+        && update.status == HybridMarketDataStatus::Streaming
+        && update.transport == MarketDataTransport::WebSocketStream
+        && update
+            .quote
+            .as_ref()
+            .is_some_and(|quote| quote.freshness.is_stale())
+        && update.reason_codes.iter().any(|code| code == "DATA_STALE")
+        && !update.reason_codes.iter().any(|code| {
+            matches!(
+                code.as_str(),
+                "REST_SNAPSHOT_REQUIRED"
+                    | "VENUE_UNHEALTHY"
+                    | "WSS_DISCONNECTED"
+                    | "WSS_SEQUENCE_GAP"
+                    | "WSS_SYMBOL_MISMATCH"
+                    | "WSS_WITHOUT_REST_SNAPSHOT"
+            )
+        })
+}
+
 impl PublicTopOfBookMonitorSnapshot {
     pub(crate) fn empty(symbol: &str, market: BinancePublicMarket, stream_url: &str) -> Self {
         Self::empty_with_market(symbol, market.as_str(), stream_url)
@@ -3981,9 +4018,12 @@ impl PublicTopOfBookMonitorSnapshot {
     ) {
         self.updated_at = current_utc_timestamp_string();
         self.coordinator_status = update.status.as_str().to_owned();
-        self.status = public_wss_monitor_status(update.status, update.fail_closed).to_owned();
-        self.fail_closed = update.fail_closed;
-        if update.fail_closed {
+        let row_level_stale = public_wss_update_is_row_level_stale(update);
+        self.status =
+            public_wss_monitor_status(update.status, update.fail_closed && !row_level_stale)
+                .to_owned();
+        self.fail_closed = update.fail_closed && !row_level_stale;
+        if update.fail_closed && !row_level_stale {
             self.fail_closed_count += 1;
             self.last_error = Some(if update.reason_codes.is_empty() {
                 "fail_closed".to_owned()
@@ -3991,6 +4031,9 @@ impl PublicTopOfBookMonitorSnapshot {
                 format!("fail_closed: {}", update.reason_codes.join(","))
             });
         } else {
+            if row_level_stale {
+                self.fail_closed_count += 1;
+            }
             self.last_error = None;
         }
         if update.status == HybridMarketDataStatus::Reconnecting {

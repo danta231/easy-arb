@@ -88,7 +88,7 @@ use arb_venue_data::{
 };
 #[cfg(test)]
 use arb_venue_data::{
-    DataFreshness, HybridMarketDataInput, MarketQuote, RestWssMarketDataCoordinator,
+    DataFreshness, HybridMarketDataInput, MarketQuote, RestWssMarketDataCoordinator, WssQuoteUpdate,
 };
 use native_tls::TlsConnector;
 
@@ -18308,7 +18308,7 @@ fn append_funding_arb_depth_backfill_warnings(
     snapshot: &mut FundingArbMonitorSnapshot,
     warnings: Vec<String>,
 ) {
-    if warnings.is_empty() {
+    if warnings.is_empty() || snapshot.source_error_count == 0 {
         return;
     }
     let warning = warnings.join("; ");
@@ -38566,9 +38566,16 @@ fn funding_arb_monitor_root_blocking_path(
         || snapshot.status != "healthy"
         || snapshot.last_error.is_some()
     {
+        let blocker = if snapshot.source_error_count > 0 {
+            "source_error_count>0"
+        } else if snapshot.status != "healthy" {
+            "snapshot_status!=healthy"
+        } else {
+            "last_error_present"
+        };
         let mut entry = FundingArbBlockingPathEntry::new(
             "venue_status",
-            "source_error_count>0",
+            blocker,
             "阻断原因：上游 venue status 不完整或 source 报错",
         )
         .with_evidence(format!(
@@ -42053,6 +42060,13 @@ mod tests {
                 .expect("bitget array size update");
         assert_eq!(bitget_array_size_parsed.bid_size.to_string(), "1.2");
         assert_eq!(bitget_array_size_parsed.ask_size.to_string(), "1.3");
+        let bitget_array_price_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":["101.00"],"bidSz":"1.2","askPr":[["101.10"]],"askSz":"1.3","ts":"1778630400000"}]}"#;
+        let bitget_array_price_parsed =
+            parse_bitget_wss_book_ticker_runtime_raw(bitget_array_price_raw, ingested_at)
+                .expect("bitget array price raw")
+                .expect("bitget array price update");
+        assert_eq!(bitget_array_price_parsed.best_bid.to_string(), "101.00");
+        assert_eq!(bitget_array_price_parsed.best_ask.to_string(), "101.10");
         let bitget_empty_quote_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":"","bidSz":"","askPr":"","askSz":"","ts":"1778630400000"}]}"#;
         assert!(
             parse_bitget_wss_book_ticker_runtime_raw(bitget_empty_quote_raw, ingested_at)
@@ -42230,9 +42244,13 @@ mod tests {
             BitgetPublicWssMarket::Spot,
             true,
         );
-        assert_eq!(bitget_all_scope_payloads.len(), 1);
-        assert!(bitget_all_scope_payloads[0].contains("\"instId\":\"default\""));
-        assert!(!bitget_all_scope_payloads[0].contains("\"instId\":\"SYM0USDT\""));
+        assert_eq!(bitget_all_scope_payloads.len(), 3);
+        assert!(bitget_all_scope_payloads
+            .iter()
+            .all(|payload| payload.len() <= BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES));
+        assert!(bitget_all_scope_payloads[0].contains("\"instId\":\"SYM0USDT\""));
+        assert!(bitget_all_scope_payloads[2].contains("\"instId\":\"SYM122USDT\""));
+        assert!(!bitget_all_scope_payloads[0].contains("\"instId\":\"default\""));
 
         let bitget_scoped_payloads = bitget_wss_ticker_subscribe_payloads_for_scope(
             &bitget_symbols,
@@ -42367,6 +42385,55 @@ mod tests {
             hyperliquid_quote.source_event_id.as_deref(),
             Some("hyperliquid:wss-book-ticker:perp:BTC:1778630400000")
         );
+    }
+
+    #[test]
+    fn public_wss_all_scope_ignores_supported_symbols_missing_from_rest_bootstrap() {
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+
+        let mut binance_state = binance_wss_test_market_state("BTCUSDT", true);
+        let binance_raw = r#"{"stream":"ethusdt@bookTicker","data":{"u":400900302,"s":"ETHUSDT","b":"2500.10","B":"1.00000000","a":"2501.20","A":"1.50000000"}}"#;
+        assert!(apply_binance_wss_book_ticker_text(
+            binance_raw,
+            ingested_at,
+            BinancePublicMarket::Spot,
+            &mut binance_state,
+        )
+        .expect("binance all scope missing symbol is skipped")
+        .is_none());
+
+        let mut bybit_state = bybit_wss_test_market_state("BTCUSDT", true);
+        let bybit_raw = r#"{"topic":"orderbook.1.ETHUSDT","type":"snapshot","ts":1778630401123,"data":{"s":"ETHUSDT","b":[["2500.10","1.00000000"]],"a":[["2501.20","1.50000000"]],"u":400900301,"seq":9001}}"#;
+        assert!(apply_bybit_wss_book_ticker_text(
+            bybit_raw,
+            ingested_at,
+            BybitPublicMarket::Spot,
+            &mut bybit_state,
+        )
+        .expect("bybit all scope missing symbol is skipped")
+        .is_none());
+
+        let mut aster_state = aster_wss_test_market_state("BTCUSDT", true);
+        let aster_raw = r#"{"u":400900301,"s":"ETHUSDT","b":"2500.10","B":"1.00000000","a":"2501.20","A":"1.50000000","T":1778630400000}"#;
+        assert!(apply_aster_wss_book_ticker_text(
+            aster_raw,
+            ingested_at,
+            AsterPublicWssMarket::UsdtFutures,
+            &mut aster_state,
+        )
+        .expect("aster all scope missing symbol is skipped")
+        .is_none());
+
+        let mut hyperliquid_state = hyperliquid_wss_test_market_state("BTC", true);
+        let hyperliquid_raw = r#"{"channel":"bbo","data":{"coin":"ETH","time":1778630400000,"bbo":[["2500.10","1.00000000"],["2501.20","1.50000000"]]}}"#;
+        assert!(apply_hyperliquid_wss_book_ticker_text(
+            hyperliquid_raw,
+            ingested_at,
+            HyperliquidPublicWssMarket::Perp,
+            &mut hyperliquid_state,
+        )
+        .expect("hyperliquid all scope missing coin is skipped")
+        .is_none());
     }
 
     #[test]
@@ -42793,6 +42860,80 @@ mod tests {
         assert!(quote.contains("\"latest_quote\""));
         assert!(quote.contains("\"best_bid\":\"100.01\""));
         assert!(status.contains("\"last_error\":\"forced fail closed for test\""));
+    }
+
+    #[test]
+    fn public_wss_monitor_row_stale_keeps_global_streaming_status() {
+        let observed_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("observed at");
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:06Z").expect("ingested at");
+        let venue_id = VenueId::new(BYBIT_BASIS_PERP_VENUE_ID).expect("venue id");
+        let instrument_id =
+            InstrumentId::new(BYBIT_BASIS_PERP_INSTRUMENT_ID).expect("instrument id");
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id.clone(),
+            observed_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )
+        .expect("coordinator");
+        let rest_quote = MarketQuote {
+            venue_id: venue_id.clone(),
+            instrument_id: instrument_id.clone(),
+            last_price: None,
+            best_bid: Some(Price::from_str("100.00").expect("rest bid")),
+            best_ask: Some(Price::from_str("100.10").expect("rest ask")),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(Quantity::from_str("1.0").expect("rest bid size")),
+            ask_size: Some(Quantity::from_str("1.0").expect("rest ask size")),
+            source_sequence: Some("rest".to_owned()),
+            source_event_id: Some("test:rest".to_owned()),
+            freshness: DataFreshness::new(observed_at, observed_at, MARKET_DATA_MAX_AGE_MS)
+                .expect("rest freshness"),
+        };
+        coordinator
+            .apply(HybridMarketDataInput::RestSnapshot { quote: rest_quote })
+            .expect("rest snapshot");
+        let update = coordinator
+            .apply(HybridMarketDataInput::WssQuote {
+                update: WssQuoteUpdate {
+                    venue_id,
+                    instrument_id,
+                    last_price: None,
+                    best_bid: Some(Price::from_str("100.01").expect("bid")),
+                    best_ask: Some(Price::from_str("100.11").expect("ask")),
+                    mark_price: None,
+                    index_price: None,
+                    bid_size: Some(Quantity::from_str("1.1").expect("bid size")),
+                    ask_size: Some(Quantity::from_str("1.2").expect("ask size")),
+                    source_sequence: 1,
+                    source_event_id: Some("test:wss:stale".to_owned()),
+                    observed_at,
+                    ingested_at,
+                },
+            })
+            .expect("stale wss update");
+        assert!(update.fail_closed);
+        assert!(update.reason_codes.iter().any(|code| code == "DATA_STALE"));
+
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BybitPublicMarket::LinearPerpetual.as_str(),
+            BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+        );
+        snapshot.record_update_with_symbol(&update, Some("BTCUSDT"));
+
+        assert_eq!(snapshot.status, "streaming");
+        assert!(!snapshot.fail_closed);
+        assert_eq!(snapshot.fail_closed_count, 1);
+        assert_eq!(snapshot.last_error, None);
+        assert_eq!(
+            snapshot
+                .latest_quote
+                .as_ref()
+                .map(|quote| quote.freshness_status.as_str()),
+            Some("Stale")
+        );
     }
 
     #[cfg(feature = "live-exec")]
@@ -44795,6 +44936,52 @@ mod tests {
         assert_eq!(backfilled.venue_a_ask_depth.len(), 2);
         assert_eq!(backfilled.venue_b_bid_depth.len(), 2);
         assert!(backfilled.reason.is_none());
+    }
+
+    #[test]
+    fn funding_arb_depth_backfill_warnings_do_not_create_source_errors() {
+        let row = funding_arb_test_row("0.00010000", "0.00600000");
+        let mut snapshot =
+            funding_arb_test_snapshot(vec![row.clone()], "2026-05-13T00:00:00Z".to_owned());
+
+        append_funding_arb_depth_backfill_warnings(
+            &mut snapshot,
+            vec!["funding arb depth backfill: OKX depth unavailable".to_owned()],
+        );
+
+        assert_eq!(snapshot.source_error_count, 0);
+        assert_eq!(snapshot.last_error, None);
+        assert!(funding_arb_monitor_root_blocking_path(&snapshot)
+            .iter()
+            .all(|entry| entry.blocker != "source_error_count>0"));
+
+        snapshot.source_error_count = 1;
+        snapshot.status = "degraded".to_owned();
+        append_funding_arb_depth_backfill_warnings(
+            &mut snapshot,
+            vec!["funding arb depth backfill: Bybit depth unavailable".to_owned()],
+        );
+
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Bybit depth unavailable")));
+        assert_eq!(
+            funding_arb_monitor_root_blocking_path(&snapshot)
+                .first()
+                .map(|entry| entry.blocker.as_str()),
+            Some("source_error_count>0")
+        );
+
+        let mut last_error_snapshot =
+            funding_arb_test_snapshot(vec![row], "2026-05-13T00:00:00Z".to_owned());
+        last_error_snapshot.last_error = Some("poll warning".to_owned());
+        assert_eq!(
+            funding_arb_monitor_root_blocking_path(&last_error_snapshot)
+                .first()
+                .map(|entry| entry.blocker.as_str()),
+            Some("last_error_present")
+        );
     }
 
     #[test]
