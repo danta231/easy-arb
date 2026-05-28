@@ -43003,6 +43003,61 @@ mod tests {
         assert_eq!(quote.freshness.observed_at, ingested_at);
     }
 
+    #[test]
+    fn bybit_wss_empty_top_of_book_payloads_are_ignored() {
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        let empty_ticker_raw = r#"{"topic":"tickers.PRLUSDT","type":"delta","ts":1778630401000,"data":{"symbol":"PRLUSDT","bid1Price":"","bid1Size":"","ask1Price":"","ask1Size":"","seq":9002}}"#;
+        assert!(
+            parse_bybit_wss_book_ticker_runtime_raw(empty_ticker_raw, ingested_at)
+                .expect("bybit empty ticker")
+                .is_none()
+        );
+
+        let empty_orderbook_raw = r#"{"topic":"orderbook.1.PRLUSDT","type":"delta","ts":1778630401000,"data":{"s":"PRLUSDT","b":[["",""]],"a":[],"u":400900302,"seq":9002}}"#;
+        assert!(
+            parse_bybit_wss_book_ticker_runtime_raw(empty_orderbook_raw, ingested_at)
+                .expect("bybit empty orderbook")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bybit_wss_partial_orderbook_delta_merges_with_previous_quote() {
+        let mut state = bybit_wss_test_market_state("BTCUSDT", false);
+        let snapshot_raw = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1778630401000,"data":{"s":"BTCUSDT","b":[["43250.10","1.00000000"]],"a":[["43251.20","1.50000000"]],"u":400900301,"seq":9001}}"#;
+        let snapshot_ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        apply_bybit_wss_book_ticker_text(
+            snapshot_raw,
+            snapshot_ingested_at,
+            BybitPublicMarket::Spot,
+            &mut state,
+        )
+        .expect("bybit snapshot")
+        .expect("snapshot update");
+
+        let delta_raw = r#"{"topic":"orderbook.1.BTCUSDT","type":"delta","ts":1778630402000,"data":{"s":"BTCUSDT","b":[],"a":[["43252.20","1.60000000"]],"u":400900302,"seq":9002}}"#;
+        let delta_ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("time");
+        let update = apply_bybit_wss_book_ticker_text(
+            delta_raw,
+            delta_ingested_at,
+            BybitPublicMarket::Spot,
+            &mut state,
+        )
+        .expect("bybit partial delta")
+        .expect("delta update");
+
+        let quote = update.quote.expect("quote");
+        assert_eq!(quote.best_bid.expect("bid").to_string(), "43250.10");
+        assert_eq!(quote.bid_size.expect("bid size").to_string(), "1.00000000");
+        assert_eq!(quote.best_ask.expect("ask").to_string(), "43252.20");
+        assert_eq!(quote.ask_size.expect("ask size").to_string(), "1.60000000");
+        assert_eq!(quote.source_sequence.as_deref(), Some("3"));
+        assert_eq!(
+            quote.source_event_id.as_deref(),
+            Some("bybit:wss-book-ticker:spot:BTCUSDT:400900302")
+        );
+    }
+
     #[cfg(feature = "live-exec")]
     #[test]
     fn bybit_wss_monitor_quote_converts_to_linear_ticker_with_premium_fields() {

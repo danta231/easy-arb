@@ -1560,6 +1560,16 @@ pub(crate) struct PublicTopOfBookRuntimeRaw {
     pub(crate) observed_at: UtcTimestamp,
 }
 
+pub(crate) struct BybitTopOfBookRuntimeRaw {
+    pub(crate) symbol: String,
+    pub(crate) update_id: u64,
+    pub(crate) best_bid: Option<Price>,
+    pub(crate) best_ask: Option<Price>,
+    pub(crate) bid_size: Option<Quantity>,
+    pub(crate) ask_size: Option<Quantity>,
+    pub(crate) observed_at: UtcTimestamp,
+}
+
 pub(crate) struct PublicWssTickerRuntimeRaw {
     pub(crate) symbol: String,
     pub(crate) venue_symbol: String,
@@ -2412,8 +2422,48 @@ pub(crate) fn apply_bybit_wss_book_ticker_text(
             return Ok(Some(update));
         }
     }
-    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
     let instrument = bybit_public_wss_instrument(&raw.symbol, market)?;
+    let previous_quote = state
+        .coordinators
+        .get(&raw.symbol)
+        .expect("coordinator exists")
+        .latest_quote(&MarketDataQuery::new(
+            state.venue_id.clone(),
+            instrument.instrument_id.clone(),
+        ))?;
+    let best_bid = raw
+        .best_bid
+        .or_else(|| previous_quote.as_ref().and_then(|quote| quote.best_bid));
+    let best_ask = raw
+        .best_ask
+        .or_else(|| previous_quote.as_ref().and_then(|quote| quote.best_ask));
+    let bid_size = raw
+        .bid_size
+        .or_else(|| previous_quote.as_ref().and_then(|quote| quote.bid_size));
+    let ask_size = raw
+        .ask_size
+        .or_else(|| previous_quote.as_ref().and_then(|quote| quote.ask_size));
+    let (Some(best_bid), Some(best_ask), Some(bid_size), Some(ask_size)) =
+        (best_bid, best_ask, bid_size, ask_size)
+    else {
+        let detail = format!(
+            "Bybit WSS top-of-book update for `{}` lacks a complete bid/ask and previous quote cannot complete it; REST rebuild required",
+            raw.symbol
+        );
+        let update = state
+            .coordinators
+            .get_mut(&raw.symbol)
+            .expect("coordinator exists")
+            .apply(HybridMarketDataInput::WssGapDetected {
+                expected_sequence: None,
+                observed_sequence: state.local_sequences.get(&raw.symbol).copied(),
+                occurred_at: raw.observed_at,
+                ingested_at,
+                detail,
+            })?;
+        return Ok(Some(update));
+    };
+    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
     let update = state
         .coordinators
         .get_mut(&raw.symbol)
@@ -2423,12 +2473,12 @@ pub(crate) fn apply_bybit_wss_book_ticker_text(
                 venue_id: state.venue_id.clone(),
                 instrument_id: instrument.instrument_id,
                 last_price: None,
-                best_bid: Some(raw.best_bid),
-                best_ask: Some(raw.best_ask),
+                best_bid: Some(best_bid),
+                best_ask: Some(best_ask),
                 mark_price: None,
                 index_price: None,
-                bid_size: Some(raw.bid_size),
-                ask_size: Some(raw.ask_size),
+                bid_size: Some(bid_size),
+                ask_size: Some(ask_size),
                 source_sequence: local_sequence,
                 source_event_id: Some(format!(
                     "bybit:wss-book-ticker:{}:{}:{}",
@@ -2697,7 +2747,7 @@ pub(crate) fn next_public_wss_local_sequence(
 pub(crate) fn parse_bybit_wss_book_ticker_runtime_raw(
     raw_json: &str,
     ingested_at: UtcTimestamp,
-) -> RuntimeResult<Option<PublicTopOfBookRuntimeRaw>> {
+) -> RuntimeResult<Option<BybitTopOfBookRuntimeRaw>> {
     let root = parse_json_object_value_slices(raw_json)?;
     if let Some(op) = optional_json_value_string(&root, "op", "bybit wss")? {
         if op == "subscribe" || op == "pong" {
@@ -2711,6 +2761,7 @@ pub(crate) fn parse_bybit_wss_book_ticker_runtime_raw(
     if !topic.starts_with("orderbook.1.") && !topic.starts_with("tickers.") {
         return Ok(None);
     }
+    let is_orderbook = topic.starts_with("orderbook.1.");
     let fields = parse_json_object_value_slices(data)?;
     let symbol = required_json_value_string(&fields, "s", "bybit wss orderbook")
         .or_else(|_| required_json_value_string(&fields, "symbol", "bybit wss ticker"))?;
@@ -2723,45 +2774,40 @@ pub(crate) fn parse_bybit_wss_book_ticker_runtime_raw(
         .ok_or_else(|| RuntimeError::LiveMarketData {
             message: "Bybit WSS orderbook lacks `u` or `seq` update id".to_owned(),
         })?;
-    let (best_bid, bid_size) = if let Some(bids) = fields.get("b") {
-        bybit_wss_first_price_size(bids, "bid")?
+    let bid = if is_orderbook {
+        fields
+            .get("b")
+            .map(|bids| bybit_wss_first_price_size(bids, "bid"))
+            .transpose()?
+            .flatten()
     } else {
-        (
-            Price::from_str(&required_json_value_string(
-                &fields,
-                "bid1Price",
-                "bybit wss ticker",
-            )?)?,
-            Quantity::from_str(&required_json_value_string(
-                &fields,
-                "bid1Size",
-                "bybit wss ticker",
-            )?)?,
-        )
+        bybit_wss_optional_ticker_price_size(&fields, "bid1Price", "bid1Size", "bid")?
     };
-    let (best_ask, ask_size) = if let Some(asks) = fields.get("a") {
-        bybit_wss_first_price_size(asks, "ask")?
+    let ask = if is_orderbook {
+        fields
+            .get("a")
+            .map(|asks| bybit_wss_first_price_size(asks, "ask"))
+            .transpose()?
+            .flatten()
     } else {
-        (
-            Price::from_str(&required_json_value_string(
-                &fields,
-                "ask1Price",
-                "bybit wss ticker",
-            )?)?,
-            Quantity::from_str(&required_json_value_string(
-                &fields,
-                "ask1Size",
-                "bybit wss ticker",
-            )?)?,
-        )
+        bybit_wss_optional_ticker_price_size(&fields, "ask1Price", "ask1Size", "ask")?
     };
+    if bid.is_none() && ask.is_none() {
+        return Ok(None);
+    }
+    let (best_bid, bid_size) = bid
+        .map(|(price, size)| (Some(price), Some(size)))
+        .unwrap_or((None, None));
+    let (best_ask, ask_size) = ask
+        .map(|(price, size)| (Some(price), Some(size)))
+        .unwrap_or((None, None));
     let observed_at = optional_json_scalar_u64(&root, "ts", "bybit wss")?
         .or(optional_json_scalar_u64(&fields, "ts", "bybit wss")?)
         .map(timestamp_from_unix_millis)
         .transpose()?
         .unwrap_or(ingested_at);
     let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
-    Ok(Some(PublicTopOfBookRuntimeRaw {
+    Ok(Some(BybitTopOfBookRuntimeRaw {
         symbol,
         update_id,
         best_bid,
@@ -2995,14 +3041,12 @@ pub(crate) fn first_json_array_object<'a>(
 pub(crate) fn bybit_wss_first_price_size(
     value: &str,
     side: &'static str,
-) -> RuntimeResult<(Price, Quantity)> {
+) -> RuntimeResult<Option<(Price, Quantity)>> {
     let levels = json_array_value_slices(value)?;
-    let first = levels
-        .first()
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: format!("Bybit WSS orderbook `{side}` side is empty"),
-        })?
-        .trim();
+    let Some(first) = levels.first() else {
+        return Ok(None);
+    };
+    let first = first.trim();
     let fields = json_array_value_slices(first)?;
     if fields.len() < 2 {
         return Err(RuntimeError::LiveMarketData {
@@ -3011,7 +3055,41 @@ pub(crate) fn bybit_wss_first_price_size(
     }
     let price = decode_json_scalar_string(fields[0], "bybit wss price")?;
     let size = decode_json_scalar_string(fields[1], "bybit wss size")?;
-    Ok((Price::from_str(&price)?, Quantity::from_str(&size)?))
+    bybit_wss_optional_price_size(&price, &size, side)
+}
+
+pub(crate) fn bybit_wss_optional_ticker_price_size(
+    fields: &BTreeMap<String, &str>,
+    price_field: &'static str,
+    size_field: &'static str,
+    side: &'static str,
+) -> RuntimeResult<Option<(Price, Quantity)>> {
+    let price = optional_json_value_string(fields, price_field, "bybit wss ticker")?;
+    let size = optional_json_value_string(fields, size_field, "bybit wss ticker")?;
+    let (Some(price), Some(size)) = (price, size) else {
+        return Ok(None);
+    };
+    bybit_wss_optional_price_size(&price, &size, side)
+}
+
+pub(crate) fn bybit_wss_optional_price_size(
+    price: &str,
+    size: &str,
+    side: &'static str,
+) -> RuntimeResult<Option<(Price, Quantity)>> {
+    let price = price.trim();
+    let size = size.trim();
+    if price.is_empty() || size.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((
+        Price::from_str(price).map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("Bybit WSS `{side}` price `{price}` is invalid: {error}"),
+        })?,
+        Quantity::from_str(size).map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("Bybit WSS `{side}` size `{size}` is invalid: {error}"),
+        })?,
+    )))
 }
 
 pub(crate) fn optional_json_scalar_u64(
