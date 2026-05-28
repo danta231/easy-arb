@@ -796,10 +796,12 @@ pub struct PrivateExecutionFill {
     pub quantity: String,
     pub fee_asset_id: String,
     pub fee_amount: String,
+    pub fee_complete: bool,
     pub source_event_id: String,
     pub timestamp: Option<String>,
     pub venue_order_id: Option<String>,
     pub client_order_id: Option<String>,
+    pub venue_trade_id: Option<String>,
     pub ledger_entry_id: Option<String>,
 }
 
@@ -818,12 +820,19 @@ impl PrivateExecutionFill {
             quantity: quantity.into(),
             fee_asset_id: fee_asset_id.into(),
             fee_amount: fee_amount.into(),
+            fee_complete: true,
             source_event_id: source_event_id.into(),
             timestamp: None,
             venue_order_id: None,
             client_order_id: None,
+            venue_trade_id: None,
             ledger_entry_id: None,
         }
+    }
+
+    pub fn with_incomplete_fee(mut self) -> Self {
+        self.fee_complete = false;
+        self
     }
 
     pub fn with_timestamp(mut self, timestamp: impl Into<String>) -> Self {
@@ -838,6 +847,11 @@ impl PrivateExecutionFill {
 
     pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Self {
         self.client_order_id = Some(client_order_id.into());
+        self
+    }
+
+    pub fn with_venue_trade_id(mut self, venue_trade_id: impl Into<String>) -> Self {
+        self.venue_trade_id = Some(venue_trade_id.into());
         self
     }
 
@@ -2696,6 +2710,7 @@ struct PrivateExecutionAggregate {
     fills: Vec<String>,
     failures: Vec<String>,
     any_fill: bool,
+    any_incomplete_fee: bool,
     any_partial: bool,
     any_failure: bool,
     any_unknown: bool,
@@ -2827,6 +2842,19 @@ fn apply_private_confirmation(
                 return Ok(());
             }
             push_private_fills(plan, generated_at, index, leg, confirmation, aggregate)?;
+            if confirmation.fills.iter().any(|fill| !fill.fee_complete) {
+                aggregate.any_incomplete_fee = true;
+                aggregate.any_failure = true;
+                aggregate.failures.push(render_failure(
+                    plan,
+                    index,
+                    Some(leg.plan_leg_id.as_str()),
+                    FailureMode::ManualInterventionRequired,
+                    ExecutionFailureSeverity::Warn,
+                    "私有确认包含成交价格和数量，但手续费明细不完整；执行报告仅保留 0 手续费占位，完整净盈亏必须等待手续费补账。",
+                    "private-fee-incomplete",
+                ));
+            }
             aggregate.filled_order_leg_count += 1;
             aggregate.leg_reports.push(render_leg_report(
                 leg.plan_leg_id.as_str(),
@@ -3019,7 +3047,11 @@ fn private_execution_reconciliation_status(
 ) -> ReconciliationStatus {
     if aggregate.any_unknown {
         ReconciliationStatus::Unknown
-    } else if aggregate.any_pending || aggregate.any_partial || aggregate.any_failure {
+    } else if aggregate.any_pending
+        || aggregate.any_partial
+        || aggregate.any_failure
+        || aggregate.any_incomplete_fee
+    {
         ReconciliationStatus::Pending
     } else if aggregate.order_leg_count > 0
         && aggregate.filled_order_leg_count == aggregate.order_leg_count
@@ -4932,6 +4964,48 @@ mod tests {
             incidents_from_private_execution_report(&plan, &report, "2026-01-01T00:00:07Z")
                 .expect("incident generation");
         assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn private_fill_with_incomplete_fee_keeps_reconciliation_pending() {
+        let plan = pending_manual_plan().plan_preview;
+        let order_leg = &plan.legs[1];
+        let confirmation = PrivateOrderConfirmation::new(
+            order_leg.plan_leg_id.as_str(),
+            PrivateOrderConfirmationStatus::Filled,
+            PrivateOrderConfirmationSource::OrderQuery,
+            "event:binance:spot:query:filled",
+        )
+        .with_fill(
+            PrivateExecutionFill::new(
+                FillSide::Buy,
+                "43100.50",
+                "0.001",
+                "asset:USDC",
+                "0",
+                "event:binance:spot:query:filled",
+            )
+            .with_incomplete_fee()
+            .with_timestamp("2026-01-01T00:00:05Z"),
+        );
+
+        let report = execution_report_from_private_confirmations(PrivateExecutionReportInput::new(
+            &plan,
+            "2026-01-01T00:00:06Z",
+            std::slice::from_ref(&confirmation),
+        ))
+        .expect("private confirmation report");
+
+        assert_eq!(report.status, ExecutionReportStatus::PartiallySucceeded);
+        assert_eq!(report.reconciliation_status, ReconciliationStatus::Pending);
+        assert_eq!(report.fills.len(), 1);
+        assert!(report.failures.iter().any(|failure| {
+            failure.failure_type == FailureMode::ManualInterventionRequired
+                && failure
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("手续费明细不完整"))
+        }));
     }
 
     #[test]

@@ -14088,6 +14088,10 @@ fn write_basis_exit_supervisor_artifacts(
     write_utf8(
         output_dir.join("basis_exit_private_confirmations.jsonl"),
         &private_confirmations_jsonl(confirmations),
+    )?;
+    write_utf8(
+        output_dir.join("basis_execution_fills.jsonl"),
+        &private_execution_fills_jsonl(confirmations),
     )
 }
 
@@ -30914,6 +30918,10 @@ fn write_funding_arb_exit_cycle_artifacts(
     write_utf8(
         output_dir.join("funding_arb_exit_private_confirmations.jsonl"),
         &private_confirmations_jsonl(confirmations),
+    )?;
+    write_utf8(
+        output_dir.join("funding_arb_execution_fills.jsonl"),
+        &private_execution_fills_jsonl(confirmations),
     )
 }
 
@@ -36560,11 +36568,17 @@ fn private_execution_fill_from_update(
         fill.source_event_id.clone(),
     )
     .with_timestamp(fill.timestamp.clone());
+    if private_order_fill_missing_fee_details(fill) {
+        execution_fill = execution_fill.with_incomplete_fee();
+    }
     if let Some(order_id) = &update.venue_order_id {
         execution_fill = execution_fill.with_venue_order_id(order_id.as_str());
     }
     if let Some(client_order_id) = &update.client_order_id {
         execution_fill = execution_fill.with_client_order_id(client_order_id.as_str());
+    }
+    if let Some(trade_id) = &fill.trade_id {
+        execution_fill = execution_fill.with_venue_trade_id(trade_id.as_str());
     }
     Some(execution_fill)
 }
@@ -37194,6 +37208,10 @@ fn write_funding_arb_guarded_live_canary_artifacts(
         &private_confirmations_jsonl(confirmations),
     )?;
     write_utf8(
+        output_dir.join("funding_arb_execution_fills.jsonl"),
+        &private_execution_fills_jsonl(confirmations),
+    )?;
+    write_utf8(
         output_dir.join("execution_reports.jsonl"),
         &execution_report
             .map(|report| canonical_jsonl(std::slice::from_ref(report)))
@@ -37402,6 +37420,10 @@ fn write_basis_guarded_live_cycle_artifacts(
     write_utf8(
         output_dir.join("private_confirmations.jsonl"),
         &private_confirmations_jsonl(confirmations),
+    )?;
+    write_utf8(
+        output_dir.join("basis_execution_fills.jsonl"),
+        &private_execution_fills_jsonl(confirmations),
     )?;
     write_utf8(
         output_dir.join("execution_reports.jsonl"),
@@ -37660,6 +37682,10 @@ fn write_binance_guarded_live_dispatch_artifacts(
         &private_confirmations_jsonl(confirmations),
     )?;
     write_utf8(
+        output_dir.join("execution_fills.jsonl"),
+        &private_execution_fills_jsonl(confirmations),
+    )?;
+    write_utf8(
         output_dir.join("execution_reports.jsonl"),
         &execution_report
             .map(|report| canonical_jsonl(std::slice::from_ref(report)))
@@ -37804,10 +37830,17 @@ fn private_confirmations_jsonl(
 #[cfg(feature = "live-exec")]
 fn private_confirmation_json(confirmation: &arb_execution::PrivateOrderConfirmation) -> String {
     format!(
-        "{{\"client_order_id\":{},\"detail\":{},\"fill_count\":{},\"plan_leg_id\":{},\"source\":{},\"source_event_refs\":[{}],\"status\":{},\"venue_order_id\":{}}}",
+        "{{\"client_order_id\":{},\"detail\":{},\"fill_count\":{},\"fills\":[{}],\"plan_leg_id\":{},\"source\":{},\"source_event_refs\":[{}],\"status\":{},\"venue_order_id\":{}}}",
         optional_json_string(confirmation.client_order_id.as_deref()),
         optional_json_string(confirmation.detail.as_deref()),
         confirmation.fills.len(),
+        confirmation
+            .fills
+            .iter()
+            .enumerate()
+            .map(|(index, fill)| private_execution_fill_json(confirmation, index, fill))
+            .collect::<Vec<_>>()
+            .join(","),
         json_string(&confirmation.plan_leg_id),
         json_string(confirmation.source.as_str()),
         confirmation
@@ -37818,6 +37851,61 @@ fn private_confirmation_json(confirmation: &arb_execution::PrivateOrderConfirmat
             .join(","),
         json_string(confirmation.status.as_str()),
         optional_json_string(confirmation.venue_order_id.as_deref()),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn private_execution_fills_jsonl(
+    confirmations: &[arb_execution::PrivateOrderConfirmation],
+) -> String {
+    confirmations
+        .iter()
+        .flat_map(|confirmation| {
+            confirmation
+                .fills
+                .iter()
+                .enumerate()
+                .map(move |(index, fill)| private_execution_fill_json(confirmation, index, fill))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(feature = "live-exec")]
+fn private_execution_fill_json(
+    confirmation: &arb_execution::PrivateOrderConfirmation,
+    fill_index: usize,
+    fill: &arb_execution::PrivateExecutionFill,
+) -> String {
+    let venue_order_id = fill
+        .venue_order_id
+        .as_deref()
+        .or(confirmation.venue_order_id.as_deref());
+    let client_order_id = fill
+        .client_order_id
+        .as_deref()
+        .or(confirmation.client_order_id.as_deref());
+    format!(
+        "{{\"client_order_id\":{},\"fee_amount\":{},\"fee_asset_id\":{},\"fee_status\":{},\"fill_index\":{},\"ledger_entry_id\":{},\"plan_leg_id\":{},\"price\":{},\"quantity\":{},\"schema_version\":\"1.0.0\",\"side\":{},\"source\":{},\"source_event_id\":{},\"timestamp\":{},\"venue_order_id\":{},\"venue_trade_id\":{}}}",
+        optional_json_string(client_order_id),
+        json_string(&fill.fee_amount),
+        json_string(&fill.fee_asset_id),
+        json_string(if fill.fee_complete {
+            "complete"
+        } else {
+            "incomplete_fee_placeholder"
+        }),
+        fill_index,
+        optional_json_string(fill.ledger_entry_id.as_deref()),
+        json_string(&confirmation.plan_leg_id),
+        json_string(&fill.price),
+        json_string(&fill.quantity),
+        json_string(fill.side.as_str()),
+        json_string(confirmation.source.as_str()),
+        json_string(&fill.source_event_id),
+        optional_json_string(fill.timestamp.as_deref()),
+        optional_json_string(venue_order_id),
+        optional_json_string(fill.venue_trade_id.as_deref()),
     )
 }
 
@@ -39328,7 +39416,26 @@ impl BinanceBasisMonitorSnapshot {
     }
 
     fn to_json(&self) -> String {
+        self.to_json_limited(None, false)
+    }
+
+    #[cfg(test)]
+    fn opportunities_json(&self) -> String {
+        self.opportunities_json_limited(None, false)
+    }
+
+    fn to_json_limited(&self, row_limit: Option<usize>, summary_only: bool) -> String {
         let blocking_path = basis_monitor_blocking_path(self);
+        let rows_json = if summary_only {
+            String::new()
+        } else {
+            self.rows
+                .iter()
+                .take(row_limit.unwrap_or(usize::MAX))
+                .map(BinanceBasisMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
             "{{\"blocking_path\":{},\"candidate_count\":{},\"filtered_funding_count\":{},\"last_error\":{},\"min_abs_funding_rate\":{},\"min_net_bps\":{},\"missing_perp_count\":{},\"missing_spot_count\":{},\"rows\":[{}],\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
             funding_arb_blocking_path_json(&blocking_path),
@@ -39339,30 +39446,32 @@ impl BinanceBasisMonitorSnapshot {
             json_string(&self.min_net_bps),
             self.missing_perp_count,
             self.missing_spot_count,
-            self.rows
-                .iter()
-                .map(BinanceBasisMarketRow::to_json)
-                .collect::<Vec<_>>()
-                .join(","),
+            rows_json,
             json_string(&self.status),
             self.total_rows,
             json_string(&self.updated_at),
         )
     }
 
-    fn opportunities_json(&self) -> String {
+    fn opportunities_json_limited(&self, row_limit: Option<usize>, summary_only: bool) -> String {
         let blocking_path = basis_monitor_blocking_path(self);
+        let rows_json = if summary_only {
+            String::new()
+        } else {
+            self.rows
+                .iter()
+                .filter(|row| row.is_candidate)
+                .take(row_limit.unwrap_or(usize::MAX))
+                .map(BinanceBasisMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
             "{{\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"rows\":[{}],\"status\":{},\"updated_at\":{}}}",
             funding_arb_blocking_path_json(&blocking_path),
             self.candidate_count,
             json_option_string(&self.last_error),
-            self.rows
-                .iter()
-                .filter(|row| row.is_candidate)
-                .map(BinanceBasisMarketRow::to_json)
-                .collect::<Vec<_>>()
-                .join(","),
+            rows_json,
             json_string(&self.status),
             json_string(&self.updated_at),
         )
@@ -39457,18 +39566,33 @@ impl FundingArbMonitorSnapshot {
     }
 
     fn to_json(&self) -> String {
+        self.to_json_limited(None, false)
+    }
+
+    #[cfg(test)]
+    fn opportunities_json(&self) -> String {
+        self.opportunities_json_limited(None, false)
+    }
+
+    fn to_json_limited(&self, row_limit: Option<usize>, summary_only: bool) -> String {
         let blocking_path = funding_arb_monitor_blocking_path(self);
+        let rows_json = if summary_only {
+            String::new()
+        } else {
+            self.rows
+                .iter()
+                .take(row_limit.unwrap_or(usize::MAX))
+                .map(FundingArbMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
             "{{\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
             funding_arb_blocking_path_json(&blocking_path),
             self.candidate_count,
             json_option_string(&self.last_error),
             json_string(&self.min_net_funding_bps),
-            self.rows
-                .iter()
-                .map(FundingArbMarketRow::to_json)
-                .collect::<Vec<_>>()
-                .join(","),
+            rows_json,
             self.source_count,
             self.source_error_count,
             json_string(&self.status),
@@ -39477,18 +39601,24 @@ impl FundingArbMonitorSnapshot {
         )
     }
 
-    fn opportunities_json(&self) -> String {
+    fn opportunities_json_limited(&self, row_limit: Option<usize>, summary_only: bool) -> String {
         let blocking_path = funding_arb_monitor_blocking_path(self);
+        let rows_json = if summary_only {
+            String::new()
+        } else {
+            self.rows
+                .iter()
+                .filter(|row| row.is_candidate)
+                .take(row_limit.unwrap_or(usize::MAX))
+                .map(FundingArbMarketRow::to_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
             "{{\"blocking_path\":{},\"candidate_count\":{},\"rows\":[{}],\"status\":{},\"updated_at\":{}}}",
             funding_arb_blocking_path_json(&blocking_path),
             self.candidate_count,
-            self.rows
-                .iter()
-                .filter(|row| row.is_candidate)
-                .map(FundingArbMarketRow::to_json)
-                .collect::<Vec<_>>()
-                .join(","),
+            rows_json,
             json_string(&self.status),
             json_string(&self.updated_at),
         )
@@ -45314,6 +45444,44 @@ mod tests {
         let opportunities_json = snapshot.opportunities_json();
         assert!(opportunities_json.contains("\"rows\":[]"));
         assert!(opportunities_json.contains("venue_b.perp_bid_qty"));
+    }
+
+    #[test]
+    fn funding_arb_monitor_status_supports_row_limit_and_summary_only() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00600000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let options = FundingArbMonitorOptions::default();
+        let mut snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![binance, bybit], vec![], &options)
+                .expect("funding arb snapshot");
+        snapshot.rows.push(snapshot.rows[0].clone());
+        snapshot.total_rows = snapshot.rows.len();
+
+        let limited_json = snapshot.to_json_limited(Some(1), false);
+        assert_eq!(limited_json.matches("\"pair_id\"").count(), 1);
+        assert!(limited_json.contains("\"total_rows\":2"));
+
+        let summary_json = snapshot.to_json_limited(Some(1), true);
+        assert!(summary_json.contains("\"rows\":[]"));
+        assert!(summary_json.contains("\"total_rows\":2"));
     }
 
     #[test]
@@ -53682,6 +53850,13 @@ mod tests {
         assert_eq!(confirmation.fills.len(), 1);
         assert_eq!(confirmation.fills[0].fee_asset_id, "asset:USDT");
         assert_eq!(confirmation.fills[0].fee_amount, "0");
+        assert!(!confirmation.fills[0].fee_complete);
+        let json = private_confirmation_json(&confirmation);
+        assert!(json.contains("\"fills\":["));
+        assert!(json.contains("\"fee_status\":\"incomplete_fee_placeholder\""));
+        let fills_jsonl = private_execution_fills_jsonl(std::slice::from_ref(&confirmation));
+        assert!(fills_jsonl.contains("\"plan_leg_id\":\"pleg:bitget-perp\""));
+        assert!(fills_jsonl.contains("\"venue_trade_id\":\"1\""));
         assert!(confirmation
             .detail
             .as_deref()

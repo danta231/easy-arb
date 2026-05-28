@@ -132,6 +132,34 @@ pub(crate) fn start_funding_arb_http_api(
     Ok(handle)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct MonitorHttpQuery {
+    row_limit: Option<usize>,
+    summary_only: bool,
+}
+
+fn parse_monitor_http_query(path: &str) -> (&str, MonitorHttpQuery) {
+    let Some((route, query)) = path.split_once('?') else {
+        return (path, MonitorHttpQuery::default());
+    };
+    let mut parsed = MonitorHttpQuery::default();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = key.trim();
+        let value = value.trim();
+        if matches!(key, "summary" | "summaryOnly" | "summary_only") {
+            parsed.summary_only = matches!(value, "1" | "true" | "yes" | "y" | "");
+        } else if matches!(key, "limit" | "rows" | "row_limit") {
+            if matches!(value, "all" | "full" | "debug") {
+                parsed.row_limit = None;
+            } else if let Ok(limit) = value.parse::<usize>() {
+                parsed.row_limit = Some(limit);
+            }
+        }
+    }
+    (route, parsed)
+}
+
 fn handle_basis_http_connection(
     mut stream: TcpStream,
     state: &Arc<RwLock<BinanceBasisMonitorSnapshot>>,
@@ -146,7 +174,7 @@ fn handle_basis_http_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
-    let route = path.split('?').next().unwrap_or(path);
+    let (route, query) = parse_monitor_http_query(path);
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -171,9 +199,15 @@ fn handle_basis_http_connection(
             ),
         )
     } else if route == "/api/basis/status" {
-        (200, snapshot.to_json())
+        (
+            200,
+            snapshot.to_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/basis/opportunities" {
-        (200, snapshot.opportunities_json())
+        (
+            200,
+            snapshot.opportunities_json_limited(query.row_limit, query.summary_only),
+        )
     } else if let Some(symbol) = route.strip_prefix("/api/basis/status/") {
         match snapshot.symbol_json(symbol.trim_matches('/')) {
             Some(row) => (200, row),
@@ -208,7 +242,7 @@ fn handle_bybit_basis_http_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
-    let route = path.split('?').next().unwrap_or(path);
+    let (route, query) = parse_monitor_http_query(path);
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -229,9 +263,15 @@ fn handle_bybit_basis_http_connection(
             ),
         )
     } else if route == "/api/bybit-basis/status" {
-        (200, snapshot.to_json())
+        (
+            200,
+            snapshot.to_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/bybit-basis/opportunities" {
-        (200, snapshot.opportunities_json())
+        (
+            200,
+            snapshot.opportunities_json_limited(query.row_limit, query.summary_only),
+        )
     } else if let Some(symbol) = route.strip_prefix("/api/bybit-basis/status/") {
         match snapshot.symbol_json(symbol.trim_matches('/')) {
             Some(row) => (200, row),
@@ -266,7 +306,7 @@ fn handle_okx_basis_http_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
-    let route = path.split('?').next().unwrap_or(path);
+    let (route, query) = parse_monitor_http_query(path);
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -287,9 +327,15 @@ fn handle_okx_basis_http_connection(
             ),
         )
     } else if route == "/api/okx-basis/status" {
-        (200, snapshot.to_json())
+        (
+            200,
+            snapshot.to_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/okx-basis/opportunities" {
-        (200, snapshot.opportunities_json())
+        (
+            200,
+            snapshot.opportunities_json_limited(query.row_limit, query.summary_only),
+        )
     } else if let Some(symbol) = route.strip_prefix("/api/okx-basis/status/") {
         match snapshot.symbol_json(symbol.trim_matches('/')) {
             Some(row) => (200, row),
@@ -324,7 +370,7 @@ fn handle_bitget_basis_http_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
-    let route = path.split('?').next().unwrap_or(path);
+    let (route, query) = parse_monitor_http_query(path);
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -349,9 +395,15 @@ fn handle_bitget_basis_http_connection(
             ),
         )
     } else if route == "/api/bitget-basis/status" {
-        (200, snapshot.to_json())
+        (
+            200,
+            snapshot.to_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/bitget-basis/opportunities" {
-        (200, snapshot.opportunities_json())
+        (
+            200,
+            snapshot.opportunities_json_limited(query.row_limit, query.summary_only),
+        )
     } else if let Some(symbol) = route.strip_prefix("/api/bitget-basis/status/") {
         match snapshot.symbol_json(symbol.trim_matches('/')) {
             Some(row) => (200, row),
@@ -386,7 +438,7 @@ fn handle_hyperliquid_basis_http_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
-    let route = path.split('?').next().unwrap_or(path);
+    let (route, query) = parse_monitor_http_query(path);
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -411,9 +463,15 @@ fn handle_hyperliquid_basis_http_connection(
             ),
         )
     } else if route == "/api/hyperliquid-basis/status" {
-        (200, snapshot.to_json())
+        (
+            200,
+            snapshot.to_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/hyperliquid-basis/opportunities" {
-        (200, snapshot.opportunities_json())
+        (
+            200,
+            snapshot.opportunities_json_limited(query.row_limit, query.summary_only),
+        )
     } else if let Some(symbol) = route.strip_prefix("/api/hyperliquid-basis/status/") {
         match snapshot.symbol_json(symbol.trim_matches('/')) {
             Some(row) => (200, row),
@@ -448,7 +506,7 @@ fn handle_aster_basis_http_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
-    let route = path.split('?').next().unwrap_or(path);
+    let (route, query) = parse_monitor_http_query(path);
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -469,9 +527,15 @@ fn handle_aster_basis_http_connection(
             ),
         )
     } else if route == "/api/aster-basis/status" {
-        (200, snapshot.to_json())
+        (
+            200,
+            snapshot.to_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/aster-basis/opportunities" {
-        (200, snapshot.opportunities_json())
+        (
+            200,
+            snapshot.opportunities_json_limited(query.row_limit, query.summary_only),
+        )
     } else if let Some(symbol) = route.strip_prefix("/api/aster-basis/status/") {
         match snapshot.symbol_json(symbol.trim_matches('/')) {
             Some(row) => (200, row),
@@ -507,7 +571,7 @@ fn handle_funding_arb_http_connection(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
-    let route = path.split('?').next().unwrap_or(path);
+    let (route, query) = parse_monitor_http_query(path);
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -528,9 +592,15 @@ fn handle_funding_arb_http_connection(
             ),
         )
     } else if route == "/api/funding-arb/status" {
-        (200, snapshot.to_json())
+        (
+            200,
+            snapshot.to_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/funding-arb/opportunities" {
-        (200, snapshot.opportunities_json())
+        (
+            200,
+            snapshot.opportunities_json_limited(query.row_limit, query.summary_only),
+        )
     } else if route == "/api/funding-arb/execution-status" {
         (200, funding_arb_execution_status_json(context.as_ref()))
     } else if route == "/api/funding-arb/history" {
