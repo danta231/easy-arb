@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arb_domain::{AssetId, InstrumentId, Price, Quantity, UtcTimestamp, VenueId};
 use arb_venue_data::{
@@ -3210,12 +3210,36 @@ pub(crate) fn hyperliquid_wss_bbo_subscribe_payload(coin: &str) -> RuntimeResult
 }
 
 pub(crate) fn public_wss_reconnect_backoff(base_secs: u64, consecutive_failures: u32) -> Duration {
+    let jitter_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos()))
+        .unwrap_or(0);
+    public_wss_reconnect_backoff_with_jitter_seed(base_secs, consecutive_failures, jitter_seed)
+}
+
+fn public_wss_reconnect_backoff_with_jitter_seed(
+    base_secs: u64,
+    consecutive_failures: u32,
+    jitter_seed: u64,
+) -> Duration {
     let shift = consecutive_failures.saturating_sub(1).min(5);
     let multiplier = 1_u64.checked_shl(shift).unwrap_or(32);
+    let base_secs = base_secs.max(1);
     let seconds = base_secs
         .saturating_mul(multiplier)
         .min(PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS);
-    Duration::from_secs(seconds.max(1))
+    let jitter_window_secs = base_secs.min(5);
+    let jitter_secs = if seconds >= PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS || jitter_window_secs <= 1
+    {
+        0
+    } else {
+        jitter_seed % jitter_window_secs
+    };
+    Duration::from_secs(
+        seconds
+            .saturating_add(jitter_secs)
+            .min(PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS),
+    )
 }
 
 pub(crate) fn validate_binance_wss_probe_options(
@@ -4455,4 +4479,29 @@ pub(crate) fn handle_public_wss_book_ticker_http_connection(
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_wss_reconnect_backoff_applies_exponential_cap_and_jitter() {
+        assert_eq!(
+            public_wss_reconnect_backoff_with_jitter_seed(2, 1, 0),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            public_wss_reconnect_backoff_with_jitter_seed(2, 1, 1),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            public_wss_reconnect_backoff_with_jitter_seed(2, 4, 0),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            public_wss_reconnect_backoff_with_jitter_seed(2, 64, 1),
+            Duration::from_secs(PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS)
+        );
+    }
 }

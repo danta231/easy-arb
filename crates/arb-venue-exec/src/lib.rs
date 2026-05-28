@@ -14813,6 +14813,31 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bitget_spot_config_keeps_target_leverage_unset() {
+        let config = live::BitgetExecConfig::spot(
+            venue("venue:BITGET-SPOT"),
+            account("account:bitget-unit"),
+            "https://api.bitget.com",
+            bitget_signing_policy("kms-policy/bitget-spot-config-unit"),
+        )
+        .unwrap();
+
+        assert_eq!(config.market(), live::BitgetExecMarket::Spot);
+        assert_eq!(config.target_leverage(), None);
+        let error = config
+            .with_target_leverage(1)
+            .expect_err("Bitget spot config must reject target leverage");
+        match error {
+            VenueExecError::InvalidRequest { field, reason } => {
+                assert_eq!(field, "target_leverage");
+                assert!(reason.contains("USDT-FUTURES"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn bitget_spot_market_order_uses_real_submit_body_without_price() {
         let mut adapter = live::BitgetSpotExecAdapter::new(
             live::BitgetExecConfig::spot(

@@ -11268,35 +11268,42 @@ fn funding_arb_live_dispatch_affordability_blocking_reason_with_leverage_resolve
         "funding_private_account.min_margin_buffer_usd",
         min_margin_raw,
     )?;
-    let Some((required, max_notional, min_leverage)) =
-        funding_arb_dispatch_required_collateral_usd(
-            dispatch_plan,
-            taker_fee_bps,
-            slippage_buffer_bps,
-            resolve_leverage,
-        )?
+    let Some(required) = funding_arb_dispatch_required_collateral_usd(
+        dispatch_plan,
+        taker_fee_bps,
+        slippage_buffer_bps,
+        resolve_leverage,
+    )?
     else {
         return Ok(None);
     };
 
-    if min_available.raw < required.raw || min_margin_buffer.raw < required.raw {
-        let buffer_bps = taker_fee_bps
-            .checked_add(slippage_buffer_bps)
-            .ok_or_else(|| RuntimeError::LiveMarketData {
-                message: "funding arb live dispatch buffer bps overflowed".to_owned(),
-            })?;
+    if min_available.raw < required.available_required.raw
+        || min_margin_buffer.raw < required.margin_required.raw
+    {
         return Ok(Some(format!(
-            "private account minimum available={} USD and margin_buffer={} USD must both be at least estimated funding-arb live dispatch requirement {} USD (max leg notional {} USD at target leverage {} plus taker/slippage buffer {} bps)",
+            "private account minimum available={} USD must be at least estimated funding-arb live dispatch available requirement {} USD, and margin_buffer={} USD must be at least margin requirement {} USD (max leg notional {} USD at target leverage {} plus taker/slippage buffer {} bps)",
             min_available.format_trimmed(),
+            required.available_required.format_trimmed(),
             min_margin_buffer.format_trimmed(),
-            required.format_trimmed(),
-            max_notional.format_trimmed(),
-            min_leverage,
-            buffer_bps
+            required.margin_required.format_trimmed(),
+            required.max_notional.format_trimmed(),
+            required.min_leverage,
+            required.buffer_bps
         )));
     }
 
     Ok(None)
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FundingArbDispatchRequiredCollateral {
+    available_required: MonitorDecimal,
+    margin_required: MonitorDecimal,
+    max_notional: MonitorDecimal,
+    min_leverage: u32,
+    buffer_bps: i128,
 }
 
 #[cfg(feature = "live-exec")]
@@ -11305,7 +11312,7 @@ fn funding_arb_dispatch_required_collateral_usd(
     taker_fee_bps: i128,
     slippage_buffer_bps: i128,
     resolve_leverage: fn(&VenueId) -> RuntimeResult<u32>,
-) -> RuntimeResult<Option<(MonitorDecimal, MonitorDecimal, u32)>> {
+) -> RuntimeResult<Option<FundingArbDispatchRequiredCollateral>> {
     let buffer_bps = taker_fee_bps
         .checked_add(slippage_buffer_bps)
         .ok_or_else(|| RuntimeError::LiveMarketData {
@@ -11317,7 +11324,8 @@ fn funding_arb_dispatch_required_collateral_usd(
         });
     }
 
-    let mut max_required: Option<MonitorDecimal> = None;
+    let mut max_available_required: Option<MonitorDecimal> = None;
+    let mut max_margin_required: Option<MonitorDecimal> = None;
     let mut max_notional: Option<MonitorDecimal> = None;
     let mut min_leverage: Option<u32> = None;
     for planned in &dispatch_plan.requests {
@@ -11329,11 +11337,17 @@ fn funding_arb_dispatch_required_collateral_usd(
             "funding_arb.dispatch_plan.notional_usd",
             &planned.notional_usd.to_string(),
         )?;
-        let required =
-            funding_arb_planned_order_required_collateral_usd(notional, leverage, buffer_bps)?;
-        max_required = Some(match max_required {
-            Some(current) if current.raw >= required.raw => current,
-            _ => required,
+        let available_required =
+            funding_arb_planned_order_required_available_usd(notional, buffer_bps)?;
+        let margin_required =
+            funding_arb_planned_order_required_margin_usd(notional, leverage, buffer_bps)?;
+        max_available_required = Some(match max_available_required {
+            Some(current) if current.raw >= available_required.raw => current,
+            _ => available_required,
+        });
+        max_margin_required = Some(match max_margin_required {
+            Some(current) if current.raw >= margin_required.raw => current,
+            _ => margin_required,
         });
         max_notional = Some(match max_notional {
             Some(current) if current.raw >= notional.raw => current,
@@ -11345,17 +11359,33 @@ fn funding_arb_dispatch_required_collateral_usd(
         });
     }
 
-    Ok(max_required.map(|required| {
-        (
-            required,
-            max_notional.expect("max notional set with required"),
-            min_leverage.expect("min leverage set with required"),
-        )
-    }))
+    Ok(
+        max_available_required.map(|available_required| FundingArbDispatchRequiredCollateral {
+            available_required,
+            margin_required: max_margin_required.expect("max margin required set with available"),
+            max_notional: max_notional.expect("max notional set with required"),
+            min_leverage: min_leverage.expect("min leverage set with required"),
+            buffer_bps,
+        }),
+    )
 }
 
 #[cfg(feature = "live-exec")]
-fn funding_arb_planned_order_required_collateral_usd(
+fn funding_arb_planned_order_required_available_usd(
+    notional: MonitorDecimal,
+    buffer_bps: i128,
+) -> RuntimeResult<MonitorDecimal> {
+    let buffer = notional
+        .checked_mul_i128(buffer_bps, "funding arb live dispatch available buffer")?
+        .checked_div_i128(10_000, "funding arb live dispatch available buffer")?;
+    notional.checked_add(
+        buffer,
+        "funding arb live dispatch required available balance",
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_planned_order_required_margin_usd(
     notional: MonitorDecimal,
     leverage: u32,
     buffer_bps: i128,
@@ -20910,6 +20940,17 @@ struct MonitorDecimal {
     raw: i128,
 }
 
+fn monitor_decimal_gcd_abs_i128(value: i128, positive: i128) -> i128 {
+    let mut left = value.unsigned_abs();
+    let mut right = positive.unsigned_abs();
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    i128::try_from(left).expect("monitor decimal gcd fits i128")
+}
+
 impl MonitorDecimal {
     const SCALE_DIGITS: usize = 18;
 
@@ -21018,6 +21059,26 @@ impl MonitorDecimal {
             raw: self
                 .raw
                 .checked_mul(value)
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: format!("{context} overflowed"),
+                })?,
+        })
+    }
+
+    fn checked_mul_decimal(self, value: Self, context: &'static str) -> RuntimeResult<Self> {
+        let mut left = self.raw;
+        let mut right = value.raw;
+        let mut divisor = 10_i128.pow(Self::SCALE_DIGITS as u32);
+        let left_gcd = monitor_decimal_gcd_abs_i128(left, divisor);
+        left /= left_gcd;
+        divisor /= left_gcd;
+        let right_gcd = monitor_decimal_gcd_abs_i128(right, divisor);
+        right /= right_gcd;
+        divisor /= right_gcd;
+        Ok(Self {
+            raw: left
+                .checked_mul(right)
+                .and_then(|raw| raw.checked_div(divisor))
                 .ok_or_else(|| RuntimeError::LiveMarketData {
                     message: format!("{context} overflowed"),
                 })?,
@@ -24964,6 +25025,7 @@ fn funding_arb_expected_funding_unavailable_can_hold(error: &RuntimeError) -> bo
                 && (
                     message == "funding arb row is missing gross_funding_spread_bps"
                     || message == "funding arb row gross_funding_spread_bps must be an integer"
+                    || message == "funding arb row gross_funding_spread_bps must be a decimal"
                 )
     )
 }
@@ -24976,20 +25038,20 @@ fn expected_gross_funding_usd(
         "funding_arb.notional_usd",
         &spec.strategy_config.economics.notional_usd,
     )?;
-    let gross_bps = row
-        .gross_funding_spread_bps
-        .as_deref()
-        .ok_or_else(|| RuntimeError::Module {
-            module: "arb-runtime",
-            message: "funding arb row is missing gross_funding_spread_bps".to_owned(),
-        })?
-        .parse::<i128>()
+    let gross_bps_raw =
+        row.gross_funding_spread_bps
+            .as_deref()
+            .ok_or_else(|| RuntimeError::Module {
+                module: "arb-runtime",
+                message: "funding arb row is missing gross_funding_spread_bps".to_owned(),
+            })?;
+    let gross_bps = MonitorDecimal::parse("funding_arb.gross_funding_spread_bps", gross_bps_raw)
         .map_err(|_| RuntimeError::Module {
             module: "arb-runtime",
-            message: "funding arb row gross_funding_spread_bps must be an integer".to_owned(),
+            message: "funding arb row gross_funding_spread_bps must be a decimal".to_owned(),
         })?;
     notional
-        .checked_mul_i128(gross_bps, "expected gross funding USD")
+        .checked_mul_decimal(gross_bps, "expected gross funding USD")
         .and_then(|value| value.checked_div_i128(10_000, "expected gross funding USD"))
 }
 
@@ -28098,10 +28160,10 @@ fn funding_arb_row_target_funding_time_ms(row: &FundingArbMarketRow) -> Option<u
 #[cfg(feature = "live-exec")]
 fn funding_arb_expected_gross_funding_usd_for_notional(
     notional_usd: &str,
-    gross_funding_spread_bps: i128,
+    gross_funding_spread_bps: MonitorDecimal,
 ) -> RuntimeResult<String> {
     MonitorDecimal::parse("funding_arb.notional_usd", notional_usd)?
-        .checked_mul_i128(gross_funding_spread_bps, "expected gross funding USD")?
+        .checked_mul_decimal(gross_funding_spread_bps, "expected gross funding USD")?
         .checked_div_i128(10_000, "expected gross funding USD")
         .map(|value| value.format_trimmed())
 }
@@ -28111,7 +28173,7 @@ fn funding_arb_target_expected_gross_funding_usd(
     row: &FundingArbMarketRow,
     notional_usd: &str,
 ) -> RuntimeResult<Option<String>> {
-    funding_arb_row_gross_funding_spread_bps(row)
+    funding_arb_row_gross_funding_spread_bps_decimal(row)
         .map(|gross_bps| {
             funding_arb_expected_gross_funding_usd_for_notional(notional_usd, gross_bps)
         })
@@ -36406,18 +36468,28 @@ fn private_confirmation_from_update(
     if let Some(client_order_id) = &update.client_order_id {
         confirmation = confirmation.with_client_order_id(client_order_id.as_str());
     }
-    if let Some(fill) = update
-        .last_fill
-        .as_ref()
-        .and_then(|fill| private_execution_fill_from_update(update, fill))
-    {
-        confirmation = confirmation.with_fill(fill);
+    if let Some(last_fill) = update.last_fill.as_ref() {
+        if let Some(fill) = private_execution_fill_from_update(update, last_fill) {
+            confirmation = confirmation.with_fill(fill);
+            if private_order_fill_missing_fee_details(last_fill) {
+                confirmation = confirmation.with_detail(
+                    "私有查单返回成交状态但缺少手续费明细；执行报告使用 0 手续费占位并保留手续费补账告警。",
+                );
+            }
+        } else if matches!(
+            update.status,
+            OrderConfirmationStatus::Filled | OrderConfirmationStatus::PartiallyFilled
+        ) {
+            confirmation = confirmation.with_detail(
+                "私有查单返回成交状态但缺少可入账成交明细；执行报告保持失败闭合，等待 user data stream 或更完整成交明细。",
+            );
+        }
     } else if matches!(
         update.status,
         OrderConfirmationStatus::Filled | OrderConfirmationStatus::PartiallyFilled
     ) {
         confirmation = confirmation.with_detail(
-            "私有查单返回成交状态但缺少手续费明细；执行报告保持失败闭合，等待 user data stream 或更完整成交明细。",
+            "私有查单返回成交状态但缺少可入账成交明细；执行报告保持失败闭合，等待 user data stream 或更完整成交明细。",
         );
     }
     confirmation
@@ -36469,8 +36541,16 @@ fn private_execution_fill_from_update(
         arb_venue_exec::OrderSide::Buy => arb_contracts::FillSide::Buy,
         arb_venue_exec::OrderSide::Sell => arb_contracts::FillSide::Sell,
     };
-    let fee_asset_id = fill.fee_asset_id.as_ref()?.as_str().to_owned();
-    let fee_amount = fill.fee_amount.as_ref()?.to_string();
+    let fee_asset_id = fill
+        .fee_asset_id
+        .as_ref()
+        .map(|asset_id| asset_id.as_str().to_owned())
+        .unwrap_or_else(|| private_execution_default_fee_asset_id(update));
+    let fee_amount = fill
+        .fee_amount
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "0".to_owned());
     let mut execution_fill = arb_execution::PrivateExecutionFill::new(
         side,
         fill.price.clone(),
@@ -36487,6 +36567,22 @@ fn private_execution_fill_from_update(
         execution_fill = execution_fill.with_client_order_id(client_order_id.as_str());
     }
     Some(execution_fill)
+}
+
+#[cfg(feature = "live-exec")]
+fn private_order_fill_missing_fee_details(fill: &PrivateOrderFillUpdate) -> bool {
+    fill.fee_asset_id.is_none() || fill.fee_amount.is_none()
+}
+
+#[cfg(feature = "live-exec")]
+fn private_execution_default_fee_asset_id(update: &PrivateOrderUpdate) -> String {
+    if matches!(update.market, PrivateOrderMarket::HyperliquidPerp)
+        || update.symbol.trim().to_ascii_uppercase().ends_with("USDC")
+    {
+        "asset:USDC".to_owned()
+    } else {
+        "asset:USDT".to_owned()
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -45726,6 +45822,36 @@ mod tests {
     }
 
     #[test]
+    fn funding_settlement_reconciliation_uses_decimal_gross_spread_bps() {
+        let mut row = funding_arb_test_row("0.00010000", "0.00683849");
+        row.gross_funding_spread_bps = Some("68.3849".to_owned());
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("unused.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("funding arb spec");
+
+        let expected = expected_gross_funding_usd(&row, &spec).expect("expected funding");
+
+        assert_eq!(expected.format_trimmed(), "0.683849");
+    }
+
+    #[test]
     fn funding_settlement_raw_snapshot_normalizes_exchange_specific_funding_entries() {
         let snapshot = parse_funding_settlement_raw_snapshot_json(
             r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T08:00:01Z","statements":[{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":{"result":{"list":[{"symbol":"BTCUSDT","type":"SETTLEMENT","cashFlow":"99.00","funding":"0.30","transactionTime":"1770000001000"}]}}},{"venue_family":"okx","account_id":"acct:okx-funding-arb-readonly","payload":{"data":[{"instId":"BTC-USDT-SWAP","type":"8","balChg":"-0.01","ts":"1770000002000"}]}},{"venue_family":"hyperliquid","account_id":"acct:hyperliquid-funding-arb-readonly","payload":[{"time":1770000000000,"delta":{"type":"funding","coin":"BTC","usdc":"0.24"}}]}]}"#,
@@ -48411,13 +48537,14 @@ mod tests {
             .expect("affordability check")
             .expect("exact one-x collateral is blocked");
 
-        assert!(reason.contains("estimated funding-arb live dispatch requirement 100.1 USD"));
+        assert!(reason.contains("available requirement 100.1 USD"));
+        assert!(reason.contains("margin requirement 100.1 USD"));
         assert!(reason.contains("target leverage 1"));
     }
 
     #[test]
     #[cfg(feature = "live-exec")]
-    fn funding_arb_live_dispatch_affordability_allows_buffered_ten_x_collateral() {
+    fn funding_arb_live_dispatch_affordability_blocks_ten_x_without_full_available_buffer() {
         fn ten_x(_: &VenueId) -> RuntimeResult<u32> {
             Ok(10)
         }
@@ -48457,6 +48584,67 @@ mod tests {
         aster.notional_usd = Amount::from_str("100").expect("notional");
         let dispatch_plan = ExecutionDispatchPlan {
             plan_id: "plan:funding-arb:affordability-ten-x-test".to_owned(),
+            requests: vec![bitget, aster],
+        };
+
+        let reason =
+            funding_arb_live_dispatch_affordability_blocking_reason_with_leverage_resolver(
+                &private_accounts,
+                &dispatch_plan,
+                5,
+                5,
+                ten_x,
+            )
+            .expect("affordability check");
+
+        let reason = reason.expect("available balance below full notional buffer is blocked");
+        assert!(reason.contains("available requirement 100.1 USD"));
+        assert!(reason.contains("margin requirement 10.1 USD"));
+        assert!(reason.contains("target leverage 10"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_live_dispatch_affordability_allows_buffered_available_and_margin() {
+        fn ten_x(_: &VenueId) -> RuntimeResult<u32> {
+            Ok(10)
+        }
+
+        let private_accounts = FundingPrivateAccountReconciliationSummary {
+            status: "Matched".to_owned(),
+            snapshot_updated_at: Some("2026-05-22T00:00:00Z".to_owned()),
+            checked_account_count: 2,
+            min_required_available_usd: Some("10".to_owned()),
+            min_available_usd: Some("100.1".to_owned()),
+            min_margin_buffer_usd: Some("10.1".to_owned()),
+            reason: None,
+        };
+        let mut bitget = test_basis_planned_order_for_account(
+            "perp_long",
+            BITGET_BASIS_PERP_VENUE_ID,
+            "inst:BITGET:CHIPUSDT:USDT-FUTURES",
+            "acct:bitget-funding-arb-readonly",
+            OrderSide::Buy,
+            "2081",
+            "0.04804",
+            "bitgetChipAfford10Ok",
+            "idem:funding:bitget:chip:afford-10-ok",
+        );
+        bitget.notional_usd = Amount::from_str("100").expect("notional");
+        let mut aster = test_basis_planned_order_for_account(
+            "perp_short",
+            "venue:ASTER-USDT-FUTURES",
+            "inst:ASTER:CHIPUSDT:USDT-FUTURES",
+            "acct:aster-funding-arb-readonly",
+            OrderSide::Sell,
+            "2081",
+            "0.04801",
+            "asterChipAfford10Ok",
+            "idem:funding:aster:chip:afford-10-ok",
+        );
+        aster.notional_usd = Amount::from_str("100").expect("notional");
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:funding-arb:affordability-ten-x-ok-test".to_owned(),
             requests: vec![bitget, aster],
         };
 
@@ -53471,6 +53659,33 @@ mod tests {
                 trade_id: Some("1".to_owned()),
             }),
         }
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn private_confirmation_uses_zero_fee_placeholder_when_fee_details_are_missing() {
+        let update = test_private_order_update(
+            arb_venue_exec::PrivateOrderMarket::BitgetUsdtFutures,
+            BITGET_BASIS_PERP_VENUE_ID,
+            BITGET_BASIS_PERP_INSTRUMENT_ID,
+            OrderConfirmationStatus::Filled,
+            Some("0.100"),
+            Some(OrderSide::Buy),
+        );
+
+        let confirmation = private_confirmation_from_update("pleg:bitget-perp", &update);
+
+        assert_eq!(
+            confirmation.status,
+            arb_execution::PrivateOrderConfirmationStatus::Filled
+        );
+        assert_eq!(confirmation.fills.len(), 1);
+        assert_eq!(confirmation.fills[0].fee_asset_id, "asset:USDT");
+        assert_eq!(confirmation.fills[0].fee_amount, "0");
+        assert!(confirmation
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("缺少手续费明细")));
     }
 
     #[cfg(feature = "live-exec")]
