@@ -6117,7 +6117,7 @@ fn binance_basis_live_stack_monitor_symbol(options: &BinanceBasisLiveStackOption
     options
         .monitor_symbol
         .clone()
-        .unwrap_or_else(|| BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
+        .unwrap_or_else(|| options.symbol.clone())
 }
 
 #[cfg(feature = "live-exec")]
@@ -6350,11 +6350,22 @@ fn multi_venue_basis_live_stack_monitor_symbol(
     if let Some(symbol) = &options.monitor_symbol {
         return symbol.clone();
     }
+    if options.opportunity_urls.contains_key(&venue) {
+        return multi_venue_basis_live_stack_all_market_monitor_symbol(venue).to_owned();
+    }
+    if let Some(symbol) = options.symbols.get(&venue) {
+        return symbol.clone();
+    }
+    venue.default_symbol().to_owned()
+}
+
+#[cfg(feature = "live-exec")]
+fn multi_venue_basis_live_stack_all_market_monitor_symbol(venue: BasisLiveVenue) -> &'static str {
     match venue {
-        BasisLiveVenue::Binance => BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
-        BasisLiveVenue::Bybit => BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
-        BasisLiveVenue::Okx => OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
-        BasisLiveVenue::Bitget => BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+        BasisLiveVenue::Binance => BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        BasisLiveVenue::Bybit => BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        BasisLiveVenue::Okx => OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        BasisLiveVenue::Bitget => BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
     }
 }
 
@@ -42847,6 +42858,7 @@ mod tests {
                 monitor_book_ticker_row("ETHBTC"),
                 monitor_book_ticker_row("btcusdt"),
             ],
+            BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
             true,
         )
         .expect("full market rows");
@@ -42862,6 +42874,7 @@ mod tests {
     fn binance_wss_single_symbol_rest_rows_remain_strict() {
         let error = prepare_binance_wss_book_ticker_rest_rows(
             vec![monitor_book_ticker_row("BTCUSDT_260327")],
+            "BTCUSDT_260327",
             false,
         )
         .expect_err("unsupported single symbol must fail closed");
@@ -42915,6 +42928,30 @@ mod tests {
         assert_eq!(parsed.update_id, 400900301);
         assert_eq!(parsed.best_bid.to_string(), "43250.10");
         assert_eq!(parsed.ask_size.to_string(), "1.50000000");
+    }
+
+    #[test]
+    fn public_wss_symbol_scope_accepts_sorted_explicit_lists() {
+        assert_eq!(
+            normalize_binance_wss_symbol_scope("ethusdt,btcusdt").expect("binance list"),
+            "BTCUSDT,ETHUSDT"
+        );
+        assert_eq!(
+            normalize_bybit_wss_symbol_scope("ethusdt,btcusdt").expect("bybit list"),
+            "BTCUSDT,ETHUSDT"
+        );
+        assert_eq!(
+            normalize_okx_wss_symbol_scope("eth-usdt,btc-usdt").expect("okx list"),
+            "BTC-USDT,ETH-USDT"
+        );
+        assert_eq!(
+            normalize_bitget_wss_symbol_scope("ethusdt,btcusdt").expect("bitget list"),
+            "BTCUSDT,ETHUSDT"
+        );
+        assert!(normalize_binance_wss_symbol_scope("ALL_USDT,BTCUSDT")
+            .expect_err("all scope cannot be mixed with explicit symbols")
+            .to_string()
+            .contains("cannot mix"));
     }
 
     #[test]
@@ -43881,17 +43918,28 @@ mod tests {
     fn binance_wss_book_ticker_all_market_stream_urls_match_market_shape() {
         let symbols = vec!["BTCUSDT".to_owned(), "ETHUSDT".to_owned()];
 
-        let spot =
-            binance_wss_book_ticker_all_market_stream_url(BinancePublicMarket::Spot, &symbols)
-                .expect("spot url");
+        let spot = binance_wss_book_ticker_all_market_stream_url(
+            BinancePublicMarket::Spot,
+            &symbols,
+            false,
+        )
+        .expect("spot url");
         let usdm = binance_wss_book_ticker_all_market_stream_url(
             BinancePublicMarket::UsdmPerpetual,
             &symbols,
+            true,
         )
         .expect("usdm url");
+        let scoped_usdm = binance_wss_book_ticker_all_market_stream_url(
+            BinancePublicMarket::UsdmPerpetual,
+            &symbols,
+            false,
+        )
+        .expect("scoped usdm url");
 
         assert!(spot.contains("/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"));
         assert_eq!(usdm, "wss://fstream.binance.com/public/ws/!bookTicker");
+        assert!(scoped_usdm.contains("/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"));
     }
 
     #[test]
@@ -44276,6 +44324,7 @@ mod tests {
                 "100.00".to_owned(),
                 "2.0".to_owned(),
             )],
+            BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
             true,
         )
         .expect("prepared rows");
@@ -51569,9 +51618,9 @@ mod tests {
         assert!(spot_args
             .windows(2)
             .any(|pair| pair[0] == "--market" && pair[1] == "spot"));
-        assert!(spot_args.windows(2).any(
-            |pair| pair[0] == "--symbol" && pair[1] == BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
-        ));
+        assert!(spot_args
+            .windows(2)
+            .any(|pair| pair[0] == "--symbol" && pair[1] == BASIS_SYMBOL));
         assert_eq!(resident_args[0], "binance-basis-resident-live");
         assert!(resident_args
             .windows(2)
@@ -51720,26 +51769,23 @@ mod tests {
         assert!(bybit_perp_args
             .windows(2)
             .any(|pair| pair[0] == "--market" && pair[1] == "linear-perp"));
-        assert!(
-            bybit_perp_args
-                .windows(2)
-                .any(|pair| pair[0] == "--symbol"
-                    && pair[1] == BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS)
-        );
+        assert!(bybit_perp_args
+            .windows(2)
+            .any(|pair| pair[0] == "--symbol" && pair[1] == BASIS_SYMBOL));
         assert_eq!(okx_perp_args[0], "okx-wss-book-ticker");
         assert!(okx_perp_args
             .windows(2)
             .any(|pair| pair[0] == "--market" && pair[1] == "swap"));
         assert!(okx_perp_args
             .windows(2)
-            .any(|pair| pair[0] == "--symbol" && pair[1] == OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS));
+            .any(|pair| pair[0] == "--symbol" && pair[1] == OKX_BASIS_SYMBOL));
         assert_eq!(bitget_spot_args[0], "bitget-wss-book-ticker");
         assert!(bitget_spot_args
             .windows(2)
             .any(|pair| pair[0] == "--market" && pair[1] == "spot"));
-        assert!(bitget_spot_args.windows(2).any(
-            |pair| pair[0] == "--symbol" && pair[1] == BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
-        ));
+        assert!(bitget_spot_args
+            .windows(2)
+            .any(|pair| pair[0] == "--symbol" && pair[1] == BITGET_BASIS_SYMBOL));
         assert_eq!(resident_args[0], "multi-venue-basis-resident-live");
         assert!(resident_args
             .windows(2)
@@ -51750,6 +51796,43 @@ mod tests {
                 && pair[1] == "http://127.0.0.1:8814"));
         assert!(resident_args.contains(&"--execute-live".to_owned()));
         assert!(resident_args.contains(&"--i-understand-basis-live-orders".to_owned()));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn multi_venue_basis_live_stack_keeps_all_scope_for_opportunity_urls() {
+        let options = MultiVenueBasisLiveStackOptions {
+            venues: vec![BasisLiveVenue::Bybit],
+            symbols: BTreeMap::new(),
+            opportunity_urls: BTreeMap::from([(
+                BasisLiveVenue::Bybit,
+                "http://127.0.0.1:8702/api/bybit-basis/opportunities".to_owned(),
+            )]),
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: None,
+            min_net_bps: 7,
+            auto_price_guard_bps: Some(3),
+            spot_wss_bind_addrs: BTreeMap::new(),
+            perp_wss_bind_addrs: BTreeMap::new(),
+            monitor_symbol: None,
+            monitor_reconnect_delay_secs: 3,
+            readiness_timeout_secs: 45,
+            shutdown_grace_secs: 4,
+            private_order_events_dir: None,
+            adl_events_dir: None,
+            poll_interval_secs: 30,
+            max_cycles: Some(5),
+            max_concurrent_positions: 2,
+            max_total_notional_usdt: "40.00".to_owned(),
+            use_existing_monitors: false,
+            execute_live: false,
+            acknowledge_basis_live_orders: false,
+        };
+
+        assert_eq!(
+            multi_venue_basis_live_stack_monitor_symbol(BasisLiveVenue::Bybit, &options),
+            BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS
+        );
     }
 
     #[cfg(feature = "live-exec")]

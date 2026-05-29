@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -1652,22 +1652,35 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_all_market(
     symbol_scope: &str,
     market: BinancePublicMarket,
 ) -> RuntimeResult<PublicTopOfBookAllMarketState> {
+    let symbol_scope = normalize_binance_wss_symbol_scope(symbol_scope)?;
     let venue_id = binance_public_wss_venue_id(market)?;
-    let all_symbols_scope = is_binance_wss_all_symbols_scope(symbol_scope);
-    let rest_url = if all_symbols_scope {
-        match market {
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&symbol_scope, is_binance_wss_all_symbols_scope);
+    let all_symbols_scope = target_symbols.is_none();
+    let rest_url = match target_symbols.as_ref() {
+        None => match market {
             BinancePublicMarket::Spot => binance_spot_book_ticker_all_url(),
             BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_all_url(),
+        },
+        Some(symbols) if symbols.len() == 1 => {
+            let symbol = symbols
+                .iter()
+                .next()
+                .expect("target symbol set is non-empty");
+            match market {
+                BinancePublicMarket::Spot => binance_spot_book_ticker_url(symbol),
+                BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_url(symbol),
+            }
         }
-    } else {
-        match market {
-            BinancePublicMarket::Spot => binance_spot_book_ticker_url(symbol_scope),
-            BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_url(symbol_scope),
-        }
+        Some(_) => match market {
+            BinancePublicMarket::Spot => binance_spot_book_ticker_all_url(),
+            BinancePublicMarket::UsdmPerpetual => binance_usdm_book_ticker_all_url(),
+        },
     };
     let raw_rest_snapshot = fetch_public_json_with_curl(&rest_url)?;
     let rows = prepare_binance_wss_book_ticker_rest_rows(
         parse_book_ticker_rows(&raw_rest_snapshot, "binance bookTicker")?,
+        &symbol_scope,
         all_symbols_scope,
     )?;
     if rows.is_empty() {
@@ -1702,7 +1715,8 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_all_market(
         symbols.push(symbol);
     }
 
-    let stream_url = binance_wss_book_ticker_all_market_stream_url(market, &symbols)?;
+    let stream_url =
+        binance_wss_book_ticker_all_market_stream_url(market, &symbols, all_symbols_scope)?;
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url,
@@ -1717,16 +1731,25 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_all_market(
 
 pub(crate) fn prepare_binance_wss_book_ticker_rest_rows(
     rows: Vec<MonitorBookTickerRow>,
+    symbol_scope: &str,
     all_symbols_scope: bool,
 ) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    let normalized_scope = normalize_binance_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope =
+        all_symbols_scope || is_binance_wss_all_symbols_scope(&normalized_scope);
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&normalized_scope, is_binance_wss_all_symbols_scope);
     let mut prepared = Vec::with_capacity(rows.len());
     for mut row in rows {
         match validate_binance_public_wss_symbol(&row.symbol) {
-            Ok(symbol) => {
+            Ok(symbol)
+                if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
+            {
                 row.symbol = symbol;
                 prepared.push(row);
             }
-            Err(_) if all_symbols_scope => {}
+            Ok(_) => {}
+            Err(_) if all_symbols_scope || target_symbols.is_some() => {}
             Err(error) => return Err(error),
         }
     }
@@ -1738,6 +1761,11 @@ pub(crate) fn prepare_binance_wss_book_ticker_rest_rows(
             prepared.insert(0, row);
         }
     }
+    ensure_wss_requested_symbols_present(
+        "Binance WSS bookTicker REST bootstrap",
+        target_symbols.as_ref(),
+        prepared.iter().map(|row| row.symbol.clone()).collect(),
+    )?;
     Ok(prepared)
 }
 
@@ -1745,8 +1773,9 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
     symbol_scope: &str,
     market: BybitPublicMarket,
 ) -> RuntimeResult<PublicTopOfBookAllMarketState> {
+    let symbol_scope = normalize_bybit_wss_symbol_scope(symbol_scope)?;
     let venue_id = bybit_public_wss_venue_id(market)?;
-    let all_symbols_scope = is_bybit_wss_all_symbols_scope(symbol_scope);
+    let all_symbols_scope = is_bybit_wss_all_symbols_scope(&symbol_scope);
     let raw_rest_snapshot = match market {
         BybitPublicMarket::Spot => fetch_public_json_with_curl(&bybit_spot_tickers_url())?,
         BybitPublicMarket::LinearPerpetual => {
@@ -1768,7 +1797,7 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
             })
             .collect(),
     };
-    let rows = prepare_bybit_wss_book_ticker_rest_rows(rows, symbol_scope, all_symbols_scope)?;
+    let rows = prepare_bybit_wss_book_ticker_rest_rows(rows, &symbol_scope, all_symbols_scope)?;
     if rows.is_empty() {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
@@ -1819,16 +1848,15 @@ pub(crate) fn prepare_bybit_wss_book_ticker_rest_rows(
     symbol_scope: &str,
     all_symbols_scope: bool,
 ) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
-    let target_symbol = if all_symbols_scope {
-        None
-    } else {
-        Some(validate_bybit_public_wss_symbol(symbol_scope)?)
-    };
+    let normalized_scope = normalize_bybit_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope = all_symbols_scope || is_bybit_wss_all_symbols_scope(&normalized_scope);
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&normalized_scope, is_bybit_wss_all_symbols_scope);
     let mut prepared = Vec::with_capacity(rows.len());
     for mut row in rows {
         match validate_bybit_public_wss_symbol(&row.symbol) {
             Ok(symbol)
-                if all_symbols_scope || target_symbol.as_deref() == Some(symbol.as_str()) =>
+                if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
             {
                 row.symbol = symbol;
                 prepared.push(row);
@@ -1839,6 +1867,11 @@ pub(crate) fn prepare_bybit_wss_book_ticker_rest_rows(
     }
     prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
     prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    ensure_wss_requested_symbols_present(
+        "Bybit WSS orderbook REST bootstrap",
+        target_symbols.as_ref(),
+        prepared.iter().map(|row| row.symbol.clone()).collect(),
+    )?;
     Ok(prepared)
 }
 
@@ -1987,10 +2020,16 @@ pub(crate) fn prepare_okx_wss_book_ticker_rest_rows(
     market: OkxPublicWssMarket,
     all_symbols_scope: bool,
 ) -> RuntimeResult<Vec<(String, OkxTickerRow)>> {
+    let normalized_scope = normalize_okx_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope = all_symbols_scope || is_okx_wss_all_symbols_scope(&normalized_scope);
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&normalized_scope, is_okx_wss_all_symbols_scope);
     let mut prepared = Vec::with_capacity(rows.len());
     for row in rows {
         match okx_public_wss_symbol_from_inst_id(&row.inst_id, market) {
-            Ok(symbol) if all_symbols_scope || symbol == symbol_scope => {
+            Ok(symbol)
+                if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
+            {
                 if !okx_ticker_row_has_complete_top_of_book(&row) {
                     if all_symbols_scope {
                         continue;
@@ -2019,6 +2058,11 @@ pub(crate) fn prepare_okx_wss_book_ticker_rest_rows(
             prepared.insert(0, row);
         }
     }
+    ensure_wss_requested_symbols_present(
+        "OKX WSS REST bootstrap",
+        target_symbols.as_ref(),
+        prepared.iter().map(|(symbol, _)| symbol.clone()).collect(),
+    )?;
     Ok(prepared)
 }
 
@@ -2039,10 +2083,16 @@ pub(crate) fn prepare_bitget_wss_book_ticker_rest_rows(
     market: BitgetPublicWssMarket,
     all_symbols_scope: bool,
 ) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    let normalized_scope = normalize_bitget_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope = all_symbols_scope || is_bitget_wss_all_symbols_scope(&normalized_scope);
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&normalized_scope, is_bitget_wss_all_symbols_scope);
     let mut prepared = Vec::with_capacity(rows.len());
     for mut row in rows {
         match normalize_cex_usdt_basis_symbol(&row.symbol, "Bitget") {
-            Ok(symbol) if all_symbols_scope || symbol == symbol_scope => {
+            Ok(symbol)
+                if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
+            {
                 if let Err(error) = bitget_public_wss_instrument_id(&symbol, market) {
                     if all_symbols_scope {
                         continue;
@@ -2067,6 +2117,11 @@ pub(crate) fn prepare_bitget_wss_book_ticker_rest_rows(
             prepared.insert(0, row);
         }
     }
+    ensure_wss_requested_symbols_present(
+        "Bitget WSS REST bootstrap",
+        target_symbols.as_ref(),
+        prepared.iter().map(|row| row.symbol.clone()).collect(),
+    )?;
     Ok(prepared)
 }
 
@@ -2076,11 +2131,19 @@ pub(crate) fn bootstrap_aster_wss_book_ticker(
 ) -> RuntimeResult<PublicTopOfBookAllMarketState> {
     let symbol_scope = normalize_aster_wss_symbol_scope(symbol_scope)?;
     let venue_id = VenueId::new(market.venue_id())?;
-    let all_symbols_scope = is_aster_wss_all_symbols_scope(&symbol_scope);
-    let raw_rest_snapshot = if all_symbols_scope {
-        fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?
-    } else {
-        fetch_public_json_with_curl(&aster_futures_book_ticker_url(&symbol_scope))?
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&symbol_scope, is_aster_wss_all_symbols_scope);
+    let all_symbols_scope = target_symbols.is_none();
+    let raw_rest_snapshot = match target_symbols.as_ref() {
+        None => fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?,
+        Some(symbols) if symbols.len() == 1 => {
+            let symbol = symbols
+                .iter()
+                .next()
+                .expect("target symbol set is non-empty");
+            fetch_public_json_with_curl(&aster_futures_book_ticker_url(symbol))?
+        }
+        Some(_) => fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?,
     };
     let rows = prepare_aster_wss_book_ticker_rest_rows(
         parse_book_ticker_rows(&raw_rest_snapshot, "aster wss bootstrap bookTicker")?,
@@ -2144,15 +2207,24 @@ pub(crate) fn bootstrap_hyperliquid_wss_book_ticker(
     market: HyperliquidPublicWssMarket,
 ) -> RuntimeResult<PublicTopOfBookAllMarketState> {
     let symbol_scope = normalize_hyperliquid_wss_symbol_scope(symbol_scope)?;
-    let all_symbols_scope = is_hyperliquid_wss_all_symbols_scope(&symbol_scope);
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&symbol_scope, is_hyperliquid_wss_all_symbols_scope);
+    let all_symbols_scope = target_symbols.is_none();
     let raw_rest_snapshot = fetch_public_json_post_with_curl(
         HYPERLIQUID_INFO_URL,
         &hyperliquid_info_request_body("metaAndAssetCtxs"),
     )?;
     let mut rows = parse_hyperliquid_perp_context_rows(&raw_rest_snapshot)?;
-    if !all_symbols_scope {
-        rows.retain(|row| row.coin == symbol_scope);
+    if let Some(symbols) = target_symbols.as_ref() {
+        rows.retain(|row| symbols.contains(&row.coin));
     }
+    rows.sort_by(|left, right| left.coin.cmp(&right.coin));
+    rows.dedup_by(|left, right| left.coin == right.coin);
+    ensure_wss_requested_symbols_present(
+        "Hyperliquid WSS REST bootstrap",
+        target_symbols.as_ref(),
+        rows.iter().map(|row| row.coin.clone()).collect(),
+    )?;
     if rows.is_empty() {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
@@ -2160,8 +2232,6 @@ pub(crate) fn bootstrap_hyperliquid_wss_book_ticker(
             ),
         });
     }
-    rows.sort_by(|left, right| left.coin.cmp(&right.coin));
-    rows.dedup_by(|left, right| left.coin == right.coin);
 
     let observed_at = current_utc_timestamp()?;
     let venue_id = VenueId::new(market.venue_id())?;
@@ -2219,20 +2289,31 @@ pub(crate) fn prepare_aster_wss_book_ticker_rest_rows(
     symbol_scope: &str,
     all_symbols_scope: bool,
 ) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    let normalized_scope = normalize_aster_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope = all_symbols_scope || is_aster_wss_all_symbols_scope(&normalized_scope);
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&normalized_scope, is_aster_wss_all_symbols_scope);
     let mut prepared = Vec::with_capacity(rows.len());
     for mut row in rows {
         match validate_aster_public_wss_symbol(&row.symbol) {
-            Ok(symbol) if all_symbols_scope || symbol == symbol_scope => {
+            Ok(symbol)
+                if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
+            {
                 row.symbol = symbol;
                 prepared.push(row);
             }
             Ok(_) => {}
-            Err(_) if all_symbols_scope => {}
+            Err(_) if all_symbols_scope || target_symbols.is_some() => {}
             Err(error) => return Err(error),
         }
     }
     prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
     prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    ensure_wss_requested_symbols_present(
+        "Aster WSS REST bootstrap",
+        target_symbols.as_ref(),
+        prepared.iter().map(|row| row.symbol.clone()).collect(),
+    )?;
     Ok(prepared)
 }
 
@@ -3309,6 +3390,7 @@ pub(crate) fn observed_at_not_after_ingested(
 pub(crate) fn binance_wss_book_ticker_all_market_stream_url(
     market: BinancePublicMarket,
     symbols: &[String],
+    all_symbols_scope: bool,
 ) -> RuntimeResult<String> {
     match market {
         BinancePublicMarket::Spot => {
@@ -3330,13 +3412,30 @@ pub(crate) fn binance_wss_book_ticker_all_market_stream_url(
             ))
         }
         BinancePublicMarket::UsdmPerpetual => {
-            if symbols.len() == 1 {
+            if all_symbols_scope {
+                Ok("wss://fstream.binance.com/public/ws/!bookTicker".to_owned())
+            } else if symbols.len() == 1 {
                 Ok(format!(
                     "wss://fstream.binance.com/public/ws/{}@bookTicker",
                     symbols[0].to_ascii_lowercase()
                 ))
             } else {
-                Ok("wss://fstream.binance.com/public/ws/!bookTicker".to_owned())
+                if symbols.len() > 1_024 {
+                    return Err(RuntimeError::LiveMarketData {
+                        message: format!(
+                            "Binance USD-M combined stream supports at most 1024 streams; got {}",
+                            symbols.len()
+                        ),
+                    });
+                }
+                let streams = symbols
+                    .iter()
+                    .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                Ok(format!(
+                    "wss://fstream.binance.com/stream?streams={streams}"
+                ))
             }
         }
     }
@@ -3351,11 +3450,34 @@ pub(crate) fn aster_wss_book_ticker_stream_url(
             if is_aster_wss_all_symbols_scope(symbol_scope) {
                 Ok(format!("{ASTER_PUBLIC_WSS_BASE_URL}/ws/!bookTicker"))
             } else {
-                let symbol = validate_aster_public_wss_symbol(symbol_scope)?;
-                Ok(format!(
-                    "{ASTER_PUBLIC_WSS_BASE_URL}/ws/{}@bookTicker",
-                    symbol.to_ascii_lowercase()
-                ))
+                let symbol_scope = normalize_aster_wss_symbol_scope(symbol_scope)?;
+                let symbols =
+                    explicit_wss_symbol_scope_set(&symbol_scope, is_aster_wss_all_symbols_scope)
+                        .unwrap_or_default();
+                if symbols.len() == 1 {
+                    let symbol = symbols.iter().next().expect("symbol set is non-empty");
+                    Ok(format!(
+                        "{ASTER_PUBLIC_WSS_BASE_URL}/ws/{}@bookTicker",
+                        symbol.to_ascii_lowercase()
+                    ))
+                } else {
+                    if symbols.len() > 1_024 {
+                        return Err(RuntimeError::LiveMarketData {
+                            message: format!(
+                                "Aster combined stream supports at most 1024 streams; got {}",
+                                symbols.len()
+                            ),
+                        });
+                    }
+                    let streams = symbols
+                        .iter()
+                        .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    Ok(format!(
+                        "{ASTER_PUBLIC_WSS_BASE_URL}/stream?streams={streams}"
+                    ))
+                }
             }
         }
     }
@@ -3562,12 +3684,12 @@ pub(crate) fn validate_hyperliquid_wss_probe_options(
 }
 
 pub(crate) fn normalize_binance_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
-    let symbol = symbol.trim().to_ascii_uppercase();
-    if is_binance_wss_all_symbols_scope(&symbol) {
-        Ok(BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
-    } else {
-        validate_binance_public_wss_symbol(&symbol)
-    }
+    normalize_wss_symbol_scope_list(
+        symbol,
+        BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_binance_wss_all_symbols_scope,
+        validate_binance_public_wss_symbol,
+    )
 }
 
 pub(crate) fn is_binance_wss_all_symbols_scope(symbol: &str) -> bool {
@@ -3578,12 +3700,12 @@ pub(crate) fn is_binance_wss_all_symbols_scope(symbol: &str) -> bool {
 }
 
 pub(crate) fn normalize_bybit_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
-    let symbol = symbol.trim().to_ascii_uppercase();
-    if is_bybit_wss_all_symbols_scope(&symbol) {
-        Ok(BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
-    } else {
-        validate_bybit_public_wss_symbol(&symbol)
-    }
+    normalize_wss_symbol_scope_list(
+        symbol,
+        BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_bybit_wss_all_symbols_scope,
+        validate_bybit_public_wss_symbol,
+    )
 }
 
 pub(crate) fn is_bybit_wss_all_symbols_scope(symbol: &str) -> bool {
@@ -3594,12 +3716,12 @@ pub(crate) fn is_bybit_wss_all_symbols_scope(symbol: &str) -> bool {
 }
 
 pub(crate) fn normalize_okx_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
-    let upper = symbol.trim().to_ascii_uppercase();
-    if is_okx_wss_all_symbols_scope(&upper) {
-        Ok(OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
-    } else {
-        normalize_okx_usdt_basis_symbol(symbol)
-    }
+    normalize_wss_symbol_scope_list(
+        symbol,
+        OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_okx_wss_all_symbols_scope,
+        normalize_okx_usdt_basis_symbol,
+    )
 }
 
 pub(crate) fn is_okx_wss_all_symbols_scope(symbol: &str) -> bool {
@@ -3610,12 +3732,12 @@ pub(crate) fn is_okx_wss_all_symbols_scope(symbol: &str) -> bool {
 }
 
 pub(crate) fn normalize_bitget_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
-    let upper = symbol.trim().to_ascii_uppercase();
-    if is_bitget_wss_all_symbols_scope(&upper) {
-        Ok(BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
-    } else {
-        normalize_cex_usdt_basis_symbol(symbol, "Bitget")
-    }
+    normalize_wss_symbol_scope_list(
+        symbol,
+        BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_bitget_wss_all_symbols_scope,
+        |value| normalize_cex_usdt_basis_symbol(value, "Bitget"),
+    )
 }
 
 pub(crate) fn is_bitget_wss_all_symbols_scope(symbol: &str) -> bool {
@@ -3626,12 +3748,12 @@ pub(crate) fn is_bitget_wss_all_symbols_scope(symbol: &str) -> bool {
 }
 
 pub(crate) fn normalize_aster_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
-    let symbol = symbol.trim().to_ascii_uppercase();
-    if is_aster_wss_all_symbols_scope(&symbol) {
-        Ok(ASTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
-    } else {
-        validate_aster_public_wss_symbol(&symbol)
-    }
+    normalize_wss_symbol_scope_list(
+        symbol,
+        ASTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_aster_wss_all_symbols_scope,
+        validate_aster_public_wss_symbol,
+    )
 }
 
 pub(crate) fn is_aster_wss_all_symbols_scope(symbol: &str) -> bool {
@@ -3642,12 +3764,12 @@ pub(crate) fn is_aster_wss_all_symbols_scope(symbol: &str) -> bool {
 }
 
 pub(crate) fn normalize_hyperliquid_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
-    let symbol = symbol.trim();
-    if is_hyperliquid_wss_all_symbols_scope(symbol) {
-        Ok(HYPERLIQUID_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned())
-    } else {
-        validate_hyperliquid_public_wss_coin(symbol)
-    }
+    normalize_wss_symbol_scope_list(
+        symbol,
+        HYPERLIQUID_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_hyperliquid_wss_all_symbols_scope,
+        validate_hyperliquid_public_wss_coin,
+    )
 }
 
 pub(crate) fn is_hyperliquid_wss_all_symbols_scope(symbol: &str) -> bool {
@@ -3655,6 +3777,91 @@ pub(crate) fn is_hyperliquid_wss_all_symbols_scope(symbol: &str) -> bool {
         symbol.trim().to_ascii_uppercase().as_str(),
         "ALL" | "ALL_USDT" | "*"
     )
+}
+
+fn normalize_wss_symbol_scope_list<F, A>(
+    symbol_scope: &str,
+    all_symbol_scope: &str,
+    is_all_scope: A,
+    normalize_symbol: F,
+) -> RuntimeResult<String>
+where
+    F: Fn(&str) -> RuntimeResult<String>,
+    A: Fn(&str) -> bool,
+{
+    let parts = symbol_scope
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Err(cli_arg_error("WSS symbol scope must not be empty"));
+    }
+    if parts.len() == 1 && is_all_scope(parts[0]) {
+        return Ok(all_symbol_scope.to_owned());
+    }
+    if parts.iter().any(|part| is_all_scope(part)) {
+        return Err(cli_arg_error(
+            "WSS symbol scope cannot mix ALL/ALL_USDT/* with explicit symbols",
+        ));
+    }
+
+    let mut symbols = BTreeSet::new();
+    for part in parts {
+        symbols.insert(normalize_symbol(part)?);
+    }
+    Ok(symbols.into_iter().collect::<Vec<_>>().join(","))
+}
+
+fn explicit_wss_symbol_scope_set<A>(symbol_scope: &str, is_all_scope: A) -> Option<BTreeSet<String>>
+where
+    A: Fn(&str) -> bool,
+{
+    if is_all_scope(symbol_scope) {
+        return None;
+    }
+    Some(
+        symbol_scope
+            .split(',')
+            .map(str::trim)
+            .filter(|symbol| !symbol.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn wss_symbol_in_scope(
+    symbol: &str,
+    all_symbols_scope: bool,
+    target_symbols: Option<&BTreeSet<String>>,
+) -> bool {
+    all_symbols_scope
+        || target_symbols
+            .map(|symbols| symbols.contains(symbol))
+            .unwrap_or(false)
+}
+
+fn ensure_wss_requested_symbols_present(
+    source: &str,
+    target_symbols: Option<&BTreeSet<String>>,
+    available_symbols: BTreeSet<String>,
+) -> RuntimeResult<()> {
+    let Some(target_symbols) = target_symbols else {
+        return Ok(());
+    };
+    let missing = target_symbols
+        .difference(&available_symbols)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "{source} missing requested symbol(s): {}",
+            missing.join(",")
+        ),
+    })
 }
 
 pub(crate) fn validate_binance_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {

@@ -38,7 +38,7 @@ usage() {
   ARB_RUNTIME_LIVE_DERISK_ONLY=0 # 事故处理模式；1 表示只启动 funding arb resident 一轮恢复/减仓，不启动 spot-perp 实盘 resident。
   ARB_RUNTIME_LIVE_STRATEGIES=cross-exchange-funding-arb # live 默认只启用 funding-arb；需要 spot-perp 时显式改为 spot-perp-basis,cross-exchange-funding-arb。
   ARB_RUNTIME_LIVE_SPOT_PERP_BASIS_MODE=auto-once # spot-perp-basis 默认不跑常驻 resident；需要实盘常驻时显式设为 resident。
-  ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=all # Binance/Bybit/OKX/Bitget 全市场 WSS 覆盖范围；all 表示全部 USDT，target 表示只订阅 resident 实盘目标 symbol，custom 表示使用下面各交易所自定义值。
+  ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=target # Binance/Bybit/OKX/Bitget WSS 覆盖范围；target 表示只订阅 resident 实盘目标 symbol，all 表示全部 USDT，custom 表示使用下面各交易所自定义值。
   ARB_RUNTIME_OKX_FUNDING_RATE_CACHE_TTL_SECS=60 # OKX funding-rate 全市场逐合约请求缓存秒数；0 表示每轮都重新请求。
   ARB_RUNTIME_BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_SECS=300 # Bybit linear instruments-info 元数据缓存秒数；0 表示每轮都重新请求。
   ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
@@ -46,10 +46,10 @@ usage() {
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=0 # funding-arb 直接读取 perp/funding 公开源；0 表示复用 basis monitor status。
   ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=auto # 是否额外启动实盘 guard 专用 target WSS；auto 表示 spot-perp resident 启用时启动并作为 readiness gate。
   ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE=1 # foreground live 失败时是否保留只读 API/WSS 便于排查；停止用 scripts/stop-arb-runtime-live.sh。
-  ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance WSS monitor 订阅 symbol。
-  ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bybit WSS monitor 订阅 symbol。
-  ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL=BTC-USDT # CEX_WSS_SCOPE=custom 时的 OKX WSS monitor 订阅 symbol。
-  ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bitget WSS monitor 订阅 symbol。
+  ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance WSS monitor 订阅 symbol，多个用逗号分隔。
+  ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bybit WSS monitor 订阅 symbol，多个用逗号分隔。
+  ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL=BTC-USDT # CEX_WSS_SCOPE=custom 时的 OKX WSS monitor 订阅 symbol，多个用逗号分隔。
+  ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bitget WSS monitor 订阅 symbol，多个用逗号分隔。
   ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL=ALL_USDT # Aster perp WSS monitor 订阅范围；ALL_USDT 表示全部 USDT 合约；启动不阻塞，策略侧按数据新鲜度 fail-closed。
   ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL=ALL_USDT # Hyperliquid perp WSS monitor 订阅范围；ALL_USDT 表示全部永续合约；启动不阻塞，策略侧按数据新鲜度 fail-closed。
   ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805 # portfolio JSON API 监听地址。
@@ -500,7 +500,7 @@ BYBIT_BASIS_READY_SYMBOL="BTCUSDT"
 OKX_BASIS_READY_SYMBOL="BTC-USDT"
 BITGET_BASIS_READY_SYMBOL="BTCUSDT"
 
-CEX_WSS_SCOPE="${ARB_RUNTIME_LIVE_CEX_WSS_SCOPE:-all}"
+CEX_WSS_SCOPE="${ARB_RUNTIME_LIVE_CEX_WSS_SCOPE:-target}"
 TARGET_WSS_ENABLED="${ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED:-${SPOT_PERP_RESIDENT_ENABLED}}"
 if [[ "${TARGET_WSS_ENABLED}" == "auto" ]]; then
   TARGET_WSS_ENABLED="${SPOT_PERP_RESIDENT_ENABLED}"
