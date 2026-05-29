@@ -2895,6 +2895,9 @@ pub(crate) fn parse_bitget_wss_book_ticker_runtime_raw(
         .transpose()?
         .unwrap_or(ingested_at);
     let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
+    if !bitget_wss_ticker_has_top_of_book_fields(&fields) {
+        return Ok(None);
+    }
     let bid_price = required_first_bitget_ticker_value_string(
         &fields,
         &["bidPr", "bidPx", "bidPrice"],
@@ -2935,6 +2938,17 @@ pub(crate) fn parse_bitget_wss_book_ticker_runtime_raw(
         ask_size: Quantity::from_str(&ask_qty)?,
         observed_at,
     }))
+}
+
+fn bitget_wss_ticker_has_top_of_book_fields(fields: &BTreeMap<String, &str>) -> bool {
+    [
+        &["bidPr", "bidPx", "bidPrice"][..],
+        &["askPr", "askPx", "askPrice"][..],
+        &["bidSz", "bidSize", "bidQty"][..],
+        &["askSz", "askSize", "askQty"][..],
+    ]
+    .iter()
+    .all(|names| names.iter().any(|name| fields.contains_key(*name)))
 }
 
 pub(crate) fn parse_aster_wss_book_ticker_runtime_raw(

@@ -42883,6 +42883,13 @@ mod tests {
                 .expect("bitget empty quote raw")
                 .is_none()
         );
+
+        let bitget_metadata_only_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","ts":"1778630400000","change24h":"0.01"}]}"#;
+        assert!(
+            parse_bitget_wss_book_ticker_runtime_raw(bitget_metadata_only_raw, ingested_at)
+                .expect("bitget metadata-only quote raw")
+                .is_none()
+        );
     }
 
     #[test]
