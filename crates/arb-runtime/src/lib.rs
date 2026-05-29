@@ -347,9 +347,9 @@ const RUNTIME_JSONL_ROTATE_BYTES_ENV: &str = "ARB_RUNTIME_JSONL_ROTATE_BYTES";
 #[cfg(feature = "live-exec")]
 const RUNTIME_JSONL_ROTATE_KEEP_ENV: &str = "ARB_RUNTIME_JSONL_ROTATE_KEEP";
 #[cfg(feature = "live-exec")]
-const RUNTIME_JSONL_ROTATE_DEFAULT_BYTES: u64 = 128 * 1024 * 1024;
+const RUNTIME_JSONL_ROTATE_DEFAULT_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(feature = "live-exec")]
-const RUNTIME_JSONL_ROTATE_DEFAULT_KEEP: usize = 4;
+const RUNTIME_JSONL_ROTATE_DEFAULT_KEEP: usize = 3;
 #[cfg(feature = "live-exec")]
 const RUNTIME_JSONL_ROTATE_KEEP_LIMIT: usize = 32;
 const FUNDING_ARB_FULL_DEBUG_ARTIFACTS_ENV: &str = "ARB_RUNTIME_FUNDING_ARB_FULL_DEBUG_ARTIFACTS";
@@ -20156,6 +20156,14 @@ fn poll_opportunity_recorder_spot_source(
             return Ok(());
         }
     };
+    append_opportunity_recorder_provenance_snapshot(
+        options,
+        &body,
+        &ts,
+        SPOT_PERP_BASIS_OBSERVER_STRATEGY,
+        Some(&source.venue),
+        &source.url,
+    )?;
     let health_key = format!(
         "poll_ok|status={}|candidate_count={}|total_rows={}",
         snapshot.status, snapshot.candidate_count, snapshot.total_rows
@@ -20180,8 +20188,14 @@ fn poll_opportunity_recorder_spot_source(
     }
 
     if snapshot.candidate_count > 0 {
-        let line = json_object_with_extra_fields(
+        let compact_body = opportunity_recorder_compact_candidate_snapshot_json(
             &body,
+            &["updated_at"],
+            options.blocking_path_limit,
+            "spot_perp_basis_compact_candidates",
+        )?;
+        let line = json_object_with_extra_fields(
+            &compact_body,
             &[
                 ("recorded_at", json_string(&ts)),
                 ("venue", json_string(&source.venue)),
@@ -20272,6 +20286,14 @@ fn poll_opportunity_recorder_funding_arb(
             return Ok(());
         }
     };
+    append_opportunity_recorder_provenance_snapshot(
+        options,
+        &body,
+        &ts,
+        CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
+        None,
+        url,
+    )?;
     let health_key = format!(
         "poll_ok|status={}|candidate_count={}|total_rows={}",
         snapshot.status, snapshot.candidate_count, snapshot.total_rows
@@ -20295,8 +20317,14 @@ fn poll_opportunity_recorder_funding_arb(
     }
 
     if snapshot.candidate_count > 0 {
-        let line = json_object_with_extra_fields(
+        let compact_body = opportunity_recorder_compact_candidate_snapshot_json(
             &body,
+            &["updated_at"],
+            options.blocking_path_limit,
+            "funding_arb_compact_candidates",
+        )?;
+        let line = json_object_with_extra_fields(
+            &compact_body,
             &[
                 ("recorded_at", json_string(&ts)),
                 (
@@ -20340,6 +20368,58 @@ fn poll_opportunity_recorder_funding_arb(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn append_opportunity_recorder_provenance_snapshot(
+    options: &OpportunityRecorderOptions,
+    body: &str,
+    recorded_at: &str,
+    strategy: &'static str,
+    venue: Option<&str>,
+    endpoint: &str,
+) -> RuntimeResult<()> {
+    let mut extras = vec![
+        ("recorded_at", json_string(recorded_at)),
+        ("strategy", json_string(strategy)),
+        ("endpoint", json_string(endpoint)),
+        ("artifact_mode", json_string("full_poll_provenance")),
+        ("mutable_execution_started", "false".to_owned()),
+    ];
+    if let Some(venue) = venue {
+        extras.push(("venue", json_string(venue)));
+    }
+    let line = json_object_with_extra_fields(body, &extras)?;
+    append_line_to_jsonl(
+        opportunity_recorder_provenance_path(options, strategy, venue),
+        &line,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_provenance_path(
+    options: &OpportunityRecorderOptions,
+    strategy: &str,
+    venue: Option<&str>,
+) -> PathBuf {
+    if strategy == SPOT_PERP_BASIS_OBSERVER_STRATEGY {
+        if let Some(venue) = venue {
+            return options
+                .opportunity_dir
+                .join(format!("{venue}-provenance.jsonl"));
+        }
+        return options
+            .opportunity_dir
+            .join("spot-perp-basis-provenance.jsonl");
+    }
+    if strategy == CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY {
+        return options
+            .opportunity_dir
+            .join("cross-exchange-funding-arb-provenance.jsonl");
+    }
+    options
+        .opportunity_dir
+        .join(format!("{strategy}-provenance.jsonl"))
 }
 
 #[cfg(feature = "live-exec")]
@@ -20573,6 +20653,151 @@ fn truncate_log_string(value: &str) -> String {
         format!("{prefix}...<truncated>")
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_compact_candidate_snapshot_json(
+    body: &str,
+    updated_at_fields: &[&'static str],
+    blocking_path_limit: usize,
+    artifact_mode: &'static str,
+) -> RuntimeResult<String> {
+    let fields = parse_json_object_value_slices(body)?;
+    let candidate_count =
+        opportunity_recorder_usize_field(&fields, "candidate_count")?.unwrap_or(0);
+    let row_values = json_object_array_field_slices(&fields, "rows")?;
+    let mut retained_rows = Vec::new();
+    for row in &row_values {
+        let row_fields = parse_json_object_value_slices(row)?;
+        if json_field_is_true(&row_fields, "is_candidate")? {
+            retained_rows.push(bounded_log_json_value(row)?);
+        }
+    }
+    let status = opportunity_recorder_optional_field(&fields, "status")
+        .unwrap_or_else(|| "unknown".to_owned());
+    let updated_at = updated_at_fields
+        .iter()
+        .find_map(|field| opportunity_recorder_optional_field(&fields, field))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let (blocking_path_json, blocking_path_total_count, blocking_path_truncated) =
+        opportunity_recorder_blocking_path_json(&fields, "blocking_path", blocking_path_limit)?;
+    let (
+        non_candidate_blocking_groups_json,
+        non_candidate_row_count,
+        non_candidate_blocking_group_total_count,
+        non_candidate_blocking_group_truncated,
+    ) = opportunity_recorder_non_candidate_blocking_groups_json(&row_values, blocking_path_limit)?;
+    Ok(format!(
+        "{{\"artifact_mode\":{},\"blocking_path\":{},\"blocking_path_total_count\":{},\"blocking_path_truncated\":{},\"candidate_count\":{},\"non_candidate_blocking_group_total_count\":{},\"non_candidate_blocking_group_truncated\":{},\"non_candidate_blocking_groups\":{},\"non_candidate_row_count\":{},\"retained_rows\":{},\"rows\":[{}],\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+        json_string(artifact_mode),
+        blocking_path_json,
+        blocking_path_total_count,
+        blocking_path_truncated,
+        candidate_count,
+        non_candidate_blocking_group_total_count,
+        non_candidate_blocking_group_truncated,
+        non_candidate_blocking_groups_json,
+        non_candidate_row_count,
+        retained_rows.len(),
+        retained_rows.join(","),
+        json_string(&status),
+        row_values.len(),
+        json_string(&updated_at),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_non_candidate_blocking_groups_json(
+    row_values: &[&str],
+    limit: usize,
+) -> RuntimeResult<(String, usize, usize, bool)> {
+    let mut groups = BTreeMap::<(String, String), (usize, Vec<String>)>::new();
+    let mut non_candidate_row_count = 0usize;
+    for row in row_values {
+        let row_fields = parse_json_object_value_slices(row)?;
+        if json_field_is_true(&row_fields, "is_candidate")? {
+            continue;
+        }
+        non_candidate_row_count = non_candidate_row_count.saturating_add(1);
+        let source_status = opportunity_recorder_optional_field(&row_fields, "source_status")
+            .unwrap_or_else(|| "unknown".to_owned());
+        let raw_reason = opportunity_recorder_optional_field(&row_fields, "reason")
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| format!("source_status={source_status}"));
+        let reason =
+            opportunity_recorder_compact_non_candidate_row_reason(&source_status, &raw_reason);
+        let sample = opportunity_recorder_row_sample_label(&row_fields);
+        let group = groups
+            .entry((source_status, reason))
+            .or_insert_with(|| (0, Vec::new()));
+        group.0 = group.0.saturating_add(1);
+        if group.1.len() < FUNDING_ARB_BLOCKING_PATH_GROUP_SAMPLE_LIMIT {
+            group.1.push(sample);
+        }
+    }
+    let group_total_count = groups.len();
+    let group_truncated = group_total_count > limit;
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by(
+        |((left_status, left_reason), (left_count, _)),
+         ((right_status, right_reason), (right_count, _))| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_status.cmp(right_status))
+                .then_with(|| left_reason.cmp(right_reason))
+        },
+    );
+    let entries = groups
+        .into_iter()
+        .take(limit)
+        .map(|((source_status, reason), (count, samples))| {
+            format!(
+                "{{\"count\":{},\"reason\":{},\"sample_rows\":[{}],\"source_status\":{}}}",
+                count,
+                json_string(&reason),
+                samples
+                    .iter()
+                    .map(|sample| json_string(sample))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                json_string(&source_status),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok((
+        format!("[{}]", entries.join(",")),
+        non_candidate_row_count,
+        group_total_count,
+        group_truncated,
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_compact_non_candidate_row_reason(
+    source_status: &str,
+    raw_reason: &str,
+) -> String {
+    let compacted = compact_blocking_reason_for_summary(raw_reason);
+    if source_status == "missing_perp_top_of_book"
+        && compacted.contains("missing required funding arb fields")
+    {
+        return "上游 perp top-of-book、mark/index 或盘口数量字段缺失".to_owned();
+    }
+    compacted
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_row_sample_label(fields: &BTreeMap<String, &str>) -> String {
+    let pair_id = opportunity_recorder_optional_field(fields, "pair_id");
+    let symbol = opportunity_recorder_optional_field(fields, "symbol");
+    match (pair_id, symbol) {
+        (Some(pair_id), Some(symbol)) if !symbol.trim().is_empty() => {
+            format!("{pair_id}:{symbol}")
+        }
+        (Some(pair_id), _) => pair_id,
+        (_, Some(symbol)) => symbol,
+        _ => "unknown".to_owned(),
     }
 }
 
@@ -25892,6 +26117,92 @@ fn hyperliquid_margin_balance_from_clearinghouse_fields(
     Ok(margin_balance)
 }
 
+const GENERIC_PRIVATE_AVAILABLE_USD_FIELDS: &[&str] = &[
+    "available_usd",
+    "totalAvailableBalance",
+    "availableBalance",
+    "available_balance",
+    "available",
+    "availableToWithdraw",
+    "availBal",
+    "availEq",
+    "crossedMaxAvailable",
+    "isolatedMaxAvailable",
+    "maxWithdrawAmount",
+    "virtualMaxWithdrawAmount",
+    "maxTransferOut",
+    "unionAvailable",
+    "free",
+];
+
+const BITGET_PRIVATE_AVAILABLE_USD_FIELDS: &[&str] = &[
+    "available_usd",
+    "crossedMaxAvailable",
+    "unionAvailable",
+    "isolatedMaxAvailable",
+    "maxTransferOut",
+    "availableBalance",
+    "totalAvailableBalance",
+    "available_balance",
+    "availableToWithdraw",
+    "available",
+    "availBal",
+    "availEq",
+    "maxWithdrawAmount",
+    "virtualMaxWithdrawAmount",
+    "free",
+];
+
+const GENERIC_PRIVATE_MARGIN_BUFFER_USD_FIELDS: &[&str] = &[
+    "margin_buffer_usd",
+    "available_margin_usd",
+    "availableMargin",
+    "totalAvailableBalance",
+    "availableBalance",
+    "available",
+    "availBal",
+    "availEq",
+    "crossedMaxAvailable",
+    "isolatedMaxAvailable",
+    "maxWithdrawAmount",
+    "virtualMaxWithdrawAmount",
+    "maxTransferOut",
+    "unionAvailable",
+];
+
+const BITGET_PRIVATE_MARGIN_BUFFER_USD_FIELDS: &[&str] = &[
+    "margin_buffer_usd",
+    "available_margin_usd",
+    "crossedMaxAvailable",
+    "unionAvailable",
+    "isolatedMaxAvailable",
+    "maxTransferOut",
+    "availableMargin",
+    "availableBalance",
+    "totalAvailableBalance",
+    "available",
+    "availBal",
+    "availEq",
+    "maxWithdrawAmount",
+    "virtualMaxWithdrawAmount",
+];
+
+fn funding_private_available_usd_fields(venue_family: &str) -> &'static [&'static str] {
+    if normalize_venue_family(venue_family) == "bitget" {
+        BITGET_PRIVATE_AVAILABLE_USD_FIELDS
+    } else {
+        GENERIC_PRIVATE_AVAILABLE_USD_FIELDS
+    }
+}
+
+fn funding_private_margin_buffer_usd_fields(venue_family: &str) -> &'static [&'static str] {
+    if normalize_venue_family(venue_family) == "bitget" {
+        BITGET_PRIVATE_MARGIN_BUFFER_USD_FIELDS
+    } else {
+        GENERIC_PRIVATE_MARGIN_BUFFER_USD_FIELDS
+    }
+}
+
 fn generic_private_account_entry_from_raw_statement(
     statement: &FundingPrivateRawStatement,
 ) -> RuntimeResult<Option<FundingPrivateAccountEntry>> {
@@ -25909,23 +26220,7 @@ fn generic_private_account_entry_from_raw_statement(
         }
         let mut available_usd = first_non_empty_json_scalar_string(
             &fields,
-            &[
-                "available_usd",
-                "totalAvailableBalance",
-                "availableBalance",
-                "available_balance",
-                "available",
-                "availableToWithdraw",
-                "availBal",
-                "availEq",
-                "crossedMaxAvailable",
-                "isolatedMaxAvailable",
-                "maxWithdrawAmount",
-                "virtualMaxWithdrawAmount",
-                "maxTransferOut",
-                "unionAvailable",
-                "free",
-            ],
+            funding_private_available_usd_fields(&statement.venue_family),
         )?;
         if available_usd.is_none() {
             available_usd = funding_private_available_usd_from_unencumbered_wallet_fields(&fields)?;
@@ -25968,22 +26263,7 @@ fn generic_private_account_entry_from_raw_statement(
         )?;
         let margin_buffer_usd = first_non_empty_json_scalar_string(
             &fields,
-            &[
-                "margin_buffer_usd",
-                "available_margin_usd",
-                "availableMargin",
-                "totalAvailableBalance",
-                "availableBalance",
-                "available",
-                "availBal",
-                "availEq",
-                "crossedMaxAvailable",
-                "isolatedMaxAvailable",
-                "maxWithdrawAmount",
-                "virtualMaxWithdrawAmount",
-                "maxTransferOut",
-                "unionAvailable",
-            ],
+            funding_private_margin_buffer_usd_fields(&statement.venue_family),
         )?;
         let entry = FundingPrivateAccountEntry {
             venue_family: statement.venue_family.clone(),
@@ -30332,6 +30612,12 @@ fn execute_funding_arb_exit_close_orders(
                 receipt
             }
             Err(error) => {
+                if funding_arb_exit_close_submit_error_confirms_flat(&error) {
+                    outcome
+                        .protection
+                        .record_action(format!("funding_exit_close_already_flat:{}", leg.leg.role));
+                    continue;
+                }
                 outcome.blocking_reasons.push(format!(
                     "funding exit close submit failed for {}: {error}",
                     leg.leg.venue_family
@@ -30354,6 +30640,23 @@ fn execute_funding_arb_exit_close_orders(
         )?;
     }
     Ok(outcome)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_submit_error_confirms_flat(error: &VenueExecError) -> bool {
+    let VenueExecError::ExternalRejected {
+        status_code,
+        reason,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    if *status_code != 400 {
+        return false;
+    }
+    let lower_reason = reason.to_ascii_lowercase();
+    reason.contains("\"22002\"") && lower_reason.contains("no position to close")
 }
 
 #[cfg(feature = "live-exec")]
@@ -30420,6 +30723,13 @@ where
             receipt
         }
         Err(error) => {
+            if funding_arb_exit_close_submit_error_confirms_flat(&error) {
+                outcome.protection.record_action(format!(
+                    "funding_exit_close_market_retry_already_flat:{}",
+                    leg.leg.role
+                ));
+                return Ok(());
+            }
             outcome.blocking_reasons.push(format!(
                 "funding exit close market retry submit failed for {} after `{}`: {error}",
                 leg.leg.venue_family,
@@ -35695,7 +36005,7 @@ fn manual_gate_release_preview_markdown(
     generated_at: &str,
 ) -> String {
     format!(
-        r#"# Binance BTCUSDT Manual Gate Release Preview
+        r#"# Manual Gate Release Preview
 
 中文说明：本文件只记录人工审批门禁释放预览，不分发订单、不下单、不撤单、不转账、不签名。
 
@@ -43305,6 +43615,77 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn bitget_basis_live_wss_monitor_selects_requested_symbol_row() {
+        let raw = r#"{
+          "status":"streaming",
+          "market":"spot",
+          "fail_closed":false,
+          "wss_update_count":8,
+          "last_error":null,
+          "latest_quote":{
+            "symbol":"TRADOORUSDT",
+            "venue_id":"venue:BITGET-SPOT",
+            "instrument_id":"inst:BITGET:TRADOORUSDT:SPOT",
+            "best_bid":"0.1001",
+            "best_ask":"0.1002",
+            "bid_size":"10",
+            "ask_size":"20",
+            "source_sequence":"7",
+            "source_event_id":"event:venue-data:bitget-public:book-ticker:spot:TRADOORUSDT:7:raw",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          },
+          "rows":[{
+            "symbol":"TRADOORUSDT",
+            "venue_id":"venue:BITGET-SPOT",
+            "instrument_id":"inst:BITGET:TRADOORUSDT:SPOT",
+            "best_bid":"0.1001",
+            "best_ask":"0.1002",
+            "bid_size":"10",
+            "ask_size":"20",
+            "source_sequence":"7",
+            "source_event_id":"event:venue-data:bitget-public:book-ticker:spot:TRADOORUSDT:7:raw",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          },{
+            "symbol":"SKYAIUSDT",
+            "venue_id":"venue:BITGET-SPOT",
+            "instrument_id":"inst:BITGET:SKYAIUSDT:SPOT",
+            "best_bid":"0.0201",
+            "best_ask":"0.0202",
+            "bid_size":"300",
+            "ask_size":"400",
+            "source_sequence":"8",
+            "source_event_id":"event:venue-data:bitget-public:wss-book-ticker:spot:SKYAIUSDT:8:u400900301",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          }]
+        }"#;
+
+        let quote = parse_public_wss_monitor_quote_for_basis(
+            raw,
+            "http://127.0.0.1:8808/api/bitget-wss-book-ticker/status",
+            "SKYAIUSDT",
+            BitgetPublicWssMarket::Spot.as_str(),
+            BITGET_BASIS_SPOT_VENUE_ID,
+            "inst:BITGET:SKYAIUSDT:SPOT",
+            UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at"),
+        )
+        .expect("Bitget monitor quote");
+
+        assert_eq!(quote.symbol, "SKYAIUSDT");
+        assert_eq!(quote.best_bid.as_deref(), Some("0.0201"));
+        assert!(quote
+            .source_event_id
+            .as_deref()
+            .is_some_and(|source| source.contains("wss-book-ticker:spot:SKYAIUSDT")));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn okx_basis_live_wss_monitor_quote_becomes_ticker_input() {
         let raw = r#"{
           "status":"streaming",
@@ -46616,6 +46997,41 @@ mod tests {
         assert_eq!(summary.checked_account_count, 2);
         assert_eq!(summary.min_available_usd.as_deref(), Some("25"));
         assert!(summary.reason.is_none());
+    }
+
+    #[test]
+    fn funding_private_account_raw_snapshot_prefers_bitget_trade_available_margin() {
+        let mut config = CrossExchangeFundingArbStrategyConfig::binance_bybit_btcusdt();
+        config.venues.venue_b = funding_arb_leg_config("bitget", "BTCUSDT").expect("bitget leg");
+        let mut venue_capabilities =
+            arb_venue_capability_descriptors("binance").expect("binance capabilities");
+        venue_capabilities
+            .extend(arb_venue_capability_descriptors("bitget").expect("bitget capabilities"));
+        let spec = CrossExchangeFundingArbPipelineSpec::new(
+            config,
+            venue_capabilities,
+            "state:test:funding-arb-binance-bitget",
+            "hash:test:funding-arb-binance-bitget",
+        )
+        .expect("spec");
+
+        let summary = reconcile_funding_private_account_raw_snapshot_json(
+            &spec,
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-28T15:00:01Z","statements":[
+                {"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":{"availableBalance":"125","totalMarginBalance":"125","totalMaintMargin":"1"}},
+                {"venue_family":"bitget","account_id":"acct:bitget-funding-arb-readonly","payload":{"code":"00000","msg":"success","data":[{"marginCoin":"USDT","available":"101.43273583","crossedMaxAvailable":"1.39793583","isolatedMaxAvailable":"1.39793583","maxTransferOut":"1.39793583","unionAvailable":"1.39793583","accountEquity":"101.37013583","unionMm":"2.55928832","crossedMargin":"99.9722"}]}}
+            ]}"#,
+        )
+        .expect("summary");
+
+        assert_eq!(summary.status, "Insufficient");
+        assert_eq!(summary.checked_account_count, 2);
+        assert_eq!(summary.min_available_usd.as_deref(), Some("1.39793583"));
+        assert_eq!(summary.min_margin_buffer_usd.as_deref(), Some("1.39793583"));
+        assert!(summary
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("must both be at least")));
     }
 
     #[test]
@@ -50133,6 +50549,30 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_close_bitget_no_position_reject_confirms_flat() {
+        let error = VenueExecError::ExternalRejected {
+            venue_id: VenueId::new(BITGET_BASIS_PERP_VENUE_ID).expect("venue"),
+            endpoint: "/api/v2/mix/order/close-positions".to_owned(),
+            status_code: 400,
+            reason: r#"{"code":"22002","msg":"No position to close"}"#.to_owned(),
+        };
+
+        assert!(funding_arb_exit_close_submit_error_confirms_flat(&error));
+
+        let balance_error = VenueExecError::ExternalRejected {
+            venue_id: VenueId::new(BITGET_BASIS_PERP_VENUE_ID).expect("venue"),
+            endpoint: "/api/v2/mix/order/place-order".to_owned(),
+            status_code: 400,
+            reason: r#"{"code":"40762","msg":"The order amount exceeds the balance"}"#.to_owned(),
+        };
+
+        assert!(!funding_arb_exit_close_submit_error_confirms_flat(
+            &balance_error
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_exit_close_terminal_fill_evidence_does_not_market_retry() {
         let leg = FundingArbExitLegSnapshot {
             leg: FundingArbPositionLegState {
@@ -52040,6 +52480,10 @@ mod tests {
                 .expect("release preview")
                 .contains("\"released_manual_gate\":true")
         );
+        let release_preview_md =
+            read_utf8(&preview_dir.join("manual_gate_release_preview.md")).expect("release md");
+        assert!(release_preview_md.contains("# Manual Gate Release Preview"));
+        assert!(!release_preview_md.contains("Binance BTCUSDT"));
 
         let config_path = output_root.path().join("guarded-live.yaml");
         fs::write(&config_path, guarded_live_blocked_by_kill_switch_yaml()).expect("write config");
@@ -54188,6 +54632,94 @@ mod tests {
             line,
             r#"{"candidate_count":1,"rows":[],"recorded_at":"2026-05-21T00:00:00Z","venue":"okx","mutable_execution_started":false}"#
         );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_compacts_candidate_history_to_candidate_rows() {
+        let compact = opportunity_recorder_compact_candidate_snapshot_json(
+            r#"{
+              "status":"healthy",
+              "updated_at":"2026-05-21T00:00:00Z",
+              "candidate_count":1,
+              "rows":[
+                {"symbol":"BTCUSDT","pair_id":"binance:bybit:BTCUSDT:BTCUSDT","is_candidate":true,"net_funding_bps":"12","expected_funding_usd":"0.50"},
+                {"symbol":"ETHUSDT","pair_id":"binance:hyperliquid:ETHUSDT:ETH","is_candidate":false,"reason":"missing required funding arb fields: venue_b.perp_bid_qty, venue_b.perp_ask_qty","source_status":"missing_perp_top_of_book"}
+              ],
+              "blocking_path":[
+                {"stage":"opportunity_row","blocker":"missing_perp_top_of_book:is_candidate=false","reason":"阻断原因：上游 perp top-of-book、mark/index 或盘口数量字段缺失；missing required funding arb fields: venue_b.perp_bid_qty, venue_b.perp_ask_qty"}
+              ]
+            }"#,
+            &["updated_at"],
+            12,
+            "test_compact_candidates",
+        )
+        .expect("compact candidates");
+
+        assert!(compact.contains("\"artifact_mode\":\"test_compact_candidates\""));
+        assert!(compact.contains("\"candidate_count\":1"));
+        assert!(compact.contains("\"total_rows\":2"));
+        assert!(compact.contains("\"retained_rows\":1"));
+        assert!(compact.contains("\"non_candidate_row_count\":1"));
+        assert!(compact.contains("\"non_candidate_blocking_groups\""));
+        assert!(compact.contains("BTCUSDT"));
+        assert!(compact.contains("binance:hyperliquid:ETHUSDT:ETH:ETHUSDT"));
+        assert!(!compact.contains("venue_b.perp_bid_qty"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_provenance_keeps_full_non_candidate_rows() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        let opportunity_dir = root.path().join("opportunities");
+        ensure_dir(&logs_dir).expect("logs dir");
+        ensure_dir(&opportunity_dir).expect("opportunity dir");
+        let options = OpportunityRecorderOptions {
+            root: root.path().to_path_buf(),
+            opportunity_dir: opportunity_dir.clone(),
+            logs_dir: logs_dir.clone(),
+            feedback_log: logs_dir.join("realtime-feedback.log"),
+            health_events_jsonl: logs_dir.join("health-events.jsonl"),
+            basis_resident_out_dir: root.path().join("resident-live/spot-perp-basis"),
+            funding_arb_resident_out_dir: root
+                .path()
+                .join("resident-live/cross-exchange-funding-arb"),
+            spot_sources: Vec::new(),
+            funding_arb_url: None,
+            strategies: BTreeSet::new(),
+            execution_mode: "live".to_owned(),
+            spot_perp_basis_mode: "resident".to_owned(),
+            funding_arb_mode: "resident".to_owned(),
+            interval_secs: 5,
+            timeout_secs: 1,
+            retries: 1,
+            retry_sleep_ms: 0,
+            blocking_path_limit: 12,
+            health_sample_secs: 0,
+            resident_health_tail_lines: 200,
+            once: true,
+        };
+        let body = r#"{"status":"healthy","updated_at":"2026-05-21T00:00:00Z","candidate_count":1,"rows":[{"symbol":"BTCUSDT","pair_id":"binance:bybit:BTCUSDT:BTCUSDT","is_candidate":true,"net_funding_bps":"12","expected_funding_usd":"0.50"},{"symbol":"ETHUSDT","pair_id":"binance:hyperliquid:ETHUSDT:ETH","is_candidate":false,"reason":"missing required funding arb fields: venue_b.perp_bid_qty, venue_b.perp_ask_qty","source_status":"missing_perp_top_of_book"}],"blocking_path":[]}"#;
+
+        append_opportunity_recorder_provenance_snapshot(
+            &options,
+            body,
+            "2026-05-21T00:00:01Z",
+            CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
+            None,
+            "http://127.0.0.1:9904/api/funding-arb/status",
+        )
+        .expect("append provenance");
+
+        let provenance =
+            read_utf8(&opportunity_dir.join("cross-exchange-funding-arb-provenance.jsonl"))
+                .expect("provenance");
+        assert!(provenance.contains("\"artifact_mode\":\"full_poll_provenance\""));
+        assert!(provenance.contains("\"strategy\":\"cross-exchange-funding-arb\""));
+        assert!(provenance.contains("binance:hyperliquid:ETHUSDT:ETH"));
+        assert!(provenance.contains("venue_b.perp_bid_qty"));
+        assert!(provenance.contains("\"is_candidate\":false"));
     }
 
     #[cfg(feature = "live-exec")]
