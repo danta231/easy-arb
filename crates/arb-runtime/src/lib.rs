@@ -65,10 +65,10 @@ use arb_replay::{ReplayInput, TimeSource as ReplayTimeSource};
 use arb_risk::{RiskEvaluationInput, RiskEvaluator, StaticRiskEvaluator};
 use arb_strategies::{
     evaluate_cross_exchange_funding_arb_signal, evaluate_spot_perp_basis_signal,
-    sample_spot_strategy, CrossExchangeFundingArbSignalInput, CrossExchangeFundingArbStrategy,
-    CrossExchangeFundingArbStrategyConfig, CrossExchangeFundingLegConfig, SignalDepthLevel,
-    SpotPerpBasisSignal, SpotPerpBasisSignalInput, SpotPerpBasisStrategy,
-    SpotPerpBasisStrategyConfig,
+    sample_spot_strategy, CrossExchangeFundingArbSignal, CrossExchangeFundingArbSignalInput,
+    CrossExchangeFundingArbStrategy, CrossExchangeFundingArbStrategyConfig,
+    CrossExchangeFundingLegConfig, SignalDepthLevel, SpotPerpBasisSignal, SpotPerpBasisSignalInput,
+    SpotPerpBasisStrategy, SpotPerpBasisStrategyConfig,
 };
 #[cfg(feature = "live-exec")]
 use arb_strategies::{
@@ -18592,6 +18592,7 @@ fn funding_arb_pair_row(
                     gross_funding_spread_bps: Option<String>,
                     total_cost_bps: Option<String>,
                     net_funding_bps: Option<String>,
+                    entry_price_edge_bps: Option<String>,
                     expected_funding_usd: Option<String>| FundingArbMarketRow {
         pair_id: pair_id.clone(),
         symbol: symbol.clone(),
@@ -18633,6 +18634,7 @@ fn funding_arb_pair_row(
         gross_funding_spread_bps,
         total_cost_bps,
         net_funding_bps,
+        entry_price_edge_bps,
         expected_funding_usd,
         is_candidate,
         reason,
@@ -18645,6 +18647,7 @@ fn funding_arb_pair_row(
             false,
             Some(reason),
             "invalid_symbol".to_owned(),
+            None,
             None,
             None,
             None,
@@ -18673,6 +18676,7 @@ fn funding_arb_pair_row(
             None,
             None,
             None,
+            None,
         ));
     }
 
@@ -18685,6 +18689,7 @@ fn funding_arb_pair_row(
                 missing.join(", ")
             )),
             "missing_perp_top_of_book".to_owned(),
+            None,
             None,
             None,
             None,
@@ -18705,6 +18710,7 @@ fn funding_arb_pair_row(
             None,
             None,
             None,
+            None,
         ));
     }
 
@@ -18713,6 +18719,7 @@ fn funding_arb_pair_row(
             false,
             Some(reason),
             "mark_index_divergence".to_owned(),
+            None,
             None,
             None,
             None,
@@ -18789,7 +18796,9 @@ fn funding_arb_pair_row(
     })
     .map_err(|message| RuntimeError::LiveMarketData { message })?;
 
-    let selected = if forward.net_funding_bps >= reverse.net_funding_bps {
+    let selected = if funding_arb_signal_net_funding_bps_decimal(&forward)?.raw
+        >= funding_arb_signal_net_funding_bps_decimal(&reverse)?.raw
+    {
         (
             &forward,
             venue_a.venue_family.clone(),
@@ -18840,8 +18849,18 @@ fn funding_arb_pair_row(
         Some(selected.0.gross_funding_spread_bps.to_string()),
         Some(selected.0.total_cost_bps.to_string()),
         Some(selected.0.net_funding_bps.to_string()),
+        Some(selected.0.entry_price_edge_bps.clone()),
         Some(selected.0.expected_funding_usd.clone()),
     ))
+}
+
+fn funding_arb_signal_net_funding_bps_decimal(
+    signal: &CrossExchangeFundingArbSignal,
+) -> RuntimeResult<MonitorDecimal> {
+    MonitorDecimal::parse(
+        "funding_arb.signal.net_funding_bps",
+        &signal.net_funding_bps,
+    )
 }
 
 fn funding_arb_next_settlement_rejection(
@@ -23880,6 +23899,7 @@ pub struct FundingArbMarketRow {
     pub gross_funding_spread_bps: Option<String>,
     pub total_cost_bps: Option<String>,
     pub net_funding_bps: Option<String>,
+    pub entry_price_edge_bps: Option<String>,
     pub expected_funding_usd: Option<String>,
     pub is_candidate: bool,
     pub reason: Option<String>,
@@ -28792,6 +28812,260 @@ fn funding_arb_row_gross_funding_spread_bps_decimal(
 ) -> Option<MonitorDecimal> {
     let value = row.gross_funding_spread_bps.as_deref()?;
     MonitorDecimal::parse("funding_arb.gross_funding_spread_bps", value).ok()
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_total_cost_bps_decimal(row: &FundingArbMarketRow) -> Option<MonitorDecimal> {
+    let value = row.total_cost_bps.as_deref()?;
+    MonitorDecimal::parse("funding_arb.total_cost_bps", value).ok()
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_decimal_checked_div_decimal(
+    numerator: MonitorDecimal,
+    denominator: MonitorDecimal,
+    context: &'static str,
+) -> RuntimeResult<MonitorDecimal> {
+    if denominator.raw <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{context} denominator must be greater than zero"),
+        });
+    }
+    let mut numerator_raw = numerator.raw;
+    let mut denominator_raw = denominator.raw;
+    let mut scale = monitor_decimal_i128_scale();
+    let numerator_gcd = monitor_decimal_gcd_abs_i128(numerator_raw, denominator_raw);
+    numerator_raw /= numerator_gcd;
+    denominator_raw /= numerator_gcd;
+    let scale_gcd = monitor_decimal_gcd_abs_i128(scale, denominator_raw);
+    scale /= scale_gcd;
+    denominator_raw /= scale_gcd;
+    Ok(MonitorDecimal {
+        raw: numerator_raw
+            .checked_mul(scale)
+            .and_then(|value| value.checked_div(denominator_raw))
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: format!("{context} overflowed"),
+            })?,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn monitor_decimal_ratio_bps(
+    numerator_raw: i128,
+    denominator_raw: i128,
+    context: &'static str,
+) -> RuntimeResult<MonitorDecimal> {
+    if denominator_raw <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{context} denominator must be greater than zero"),
+        });
+    }
+    let mut numerator = numerator_raw;
+    let mut denominator = denominator_raw;
+    let mut bps_multiplier = 10_000_i128;
+    let mut scale = monitor_decimal_i128_scale();
+    let numerator_gcd = monitor_decimal_gcd_abs_i128(numerator, denominator);
+    numerator /= numerator_gcd;
+    denominator /= numerator_gcd;
+    let multiplier_gcd = monitor_decimal_gcd_abs_i128(bps_multiplier, denominator);
+    bps_multiplier /= multiplier_gcd;
+    denominator /= multiplier_gcd;
+    let scale_gcd = monitor_decimal_gcd_abs_i128(scale, denominator);
+    scale /= scale_gcd;
+    denominator /= scale_gcd;
+    Ok(MonitorDecimal {
+        raw: numerator
+            .checked_mul(bps_multiplier)
+            .and_then(|value| value.checked_mul(scale))
+            .and_then(|value| value.checked_div(denominator))
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: format!("{context} overflowed"),
+            })?,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_entry_price_edge_bps_from_prices(
+    long_price: MonitorDecimal,
+    short_price: MonitorDecimal,
+) -> RuntimeResult<MonitorDecimal> {
+    if long_price.raw <= 0 || short_price.raw <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: "funding arb entry fill prices must be greater than zero".to_owned(),
+        });
+    }
+    let midpoint = long_price
+        .raw
+        .checked_add(short_price.raw)
+        .and_then(|value| value.checked_div(2))
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "funding arb entry fill midpoint calculation overflowed".to_owned(),
+        })?;
+    let difference = short_price.raw.checked_sub(long_price.raw).ok_or_else(|| {
+        RuntimeError::LiveMarketData {
+            message: "funding arb entry fill edge calculation overflowed".to_owned(),
+        }
+    })?;
+    monitor_decimal_ratio_bps(difference, midpoint, "funding arb entry fill edge bps")
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_two_leg_monitor_return_bps(
+    single_leg_bps: MonitorDecimal,
+) -> RuntimeResult<MonitorDecimal> {
+    single_leg_bps.checked_div_i128(2, "funding arb two-leg return bps")
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_adverse_entry_bps(edge_bps: MonitorDecimal) -> RuntimeResult<MonitorDecimal> {
+    if edge_bps.raw >= 0 {
+        return Ok(MonitorDecimal { raw: 0 });
+    }
+    Ok(MonitorDecimal {
+        raw: edge_bps
+            .raw
+            .checked_neg()
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "funding arb entry adverse bps overflowed".to_owned(),
+            })?,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_entry_fill_economics_blocking_reason_from_prices(
+    long_average_price: MonitorDecimal,
+    short_average_price: MonitorDecimal,
+    gross_funding_spread_bps: MonitorDecimal,
+    total_cost_bps: MonitorDecimal,
+    min_net_funding_bps: i128,
+) -> RuntimeResult<Option<String>> {
+    let min_net = monitor_decimal_from_i128(min_net_funding_bps).ok_or_else(|| {
+        RuntimeError::LiveMarketData {
+            message: "funding arb min_net_funding_bps overflowed".to_owned(),
+        }
+    })?;
+    let entry_price_edge_bps =
+        funding_arb_entry_price_edge_bps_from_prices(long_average_price, short_average_price)?;
+    let entry_price_adverse_bps = funding_arb_adverse_entry_bps(entry_price_edge_bps)?;
+    let single_leg_net_bps = gross_funding_spread_bps
+        .checked_sub(total_cost_bps, "funding arb post-fill net funding bps")?
+        .checked_sub(
+            entry_price_adverse_bps,
+            "funding arb post-fill entry-adjusted net funding bps",
+        )?;
+    let net_funding_bps = funding_arb_two_leg_monitor_return_bps(single_leg_net_bps)?;
+    if net_funding_bps.raw >= min_net.raw {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "post_fill_entry_economics: actual_net_funding_bps={} below minimum {}; gross_funding_spread_bps={}, total_cost_bps={}, actual_entry_price_edge_bps={}, actual_entry_price_adverse_bps={}, long_average_fill_price={}, short_average_fill_price={}",
+        net_funding_bps.format_trimmed(),
+        min_net_funding_bps,
+        gross_funding_spread_bps.format_trimmed(),
+        total_cost_bps.format_trimmed(),
+        entry_price_edge_bps.format_trimmed(),
+        entry_price_adverse_bps.format_trimmed(),
+        long_average_price.format_trimmed(),
+        short_average_price.format_trimmed()
+    )))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_execution_report_leg_average_fill_price(
+    execution_report: &ExecutionReport,
+    plan_leg_id: &str,
+) -> RuntimeResult<Option<MonitorDecimal>> {
+    let mut notional = MonitorDecimal { raw: 0 };
+    let mut quantity = MonitorDecimal { raw: 0 };
+    for fill in execution_report
+        .fills
+        .iter()
+        .filter(|fill| fill.plan_leg_id.as_str() == plan_leg_id)
+    {
+        let price = MonitorDecimal::parse("funding_arb.fill_price", fill.price.as_str())?;
+        let fill_quantity =
+            MonitorDecimal::parse("funding_arb.fill_quantity", fill.quantity.as_str())?;
+        if price.raw <= 0 || fill_quantity.raw <= 0 {
+            continue;
+        }
+        notional = notional.checked_add(
+            price.checked_mul_decimal(fill_quantity, "funding arb fill notional")?,
+            "funding arb fill notional sum",
+        )?;
+        quantity = quantity.checked_add(fill_quantity, "funding arb fill quantity sum")?;
+    }
+    if quantity.raw <= 0 {
+        return Ok(None);
+    }
+    Ok(Some(monitor_decimal_checked_div_decimal(
+        notional,
+        quantity,
+        "funding arb average fill price",
+    )?))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_post_fill_entry_economics_blocking_reason(
+    row: &FundingArbMarketRow,
+    dispatch_plan: &ExecutionDispatchPlan,
+    execution_report: &ExecutionReport,
+    min_net_funding_bps: i128,
+) -> RuntimeResult<Option<String>> {
+    let Some(gross_funding_spread_bps) = funding_arb_row_gross_funding_spread_bps_decimal(row)
+    else {
+        return Ok(Some(
+            "post_fill_entry_economics: missing gross_funding_spread_bps after both entry legs filled"
+                .to_owned(),
+        ));
+    };
+    let Some(total_cost_bps) = funding_arb_row_total_cost_bps_decimal(row) else {
+        return Ok(Some(
+            "post_fill_entry_economics: missing total_cost_bps after both entry legs filled"
+                .to_owned(),
+        ));
+    };
+    let long_leg = dispatch_plan
+        .requests
+        .iter()
+        .find(|request| request.basis_leg_role.as_deref() == Some("perp_long"));
+    let short_leg = dispatch_plan
+        .requests
+        .iter()
+        .find(|request| request.basis_leg_role.as_deref() == Some("perp_short"));
+    let (Some(long_leg), Some(short_leg)) = (long_leg, short_leg) else {
+        return Ok(Some(
+            "post_fill_entry_economics: dispatch plan is missing perp_long or perp_short role after fills"
+                .to_owned(),
+        ));
+    };
+    let Some(long_average_price) = funding_arb_execution_report_leg_average_fill_price(
+        execution_report,
+        &long_leg.plan_leg_id,
+    )?
+    else {
+        return Ok(Some(format!(
+            "post_fill_entry_economics: missing long fill price for plan_leg_id={}",
+            long_leg.plan_leg_id
+        )));
+    };
+    let Some(short_average_price) = funding_arb_execution_report_leg_average_fill_price(
+        execution_report,
+        &short_leg.plan_leg_id,
+    )?
+    else {
+        return Ok(Some(format!(
+            "post_fill_entry_economics: missing short fill price for plan_leg_id={}",
+            short_leg.plan_leg_id
+        )));
+    };
+    funding_arb_entry_fill_economics_blocking_reason_from_prices(
+        long_average_price,
+        short_average_price,
+        gross_funding_spread_bps,
+        total_cost_bps,
+        min_net_funding_bps,
+    )
 }
 
 #[cfg(feature = "live-exec")]
@@ -39417,6 +39691,11 @@ fn parse_funding_arb_market_row_json_fields(
             "net_funding_bps",
             "funding arb monitor row",
         )?,
+        entry_price_edge_bps: optional_json_value_string(
+            fields,
+            "entry_price_edge_bps",
+            "funding arb monitor row",
+        )?,
         expected_funding_usd: optional_json_value_string(
             fields,
             "expected_funding_usd",
@@ -39747,12 +40026,13 @@ fn funding_arb_monitor_row_blocking_summary(row: &FundingArbMarketRow) -> &'stat
 
 fn funding_arb_monitor_row_blocking_evidence(row: &FundingArbMarketRow) -> String {
     format!(
-        "venue_a={} venue_b={} gross_funding_spread_bps={} total_cost_bps={} net_funding_bps={} expected_funding_usd={}",
+        "venue_a={} venue_b={} gross_funding_spread_bps={} total_cost_bps={} net_funding_bps={} entry_price_edge_bps={} expected_funding_usd={}",
         row.venue_a_family,
         row.venue_b_family,
         row.gross_funding_spread_bps.as_deref().unwrap_or("null"),
         row.total_cost_bps.as_deref().unwrap_or("null"),
         row.net_funding_bps.as_deref().unwrap_or("null"),
+        row.entry_price_edge_bps.as_deref().unwrap_or("null"),
         row.expected_funding_usd.as_deref().unwrap_or("null")
     )
 }
@@ -40496,7 +40776,8 @@ fn funding_arb_history_json(context: &FundingArbDashboardContext) -> String {
 impl FundingArbMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_depth_levels\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_depth_levels\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_depth_levels\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_depth_levels\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
+            "{{\"entry_price_edge_bps\":{},\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_depth_levels\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_depth_levels\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_depth_levels\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_depth_levels\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
+            json_option_string(&self.entry_price_edge_bps),
             json_option_string(&self.expected_funding_usd),
             json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_funding_spread_bps),
@@ -42246,6 +42527,7 @@ mod tests {
             gross_funding_spread_bps: Some("59".to_owned()),
             total_cost_bps: Some("25".to_owned()),
             net_funding_bps: Some("17".to_owned()),
+            entry_price_edge_bps: Some("4.99884826".to_owned()),
             expected_funding_usd: Some("0.34".to_owned()),
             is_candidate: true,
             reason: None,
@@ -46303,6 +46585,8 @@ mod tests {
                     status_url: "http://127.0.0.1/hyperliquid/status".to_owned(),
                 },
             ],
+            taker_fee_bps: "1".to_owned(),
+            slippage_buffer_bps: 0,
             ..FundingArbMonitorOptions::default()
         };
 
@@ -46359,6 +46643,8 @@ mod tests {
                     status_url: "http://127.0.0.1/hyperliquid/status".to_owned(),
                 },
             ],
+            taker_fee_bps: "1".to_owned(),
+            slippage_buffer_bps: 0,
             ..FundingArbMonitorOptions::default()
         };
 
@@ -49570,6 +49856,40 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_post_fill_entry_economics_blocks_adverse_fill_below_min() {
+        let reason = funding_arb_entry_fill_economics_blocking_reason_from_prices(
+            MonitorDecimal::parse("test", "0.0321").expect("long price"),
+            MonitorDecimal::parse("test", "0.03204").expect("short price"),
+            MonitorDecimal::parse("test", "39.724").expect("gross bps"),
+            MonitorDecimal::parse("test", "25").expect("cost bps"),
+            5,
+        )
+        .expect("post-fill economics")
+        .expect("blocking reason");
+
+        assert!(reason.contains("post_fill_entry_economics"));
+        assert!(reason.contains("below minimum 5"));
+        assert!(reason.contains("actual_entry_price_edge_bps=-18."));
+        assert!(reason.contains("actual_entry_price_adverse_bps=18."));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_post_fill_entry_economics_allows_positive_net_after_adverse_fill() {
+        let reason = funding_arb_entry_fill_economics_blocking_reason_from_prices(
+            MonitorDecimal::parse("test", "100.10").expect("long price"),
+            MonitorDecimal::parse("test", "100.00").expect("short price"),
+            MonitorDecimal::parse("test", "60").expect("gross bps"),
+            MonitorDecimal::parse("test", "20").expect("cost bps"),
+            5,
+        )
+        .expect("post-fill economics");
+
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_live_canary_mutable_execution_requires_durable_evidence() {
         assert!(!funding_arb_live_canary_mutable_execution_started(
             0, 0, false, None
@@ -52389,15 +52709,16 @@ mod tests {
             venue_b_ask_depth: signal_depth_from_top_strings("0.0274", "59008"),
             venue_b_mark_price: "0.0273".to_owned(),
             venue_b_index_price: "0.0272524900485994".to_owned(),
-            venue_b_funding_rate: "0.0013".to_owned(),
+            venue_b_funding_rate: "0.0017".to_owned(),
             venue_b_funding_interval_hours: "8".to_owned(),
             venue_b_next_funding_time_ms: "1779624000000".to_owned(),
             funding_interval_hours: "8".to_owned(),
             long_venue_family: Some("bybit".to_owned()),
             short_venue_family: Some("bitget".to_owned()),
-            gross_funding_spread_bps: Some("40".to_owned()),
+            gross_funding_spread_bps: Some("44".to_owned()),
             total_cost_bps: Some("27".to_owned()),
             net_funding_bps: Some("6".to_owned()),
+            entry_price_edge_bps: Some("-7.3198536".to_owned()),
             expected_funding_usd: Some("0.117".to_owned()),
             is_candidate: true,
             reason: None,

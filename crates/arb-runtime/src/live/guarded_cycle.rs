@@ -960,6 +960,7 @@ pub(crate) fn run_funding_arb_guarded_live_canary_once_live(
     let mut submitted_receipt_count = 0usize;
     let mut protection = BasisLiveProtection::default();
     let mut flat_after_cancel = false;
+    let mut post_fill_entry_economics_failed = false;
 
     let maybe_pending =
         build_funding_arb_live_canary_pending_plan(&config, &spec, events, observed_at, &dry_run)?;
@@ -1139,9 +1140,28 @@ pub(crate) fn run_funding_arb_guarded_live_canary_once_live(
         }
     }
 
+    if blocking_reasons.is_empty() && options.execute_live {
+        if let (Some(dispatch_plan), Some(report)) =
+            (maybe_dispatch_plan.as_ref(), execution_report.as_ref())
+        {
+            if let Some(reason) = funding_arb_post_fill_entry_economics_blocking_reason(
+                row,
+                dispatch_plan,
+                report,
+                options.dry_run.min_net_funding_bps,
+            )? {
+                post_fill_entry_economics_failed = true;
+                protection.record_residual_risk(
+                    "funding arb entry actual fill economics fell below the configured minimum after both legs filled; position state is still written for resident supervision",
+                );
+                blocking_reasons.push(reason);
+            }
+        }
+    }
+
     if options.execute_live
         && dispatch_attempted
-        && blocking_reasons.is_empty()
+        && (blocking_reasons.is_empty() || post_fill_entry_economics_failed)
         && submitted_receipt_count == 2
     {
         if let (Some(output_dir), Some(dispatch_plan)) = (&output_dir, maybe_dispatch_plan.as_ref())

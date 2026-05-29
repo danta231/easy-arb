@@ -1529,6 +1529,7 @@ impl CrossExchangeFundingArbStrategy {
         let expected_profit_bps = opportunity.signal.net_funding_bps.clone();
         let gross_spread_bps = opportunity.signal.gross_funding_spread_bps.clone();
         let entry_price_divergence_bps = opportunity.signal.entry_price_divergence_bps.to_string();
+        let entry_price_edge_bps = opportunity.signal.entry_price_edge_bps.clone();
         let source_ref_seed = input_event_refs.join("|");
         let long_client_order_id = funding_client_order_id(
             &opportunity.long_leg.venue_id,
@@ -1626,6 +1627,7 @@ impl CrossExchangeFundingArbStrategy {
         "basis_leg_role": "perp_long",
         "client_order_id": {},
         "entry_price_divergence_bps": {},
+        "entry_price_edge_bps": {},
         "funding_interval_hours": {},
         "funding_rate": {},
         "gross_funding_spread_bps": {},
@@ -1657,6 +1659,7 @@ impl CrossExchangeFundingArbStrategy {
         "basis_leg_role": "perp_short",
         "client_order_id": {},
         "entry_price_divergence_bps": {},
+        "entry_price_edge_bps": {},
         "funding_interval_hours": {},
         "funding_rate": {},
         "gross_funding_spread_bps": {},
@@ -1759,6 +1762,7 @@ impl CrossExchangeFundingArbStrategy {
             json_string(&opportunity.long_leg.account_id),
             json_string(&long_client_order_id),
             json_string(&entry_price_divergence_bps),
+            json_string(&entry_price_edge_bps),
             json_string(&opportunity.funding_interval_hours),
             json_string(&opportunity.long_premium.last_funding_rate),
             json_string(&gross_spread_bps),
@@ -1778,6 +1782,7 @@ impl CrossExchangeFundingArbStrategy {
             json_string(&opportunity.short_leg.account_id),
             json_string(&short_client_order_id),
             json_string(&entry_price_divergence_bps),
+            json_string(&entry_price_edge_bps),
             json_string(&opportunity.funding_interval_hours),
             json_string(&opportunity.short_premium.last_funding_rate),
             json_string(&gross_spread_bps),
@@ -2240,6 +2245,7 @@ pub struct CrossExchangeFundingArbSignal {
     pub total_cost_bps: String,
     pub net_funding_bps: String,
     pub entry_price_divergence_bps: i128,
+    pub entry_price_edge_bps: String,
     pub quantity: String,
     pub expected_funding_usd: String,
     pub fee_estimate_usd: String,
@@ -2478,9 +2484,25 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         slippage_buffer_bps,
         "total funding cost bps calculation overflowed",
     )?;
-    let single_leg_net_funding_bps = single_leg_gross_funding_spread_bps.checked_sub(
+    let single_leg_net_funding_bps_before_entry = single_leg_gross_funding_spread_bps.checked_sub(
         single_leg_total_cost_bps,
         "net funding bps calculation overflowed",
+    )?;
+    let entry_price_edge_bps =
+        signed_entry_price_edge_bps(execution_long_ask, execution_short_bid)?;
+    let entry_price_adverse_bps = if entry_price_edge_bps.raw < 0 {
+        FixedDecimal {
+            raw: entry_price_edge_bps
+                .raw
+                .checked_neg()
+                .ok_or_else(|| "entry price adverse bps calculation overflowed".to_owned())?,
+        }
+    } else {
+        FixedDecimal { raw: 0 }
+    };
+    let single_leg_net_funding_bps = single_leg_net_funding_bps_before_entry.checked_sub(
+        entry_price_adverse_bps,
+        "entry-adjusted net funding bps calculation overflowed",
     )?;
     let gross_funding_spread_bps = single_leg_gross_funding_spread_bps;
     let total_cost_bps = single_leg_total_cost_bps;
@@ -2523,11 +2545,13 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         ))
     } else if !threshold_is_satisfied {
         Some(format!(
-            "net_funding_bps={} below minimum {}; gross_funding_spread_bps={}, total_cost_bps={}",
+            "net_funding_bps={} below minimum {}; gross_funding_spread_bps={}, total_cost_bps={}, entry_price_edge_bps={}, entry_price_adverse_bps={}",
             net_funding_bps.format_trimmed(),
             input.min_net_funding_bps,
             gross_funding_spread_bps.format_trimmed(),
-            total_cost_bps.format_trimmed()
+            total_cost_bps.format_trimmed(),
+            entry_price_edge_bps.format_trimmed(),
+            entry_price_adverse_bps.format_trimmed()
         ))
     } else {
         None
@@ -2539,6 +2563,7 @@ pub fn evaluate_cross_exchange_funding_arb_signal(
         total_cost_bps: total_cost_bps.format_trimmed(),
         net_funding_bps: net_funding_bps.format_trimmed(),
         entry_price_divergence_bps,
+        entry_price_edge_bps: entry_price_edge_bps.format_trimmed(),
         quantity: quantity.format_trimmed(),
         expected_funding_usd: expected_funding_usd.format_trimmed(),
         fee_estimate_usd: fee_estimate_usd.format_trimmed(),
@@ -3446,6 +3471,31 @@ fn price_divergence_bps(left: FixedDecimal, right: FixedDecimal) -> Result<i128,
     diff.checked_mul(10_000)
         .and_then(|value| value.checked_div(midpoint))
         .ok_or_else(|| "entry price divergence calculation overflowed".to_owned())
+}
+
+fn signed_entry_price_edge_bps(
+    long_price: FixedDecimal,
+    short_price: FixedDecimal,
+) -> Result<FixedDecimal, String> {
+    if long_price.raw <= 0 || short_price.raw <= 0 {
+        return Err("entry prices must be greater than zero".to_owned());
+    }
+    let midpoint = long_price
+        .raw
+        .checked_add(short_price.raw)
+        .and_then(|value| value.checked_div(2))
+        .ok_or_else(|| "entry price midpoint calculation overflowed".to_owned())?;
+    if midpoint <= 0 {
+        return Err("entry price midpoint must be greater than zero".to_owned());
+    }
+    let raw = short_price
+        .raw
+        .checked_sub(long_price.raw)
+        .and_then(|value| value.checked_mul(10_000))
+        .and_then(|value| value.checked_mul(FIXED_SCALE))
+        .and_then(|value| value.checked_div(midpoint))
+        .ok_or_else(|| "entry price edge calculation overflowed".to_owned())?;
+    Ok(FixedDecimal { raw })
 }
 
 fn mark_index_divergence_bps(
@@ -4589,6 +4639,7 @@ mod tests {
         assert_eq!(signal.gross_funding_spread_bps, "59");
         assert_eq!(signal.total_cost_bps, "24");
         assert_eq!(signal.net_funding_bps, "17.5");
+        assert_eq!(signal.entry_price_edge_bps, "4.99884826");
         assert_eq!(signal.expected_funding_usd, "0.35");
         assert_eq!(signal.fee_estimate_usd, "0.19");
         assert_eq!(signal.slippage_estimate_usd, "0.05");
@@ -4636,6 +4687,24 @@ mod tests {
             .as_deref()
             .expect("reason")
             .contains("below minimum"));
+    }
+
+    #[test]
+    fn cross_exchange_funding_signal_deducts_adverse_entry_price() {
+        let mut input = cross_exchange_funding_signal_input();
+        input.long_best_bid = "100.05".to_owned();
+        input.long_best_ask = "100.10".to_owned();
+        input.short_best_bid = "100.00".to_owned();
+        input.short_best_ask = "100.05".to_owned();
+        input.short_funding_rate = "0.00410000".to_owned();
+
+        let signal = evaluate_cross_exchange_funding_arb_signal(&input).expect("signal");
+
+        assert!(!signal.is_candidate);
+        assert!(signal.entry_price_edge_bps.starts_with("-9."));
+        let reason = signal.reason.as_deref().expect("reason");
+        assert!(reason.contains("below minimum"));
+        assert!(reason.contains("entry_price_adverse_bps"));
     }
 
     #[test]
