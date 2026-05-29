@@ -22269,7 +22269,15 @@ fn bybit_linear_instrument_funding_interval_hours(
     else {
         return Ok(None);
     };
-    let minutes = parse_positive_u64_runtime("funding_interval_minutes", &minutes)?;
+    let minutes = minutes
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: "funding_interval_minutes must be a non-negative integer".to_owned(),
+        })?;
+    if minutes == 0 {
+        return Ok(None);
+    }
     if minutes % 60 != 0 {
         return Err(RuntimeError::LiveMarketData {
             message: format!(
@@ -56577,7 +56585,8 @@ mod tests {
                 "nextPageCursor": "",
                 "list": [
                   {"symbol":"PRLUSDT","contractType":"LinearPerpetual","status":"Trading","baseCoin":"PRL","quoteCoin":"USDT","settleCoin":"USDT","fundingInterval":"60"},
-                  {"symbol":"BLESSUSDT","contractType":"LinearPerpetual","status":"Trading","baseCoin":"BLESS","quoteCoin":"USDT","settleCoin":"USDT","fundingInterval":"240"}
+                  {"symbol":"BLESSUSDT","contractType":"LinearPerpetual","status":"Trading","baseCoin":"BLESS","quoteCoin":"USDT","settleCoin":"USDT","fundingInterval":"240"},
+                  {"symbol":"ZEROUSDT","contractType":"LinearPerpetual","status":"Trading","baseCoin":"ZERO","quoteCoin":"USDT","settleCoin":"USDT","fundingInterval":"0"}
                 ]
               },
               "retExtInfo": {},
@@ -56605,8 +56614,14 @@ mod tests {
             .iter()
             .find(|row| row.symbol == "BLESSUSDT")
             .expect("BLESS row");
+        let zero = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "ZEROUSDT")
+            .expect("ZERO row");
         assert_eq!(prl.funding_interval_hours, "1");
         assert_eq!(bless.funding_interval_hours, "4");
+        assert_eq!(zero.funding_interval_hours, "8");
     }
 
     #[cfg(feature = "live-exec")]
