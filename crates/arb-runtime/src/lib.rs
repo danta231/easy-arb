@@ -14881,6 +14881,13 @@ fn hyperliquid_spot_perp_spot_scan_enabled() -> RuntimeResult<bool> {
     runtime_bool_env(HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV, false)
 }
 
+fn hyperliquid_perp_depth_backfill_limit() -> RuntimeResult<usize> {
+    runtime_positive_usize_env(
+        HYPERLIQUID_PERP_DEPTH_BACKFILL_LIMIT_ENV,
+        HYPERLIQUID_PERP_DEPTH_BACKFILL_LIMIT_DEFAULT,
+    )
+}
+
 fn funding_arb_direct_public_sources_enabled() -> RuntimeResult<bool> {
     runtime_bool_env(FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENV, false)
 }
@@ -14961,6 +14968,7 @@ struct FundingArbDepthBackfillCache {
     okx: PublicOrderBookDepthCache,
     bitget: PublicOrderBookDepthCache,
     aster: PublicOrderBookDepthCache,
+    hyperliquid: PublicOrderBookDepthCache,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -14970,6 +14978,7 @@ struct FundingArbDepthBackfillRequests {
     okx: BTreeSet<String>,
     bitget: BTreeSet<String>,
     aster: BTreeSet<String>,
+    hyperliquid: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -14979,6 +14988,7 @@ struct FundingArbDepthBackfillMaps {
     okx: BTreeMap<String, PublicOrderBookDepth>,
     bitget: BTreeMap<String, PublicOrderBookDepth>,
     aster: BTreeMap<String, PublicOrderBookDepth>,
+    hyperliquid: BTreeMap<String, PublicOrderBookDepth>,
 }
 
 #[derive(Clone, Debug)]
@@ -17280,6 +17290,31 @@ fn bitget_basis_monitor_depth_symbols_from_parsed_with_limit(
     Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
 }
 
+fn hyperliquid_perp_depth_backfill_symbols(
+    perp_json: &str,
+    min_abs_funding_rate: &str,
+    limit: usize,
+) -> RuntimeResult<BTreeSet<String>> {
+    if limit == 0 {
+        return Ok(BTreeSet::new());
+    }
+    let min_abs_funding_rate = MonitorDecimal::parse("min_abs_funding_rate", min_abs_funding_rate)?;
+    let mut scored_symbols = Vec::new();
+    for perp in parse_hyperliquid_perp_context_rows(perp_json)? {
+        let funding_rate = MonitorDecimal::parse("funding", &perp.funding_rate)?;
+        if funding_rate.abs_less_than(min_abs_funding_rate) {
+            continue;
+        }
+        scored_symbols.push((
+            0,
+            0,
+            funding_rate.raw.checked_abs().unwrap_or(i128::MAX),
+            perp.coin,
+        ));
+    }
+    Ok(top_scored_basis_depth_symbols(scored_symbols, limit))
+}
+
 fn fetch_hyperliquid_basis_monitor_snapshot(
     options: &HyperliquidBasisMonitorOptions,
 ) -> RuntimeResult<HyperliquidBasisMonitorSnapshot> {
@@ -17295,10 +17330,21 @@ fn fetch_hyperliquid_basis_monitor_snapshot(
         HYPERLIQUID_INFO_URL,
         &hyperliquid_info_request_body("metaAndAssetCtxs"),
     )?;
-    build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
+    let depth_symbols = hyperliquid_perp_depth_backfill_symbols(
+        &perp_json,
+        &options.min_abs_funding_rate,
+        hyperliquid_perp_depth_backfill_limit()?,
+    )?;
+    let depth_report = fetch_public_order_book_depth_map(
+        PublicOrderBookDepthVenue::HyperliquidPerp,
+        &depth_symbols,
+    );
+    build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         spot_json.as_deref(),
         &perp_json,
         options,
+        &depth_report.depths,
+        depth_report.warnings,
     )
 }
 
@@ -17315,10 +17361,27 @@ fn build_hyperliquid_basis_monitor_snapshot_from_json(
     )
 }
 
+#[cfg(test)]
 fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
     spot_json: Option<&str>,
     perp_json: &str,
     options: &HyperliquidBasisMonitorOptions,
+) -> RuntimeResult<HyperliquidBasisMonitorSnapshot> {
+    build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+        spot_json,
+        perp_json,
+        options,
+        &BTreeMap::new(),
+        Vec::new(),
+    )
+}
+
+fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+    spot_json: Option<&str>,
+    perp_json: &str,
+    options: &HyperliquidBasisMonitorOptions,
+    perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
+    mut warnings: Vec<String>,
 ) -> RuntimeResult<HyperliquidBasisMonitorSnapshot> {
     let updated_at = current_utc_timestamp()?.to_string();
     let min_abs_funding_rate =
@@ -17331,7 +17394,6 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
         None => BTreeMap::new(),
     };
     let perp_contexts = parse_hyperliquid_perp_context_rows(perp_json)?;
-    let mut warnings = Vec::new();
     let perp_wss_quotes = match options.perp_wss_monitor_url.as_deref() {
         Some(url) => match fetch_public_wss_monitor_quote_map_for_basis(
             url,
@@ -17398,6 +17460,11 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
             }
             None => None,
         };
+        let perp_depth = perp_depths.get(&perp.coin);
+        let depth_bid = perp_depth.and_then(|depth| depth.bid_depth.first());
+        let depth_ask = perp_depth.and_then(|depth| depth.ask_depth.first());
+        let has_perp_top_size =
+            perp_wss_row.is_some() || (depth_bid.is_some() && depth_ask.is_some());
         let (mut source_status, reason) = match spot {
             Some(_) => ("complete".to_owned(), None),
             None => {
@@ -17412,7 +17479,7 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
         let mut signal_error = None;
         let signal: Option<SpotPerpBasisSignal> = match spot {
             Some(_) => {
-                if perp_wss_row.is_none() {
+                if !has_perp_top_size {
                     source_status = "missing_top_of_book_size".to_owned();
                     signal_error = Some("MISSING_HYPERLIQUID_TOP_OF_BOOK_SIZE".to_owned());
                 } else {
@@ -17440,24 +17507,34 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json(
             perp_bid: perp_wss_row
                 .as_ref()
                 .map(|row| row.bid_price.clone())
+                .or_else(|| depth_bid.map(|level| level.price.clone()))
                 .or_else(|| Some(perp.price.clone())),
             perp_ask: perp_wss_row
                 .as_ref()
                 .map(|row| row.ask_price.clone())
+                .or_else(|| depth_ask.map(|level| level.price.clone()))
                 .or_else(|| Some(perp.price.clone())),
-            perp_bid_qty: perp_wss_row.as_ref().map(|row| row.bid_qty.clone()),
-            perp_ask_qty: perp_wss_row.as_ref().map(|row| row.ask_qty.clone()),
+            perp_bid_qty: perp_wss_row
+                .as_ref()
+                .map(|row| row.bid_qty.clone())
+                .or_else(|| depth_bid.map(|level| level.size.clone())),
+            perp_ask_qty: perp_wss_row
+                .as_ref()
+                .map(|row| row.ask_qty.clone())
+                .or_else(|| depth_ask.map(|level| level.size.clone())),
             perp_bid_depth: perp_wss_row
                 .as_ref()
                 .map(|row| {
                     signal_depth_or_top_strings(&row.bid_depth, &row.bid_price, &row.bid_qty)
                 })
+                .or_else(|| perp_depth.map(|depth| depth.bid_depth.clone()))
                 .unwrap_or_default(),
             perp_ask_depth: perp_wss_row
                 .as_ref()
                 .map(|row| {
                     signal_depth_or_top_strings(&row.ask_depth, &row.ask_price, &row.ask_qty)
                 })
+                .or_else(|| perp_depth.map(|depth| depth.ask_depth.clone()))
                 .unwrap_or_default(),
             mark_price: perp.mark_price,
             index_price: perp.oracle_price,
@@ -17804,30 +17881,61 @@ fn fetch_hyperliquid_funding_arb_public_venue_snapshot() -> RuntimeResult<Fundin
         HYPERLIQUID_INFO_URL,
         &hyperliquid_info_request_body("metaAndAssetCtxs"),
     )?;
+    let depth_symbols = hyperliquid_perp_depth_backfill_symbols(
+        &perp_json,
+        "0",
+        hyperliquid_perp_depth_backfill_limit()?,
+    )?;
+    let depth_report = fetch_public_order_book_depth_map(
+        PublicOrderBookDepthVenue::HyperliquidPerp,
+        &depth_symbols,
+    );
     let rows = parse_hyperliquid_perp_context_rows(&perp_json)?
         .into_iter()
         .filter(|row| !row.funding_rate.trim().is_empty())
-        .map(|row| FundingArbVenueMarket {
-            venue_family: "hyperliquid".to_owned(),
-            symbol: funding_display_symbol(&row.coin),
-            base_asset: funding_base_asset_from_symbol(&row.coin),
-            perp_bid: Some(row.price.clone()),
-            perp_ask: Some(row.price),
-            perp_bid_qty: None,
-            perp_ask_qty: None,
-            perp_bid_depth: Vec::new(),
-            perp_ask_depth: Vec::new(),
-            mark_price: Some(row.mark_price),
-            index_price: Some(row.oracle_price),
-            funding_rate: row.funding_rate,
-            funding_interval_hours: funding_interval_hours_string_for_venue("hyperliquid")
-                .unwrap_or_else(|_| "1".to_owned()),
-            next_funding_time_ms: None,
-            source_status: "missing_top_of_book_size".to_owned(),
+        .map(|row| {
+            let depth = depth_report.depths.get(&row.coin);
+            let depth_bid = depth.and_then(|depth| depth.bid_depth.first());
+            let depth_ask = depth.and_then(|depth| depth.ask_depth.first());
+            FundingArbVenueMarket {
+                venue_family: "hyperliquid".to_owned(),
+                symbol: funding_display_symbol(&row.coin),
+                base_asset: funding_base_asset_from_symbol(&row.coin),
+                perp_bid: depth_bid
+                    .map(|level| level.price.clone())
+                    .or(Some(row.price.clone())),
+                perp_ask: depth_ask
+                    .map(|level| level.price.clone())
+                    .or(Some(row.price)),
+                perp_bid_qty: depth_bid.map(|level| level.size.clone()),
+                perp_ask_qty: depth_ask.map(|level| level.size.clone()),
+                perp_bid_depth: depth
+                    .map(|depth| depth.bid_depth.clone())
+                    .unwrap_or_default(),
+                perp_ask_depth: depth
+                    .map(|depth| depth.ask_depth.clone())
+                    .unwrap_or_default(),
+                mark_price: Some(row.mark_price),
+                index_price: Some(row.oracle_price),
+                funding_rate: row.funding_rate,
+                funding_interval_hours: funding_interval_hours_string_for_venue("hyperliquid")
+                    .unwrap_or_else(|_| "1".to_owned()),
+                next_funding_time_ms: None,
+                source_status: if depth_bid.is_some() && depth_ask.is_some() {
+                    "complete".to_owned()
+                } else {
+                    "missing_top_of_book_size".to_owned()
+                },
+            }
         })
         .collect::<Vec<_>>();
+    let status = if depth_report.warnings.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    };
     Ok(FundingArbVenueSnapshot {
-        status: "healthy".to_owned(),
+        status: status.to_owned(),
         rows,
     })
 }
@@ -18146,6 +18254,9 @@ impl FundingArbDepthBackfillRequests {
             "aster" => {
                 self.aster.insert(symbol);
             }
+            "hyperliquid" => {
+                self.hyperliquid.insert(symbol);
+            }
             _ => {}
         }
     }
@@ -18181,11 +18292,17 @@ fn fetch_funding_arb_depth_backfill_maps(
         &requests.aster,
         &mut cache.aster,
     );
+    let (hyperliquid, hyperliquid_warnings) = fetch_funding_arb_depth_backfill_for_venue(
+        PublicOrderBookDepthVenue::HyperliquidPerp,
+        &requests.hyperliquid,
+        &mut cache.hyperliquid,
+    );
     warnings.extend(binance_warnings);
     warnings.extend(bybit_warnings);
     warnings.extend(okx_warnings);
     warnings.extend(bitget_warnings);
     warnings.extend(aster_warnings);
+    warnings.extend(hyperliquid_warnings);
 
     (
         FundingArbDepthBackfillMaps {
@@ -18194,6 +18311,7 @@ fn fetch_funding_arb_depth_backfill_maps(
             okx,
             bitget,
             aster,
+            hyperliquid,
         },
         warnings,
     )
@@ -18422,6 +18540,7 @@ fn funding_arb_depth_backfill_lookup<'a>(
         "okx" => depths.okx.get(symbol),
         "bitget" => depths.bitget.get(symbol),
         "aster" => depths.aster.get(symbol),
+        "hyperliquid" => depths.hyperliquid.get(symbol),
         _ => None,
     }
 }
@@ -19104,6 +19223,11 @@ fn aster_futures_book_ticker_url(symbol: &str) -> String {
 }
 
 #[cfg(feature = "live-exec")]
+fn aster_futures_exchange_info_all_url() -> String {
+    format!("{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/exchangeInfo")
+}
+
+#[cfg(feature = "live-exec")]
 fn aster_futures_exchange_info_symbol_url(symbol: &str) -> String {
     let symbol = public_url_query_component(symbol);
     format!("{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/exchangeInfo?symbol={symbol}")
@@ -19214,6 +19338,14 @@ fn hyperliquid_info_request_body(request_type: &str) -> String {
     format!("{{\"type\":{}}}", json_string(request_type))
 }
 
+fn hyperliquid_l2_book_request_body(symbol: &str) -> RuntimeResult<String> {
+    let coin = validate_hyperliquid_public_wss_coin(symbol)?;
+    Ok(format!(
+        "{{\"type\":\"l2Book\",\"coin\":{}}}",
+        json_string(&coin)
+    ))
+}
+
 fn public_order_book_depth_url(venue: PublicOrderBookDepthVenue, symbol: &str) -> String {
     match venue {
         PublicOrderBookDepthVenue::BinanceSpot => binance_spot_depth_url(symbol),
@@ -19225,6 +19357,7 @@ fn public_order_book_depth_url(venue: PublicOrderBookDepthVenue, symbol: &str) -
         PublicOrderBookDepthVenue::Okx => okx_order_book_url(symbol),
         PublicOrderBookDepthVenue::BitgetSpot => bitget_spot_order_book_url(symbol),
         PublicOrderBookDepthVenue::BitgetUsdtFutures => bitget_usdt_futures_order_book_url(symbol),
+        PublicOrderBookDepthVenue::HyperliquidPerp => HYPERLIQUID_INFO_URL.to_owned(),
     }
 }
 
@@ -19239,6 +19372,7 @@ fn public_order_book_depth_venue_label(venue: PublicOrderBookDepthVenue) -> &'st
         PublicOrderBookDepthVenue::Okx => "OKX",
         PublicOrderBookDepthVenue::BitgetSpot => "Bitget spot",
         PublicOrderBookDepthVenue::BitgetUsdtFutures => "Bitget USDT futures",
+        PublicOrderBookDepthVenue::HyperliquidPerp => "Hyperliquid perp",
     }
 }
 
@@ -19352,12 +19486,8 @@ fn fetch_public_order_book_depth_map_with_concurrency(
                 .map(|symbol| {
                     let symbol = symbol.clone();
                     scope.spawn(move || {
-                        let url = public_order_book_depth_url(venue, &symbol);
-                        let parsed = fetch_public_json_with_curl_max_time(
-                            &url,
-                            BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS,
-                        )
-                        .and_then(|raw| parse_public_order_book_depth(venue, &raw));
+                        let parsed = fetch_public_order_book_depth_raw(venue, &symbol)
+                            .and_then(|raw| parse_public_order_book_depth(venue, &raw));
                         match parsed {
                             Ok(depth) => Ok((symbol, depth)),
                             Err(error) => Err((symbol, error.to_string())),
@@ -19406,13 +19536,31 @@ fn summarize_public_order_book_depth_warnings(mut warnings: Vec<String>) -> Vec<
     warnings
 }
 
+fn fetch_public_order_book_depth_raw(
+    venue: PublicOrderBookDepthVenue,
+    symbol: &str,
+) -> RuntimeResult<String> {
+    let url = public_order_book_depth_url(venue, symbol);
+    match venue {
+        PublicOrderBookDepthVenue::HyperliquidPerp => {
+            let body = hyperliquid_l2_book_request_body(symbol)?;
+            fetch_public_json_with_http(
+                "POST",
+                &url,
+                Some(&body),
+                BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS,
+            )
+        }
+        _ => fetch_public_json_with_curl_max_time(&url, BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS),
+    }
+}
+
 #[cfg(feature = "live-exec")]
 fn fetch_public_order_book_depth(
     venue: PublicOrderBookDepthVenue,
     symbol: &str,
 ) -> RuntimeResult<PublicOrderBookDepth> {
-    let url = public_order_book_depth_url(venue, symbol);
-    let raw = fetch_public_json_with_curl_max_time(&url, BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS)?;
+    let raw = fetch_public_order_book_depth_raw(venue, symbol)?;
     parse_public_order_book_depth(venue, &raw)
 }
 
@@ -19459,6 +19607,9 @@ fn parse_public_order_book_depth(
         }
         PublicOrderBookDepthVenue::BitgetSpot | PublicOrderBookDepthVenue::BitgetUsdtFutures => {
             parse_bitget_order_book_depth(input, public_order_book_depth_venue_label(venue))
+        }
+        PublicOrderBookDepthVenue::HyperliquidPerp => {
+            parse_hyperliquid_l2_book_depth(input, public_order_book_depth_venue_label(venue))
         }
     }
 }
@@ -19567,6 +19718,28 @@ fn parse_bitget_order_book_depth(
     })
 }
 
+fn parse_hyperliquid_l2_book_depth(
+    input: &str,
+    source: &'static str,
+) -> RuntimeResult<PublicOrderBookDepth> {
+    let fields = parse_json_object_value_slices(input)?;
+    let levels = fields
+        .get("levels")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{source} l2Book response is missing levels"),
+        })?;
+    let sides = json_array_value_slices(levels)?;
+    if sides.len() < 2 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{source} l2Book response must contain bid and ask sides"),
+        });
+    }
+    Ok(PublicOrderBookDepth {
+        bid_depth: parse_order_book_depth_levels(sides[0], source, "levels[0]")?,
+        ask_depth: parse_order_book_depth_levels(sides[1], source, "levels[1]")?,
+    })
+}
+
 fn parse_order_book_depth_levels(
     value: &str,
     source: &'static str,
@@ -19624,6 +19797,9 @@ const BASIS_MONITOR_DEPTH_SYMBOL_LIMIT: usize = 12;
 const BASIS_MONITOR_DEPTH_WARNING_LIMIT: usize = 8;
 const BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS: u64 = 5;
 const BASIS_MONITOR_ORDER_BOOK_DEPTH_LIMIT: usize = 20;
+const HYPERLIQUID_PERP_DEPTH_BACKFILL_LIMIT_ENV: &str =
+    "ARB_RUNTIME_HYPERLIQUID_PERP_DEPTH_BACKFILL_LIMIT";
+const HYPERLIQUID_PERP_DEPTH_BACKFILL_LIMIT_DEFAULT: usize = 24;
 const FUNDING_ARB_DEPTH_BACKFILL_PAIR_LIMIT: usize = 12;
 const FUNDING_ARB_DEPTH_BACKFILL_TTL_SECS: u64 = 10;
 
@@ -19638,6 +19814,7 @@ enum PublicOrderBookDepthVenue {
     Okx,
     BitgetSpot,
     BitgetUsdtFutures,
+    HyperliquidPerp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21957,10 +22134,29 @@ fn parse_binance_usdm_price_tick(input: &str, symbol: &str) -> RuntimeResult<Pri
 
 #[cfg(feature = "live-exec")]
 fn fetch_aster_futures_price_tick(symbol: &str) -> RuntimeResult<Price> {
-    parse_aster_futures_price_tick(
-        &fetch_public_json_with_curl(&aster_futures_exchange_info_symbol_url(symbol))?,
-        symbol,
-    )
+    match fetch_public_json_with_curl(&aster_futures_exchange_info_symbol_url(symbol))
+        .and_then(|raw| parse_aster_futures_price_tick(&raw, symbol))
+    {
+        Ok(tick) => Ok(tick),
+        Err(symbol_error) => {
+            let symbol_error = symbol_error.to_string();
+            let all_raw =
+                fetch_public_json_with_curl(&aster_futures_exchange_info_all_url()).map_err(
+                    |all_error| RuntimeError::LiveMarketData {
+                        message: format!(
+                            "Aster Futures symbol exchangeInfo lookup failed for `{symbol}`: {symbol_error}; all-symbol rebuild lookup also failed: {all_error}"
+                        ),
+                    },
+                )?;
+            parse_aster_futures_price_tick(&all_raw, symbol).map_err(|all_error| {
+                RuntimeError::LiveMarketData {
+                    message: format!(
+                        "Aster Futures symbol exchangeInfo lookup failed for `{symbol}`: {symbol_error}; all-symbol rebuild lookup failed: {all_error}"
+                    ),
+                }
+            })
+        }
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -52623,12 +52819,14 @@ mod tests {
         let bybit = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","s":"BTCUSDT","b":[["102.00","0.5"]],"a":[["102.10","0.5"]]},"retExtInfo":{},"time":1778584220000}"#;
         let okx = r#"{"code":"0","msg":"","data":[{"asks":[["102.10","0.5","0","1"]],"bids":[["102.00","0.5","0","1"]],"ts":"1778584220000"}]}"#;
         let bitget = r#"{"code":"00000","msg":"success","data":{"asks":[["102.10","0.5"]],"bids":[["102.00","0.5"]],"ts":"1778584220000"}}"#;
+        let hyperliquid = r#"{"coin":"BTC","time":1778584220000,"levels":[[{"px":"102.00","sz":"0.5","n":1}],[{"px":"102.10","sz":"0.5","n":1}]]}"#;
 
         for (venue, raw) in [
             (PublicOrderBookDepthVenue::BinanceUsdmPerp, binance),
             (PublicOrderBookDepthVenue::BybitLinear, bybit),
             (PublicOrderBookDepthVenue::Okx, okx),
             (PublicOrderBookDepthVenue::BitgetUsdtFutures, bitget),
+            (PublicOrderBookDepthVenue::HyperliquidPerp, hyperliquid),
         ] {
             let depth = parse_public_order_book_depth(venue, raw).expect("depth");
             assert_eq!(depth.bid_depth[0].price, "102.00");
@@ -55352,6 +55550,94 @@ mod tests {
         let status_json = snapshot.to_json();
         assert!(status_json.contains("Hyperliquid 多数永续合约没有 USDC 现货 context"));
         assert!(status_json.contains("缺少 perp WSS top-of-book 数量"));
+    }
+
+    #[test]
+    fn hyperliquid_perp_depth_backfill_symbols_prioritize_abs_funding() {
+        let perp = r#"[
+          {
+            "universe": [
+              {"name":"BTC","szDecimals":5,"maxLeverage":50},
+              {"name":"ETH","szDecimals":4,"maxLeverage":50},
+              {"name":"DOGE","szDecimals":0,"maxLeverage":3}
+            ],
+            "marginTables": []
+          },
+          [
+            {"dayNtlVlm":"1000000.0","funding":"0.00020000","markPx":"101.00","midPx":"101.00","openInterest":"100.0","oraclePx":"100.00","premium":"0.0001","prevDayPx":"99.00"},
+            {"dayNtlVlm":"1000000.0","funding":"-0.00030000","markPx":"201.00","midPx":"201.00","openInterest":"100.0","oraclePx":"200.00","premium":"0.0001","prevDayPx":"199.00"},
+            {"dayNtlVlm":"1000000.0","funding":"0.00000001","markPx":"0.10","midPx":"0.10","openInterest":"100.0","oraclePx":"0.10","premium":"0.0001","prevDayPx":"0.09"}
+          ]
+        ]"#;
+
+        let symbols =
+            hyperliquid_perp_depth_backfill_symbols(perp, "0.00000100", 2).expect("symbols");
+
+        assert_eq!(symbols.len(), 2);
+        assert!(symbols.contains("BTC"));
+        assert!(symbols.contains("ETH"));
+        assert!(!symbols.contains("DOGE"));
+    }
+
+    #[test]
+    fn hyperliquid_basis_monitor_snapshot_uses_l2_book_depth_without_wss() {
+        let perp = r#"[
+          {
+            "universe": [
+              {"name":"BTC","szDecimals":5,"maxLeverage":50}
+            ],
+            "marginTables": []
+          },
+          [
+            {"dayNtlVlm":"1000000.0","funding":"0.00010000","markPx":"101.00","midPx":"101.00","openInterest":"100.0","oraclePx":"100.00","premium":"0.0001","prevDayPx":"99.00"}
+          ]
+        ]"#;
+        let mut depths = BTreeMap::new();
+        depths.insert(
+            "BTC".to_owned(),
+            PublicOrderBookDepth {
+                bid_depth: vec![SignalDepthLevel {
+                    price: "100.90".to_owned(),
+                    size: "0.25".to_owned(),
+                }],
+                ask_depth: vec![SignalDepthLevel {
+                    price: "101.10".to_owned(),
+                    size: "0.30".to_owned(),
+                }],
+            },
+        );
+        let options = HyperliquidBasisMonitorOptions {
+            min_abs_funding_rate: "0.00000100".to_owned(),
+            once: true,
+            ..HyperliquidBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+            None,
+            perp,
+            &options,
+            &depths,
+            Vec::new(),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.missing_spot_count, 1);
+        let row = snapshot.rows.first().expect("row");
+        assert_eq!(row.source_status, "missing_spot");
+        assert_eq!(row.perp_bid.as_deref(), Some("100.90"));
+        assert_eq!(row.perp_ask.as_deref(), Some("101.10"));
+        assert_eq!(row.perp_bid_qty.as_deref(), Some("0.25"));
+        assert_eq!(row.perp_ask_qty.as_deref(), Some("0.30"));
+        assert_eq!(row.perp_bid_depth.len(), 1);
+        assert_eq!(row.perp_ask_depth.len(), 1);
+    }
+
+    #[test]
+    fn hyperliquid_l2_book_request_body_accepts_display_symbol() {
+        let body = hyperliquid_l2_book_request_body("BTCUSDT").expect("request body");
+
+        assert_eq!(body, r#"{"type":"l2Book","coin":"BTC"}"#);
     }
 
     #[test]

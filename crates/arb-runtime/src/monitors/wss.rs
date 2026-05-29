@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
@@ -41,6 +42,7 @@ use crate::{
 pub(crate) const HYPERLIQUID_PUBLIC_WSS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub(crate) const ASTER_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.asterdex.com";
 pub(crate) const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
+pub(crate) const PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL: u32 = 10;
 pub(crate) const BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8801";
 pub(crate) const BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
@@ -482,6 +484,7 @@ pub fn run_binance_wss_book_ticker_monitor(
 
     let mut rebuild_from_rest = false;
     let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("binance-wss-book-ticker");
     loop {
         let cycle = run_binance_wss_book_ticker_monitor_cycle(
             &options,
@@ -491,11 +494,21 @@ pub fn run_binance_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => consecutive_failures = 0,
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
             Err(error) if options.once => return Err(error),
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                eprintln!("binance-wss-book-ticker cycle failed: {error}");
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
             }
         }
         rebuild_from_rest = true;
@@ -728,6 +741,7 @@ pub fn run_bybit_wss_book_ticker_monitor(
 
     let mut rebuild_from_rest = false;
     let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("bybit-wss-book-ticker");
     loop {
         let cycle = run_bybit_wss_book_ticker_monitor_cycle(
             &options,
@@ -737,11 +751,21 @@ pub fn run_bybit_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => consecutive_failures = 0,
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
             Err(error) if options.once => return Err(error),
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                eprintln!("bybit-wss-book-ticker cycle failed: {error}");
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
             }
         }
         rebuild_from_rest = true;
@@ -896,6 +920,7 @@ pub fn run_okx_wss_book_ticker_monitor(
 
     let mut rebuild_from_rest = false;
     let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("okx-wss-book-ticker");
     loop {
         let cycle = run_okx_wss_book_ticker_monitor_cycle(
             &options,
@@ -905,11 +930,21 @@ pub fn run_okx_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => consecutive_failures = 0,
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
             Err(error) if options.once => return Err(error),
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                eprintln!("okx-wss-book-ticker cycle failed: {error}");
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
             }
         }
         rebuild_from_rest = true;
@@ -1062,6 +1097,7 @@ pub fn run_bitget_wss_book_ticker_monitor(
 
     let mut rebuild_from_rest = false;
     let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("bitget-wss-book-ticker");
     loop {
         let cycle = run_bitget_wss_book_ticker_monitor_cycle(
             &options,
@@ -1071,11 +1107,21 @@ pub fn run_bitget_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => consecutive_failures = 0,
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
             Err(error) if options.once => return Err(error),
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                eprintln!("bitget-wss-book-ticker cycle failed: {error}");
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
             }
         }
         rebuild_from_rest = true;
@@ -1230,6 +1276,7 @@ pub fn run_aster_wss_book_ticker_monitor(
 
     let mut rebuild_from_rest = false;
     let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("aster-wss-book-ticker");
     loop {
         let cycle = run_aster_wss_book_ticker_monitor_cycle(
             &options,
@@ -1239,11 +1286,21 @@ pub fn run_aster_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => consecutive_failures = 0,
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
             Err(error) if options.once => return Err(error),
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                eprintln!("aster-wss-book-ticker cycle failed: {error}");
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
             }
         }
         rebuild_from_rest = true;
@@ -1396,6 +1453,7 @@ pub fn run_hyperliquid_wss_book_ticker_monitor(
 
     let mut rebuild_from_rest = false;
     let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("hyperliquid-wss-book-ticker");
     loop {
         let cycle = run_hyperliquid_wss_book_ticker_monitor_cycle(
             &options,
@@ -1405,11 +1463,21 @@ pub fn run_hyperliquid_wss_book_ticker_monitor(
         );
         match cycle {
             Ok(()) if options.once => return Ok(()),
-            Ok(()) => consecutive_failures = 0,
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
             Err(error) if options.once => return Err(error),
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                eprintln!("hyperliquid-wss-book-ticker cycle failed: {error}");
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
             }
         }
         rebuild_from_rest = true;
@@ -3332,6 +3400,57 @@ fn public_wss_reconnect_backoff_with_jitter_seed(
             .saturating_add(jitter_secs)
             .min(PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS),
     )
+}
+
+#[derive(Debug)]
+struct PublicWssCycleFailureLogger {
+    label: &'static str,
+    last_message: Option<String>,
+    repeated_count: u32,
+}
+
+impl PublicWssCycleFailureLogger {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            last_message: None,
+            repeated_count: 0,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.last_message = None;
+        self.repeated_count = 0;
+    }
+
+    fn record_failure(
+        &mut self,
+        error: &impl Display,
+        consecutive_failures: u32,
+        reconnect_backoff: Duration,
+    ) {
+        let message = error.to_string();
+        let changed = self.last_message.as_deref() != Some(message.as_str());
+        if changed {
+            self.last_message = Some(message.clone());
+            self.repeated_count = 1;
+        } else {
+            self.repeated_count = self.repeated_count.saturating_add(1);
+        }
+        if changed
+            || self.repeated_count == 1
+            || self.repeated_count % PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL == 0
+        {
+            eprintln!(
+                "{} cycle failed: {}; consecutive_failures={} repeated_count={} next_reconnect_delay_secs={}",
+                self.label,
+                message,
+                consecutive_failures,
+                self.repeated_count,
+                reconnect_backoff.as_secs()
+            );
+        }
+    }
 }
 
 pub(crate) fn validate_binance_wss_probe_options(
