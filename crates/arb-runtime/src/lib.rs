@@ -495,6 +495,8 @@ const FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENV: &str =
 const BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS: i128 = 5;
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_RESIDENT_NO_CANDIDATE_EVENT_BLOCKING_PATH_LIMIT: usize = 5;
+#[cfg(feature = "live-exec")]
+const OPPORTUNITY_RECORDER_RESIDENT_HEALTH_EVENT_MAX_AGE_SECS: i64 = 15 * 60;
 const ARB_RUNTIME_LEGACY_COMMANDS_ENV: &str = "ARB_RUNTIME_ENABLE_LEGACY_COMMANDS";
 const UNIFIED_RUNTIME_DEFAULT_CONFIG: &str = "templates/personal_guarded_live.preflight.yaml";
 const UNIFIED_RUNTIME_PAPER_DEFAULT_OUT: &str = "target/arb-runtime/paper";
@@ -18251,6 +18253,92 @@ fn funding_arb_row_venue_symbols(row: &FundingArbMarketRow) -> Option<(String, S
     Some((venue_a_symbol.to_owned(), venue_b_symbol.to_owned()))
 }
 
+fn funding_arb_pair_exchange_native_symbol_rejection(
+    venue_a: &FundingArbVenueMarket,
+    venue_b: &FundingArbVenueMarket,
+) -> Option<String> {
+    funding_arb_exchange_native_symbol_rejection(&venue_a.venue_family, &venue_a.symbol).or_else(
+        || funding_arb_exchange_native_symbol_rejection(&venue_b.venue_family, &venue_b.symbol),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_monitor_row_exchange_native_symbol_rejection(
+    row: &FundingArbMarketRow,
+) -> Option<String> {
+    if funding_arb_symbol_has_synthetic_hash_base(&row.symbol) {
+        return Some(format!(
+            "funding arb display symbol `{}` is a synthetic hashed symbol; live/private endpoints require exchange-native symbols",
+            row.symbol
+        ));
+    }
+    let (venue_a_symbol, venue_b_symbol) = funding_arb_row_venue_symbols(row)?;
+    funding_arb_exchange_native_symbol_rejection(&row.venue_a_family, &venue_a_symbol).or_else(
+        || funding_arb_exchange_native_symbol_rejection(&row.venue_b_family, &venue_b_symbol),
+    )
+}
+
+fn funding_arb_exchange_native_symbol_rejection(
+    venue_family: &str,
+    symbol: &str,
+) -> Option<String> {
+    let venue_family = normalize_venue_family(venue_family);
+    let venue_label = if venue_family.is_empty() {
+        "unknown"
+    } else {
+        venue_family.as_str()
+    };
+    let symbol = symbol.trim();
+    if funding_arb_symbol_has_synthetic_hash_base(symbol) {
+        return Some(format!(
+            "{venue_label} symbol `{symbol}` is synthetic; funding arb live/private endpoints require an exchange-native symbol"
+        ));
+    }
+    let valid = match venue_family.as_str() {
+        "binance" | "bybit" | "bitget" | "aster" => {
+            funding_arb_ascii_usdt_symbol_is_exchange_native(symbol)
+        }
+        "okx" => funding_arb_okx_symbol_is_exchange_native(symbol),
+        "hyperliquid" => funding_arb_hyperliquid_coin_is_exchange_native(symbol),
+        _ => !symbol.is_empty() && symbol.is_ascii(),
+    };
+    (!valid).then(|| {
+        format!(
+            "{venue_label} symbol `{symbol}` is not exchange-native for funding arb live/private endpoints"
+        )
+    })
+}
+
+fn funding_arb_ascii_usdt_symbol_is_exchange_native(symbol: &str) -> bool {
+    symbol.len() > 4
+        && symbol.ends_with("USDT")
+        && symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn funding_arb_okx_symbol_is_exchange_native(symbol: &str) -> bool {
+    symbol.contains("-USDT")
+        && symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn funding_arb_hyperliquid_coin_is_exchange_native(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol.is_ascii()
+        && symbol
+            .chars()
+            .all(|ch| !ch.is_control() && !ch.is_whitespace() && ch != '"' && ch != '\\')
+}
+
+fn funding_arb_symbol_has_synthetic_hash_base(symbol: &str) -> bool {
+    let base = funding_base_asset_from_symbol(symbol).to_ascii_uppercase();
+    base.len() == 19
+        && base.starts_with("SYM")
+        && base[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn funding_arb_market_from_monitor_row(
     row: &FundingArbMarketRow,
     venue_a: bool,
@@ -18421,6 +18509,20 @@ fn funding_arb_pair_row(
         source_status,
         product_tags: funding_arb_product_tags_for_symbol(&symbol),
     };
+
+    if let Some(reason) = funding_arb_pair_exchange_native_symbol_rejection(venue_a, venue_b) {
+        return Ok(base_row(
+            false,
+            Some(reason),
+            "invalid_symbol".to_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
 
     if !funding_arb_source_status_allows_perp(&venue_a.source_status)
         || !funding_arb_source_status_allows_perp(&venue_b.source_status)
@@ -19312,6 +19414,30 @@ fn fetch_public_order_book_depth(
     let url = public_order_book_depth_url(venue, symbol);
     let raw = fetch_public_json_with_curl_max_time(&url, BASIS_MONITOR_DEPTH_CURL_MAX_TIME_SECS)?;
     parse_public_order_book_depth(venue, &raw)
+}
+
+#[cfg(feature = "live-exec")]
+fn basis_raw_refs_use_fixture_depth(refs: &[&str]) -> bool {
+    cfg!(test) && refs.iter().all(|value| value.starts_with("test:"))
+}
+
+#[cfg(feature = "live-exec")]
+fn public_order_book_depth_from_top_of_book(
+    bid_price: &str,
+    bid_size: &str,
+    ask_price: &str,
+    ask_size: &str,
+) -> PublicOrderBookDepth {
+    PublicOrderBookDepth {
+        bid_depth: vec![SignalDepthLevel {
+            price: bid_price.to_owned(),
+            size: bid_size.to_owned(),
+        }],
+        ask_depth: vec![SignalDepthLevel {
+            price: ask_price.to_owned(),
+            size: ask_size.to_owned(),
+        }],
+    }
 }
 
 fn parse_public_order_book_depth(
@@ -20975,12 +21101,14 @@ fn append_opportunity_recorder_resident_tail_health(
         .rposition(|line| line.contains("\"event_type\":\"resident_started\""))
         .unwrap_or(0);
     let scoped_lines = &lines[start..];
-    let cycle_error_count = count_lines_containing(scoped_lines, "\"event_type\":\"cycle_error\"");
+    let recent_lines = opportunity_recorder_resident_recent_health_lines(scoped_lines);
+    let health_lines = recent_lines.as_slice();
+    let cycle_error_count = count_lines_containing(health_lines, "\"event_type\":\"cycle_error\"");
     let residual_de_risk_retry_count =
-        count_lines_containing(scoped_lines, "\"event_type\":\"residual_de_risk_retry\"");
-    let blocked_decision_count = count_lines_containing(scoped_lines, "\"decision\":\"blocked\"");
+        count_lines_containing(health_lines, "\"event_type\":\"residual_de_risk_retry\"");
+    let blocked_decision_count = count_lines_containing(health_lines, "\"decision\":\"blocked\"");
     let entry_capacity_blocked_count =
-        count_lines_containing(scoped_lines, "\"event_type\":\"entry_capacity_blocked\"");
+        count_lines_containing(health_lines, "\"event_type\":\"entry_capacity_blocked\"");
     let status = if cycle_error_count > 0
         || residual_de_risk_retry_count > 0
         || blocked_decision_count > 0
@@ -21027,6 +21155,47 @@ fn tail_lines(input: &str, limit: usize) -> Vec<&str> {
 #[cfg(feature = "live-exec")]
 fn count_lines_containing(lines: &[&str], pattern: &str) -> usize {
     lines.iter().filter(|line| line.contains(pattern)).count()
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_recent_health_lines<'a>(lines: &'a [&str]) -> Vec<&'a str> {
+    let Ok(now) = current_utc_timestamp() else {
+        return lines.to_vec();
+    };
+    lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            opportunity_recorder_resident_event_is_recent(
+                line,
+                now,
+                OPPORTUNITY_RECORDER_RESIDENT_HEALTH_EVENT_MAX_AGE_SECS,
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_event_is_recent(
+    line: &str,
+    now: UtcTimestamp,
+    max_age_secs: i64,
+) -> bool {
+    let Ok(fields) = parse_json_object_value_slices(line) else {
+        return true;
+    };
+    let Ok(Some(recorded_at)) =
+        optional_json_value_string(&fields, "recorded_at", "resident health event")
+    else {
+        return true;
+    };
+    let Ok(recorded_at) = UtcTimestamp::from_str(&recorded_at) else {
+        return true;
+    };
+    let age_secs = now
+        .unix_seconds()
+        .saturating_sub(recorded_at.unix_seconds());
+    age_secs <= max_age_secs
 }
 
 #[cfg(feature = "live-exec")]
@@ -28359,15 +28528,17 @@ fn select_funding_arb_resident_candidate<'a>(
     options: &FundingArbResidentLiveOptions,
 ) -> Option<&'a FundingArbMarketRow> {
     if let Some(pair_id) = &options.pair_id {
-        return snapshot
-            .rows
-            .iter()
-            .find(|row| row.pair_id == *pair_id && row.is_candidate);
+        return snapshot.rows.iter().find(|row| {
+            row.pair_id == *pair_id
+                && row.is_candidate
+                && funding_arb_monitor_row_exchange_native_symbol_rejection(row).is_none()
+        });
     }
     snapshot
         .rows
         .iter()
         .filter(|row| row.is_candidate)
+        .filter(|row| funding_arb_monitor_row_exchange_native_symbol_rejection(row).is_none())
         .filter(|row| funding_arb_row_net_funding_bps_meets_min(row, options.min_net_funding_bps))
         .max_by_key(|row| funding_arb_row_net_funding_bps_sort_key(row).unwrap_or(i128::MIN))
 }
@@ -28470,7 +28641,10 @@ fn funding_arb_resident_no_candidate_reason(
     options: &FundingArbResidentLiveOptions,
 ) -> String {
     if let Some(pair_id) = &options.pair_id {
-        if snapshot.rows.iter().any(|row| row.pair_id == *pair_id) {
+        if let Some(row) = snapshot.rows.iter().find(|row| row.pair_id == *pair_id) {
+            if let Some(reason) = funding_arb_monitor_row_exchange_native_symbol_rejection(row) {
+                return format!("configured pair_id `{pair_id}` is blocked: {reason}");
+            }
             format!("configured pair_id `{pair_id}` is present but not a current candidate")
         } else {
             format!("configured pair_id `{pair_id}` is not present in current funding arb snapshot")
@@ -28490,6 +28664,18 @@ fn funding_arb_resident_no_candidate_blocking_path(
 ) -> Vec<FundingArbBlockingPathEntry> {
     let mut entries = funding_arb_monitor_compact_blocking_path(snapshot);
     if let Some(pair_id) = &options.pair_id {
+        if let Some(row) = snapshot.rows.iter().find(|row| row.pair_id == *pair_id) {
+            if let Some(reason) = funding_arb_monitor_row_exchange_native_symbol_rejection(row) {
+                return vec![FundingArbBlockingPathEntry::new(
+                    "opportunity_row",
+                    "invalid_symbol:is_candidate=false",
+                    format!("阻断原因：交易所原生符号校验失败；{reason}"),
+                )
+                .with_pair(row.pair_id.clone(), row.symbol.clone())
+                .with_venues(row.venue_a_family.clone(), row.venue_b_family.clone())
+                .with_source_status("invalid_symbol")];
+            }
+        }
         let row_entries = snapshot
             .rows
             .iter()
@@ -33257,10 +33443,31 @@ fn write_binance_basis_guarded_live_auto_market_artifacts(
         &perp_instrument_id,
         "Binance basis premium index",
     )?;
-    let spot_depth =
-        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BinanceSpot, &symbol)?;
-    let perp_depth =
-        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BinanceUsdmPerp, &symbol)?;
+    let (spot_depth, perp_depth) = if basis_raw_refs_use_fixture_depth(&[
+        inputs.spot_book_ref,
+        inputs.perp_book_ref,
+        inputs.premium_index_ref,
+    ]) {
+        (
+            public_order_book_depth_from_top_of_book(
+                payload_string(spot, "best_bid")?,
+                payload_string(spot, "bid_size")?,
+                payload_string(spot, "best_ask")?,
+                payload_string(spot, "ask_size")?,
+            ),
+            public_order_book_depth_from_top_of_book(
+                payload_string(perp, "best_bid")?,
+                payload_string(perp, "bid_size")?,
+                payload_string(perp, "best_ask")?,
+                payload_string(perp, "ask_size")?,
+            ),
+        )
+    } else {
+        (
+            fetch_public_order_book_depth(PublicOrderBookDepthVenue::BinanceSpot, &symbol)?,
+            fetch_public_order_book_depth(PublicOrderBookDepthVenue::BinanceUsdmPerp, &symbol)?,
+        )
+    };
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
         spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
@@ -33348,9 +33555,28 @@ fn write_bybit_basis_guarded_live_auto_market_artifacts(
         &perp_instrument_id,
         "Bybit basis premium index",
     )?;
-    let spot_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::BybitSpot, &symbol)?;
-    let perp_depth =
-        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BybitLinear, &symbol)?;
+    let (spot_depth, perp_depth) =
+        if basis_raw_refs_use_fixture_depth(&[inputs.spot_ticker_ref, inputs.linear_ticker_ref]) {
+            (
+                public_order_book_depth_from_top_of_book(
+                    payload_string(spot, "best_bid")?,
+                    payload_string(spot, "bid_size")?,
+                    payload_string(spot, "best_ask")?,
+                    payload_string(spot, "ask_size")?,
+                ),
+                public_order_book_depth_from_top_of_book(
+                    payload_string(perp, "best_bid")?,
+                    payload_string(perp, "bid_size")?,
+                    payload_string(perp, "best_ask")?,
+                    payload_string(perp, "ask_size")?,
+                ),
+            )
+        } else {
+            (
+                fetch_public_order_book_depth(PublicOrderBookDepthVenue::BybitSpot, &symbol)?,
+                fetch_public_order_book_depth(PublicOrderBookDepthVenue::BybitLinear, &symbol)?,
+            )
+        };
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
         spot_best_bid: payload_string(spot, "best_bid")?.to_owned(),
@@ -33454,9 +33680,31 @@ fn write_bitget_basis_guarded_live_auto_market_artifacts(
                 inputs.usdt_futures_funding_rate_ref, symbol
             ),
         })?;
-    let spot_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::BitgetSpot, &symbol)?;
-    let futures_depth =
-        fetch_public_order_book_depth(PublicOrderBookDepthVenue::BitgetUsdtFutures, &symbol)?;
+    let (spot_depth, futures_depth) = if basis_raw_refs_use_fixture_depth(&[
+        inputs.spot_ticker_ref,
+        inputs.usdt_futures_ticker_ref,
+        inputs.usdt_futures_funding_rate_ref,
+    ]) {
+        (
+            public_order_book_depth_from_top_of_book(
+                &spot.bid_price,
+                &spot.bid_qty,
+                &spot.ask_price,
+                &spot.ask_qty,
+            ),
+            public_order_book_depth_from_top_of_book(
+                &perp.bid_price,
+                &perp.bid_qty,
+                &perp.ask_price,
+                &perp.ask_qty,
+            ),
+        )
+    } else {
+        (
+            fetch_public_order_book_depth(PublicOrderBookDepthVenue::BitgetSpot, &symbol)?,
+            fetch_public_order_book_depth(PublicOrderBookDepthVenue::BitgetUsdtFutures, &symbol)?,
+        )
+    };
 
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
@@ -33654,8 +33902,33 @@ fn write_okx_basis_guarded_live_auto_market_artifacts(
                 inputs.funding_rate_ref
             ),
         })?;
-    let spot_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::Okx, &symbol)?;
-    let swap_depth = fetch_public_order_book_depth(PublicOrderBookDepthVenue::Okx, &swap_inst_id)?;
+    let (spot_depth, swap_depth) = if basis_raw_refs_use_fixture_depth(&[
+        inputs.spot_ticker_ref,
+        inputs.swap_ticker_ref,
+        inputs.mark_price_ref,
+        inputs.index_ticker_ref,
+        inputs.funding_rate_ref,
+    ]) {
+        (
+            public_order_book_depth_from_top_of_book(
+                &spot.bid_price,
+                &spot.bid_qty,
+                &spot.ask_price,
+                &spot.ask_qty,
+            ),
+            public_order_book_depth_from_top_of_book(
+                &swap.bid_price,
+                &swap.bid_qty,
+                &swap.ask_price,
+                &swap.ask_qty,
+            ),
+        )
+    } else {
+        (
+            fetch_public_order_book_depth(PublicOrderBookDepthVenue::Okx, &symbol)?,
+            fetch_public_order_book_depth(PublicOrderBookDepthVenue::Okx, &swap_inst_id)?,
+        )
+    };
 
     let signal = evaluate_spot_perp_basis_signal(&SpotPerpBasisSignalInput {
         symbol: symbol.clone(),
@@ -39239,6 +39512,7 @@ fn funding_arb_monitor_row_blocking_reason(row: &FundingArbMarketRow) -> String 
 
 fn funding_arb_monitor_row_blocking_summary(row: &FundingArbMarketRow) -> &'static str {
     match row.source_status.as_str() {
+        "invalid_symbol" => "阻断原因：交易所原生符号校验失败",
         "source_not_ready" => "阻断原因：上游 venue status 不完整",
         "missing_perp_top_of_book" => {
             "阻断原因：上游 perp top-of-book、mark/index 或盘口数量字段缺失"
@@ -43438,6 +43712,7 @@ mod tests {
             ingested_at: "2026-05-13T00:00:00.000000000Z".to_owned(),
             freshness_status: "Fresh".to_owned(),
         });
+        snapshot.wss_update_count = 1;
         snapshot.record_failure("forced fail closed for test", true);
         snapshot.begin_rest_rebuild();
 
@@ -43448,8 +43723,8 @@ mod tests {
         assert!(health.contains("\"fail_closed\":true"));
         assert!(health.contains("\"disconnect_count\":1"));
         assert!(health.contains("\"rest_rebuild_count\":1"));
-        assert!(quote.contains("\"latest_quote\""));
-        assert!(quote.contains("\"best_bid\":\"100.01\""));
+        assert!(health.contains("\"wss_update_count\":0"));
+        assert!(quote.contains("\"latest_quote\":null"));
         assert!(status.contains("\"last_error\":\"forced fail closed for test\""));
     }
 
@@ -45438,6 +45713,62 @@ mod tests {
             .net_funding_bps
             .as_deref()
             .is_some_and(|value| value != "0"));
+    }
+
+    #[test]
+    fn funding_arb_monitor_rejects_non_exchange_native_symbols() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "龙虾USDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let bitget = funding_arb_test_venue_snapshot(
+            "bitget",
+            &funding_arb_basis_status_json(
+                "龙虾USDT",
+                "0.00600000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "binance".to_owned(),
+                    status_url: "http://127.0.0.1/binance/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "bitget".to_owned(),
+                    status_url: "http://127.0.0.1/bitget/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot = build_funding_arb_monitor_snapshot_from_sources(
+            vec![binance, bitget],
+            vec![],
+            &options,
+        )
+        .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.candidate_count, 0);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.pair_id, "binance:bitget:龙虾USDT:龙虾USDT");
+        assert!(row.symbol.starts_with("SYM"));
+        assert!(!row.is_candidate);
+        assert_eq!(row.source_status, "invalid_symbol");
+        assert!(row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exchange-native")));
     }
 
     #[test]
@@ -54632,6 +54963,27 @@ mod tests {
             line,
             r#"{"candidate_count":1,"rows":[],"recorded_at":"2026-05-21T00:00:00Z","venue":"okx","mutable_execution_started":false}"#
         );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_resident_tail_health_ignores_old_errors() {
+        let now = UtcTimestamp::from_str("2026-05-29T00:15:00Z").expect("time");
+        assert!(!opportunity_recorder_resident_event_is_recent(
+            r#"{"event_type":"cycle_error","recorded_at":"2026-05-29T00:00:00Z"}"#,
+            now,
+            60,
+        ));
+        assert!(opportunity_recorder_resident_event_is_recent(
+            r#"{"event_type":"cycle_error","recorded_at":"2026-05-29T00:14:30Z"}"#,
+            now,
+            60,
+        ));
+        assert!(opportunity_recorder_resident_event_is_recent(
+            r#"{"event_type":"cycle_error"}"#,
+            now,
+            60,
+        ));
     }
 
     #[cfg(feature = "live-exec")]

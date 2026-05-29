@@ -110,6 +110,14 @@ pub(crate) fn unknown_public_command_error(command: &str) -> RuntimeError {
     ))
 }
 
+fn live_report_cli_prefix(phase: &str, halt_reason: Option<&str>) -> &'static str {
+    if phase == "halted" || halt_reason.is_some_and(|reason| reason != "none") {
+        "halted"
+    } else {
+        "ok"
+    }
+}
+
 pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
     if args.is_empty() || args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return Ok(help_text());
@@ -346,8 +354,9 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
     if args[0] == "binance-basis-live-stack" {
         let options = parse_binance_basis_live_stack_args(&args[1..])?;
         let report = run_binance_basis_live_stack(options)?;
+        let prefix = live_report_cli_prefix(&report.phase, report.halt_reason.as_deref());
         return Ok(format!(
-            "ok: Binance basis live stack completed; phase={}; readiness_ok={}; resident_exit_status={}; spot_monitor_exit_status={}; perp_monitor_exit_status={}; halt_reason={}; wrote artifacts to {}",
+            "{prefix}: Binance basis live stack completed; phase={}; readiness_ok={}; resident_exit_status={}; spot_monitor_exit_status={}; perp_monitor_exit_status={}; halt_reason={}; wrote artifacts to {}",
             report.phase,
             report.readiness_ok,
             report.resident_exit_status.as_deref().unwrap_or("none"),
@@ -360,13 +369,14 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
     if args[0] == "binance-basis-resident-live" {
         let options = parse_binance_basis_resident_live_args(&args[1..])?;
         let report = run_binance_basis_resident_live(options)?;
+        let prefix = live_report_cli_prefix(&report.phase, report.halt_reason.as_deref());
         let output_note = report
             .output_dir
             .as_ref()
             .map(|path| format!("; wrote artifacts to {}", path.display()))
             .unwrap_or_else(|| "; no artifacts written".to_owned());
         return Ok(format!(
-            "ok: Binance basis resident live completed; phase={}; cycles={}; last_net_bps={}; entry_dispatch_attempted={}; exit_dispatch_attempted={}; open_positions={}; live_entries={}; total_open_notional_usdt={}; position_state={}; halt_reason={}{}",
+            "{prefix}: Binance basis resident live completed; phase={}; cycles={}; last_net_bps={}; entry_dispatch_attempted={}; exit_dispatch_attempted={}; open_positions={}; live_entries={}; total_open_notional_usdt={}; position_state={}; halt_reason={}{}",
             report.phase,
             report.cycles,
             report
@@ -390,13 +400,14 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
     if args[0] == "multi-venue-basis-resident-live" {
         let options = parse_multi_venue_basis_resident_live_args(&args[1..])?;
         let report = run_multi_venue_basis_resident_live(options)?;
+        let prefix = live_report_cli_prefix(&report.phase, report.halt_reason.as_deref());
         let output_note = report
             .output_dir
             .as_ref()
             .map(|path| format!("; wrote artifacts to {}", path.display()))
             .unwrap_or_else(|| "; no artifacts written".to_owned());
         return Ok(format!(
-            "ok: multi-venue basis resident live completed; phase={}; cycles={}; venues={}; entry_dispatch_attempted={}; exit_dispatch_attempted={}; open_positions={}; live_entries={}; total_open_notional_usdt={}; halt_reason={}{}",
+            "{prefix}: multi-venue basis resident live completed; phase={}; cycles={}; venues={}; entry_dispatch_attempted={}; exit_dispatch_attempted={}; open_positions={}; live_entries={}; total_open_notional_usdt={}; halt_reason={}{}",
             report.phase,
             report.cycles,
             report.venue_count,
@@ -412,8 +423,9 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
     if args[0] == "multi-venue-basis-live-stack" {
         let options = parse_multi_venue_basis_live_stack_args(&args[1..])?;
         let report = run_multi_venue_basis_live_stack(options)?;
+        let prefix = live_report_cli_prefix(&report.phase, report.halt_reason.as_deref());
         return Ok(format!(
-            "ok: multi-venue basis live stack completed; phase={}; readiness_ok={}; resident_exit_status={}; monitor_exit_statuses={}; halt_reason={}; wrote artifacts to {}",
+            "{prefix}: multi-venue basis live stack completed; phase={}; readiness_ok={}; resident_exit_status={}; monitor_exit_statuses={}; halt_reason={}; wrote artifacts to {}",
             report.phase,
             report.readiness_ok,
             report.resident_exit_status.as_deref().unwrap_or("none"),
@@ -831,13 +843,14 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         let options = parse_funding_arb_resident_live_args(&args[1..])?;
         let output_dir = options.output_dir.clone();
         let report = run_funding_arb_resident_live(options)?;
+        let prefix = live_report_cli_prefix(&report.phase, report.halt_reason.as_deref());
         let output_note = output_dir
             .or_else(|| report.output_dir.clone())
             .as_ref()
             .map(|path| format!("; wrote artifacts to {}", path.display()))
             .unwrap_or_else(|| "; no artifacts written".to_owned());
         return Ok(format!(
-            "ok: funding arb resident live completed; phase={}; cycles={}; last_pair_id={}; last_symbol={}; last_net_funding_bps={}; dispatch_attempted={}; live_entry_count={}; open_positions={}; closed_positions={}; unknown_positions={}; halt_reason={}; mutable_execution_started={}{}",
+            "{prefix}: funding arb resident live completed; phase={}; cycles={}; last_pair_id={}; last_symbol={}; last_net_funding_bps={}; dispatch_attempted={}; live_entry_count={}; open_positions={}; closed_positions={}; unknown_positions={}; halt_reason={}; mutable_execution_started={}{}",
             report.phase,
             report.cycles,
             report.last_pair_id.as_deref().unwrap_or("none"),

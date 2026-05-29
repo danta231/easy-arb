@@ -4107,6 +4107,10 @@ impl PublicTopOfBookMonitorSnapshot {
         self.rest_rebuild_count += 1;
         self.status = "rebuilding".to_owned();
         self.updated_at = current_utc_timestamp_string();
+        self.latest_quote = None;
+        self.rows.clear();
+        self.total_rows = 0;
+        self.wss_update_count = 0;
     }
 
     pub(crate) fn record_update(&mut self, update: &HybridMarketDataUpdate) {
@@ -4149,7 +4153,11 @@ impl PublicTopOfBookMonitorSnapshot {
                 .map(|symbol| PublicTopOfBookQuoteSnapshot::from_quote_with_symbol(quote, symbol))
                 .unwrap_or_else(|| PublicTopOfBookQuoteSnapshot::from_quote(quote));
             self.upsert_quote_row(quote_snapshot.clone());
-            self.latest_quote = Some(quote_snapshot);
+            if update.transport == MarketDataTransport::WebSocketStream {
+                self.latest_quote = Some(quote_snapshot);
+            }
+        } else if update.status == HybridMarketDataStatus::Streaming {
+            self.latest_quote = None;
         }
     }
 
