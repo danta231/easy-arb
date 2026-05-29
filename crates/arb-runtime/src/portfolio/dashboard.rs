@@ -91,6 +91,7 @@ pub(crate) struct PortfolioPositionRow {
     pub(crate) close_average_price: Option<String>,
     pub(crate) open_close_spread_pct: Option<String>,
     pub(crate) realtime_funding_rate: Option<String>,
+    pub(crate) realtime_funding_interval_hours: Option<String>,
     pub(crate) funding_settlement_time: Option<String>,
     pub(crate) open_close_condition: Option<String>,
     pub(crate) position_status: String,
@@ -1899,7 +1900,7 @@ pub(crate) fn portfolio_balance_row_json(row: &PortfolioBalanceRow) -> String {
 
 pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String {
     format!(
-        "{{\"account_id\":{},\"accumulated_position\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
+        "{{\"account_id\":{},\"accumulated_position\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
         json_string(&row.account_id),
         json_option_string(&row.accumulated_position),
         json_option_string(&row.close_average_price),
@@ -1916,6 +1917,7 @@ pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String 
         json_option_string(&row.position_limit),
         json_string(&row.position_quantity),
         json_string(&row.position_status),
+        json_option_string(&row.realtime_funding_interval_hours),
         json_option_string(&row.realtime_funding_rate),
         json_option_string(&row.settled_funding_usd),
         json_string(&row.source),
@@ -2873,16 +2875,16 @@ pub(crate) fn portfolio_funding_contexts_from_snapshot_json(
         contexts.push(PortfolioFundingContext {
             venue_family: normalize_venue_family(&row.venue_a_family),
             symbol: funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol)),
-            funding_rate: row.venue_a_funding_rate.clone(),
+            funding_rate: row.venue_a_native_funding_rate.clone(),
             next_funding_time_ms: row.venue_a_next_funding_time_ms.clone(),
-            funding_interval_hours: row.venue_a_funding_interval_hours.clone(),
+            funding_interval_hours: row.venue_a_native_funding_interval_hours.clone(),
         });
         contexts.push(PortfolioFundingContext {
             venue_family: normalize_venue_family(&row.venue_b_family),
             symbol: funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol)),
-            funding_rate: row.venue_b_funding_rate.clone(),
+            funding_rate: row.venue_b_native_funding_rate.clone(),
             next_funding_time_ms: row.venue_b_next_funding_time_ms.clone(),
-            funding_interval_hours: row.venue_b_funding_interval_hours.clone(),
+            funding_interval_hours: row.venue_b_native_funding_interval_hours.clone(),
         });
     }
     Ok((Some(snapshot.updated_at), contexts))
@@ -3202,6 +3204,21 @@ pub(crate) fn portfolio_position_row_from_fields(
         ],
     )?
     .or_else(|| funding_context.map(|context| context.funding_rate.clone()));
+    let realtime_funding_interval_hours = funding_context
+        .map(|context| context.funding_interval_hours.clone())
+        .or_else(|| {
+            first_json_scalar_string(
+                fields,
+                &[
+                    "realtime_funding_interval_hours",
+                    "funding_interval_hours",
+                    "fundingIntervalHours",
+                    "fundingIntervalHour",
+                ],
+            )
+            .ok()
+            .flatten()
+        });
     let funding_settlement_time = first_json_scalar_string(
         fields,
         &[
@@ -3280,6 +3297,7 @@ pub(crate) fn portfolio_position_row_from_fields(
         close_average_price,
         open_close_spread_pct,
         realtime_funding_rate,
+        realtime_funding_interval_hours,
         funding_settlement_time,
         open_close_condition,
         position_status,
@@ -3582,6 +3600,8 @@ pub(crate) fn portfolio_funding_arb_leg_metadata_row(
         close_average_price: None,
         open_close_spread_pct: entry_net_funding_bps.map(portfolio_bps_to_percent_string),
         realtime_funding_rate: funding_context.map(|context| context.funding_rate.clone()),
+        realtime_funding_interval_hours: funding_context
+            .map(|context| context.funding_interval_hours.clone()),
         funding_settlement_time: funding_context.map(|context| context.next_funding_time_ms.clone()),
         open_close_condition: Some(
             "开仓按资金费率价差信号；清仓由 funding-arb resident 在资金费结算完成或仓位失衡时用 reduce-only 订单退出/降风险。"
@@ -4218,6 +4238,7 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
                 close_average_price: None,
                 open_close_spread_pct: None,
                 realtime_funding_rate: None,
+                realtime_funding_interval_hours: None,
                 funding_settlement_time: None,
                 open_close_condition: Some(
                     "仓位状态文件不可读；已使用 resident registry 降级展示，外部真实状态仍需私有快照或交易所确认。".to_owned(),
@@ -4294,6 +4315,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
     let realtime_funding_rate = funding_context
         .map(|context| context.funding_rate.clone())
         .or_else(|| expected_next_funding_bps.map(portfolio_bps_to_percent_string));
+    let realtime_funding_interval_hours =
+        funding_context.map(|context| context.funding_interval_hours.clone());
     let funding_settlement_time =
         funding_context.map(|context| context.next_funding_time_ms.clone());
     Ok(PortfolioPositionRow {
@@ -4310,6 +4333,7 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
         close_average_price: None,
         open_close_spread_pct: entry_gross_basis_bps.map(portfolio_bps_to_percent_string),
         realtime_funding_rate,
+        realtime_funding_interval_hours,
         funding_settlement_time,
         open_close_condition: Some(
             "开仓按 basis 入场信号；清仓由 basis-exit-supervisor 按收敛、止盈、止损和风险信号判断。".to_owned(),
@@ -4347,6 +4371,7 @@ pub(crate) fn portfolio_terminal_position_row_from_resident_ref(
         close_average_price: None,
         open_close_spread_pct: None,
         realtime_funding_rate: None,
+        realtime_funding_interval_hours: None,
         funding_settlement_time: None,
         open_close_condition: Some(
             "resident registry 已记录终态；数量按 0 展示，外部真实状态仍以最新私有快照或交易所为准。".to_owned(),
@@ -4389,6 +4414,7 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
                 close_average_price: None,
                 open_close_spread_pct: None,
                 realtime_funding_rate: None,
+                realtime_funding_interval_hours: None,
                 funding_settlement_time: None,
                 open_close_condition: Some(
                     "资金费率套利仓位状态文件不可读；已使用 resident registry 降级展示，外部真实状态仍需私有快照或交易所确认。".to_owned(),
@@ -4440,6 +4466,12 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
     }));
     let realtime_funding_rate =
         portfolio_funding_arb_realtime_funding_rate(funding_contexts, &symbol, &leg_a, &leg_b);
+    let realtime_funding_interval_hours = portfolio_funding_arb_realtime_funding_interval_hours(
+        funding_contexts,
+        &symbol,
+        &leg_a,
+        &leg_b,
+    );
     let funding_settlement_time =
         portfolio_funding_arb_settlement_time(funding_contexts, &symbol, &leg_a, &leg_b);
     Ok(PortfolioPositionRow {
@@ -4456,6 +4488,7 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
         close_average_price: None,
         open_close_spread_pct: entry_net_funding_bps.map(portfolio_bps_to_percent_string),
         realtime_funding_rate,
+        realtime_funding_interval_hours,
         funding_settlement_time,
         open_close_condition: Some(
             "开仓按资金费率价差信号；清仓由 funding-arb resident 在资金费结算完成或仓位失衡时用 reduce-only 订单退出/降风险。"
@@ -4613,6 +4646,26 @@ pub(crate) fn portfolio_funding_arb_realtime_funding_rate(
         if let Some(context) = portfolio_find_funding_context(contexts, &leg.venue_family, symbol) {
             let label = normalize_venue_family(&leg.venue_family);
             let part = format!("{label}:{}", context.funding_rate);
+            if seen.insert(part.clone()) {
+                parts.push(part);
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" / "))
+}
+
+pub(crate) fn portfolio_funding_arb_realtime_funding_interval_hours(
+    contexts: &[PortfolioFundingContext],
+    symbol: &str,
+    leg_a: &Option<PortfolioFundingArbLegDisplay>,
+    leg_b: &Option<PortfolioFundingArbLegDisplay>,
+) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let mut parts = Vec::new();
+    for leg in [leg_a.as_ref(), leg_b.as_ref()].into_iter().flatten() {
+        if let Some(context) = portfolio_find_funding_context(contexts, &leg.venue_family, symbol) {
+            let label = normalize_venue_family(&leg.venue_family);
+            let part = format!("{label}:{}", context.funding_interval_hours);
             if seen.insert(part.clone()) {
                 parts.push(part);
             }

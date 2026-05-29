@@ -15007,6 +15007,7 @@ struct BinanceBasisMonitorParsedInputs {
     spot_books: BTreeMap<String, MonitorBookTickerRow>,
     perp_books: BTreeMap<String, MonitorBookTickerRow>,
     premiums: Vec<MonitorPremiumIndexRow>,
+    funding_intervals: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -15014,6 +15015,7 @@ struct BybitBasisMonitorParsedInputs {
     spot_books: BTreeMap<String, MonitorBookTickerRow>,
     linear_tickers: BTreeMap<String, BybitLinearTickerRow>,
     linear_symbols: BTreeSet<String>,
+    linear_funding_intervals: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -15038,7 +15040,13 @@ fn fetch_binance_basis_monitor_snapshot(
     let spot_json = fetch_public_json_with_curl(&binance_spot_book_ticker_all_url())?;
     let perp_json = fetch_public_json_with_curl(&binance_usdm_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&binance_usdm_premium_index_all_url())?;
-    let parsed = parse_binance_basis_monitor_inputs(&spot_json, &perp_json, &premium_json)?;
+    let funding_info_json = fetch_public_json_with_curl(&binance_usdm_funding_info_url())?;
+    let parsed = parse_binance_basis_monitor_inputs_with_funding_info(
+        &spot_json,
+        &perp_json,
+        &premium_json,
+        Some(&funding_info_json),
+    )?;
     let depth_symbols = binance_basis_monitor_depth_symbols_from_parsed(&parsed, options)?;
     let spot_depths =
         fetch_public_order_book_depth_map(PublicOrderBookDepthVenue::BinanceSpot, &depth_symbols);
@@ -15060,10 +15068,20 @@ fn fetch_binance_basis_monitor_snapshot(
     )
 }
 
+#[cfg(test)]
 fn parse_binance_basis_monitor_inputs(
     spot_json: &str,
     perp_json: &str,
     premium_json: &str,
+) -> RuntimeResult<BinanceBasisMonitorParsedInputs> {
+    parse_binance_basis_monitor_inputs_with_funding_info(spot_json, perp_json, premium_json, None)
+}
+
+fn parse_binance_basis_monitor_inputs_with_funding_info(
+    spot_json: &str,
+    perp_json: &str,
+    premium_json: &str,
+    funding_info_json: Option<&str>,
 ) -> RuntimeResult<BinanceBasisMonitorParsedInputs> {
     Ok(BinanceBasisMonitorParsedInputs {
         spot_books: parse_book_ticker_rows(spot_json, "spot")?
@@ -15075,6 +15093,9 @@ fn parse_binance_basis_monitor_inputs(
             .map(|row| (row.symbol.clone(), row))
             .collect(),
         premiums: parse_premium_index_rows(premium_json)?,
+        funding_intervals: funding_info_json
+            .map(|json| parse_funding_interval_info_map(json, "binance usdm fundingInfo"))
+            .unwrap_or_else(|| Ok(BTreeMap::new()))?,
     })
 }
 
@@ -15218,8 +15239,12 @@ fn build_binance_basis_monitor_snapshot_from_parsed_with_depth(
             .and_then(|signal| signal.reason.clone())
             .or(signal_error)
             .or(reason);
-        let funding_interval_hours =
-            funding_interval_hours_or_default("binance", premium.funding_interval_hours.clone())?;
+        let funding_interval_hours = funding_interval_hours_for_symbol(
+            "binance",
+            &premium.symbol,
+            premium.funding_interval_hours.clone(),
+            &parsed.funding_intervals,
+        )?;
 
         rows.push(BinanceBasisMarketRow {
             symbol: premium.symbol.clone(),
@@ -15437,6 +15462,7 @@ fn fetch_aster_basis_monitor_snapshot(
     };
     let perp_json = fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&aster_futures_premium_index_all_url())?;
+    let funding_info_json = fetch_public_json_with_curl(&aster_futures_funding_info_url())?;
     let depth_symbols = aster_basis_monitor_depth_symbols(
         spot_json.as_deref(),
         &perp_json,
@@ -15465,6 +15491,7 @@ fn fetch_aster_basis_monitor_snapshot(
                 spot_json,
                 &perp_json,
                 &premium_json,
+                Some(&funding_info_json),
                 options,
                 &spot_depths.depths,
                 &perp_depths.depths,
@@ -15476,6 +15503,7 @@ fn fetch_aster_basis_monitor_snapshot(
         spot_json.as_deref(),
         &perp_json,
         &premium_json,
+        Some(&funding_info_json),
         options,
         &spot_depths.depths,
         &perp_depths.depths,
@@ -15494,6 +15522,7 @@ fn build_aster_basis_monitor_snapshot_from_json(
         spot_json,
         perp_json,
         premium_json,
+        None,
         options,
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -15506,6 +15535,7 @@ fn build_aster_basis_monitor_snapshot_from_json_with_depth(
     spot_json: &str,
     perp_json: &str,
     premium_json: &str,
+    funding_info_json: Option<&str>,
     options: &AsterBasisMonitorOptions,
     spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
     perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
@@ -15515,6 +15545,7 @@ fn build_aster_basis_monitor_snapshot_from_json_with_depth(
         Some(spot_json),
         perp_json,
         premium_json,
+        funding_info_json,
         options,
         spot_depths,
         perp_depths,
@@ -15534,6 +15565,7 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json(
         spot_json,
         perp_json,
         premium_json,
+        None,
         options,
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -15546,6 +15578,7 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
     spot_json: Option<&str>,
     perp_json: &str,
     premium_json: &str,
+    funding_info_json: Option<&str>,
     options: &AsterBasisMonitorOptions,
     spot_depths: &BTreeMap<String, PublicOrderBookDepth>,
     perp_depths: &BTreeMap<String, PublicOrderBookDepth>,
@@ -15566,6 +15599,9 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         .map(|row| (row.symbol.clone(), row))
         .collect::<BTreeMap<_, _>>();
     let premiums = parse_premium_index_rows(premium_json)?;
+    let funding_intervals = funding_info_json
+        .map(|json| parse_funding_interval_info_map(json, "aster futures fundingInfo"))
+        .unwrap_or_else(|| Ok(BTreeMap::new()))?;
     let perp_wss_quotes = match options.perp_wss_monitor_url.as_deref() {
         Some(url) => match fetch_public_wss_monitor_quote_map_for_basis(
             url,
@@ -15670,8 +15706,12 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
             .and_then(|signal| signal.reason.clone())
             .or(signal_error)
             .or(reason);
-        let funding_interval_hours =
-            funding_interval_hours_or_default("aster", premium.funding_interval_hours.clone())?;
+        let funding_interval_hours = funding_interval_hours_for_symbol(
+            "aster",
+            &premium.symbol,
+            premium.funding_interval_hours.clone(),
+            &funding_intervals,
+        )?;
 
         rows.push(AsterBasisMarketRow {
             symbol: premium.symbol,
@@ -15892,6 +15932,7 @@ fn parse_bybit_basis_monitor_inputs(
     linear_json: &str,
     instrument_pages: &[String],
 ) -> RuntimeResult<BybitBasisMonitorParsedInputs> {
+    let instrument_metadata = parse_bybit_linear_perpetual_instrument_metadata(instrument_pages)?;
     Ok(BybitBasisMonitorParsedInputs {
         spot_books: parse_bybit_spot_ticker_rows(spot_json)?
             .into_iter()
@@ -15901,7 +15942,8 @@ fn parse_bybit_basis_monitor_inputs(
             .into_iter()
             .map(|row| (row.symbol.clone(), row))
             .collect(),
-        linear_symbols: parse_bybit_linear_perpetual_symbols(instrument_pages)?,
+        linear_symbols: instrument_metadata.symbols,
+        linear_funding_intervals: instrument_metadata.funding_intervals,
     })
 }
 
@@ -16145,9 +16187,11 @@ fn build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
             last_funding_rate: linear
                 .map(|row| row.last_funding_rate.clone())
                 .unwrap_or_default(),
-            funding_interval_hours: funding_interval_hours_or_default(
+            funding_interval_hours: funding_interval_hours_for_symbol(
                 "bybit",
+                symbol,
                 linear.and_then(|row| row.funding_interval_hours.clone()),
+                &parsed.linear_funding_intervals,
             )?,
             next_funding_time_ms: linear
                 .map(|row| row.next_funding_time_ms.clone())
@@ -17692,6 +17736,9 @@ fn fetch_funding_arb_direct_public_venue_snapshot(
 fn fetch_binance_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
     let book_json = fetch_public_json_with_curl(&binance_usdm_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&binance_usdm_premium_index_all_url())?;
+    let funding_info_json = fetch_public_json_with_curl(&binance_usdm_funding_info_url())?;
+    let funding_intervals =
+        parse_funding_interval_info_map(&funding_info_json, "binance usdm fundingInfo")?;
     let books = parse_book_ticker_rows(&book_json, "binance usdm bookTicker")?
         .into_iter()
         .map(|row| (row.symbol.clone(), row))
@@ -17701,6 +17748,13 @@ fn fetch_binance_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArb
         .filter(|row| row.symbol.ends_with("USDT") && !row.last_funding_rate.trim().is_empty())
         .filter_map(|premium| {
             let book = books.get(&premium.symbol)?;
+            let funding_interval_hours = funding_interval_hours_for_symbol(
+                "binance",
+                &premium.symbol,
+                premium.funding_interval_hours.clone(),
+                &funding_intervals,
+            )
+            .ok()?;
             Some(funding_arb_market_from_top_of_book(
                 "binance",
                 premium.symbol,
@@ -17711,8 +17765,7 @@ fn fetch_binance_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArb
                 premium.mark_price,
                 premium.index_price,
                 premium.last_funding_rate,
-                funding_interval_hours_or_default("binance", premium.funding_interval_hours)
-                    .ok()?,
+                funding_interval_hours,
                 Some(premium.next_funding_time_ms),
             ))
         })
@@ -17729,12 +17782,18 @@ fn fetch_bybit_funding_arb_public_venue_snapshot(
     let ticker_json = fetch_public_json_with_curl(&bybit_linear_tickers_url())?;
     let instrument_pages =
         fetch_bybit_linear_instrument_pages_cached(&mut cache.bybit_instruments)?;
-    let linear_symbols = parse_bybit_linear_perpetual_symbols(&instrument_pages)?;
+    let instrument_metadata = parse_bybit_linear_perpetual_instrument_metadata(&instrument_pages)?;
     let rows = parse_bybit_linear_ticker_rows(&ticker_json)?
         .into_iter()
-        .filter(|row| linear_symbols.contains(&row.symbol))
+        .filter(|row| instrument_metadata.symbols.contains(&row.symbol))
         .filter(|row| !row.last_funding_rate.trim().is_empty())
         .map(|row| {
+            let funding_interval_hours = funding_interval_hours_for_symbol(
+                "bybit",
+                &row.symbol,
+                row.funding_interval_hours.clone(),
+                &instrument_metadata.funding_intervals,
+            )?;
             Ok(funding_arb_market_from_top_of_book(
                 "bybit",
                 row.symbol,
@@ -17745,7 +17804,7 @@ fn fetch_bybit_funding_arb_public_venue_snapshot(
                 row.mark_price,
                 row.index_price,
                 row.last_funding_rate,
-                funding_interval_hours_or_default("bybit", row.funding_interval_hours)?,
+                funding_interval_hours,
                 Some(row.next_funding_time_ms),
             ))
         })
@@ -17853,6 +17912,9 @@ fn fetch_bitget_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbV
 fn fetch_aster_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
     let book_json = fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&aster_futures_premium_index_all_url())?;
+    let funding_info_json = fetch_public_json_with_curl(&aster_futures_funding_info_url())?;
+    let funding_intervals =
+        parse_funding_interval_info_map(&funding_info_json, "aster futures fundingInfo")?;
     let books = parse_book_ticker_rows(&book_json, "aster futures bookTicker")?
         .into_iter()
         .map(|row| (row.symbol.clone(), row))
@@ -17866,6 +17928,13 @@ fn fetch_aster_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVe
         })
         .filter_map(|premium| {
             let book = books.get(&premium.symbol)?;
+            let funding_interval_hours = funding_interval_hours_for_symbol(
+                "aster",
+                &premium.symbol,
+                premium.funding_interval_hours.clone(),
+                &funding_intervals,
+            )
+            .ok()?;
             Some(funding_arb_market_from_top_of_book(
                 "aster",
                 premium.symbol,
@@ -17876,7 +17945,7 @@ fn fetch_aster_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVe
                 premium.mark_price,
                 premium.index_price,
                 premium.last_funding_rate,
-                funding_interval_hours_or_default("aster", premium.funding_interval_hours).ok()?,
+                funding_interval_hours,
                 Some(premium.next_funding_time_ms),
             ))
         })
@@ -18507,16 +18576,16 @@ fn funding_arb_market_from_monitor_row(
             (
                 row.venue_a_mark_price.clone(),
                 row.venue_a_index_price.clone(),
-                row.venue_a_funding_rate.clone(),
-                row.venue_a_funding_interval_hours.clone(),
+                row.venue_a_native_funding_rate.clone(),
+                row.venue_a_native_funding_interval_hours.clone(),
                 row.venue_a_next_funding_time_ms.clone(),
             )
         } else {
             (
                 row.venue_b_mark_price.clone(),
                 row.venue_b_index_price.clone(),
-                row.venue_b_funding_rate.clone(),
-                row.venue_b_funding_interval_hours.clone(),
+                row.venue_b_native_funding_rate.clone(),
+                row.venue_b_native_funding_interval_hours.clone(),
                 row.venue_b_next_funding_time_ms.clone(),
             )
         };
@@ -18612,6 +18681,8 @@ fn funding_arb_pair_row(
         )
         .unwrap_or_else(|_| venue_a.funding_rate.clone()),
         venue_a_funding_interval_hours: "8".to_owned(),
+        venue_a_native_funding_rate: venue_a.funding_rate.clone(),
+        venue_a_native_funding_interval_hours: venue_a.funding_interval_hours.clone(),
         venue_a_next_funding_time_ms: venue_a.next_funding_time_ms.clone().unwrap_or_default(),
         venue_b_bid: venue_b.perp_bid.clone().unwrap_or_default(),
         venue_b_ask: venue_b.perp_ask.clone().unwrap_or_default(),
@@ -18627,6 +18698,8 @@ fn funding_arb_pair_row(
         )
         .unwrap_or_else(|_| venue_b.funding_rate.clone()),
         venue_b_funding_interval_hours: "8".to_owned(),
+        venue_b_native_funding_rate: venue_b.funding_rate.clone(),
+        venue_b_native_funding_interval_hours: venue_b.funding_interval_hours.clone(),
         venue_b_next_funding_time_ms: venue_b.next_funding_time_ms.clone().unwrap_or_default(),
         funding_interval_hours: "8".to_owned(),
         long_venue_family,
@@ -19096,6 +19169,24 @@ fn funding_interval_hours_or_default(
     funding_interval_hours_string_for_venue(venue_family)
 }
 
+fn funding_interval_hours_for_symbol(
+    venue_family: &str,
+    symbol: &str,
+    observed: Option<String>,
+    symbol_intervals: &BTreeMap<String, String>,
+) -> RuntimeResult<String> {
+    if let Some(value) = observed.filter(|value| !value.trim().is_empty()) {
+        return Ok(parse_positive_u64_runtime("funding_interval_hours", &value)?.to_string());
+    }
+    if let Some(value) = symbol_intervals
+        .get(symbol)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(parse_positive_u64_runtime("funding_interval_hours", value)?.to_string());
+    }
+    funding_interval_hours_string_for_venue(venue_family)
+}
+
 fn mark_index_divergence_bps(mark_price: &str, index_price: &str) -> RuntimeResult<i128> {
     let mark = MonitorDecimal::parse("mark_price", mark_price)?;
     let index = MonitorDecimal::parse("index_price", index_price)?;
@@ -19227,6 +19318,10 @@ fn binance_usdm_premium_index_all_url() -> String {
     format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/premiumIndex")
 }
 
+fn binance_usdm_funding_info_url() -> String {
+    format!("{BINANCE_USDM_FUTURES_BASE_URL}/fapi/v1/fundingInfo")
+}
+
 fn public_url_query_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -19277,6 +19372,10 @@ fn aster_futures_depth_url(symbol: &str) -> String {
 
 fn aster_futures_premium_index_all_url() -> String {
     format!("{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/premiumIndex")
+}
+
+fn aster_futures_funding_info_url() -> String {
+    format!("{ASTER_FUTURES_REST_BASE_URL}/fapi/v3/fundingInfo")
 }
 
 fn bybit_spot_tickers_url() -> String {
@@ -21839,6 +21938,12 @@ struct MonitorPremiumIndexRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingIntervalInfoRow {
+    symbol: String,
+    funding_interval_hours: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct BybitLinearTickerRow {
     symbol: String,
     bid_price: String,
@@ -21882,6 +21987,13 @@ struct BybitLinearInstrumentRow {
     status: String,
     quote_coin: String,
     settle_coin: String,
+    funding_interval_hours: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BybitLinearPerpetualInstrumentMetadata {
+    symbols: BTreeSet<String>,
+    funding_intervals: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21976,6 +22088,46 @@ fn parse_premium_index_rows(input: &str) -> RuntimeResult<Vec<MonitorPremiumInde
         .collect()
 }
 
+fn parse_funding_interval_info_rows(
+    input: &str,
+    source_name: &'static str,
+) -> RuntimeResult<Vec<FundingIntervalInfoRow>> {
+    json_object_slices(input)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            let symbol = required_json_value_string(&fields, "symbol", source_name)?;
+            let funding_interval_hours = required_first_json_value_string(
+                &fields,
+                &[
+                    "fundingIntervalHours",
+                    "fundingIntervalHour",
+                    "fundingRateInterval",
+                ],
+                source_name,
+            )?;
+            Ok(FundingIntervalInfoRow {
+                symbol,
+                funding_interval_hours: parse_positive_u64_runtime(
+                    "funding_interval_hours",
+                    &funding_interval_hours,
+                )?
+                .to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_funding_interval_info_map(
+    input: &str,
+    source_name: &'static str,
+) -> RuntimeResult<BTreeMap<String, String>> {
+    Ok(parse_funding_interval_info_rows(input, source_name)?
+        .into_iter()
+        .map(|row| (row.symbol, row.funding_interval_hours))
+        .collect())
+}
+
 fn parse_bybit_spot_ticker_rows(input: &str) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
     bybit_response_list_object_slices(input, "bybit spot tickers", "spot")?
         .into_iter()
@@ -22043,10 +22195,10 @@ fn parse_bybit_linear_ticker_rows(input: &str) -> RuntimeResult<Vec<BybitLinearT
         .collect()
 }
 
-fn parse_bybit_linear_perpetual_symbols(
+fn parse_bybit_linear_perpetual_instrument_metadata(
     instrument_pages: &[String],
-) -> RuntimeResult<BTreeSet<String>> {
-    let mut symbols = BTreeSet::new();
+) -> RuntimeResult<BybitLinearPerpetualInstrumentMetadata> {
+    let mut metadata = BybitLinearPerpetualInstrumentMetadata::default();
     for page in instrument_pages {
         for row in parse_bybit_linear_instrument_rows(page)? {
             if row.status == "Trading"
@@ -22055,11 +22207,16 @@ fn parse_bybit_linear_perpetual_symbols(
                 && row.settle_coin == "USDT"
                 && row.symbol.ends_with("USDT")
             {
-                symbols.insert(row.symbol);
+                if let Some(interval) = row.funding_interval_hours.clone() {
+                    metadata
+                        .funding_intervals
+                        .insert(row.symbol.clone(), interval);
+                }
+                metadata.symbols.insert(row.symbol);
             }
         }
     }
-    Ok(symbols)
+    Ok(metadata)
 }
 
 fn parse_bybit_linear_instrument_rows(input: &str) -> RuntimeResult<Vec<BybitLinearInstrumentRow>> {
@@ -22085,9 +22242,42 @@ fn parse_bybit_linear_instrument_rows(input: &str) -> RuntimeResult<Vec<BybitLin
                     "settleCoin",
                     "bybit linear instruments",
                 )?,
+                funding_interval_hours: bybit_linear_instrument_funding_interval_hours(&fields)?,
             })
         })
         .collect()
+}
+
+fn bybit_linear_instrument_funding_interval_hours(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<String>> {
+    if let Some(hours) = optional_first_json_value_string(
+        fields,
+        &[
+            "fundingIntervalHour",
+            "fundingIntervalHours",
+            "fundingRateInterval",
+        ],
+        "bybit linear instruments",
+    )? {
+        return Ok(Some(
+            parse_positive_u64_runtime("funding_interval_hours", &hours)?.to_string(),
+        ));
+    }
+    let Some(minutes) =
+        optional_json_value_string(fields, "fundingInterval", "bybit linear instruments")?
+    else {
+        return Ok(None);
+    };
+    let minutes = parse_positive_u64_runtime("funding_interval_minutes", &minutes)?;
+    if minutes % 60 != 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "bybit linear instruments fundingInterval={minutes} minutes is not an integer number of hours"
+            ),
+        });
+    }
+    Ok(Some((minutes / 60).to_string()))
 }
 
 #[cfg(feature = "live-exec")]
@@ -22895,13 +23085,33 @@ fn parse_okx_funding_rate_rows(input: &str) -> RuntimeResult<Vec<OkxFundingRateR
         .into_iter()
         .map(|object| {
             let fields = parse_json_object_value_slices(object)?;
-            let next_funding_time_ms =
+            let funding_time_ms =
+                required_json_value_string(&fields, "fundingTime", "okx funding rate")?;
+            let explicit_funding_interval_hours = optional_first_json_value_string(
+                &fields,
+                &[
+                    "fundingRateInterval",
+                    "fundingIntervalHour",
+                    "fundingIntervalHours",
+                ],
+                "okx funding rate",
+            )?;
+            let next_funding_time_for_interval =
                 optional_json_value_string(&fields, "nextFundingTime", "okx funding rate")?
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        required_json_value_string(&fields, "fundingTime", "okx funding rate")
-                    })?;
+                    .filter(|value| !value.trim().is_empty());
+            let derived_funding_interval_hours = next_funding_time_for_interval
+                .as_deref()
+                .map(|next_funding_time| {
+                    derive_funding_interval_hours_from_ms(
+                        &funding_time_ms,
+                        next_funding_time,
+                        "okx funding rate",
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let next_funding_time_ms =
+                next_funding_time_for_interval.unwrap_or_else(|| funding_time_ms.clone());
             Ok(OkxFundingRateRow {
                 inst_id: required_json_value_string(&fields, "instId", "okx funding rate")?,
                 funding_rate: required_json_value_string(
@@ -22909,19 +23119,56 @@ fn parse_okx_funding_rate_rows(input: &str) -> RuntimeResult<Vec<OkxFundingRateR
                     "fundingRate",
                     "okx funding rate",
                 )?,
-                funding_interval_hours: optional_first_json_value_string(
-                    &fields,
-                    &[
-                        "fundingRateInterval",
-                        "fundingIntervalHour",
-                        "fundingIntervalHours",
-                    ],
-                    "okx funding rate",
-                )?,
+                funding_interval_hours: explicit_funding_interval_hours
+                    .or(derived_funding_interval_hours),
                 next_funding_time_ms,
             })
         })
         .collect()
+}
+
+fn derive_funding_interval_hours_from_ms(
+    funding_time_ms: &str,
+    next_funding_time_ms: &str,
+    source_name: &'static str,
+) -> RuntimeResult<Option<String>> {
+    let funding_time =
+        funding_time_ms
+            .trim()
+            .parse::<i128>()
+            .map_err(|_| RuntimeError::LiveMarketData {
+                message: format!(
+                    "{source_name} fundingTime is not an integer millisecond timestamp"
+                ),
+            })?;
+    let next_funding_time =
+        next_funding_time_ms
+            .trim()
+            .parse::<i128>()
+            .map_err(|_| RuntimeError::LiveMarketData {
+                message: format!(
+                    "{source_name} nextFundingTime is not an integer millisecond timestamp"
+                ),
+            })?;
+    let delta_ms = next_funding_time.checked_sub(funding_time).ok_or_else(|| {
+        RuntimeError::LiveMarketData {
+            message: format!("{source_name} funding interval timestamp delta overflowed"),
+        }
+    })?;
+    if delta_ms <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{source_name} nextFundingTime must be after fundingTime"),
+        });
+    }
+    const HOUR_MS: i128 = 3_600_000;
+    if delta_ms % HOUR_MS != 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "{source_name} funding interval delta {delta_ms}ms is not an integer number of hours"
+            ),
+        });
+    }
+    Ok(Some((delta_ms / HOUR_MS).to_string()))
 }
 
 fn okx_response_data_object_slices<'a>(
@@ -23881,6 +24128,8 @@ pub struct FundingArbMarketRow {
     pub venue_a_index_price: String,
     pub venue_a_funding_rate: String,
     pub venue_a_funding_interval_hours: String,
+    pub venue_a_native_funding_rate: String,
+    pub venue_a_native_funding_interval_hours: String,
     pub venue_a_next_funding_time_ms: String,
     pub venue_b_bid: String,
     pub venue_b_ask: String,
@@ -23892,6 +24141,8 @@ pub struct FundingArbMarketRow {
     pub venue_b_index_price: String,
     pub venue_b_funding_rate: String,
     pub venue_b_funding_interval_hours: String,
+    pub venue_b_native_funding_rate: String,
+    pub venue_b_native_funding_interval_hours: String,
     pub venue_b_next_funding_time_ms: String,
     pub funding_interval_hours: String,
     pub long_venue_family: Option<String>,
@@ -39568,6 +39819,44 @@ fn parse_funding_arb_market_row_json_fields(
         required_json_value_string(fields, "venue_b_bid_qty", "funding arb monitor row")?;
     let venue_b_ask_qty =
         required_json_value_string(fields, "venue_b_ask_qty", "funding arb monitor row")?;
+    let venue_a_funding_rate =
+        required_json_value_string(fields, "venue_a_funding_rate", "funding arb monitor row")?;
+    let venue_a_funding_interval_hours = required_json_value_string(
+        fields,
+        "venue_a_funding_interval_hours",
+        "funding arb monitor row",
+    )?;
+    let venue_b_funding_rate =
+        required_json_value_string(fields, "venue_b_funding_rate", "funding arb monitor row")?;
+    let venue_b_funding_interval_hours = required_json_value_string(
+        fields,
+        "venue_b_funding_interval_hours",
+        "funding arb monitor row",
+    )?;
+    let venue_a_native_funding_rate = optional_json_value_string(
+        fields,
+        "venue_a_native_funding_rate",
+        "funding arb monitor row",
+    )?
+    .unwrap_or_else(|| venue_a_funding_rate.clone());
+    let venue_a_native_funding_interval_hours = optional_json_value_string(
+        fields,
+        "venue_a_native_funding_interval_hours",
+        "funding arb monitor row",
+    )?
+    .unwrap_or_else(|| venue_a_funding_interval_hours.clone());
+    let venue_b_native_funding_rate = optional_json_value_string(
+        fields,
+        "venue_b_native_funding_rate",
+        "funding arb monitor row",
+    )?
+    .unwrap_or_else(|| venue_b_funding_rate.clone());
+    let venue_b_native_funding_interval_hours = optional_json_value_string(
+        fields,
+        "venue_b_native_funding_interval_hours",
+        "funding arb monitor row",
+    )?
+    .unwrap_or_else(|| venue_b_funding_interval_hours.clone());
     Ok(FundingArbMarketRow {
         pair_id: required_json_value_string(fields, "pair_id", "funding arb monitor row")?,
         symbol,
@@ -39605,16 +39894,10 @@ fn parse_funding_arb_market_row_json_fields(
             "venue_a_index_price",
             "funding arb monitor row",
         )?,
-        venue_a_funding_rate: required_json_value_string(
-            fields,
-            "venue_a_funding_rate",
-            "funding arb monitor row",
-        )?,
-        venue_a_funding_interval_hours: required_json_value_string(
-            fields,
-            "venue_a_funding_interval_hours",
-            "funding arb monitor row",
-        )?,
+        venue_a_funding_rate,
+        venue_a_funding_interval_hours,
+        venue_a_native_funding_rate,
+        venue_a_native_funding_interval_hours,
         venue_a_next_funding_time_ms: optional_json_value_string(
             fields,
             "venue_a_next_funding_time_ms",
@@ -39645,16 +39928,10 @@ fn parse_funding_arb_market_row_json_fields(
             "venue_b_index_price",
             "funding arb monitor row",
         )?,
-        venue_b_funding_rate: required_json_value_string(
-            fields,
-            "venue_b_funding_rate",
-            "funding arb monitor row",
-        )?,
-        venue_b_funding_interval_hours: required_json_value_string(
-            fields,
-            "venue_b_funding_interval_hours",
-            "funding arb monitor row",
-        )?,
+        venue_b_funding_rate,
+        venue_b_funding_interval_hours,
+        venue_b_native_funding_rate,
+        venue_b_native_funding_interval_hours,
         venue_b_next_funding_time_ms: optional_json_value_string(
             fields,
             "venue_b_next_funding_time_ms",
@@ -40776,7 +41053,7 @@ fn funding_arb_history_json(context: &FundingArbDashboardContext) -> String {
 impl FundingArbMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"entry_price_edge_bps\":{},\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_depth_levels\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_depth_levels\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_depth_levels\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_depth_levels\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_next_funding_time_ms\":{}}}",
+            "{{\"entry_price_edge_bps\":{},\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_depth_levels\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_depth_levels\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_native_funding_interval_hours\":{},\"venue_a_native_funding_rate\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_depth_levels\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_depth_levels\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_native_funding_interval_hours\":{},\"venue_b_native_funding_rate\":{},\"venue_b_next_funding_time_ms\":{}}}",
             json_option_string(&self.entry_price_edge_bps),
             json_option_string(&self.expected_funding_usd),
             json_string(&self.funding_interval_hours),
@@ -40802,6 +41079,8 @@ impl FundingArbMarketRow {
             json_string(&self.venue_a_funding_rate),
             json_string(&self.venue_a_index_price),
             json_string(&self.venue_a_mark_price),
+            json_string(&self.venue_a_native_funding_interval_hours),
+            json_string(&self.venue_a_native_funding_rate),
             json_string(&self.venue_a_next_funding_time_ms),
             json_string(&self.venue_b_ask),
             signal_depth_levels_json(&self.venue_b_ask_depth),
@@ -40814,6 +41093,8 @@ impl FundingArbMarketRow {
             json_string(&self.venue_b_funding_rate),
             json_string(&self.venue_b_index_price),
             json_string(&self.venue_b_mark_price),
+            json_string(&self.venue_b_native_funding_interval_hours),
+            json_string(&self.venue_b_native_funding_rate),
             json_string(&self.venue_b_next_funding_time_ms),
         )
     }
@@ -42509,6 +42790,8 @@ mod tests {
             venue_a_index_price: "100.00".to_owned(),
             venue_a_funding_rate: venue_a_funding_rate.to_owned(),
             venue_a_funding_interval_hours: "8".to_owned(),
+            venue_a_native_funding_rate: venue_a_funding_rate.to_owned(),
+            venue_a_native_funding_interval_hours: "8".to_owned(),
             venue_a_next_funding_time_ms: "1778659200000".to_owned(),
             venue_b_bid: "100.05".to_owned(),
             venue_b_ask: "100.10".to_owned(),
@@ -42520,6 +42803,8 @@ mod tests {
             venue_b_index_price: "100.00".to_owned(),
             venue_b_funding_rate: venue_b_funding_rate.to_owned(),
             venue_b_funding_interval_hours: "8".to_owned(),
+            venue_b_native_funding_rate: venue_b_funding_rate.to_owned(),
+            venue_b_native_funding_interval_hours: "8".to_owned(),
             venue_b_next_funding_time_ms: "1778659200000".to_owned(),
             funding_interval_hours: "8".to_owned(),
             long_venue_family: Some("binance".to_owned()),
@@ -45115,6 +45400,43 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_dashboard_prefers_native_funding_rate_context() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let position_path = root.path().join("positions.json");
+        let funding_path = root.path().join("funding.json");
+        write_utf8(
+            position_path.clone(),
+            r#"{"positions":[{"account_id":"acct-bybit","accumulated_position":"100 USDT","quantity":"100","strategy":"cross-exchange-funding","symbol":"PRLUSDT","venue_family":"bybit"}],"status":"healthy","updated_at":"2026-05-29T12:00:01Z"}"#,
+        )
+        .expect("position snapshot");
+        write_utf8(
+            funding_path.clone(),
+            r#"{"candidate_count":1,"rows":[{"funding_interval_hours":"8","is_candidate":true,"pair_id":"bybit:aster:PRLUSDT:PRLUSDT","source_status":"complete","symbol":"PRLUSDT","venue_a_ask":"0.103","venue_a_ask_qty":"1000","venue_a_bid":"0.102","venue_a_bid_qty":"1000","venue_a_family":"bybit","venue_a_funding_interval_hours":"8","venue_a_funding_rate":"-0.003072","venue_a_native_funding_interval_hours":"1","venue_a_native_funding_rate":"-0.000384","venue_a_index_price":"0.100","venue_a_mark_price":"0.102","venue_a_next_funding_time_ms":"1778601600000","venue_b_ask":"0.103","venue_b_ask_qty":"1000","venue_b_bid":"0.102","venue_b_bid_qty":"1000","venue_b_family":"aster","venue_b_funding_interval_hours":"8","venue_b_funding_rate":"-0.003296","venue_b_native_funding_interval_hours":"1","venue_b_native_funding_rate":"-0.000412","venue_b_index_price":"0.100","venue_b_mark_price":"0.102","venue_b_next_funding_time_ms":"1778601600000"}],"source_count":2,"source_error_count":0,"status":"healthy","total_rows":1,"updated_at":"2026-05-29T12:00:02Z"}"#,
+        )
+        .expect("funding snapshot");
+        let options = PortfolioDashboardOptions {
+            position_snapshot_path: Some(position_path),
+            funding_snapshot_path: Some(funding_path),
+            once: true,
+            ..PortfolioDashboardOptions::default()
+        };
+
+        let snapshot = build_portfolio_dashboard_snapshot(&options).expect("snapshot");
+
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(
+            snapshot.positions[0].realtime_funding_rate.as_deref(),
+            Some("-0.000384")
+        );
+        assert_eq!(
+            snapshot.positions[0]
+                .realtime_funding_interval_hours
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn portfolio_dashboard_cache_serves_loading_then_snapshot() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let account_path = root.path().join("accounts.json");
@@ -46075,6 +46397,60 @@ mod tests {
             snapshot.rows[0].net_basis_bps.as_deref(),
             Some("35.5000505")
         );
+    }
+
+    #[test]
+    fn binance_basis_monitor_uses_funding_info_symbol_intervals() {
+        let spot = r#"[
+          {"symbol":"PRLUSDT","bidPrice":"0.1000","bidQty":"1000","askPrice":"0.1010","askQty":"1000"},
+          {"symbol":"BLESSUSDT","bidPrice":"0.2000","bidQty":"1000","askPrice":"0.2010","askQty":"1000"}
+        ]"#;
+        let perp = r#"[
+          {"symbol":"PRLUSDT","bidPrice":"0.1020","bidQty":"1000","askPrice":"0.1030","askQty":"1000","time":1778584221117},
+          {"symbol":"BLESSUSDT","bidPrice":"0.2020","bidQty":"1000","askPrice":"0.2030","askQty":"1000","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"PRLUSDT","markPrice":"0.1020","indexPrice":"0.1000","lastFundingRate":"-0.00038400","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"BLESSUSDT","markPrice":"0.2020","indexPrice":"0.2000","lastFundingRate":"0.00005000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let funding_info = r#"[
+          {"symbol":"PRLUSDT","fundingIntervalHours":1},
+          {"symbol":"BLESSUSDT","fundingIntervalHours":4}
+        ]"#;
+        let parsed = parse_binance_basis_monitor_inputs_with_funding_info(
+            spot,
+            perp,
+            premium,
+            Some(funding_info),
+        )
+        .expect("parsed");
+        let options = BinanceBasisMonitorOptions {
+            min_abs_funding_rate: "0".to_owned(),
+            once: true,
+            ..BinanceBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_binance_basis_monitor_snapshot_from_parsed_with_depth(
+            &parsed,
+            &options,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Vec::new(),
+        )
+        .expect("snapshot");
+
+        let prl = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "PRLUSDT")
+            .expect("PRL row");
+        let bless = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "BLESSUSDT")
+            .expect("BLESS row");
+        assert_eq!(prl.funding_interval_hours, "1");
+        assert_eq!(bless.funding_interval_hours, "4");
     }
 
     #[test]
@@ -52700,6 +53076,8 @@ mod tests {
             venue_a_index_price: "0.02742".to_owned(),
             venue_a_funding_rate: "-0.00272114".to_owned(),
             venue_a_funding_interval_hours: "8".to_owned(),
+            venue_a_native_funding_rate: "-0.00272114".to_owned(),
+            venue_a_native_funding_interval_hours: "8".to_owned(),
             venue_a_next_funding_time_ms: "1779624000000".to_owned(),
             venue_b_bid: "0.0273".to_owned(),
             venue_b_ask: "0.0274".to_owned(),
@@ -52711,6 +53089,8 @@ mod tests {
             venue_b_index_price: "0.0272524900485994".to_owned(),
             venue_b_funding_rate: "0.0017".to_owned(),
             venue_b_funding_interval_hours: "8".to_owned(),
+            venue_b_native_funding_rate: "0.0017".to_owned(),
+            venue_b_native_funding_interval_hours: "8".to_owned(),
             venue_b_next_funding_time_ms: "1779624000000".to_owned(),
             funding_interval_hours: "8".to_owned(),
             long_venue_family: Some("bybit".to_owned()),
@@ -55849,6 +56229,56 @@ mod tests {
     }
 
     #[test]
+    fn aster_basis_monitor_uses_funding_info_symbol_intervals() {
+        let spot = r#"[
+          {"symbol":"PRLUSDT","bidPrice":"0.1000","bidQty":"1000","askPrice":"0.1010","askQty":"1000","time":1778584221117},
+          {"symbol":"BLESSUSDT","bidPrice":"0.2000","bidQty":"1000","askPrice":"0.2010","askQty":"1000","time":1778584221117}
+        ]"#;
+        let perp = r#"[
+          {"symbol":"PRLUSDT","bidPrice":"0.1020","bidQty":"1000","askPrice":"0.1030","askQty":"1000","time":1778584221117},
+          {"symbol":"BLESSUSDT","bidPrice":"0.2020","bidQty":"1000","askPrice":"0.2030","askQty":"1000","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"PRLUSDT","markPrice":"0.1020","indexPrice":"0.1000","lastFundingRate":"-0.00041200","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"BLESSUSDT","markPrice":"0.2020","indexPrice":"0.2000","lastFundingRate":"0.00005000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let funding_info = r#"[
+          {"symbol":"PRLUSDT","fundingIntervalHours":1},
+          {"symbol":"BLESSUSDT","fundingIntervalHours":4}
+        ]"#;
+        let options = AsterBasisMonitorOptions {
+            min_abs_funding_rate: "0".to_owned(),
+            once: true,
+            ..AsterBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
+            Some(spot),
+            perp,
+            premium,
+            Some(funding_info),
+            &options,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Vec::new(),
+        )
+        .expect("snapshot");
+
+        let prl = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "PRLUSDT")
+            .expect("PRL row");
+        let bless = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "BLESSUSDT")
+            .expect("BLESS row");
+        assert_eq!(prl.funding_interval_hours, "1");
+        assert_eq!(bless.funding_interval_hours, "4");
+    }
+
+    #[test]
     fn aster_basis_monitor_snapshot_reports_missing_spot_without_failing_open() {
         let spot = r#"[]"#;
         let perp = r#"[
@@ -56108,6 +56538,75 @@ mod tests {
             snapshot.rows[0].net_basis_bps.as_deref(),
             Some("32.5000505")
         );
+    }
+
+    #[test]
+    fn bybit_basis_monitor_uses_instrument_funding_interval_fallback() {
+        let spot = r#"{
+          "retCode": 0,
+          "retMsg": "OK",
+          "result": {
+            "category": "spot",
+            "list": [
+              {"symbol":"PRLUSDT","bid1Price":"0.1000","bid1Size":"1000","ask1Price":"0.1010","ask1Size":"1000"},
+              {"symbol":"BLESSUSDT","bid1Price":"0.2000","bid1Size":"1000","ask1Price":"0.2010","ask1Size":"1000"}
+            ]
+          },
+          "retExtInfo": {},
+          "time": 1778584221117
+        }"#;
+        let linear = r#"{
+          "retCode": 0,
+          "retMsg": "OK",
+          "result": {
+            "category": "linear",
+            "list": [
+              {"symbol":"PRLUSDT","lastPrice":"0.1020","indexPrice":"0.1000","markPrice":"0.1020","fundingRate":"-0.00038400","nextFundingTime":"1778601600000","ask1Size":"1000","bid1Price":"0.1020","ask1Price":"0.1030","bid1Size":"1000"},
+              {"symbol":"BLESSUSDT","lastPrice":"0.2020","indexPrice":"0.2000","markPrice":"0.2020","fundingRate":"0.00005000","nextFundingTime":"1778601600000","ask1Size":"1000","bid1Price":"0.2020","ask1Price":"0.2030","bid1Size":"1000"}
+            ]
+          },
+          "retExtInfo": {},
+          "time": 1778584221117
+        }"#;
+        let instruments = vec![
+            r#"{
+              "retCode": 0,
+              "retMsg": "OK",
+              "result": {
+                "category": "linear",
+                "nextPageCursor": "",
+                "list": [
+                  {"symbol":"PRLUSDT","contractType":"LinearPerpetual","status":"Trading","baseCoin":"PRL","quoteCoin":"USDT","settleCoin":"USDT","fundingInterval":"60"},
+                  {"symbol":"BLESSUSDT","contractType":"LinearPerpetual","status":"Trading","baseCoin":"BLESS","quoteCoin":"USDT","settleCoin":"USDT","fundingInterval":"240"}
+                ]
+              },
+              "retExtInfo": {},
+              "time": 1778584221117
+            }"#
+            .to_owned(),
+        ];
+        let options = BybitBasisMonitorOptions {
+            min_abs_funding_rate: "0".to_owned(),
+            once: true,
+            ..BybitBasisMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_bybit_basis_monitor_snapshot_from_json(spot, linear, &instruments, &options)
+                .expect("snapshot");
+
+        let prl = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "PRLUSDT")
+            .expect("PRL row");
+        let bless = snapshot
+            .rows
+            .iter()
+            .find(|row| row.symbol == "BLESSUSDT")
+            .expect("BLESS row");
+        assert_eq!(prl.funding_interval_hours, "1");
+        assert_eq!(bless.funding_interval_hours, "4");
     }
 
     #[cfg(feature = "live-exec")]
@@ -56370,6 +56869,23 @@ mod tests {
             snapshot.rows[0].net_basis_bps.as_deref(),
             Some("32.5000505")
         );
+    }
+
+    #[test]
+    fn okx_funding_rate_rows_derive_interval_from_funding_times() {
+        let funding = r#"{
+          "code": "0",
+          "msg": "",
+          "data": [
+            {"instType":"SWAP","instId":"BLESS-USDT-SWAP","fundingRate":"0.000050000000000000","fundingTime":"1778601600000","nextFundingTime":"1778616000000","ts":"1778584221117"}
+          ]
+        }"#;
+
+        let rows = parse_okx_funding_rate_rows(funding).expect("funding rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].funding_interval_hours.as_deref(), Some("4"));
+        assert_eq!(rows[0].next_funding_time_ms, "1778616000000");
     }
 
     #[cfg(feature = "live-exec")]
