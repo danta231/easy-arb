@@ -601,17 +601,46 @@ pub(crate) fn run_multi_venue_basis_resident_live_inner(
                                 retryable_entry_error_streaks.remove(venue);
                             }
                             if options.execute_live && !retryable {
-                                halt_reason = Some(format!(
-                                    "{} entry cycle failed; multi-venue resident live stopped: {error}",
-                                    venue.label()
-                                ));
-                                write_multi_venue_basis_resident_live_state(
-                                    &output_root,
-                                    "halted",
-                                    cycles,
-                                    halt_reason.as_deref(),
-                                )?;
-                                break;
+                                if resident_entry_cycle_error_can_isolate_venue(&error) {
+                                    let reason = format!(
+                                        "{} entry cycle isolated venue after non-retryable configuration error: {error}",
+                                        venue.label()
+                                    );
+                                    write_utf8(venue_dir.join("STOP"), &format!("{reason}\n"))?;
+                                    append_binance_basis_resident_jsonl(
+                                        &venue_dir,
+                                        &format!(
+                                            "{{\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"event_type\":\"venue_isolated\",\"phase\":\"entry\",\"reason\":{},\"status\":\"stopped\"}}",
+                                            cycles,
+                                            json_string(&cycle_dir.display().to_string()),
+                                            json_string(&error.to_string()),
+                                            json_string(&reason)
+                                        ),
+                                    )?;
+                                    append_multi_venue_basis_resident_event(
+                                        &output_root,
+                                        "venue_isolated",
+                                        &format!(
+                                            "\"cycle\":{},\"error\":{},\"reason\":{},\"venue\":{}",
+                                            cycles,
+                                            json_string(&error.to_string()),
+                                            json_string(&reason),
+                                            json_string(venue.as_str())
+                                        ),
+                                    )?;
+                                } else {
+                                    halt_reason = Some(format!(
+                                        "{} entry cycle failed; multi-venue resident live stopped: {error}",
+                                        venue.label()
+                                    ));
+                                    write_multi_venue_basis_resident_live_state(
+                                        &output_root,
+                                        "halted",
+                                        cycles,
+                                        halt_reason.as_deref(),
+                                    )?;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1149,7 +1178,7 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                         if funding_arb_exit_cycle_cleanly_closed(&report) {
                             append_funding_arb_resident_position_closed(
                                 &output_root,
-                                &position.position_id,
+                                &position,
                                 cycles,
                                 &exit_dir,
                                 &report,

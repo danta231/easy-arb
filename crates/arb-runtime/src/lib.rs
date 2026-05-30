@@ -5160,6 +5160,25 @@ fn resident_entry_cycle_error_can_retry(error: &RuntimeError) -> bool {
 }
 
 #[cfg(feature = "live-exec")]
+fn resident_entry_cycle_error_can_isolate_venue(error: &RuntimeError) -> bool {
+    match error {
+        RuntimeError::UnsafeConfig { message } => {
+            message.contains("invalid mutable execution request")
+                || message.contains("target_leverage")
+                || message.contains("cannot be applied to spot")
+        }
+        RuntimeError::Module {
+            module: "arb-venue-exec",
+            message,
+        } => {
+            message.contains("invalid mutable execution request")
+                || message.contains("target_leverage")
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn resident_retryable_error_class(error: &RuntimeError) -> &'static str {
     if !resident_entry_cycle_error_can_retry(error) {
         return "non_retryable";
@@ -18206,11 +18225,8 @@ fn build_funding_arb_monitor_snapshot_from_sources(
     }
     sort_funding_arb_monitor_rows(&mut rows);
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
-    let source_error_count = source_errors.len()
-        + snapshots
-            .iter()
-            .filter(|snapshot| snapshot.status != "healthy")
-            .count();
+    let degraded_source_errors = funding_arb_degraded_source_error_messages(&snapshots, options);
+    let source_error_count = source_errors.len() + degraded_source_errors.len();
     let status = if source_error_count == 0 {
         "healthy"
     } else {
@@ -18225,9 +18241,46 @@ fn build_funding_arb_monitor_snapshot_from_sources(
         candidate_count,
         source_count: snapshots.len(),
         source_error_count,
-        last_error: (!source_errors.is_empty()).then(|| source_errors.join("; ")),
+        last_error: funding_arb_monitor_last_error(source_errors, degraded_source_errors),
         rows,
     })
+}
+
+fn funding_arb_degraded_source_error_messages(
+    snapshots: &[FundingArbVenueSnapshot],
+    options: &FundingArbMonitorOptions,
+) -> Vec<String> {
+    snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, snapshot)| snapshot.status != "healthy")
+        .map(|(index, snapshot)| {
+            let venue_family = snapshot
+                .rows
+                .first()
+                .map(|row| row.venue_family.as_str())
+                .or_else(|| {
+                    options
+                        .sources
+                        .get(index)
+                        .map(|source| source.venue_family.as_str())
+                })
+                .unwrap_or("unknown");
+            format!(
+                "{venue_family} source status is {} with {} row(s)",
+                snapshot.status,
+                snapshot.rows.len()
+            )
+        })
+        .collect()
+}
+
+fn funding_arb_monitor_last_error(
+    mut source_errors: Vec<String>,
+    degraded_source_errors: Vec<String>,
+) -> Option<String> {
+    source_errors.extend(degraded_source_errors);
+    (!source_errors.is_empty()).then(|| source_errors.join("; "))
 }
 
 fn sort_funding_arb_monitor_rows(rows: &mut [FundingArbMarketRow]) {
@@ -19931,6 +19984,8 @@ const HYPERLIQUID_PERP_DEPTH_BACKFILL_LIMIT_ENV: &str =
 const HYPERLIQUID_PERP_DEPTH_BACKFILL_LIMIT_DEFAULT: usize = 24;
 const FUNDING_ARB_DEPTH_BACKFILL_PAIR_LIMIT: usize = 12;
 const FUNDING_ARB_DEPTH_BACKFILL_TTL_SECS: u64 = 10;
+#[cfg(feature = "live-exec")]
+const OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_ENV: &str = "ARB_RUNTIME_FULL_POLL_PROVENANCE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicOrderBookDepthVenue {
@@ -20591,6 +20646,7 @@ fn poll_opportunity_recorder_spot_source(
     append_opportunity_recorder_provenance_snapshot(
         options,
         &body,
+        &["updated_at", "refreshed_at"],
         &ts,
         SPOT_PERP_BASIS_OBSERVER_STRATEGY,
         Some(&source.venue),
@@ -20721,6 +20777,7 @@ fn poll_opportunity_recorder_funding_arb(
     append_opportunity_recorder_provenance_snapshot(
         options,
         &body,
+        &["updated_at"],
         &ts,
         CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
         None,
@@ -20806,18 +20863,32 @@ fn poll_opportunity_recorder_funding_arb(
 fn append_opportunity_recorder_provenance_snapshot(
     options: &OpportunityRecorderOptions,
     body: &str,
+    updated_at_fields: &[&'static str],
     recorded_at: &str,
     strategy: &'static str,
     venue: Option<&str>,
     endpoint: &str,
 ) -> RuntimeResult<()> {
+    let full_provenance = runtime_bool_env(OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_ENV, false)?;
+    let provenance_body;
     let mut extras = vec![
         ("recorded_at", json_string(recorded_at)),
         ("strategy", json_string(strategy)),
         ("endpoint", json_string(endpoint)),
-        ("artifact_mode", json_string("full_poll_provenance")),
         ("mutable_execution_started", "false".to_owned()),
     ];
+    let body = if full_provenance {
+        extras.push(("artifact_mode", json_string("full_poll_provenance")));
+        body
+    } else {
+        provenance_body = opportunity_recorder_compact_candidate_snapshot_json(
+            body,
+            updated_at_fields,
+            options.blocking_path_limit,
+            "compact_poll_provenance",
+        )?;
+        provenance_body.as_str()
+    };
     if let Some(venue) = venue {
         extras.push(("venue", json_string(venue)));
     }
@@ -21424,6 +21495,9 @@ fn append_opportunity_recorder_resident_tail_health(
     } else {
         "healthy"
     };
+    let last_error = (status == "warning")
+        .then(|| opportunity_recorder_resident_tail_last_error(health_lines))
+        .flatten();
     let key = format!(
         "resident_tail_health|status={status}|cycle_errors={cycle_error_count}|residual_retry={residual_de_risk_retry_count}|blocked={blocked_decision_count}|capacity={entry_capacity_blocked_count}"
     );
@@ -21433,7 +21507,7 @@ fn append_opportunity_recorder_resident_tail_health(
     append_line_to_jsonl(
         options.health_events_jsonl.clone(),
         &format!(
-            "{{\"recorded_at\":{},\"strategy\":{},\"source\":{},\"event\":\"resident_tail_health\",\"status\":{},\"event_file\":{},\"tail_lines\":{},\"cycle_error_count\":{},\"residual_de_risk_retry_count\":{},\"blocked_decision_count\":{},\"entry_capacity_blocked_count\":{},\"mutable_execution_started\":false}}",
+            "{{\"recorded_at\":{},\"strategy\":{},\"source\":{},\"event\":\"resident_tail_health\",\"status\":{},\"event_file\":{},\"tail_lines\":{},\"cycle_error_count\":{},\"residual_de_risk_retry_count\":{},\"blocked_decision_count\":{},\"entry_capacity_blocked_count\":{},\"last_error\":{},\"mutable_execution_started\":false}}",
             json_string(&current_utc_timestamp_string()),
             json_string(strategy),
             json_string(source),
@@ -21443,7 +21517,8 @@ fn append_opportunity_recorder_resident_tail_health(
             cycle_error_count,
             residual_de_risk_retry_count,
             blocked_decision_count,
-            entry_capacity_blocked_count
+            entry_capacity_blocked_count,
+            optional_json_string(last_error.as_deref())
         ),
     )
 }
@@ -21461,6 +21536,20 @@ fn tail_lines(input: &str, limit: usize) -> Vec<&str> {
 #[cfg(feature = "live-exec")]
 fn count_lines_containing(lines: &[&str], pattern: &str) -> usize {
     lines.iter().filter(|line| line.contains(pattern)).count()
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_tail_last_error(lines: &[&str]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .find(|line| {
+            line.contains("\"event_type\":\"cycle_error\"")
+                || line.contains("\"event_type\":\"residual_de_risk_retry\"")
+                || line.contains("\"decision\":\"blocked\"")
+                || line.contains("\"event_type\":\"entry_capacity_blocked\"")
+        })
+        .map(|line| truncate_log_string(line.trim()))
 }
 
 #[cfg(feature = "live-exec")]
@@ -30124,19 +30213,23 @@ fn append_funding_arb_resident_recovered_position_closed(
 #[cfg(feature = "live-exec")]
 fn append_funding_arb_resident_position_closed(
     output_root: &Path,
-    position_id: &str,
+    position: &FundingArbResidentPosition,
     cycle: u64,
     cycle_dir: &Path,
     report: &FundingArbExitCycleReport,
 ) -> RuntimeResult<()> {
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"position_id\":{},\"private_confirmation_count\":{},\"submitted_receipt_count\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"status\":\"closed\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
-        json_string(position_id),
+        json_string(&position.notional_usdt),
+        json_string(&position.pair_id),
+        json_string(&position.position_id),
+        json_string(&position.position_state_path.display().to_string()),
         report.private_confirmation_count,
         report.submitted_receipt_count,
+        json_string(&position.symbol),
     );
     append_funding_arb_resident_position_jsonl(output_root, &line)?;
     append_funding_arb_resident_event(output_root, &line)
@@ -46896,6 +46989,48 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_monitor_reports_degraded_source_as_last_error() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            r#"{"status":"degraded","updated_at":"2026-05-13T00:00:00Z","rows":[]}"#,
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "binance".to_owned(),
+                    status_url: "http://127.0.0.1/binance/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "bybit".to_owned(),
+                    status_url: "http://127.0.0.1/bybit/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![binance, bybit], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.status, "degraded");
+        assert_eq!(snapshot.source_error_count, 1);
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("bybit source status is degraded")));
+    }
+
+    #[test]
     fn funding_arb_monitor_prefers_row_level_funding_interval() {
         let binance = funding_arb_test_venue_snapshot(
             "binance",
@@ -49293,6 +49428,48 @@ mod tests {
             closed_history_capacity,
             ResidentEntryCapacity::Allowed
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_position_closed_event_keeps_pair_and_symbol() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let cycle_dir = root.path().join("exit/pos:one/000001-test");
+        ensure_dir(&cycle_dir).expect("cycle dir");
+        let position = FundingArbResidentPosition {
+            position_id: "pos:one".to_owned(),
+            position_state_path: root.path().join("position.json"),
+            pair_id: "binance:bybit:BTCUSDT:BTCUSDT".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            notional_usdt: "10.00".to_owned(),
+            status: "open".to_owned(),
+        };
+        let report = FundingArbExitCycleReport {
+            pair_id: position.pair_id.clone(),
+            symbol: position.symbol.clone(),
+            decision: "close".to_owned(),
+            reason_codes: Vec::new(),
+            runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
+            funding_settlement_status: "Matched".to_owned(),
+            private_position_status: "Flat".to_owned(),
+            dispatch_attempted: true,
+            submitted_receipt_count: 2,
+            private_confirmation_count: 2,
+            residual_risk: None,
+            blocking_reasons: Vec::new(),
+            output_dir: Some(cycle_dir.clone()),
+        };
+
+        append_funding_arb_resident_position_closed(root.path(), &position, 1, &cycle_dir, &report)
+            .expect("append closed event");
+
+        let registry =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("registry");
+        assert!(registry.contains("\"event_type\":\"position_closed\""));
+        assert!(registry.contains("\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\""));
+        assert!(registry.contains("\"symbol\":\"BTCUSDT\""));
+        assert!(registry.contains("\"notional_usdt\":\"10.00\""));
+        assert!(registry.contains("\"status\":\"closed\""));
     }
 
     #[test]
@@ -52567,6 +52744,14 @@ mod tests {
         let unsafe_config = RuntimeError::UnsafeConfig {
             message: "invalid live signing config".to_owned(),
         };
+        let unsafe_leverage_config = RuntimeError::UnsafeConfig {
+            message: "target_leverage cannot be applied to spot market".to_owned(),
+        };
+        let venue_exec_config = RuntimeError::Module {
+            module: "arb-venue-exec",
+            message: "invalid mutable execution request: target_leverage cannot be applied to spot"
+                .to_owned(),
+        };
 
         assert!(resident_entry_cycle_error_can_retry(&market_data));
         assert!(resident_entry_cycle_error_can_retry(&public_rest));
@@ -52577,6 +52762,16 @@ mod tests {
         ));
         assert!(!resident_entry_cycle_error_can_retry(&private_http));
         assert!(!resident_entry_cycle_error_can_retry(&unsafe_config));
+        assert!(!resident_entry_cycle_error_can_isolate_venue(
+            &unsafe_config
+        ));
+        assert!(resident_entry_cycle_error_can_isolate_venue(
+            &unsafe_leverage_config
+        ));
+        assert!(resident_entry_cycle_error_can_isolate_venue(
+            &venue_exec_config
+        ));
+        assert!(!resident_entry_cycle_error_can_isolate_venue(&private_http));
         assert_eq!(
             resident_retryable_error_class(&market_data),
             "wss_monitor_unavailable"
@@ -56018,7 +56213,7 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
-    fn opportunity_recorder_provenance_keeps_full_non_candidate_rows() {
+    fn opportunity_recorder_provenance_compacts_non_candidate_rows_by_default() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let logs_dir = root.path().join("logs");
         let opportunity_dir = root.path().join("opportunities");
@@ -56054,6 +56249,7 @@ mod tests {
         append_opportunity_recorder_provenance_snapshot(
             &options,
             body,
+            &["updated_at"],
             "2026-05-21T00:00:01Z",
             CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
             None,
@@ -56064,11 +56260,13 @@ mod tests {
         let provenance =
             read_utf8(&opportunity_dir.join("cross-exchange-funding-arb-provenance.jsonl"))
                 .expect("provenance");
-        assert!(provenance.contains("\"artifact_mode\":\"full_poll_provenance\""));
+        assert!(provenance.contains("\"artifact_mode\":\"compact_poll_provenance\""));
         assert!(provenance.contains("\"strategy\":\"cross-exchange-funding-arb\""));
+        assert!(provenance.contains("\"retained_rows\":1"));
+        assert!(provenance.contains("\"non_candidate_blocking_groups\""));
         assert!(provenance.contains("binance:hyperliquid:ETHUSDT:ETH"));
-        assert!(provenance.contains("venue_b.perp_bid_qty"));
-        assert!(provenance.contains("\"is_candidate\":false"));
+        assert!(!provenance.contains("venue_b.perp_bid_qty"));
+        assert!(!provenance.contains("\"is_candidate\":false"));
     }
 
     #[cfg(feature = "live-exec")]
@@ -56156,6 +56354,61 @@ mod tests {
         assert!(health_events.contains("\"source\":\"cross-exchange-funding-arb\""));
         assert!(!health_events.contains("spot-perp-basis"));
         assert!(!health_events.contains("\"cycle_error_count\":1"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_resident_health_includes_last_error_line() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        let opportunity_dir = root.path().join("opportunities");
+        let funding_arb_dir = root.path().join("resident-live/cross-exchange-funding-arb");
+        ensure_dir(&logs_dir).expect("logs dir");
+        ensure_dir(&opportunity_dir).expect("opportunity dir");
+        ensure_dir(&funding_arb_dir).expect("funding arb dir");
+        write_utf8(
+            funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
+            r#"{"event_type":"resident_started"}
+{"event_type":"cycle_error","error":"forced test failure"}"#,
+        )
+        .expect("write resident event log");
+
+        let mut strategies = BTreeSet::new();
+        strategies.insert(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY.to_owned());
+        let health_events_jsonl = logs_dir.join("health-events.jsonl");
+        let options = OpportunityRecorderOptions {
+            root: root.path().to_path_buf(),
+            opportunity_dir,
+            logs_dir: logs_dir.clone(),
+            feedback_log: logs_dir.join("realtime-feedback.log"),
+            health_events_jsonl: health_events_jsonl.clone(),
+            basis_resident_out_dir: root.path().join("resident-live/spot-perp-basis"),
+            funding_arb_resident_out_dir: funding_arb_dir,
+            spot_sources: Vec::new(),
+            funding_arb_url: None,
+            strategies,
+            execution_mode: "live".to_owned(),
+            spot_perp_basis_mode: "resident".to_owned(),
+            funding_arb_mode: "resident".to_owned(),
+            interval_secs: 5,
+            timeout_secs: 1,
+            retries: 1,
+            retry_sleep_ms: 0,
+            blocking_path_limit: 12,
+            health_sample_secs: 0,
+            resident_health_tail_lines: 200,
+            once: true,
+        };
+        let mut sampler = OpportunityRecorderHealthSampler::new(0);
+
+        append_opportunity_recorder_resident_health_events(&options, &mut sampler)
+            .expect("append health events");
+
+        let health_events = read_utf8(&health_events_jsonl).expect("health events");
+        assert!(health_events.contains("\"status\":\"warning\""));
+        assert!(health_events.contains("\"cycle_error_count\":1"));
+        assert!(health_events.contains("\"last_error\""));
+        assert!(health_events.contains("forced test failure"));
     }
 
     #[test]

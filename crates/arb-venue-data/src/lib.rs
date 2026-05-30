@@ -2946,8 +2946,8 @@ impl BybitPublicTickerAdapter {
         )?;
         let best_bid = parse_price_field(&raw.row, "bid1Price", &self.venue_id)?;
         let best_ask = parse_price_field(&raw.row, "ask1Price", &self.venue_id)?;
-        let bid_size = parse_quantity_field(&raw.row, "bid1Size", &self.venue_id)?;
-        let ask_size = parse_quantity_field(&raw.row, "ask1Size", &self.venue_id)?;
+        let bid_size = parse_quantity_field_empty_as_zero(&raw.row, "bid1Size", &self.venue_id)?;
+        let ask_size = parse_quantity_field_empty_as_zero(&raw.row, "ask1Size", &self.venue_id)?;
         Ok(BybitTickerRaw {
             symbol: raw.symbol,
             best_bid,
@@ -9355,6 +9355,33 @@ fn parse_quantity_field(
     })
 }
 
+fn parse_quantity_field_empty_as_zero(
+    object: &BTreeMap<String, FlatJsonValue>,
+    field: &'static str,
+    venue_id: &VenueId,
+) -> VenueDataResult<Quantity> {
+    let value = required_string(object, field, venue_id.clone(), ReadOnlySurface::MarketData)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return "0".parse::<Quantity>().map_err(|error| {
+            VenueDataError::External(ClassifiedExternalError::new(
+                venue_id.clone(),
+                ReadOnlySurface::MarketData,
+                ExternalErrorClass::MalformedPayload,
+                format!("internal zero quantity is invalid while normalizing `{field}`: {error}"),
+            ))
+        });
+    }
+    value.parse::<Quantity>().map_err(|error| {
+        VenueDataError::External(ClassifiedExternalError::new(
+            venue_id.clone(),
+            ReadOnlySurface::MarketData,
+            ExternalErrorClass::MalformedPayload,
+            format!("field `{field}` is not a valid quantity: {error}"),
+        ))
+    })
+}
+
 fn parse_decimal_string_field(
     object: &BTreeMap<String, FlatJsonValue>,
     field: &'static str,
@@ -11731,6 +11758,34 @@ mod tests {
             instruments[0].margin_asset_id.as_ref().map(AssetId::as_str),
             Some("asset:USDT")
         );
+    }
+
+    #[test]
+    fn bybit_public_ticker_treats_empty_top_of_book_sizes_as_zero() {
+        let mut spot = bybit_ticker_adapter(
+            "venue:BYBIT-SPOT",
+            "inst:BYBIT:BTCUSDT:SPOT",
+            BybitPublicMarket::Spot,
+        );
+
+        let batch = spot
+            .ingest_ticker_json(
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"BTCUSDT","bid1Price":"43187.40","bid1Size":"","ask1Price":"43188.10","ask1Size":""}]},"retExtInfo":{},"time":1767225601000}"#,
+                "https://api.bybit.com/v5/market/tickers?category=spot",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("spot ticker with blank sizes");
+
+        assert_eq!(
+            batch.quote.bid_size.as_ref().map(ToString::to_string),
+            Some("0".to_owned())
+        );
+        assert_eq!(
+            batch.quote.ask_size.as_ref().map(ToString::to_string),
+            Some("0".to_owned())
+        );
+        assert_eq!(payload_string(&batch.normalized_event, "bid_size"), "0");
+        assert_eq!(payload_string(&batch.normalized_event, "ask_size"), "0");
     }
 
     #[test]
