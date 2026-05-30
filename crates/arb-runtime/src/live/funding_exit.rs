@@ -199,6 +199,8 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
     let mut confirmations = Vec::new();
     let mut residual_risk = None;
     let mut dispatch_attempted = false;
+    let mut partial_close = false;
+    let mut requested_close_quantity = None;
 
     let close_required_count = [leg_a.close_required, leg_b.close_required]
         .into_iter()
@@ -239,58 +241,91 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
     }
 
     if matches!(decision.as_str(), "close" | "emergency_de_risk") {
+        let mut close_legs = [leg_a.clone(), leg_b.clone()];
+        let mut close_blocked = false;
         let close_liquidity_blocking_reasons = if decision == "close" {
-            funding_arb_exit_close_liquidity_blocking_reasons(row, [&leg_a, &leg_b])?
+            funding_arb_exit_close_liquidity_blocking_reasons(
+                row,
+                [&close_legs[0], &close_legs[1]],
+            )?
         } else {
             Vec::new()
         };
         if !close_liquidity_blocking_reasons.is_empty() {
-            funding_arb_push_unique_reason_code(
-                &mut reason_codes,
-                "exit_close_liquidity_insufficient",
-            );
-            blocking_reasons.extend(close_liquidity_blocking_reasons);
-        } else if !options.acknowledge_funding_arb_live_orders {
-            blocking_reasons.push(
-                "缺少 --i-understand-funding-arb-live-orders，拒绝提交 funding arb 退出订单"
-                    .to_owned(),
-            );
-        } else {
-            if decision == "emergency_de_risk" {
-                let de_risk_slippage_buffer_bps =
-                    funding_arb_exit_emergency_de_risk_slippage_bps(options.slippage_buffer_bps);
-                leg_a = funding_arb_exit_leg_snapshot(
-                    row,
-                    &state.leg_a,
-                    &position_snapshot,
-                    de_risk_slippage_buffer_bps,
-                )?;
-                leg_b = funding_arb_exit_leg_snapshot(
-                    row,
-                    &state.leg_b,
-                    &position_snapshot,
-                    de_risk_slippage_buffer_bps,
-                )?;
+            if financial_risk.is_triggered() {
+                if let Some((partial_legs, quantity)) =
+                    funding_arb_exit_partial_close_legs(row, [&close_legs[0], &close_legs[1]])?
+                {
+                    funding_arb_push_unique_reason_code(
+                        &mut reason_codes,
+                        "exit_close_liquidity_partial",
+                    );
+                    partial_close = true;
+                    requested_close_quantity = Some(quantity);
+                    close_legs = partial_legs;
+                } else {
+                    funding_arb_push_unique_reason_code(
+                        &mut reason_codes,
+                        "exit_close_liquidity_insufficient",
+                    );
+                    blocking_reasons.extend(close_liquidity_blocking_reasons);
+                    close_blocked = true;
+                }
+            } else {
+                funding_arb_push_unique_reason_code(
+                    &mut reason_codes,
+                    "exit_close_liquidity_insufficient",
+                );
+                blocking_reasons.extend(close_liquidity_blocking_reasons);
+                close_blocked = true;
             }
-            let config = arb_config::ArbConfig::from_path(&options.config_path)?;
-            let signing_policy = signing_policy_from_config(&config)?;
-            let private_order_events = state
-                .private_order_events_dir
-                .as_ref()
-                .map(|path| PrivateOrderEventStore::from_dir(Path::new(path)))
-                .transpose()?;
-            dispatch_attempted = true;
-            let outcome = execute_funding_arb_exit_close_orders(
-                options,
-                &signing_policy,
-                &[leg_a, leg_b],
-                private_order_events.as_ref(),
-                position_modes,
-            )?;
-            receipts = outcome.receipts;
-            confirmations = outcome.confirmations;
-            residual_risk = outcome.protection.residual_risk;
-            blocking_reasons.extend(outcome.blocking_reasons);
+        }
+        if !close_blocked {
+            if !options.acknowledge_funding_arb_live_orders {
+                blocking_reasons.push(
+                    "缺少 --i-understand-funding-arb-live-orders，拒绝提交 funding arb 退出订单"
+                        .to_owned(),
+                );
+            } else {
+                if decision == "emergency_de_risk" {
+                    let de_risk_slippage_buffer_bps =
+                        funding_arb_exit_emergency_de_risk_slippage_bps(
+                            options.slippage_buffer_bps,
+                        );
+                    leg_a = funding_arb_exit_leg_snapshot(
+                        row,
+                        &state.leg_a,
+                        &position_snapshot,
+                        de_risk_slippage_buffer_bps,
+                    )?;
+                    leg_b = funding_arb_exit_leg_snapshot(
+                        row,
+                        &state.leg_b,
+                        &position_snapshot,
+                        de_risk_slippage_buffer_bps,
+                    )?;
+                    close_legs = [leg_a.clone(), leg_b.clone()];
+                }
+                let config = arb_config::ArbConfig::from_path(&options.config_path)?;
+                let signing_policy = signing_policy_from_config(&config)?;
+                let private_order_events = state
+                    .private_order_events_dir
+                    .as_ref()
+                    .map(|path| PrivateOrderEventStore::from_dir(Path::new(path)))
+                    .transpose()?;
+                dispatch_attempted = true;
+                let outcome = execute_funding_arb_exit_close_orders(
+                    options,
+                    &signing_policy,
+                    &close_legs,
+                    private_order_events.as_ref(),
+                    position_modes,
+                )?;
+                receipts = outcome.receipts;
+                confirmations = outcome.confirmations;
+                residual_risk = outcome.protection.residual_risk;
+                blocking_reasons.extend(outcome.blocking_reasons);
+            }
         }
     }
 
@@ -301,6 +336,8 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         reason_codes,
         runtime_risk,
         financial_risk,
+        partial_close,
+        requested_close_quantity,
         funding_settlement_status: settlement.status,
         private_position_status: position_status.status,
         dispatch_attempted,

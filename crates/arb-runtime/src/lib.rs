@@ -28562,6 +28562,8 @@ struct FundingArbExitCycleReport {
     reason_codes: Vec<String>,
     runtime_risk: FundingArbExitRuntimeRiskSummary,
     financial_risk: FundingArbExitFinancialRiskSummary,
+    partial_close: bool,
+    requested_close_quantity: Option<String>,
     funding_settlement_status: String,
     private_position_status: String,
     dispatch_attempted: bool,
@@ -30785,6 +30787,8 @@ fn funding_arb_exit_cycle_blocked_before_dispatch(
         reason_codes: vec![reason_code.to_owned()],
         runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
         financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
+        partial_close: false,
+        requested_close_quantity: None,
         funding_settlement_status: "NotChecked".to_owned(),
         private_position_status: "Unknown".to_owned(),
         dispatch_attempted: false,
@@ -31773,11 +31777,46 @@ fn funding_arb_exit_private_position_status(
 }
 
 #[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbExitCloseLiquidity {
+    venue_family: String,
+    role: String,
+    available: MonitorDecimal,
+    required: MonitorDecimal,
+    close_side: OrderSide,
+    limit_price: Price,
+    levels_used: usize,
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exit_close_liquidity_blocking_reasons(
     row: &FundingArbMarketRow,
     legs: [&FundingArbExitLegSnapshot; 2],
 ) -> RuntimeResult<Vec<String>> {
     let mut reasons = Vec::new();
+    for liquidity in funding_arb_exit_close_liquidity(row, legs)? {
+        if liquidity.available.raw < liquidity.required.raw {
+            reasons.push(format!(
+                "funding arb exit close liquidity is insufficient for {} {}: available_close_qty={} required_close_qty={} close_side={} limit_price={} levels_used={}; exit will retry before submitting live close orders",
+                liquidity.venue_family,
+                liquidity.role,
+                liquidity.available.format_trimmed(),
+                liquidity.required.format_trimmed(),
+                liquidity.close_side.as_str(),
+                liquidity.limit_price,
+                liquidity.levels_used
+            ));
+        }
+    }
+    Ok(reasons)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_close_liquidity(
+    row: &FundingArbMarketRow,
+    legs: [&FundingArbExitLegSnapshot; 2],
+) -> RuntimeResult<Vec<FundingArbExitCloseLiquidity>> {
+    let mut liquidities = Vec::new();
     for leg in legs {
         if !leg.close_required {
             continue;
@@ -31792,20 +31831,52 @@ fn funding_arb_exit_close_liquidity_blocking_reasons(
         if required.raw <= 0 {
             continue;
         }
-        if available.raw < required.raw {
-            reasons.push(format!(
-                "funding arb exit close liquidity is insufficient for {} {}: available_close_qty={} required_close_qty={} close_side={} limit_price={} levels_used={}; exit will retry before submitting live close orders",
-                leg.leg.venue_family,
-                leg.leg.role,
-                available.format_trimmed(),
-                required.format_trimmed(),
-                close_side.as_str(),
-                leg.close_price,
-                levels_used
-            ));
-        }
+        liquidities.push(FundingArbExitCloseLiquidity {
+            venue_family: leg.leg.venue_family.clone(),
+            role: leg.leg.role.clone(),
+            available,
+            required,
+            close_side,
+            limit_price: leg.close_price,
+            levels_used,
+        });
     }
-    Ok(reasons)
+    Ok(liquidities)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_partial_close_legs(
+    row: &FundingArbMarketRow,
+    legs: [&FundingArbExitLegSnapshot; 2],
+) -> RuntimeResult<Option<([FundingArbExitLegSnapshot; 2], String)>> {
+    if !legs.iter().all(|leg| leg.close_required) {
+        return Ok(None);
+    }
+    let liquidities = funding_arb_exit_close_liquidity(row, legs)?;
+    if liquidities.len() != 2 {
+        return Ok(None);
+    }
+    let partial_raw = liquidities
+        .iter()
+        .map(|liquidity| liquidity.available.raw.min(liquidity.required.raw))
+        .min()
+        .unwrap_or(0);
+    if partial_raw <= 0 {
+        return Ok(None);
+    }
+    if liquidities
+        .iter()
+        .all(|liquidity| partial_raw >= liquidity.required.raw)
+    {
+        return Ok(None);
+    }
+    let quantity_text = MonitorDecimal { raw: partial_raw }.format_trimmed();
+    let quantity = Quantity::from_str(&quantity_text)?;
+    let mut leg_a = legs[0].clone();
+    let mut leg_b = legs[1].clone();
+    leg_a.close_quantity = quantity;
+    leg_b.close_quantity = quantity;
+    Ok(Some(([leg_a, leg_b], quantity_text)))
 }
 
 #[cfg(feature = "live-exec")]
@@ -33069,6 +33140,7 @@ fn funding_private_order_market_for_venue_id(venue_id: &str) -> RuntimeResult<Pr
 fn funding_arb_exit_cycle_cleanly_closed(report: &FundingArbExitCycleReport) -> bool {
     report.decision == "closed"
         || (matches!(report.decision.as_str(), "close" | "emergency_de_risk")
+            && !report.partial_close
             && report.dispatch_attempted
             && report.blocking_reasons.is_empty()
             && report.residual_risk.is_none()
@@ -33104,7 +33176,7 @@ fn write_funding_arb_exit_cycle_artifacts(
 #[cfg(feature = "live-exec")]
 fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> String {
     format!(
-        "{{\"blocking_reasons\":[{}],\"decision\":{},\"dispatch_attempted\":{},\"financial_risk\":{},\"funding_settlement_status\":{},\"output_dir\":{},\"pair_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason_codes\":{},\"residual_risk\":{},\"runtime_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":[{}],\"decision\":{},\"dispatch_attempted\":{},\"financial_risk\":{},\"funding_settlement_status\":{},\"output_dir\":{},\"pair_id\":{},\"partial_close\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason_codes\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"runtime_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         report
             .blocking_reasons
             .iter()
@@ -33117,9 +33189,11 @@ fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> Str
         json_string(&report.funding_settlement_status),
         optional_json_string(report.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
         json_string(&report.pair_id),
+        report.partial_close,
         report.private_confirmation_count,
         json_string(&report.private_position_status),
         json_string_array(&report.reason_codes),
+        json_option_string(&report.requested_close_quantity),
         optional_json_string(report.residual_risk.as_deref()),
         funding_arb_exit_runtime_risk_json(&report.runtime_risk),
         report.submitted_receipt_count,
@@ -33179,17 +33253,19 @@ fn append_funding_arb_resident_exit_event(
 ) -> RuntimeResult<()> {
     let recorded_at = current_utc_timestamp_string();
     let line = format!(
-        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"funding_settlement_status\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"residual_risk\":{},\"submitted_receipt_count\":{}}}",
+        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"funding_settlement_status\":{},\"partial_close\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"submitted_receipt_count\":{}}}",
         report.blocking_reasons.len(),
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
         report.dispatch_attempted,
         json_string(&report.funding_settlement_status),
+        report.partial_close,
         json_string(position_id),
         report.private_confirmation_count,
         json_string(&report.private_position_status),
         json_string(&recorded_at),
+        json_option_string(&report.requested_close_quantity),
         optional_json_string(report.residual_risk.as_deref()),
         report.submitted_receipt_count,
     );
@@ -33199,7 +33275,7 @@ fn append_funding_arb_resident_exit_event(
             output_root,
             "resident_exit_cycle",
             &format!(
-                "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event\":\"resident_exit_cycle\",\"funding_settlement_status\":{},\"mutable_execution_started\":{},\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"residual_risk\":{},\"strategy\":\"cross-exchange-funding-arb\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+                "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event\":\"resident_exit_cycle\",\"funding_settlement_status\":{},\"mutable_execution_started\":{},\"pair_id\":{},\"partial_close\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"strategy\":\"cross-exchange-funding-arb\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
                 cycle,
                 json_string(&cycle_dir.display().to_string()),
                 json_string(&report.decision),
@@ -33207,10 +33283,12 @@ fn append_funding_arb_resident_exit_event(
                 json_string(&report.funding_settlement_status),
                 report.dispatch_attempted,
                 json_string(&report.pair_id),
+                report.partial_close,
                 json_string(position_id),
                 report.private_confirmation_count,
                 json_string(&report.private_position_status),
                 json_string(&recorded_at),
+                json_option_string(&report.requested_close_quantity),
                 optional_json_string(report.residual_risk.as_deref()),
                 report.submitted_receipt_count,
                 json_string(&report.symbol),
@@ -50442,6 +50520,8 @@ mod tests {
             reason_codes: Vec::new(),
             runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
             financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
+            partial_close: false,
+            requested_close_quantity: None,
             funding_settlement_status: "Matched".to_owned(),
             private_position_status: "Flat".to_owned(),
             dispatch_attempted: true,
@@ -53114,6 +53194,95 @@ mod tests {
         assert!(reasons[1].contains("bybit funding_perp_short"));
         assert!(reasons[1].contains("available_close_qty=10"));
         assert!(reasons[1].contains("required_close_qty=10550"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_partial_close_legs_uses_common_liquidity() {
+        let mut row = funding_arb_test_row("0.00010000", "-0.00005000");
+        row.pair_id = "binance:bitget:GENIUSUSDT:GENIUSUSDT".to_owned();
+        row.symbol = "GENIUSUSDT".to_owned();
+        row.venue_b_family = "bitget".to_owned();
+        row.venue_a_bid = "0.4481".to_owned();
+        row.venue_a_bid_qty = "44".to_owned();
+        row.venue_a_bid_depth = signal_depth_from_top_strings("0.4481", "44");
+        row.venue_b_ask = "0.4490".to_owned();
+        row.venue_b_ask_qty = "12".to_owned();
+        row.venue_b_ask_depth = signal_depth_from_top_strings("0.4490", "12");
+
+        let long_leg = FundingArbExitLegSnapshot {
+            leg: FundingArbPositionLegState {
+                role: "funding_perp_long".to_owned(),
+                venue_family: "binance".to_owned(),
+                venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BINANCE:GENIUSUSDT:USDT-FUTURES".to_owned(),
+                side: OrderSide::Buy,
+                quantity: "201".to_owned(),
+                entry_limit_price: "0.4490".to_owned(),
+            },
+            signed_quantity: MonitorDecimal::parse("test.long_quantity", "201").expect("quantity"),
+            close_quantity: Quantity::from_str("201").expect("quantity"),
+            close_price: Price::from_str("0.4480").expect("price"),
+            close_required: true,
+        };
+        let short_leg = FundingArbExitLegSnapshot {
+            leg: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "bitget".to_owned(),
+                venue_id: BITGET_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:bitget-funding-arb-readonly".to_owned(),
+                instrument_id: "inst:BITGET:GENIUSUSDT:USDT-FUTURES".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "201".to_owned(),
+                entry_limit_price: "0.4485".to_owned(),
+            },
+            signed_quantity: MonitorDecimal::parse("test.short_quantity", "-201")
+                .expect("quantity"),
+            close_quantity: Quantity::from_str("201").expect("quantity"),
+            close_price: Price::from_str("0.4495").expect("price"),
+            close_required: true,
+        };
+
+        let (partial_legs, quantity) =
+            funding_arb_exit_partial_close_legs(&row, [&long_leg, &short_leg])
+                .expect("partial close liquidity")
+                .expect("partial close legs");
+
+        assert_eq!(quantity, "12");
+        assert_eq!(partial_legs[0].close_quantity.to_string(), "12");
+        assert_eq!(partial_legs[1].close_quantity.to_string(), "12");
+        assert_eq!(partial_legs[0].signed_quantity, long_leg.signed_quantity);
+        assert_eq!(partial_legs[1].signed_quantity, short_leg.signed_quantity);
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_cycle_cleanly_closed_rejects_partial_close() {
+        let report = FundingArbExitCycleReport {
+            pair_id: "binance:bitget:GENIUSUSDT:GENIUSUSDT".to_owned(),
+            symbol: "GENIUSUSDT".to_owned(),
+            decision: "close".to_owned(),
+            reason_codes: vec!["expected_return_loss_limit".to_owned()],
+            runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
+            financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
+            partial_close: false,
+            requested_close_quantity: None,
+            funding_settlement_status: "Pending".to_owned(),
+            private_position_status: "Matched".to_owned(),
+            dispatch_attempted: true,
+            submitted_receipt_count: 2,
+            private_confirmation_count: 2,
+            residual_risk: None,
+            blocking_reasons: Vec::new(),
+            output_dir: None,
+        };
+        assert!(funding_arb_exit_cycle_cleanly_closed(&report));
+
+        let mut partial_report = report.clone();
+        partial_report.partial_close = true;
+        partial_report.requested_close_quantity = Some("12".to_owned());
+        assert!(!funding_arb_exit_cycle_cleanly_closed(&partial_report));
     }
 
     #[test]
