@@ -3481,6 +3481,15 @@ pub(crate) fn parse_portfolio_dashboard_args(
                 };
                 options.resident_root = Some(PathBuf::from(value));
             }
+            "--navigation-wss-pid-file" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--navigation-wss-pid-file requires a file path",
+                    ));
+                };
+                options.navigation_wss_pid_file = Some(PathBuf::from(value));
+            }
             "--once" => options.once = true,
             value if value.starts_with('-') => {
                 return Err(cli_arg_error(format!(

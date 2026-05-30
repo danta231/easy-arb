@@ -1,4 +1,7 @@
 use crate::*;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 
 pub(crate) struct SystemNavigationEntry {
     pub(crate) category: &'static str,
@@ -138,19 +141,71 @@ pub(crate) fn system_navigation_entries() -> &'static [SystemNavigationEntry] {
             url: "http://127.0.0.1:8793/api/bitget-wss-book-ticker/status",
             health_url: "http://127.0.0.1:8793/health",
         },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Aster perp WSS",
+            description: "Aster USDT perp bookTicker 实时前置行情。",
+            url: "http://127.0.0.1:8794/api/aster-wss-book-ticker/status",
+            health_url: "http://127.0.0.1:8794/health",
+        },
+        SystemNavigationEntry {
+            category: "WSS",
+            title: "Hyperliquid perp WSS",
+            description: "Hyperliquid perp bbo 实时前置行情。",
+            url: "http://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status",
+            health_url: "http://127.0.0.1:8795/health",
+        },
     ]
 }
 
+#[cfg(test)]
 pub(crate) fn system_navigation_pages_json() -> String {
+    system_navigation_pages_json_with_wss_pid_file(None)
+}
+
+pub(crate) fn system_navigation_pages_json_with_wss_pid_file(
+    wss_pid_file: Option<&Path>,
+) -> String {
+    let active_wss_urls = wss_pid_file.and_then(active_wss_status_urls_from_pid_file);
     format!(
         "{{\"pages\":[{}],\"schema_version\":\"1.0.0\",\"updated_at\":{}}}",
         system_navigation_entries()
             .iter()
+            .filter(|entry| navigation_entry_is_active(entry, active_wss_urls.as_ref()))
             .map(system_navigation_entry_json)
             .collect::<Vec<_>>()
             .join(","),
         json_string(&current_utc_timestamp_string()),
     )
+}
+
+pub(crate) fn active_wss_status_urls_from_pid_file(path: &Path) -> Option<BTreeSet<String>> {
+    let content = fs::read_to_string(path).ok()?;
+    let urls = content
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let _pid = fields.next()?;
+            let _name = fields.next()?;
+            let _log_file = fields.next()?;
+            let status_url = fields.next()?.trim();
+            (!status_url.is_empty()).then(|| status_url.to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    Some(urls)
+}
+
+fn navigation_entry_is_active(
+    entry: &SystemNavigationEntry,
+    active_wss_urls: Option<&BTreeSet<String>>,
+) -> bool {
+    if entry.category != "WSS" {
+        return true;
+    }
+    match active_wss_urls {
+        Some(urls) => urls.contains(entry.url),
+        None => true,
+    }
 }
 
 pub(crate) fn system_navigation_entry_json(entry: &SystemNavigationEntry) -> String {

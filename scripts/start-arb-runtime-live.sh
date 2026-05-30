@@ -753,6 +753,7 @@ start_portfolio_dashboard() {
     "${RUNTIME_BIN}" portfolio-dashboard
     --bind "${PORTFOLIO_BIND}"
     --resident-root "${RUN_ROOT}"
+    --navigation-wss-pid-file "${WSS_PID_FILE}"
   )
   [[ -n "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT:-}" ]] && args+=(--account-snapshot "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT}")
   [[ -n "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_RAW_SNAPSHOT:-}" ]] && args+=(--account-raw-snapshot "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_RAW_SNAPSHOT}")

@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::monitors::dashboard::system_navigation_pages_json;
+use crate::monitors::dashboard::system_navigation_pages_json_with_wss_pid_file;
 use crate::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5034,7 +5034,13 @@ fn handle_portfolio_dashboard_http_connection(
         return;
     }
     if route == "/api/navigation/pages" {
-        let _ = write_http_json(&mut stream, 200, &system_navigation_pages_json());
+        let _ = write_http_json(
+            &mut stream,
+            200,
+            &system_navigation_pages_json_with_wss_pid_file(
+                state.options.navigation_wss_pid_file.as_deref(),
+            ),
+        );
         return;
     }
     if route == "/api/errors/logs" {

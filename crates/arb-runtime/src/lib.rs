@@ -2096,6 +2096,7 @@ pub struct PortfolioDashboardOptions {
     pub position_raw_snapshot_path: Option<PathBuf>,
     pub funding_snapshot_path: Option<PathBuf>,
     pub resident_root: Option<PathBuf>,
+    pub navigation_wss_pid_file: Option<PathBuf>,
     pub once: bool,
 }
 
@@ -2109,6 +2110,7 @@ impl Default for PortfolioDashboardOptions {
             position_raw_snapshot_path: None,
             funding_snapshot_path: None,
             resident_root: None,
+            navigation_wss_pid_file: None,
             once: false,
         }
     }
@@ -47391,9 +47393,34 @@ mod tests {
         assert!(json.contains("Binance basis"));
         assert!(json.contains("Funding arb"));
         assert!(json.contains("Bitget futures WSS"));
+        assert!(json.contains("Aster perp WSS"));
+        assert!(json.contains("Hyperliquid perp WSS"));
         assert!(json.contains("http://127.0.0.1:8805/api/navigation/pages"));
         assert!(json.contains("http://127.0.0.1:8804/api/funding-arb/status"));
-        assert_eq!(system_navigation_entries().len(), 18);
+        assert_eq!(system_navigation_entries().len(), 20);
+    }
+
+    #[test]
+    fn navigation_dashboard_filters_wss_pages_from_pid_file() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let pid_file = root.path().join("wss-book-ticker.pids");
+        write_utf8(
+            pid_file.clone(),
+            concat!(
+                "101\tbinance-perp\t/tmp/binance-perp.log\thttp://127.0.0.1:8806/api/binance-wss-book-ticker/status\t__none__\t0\n",
+                "102\thyperliquid-perp\t/tmp/hyperliquid-perp.log\thttp://127.0.0.1:8795/api/hyperliquid-wss-book-ticker/status\t__none__\t0\n",
+            ),
+        )
+        .expect("write pid file");
+
+        let json = system_navigation_pages_json_with_wss_pid_file(Some(&pid_file));
+
+        assert!(json.contains("Binance perp WSS"));
+        assert!(json.contains("Hyperliquid perp WSS"));
+        assert!(json.contains("Funding arb"));
+        assert!(!json.contains("Binance spot WSS"));
+        assert!(!json.contains("Bybit spot WSS"));
+        assert!(!json.contains("Bitget futures WSS"));
     }
 
     #[test]
