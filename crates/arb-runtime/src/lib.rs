@@ -7244,19 +7244,18 @@ fn validate_public_wss_monitor_snapshot_for_basis(
             ),
         });
     }
-    if optional_json_bool(fields, "fail_closed", "Public WSS monitor")?.unwrap_or(true) {
+    let fail_closed =
+        optional_json_bool(fields, "fail_closed", "Public WSS monitor")?.unwrap_or(true);
+    if fail_closed {
+        let last_error = optional_json_value_string(fields, "last_error", "Public WSS monitor")?
+            .filter(|error| !error.trim().is_empty())
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
         return Err(RuntimeError::LiveMarketData {
             message: format!(
-                "Public WSS monitor `{monitor_ref}` is fail-closed or lacks fail_closed state"
+                "Public WSS monitor `{monitor_ref}` is fail-closed or lacks fail_closed state{last_error}"
             ),
         });
-    }
-    if let Some(error) = optional_json_value_string(fields, "last_error", "Public WSS monitor")? {
-        if !error.trim().is_empty() {
-            return Err(RuntimeError::LiveMarketData {
-                message: format!("Public WSS monitor `{monitor_ref}` reports last_error `{error}`"),
-            });
-        }
     }
     if let Some(market) = optional_json_value_string(fields, "market", "Public WSS monitor")? {
         if market != expected_market {
@@ -46301,6 +46300,44 @@ mod tests {
     }
 
     #[test]
+    fn public_wss_quote_map_accepts_reconnecting_stream_status_when_available() {
+        let fetched_at = UtcTimestamp::from_str("2026-05-13T00:00:10Z").expect("fetched at");
+        let raw = r#"{
+          "status":"streaming",
+          "stream_status":"reconnecting",
+          "market":"usdt-futures",
+          "fail_closed":false,
+          "wss_update_count":3,
+          "last_error":"connection reset without closing handshake",
+          "rows":[{
+            "symbol":"BTCUSDT",
+            "venue_id":"venue:ASTER-USDT-FUTURES",
+            "instrument_id":"inst:ASTER:BTCUSDT:USDT-FUTURES",
+            "best_bid":"43250.10",
+            "best_ask":"43251.20",
+            "bid_size":"1.00000000",
+            "ask_size":"1.50000000",
+            "source_sequence":"3",
+            "source_event_id":"aster:wss-book-ticker:usdt-futures:BTCUSDT:400900303",
+            "observed_at":"2026-05-13T00:00:09Z",
+            "ingested_at":"2026-05-13T00:00:09Z",
+            "freshness_status":"Fresh"
+          }]
+        }"#;
+
+        let quotes = parse_public_wss_monitor_quote_map_for_basis(
+            raw,
+            "http://127.0.0.1:8794/api/aster-wss-book-ticker/status",
+            AsterPublicWssMarket::UsdtFutures.as_str(),
+            fetched_at,
+        )
+        .expect("reconnecting transport with fresh rows remains usable");
+
+        assert_eq!(quotes.len(), 1);
+        assert!(quotes.contains_key("BTCUSDT"));
+    }
+
+    #[test]
     fn aster_and_hyperliquid_basis_monitor_args_accept_perp_wss_url() {
         let hyperliquid_args = vec![
             "--perp-wss-monitor-url".to_owned(),
@@ -46589,6 +46626,8 @@ mod tests {
         assert!(health.contains("\"disconnect_count\":1"));
         assert!(health.contains("\"rest_rebuild_count\":1"));
         assert!(health.contains("\"wss_update_count\":0"));
+        assert!(health.contains("\"status\":\"fail_closed\""));
+        assert!(health.contains("\"stream_status\":\"rebuilding\""));
         assert!(quote.contains("\"latest_quote\":null"));
         assert!(status.contains("\"last_error\":\"forced fail closed for test\""));
     }
@@ -46609,7 +46648,10 @@ mod tests {
         let status = snapshot.to_json();
         assert!(health.contains("\"fail_closed\":false"));
         assert!(health.contains("\"disconnect_count\":1"));
-        assert!(status.contains("\"status\":\"reconnecting\""));
+        assert!(health.contains("\"status\":\"streaming\""));
+        assert!(health.contains("\"stream_status\":\"reconnecting\""));
+        assert!(status.contains("\"status\":\"streaming\""));
+        assert!(status.contains("\"stream_status\":\"reconnecting\""));
         assert!(status.contains("\"last_error\":\"connection reset\""));
 
         snapshot.record_wss_read_error("subscribe failed", false);

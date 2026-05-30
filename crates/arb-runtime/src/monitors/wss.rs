@@ -4602,13 +4602,24 @@ impl PublicTopOfBookMonitorSnapshot {
             .unwrap_or_else(|| "null".to_owned())
     }
 
+    fn availability_status(&self) -> &str {
+        if self.fail_closed {
+            return "fail_closed";
+        }
+        if self.total_rows > 0 || self.latest_quote.is_some() || self.wss_update_count > 0 {
+            return "streaming";
+        }
+        &self.status
+    }
+
     pub(crate) fn health_json(&self) -> String {
         format!(
-            "{{\"disconnect_count\":{},\"fail_closed\":{},\"latest_quote\":{},\"rest_rebuild_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
+            "{{\"disconnect_count\":{},\"fail_closed\":{},\"latest_quote\":{},\"rest_rebuild_count\":{},\"status\":{},\"stream_status\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
             self.disconnect_count,
             self.fail_closed,
             self.latest_quote_json_value(),
             self.rest_rebuild_count,
+            json_string(self.availability_status()),
             json_string(&self.status),
             self.total_rows,
             json_string(&self.updated_at),
@@ -4618,9 +4629,10 @@ impl PublicTopOfBookMonitorSnapshot {
 
     pub(crate) fn quote_json(&self) -> String {
         format!(
-            "{{\"fail_closed\":{},\"latest_quote\":{},\"status\":{},\"updated_at\":{}}}",
+            "{{\"fail_closed\":{},\"latest_quote\":{},\"status\":{},\"stream_status\":{},\"updated_at\":{}}}",
             self.fail_closed,
             self.latest_quote_json_value(),
+            json_string(self.availability_status()),
             json_string(&self.status),
             json_string(&self.updated_at),
         )
@@ -4628,13 +4640,14 @@ impl PublicTopOfBookMonitorSnapshot {
 
     pub(crate) fn quotes_json(&self) -> String {
         format!(
-            "{{\"fail_closed\":{},\"rows\":[{}],\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+            "{{\"fail_closed\":{},\"rows\":[{}],\"status\":{},\"stream_status\":{},\"total_rows\":{},\"updated_at\":{}}}",
             self.fail_closed,
             self.rows
                 .iter()
                 .map(PublicTopOfBookQuoteSnapshot::to_json)
                 .collect::<Vec<_>>()
                 .join(","),
+            json_string(self.availability_status()),
             json_string(&self.status),
             self.total_rows,
             json_string(&self.updated_at),
@@ -4643,7 +4656,7 @@ impl PublicTopOfBookMonitorSnapshot {
 
     pub(crate) fn to_json(&self) -> String {
         format!(
-            "{{\"coordinator_status\":{},\"disconnect_count\":{},\"fail_closed\":{},\"fail_closed_count\":{},\"last_error\":{},\"latest_quote\":{},\"market\":{},\"rest_rebuild_count\":{},\"rows\":[{}],\"status\":{},\"stream_url\":{},\"symbol\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
+            "{{\"coordinator_status\":{},\"disconnect_count\":{},\"fail_closed\":{},\"fail_closed_count\":{},\"last_error\":{},\"latest_quote\":{},\"market\":{},\"rest_rebuild_count\":{},\"rows\":[{}],\"status\":{},\"stream_status\":{},\"stream_url\":{},\"symbol\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
             json_string(&self.coordinator_status),
             self.disconnect_count,
             self.fail_closed,
@@ -4657,6 +4670,7 @@ impl PublicTopOfBookMonitorSnapshot {
                 .map(PublicTopOfBookQuoteSnapshot::to_json)
                 .collect::<Vec<_>>()
                 .join(","),
+            json_string(self.availability_status()),
             json_string(&self.status),
             json_string(&self.stream_url),
             json_string(&self.symbol),
