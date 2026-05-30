@@ -9631,6 +9631,28 @@ where
         OrderConfirmationStatus::Cancelled
         | OrderConfirmationStatus::Rejected
         | OrderConfirmationStatus::Expired => {
+            if private_order_update_has_positive_fill(&spot_update) {
+                outcome.blocking_reasons.push(format!(
+                    "spot leg reached terminal status `{}` with a positive fill before hedge; perp leg skipped and spot unwind submitted",
+                    spot_update.status.as_str()
+                ));
+                if let Some(quantity) = private_order_update_positive_fill_quantity(&spot_update) {
+                    attempt_spot_unwind(
+                        spot_adapter,
+                        spot,
+                        quantity,
+                        context.spot_unwind_limit_price,
+                        "spot-terminal-positive-fill",
+                        spot_context,
+                        &mut outcome,
+                    )?;
+                } else {
+                    outcome.protection.record_residual_risk(
+                        "spot terminal update included fill evidence but no parseable filled quantity; manual unwind is required",
+                    );
+                }
+                return Ok(outcome);
+            }
             outcome.blocking_reasons.push(format!(
                 "spot leg reached terminal non-filled status `{}`; perp leg skipped",
                 spot_update.status.as_str()
@@ -9828,6 +9850,37 @@ where
         OrderConfirmationStatus::Cancelled
         | OrderConfirmationStatus::Rejected
         | OrderConfirmationStatus::Expired => {
+            if private_order_update_has_positive_fill(&perp_update) {
+                outcome.blocking_reasons.push(format!(
+                    "perp hedge reached terminal status `{}` with a positive fill after spot fill; unwinding unmatched spot quantity and recording residual position risk",
+                    perp_update.status.as_str()
+                ));
+                if let Some(perp_filled) = private_order_update_positive_fill_quantity(&perp_update)
+                {
+                    if let Some(unmatched) =
+                        unmatched_spot_quantity(spot_filled_quantity, Some(perp_filled))
+                            .filter(|quantity| quantity_is_positive(*quantity))
+                    {
+                        attempt_spot_unwind(
+                            spot_adapter,
+                            spot,
+                            unmatched,
+                            context.spot_unwind_limit_price,
+                            "perp-terminal-positive-fill",
+                            spot_context,
+                            &mut outcome,
+                        )?;
+                    }
+                    outcome.protection.record_residual_risk(
+                        "perp hedge terminal update included fills; manual reconciliation is required before treating the pair as durable",
+                    );
+                } else {
+                    outcome.protection.record_residual_risk(
+                        "perp hedge terminal update included fill evidence but no parseable filled quantity; manual reconciliation is required",
+                    );
+                }
+                return Ok(outcome);
+            }
             outcome.blocking_reasons.push(format!(
                 "perp hedge reached terminal non-filled status `{}` after spot fill; unwinding spot",
                 perp_update.status.as_str()
@@ -10189,6 +10242,20 @@ where
         OrderConfirmationStatus::Cancelled
         | OrderConfirmationStatus::Rejected
         | OrderConfirmationStatus::Expired => {
+            if private_order_update_has_positive_fill(&second_update) {
+                handle_second_funding_perp_terminal_positive_fill(
+                    first_adapter,
+                    second_adapter,
+                    first,
+                    second,
+                    first_filled_quantity,
+                    &second_update,
+                    first_context,
+                    second_context,
+                    &mut outcome,
+                )?;
+                return Ok(outcome);
+            }
             outcome.blocking_reasons.push(format!(
                 "second funding perp leg reached terminal non-filled status `{}`; unwinding first leg",
                 second_update.status.as_str()
@@ -10345,6 +10412,56 @@ where
     let unwind_filled =
         attempt_funding_reduce_only_unwind(adapter, first, quantity, reason, context, outcome)?;
     mark_flat_after_successful_funding_unwind(outcome, unwind_filled);
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn handle_second_funding_perp_terminal_positive_fill<F, S>(
+    first_adapter: &mut F,
+    second_adapter: &mut S,
+    first: &PlannedSubmitOrder,
+    second: &PlannedSubmitOrder,
+    first_filled_quantity: Quantity,
+    second_update: &PrivateOrderUpdate,
+    first_context: BasisOrderConfirmContext<'_>,
+    second_context: BasisOrderConfirmContext<'_>,
+    outcome: &mut BasisLiveExecutionOutcome,
+) -> RuntimeResult<()>
+where
+    F: SubmitOrder + ConfirmOrderStatus,
+    S: SubmitOrder + ConfirmOrderStatus,
+{
+    outcome.blocking_reasons.push(format!(
+        "second funding perp leg reached terminal status `{}` with a positive fill; submitting reduce-only unwind for both filled legs",
+        second_update.status.as_str()
+    ));
+    let Some(second_filled_quantity) = private_order_update_positive_fill_quantity(second_update)
+    else {
+        outcome.protection.record_residual_risk(format!(
+            "second funding perp order `{}` has positive fill evidence but no parseable filled quantity; manual close is required",
+            second.plan_leg_id
+        ));
+        return Ok(());
+    };
+    let first_unwind_filled = attempt_funding_reduce_only_unwind(
+        first_adapter,
+        first,
+        first_filled_quantity,
+        "second-terminal-positive-fill-first",
+        first_context,
+        outcome,
+    )?;
+    let second_unwind_filled = attempt_funding_reduce_only_unwind(
+        second_adapter,
+        second,
+        second_filled_quantity,
+        "second-terminal-positive-fill-second",
+        second_context,
+        outcome,
+    )?;
+    if first_unwind_filled && second_unwind_filled && outcome.protection.residual_risk.is_none() {
+        outcome.flat_after_cancel = true;
+    }
     Ok(())
 }
 
@@ -54663,6 +54780,223 @@ mod tests {
 
     #[cfg(feature = "live-exec")]
     #[test]
+    fn basis_spot_terminal_positive_fill_unwinds_filled_spot_quantity() {
+        let spot = test_basis_planned_order(
+            "spot_buy",
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvbS1778630400",
+            "idem:test:basis:spot-terminal-positive-fill:spot",
+        );
+        let perp = test_basis_planned_order(
+            "perp_short",
+            BINANCE_BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_INSTRUMENT_ID,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvbP1778630400",
+            "idem:test:basis:spot-terminal-positive-fill:perp",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:basis-spot-terminal-positive-fill".to_owned(),
+            requests: vec![spot, perp],
+        };
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    "spot-terminal-fill-submit",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    "spot-terminal-fill-unwind",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::Spot,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Cancelled,
+                    Some("0.040"),
+                    Some(OrderSide::Buy),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::Spot,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("0.040"),
+                    Some(OrderSide::Sell),
+                )),
+            ],
+        );
+        let mut usdm_adapter = ScriptedBasisLiveAdapter::new(vec![], vec![], vec![]);
+
+        let outcome = execute_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut usdm_adapter,
+            BasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630400",
+                private_order_events: None,
+                spot_market: PrivateOrderMarket::Spot,
+                perp_market: PrivateOrderMarket::UsdmFutures,
+                order_query_event_prefix: "event:binance:basis-order-query",
+            },
+        )
+        .expect("spot terminal positive fill should unwind filled spot");
+
+        assert_eq!(outcome.primary_submit_receipt_count, 1);
+        assert_eq!(outcome.protection.receipt_count, 1);
+        assert!(outcome.protection.residual_risk.is_none());
+        assert!(outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("positive fill before hedge")));
+        assert!(!outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("terminal non-filled")));
+        assert_eq!(spot_adapter.submitted.len(), 2);
+        assert_eq!(spot_adapter.submitted[1].side, OrderSide::Sell);
+        assert_eq!(spot_adapter.submitted[1].quantity.to_string(), "0.040");
+        assert!(usdm_adapter.submitted.is_empty());
+        assert!(outcome
+            .protection
+            .actions
+            .iter()
+            .any(|action| action.contains("spot_unwind_sell:spot-terminal-positive-fill")));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn basis_perp_terminal_positive_fill_unwinds_only_unmatched_spot_quantity() {
+        let spot = test_basis_planned_order(
+            "spot_buy",
+            BINANCE_BASIS_SPOT_VENUE_ID,
+            BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+            OrderSide::Buy,
+            "0.100",
+            "100.00",
+            "rvbS1778630401",
+            "idem:test:basis:perp-terminal-positive-fill:spot",
+        );
+        let perp = test_basis_planned_order(
+            "perp_short",
+            BINANCE_BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_INSTRUMENT_ID,
+            OrderSide::Sell,
+            "0.100",
+            "101.00",
+            "rvbP1778630401",
+            "idem:test:basis:perp-terminal-positive-fill:perp",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:basis-perp-terminal-positive-fill".to_owned(),
+            requests: vec![spot, perp],
+        };
+        let mut spot_adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    "perp-terminal-fill-spot-submit",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    "perp-terminal-fill-spot-unwind",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::Spot,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("0.100"),
+                    Some(OrderSide::Buy),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::Spot,
+                    BINANCE_BASIS_SPOT_VENUE_ID,
+                    BINANCE_BASIS_SPOT_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("0.060"),
+                    Some(OrderSide::Sell),
+                )),
+            ],
+        );
+        let mut usdm_adapter = ScriptedBasisLiveAdapter::new(
+            vec![Ok(test_mutable_receipt(
+                MutableActionKind::SubmitOrder,
+                BINANCE_BASIS_PERP_VENUE_ID,
+                "perp-terminal-fill-perp-submit",
+            ))],
+            vec![],
+            vec![Ok(test_private_order_update(
+                arb_venue_exec::PrivateOrderMarket::UsdmFutures,
+                BINANCE_BASIS_PERP_VENUE_ID,
+                BINANCE_BASIS_PERP_INSTRUMENT_ID,
+                OrderConfirmationStatus::Cancelled,
+                Some("0.040"),
+                Some(OrderSide::Sell),
+            ))],
+        );
+
+        let outcome = execute_basis_live_dispatch(
+            &dispatch_plan,
+            &mut spot_adapter,
+            &mut usdm_adapter,
+            BasisLiveDispatchContext {
+                plan: None,
+                generated_at: "2026-05-13T00:00:00Z",
+                spot_unwind_limit_price: Price::from_str("99.90").expect("unwind price"),
+                protection_suffix: "1778630401",
+                private_order_events: None,
+                spot_market: PrivateOrderMarket::Spot,
+                perp_market: PrivateOrderMarket::UsdmFutures,
+                order_query_event_prefix: "event:binance:basis-order-query",
+            },
+        )
+        .expect("perp terminal positive fill should unwind unmatched spot");
+
+        assert_eq!(outcome.primary_submit_receipt_count, 2);
+        assert_eq!(outcome.protection.receipt_count, 1);
+        assert!(outcome.protection.residual_risk.is_some());
+        assert!(outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("positive fill after spot fill")));
+        assert!(!outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("terminal non-filled")));
+        assert_eq!(spot_adapter.submitted.len(), 2);
+        assert_eq!(spot_adapter.submitted[1].side, OrderSide::Sell);
+        assert_eq!(spot_adapter.submitted[1].quantity.to_string(), "0.060");
+        assert_eq!(usdm_adapter.submitted.len(), 1);
+        assert!(outcome
+            .protection
+            .actions
+            .iter()
+            .any(|action| action.contains("spot_unwind_sell:perp-terminal-positive-fill")));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
     fn binance_basis_live_dispatch_prefers_private_stream_confirmations() {
         let spot = test_basis_planned_order(
             "spot_buy",
@@ -55553,6 +55887,147 @@ mod tests {
             .actions
             .iter()
             .any(|action| action.contains("funding_reduce_only_unwind:second-terminal-unfilled")));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_second_terminal_positive_fill_unwinds_both_filled_legs() {
+        let first = test_basis_planned_order_for_account(
+            "perp_long",
+            BINANCE_BASIS_PERP_VENUE_ID,
+            BINANCE_BASIS_PERP_INSTRUMENT_ID,
+            BINANCE_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Buy,
+            "12378",
+            "100.00",
+            "binanceFirstFilled",
+            "idem:test:funding-second-terminal-positive-fill:first",
+        );
+        let second = test_basis_planned_order_for_account(
+            "perp_short",
+            BYBIT_BASIS_PERP_VENUE_ID,
+            BYBIT_BASIS_PERP_INSTRUMENT_ID,
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Sell,
+            "12378",
+            "101.00",
+            "bybitSecondCancelledFill",
+            "idem:test:funding-second-terminal-positive-fill:second",
+        );
+        let dispatch_plan = ExecutionDispatchPlan {
+            plan_id: "plan:test:funding-second-terminal-positive-fill".to_owned(),
+            requests: vec![first, second],
+        };
+        let mut first_adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BINANCE_BASIS_PERP_VENUE_ID,
+                    "funding-positive-first-submit",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BINANCE_BASIS_PERP_VENUE_ID,
+                    "funding-positive-first-unwind",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::UsdmFutures,
+                    BINANCE_BASIS_PERP_VENUE_ID,
+                    BINANCE_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("12378"),
+                    Some(OrderSide::Buy),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::UsdmFutures,
+                    BINANCE_BASIS_PERP_VENUE_ID,
+                    BINANCE_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("12378"),
+                    Some(OrderSide::Sell),
+                )),
+            ],
+        );
+        let mut second_adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    "funding-positive-second-submit",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    "funding-positive-second-unwind",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Cancelled,
+                    Some("8302"),
+                    Some(OrderSide::Sell),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("8302"),
+                    Some(OrderSide::Buy),
+                )),
+            ],
+        );
+
+        let outcome = execute_funding_arb_live_canary_dispatch(
+            &dispatch_plan,
+            &mut first_adapter,
+            &mut second_adapter,
+            arb_venue_exec::PrivateOrderMarket::UsdmFutures,
+            arb_venue_exec::PrivateOrderMarket::BybitLinear,
+            FundingLiveCanaryContext {
+                plan: None,
+                generated_at: "2026-05-29T21:03:00Z",
+                protection_suffix: "1780095780",
+                private_order_events: None,
+                order_query_event_prefix: "event:funding-test-order-query",
+                slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+                price_tick_resolver: test_funding_arb_price_tick_for_venue,
+            },
+        )
+        .expect("second terminal positive fill should unwind both filled legs");
+
+        assert!(outcome.flat_after_cancel);
+        assert_eq!(outcome.primary_submit_receipt_count, 2);
+        assert_eq!(outcome.protection.receipt_count, 2);
+        assert!(outcome.protection.residual_risk.is_none());
+        assert!(outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("positive fill")));
+        assert!(!outcome
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("terminal non-filled")));
+        assert_eq!(first_adapter.submitted.len(), 2);
+        assert_eq!(second_adapter.submitted.len(), 2);
+        let first_unwind = &first_adapter.submitted[1];
+        assert_eq!(first_unwind.side, OrderSide::Sell);
+        assert_eq!(first_unwind.quantity.to_string(), "12378");
+        let second_unwind = &second_adapter.submitted[1];
+        assert!(second_unwind.reduce_only);
+        assert_eq!(second_unwind.side, OrderSide::Buy);
+        assert_eq!(second_unwind.quantity.to_string(), "8302");
+        assert!(outcome.protection.actions.iter().any(|action| action
+            .contains("funding_reduce_only_unwind:second-terminal-positive-fill-first")));
+        assert!(outcome.protection.actions.iter().any(|action| action
+            .contains("funding_reduce_only_unwind:second-terminal-positive-fill-second")));
     }
 
     #[cfg(feature = "live-exec")]

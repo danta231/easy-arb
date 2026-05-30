@@ -2932,15 +2932,26 @@ fn apply_private_confirmation(
             ));
         }
         PrivateOrderConfirmationStatus::Rejected | PrivateOrderConfirmationStatus::Expired => {
+            let has_fills = !confirmation.fills.is_empty();
+            if has_fills {
+                push_private_fills(plan, generated_at, index, leg, confirmation, aggregate)?;
+                aggregate.any_partial = true;
+            }
             aggregate.any_failure = true;
             aggregate.failures.push(render_failure(
                 plan,
                 index,
                 Some(leg.plan_leg_id.as_str()),
-                FailureMode::RetryableFailure,
+                if has_fills {
+                    FailureMode::PartialFill
+                } else {
+                    FailureMode::RetryableFailure
+                },
                 ExecutionFailureSeverity::RiskCritical,
                 confirmation.detail.as_deref().unwrap_or_else(|| {
-                    if confirmation.status == PrivateOrderConfirmationStatus::Rejected {
+                    if has_fills {
+                        "私有确认显示订单已进入拒绝或过期终态，但包含成交明细；必须按部分成交处理并人工对账。"
+                    } else if confirmation.status == PrivateOrderConfirmationStatus::Rejected {
                         "私有确认显示订单被场所拒绝。"
                     } else {
                         "私有确认显示订单已过期。"
@@ -2954,7 +2965,11 @@ fn apply_private_confirmation(
             ));
             aggregate.leg_reports.push(render_leg_report(
                 leg.plan_leg_id.as_str(),
-                LegReportStatus::Failed,
+                if has_fills {
+                    LegReportStatus::PartiallyFilled
+                } else {
+                    LegReportStatus::Failed
+                },
                 &refs,
             ));
         }
@@ -5006,6 +5021,48 @@ mod tests {
                     .as_deref()
                     .is_some_and(|detail| detail.contains("手续费明细不完整"))
         }));
+    }
+
+    #[test]
+    fn private_terminal_rejected_with_fill_is_reported_as_partial_fill() {
+        let plan = pending_manual_plan().plan_preview;
+        let order_leg = &plan.legs[1];
+        let confirmation = PrivateOrderConfirmation::new(
+            order_leg.plan_leg_id.as_str(),
+            PrivateOrderConfirmationStatus::Rejected,
+            PrivateOrderConfirmationSource::OrderQuery,
+            "event:venue:query:rejected-with-fill",
+        )
+        .with_fill(
+            PrivateExecutionFill::new(
+                FillSide::Buy,
+                "43100.50",
+                "0.001",
+                "asset:USDC",
+                "0.01",
+                "event:venue:query:rejected-with-fill",
+            )
+            .with_timestamp("2026-01-01T00:00:05Z"),
+        );
+
+        let report = execution_report_from_private_confirmations(PrivateExecutionReportInput::new(
+            &plan,
+            "2026-01-01T00:00:06Z",
+            std::slice::from_ref(&confirmation),
+        ))
+        .expect("terminal rejected fill report");
+
+        assert_eq!(report.status, ExecutionReportStatus::PartiallySucceeded);
+        assert_eq!(report.reconciliation_status, ReconciliationStatus::Pending);
+        assert_eq!(report.fills.len(), 1);
+        assert_eq!(
+            report.leg_reports[1].status,
+            LegReportStatus::PartiallyFilled
+        );
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.failure_type == FailureMode::PartialFill));
     }
 
     #[test]

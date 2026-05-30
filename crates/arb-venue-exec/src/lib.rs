@@ -2222,10 +2222,7 @@ fn parse_hyperliquid_private_order_fields(
     let side = json_field_value(body, "side")
         .map(|side| hyperliquid_private_side(&side))
         .transpose()?;
-    let cumulative_filled_quantity = json_field_value(body, "origSz")
-        .filter(|_| status == OrderConfirmationStatus::Filled)
-        .map(|value| parse_quantity("cumulative_filled_quantity", &value))
-        .transpose()?;
+    let cumulative_filled_quantity = hyperliquid_cumulative_filled_quantity(body, status)?;
     let runtime_symbol = hyperliquid_runtime_symbol_from_coin(&coin);
     let instrument_id = InstrumentId::new(format!("inst:HYPERLIQUID:{runtime_symbol}:PERP"))
         .map_err(domain_invalid_request)?;
@@ -2256,6 +2253,44 @@ fn hyperliquid_runtime_symbol_from_coin(coin: &str) -> String {
     } else {
         format!("{coin}USDT")
     }
+}
+
+fn hyperliquid_cumulative_filled_quantity(
+    body: &str,
+    status: OrderConfirmationStatus,
+) -> VenueExecResult<Option<Quantity>> {
+    if status == OrderConfirmationStatus::Filled {
+        return json_field_value(body, "origSz")
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_quantity("cumulative_filled_quantity", &value))
+            .transpose();
+    }
+    if !matches!(
+        status,
+        OrderConfirmationStatus::Cancelled
+            | OrderConfirmationStatus::Rejected
+            | OrderConfirmationStatus::Expired
+    ) {
+        return Ok(None);
+    }
+    let Some(original) = json_field_value(body, "origSz").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(open) = json_field_value(body, "sz").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let original = parse_quantity("original_quantity", &original)?;
+    let open = parse_quantity("open_quantity", &open)?;
+    if original <= open {
+        return Ok(None);
+    }
+    let filled = original
+        .as_decimal()
+        .checked_sub(open.as_decimal())
+        .map_err(domain_invalid_request)?;
+    Quantity::new(filled)
+        .map(Some)
+        .map_err(domain_invalid_request)
 }
 
 fn parse_bybit_private_order_fields(
@@ -12634,6 +12669,30 @@ mod tests {
                 .expect("cumulative quantity")
                 .to_string(),
             "0.001"
+        );
+        assert!(update.last_fill.is_none());
+    }
+
+    #[test]
+    fn hyperliquid_order_status_preserves_terminal_partial_fill_quantity() {
+        let update = parse_hyperliquid_order_query_confirmation(
+            venue("venue:HYPERLIQUID-PERP"),
+            account("account:hyperliquid-unit"),
+            "event:hyperliquid:perp:query:canceled-partial",
+            r#"{"status":"order","order":{"order":{"coin":"BTC","side":"A","limitPx":"43100.50","sz":"0.0004","oid":77747315,"timestamp":1700000001000,"reduceOnly":false,"orderType":"Limit","origSz":"0.001","tif":"Ioc","cloid":"0x1234567890abcdef1234567890abcdea"},"status":"canceled","statusTimestamp":1700000001500}}"#,
+        )
+        .expect("Hyperliquid terminal partial fill confirmation");
+
+        assert_eq!(update.source, OrderConfirmationSource::OrderQuery);
+        assert_eq!(update.market, PrivateOrderMarket::HyperliquidPerp);
+        assert_eq!(update.status, OrderConfirmationStatus::Cancelled);
+        assert_eq!(update.side, Some(OrderSide::Sell));
+        assert_eq!(
+            update
+                .cumulative_filled_quantity
+                .expect("terminal partial fill quantity")
+                .to_string(),
+            "0.0006"
         );
         assert!(update.last_fill.is_none());
     }
