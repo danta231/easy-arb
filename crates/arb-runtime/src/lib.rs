@@ -218,7 +218,8 @@ use monitors::wss::bybit_public_market_category;
 use monitors::wss::*;
 use monitors::wss::{
     decode_json_scalar_string, is_binance_wss_all_symbols_scope, is_bybit_wss_all_symbols_scope,
-    normalize_aster_wss_symbol_scope, normalize_bitget_wss_symbol_scope,
+    normalize_aster_wss_symbol_scope, normalize_binance_wss_symbol_scope,
+    normalize_bitget_wss_symbol_scope, normalize_bybit_wss_symbol_scope,
     normalize_hyperliquid_wss_symbol_scope, normalize_okx_wss_symbol_scope,
     parse_aster_public_wss_market, parse_binance_public_wss_market, parse_bitget_public_wss_market,
     parse_bybit_public_wss_market, parse_hyperliquid_public_wss_market,
@@ -1779,6 +1780,61 @@ impl Default for FundingArbMonitorOptions {
 pub struct FundingArbVenueSource {
     pub venue_family: String,
     pub status_url: String,
+}
+
+/// live WSS 订阅 symbol 自动解析器输出格式。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveWssSymbolResolverOutputFormat {
+    Shell,
+    Json,
+}
+
+impl Default for LiveWssSymbolResolverOutputFormat {
+    fn default() -> Self {
+        Self::Shell
+    }
+}
+
+/// live WSS 订阅 symbol 自动解析器选项。
+///
+/// 中文说明：该解析器只读取交易所公开行情/元数据接口，不读取账户、不下单、不撤单、
+/// 不转账、不签名。它按策略需要生成各交易所 WSS monitor 的显式 symbol 列表。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveWssSymbolResolverOptions {
+    pub strategies: String,
+    pub monitors: String,
+    pub output_format: LiveWssSymbolResolverOutputFormat,
+}
+
+impl Default for LiveWssSymbolResolverOptions {
+    fn default() -> Self {
+        Self {
+            strategies: "cross-exchange-funding-arb".to_owned(),
+            monitors: "binance bybit okx bitget aster hyperliquid".to_owned(),
+            output_format: LiveWssSymbolResolverOutputFormat::Shell,
+        }
+    }
+}
+
+/// live WSS 订阅 symbol 自动解析结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveWssSymbolScopeReport {
+    pub strategies: Vec<String>,
+    pub monitors: Vec<String>,
+    pub spot_perp_basis_enabled: bool,
+    pub funding_arb_enabled: bool,
+    pub binance_spot: String,
+    pub binance_perp: String,
+    pub bybit_spot: String,
+    pub bybit_perp: String,
+    pub okx_spot: String,
+    pub okx_perp: String,
+    pub bitget_spot: String,
+    pub bitget_perp: String,
+    pub aster_perp: String,
+    pub hyperliquid_perp: String,
+    pub spot_perp_symbol_count: usize,
+    pub funding_arb_base_count: usize,
 }
 
 /// funding arb observer 候选的单次 guarded dry-run 选项。
@@ -18223,6 +18279,617 @@ fn funding_arb_market_from_top_of_book(
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LiveWssVenueSymbolCatalog {
+    venue_family: String,
+    spot_by_base: BTreeMap<String, String>,
+    perp_by_base: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LiveWssSymbolScopeSets {
+    binance_spot: BTreeSet<String>,
+    binance_perp: BTreeSet<String>,
+    bybit_spot: BTreeSet<String>,
+    bybit_perp: BTreeSet<String>,
+    okx_spot: BTreeSet<String>,
+    okx_perp: BTreeSet<String>,
+    bitget_spot: BTreeSet<String>,
+    bitget_perp: BTreeSet<String>,
+    aster_perp: BTreeSet<String>,
+    hyperliquid_perp: BTreeSet<String>,
+}
+
+pub fn run_live_wss_symbol_resolver(
+    options: LiveWssSymbolResolverOptions,
+) -> RuntimeResult<LiveWssSymbolScopeReport> {
+    let strategies = parse_live_wss_strategy_list(&options.strategies)?;
+    let monitors = parse_live_wss_monitor_list(&options.monitors)?;
+    let spot_perp_basis_enabled = strategies.iter().any(|item| item == "spot-perp-basis");
+    let funding_arb_enabled = strategies
+        .iter()
+        .any(|item| item == "cross-exchange-funding-arb");
+    if !spot_perp_basis_enabled && !funding_arb_enabled {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "live WSS symbol resolver has no supported strategy in `{}`",
+                options.strategies
+            ),
+        });
+    }
+
+    let needs_spot = spot_perp_basis_enabled;
+    let mut catalogs = Vec::new();
+    let mut errors = Vec::new();
+    for venue in &monitors {
+        match fetch_live_wss_venue_symbol_catalog(venue, needs_spot) {
+            Ok(catalog) => catalogs.push(catalog),
+            Err(error) => errors.push(format!("{venue}: {error}")),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "live WSS symbol resolver failed to fetch public venue metadata: {}",
+                errors.join("; ")
+            ),
+        });
+    }
+
+    live_wss_symbol_scope_report_from_catalogs(
+        strategies,
+        monitors,
+        spot_perp_basis_enabled,
+        funding_arb_enabled,
+        &catalogs,
+    )
+}
+
+pub fn format_live_wss_symbol_scope_report(
+    report: &LiveWssSymbolScopeReport,
+    output_format: LiveWssSymbolResolverOutputFormat,
+) -> String {
+    match output_format {
+        LiveWssSymbolResolverOutputFormat::Shell => {
+            live_wss_symbol_scope_report_shell_assignments(report)
+        }
+        LiveWssSymbolResolverOutputFormat::Json => live_wss_symbol_scope_report_json(report),
+    }
+}
+
+fn live_wss_symbol_scope_report_from_catalogs(
+    strategies: Vec<String>,
+    monitors: Vec<String>,
+    spot_perp_basis_enabled: bool,
+    funding_arb_enabled: bool,
+    catalogs: &[LiveWssVenueSymbolCatalog],
+) -> RuntimeResult<LiveWssSymbolScopeReport> {
+    let mut scope_sets = LiveWssSymbolScopeSets::default();
+    let mut spot_perp_symbol_count = 0_usize;
+    if spot_perp_basis_enabled {
+        for catalog in catalogs {
+            for (base, spot_symbol) in &catalog.spot_by_base {
+                let Some(perp_symbol) = catalog.perp_by_base.get(base) else {
+                    continue;
+                };
+                spot_perp_symbol_count += 1;
+                scope_sets.insert_spot(&catalog.venue_family, spot_symbol);
+                scope_sets.insert_perp(&catalog.venue_family, perp_symbol);
+            }
+        }
+    }
+
+    let mut funding_arb_base_count = 0_usize;
+    if funding_arb_enabled {
+        let eligible_bases = live_wss_funding_arb_eligible_bases(catalogs);
+        funding_arb_base_count = eligible_bases.len();
+        for catalog in catalogs {
+            for (base, perp_symbol) in &catalog.perp_by_base {
+                if eligible_bases.contains(base) {
+                    scope_sets.insert_perp(&catalog.venue_family, perp_symbol);
+                }
+            }
+        }
+    }
+
+    if spot_perp_basis_enabled && spot_perp_symbol_count == 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: "live WSS symbol resolver found no spot/perp intersection symbols".to_owned(),
+        });
+    }
+    if funding_arb_enabled && funding_arb_base_count == 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: "live WSS symbol resolver found no perp symbols shared by two or more venues"
+                .to_owned(),
+        });
+    }
+
+    live_wss_symbol_scope_report_from_sets(
+        strategies,
+        monitors,
+        spot_perp_basis_enabled,
+        funding_arb_enabled,
+        scope_sets,
+        spot_perp_symbol_count,
+        funding_arb_base_count,
+    )
+}
+
+fn live_wss_symbol_scope_report_from_sets(
+    strategies: Vec<String>,
+    monitors: Vec<String>,
+    spot_perp_basis_enabled: bool,
+    funding_arb_enabled: bool,
+    scope_sets: LiveWssSymbolScopeSets,
+    spot_perp_symbol_count: usize,
+    funding_arb_base_count: usize,
+) -> RuntimeResult<LiveWssSymbolScopeReport> {
+    Ok(LiveWssSymbolScopeReport {
+        strategies,
+        monitors,
+        spot_perp_basis_enabled,
+        funding_arb_enabled,
+        binance_spot: live_wss_scope_from_set(
+            &scope_sets.binance_spot,
+            normalize_binance_wss_symbol_scope,
+        )?,
+        binance_perp: live_wss_scope_from_set(
+            &scope_sets.binance_perp,
+            normalize_binance_wss_symbol_scope,
+        )?,
+        bybit_spot: live_wss_scope_from_set(
+            &scope_sets.bybit_spot,
+            normalize_bybit_wss_symbol_scope,
+        )?,
+        bybit_perp: live_wss_scope_from_set(
+            &scope_sets.bybit_perp,
+            normalize_bybit_wss_symbol_scope,
+        )?,
+        okx_spot: live_wss_scope_from_set(&scope_sets.okx_spot, normalize_okx_wss_symbol_scope)?,
+        okx_perp: live_wss_scope_from_set(&scope_sets.okx_perp, normalize_okx_wss_symbol_scope)?,
+        bitget_spot: live_wss_scope_from_set(
+            &scope_sets.bitget_spot,
+            normalize_bitget_wss_symbol_scope,
+        )?,
+        bitget_perp: live_wss_scope_from_set(
+            &scope_sets.bitget_perp,
+            normalize_bitget_wss_symbol_scope,
+        )?,
+        aster_perp: live_wss_scope_from_set(
+            &scope_sets.aster_perp,
+            normalize_aster_wss_symbol_scope,
+        )?,
+        hyperliquid_perp: live_wss_scope_from_set(
+            &scope_sets.hyperliquid_perp,
+            normalize_hyperliquid_wss_symbol_scope,
+        )?,
+        spot_perp_symbol_count,
+        funding_arb_base_count,
+    })
+}
+
+fn live_wss_funding_arb_eligible_bases(catalogs: &[LiveWssVenueSymbolCatalog]) -> BTreeSet<String> {
+    let mut venues_by_base = BTreeMap::<String, BTreeSet<String>>::new();
+    for catalog in catalogs {
+        for base in catalog.perp_by_base.keys() {
+            venues_by_base
+                .entry(base.clone())
+                .or_default()
+                .insert(catalog.venue_family.clone());
+        }
+    }
+    venues_by_base
+        .into_iter()
+        .filter_map(|(base, venues)| (venues.len() >= 2).then_some(base))
+        .collect()
+}
+
+impl LiveWssSymbolScopeSets {
+    fn insert_spot(&mut self, venue_family: &str, symbol: &str) {
+        match normalize_venue_family(venue_family).as_str() {
+            "binance" => {
+                self.binance_spot.insert(symbol.to_owned());
+            }
+            "bybit" => {
+                self.bybit_spot.insert(symbol.to_owned());
+            }
+            "okx" => {
+                self.okx_spot.insert(symbol.to_owned());
+            }
+            "bitget" => {
+                self.bitget_spot.insert(symbol.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    fn insert_perp(&mut self, venue_family: &str, symbol: &str) {
+        match normalize_venue_family(venue_family).as_str() {
+            "binance" => {
+                self.binance_perp.insert(symbol.to_owned());
+            }
+            "bybit" => {
+                self.bybit_perp.insert(symbol.to_owned());
+            }
+            "okx" => {
+                self.okx_perp.insert(symbol.to_owned());
+            }
+            "bitget" => {
+                self.bitget_perp.insert(symbol.to_owned());
+            }
+            "aster" => {
+                self.aster_perp.insert(symbol.to_owned());
+            }
+            "hyperliquid" => {
+                self.hyperliquid_perp.insert(symbol.to_owned());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn fetch_live_wss_venue_symbol_catalog(
+    venue_family: &str,
+    needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    match normalize_venue_family(venue_family).as_str() {
+        "binance" => fetch_binance_live_wss_symbol_catalog(needs_spot),
+        "bybit" => fetch_bybit_live_wss_symbol_catalog(needs_spot),
+        "okx" => fetch_okx_live_wss_symbol_catalog(needs_spot),
+        "bitget" => fetch_bitget_live_wss_symbol_catalog(needs_spot),
+        "aster" => fetch_aster_live_wss_symbol_catalog(needs_spot),
+        "hyperliquid" => fetch_hyperliquid_live_wss_symbol_catalog(needs_spot),
+        other => Err(RuntimeError::LiveMarketData {
+            message: format!("unsupported live WSS symbol resolver venue `{other}`"),
+        }),
+    }
+}
+
+fn fetch_binance_live_wss_symbol_catalog(
+    needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let spot_by_base = if needs_spot {
+        live_wss_book_ticker_symbols_by_base(
+            "binance",
+            parse_book_ticker_rows(
+                &fetch_public_json_with_curl(&binance_spot_book_ticker_all_url())?,
+                "binance spot bookTicker",
+            )?
+            .into_iter()
+            .map(|row| row.symbol),
+        )
+    } else {
+        BTreeMap::new()
+    };
+    let perp_by_base = live_wss_book_ticker_symbols_by_base(
+        "binance",
+        parse_book_ticker_rows(
+            &fetch_public_json_with_curl(&binance_usdm_book_ticker_all_url())?,
+            "binance usdm bookTicker",
+        )?
+        .into_iter()
+        .map(|row| row.symbol),
+    );
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "binance".to_owned(),
+        spot_by_base,
+        perp_by_base,
+    })
+}
+
+fn fetch_bybit_live_wss_symbol_catalog(
+    needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let spot_by_base = if needs_spot {
+        live_wss_book_ticker_symbols_by_base(
+            "bybit",
+            parse_bybit_spot_ticker_rows(&fetch_public_json_with_curl(&bybit_spot_tickers_url())?)?
+                .into_iter()
+                .map(|row| row.symbol),
+        )
+    } else {
+        BTreeMap::new()
+    };
+    let instrument_pages = fetch_bybit_linear_instrument_pages()?;
+    let instrument_metadata = parse_bybit_linear_perpetual_instrument_metadata(&instrument_pages)?;
+    let linear_ticker_symbols =
+        parse_bybit_linear_ticker_rows(&fetch_public_json_with_curl(&bybit_linear_tickers_url())?)?
+            .into_iter()
+            .map(|row| row.symbol)
+            .collect::<BTreeSet<_>>();
+    let perp_by_base = live_wss_book_ticker_symbols_by_base(
+        "bybit",
+        instrument_metadata
+            .symbols
+            .into_iter()
+            .filter(|symbol| linear_ticker_symbols.contains(symbol)),
+    );
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "bybit".to_owned(),
+        spot_by_base,
+        perp_by_base,
+    })
+}
+
+fn fetch_okx_live_wss_symbol_catalog(needs_spot: bool) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let spot_by_base = if needs_spot {
+        live_wss_okx_symbols_by_base(
+            parse_okx_ticker_rows(
+                &fetch_public_json_with_curl(&okx_tickers_url("SPOT"))?,
+                "okx spot tickers",
+            )?
+            .into_iter()
+            .map(|row| row.inst_id),
+        )
+    } else {
+        BTreeMap::new()
+    };
+    let perp_by_base = live_wss_okx_symbols_by_base(
+        parse_okx_ticker_rows(
+            &fetch_public_json_with_curl(&okx_tickers_url("SWAP"))?,
+            "okx swap tickers",
+        )?
+        .into_iter()
+        .filter_map(|row| okx_spot_inst_id_from_swap(&row.inst_id)),
+    );
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "okx".to_owned(),
+        spot_by_base,
+        perp_by_base,
+    })
+}
+
+fn fetch_bitget_live_wss_symbol_catalog(
+    needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let spot_by_base = if needs_spot {
+        live_wss_book_ticker_symbols_by_base(
+            "bitget",
+            parse_bitget_spot_ticker_rows(&fetch_public_json_with_curl(
+                &bitget_spot_tickers_url(),
+            )?)?
+            .into_iter()
+            .map(|row| row.symbol),
+        )
+    } else {
+        BTreeMap::new()
+    };
+    let perp_by_base = live_wss_book_ticker_symbols_by_base(
+        "bitget",
+        parse_bitget_usdt_futures_ticker_rows(&fetch_public_json_with_curl(
+            &bitget_usdt_futures_tickers_url(),
+        )?)?
+        .into_iter()
+        .map(|row| row.symbol),
+    );
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "bitget".to_owned(),
+        spot_by_base,
+        perp_by_base,
+    })
+}
+
+fn fetch_aster_live_wss_symbol_catalog(
+    needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let spot_by_base = if needs_spot && aster_spot_perp_spot_scan_enabled()? {
+        live_wss_book_ticker_symbols_by_base(
+            "aster",
+            parse_book_ticker_rows(
+                &fetch_public_json_with_curl(&aster_spot_book_ticker_all_url())?,
+                "aster spot bookTicker",
+            )?
+            .into_iter()
+            .map(|row| row.symbol),
+        )
+    } else {
+        BTreeMap::new()
+    };
+    let perp_by_base = live_wss_book_ticker_symbols_by_base(
+        "aster",
+        parse_book_ticker_rows(
+            &fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?,
+            "aster futures bookTicker",
+        )?
+        .into_iter()
+        .map(|row| row.symbol)
+        .filter(|symbol| !symbol.starts_with("TEST")),
+    );
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "aster".to_owned(),
+        spot_by_base,
+        perp_by_base,
+    })
+}
+
+fn fetch_hyperliquid_live_wss_symbol_catalog(
+    needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let spot_by_base = if needs_spot && hyperliquid_spot_perp_spot_scan_enabled()? {
+        parse_hyperliquid_spot_context_rows(&fetch_public_json_post_with_curl(
+            HYPERLIQUID_INFO_URL,
+            &hyperliquid_info_request_body("spotMetaAndAssetCtxs"),
+        )?)?
+        .into_iter()
+        .map(|row| (funding_base_asset_from_symbol(&row.coin), row.coin))
+        .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let perp_by_base = parse_hyperliquid_perp_context_rows(&fetch_public_json_post_with_curl(
+        HYPERLIQUID_INFO_URL,
+        &hyperliquid_info_request_body("metaAndAssetCtxs"),
+    )?)?
+    .into_iter()
+    .filter(|row| !row.funding_rate.trim().is_empty())
+    .map(|row| (funding_base_asset_from_symbol(&row.coin), row.coin))
+    .collect();
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "hyperliquid".to_owned(),
+        spot_by_base,
+        perp_by_base,
+    })
+}
+
+fn live_wss_book_ticker_symbols_by_base<I>(
+    venue_family: &str,
+    symbols: I,
+) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut by_base = BTreeMap::new();
+    for symbol in symbols {
+        if !symbol.ends_with("USDT") {
+            continue;
+        }
+        if funding_arb_exchange_native_symbol_rejection(venue_family, &symbol).is_some() {
+            continue;
+        }
+        by_base
+            .entry(funding_base_asset_from_symbol(&symbol))
+            .or_insert(symbol);
+    }
+    by_base
+}
+
+fn live_wss_okx_symbols_by_base<I>(symbols: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut by_base = BTreeMap::new();
+    for symbol in symbols {
+        if funding_arb_exchange_native_symbol_rejection("okx", &symbol).is_some() {
+            continue;
+        }
+        by_base
+            .entry(funding_base_asset_from_symbol(&symbol))
+            .or_insert(symbol);
+    }
+    by_base
+}
+
+fn live_wss_scope_from_set<F>(symbols: &BTreeSet<String>, normalize: F) -> RuntimeResult<String>
+where
+    F: Fn(&str) -> RuntimeResult<String>,
+{
+    if symbols.is_empty() {
+        return Ok(String::new());
+    }
+    normalize(&symbols.iter().cloned().collect::<Vec<_>>().join(","))
+}
+
+fn parse_live_wss_strategy_list(value: &str) -> RuntimeResult<Vec<String>> {
+    let mut strategies = BTreeSet::new();
+    for item in live_wss_split_list(value) {
+        let normalized = match item.as_str() {
+            "funding-arb" | "cross-exchange-funding-arb" => "cross-exchange-funding-arb",
+            "spot-perp" | "spot-perp-basis" => "spot-perp-basis",
+            other => {
+                return Err(cli_arg_error(format!(
+                    "unsupported live WSS resolver strategy `{other}`"
+                )));
+            }
+        };
+        strategies.insert(normalized.to_owned());
+    }
+    if strategies.is_empty() {
+        return Err(cli_arg_error(
+            "live WSS resolver --strategies must contain at least one strategy",
+        ));
+    }
+    Ok(strategies.into_iter().collect())
+}
+
+fn parse_live_wss_monitor_list(value: &str) -> RuntimeResult<Vec<String>> {
+    let mut monitors = BTreeSet::new();
+    for item in live_wss_split_list(value) {
+        let venue = normalize_venue_family(&item);
+        match venue.as_str() {
+            "binance" | "bybit" | "okx" | "bitget" | "aster" | "hyperliquid" => {
+                monitors.insert(venue);
+            }
+            other => {
+                return Err(cli_arg_error(format!(
+                    "unsupported live WSS resolver monitor `{other}`"
+                )));
+            }
+        }
+    }
+    if monitors.is_empty() {
+        return Err(cli_arg_error(
+            "live WSS resolver --monitors must contain at least one venue",
+        ));
+    }
+    Ok(monitors.into_iter().collect())
+}
+
+fn live_wss_split_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_ascii_lowercase())
+        .collect()
+}
+
+fn live_wss_symbol_scope_report_shell_assignments(report: &LiveWssSymbolScopeReport) -> String {
+    vec![
+        ("BINANCE_SPOT_WSS_SYMBOL", report.binance_spot.clone()),
+        ("BINANCE_PERP_WSS_SYMBOL", report.binance_perp.clone()),
+        ("BYBIT_SPOT_WSS_SYMBOL", report.bybit_spot.clone()),
+        ("BYBIT_PERP_WSS_SYMBOL", report.bybit_perp.clone()),
+        ("OKX_SPOT_WSS_SYMBOL", report.okx_spot.clone()),
+        ("OKX_PERP_WSS_SYMBOL", report.okx_perp.clone()),
+        ("BITGET_SPOT_WSS_SYMBOL", report.bitget_spot.clone()),
+        ("BITGET_PERP_WSS_SYMBOL", report.bitget_perp.clone()),
+        ("ASTER_WSS_SYMBOL", report.aster_perp.clone()),
+        ("HYPERLIQUID_WSS_SYMBOL", report.hyperliquid_perp.clone()),
+        ("BINANCE_WSS_SYMBOL", report.binance_perp.clone()),
+        ("BYBIT_WSS_SYMBOL", report.bybit_perp.clone()),
+        ("OKX_WSS_SYMBOL", report.okx_perp.clone()),
+        ("BITGET_WSS_SYMBOL", report.bitget_perp.clone()),
+        (
+            "LIVE_WSS_RESOLVER_SPOT_PERP_SYMBOL_COUNT",
+            report.spot_perp_symbol_count.to_string(),
+        ),
+        (
+            "LIVE_WSS_RESOLVER_FUNDING_ARB_BASE_COUNT",
+            report.funding_arb_base_count.to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{key}={}", shell_single_quote(&value)))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn live_wss_symbol_scope_report_json(report: &LiveWssSymbolScopeReport) -> String {
+    format!(
+        "{{\"status\":\"ok\",\"mutable_execution_started\":false,\"strategies\":{},\"monitors\":{},\"spot_perp_basis_enabled\":{},\"funding_arb_enabled\":{},\"spot_perp_symbol_count\":{},\"funding_arb_base_count\":{},\"scopes\":{{\"binance_spot\":{},\"binance_perp\":{},\"bybit_spot\":{},\"bybit_perp\":{},\"okx_spot\":{},\"okx_perp\":{},\"bitget_spot\":{},\"bitget_perp\":{},\"aster_perp\":{},\"hyperliquid_perp\":{}}}}}",
+        json_string_array(&report.strategies),
+        json_string_array(&report.monitors),
+        report.spot_perp_basis_enabled,
+        report.funding_arb_enabled,
+        report.spot_perp_symbol_count,
+        report.funding_arb_base_count,
+        json_string(&report.binance_spot),
+        json_string(&report.binance_perp),
+        json_string(&report.bybit_spot),
+        json_string(&report.bybit_perp),
+        json_string(&report.okx_spot),
+        json_string(&report.okx_perp),
+        json_string(&report.bitget_spot),
+        json_string(&report.bitget_perp),
+        json_string(&report.aster_perp),
+        json_string(&report.hyperliquid_perp)
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn parse_funding_arb_basis_status_snapshot(
     input: &str,
     source: &FundingArbVenueSource,
@@ -28442,6 +29109,8 @@ struct FundingArbResidentPosition {
     symbol: String,
     notional_usdt: String,
     status: String,
+    opened_at: Option<String>,
+    closed_at: Option<String>,
 }
 
 #[cfg(feature = "live-exec")]
@@ -28465,6 +29134,8 @@ struct FundingArbUnknownPositionRecovery {
     symbol: String,
     cycle_dir: PathBuf,
     notional_usdt: String,
+    opened_at: Option<String>,
+    closed_at: Option<String>,
 }
 
 #[cfg(feature = "live-exec")]
@@ -29827,11 +30498,20 @@ fn load_funding_arb_resident_position_registry(
                     "position_state_path",
                     "funding arb resident registry",
                 )?;
+                let position_state_path = PathBuf::from(position_state_path);
+                let opened_at = optional_json_value_string(
+                    &fields,
+                    "opened_at",
+                    "funding arb resident registry",
+                )?
+                .or_else(|| {
+                    funding_arb_registry_position_state_opened_at(output_root, &position_state_path)
+                });
                 registry.positions.insert(
                     position_id.clone(),
                     FundingArbResidentPosition {
                         position_id,
-                        position_state_path: PathBuf::from(position_state_path),
+                        position_state_path,
                         pair_id: required_json_value_string(
                             &fields,
                             "pair_id",
@@ -29848,12 +30528,19 @@ fn load_funding_arb_resident_position_registry(
                             "funding arb resident registry",
                         )?,
                         status: "open".to_owned(),
+                        opened_at,
+                        closed_at: optional_json_value_string(
+                            &fields,
+                            "closed_at",
+                            "funding arb resident registry",
+                        )?,
                     },
                 );
             }
             "position_closed" => {
                 if let Some(position) = registry.positions.get_mut(&position_id) {
                     position.status = "closed".to_owned();
+                    funding_arb_update_resident_position_from_registry_fields(position, &fields)?;
                 }
             }
             "position_flat_cancelled" => {
@@ -29879,12 +30566,23 @@ fn load_funding_arb_resident_position_registry(
                         )?
                         .unwrap_or_else(|| "0".to_owned()),
                         status: "flat_cancelled".to_owned(),
+                        opened_at: optional_json_value_string(
+                            &fields,
+                            "opened_at",
+                            "funding arb resident registry",
+                        )?,
+                        closed_at: optional_json_value_string(
+                            &fields,
+                            "closed_at",
+                            "funding arb resident registry",
+                        )?,
                     },
                 );
             }
             "position_unknown" => {
                 if let Some(position) = registry.positions.get_mut(&position_id) {
                     position.status = "unknown".to_owned();
+                    funding_arb_update_resident_position_from_registry_fields(position, &fields)?;
                 } else {
                     let position_state_path = optional_json_value_string(
                         &fields,
@@ -29917,6 +30615,16 @@ fn load_funding_arb_resident_position_registry(
                             )?
                             .unwrap_or_else(|| "unknown".to_owned()),
                             status: "unknown".to_owned(),
+                            opened_at: optional_json_value_string(
+                                &fields,
+                                "opened_at",
+                                "funding arb resident registry",
+                            )?,
+                            closed_at: optional_json_value_string(
+                                &fields,
+                                "closed_at",
+                                "funding arb resident registry",
+                            )?,
                         },
                     );
                 }
@@ -29925,6 +30633,65 @@ fn load_funding_arb_resident_position_registry(
         }
     }
     Ok(registry)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_update_resident_position_from_registry_fields(
+    position: &mut FundingArbResidentPosition,
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<()> {
+    if let Some(pair_id) =
+        optional_json_value_string(fields, "pair_id", "funding arb resident registry")?
+    {
+        position.pair_id = pair_id;
+    }
+    if let Some(symbol) =
+        optional_json_value_string(fields, "symbol", "funding arb resident registry")?
+    {
+        position.symbol = symbol;
+    }
+    if let Some(notional_usdt) =
+        optional_json_value_string(fields, "notional_usdt", "funding arb resident registry")?
+    {
+        position.notional_usdt = notional_usdt;
+    }
+    if let Some(opened_at) =
+        optional_json_value_string(fields, "opened_at", "funding arb resident registry")?
+    {
+        position.opened_at = Some(opened_at);
+    }
+    if let Some(closed_at) =
+        optional_json_value_string(fields, "closed_at", "funding arb resident registry")?
+    {
+        position.closed_at = Some(closed_at);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_registry_position_state_opened_at(
+    output_root: &Path,
+    position_state_path: &Path,
+) -> Option<String> {
+    for path in [
+        position_state_path.to_path_buf(),
+        output_root.join(position_state_path),
+    ] {
+        let Ok(input) = read_utf8(&path) else {
+            continue;
+        };
+        let Ok(fields) = parse_json_object_value_slices(&input) else {
+            continue;
+        };
+        if let Some(opened_at) =
+            optional_json_value_string(&fields, "opened_at", "funding arb position state")
+                .ok()
+                .flatten()
+        {
+            return Some(opened_at);
+        }
+    }
+    None
 }
 
 #[cfg(feature = "live-exec")]
@@ -30188,6 +30955,16 @@ fn funding_arb_flat_cancelled_orphan_recovery_record_from_fields(
         symbol,
         cycle_dir: PathBuf::from(cycle_dir),
         notional_usdt,
+        opened_at: optional_json_value_string(
+            fields,
+            "opened_at",
+            "funding arb flat-cancelled orphan recovery",
+        )?,
+        closed_at: optional_json_value_string(
+            fields,
+            "closed_at",
+            "funding arb flat-cancelled orphan recovery",
+        )?,
     }))
 }
 
@@ -30254,6 +31031,10 @@ fn funding_arb_unknown_recovery_record_with_fallback(
         )?
         .or_else(|| fallback.map(|known| known.notional_usdt.clone()))
         .unwrap_or_else(|| "unknown".to_owned()),
+        opened_at: optional_json_value_string(fields, "opened_at", "funding arb unknown recovery")?
+            .or_else(|| fallback.and_then(|known| known.opened_at.clone())),
+        closed_at: optional_json_value_string(fields, "closed_at", "funding arb unknown recovery")?
+            .or_else(|| fallback.and_then(|known| known.closed_at.clone())),
         position_id,
         cycle_dir,
     })
@@ -30326,8 +31107,9 @@ fn build_funding_arb_unknown_recovery_position_state_template(
             None,
         ),
     )?;
+    let opened_at_value = unknown.opened_at.as_deref().unwrap_or(&snapshot.updated_at);
     let opened_at =
-        UtcTimestamp::from_str(&snapshot.updated_at).map_err(|error| RuntimeError::Module {
+        UtcTimestamp::from_str(opened_at_value).map_err(|error| RuntimeError::Module {
             module: "arb-runtime",
             message: format!("unknown position recovery snapshot updated_at is invalid: {error}"),
         })?;
@@ -30520,7 +31302,7 @@ fn append_funding_arb_resident_position_opened(
     let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
     let position_id = funding_arb_position_id(outcome, cycle);
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":{},\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":null,\"status\":\"open\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":{},\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":null,\"status\":\"open\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         outcome
@@ -30528,6 +31310,7 @@ fn append_funding_arb_resident_position_opened(
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
         json_string(&position_state.notional_usd),
+        json_string(&position_state.opened_at),
         json_string(&outcome.pair_id),
         json_string(&position_id),
         json_string(&position_state_path.display().to_string()),
@@ -30549,7 +31332,7 @@ fn append_funding_arb_resident_entry_position_unknown(
 ) -> RuntimeResult<()> {
     let position_id = funding_arb_position_id(outcome, cycle);
     let line = format!(
-        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_unknown\",\"net_funding_bps\":{},\"notional_usdt\":\"unknown\",\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":{},\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_unknown\",\"net_funding_bps\":{},\"notional_usdt\":\"unknown\",\"opened_at\":null,\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string_array(&outcome.canary.blocking_reasons),
         cycle,
         json_string(&cycle_dir.display().to_string()),
@@ -30578,7 +31361,7 @@ fn append_funding_arb_resident_entry_flat_cancelled(
 ) -> RuntimeResult<()> {
     let position_id = funding_arb_position_id(outcome, cycle);
     let line = format!(
-        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_flat_cancelled\",\"net_funding_bps\":{},\"notional_usdt\":\"0\",\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":\"funding arb entry ended flat after terminal/cancel confirmation or reduce-only protection\",\"residual_risk\":null,\"status\":\"flat_cancelled\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":{},\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_flat_cancelled\",\"net_funding_bps\":{},\"notional_usdt\":\"0\",\"opened_at\":null,\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":\"funding arb entry ended flat after terminal/cancel confirmation or reduce-only protection\",\"residual_risk\":null,\"status\":\"flat_cancelled\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string_array(&outcome.canary.blocking_reasons),
         cycle,
         json_string(&cycle_dir.display().to_string()),
@@ -30604,11 +31387,13 @@ fn append_funding_arb_resident_recovered_position_opened(
     unknown: &FundingArbUnknownPositionRecovery,
     position_state_path: &Path,
 ) -> RuntimeResult<()> {
+    let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":0,\"reason\":\"unknown entry state recovered for reduce-only exit/de-risk\",\"recovered_from_unknown\":true,\"residual_risk\":null,\"source\":\"unknown-position-recovery\",\"status\":\"open\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        "{{\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":0,\"reason\":\"unknown entry state recovered for reduce-only exit/de-risk\",\"recovered_from_unknown\":true,\"residual_risk\":null,\"source\":\"unknown-position-recovery\",\"status\":\"open\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&unknown.notional_usdt),
+        json_string(&position_state.opened_at),
         json_string(&unknown.pair_id),
         json_string(&unknown.position_id),
         json_string(&position_state_path.display().to_string()),
@@ -30628,10 +31413,11 @@ fn append_funding_arb_resident_flat_cancelled_orphan_position_opened(
 ) -> RuntimeResult<()> {
     let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":0,\"reason\":\"flat-cancelled funding arb entry still has non-zero private position; recovered for reduce-only exit/de-risk\",\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"open\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        "{{\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":0,\"reason\":\"flat-cancelled funding arb entry still has non-zero private position; recovered for reduce-only exit/de-risk\",\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"open\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&position_state.notional_usd),
+        json_string(&position_state.opened_at),
         json_string(&candidate.pair_id),
         json_string(&candidate.position_id),
         json_string(&position_state_path.display().to_string()),
@@ -30649,11 +31435,14 @@ fn append_funding_arb_resident_recovered_position_closed(
     unknown: &FundingArbUnknownPositionRecovery,
     reason: &str,
 ) -> RuntimeResult<()> {
+    let closed_at = current_utc_timestamp()?.to_string();
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_unknown\":true,\"residual_risk\":null,\"source\":\"unknown-position-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_unknown\":true,\"residual_risk\":null,\"source\":\"unknown-position-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        json_string(&closed_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&unknown.notional_usdt),
+        optional_json_string(unknown.opened_at.as_deref()),
         json_string(&unknown.pair_id),
         json_string(&unknown.position_id),
         json_string(reason),
@@ -30671,11 +31460,14 @@ fn append_funding_arb_resident_flat_cancelled_orphan_position_closed(
     candidate: &FundingArbUnknownPositionRecovery,
     reason: &str,
 ) -> RuntimeResult<()> {
+    let closed_at = current_utc_timestamp()?.to_string();
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        json_string(&closed_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&candidate.notional_usdt),
+        optional_json_string(candidate.opened_at.as_deref()),
         json_string(&candidate.pair_id),
         json_string(&candidate.position_id),
         json_string(reason),
@@ -30693,12 +31485,15 @@ fn append_funding_arb_resident_position_closed(
     cycle_dir: &Path,
     report: &FundingArbExitCycleReport,
 ) -> RuntimeResult<()> {
+    let closed_at = current_utc_timestamp()?.to_string();
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":{},\"status\":\"closed\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":{},\"status\":\"closed\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        json_string(&closed_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
         json_string(&position.notional_usdt),
+        optional_json_string(position.opened_at.as_deref()),
         json_string(&position.pair_id),
         json_string(&position.position_id),
         json_string(&position.position_state_path.display().to_string()),
@@ -30721,11 +31516,12 @@ fn append_funding_arb_resident_position_unknown(
     reason: &str,
 ) -> RuntimeResult<()> {
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
         json_string(&position.notional_usdt),
+        optional_json_string(position.opened_at.as_deref()),
         json_string(&position.pair_id),
         json_string(&position.position_id),
         json_string(&position.position_state_path.display().to_string()),
@@ -43867,6 +44663,123 @@ mod tests {
         }
     }
 
+    fn live_wss_test_catalog(
+        venue_family: &str,
+        spot: &[(&str, &str)],
+        perp: &[(&str, &str)],
+    ) -> LiveWssVenueSymbolCatalog {
+        LiveWssVenueSymbolCatalog {
+            venue_family: venue_family.to_owned(),
+            spot_by_base: spot
+                .iter()
+                .map(|(base, symbol)| ((*base).to_owned(), (*symbol).to_owned()))
+                .collect(),
+            perp_by_base: perp
+                .iter()
+                .map(|(base, symbol)| ((*base).to_owned(), (*symbol).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn live_wss_symbol_resolver_funding_arb_uses_cross_venue_perp_intersection() {
+        let catalogs = vec![
+            live_wss_test_catalog(
+                "binance",
+                &[],
+                &[("BTC", "BTCUSDT"), ("ETH", "ETHUSDT"), ("SOL", "SOLUSDT")],
+            ),
+            live_wss_test_catalog("bybit", &[], &[("BTC", "BTCUSDT"), ("ETH", "ETHUSDT")]),
+            live_wss_test_catalog("okx", &[], &[("BTC", "BTC-USDT"), ("DOGE", "DOGE-USDT")]),
+            live_wss_test_catalog("hyperliquid", &[], &[("ETH", "ETH"), ("DOGE", "DOGE")]),
+        ];
+
+        let report = live_wss_symbol_scope_report_from_catalogs(
+            vec!["cross-exchange-funding-arb".to_owned()],
+            vec![
+                "binance".to_owned(),
+                "bybit".to_owned(),
+                "okx".to_owned(),
+                "hyperliquid".to_owned(),
+            ],
+            false,
+            true,
+            &catalogs,
+        )
+        .expect("report");
+
+        assert_eq!(report.funding_arb_base_count, 3);
+        assert_eq!(report.spot_perp_symbol_count, 0);
+        assert_eq!(report.binance_spot, "");
+        assert_eq!(report.binance_perp, "BTCUSDT,ETHUSDT");
+        assert_eq!(report.bybit_spot, "");
+        assert_eq!(report.bybit_perp, "BTCUSDT,ETHUSDT");
+        assert_eq!(report.okx_perp, "BTC-USDT,DOGE-USDT");
+        assert_eq!(report.hyperliquid_perp, "DOGE,ETH");
+    }
+
+    #[test]
+    fn live_wss_symbol_resolver_unions_spot_perp_and_funding_scopes() {
+        let catalogs = vec![
+            live_wss_test_catalog(
+                "binance",
+                &[("BTC", "BTCUSDT"), ("XRP", "XRPUSDT")],
+                &[("BTC", "BTCUSDT"), ("ETH", "ETHUSDT")],
+            ),
+            live_wss_test_catalog("bybit", &[("ETH", "ETHUSDT")], &[("ETH", "ETHUSDT")]),
+            live_wss_test_catalog("aster", &[], &[("BTC", "BTCUSDT")]),
+        ];
+
+        let report = live_wss_symbol_scope_report_from_catalogs(
+            vec![
+                "cross-exchange-funding-arb".to_owned(),
+                "spot-perp-basis".to_owned(),
+            ],
+            vec!["binance".to_owned(), "bybit".to_owned(), "aster".to_owned()],
+            true,
+            true,
+            &catalogs,
+        )
+        .expect("report");
+
+        assert_eq!(report.spot_perp_symbol_count, 2);
+        assert_eq!(report.funding_arb_base_count, 2);
+        assert_eq!(report.binance_spot, "BTCUSDT");
+        assert_eq!(report.binance_perp, "BTCUSDT,ETHUSDT");
+        assert_eq!(report.bybit_spot, "ETHUSDT");
+        assert_eq!(report.bybit_perp, "ETHUSDT");
+        assert_eq!(report.aster_perp, "BTCUSDT");
+    }
+
+    #[test]
+    fn live_wss_symbol_resolver_shell_output_uses_empty_scope_for_skipped_spot() {
+        let report = LiveWssSymbolScopeReport {
+            strategies: vec!["cross-exchange-funding-arb".to_owned()],
+            monitors: vec!["binance".to_owned()],
+            spot_perp_basis_enabled: false,
+            funding_arb_enabled: true,
+            binance_spot: String::new(),
+            binance_perp: "BTCUSDT".to_owned(),
+            bybit_spot: String::new(),
+            bybit_perp: String::new(),
+            okx_spot: String::new(),
+            okx_perp: String::new(),
+            bitget_spot: String::new(),
+            bitget_perp: String::new(),
+            aster_perp: String::new(),
+            hyperliquid_perp: String::new(),
+            spot_perp_symbol_count: 0,
+            funding_arb_base_count: 1,
+        };
+
+        let output =
+            format_live_wss_symbol_scope_report(&report, LiveWssSymbolResolverOutputFormat::Shell);
+
+        assert!(output.contains("BINANCE_SPOT_WSS_SYMBOL=''"));
+        assert!(output.contains("BINANCE_PERP_WSS_SYMBOL='BTCUSDT'"));
+        assert!(output.contains("LIVE_WSS_RESOLVER_FUNDING_ARB_BASE_COUNT='1'"));
+    }
+
     #[cfg(feature = "live-exec")]
     fn funding_arb_test_resident_options() -> FundingArbResidentLiveOptions {
         FundingArbResidentLiveOptions {
@@ -46656,6 +47569,10 @@ mod tests {
             .open_close_condition
             .as_deref()
             .is_some_and(|value| value.contains("reduce-only")));
+        assert_eq!(
+            snapshot.positions[0].opened_at.as_deref(),
+            Some("2026-05-19T00:00:03Z")
+        );
     }
 
     #[test]
@@ -46917,6 +47834,7 @@ mod tests {
         assert_eq!(binance.fee.as_deref(), None);
         assert_eq!(binance.fee_rate_bps.as_deref(), Some("5"));
         assert_eq!(binance.open_average_price.as_deref(), Some("0.03659"));
+        assert_eq!(binance.opened_at.as_deref(), Some("2026-05-25T01:41:25Z"));
         assert_eq!(binance.close_average_price.as_deref(), Some("0.03651"));
         assert!(binance.open_close_spread_pct.is_some());
         assert_eq!(
@@ -46945,6 +47863,7 @@ mod tests {
         assert_eq!(bitget.fee.as_deref(), Some("0.05402943"));
         assert_eq!(bitget.settled_funding_usd.as_deref(), Some("0.111"));
         assert_eq!(bitget.open_average_price.as_deref(), Some("0.03665"));
+        assert_eq!(bitget.opened_at, binance.opened_at);
         assert_eq!(bitget.close_average_price.as_deref(), Some("0.03661"));
         assert!(bitget.open_close_spread_pct.is_some());
         assert_eq!(bitget.realtime_funding_rate.as_deref(), Some("-0.00997"));
@@ -50470,12 +51389,14 @@ mod tests {
     fn assert_funding_arb_position_history_line_complete(line: &str) {
         let fields = parse_json_object_value_slices(line).expect("position history line fields");
         for field in [
+            "closed_at",
             "cycle",
             "cycle_dir",
             "decision",
             "event_type",
             "net_funding_bps",
             "notional_usdt",
+            "opened_at",
             "pair_id",
             "position_id",
             "position_state_path",
@@ -50512,6 +51433,8 @@ mod tests {
             symbol: "BTCUSDT".to_owned(),
             notional_usdt: "10.00".to_owned(),
             status: "open".to_owned(),
+            opened_at: Some("2026-05-13T00:00:00Z".to_owned()),
+            closed_at: None,
         };
         let report = FundingArbExitCycleReport {
             pair_id: position.pair_id.clone(),
@@ -50542,6 +51465,8 @@ mod tests {
         assert!(registry.contains("\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\""));
         assert!(registry.contains("\"symbol\":\"BTCUSDT\""));
         assert!(registry.contains("\"notional_usdt\":\"10.00\""));
+        assert!(registry.contains("\"opened_at\":\"2026-05-13T00:00:00Z\""));
+        assert!(registry.contains("\"closed_at\""));
         assert!(registry.contains("\"status\":\"closed\""));
         assert!(registry.contains("\"position_state_path\""));
         assert!(registry.contains("\"private_confirmation_count\":2"));

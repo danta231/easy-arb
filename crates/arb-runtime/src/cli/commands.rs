@@ -454,6 +454,12 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
+    if args[0] == "resolve-live-wss-symbols" {
+        let options = parse_live_wss_symbol_resolver_args(&args[1..])?;
+        let output_format = options.output_format;
+        let report = run_live_wss_symbol_resolver(options)?;
+        return Ok(format_live_wss_symbol_scope_report(&report, output_format));
+    }
     if args[0] == "binance-wss-book-ticker" {
         let options = parse_binance_wss_book_ticker_args(&args[1..])?;
         let once = options.once;

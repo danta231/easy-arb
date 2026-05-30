@@ -2207,6 +2207,56 @@ pub(crate) fn parse_basis_exit_supervisor_args(
     })
 }
 
+pub(crate) fn parse_live_wss_symbol_resolver_args(
+    args: &[String],
+) -> RuntimeResult<LiveWssSymbolResolverOptions> {
+    let mut options = LiveWssSymbolResolverOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--strategies" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--strategies requires a value"));
+                };
+                options.strategies = value.clone();
+            }
+            "--monitors" | "--venues" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--monitors requires a value"));
+                };
+                options.monitors = value.clone();
+            }
+            "--format" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--format requires shell or json"));
+                };
+                options.output_format = match value.trim().to_ascii_lowercase().as_str() {
+                    "shell" | "env" => LiveWssSymbolResolverOutputFormat::Shell,
+                    "json" => LiveWssSymbolResolverOutputFormat::Json,
+                    _ => return Err(cli_arg_error("--format must be shell or json")),
+                };
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown resolve-live-wss-symbols option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected resolve-live-wss-symbols positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(options)
+}
+
 pub(crate) fn parse_binance_wss_book_ticker_args(
     args: &[String],
 ) -> RuntimeResult<BinanceWssBookTickerCliOptions> {

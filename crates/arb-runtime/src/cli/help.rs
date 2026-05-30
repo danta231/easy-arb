@@ -69,6 +69,8 @@ pub(crate) fn legacy_help_text() -> String {
         "                                    Multi-venue resident runner: use guarded entry per venue, enforce risk caps, and halt fail-closed on unknown live state",
         "  multi-venue-basis-live-stack [--venues binance,bybit,okx,bitget] [--config path] [--out dir] [--monitor-symbol ALL_USDT|BTCUSDT[,ETHUSDT]] [--readiness-timeout-secs 60] [--interval-secs 60] [--max-concurrent-positions n --max-total-notional-usdt amount] [--use-existing-monitors] [--execute-live --i-understand-basis-live-orders]",
         "                                    Supervisor: launch managed Binance/Bybit/OKX/Bitget WSS monitors scoped to venue symbols by default; opportunity URLs keep all-market scope unless --monitor-symbol is set",
+        "  resolve-live-wss-symbols [--strategies list] [--monitors list] [--format shell|json]",
+        "                                    Resolve live WSS symbol scopes from public venue spot/perp and cross-venue perp availability; read-only and intended for start-arb-runtime-live.sh auto scope",
         "  binance-wss-book-ticker [--bind 127.0.0.1:8801] [--symbol ALL_USDT|BTCUSDT[,ETHUSDT]] [--market spot|usdm-perp] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Binance public WSS bookTicker scoped/all-market monitor and serve /api/binance-wss-book-ticker/status",
         "  bybit-wss-book-ticker [--bind 127.0.0.1:8802] [--symbol ALL_USDT|BTCUSDT[,ETHUSDT]] [--market spot|linear-perp] [--reconnect-delay-secs 2] [--once --updates 3]",

@@ -93,6 +93,8 @@ pub(crate) struct PortfolioPositionRow {
     pub(crate) realtime_funding_rate: Option<String>,
     pub(crate) realtime_funding_interval_hours: Option<String>,
     pub(crate) funding_settlement_time: Option<String>,
+    pub(crate) opened_at: Option<String>,
+    pub(crate) closed_at: Option<String>,
     pub(crate) open_close_condition: Option<String>,
     pub(crate) position_status: String,
     pub(crate) position_quantity: String,
@@ -136,6 +138,8 @@ pub(crate) struct PortfolioResidentPositionRef {
     pub(crate) net_funding_bps: Option<String>,
     pub(crate) taker_fee_bps: Option<String>,
     pub(crate) position_limit: Option<String>,
+    pub(crate) opened_at: Option<String>,
+    pub(crate) closed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1900,14 +1904,16 @@ pub(crate) fn portfolio_balance_row_json(row: &PortfolioBalanceRow) -> String {
 
 pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String {
     format!(
-        "{{\"account_id\":{},\"accumulated_position\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
+        "{{\"account_id\":{},\"accumulated_position\":{},\"closed_at\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"opened_at\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
         json_string(&row.account_id),
         json_option_string(&row.accumulated_position),
+        json_option_string(&row.closed_at),
         json_option_string(&row.close_average_price),
         json_string(&row.coin),
         json_option_string(&row.fee),
         json_option_string(&row.fee_rate_bps),
         json_option_string(&row.funding_settlement_time),
+        json_option_string(&row.opened_at),
         json_option_string(&row.open_average_price),
         json_option_string(&row.open_close_condition),
         json_option_string(&row.open_close_spread_pct),
@@ -3230,6 +3236,21 @@ pub(crate) fn portfolio_position_row_from_fields(
     )?
     .map(|value| value.trim().to_owned())
     .or_else(|| funding_context.map(|context| context.next_funding_time_ms.clone()));
+    let opened_at = first_json_scalar_string(
+        fields,
+        &[
+            "opened_at",
+            "open_time",
+            "openTime",
+            "created_at",
+            "createdAt",
+            "cTime",
+        ],
+    )?;
+    let closed_at = first_json_scalar_string(
+        fields,
+        &["closed_at", "close_time", "closeTime", "closedAt"],
+    )?;
     let open_close_condition = first_json_scalar_string(
         fields,
         &[
@@ -3299,6 +3320,8 @@ pub(crate) fn portfolio_position_row_from_fields(
         realtime_funding_rate,
         realtime_funding_interval_hours,
         funding_settlement_time,
+        opened_at,
+        closed_at,
         open_close_condition,
         position_status,
         position_quantity,
@@ -3556,6 +3579,8 @@ pub(crate) fn portfolio_resident_position_metadata_rows(
         "entry_net_funding_bps",
         "funding arb position state",
     )?;
+    let opened_at = optional_json_value_string(&fields, "opened_at", "funding arb position state")?
+        .or_else(|| position_ref.opened_at.clone());
     let mut rows = Vec::new();
     for leg in [
         portfolio_funding_arb_leg_display(&fields, "leg_a")?,
@@ -3570,6 +3595,7 @@ pub(crate) fn portfolio_resident_position_metadata_rows(
             &symbol,
             &notional_usd,
             entry_net_funding_bps,
+            opened_at.as_ref(),
             &leg,
         ));
     }
@@ -3582,6 +3608,7 @@ pub(crate) fn portfolio_funding_arb_leg_metadata_row(
     symbol: &str,
     notional_usd: &str,
     entry_net_funding_bps: Option<i128>,
+    opened_at: Option<&String>,
     leg: &PortfolioFundingArbLegDisplay,
 ) -> PortfolioPositionRow {
     let venue_family = normalize_venue_family(&leg.venue_family);
@@ -3603,6 +3630,8 @@ pub(crate) fn portfolio_funding_arb_leg_metadata_row(
         realtime_funding_interval_hours: funding_context
             .map(|context| context.funding_interval_hours.clone()),
         funding_settlement_time: funding_context.map(|context| context.next_funding_time_ms.clone()),
+        opened_at: opened_at.cloned(),
+        closed_at: position_ref.closed_at.clone(),
         open_close_condition: Some(
             "开仓按资金费率价差信号；清仓由 funding-arb resident 在资金费结算完成或仓位失衡时用 reduce-only 订单退出/降风险。"
                 .to_owned(),
@@ -3667,6 +3696,8 @@ pub(crate) fn portfolio_apply_resident_position_metadata(
             &mut row.funding_settlement_time,
             metadata.funding_settlement_time.as_ref(),
         );
+        portfolio_fill_missing_option(&mut row.opened_at, metadata.opened_at.as_ref());
+        portfolio_fill_missing_option(&mut row.closed_at, metadata.closed_at.as_ref());
         portfolio_fill_missing_option(
             &mut row.open_close_condition,
             metadata.open_close_condition.as_ref(),
@@ -3933,6 +3964,16 @@ pub(crate) fn portfolio_resident_position_refs_from_dir(
                         )?,
                         taker_fee_bps: taker_fee_bps.clone(),
                         position_limit: position_limit.clone(),
+                        opened_at: optional_json_value_string(
+                            &fields,
+                            "opened_at",
+                            "resident position registry",
+                        )?,
+                        closed_at: optional_json_value_string(
+                            &fields,
+                            "closed_at",
+                            "resident position registry",
+                        )?,
                     },
                 );
             }
@@ -4051,6 +4092,8 @@ pub(crate) fn portfolio_resident_position_ref_from_registry_fields(
         )?,
         taker_fee_bps: defaults.taker_fee_bps.cloned(),
         position_limit: defaults.position_limit.clone(),
+        opened_at: optional_json_value_string(fields, "opened_at", "resident position registry")?,
+        closed_at: optional_json_value_string(fields, "closed_at", "resident position registry")?,
     }))
 }
 
@@ -4083,6 +4126,16 @@ pub(crate) fn portfolio_update_resident_position_ref_from_fields(
         optional_json_value_string(fields, "net_funding_bps", "resident position registry")?
     {
         position.net_funding_bps = Some(net_funding_bps);
+    }
+    if let Some(opened_at) =
+        optional_json_value_string(fields, "opened_at", "resident position registry")?
+    {
+        position.opened_at = Some(opened_at);
+    }
+    if let Some(closed_at) =
+        optional_json_value_string(fields, "closed_at", "resident position registry")?
+    {
+        position.closed_at = Some(closed_at);
     }
     Ok(())
 }
@@ -4240,6 +4293,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
                 realtime_funding_rate: None,
                 realtime_funding_interval_hours: None,
                 funding_settlement_time: None,
+                opened_at: position_ref.opened_at.clone(),
+                closed_at: position_ref.closed_at.clone(),
                 open_close_condition: Some(
                     "仓位状态文件不可读；已使用 resident registry 降级展示，外部真实状态仍需私有快照或交易所确认。".to_owned(),
                 ),
@@ -4319,6 +4374,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
         funding_context.map(|context| context.funding_interval_hours.clone());
     let funding_settlement_time =
         funding_context.map(|context| context.next_funding_time_ms.clone());
+    let opened_at = optional_json_value_string(&fields, "opened_at", "resident position state")?
+        .or_else(|| position_ref.opened_at.clone());
     Ok(PortfolioPositionRow {
         coin: funding_base_asset_from_symbol(&symbol),
         symbol,
@@ -4335,6 +4392,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
         realtime_funding_rate,
         realtime_funding_interval_hours,
         funding_settlement_time,
+        opened_at,
+        closed_at: position_ref.closed_at.clone(),
         open_close_condition: Some(
             "开仓按 basis 入场信号；清仓由 basis-exit-supervisor 按收敛、止盈、止损和风险信号判断。".to_owned(),
         ),
@@ -4373,6 +4432,8 @@ pub(crate) fn portfolio_terminal_position_row_from_resident_ref(
         realtime_funding_rate: None,
         realtime_funding_interval_hours: None,
         funding_settlement_time: None,
+        opened_at: position_ref.opened_at.clone(),
+        closed_at: position_ref.closed_at.clone(),
         open_close_condition: Some(
             "resident registry 已记录终态；数量按 0 展示，外部真实状态仍以最新私有快照或交易所为准。".to_owned(),
         ),
@@ -4416,6 +4477,8 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
                 realtime_funding_rate: None,
                 realtime_funding_interval_hours: None,
                 funding_settlement_time: None,
+                opened_at: position_ref.opened_at.clone(),
+                closed_at: position_ref.closed_at.clone(),
                 open_close_condition: Some(
                     "资金费率套利仓位状态文件不可读；已使用 resident registry 降级展示，外部真实状态仍需私有快照或交易所确认。".to_owned(),
                 ),
@@ -4474,6 +4537,8 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
     );
     let funding_settlement_time =
         portfolio_funding_arb_settlement_time(funding_contexts, &symbol, &leg_a, &leg_b);
+    let opened_at = optional_json_value_string(&fields, "opened_at", "funding arb position state")?
+        .or_else(|| position_ref.opened_at.clone());
     Ok(PortfolioPositionRow {
         coin: funding_base_asset_from_symbol(&symbol),
         symbol,
@@ -4490,6 +4555,8 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
         realtime_funding_rate,
         realtime_funding_interval_hours,
         funding_settlement_time,
+        opened_at,
+        closed_at: position_ref.closed_at.clone(),
         open_close_condition: Some(
             "开仓按资金费率价差信号；清仓由 funding-arb resident 在资金费结算完成或仓位失衡时用 reduce-only 订单退出/降风险。"
                 .to_owned(),

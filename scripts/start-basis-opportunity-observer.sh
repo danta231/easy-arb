@@ -1545,6 +1545,8 @@ funding_arb_unresolved_unknowns_json() {
             event_type: "position_opened",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null)
@@ -1555,6 +1557,8 @@ funding_arb_unresolved_unknowns_json() {
             event_type: "position_unknown",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null)
@@ -1565,6 +1569,8 @@ funding_arb_unresolved_unknowns_json() {
             event_type: "position_closed",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null)
@@ -1575,6 +1581,8 @@ funding_arb_unresolved_unknowns_json() {
             event_type: "position_flat_cancelled",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null)
@@ -1605,6 +1613,8 @@ funding_arb_open_positions_json() {
             event_type: "position_opened",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null),
@@ -1617,6 +1627,8 @@ funding_arb_open_positions_json() {
             event_type: "position_unknown",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null)
@@ -1627,6 +1639,8 @@ funding_arb_open_positions_json() {
             event_type: "position_closed",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null)
@@ -1637,6 +1651,8 @@ funding_arb_open_positions_json() {
             event_type: "position_flat_cancelled",
             pair_id: ($event.pair_id // null),
             symbol: ($event.symbol // null),
+            opened_at: ($event.opened_at // null),
+            closed_at: ($event.closed_at // null),
             reason: ($event.reason // null),
             residual_risk: ($event.residual_risk // null),
             cycle_dir: ($event.cycle_dir // null)
@@ -1871,16 +1887,22 @@ append_funding_arb_startup_reconciled_position_closed() {
   local symbol="$3"
   local pair_dir="$4"
   local flat_report_path="$5"
+  local opened_at="${6:-}"
   local positions_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_positions.jsonl"
+  local closed_at
+  closed_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
   mkdir -p "${FUNDING_ARB_RESIDENT_OUT_DIR}"
   jq -nc \
+    --arg closed_at "${closed_at}" \
     --arg cycle_dir "${pair_dir}" \
     --arg flat_report_path "${flat_report_path}" \
+    --arg opened_at "${opened_at}" \
     --arg pair_id "${pair_id}" \
     --arg position_id "${position_id}" \
     --arg symbol "${symbol}" \
     '{
+      closed_at: $closed_at,
       cycle: 0,
       cycle_dir: $cycle_dir,
       decision: "flat_private_snapshot",
@@ -1888,6 +1910,7 @@ append_funding_arb_startup_reconciled_position_closed() {
       flat_reconciliation_report: $flat_report_path,
       net_funding_bps: null,
       notional_usdt: "unknown",
+      opened_at: (if $opened_at == "" then null else $opened_at end),
       pair_id: $pair_id,
       position_id: $position_id,
       position_state_path: null,
@@ -1905,6 +1928,7 @@ funding_arb_reconcile_unknowns_with_private_readonly() {
   local position_id
   local pair_id
   local symbol
+  local opened_at
   local safe_pair
   local run_id
   local pair_dir
@@ -1920,7 +1944,7 @@ funding_arb_reconcile_unknowns_with_private_readonly() {
   [[ "${FUNDING_ARB_STARTUP_UNKNOWN_READONLY_RECONCILE}" == "1" ]] || return 1
   [[ "${EXECUTE_LIVE}" == "1" ]] || return 1
 
-  while IFS=$'\t' read -r position_id pair_id symbol; do
+  while IFS=$'\t' read -r position_id pair_id symbol opened_at; do
     [[ -n "${position_id}" && -n "${pair_id}" && -n "${symbol}" ]] || continue
     safe_pair="${pair_id//[^A-Za-z0-9_.-]/_}"
     run_id="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -1952,7 +1976,7 @@ funding_arb_reconcile_unknowns_with_private_readonly() {
     fi
 
     if funding_arb_private_positions_snapshot_confirms_flat "${readonly_dir}/funding_arb_private_position_raw_snapshot.json" "${symbol}" "${flat_report_path}"; then
-      append_funding_arb_startup_reconciled_position_closed "${position_id}" "${pair_id}" "${symbol}" "${pair_dir}" "${flat_report_path}"
+      append_funding_arb_startup_reconciled_position_closed "${position_id}" "${pair_id}" "${symbol}" "${pair_dir}" "${flat_report_path}" "${opened_at}"
       echo "funding_arb_unknown_readonly_reconciled_flat pair_id=${pair_id} position_id=${position_id} report=${flat_report_path}"
       reconciled_count="$((reconciled_count + 1))"
     else
@@ -1969,7 +1993,8 @@ funding_arb_reconcile_unknowns_with_private_readonly() {
       | [
           .key,
           (.value.pair_id // ""),
-          (.value.symbol // "")
+          (.value.symbol // ""),
+          (.value.opened_at // "")
         ]
       | @tsv
     '
