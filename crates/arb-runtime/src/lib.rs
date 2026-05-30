@@ -30405,7 +30405,7 @@ fn append_funding_arb_resident_position_opened(
     let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
     let position_id = funding_arb_position_id(outcome, cycle);
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_opened\",\"net_funding_bps\":{},\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"status\":\"open\",\"symbol\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":{},\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":null,\"status\":\"open\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         outcome
@@ -30417,6 +30417,7 @@ fn append_funding_arb_resident_position_opened(
         json_string(&position_id),
         json_string(&position_state_path.display().to_string()),
         outcome.canary.private_confirmation_count,
+        outcome.canary.submitted_receipt_count,
         json_string(&outcome.symbol),
     );
     append_funding_arb_resident_position_jsonl(output_root, &line)?;
@@ -30433,7 +30434,7 @@ fn append_funding_arb_resident_entry_position_unknown(
 ) -> RuntimeResult<()> {
     let position_id = funding_arb_position_id(outcome, cycle);
     let line = format!(
-        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_unknown\",\"net_funding_bps\":{},\"notional_usdt\":\"unknown\",\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_unknown\",\"net_funding_bps\":{},\"notional_usdt\":\"unknown\",\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string_array(&outcome.canary.blocking_reasons),
         cycle,
         json_string(&cycle_dir.display().to_string()),
@@ -30462,7 +30463,7 @@ fn append_funding_arb_resident_entry_flat_cancelled(
 ) -> RuntimeResult<()> {
     let position_id = funding_arb_position_id(outcome, cycle);
     let line = format!(
-        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"net_funding_bps\":{},\"notional_usdt\":\"0\",\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":{},\"reason\":\"funding arb entry ended flat after terminal/cancel confirmation or reduce-only protection\",\"status\":\"flat_cancelled\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_flat_cancelled\",\"net_funding_bps\":{},\"notional_usdt\":\"0\",\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":\"funding arb entry ended flat after terminal/cancel confirmation or reduce-only protection\",\"residual_risk\":null,\"status\":\"flat_cancelled\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string_array(&outcome.canary.blocking_reasons),
         cycle,
         json_string(&cycle_dir.display().to_string()),
@@ -30489,7 +30490,7 @@ fn append_funding_arb_resident_recovered_position_opened(
     position_state_path: &Path,
 ) -> RuntimeResult<()> {
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_opened\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"reason\":\"unknown entry state recovered for reduce-only exit/de-risk\",\"recovered_from_unknown\":true,\"source\":\"unknown-position-recovery\",\"status\":\"open\",\"symbol\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":0,\"reason\":\"unknown entry state recovered for reduce-only exit/de-risk\",\"recovered_from_unknown\":true,\"residual_risk\":null,\"source\":\"unknown-position-recovery\",\"status\":\"open\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&unknown.notional_usdt),
@@ -30512,7 +30513,7 @@ fn append_funding_arb_resident_flat_cancelled_orphan_position_opened(
 ) -> RuntimeResult<()> {
     let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_opened\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"reason\":\"flat-cancelled funding arb entry still has non-zero private position; recovered for reduce-only exit/de-risk\",\"recovered_from_flat_cancelled\":true,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"open\",\"symbol\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":0,\"reason\":\"flat-cancelled funding arb entry still has non-zero private position; recovered for reduce-only exit/de-risk\",\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"open\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&position_state.notional_usd),
@@ -30534,7 +30535,7 @@ fn append_funding_arb_resident_recovered_position_closed(
     reason: &str,
 ) -> RuntimeResult<()> {
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_unknown\":true,\"source\":\"unknown-position-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_unknown\":true,\"residual_risk\":null,\"source\":\"unknown-position-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&unknown.notional_usdt),
@@ -30556,7 +30557,7 @@ fn append_funding_arb_resident_flat_cancelled_orphan_position_closed(
     reason: &str,
 ) -> RuntimeResult<()> {
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_flat_cancelled\":true,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&candidate.notional_usdt),
@@ -30578,7 +30579,7 @@ fn append_funding_arb_resident_position_closed(
     report: &FundingArbExitCycleReport,
 ) -> RuntimeResult<()> {
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"status\":\"closed\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":{},\"status\":\"closed\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
@@ -30587,6 +30588,7 @@ fn append_funding_arb_resident_position_closed(
         json_string(&position.position_id),
         json_string(&position.position_state_path.display().to_string()),
         report.private_confirmation_count,
+        optional_json_string(report.residual_risk.as_deref()),
         report.submitted_receipt_count,
         json_string(&position.symbol),
     );
@@ -30604,7 +30606,7 @@ fn append_funding_arb_resident_position_unknown(
     reason: &str,
 ) -> RuntimeResult<()> {
     let line = format!(
-        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"symbol\":{}}}",
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",\"net_funding_bps\":null,\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
@@ -30612,8 +30614,10 @@ fn append_funding_arb_resident_position_unknown(
         json_string(&position.pair_id),
         json_string(&position.position_id),
         json_string(&position.position_state_path.display().to_string()),
+        report.private_confirmation_count,
         json_string(reason),
         optional_json_string(report.residual_risk.as_deref()),
+        report.submitted_receipt_count,
         json_string(&position.symbol),
     );
     append_funding_arb_resident_position_jsonl(output_root, &line)?;
@@ -49789,6 +49793,39 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "live-exec")]
+    fn assert_funding_arb_position_history_line_complete(line: &str) {
+        let fields = parse_json_object_value_slices(line).expect("position history line fields");
+        for field in [
+            "cycle",
+            "cycle_dir",
+            "decision",
+            "event_type",
+            "net_funding_bps",
+            "notional_usdt",
+            "pair_id",
+            "position_id",
+            "position_state_path",
+            "private_confirmation_count",
+            "reason",
+            "residual_risk",
+            "status",
+            "submitted_receipt_count",
+            "symbol",
+        ] {
+            assert!(fields.contains_key(field), "missing {field} in {line}");
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn last_nonempty_line(input: &str) -> &str {
+        input
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("last non-empty line")
+    }
+
     #[test]
     #[cfg(feature = "live-exec")]
     fn funding_arb_resident_position_closed_event_keeps_pair_and_symbol() {
@@ -49824,11 +49861,15 @@ mod tests {
 
         let registry =
             read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("registry");
+        assert_funding_arb_position_history_line_complete(last_nonempty_line(&registry));
         assert!(registry.contains("\"event_type\":\"position_closed\""));
         assert!(registry.contains("\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\""));
         assert!(registry.contains("\"symbol\":\"BTCUSDT\""));
         assert!(registry.contains("\"notional_usdt\":\"10.00\""));
         assert!(registry.contains("\"status\":\"closed\""));
+        assert!(registry.contains("\"position_state_path\""));
+        assert!(registry.contains("\"private_confirmation_count\":2"));
+        assert!(registry.contains("\"submitted_receipt_count\":2"));
     }
 
     #[test]
@@ -50081,6 +50122,10 @@ mod tests {
         )
         .expect("append recovered orphan position");
 
+        let history =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
+        assert_funding_arb_position_history_line_complete(last_nonempty_line(&history));
+
         let registry =
             load_funding_arb_resident_position_registry(root.path()).expect("resident registry");
         let active = registry.active_positions();
@@ -50141,6 +50186,10 @@ mod tests {
             "flat-cancelled recovery private snapshot has no non-zero legs",
         )
         .expect("append flat orphan closed");
+
+        let history =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
+        assert_funding_arb_position_history_line_complete(last_nonempty_line(&history));
 
         let registry =
             load_funding_arb_resident_position_registry(root.path()).expect("resident registry");
@@ -50280,6 +50329,10 @@ mod tests {
             &position_state_path,
         )
         .expect("append recovered position");
+
+        let history =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
+        assert_funding_arb_position_history_line_complete(last_nonempty_line(&history));
 
         let registry =
             load_funding_arb_resident_position_registry(root.path()).expect("resident registry");

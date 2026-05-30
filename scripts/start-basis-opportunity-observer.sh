@@ -1883,12 +1883,19 @@ append_funding_arb_startup_reconciled_position_closed() {
     '{
       cycle: 0,
       cycle_dir: $cycle_dir,
+      decision: "flat_private_snapshot",
       event_type: "position_closed",
       flat_reconciliation_report: $flat_report_path,
+      net_funding_bps: null,
+      notional_usdt: "unknown",
       pair_id: $pair_id,
       position_id: $position_id,
+      position_state_path: null,
+      private_confirmation_count: 0,
       reason: "startup private read-only reconciliation confirmed flat positions",
+      residual_risk: null,
       status: "closed",
+      submitted_receipt_count: 0,
       symbol: $symbol
     }' >> "${positions_path}"
 }

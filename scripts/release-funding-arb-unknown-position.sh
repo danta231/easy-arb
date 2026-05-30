@@ -189,6 +189,9 @@ fi
 if [[ -z "${REASON}" ]]; then
   REASON="manual reconciliation confirmed exchange order, open orders, and position are flat"
 fi
+NOTIONAL_USDT="$(jq -r '.notional_usdt // "unknown"' <<<"${unknown_record}")"
+POSITION_STATE_PATH="$(jq -r '.position_state_path // ""' <<<"${unknown_record}")"
+NET_FUNDING_BPS="$(jq -r '.net_funding_bps // ""' <<<"${unknown_record}")"
 
 confirmed_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 line="$(
@@ -197,16 +200,28 @@ line="$(
     --arg position_id "${POSITION_ID}" \
     --arg pair_id "${PAIR_ID}" \
     --arg symbol "${SYMBOL}" \
+    --arg notional_usdt "${NOTIONAL_USDT}" \
+    --arg position_state_path "${POSITION_STATE_PATH}" \
+    --arg net_funding_bps "${NET_FUNDING_BPS}" \
     --arg order_id "${ORDER_ID}" \
     --arg reason "${REASON}" \
     --arg confirmed_at "${confirmed_at}" \
     '{
+      cycle: null,
+      cycle_dir: null,
+      decision: "manual_reconciliation",
       event_type: $event_type,
+      net_funding_bps: (if $net_funding_bps == "" then null else $net_funding_bps end),
+      notional_usdt: $notional_usdt,
       position_id: $position_id,
+      position_state_path: (if $position_state_path == "" then null else $position_state_path end),
       pair_id: $pair_id,
+      private_confirmation_count: 0,
       symbol: $symbol,
       status: "closed",
       reason: $reason,
+      residual_risk: null,
+      submitted_receipt_count: 0,
       manual_reconciliation: true,
       exchange_confirmed_flat: true,
       acknowledged_residual_risk: true,
