@@ -524,6 +524,22 @@ const FUNDING_ARB_EXIT_DEFAULT_MAX_POSITION_IMBALANCE_BPS: i128 = 5;
 const FUNDING_ARB_EXIT_ADL_WARNING_RANK: i128 = 4;
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_EXIT_EMERGENCY_DE_RISK_SLIPPAGE_BPS: i128 = 100;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_EXPECTED_RETURN_HARD_LOSS_BPS: i128 = -20;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_EXPECTED_RETURN_SEVERE_LOSS_BPS: i128 = -30;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_EARLY_WINDOW_NEGATIVE_RETURN_BPS: i128 = -10;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_NEGATIVE_NET_FUNDING_STREAK_CYCLES: u64 = 3;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_EXPECTED_FUNDING_DECLINE_STREAK_CYCLES: u64 = 3;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_EXPECTED_FUNDING_DECLINE_BPS: i128 = 15;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_EARLY_WINDOW_MS: i128 = 30 * 60 * 1_000;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_EXIT_NEAR_SETTLEMENT_SOFT_SUPPRESS_MS: i128 = 5 * 60 * 1_000;
 const BASIS_AUTO_PRICE_GUARD_MAX_BPS: i128 = 100;
 const PORTFOLIO_DASHBOARD_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8805";
 #[cfg(feature = "live-exec")]
@@ -28407,6 +28423,10 @@ struct FundingArbPositionState {
     target_gross_funding_spread_bps: Option<i128>,
     target_expected_gross_funding_usd: Option<String>,
     target_expected_net_funding_usd: Option<String>,
+    exit_risk_last_expected_funding_usd: Option<String>,
+    exit_risk_decline_streak_start_expected_funding_usd: Option<String>,
+    exit_risk_expected_funding_decline_cycles: u64,
+    exit_risk_negative_net_funding_cycles: u64,
     opened_at: String,
     private_order_events_dir: Option<String>,
     leg_a: FundingArbPositionLegState,
@@ -28472,6 +28492,47 @@ struct FundingArbExitRuntimeRiskSummary {
 }
 
 #[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbExitFinancialRiskSummary {
+    status: String,
+    reason_codes: Vec<String>,
+    reason: Option<String>,
+    warning_codes: Vec<String>,
+    warning: Option<String>,
+    expected_funding_usd: Option<String>,
+    expected_return_bps: Option<String>,
+    net_funding_bps: Option<String>,
+    expected_funding_decline_bps: Option<String>,
+    expected_funding_decline_cycles: u64,
+    negative_net_funding_cycles: u64,
+    ms_to_target_funding: Option<i128>,
+}
+
+#[cfg(feature = "live-exec")]
+impl FundingArbExitFinancialRiskSummary {
+    fn not_checked() -> Self {
+        Self {
+            status: "NotChecked".to_owned(),
+            reason_codes: Vec::new(),
+            reason: None,
+            warning_codes: Vec::new(),
+            warning: None,
+            expected_funding_usd: None,
+            expected_return_bps: None,
+            net_funding_bps: None,
+            expected_funding_decline_bps: None,
+            expected_funding_decline_cycles: 0,
+            negative_net_funding_cycles: 0,
+            ms_to_target_funding: None,
+        }
+    }
+
+    fn is_triggered(&self) -> bool {
+        self.status == "Triggered"
+    }
+}
+
+#[cfg(feature = "live-exec")]
 impl FundingArbExitRuntimeRiskSummary {
     fn not_checked() -> Self {
         Self {
@@ -28500,6 +28561,7 @@ struct FundingArbExitCycleReport {
     decision: String,
     reason_codes: Vec<String>,
     runtime_risk: FundingArbExitRuntimeRiskSummary,
+    financial_risk: FundingArbExitFinancialRiskSummary,
     funding_settlement_status: String,
     private_position_status: String,
     dispatch_attempted: bool,
@@ -28710,6 +28772,10 @@ fn write_funding_arb_position_state_from_dispatch(
             &notional_usd,
         )?,
         target_expected_net_funding_usd: row.expected_funding_usd.clone(),
+        exit_risk_last_expected_funding_usd: row.expected_funding_usd.clone(),
+        exit_risk_decline_streak_start_expected_funding_usd: row.expected_funding_usd.clone(),
+        exit_risk_expected_funding_decline_cycles: 0,
+        exit_risk_negative_net_funding_cycles: 0,
         opened_at: opened_at.to_string(),
         private_order_events_dir: private_order_events_dir.map(|path| path.display().to_string()),
         leg_a: funding_arb_position_leg_state(first)?,
@@ -28791,8 +28857,16 @@ fn write_funding_arb_position_state_path(
 #[cfg(feature = "live-exec")]
 fn funding_arb_position_state_json(state: &FundingArbPositionState) -> String {
     format!(
-        "{{\"entry_net_funding_bps\":{},\"leg_a_account_id\":{},\"leg_a_entry_limit_price\":{},\"leg_a_instrument_id\":{},\"leg_a_quantity\":{},\"leg_a_role\":{},\"leg_a_side\":{},\"leg_a_venue_family\":{},\"leg_a_venue_id\":{},\"leg_b_account_id\":{},\"leg_b_entry_limit_price\":{},\"leg_b_instrument_id\":{},\"leg_b_quantity\":{},\"leg_b_role\":{},\"leg_b_side\":{},\"leg_b_venue_family\":{},\"leg_b_venue_id\":{},\"notional_usd\":{},\"opened_at\":{},\"pair_id\":{},\"plan_hash\":{},\"private_order_events_dir\":{},\"schema_version\":\"1.0.0\",\"symbol\":{},\"target_expected_gross_funding_usd\":{},\"target_expected_net_funding_usd\":{},\"target_funding_time_ms\":{},\"target_gross_funding_spread_bps\":{}}}",
+        "{{\"entry_net_funding_bps\":{},\"exit_risk_decline_streak_start_expected_funding_usd\":{},\"exit_risk_expected_funding_decline_cycles\":{},\"exit_risk_last_expected_funding_usd\":{},\"exit_risk_negative_net_funding_cycles\":{},\"leg_a_account_id\":{},\"leg_a_entry_limit_price\":{},\"leg_a_instrument_id\":{},\"leg_a_quantity\":{},\"leg_a_role\":{},\"leg_a_side\":{},\"leg_a_venue_family\":{},\"leg_a_venue_id\":{},\"leg_b_account_id\":{},\"leg_b_entry_limit_price\":{},\"leg_b_instrument_id\":{},\"leg_b_quantity\":{},\"leg_b_role\":{},\"leg_b_side\":{},\"leg_b_venue_family\":{},\"leg_b_venue_id\":{},\"notional_usd\":{},\"opened_at\":{},\"pair_id\":{},\"plan_hash\":{},\"private_order_events_dir\":{},\"schema_version\":\"1.0.0\",\"symbol\":{},\"target_expected_gross_funding_usd\":{},\"target_expected_net_funding_usd\":{},\"target_funding_time_ms\":{},\"target_gross_funding_spread_bps\":{}}}",
         optional_json_string(state.entry_net_funding_bps.map(|value| value.to_string()).as_deref()),
+        optional_json_string(
+            state
+                .exit_risk_decline_streak_start_expected_funding_usd
+                .as_deref(),
+        ),
+        json_string(&state.exit_risk_expected_funding_decline_cycles.to_string()),
+        optional_json_string(state.exit_risk_last_expected_funding_usd.as_deref()),
+        json_string(&state.exit_risk_negative_net_funding_cycles.to_string()),
         json_string(&state.leg_a.account_id),
         json_string(&state.leg_a.entry_limit_price),
         json_string(&state.leg_a.instrument_id),
@@ -28874,11 +28948,46 @@ fn parse_funding_arb_position_state_json(input: &str) -> RuntimeResult<FundingAr
             input,
             "target_expected_net_funding_usd",
         )?,
+        exit_risk_last_expected_funding_usd: json_optional_string_field(
+            input,
+            "exit_risk_last_expected_funding_usd",
+        )?,
+        exit_risk_decline_streak_start_expected_funding_usd: json_optional_string_field(
+            input,
+            "exit_risk_decline_streak_start_expected_funding_usd",
+        )?,
+        exit_risk_expected_funding_decline_cycles: parse_optional_u64_json_string_field(
+            input,
+            "exit_risk_expected_funding_decline_cycles",
+            0,
+        )?,
+        exit_risk_negative_net_funding_cycles: parse_optional_u64_json_string_field(
+            input,
+            "exit_risk_negative_net_funding_cycles",
+            0,
+        )?,
         opened_at: json_string_field(input, "opened_at")?,
         private_order_events_dir: json_optional_string_field(input, "private_order_events_dir")?,
         leg_a: parse_funding_arb_position_leg_state_json(input, "leg_a")?,
         leg_b: parse_funding_arb_position_leg_state_json(input, "leg_b")?,
     })
+}
+
+#[cfg(feature = "live-exec")]
+fn parse_optional_u64_json_string_field(
+    input: &str,
+    field: &str,
+    default: u64,
+) -> RuntimeResult<u64> {
+    json_optional_string_field(input, field)?
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!("{field} is not a u64: {error}"),
+            })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 #[cfg(feature = "live-exec")]
@@ -30234,6 +30343,10 @@ fn build_funding_arb_unknown_recovery_position_state_template(
             &notional_usd,
         )?,
         target_expected_net_funding_usd: row.expected_funding_usd.clone(),
+        exit_risk_last_expected_funding_usd: row.expected_funding_usd.clone(),
+        exit_risk_decline_streak_start_expected_funding_usd: row.expected_funding_usd.clone(),
+        exit_risk_expected_funding_decline_cycles: 0,
+        exit_risk_negative_net_funding_cycles: 0,
         opened_at: opened_at.to_string(),
         private_order_events_dir: options
             .private_order_events_dir
@@ -30671,6 +30784,7 @@ fn funding_arb_exit_cycle_blocked_before_dispatch(
         decision: "blocked".to_owned(),
         reason_codes: vec![reason_code.to_owned()],
         runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
+        financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
         funding_settlement_status: "NotChecked".to_owned(),
         private_position_status: "Unknown".to_owned(),
         dispatch_attempted: false,
@@ -30759,6 +30873,371 @@ fn funding_arb_rollover_position_state_target(
 }
 
 #[cfg(feature = "live-exec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FundingArbExitPositionSignal {
+    expected_funding_usd: MonitorDecimal,
+    expected_return_bps: MonitorDecimal,
+    net_funding_bps: MonitorDecimal,
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy)]
+struct FundingArbRowVenueFields<'a> {
+    family: &'a str,
+    bid: &'a str,
+    ask: &'a str,
+    bid_qty: &'a str,
+    ask_qty: &'a str,
+    bid_depth: &'a [SignalDepthLevel],
+    ask_depth: &'a [SignalDepthLevel],
+    funding_rate: &'a str,
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_financial_risk_summary(
+    row: &FundingArbMarketRow,
+    state: &mut FundingArbPositionState,
+    options: &FundingArbResidentLiveOptions,
+    observed_at: &str,
+) -> RuntimeResult<FundingArbExitFinancialRiskSummary> {
+    let signal = funding_arb_exit_current_position_signal(row, state, options)?;
+    let notional = MonitorDecimal::parse("funding_arb_exit.notional_usd", &state.notional_usd)?;
+    let double_notional =
+        notional.checked_mul_i128(2, "funding arb exit double-leg notional calculation")?;
+    if double_notional.raw <= 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: "funding arb exit double-leg notional must be greater than zero".to_owned(),
+        });
+    }
+    let previous_expected = state
+        .exit_risk_last_expected_funding_usd
+        .as_deref()
+        .map(|value| MonitorDecimal::parse("funding_arb_exit.last_expected_funding_usd", value))
+        .transpose()?;
+    let previous_decline_cycles = state.exit_risk_expected_funding_decline_cycles;
+    let previous_decline_start = state
+        .exit_risk_decline_streak_start_expected_funding_usd
+        .as_deref()
+        .map(|value| {
+            MonitorDecimal::parse(
+                "funding_arb_exit.decline_streak_start_expected_funding_usd",
+                value,
+            )
+        })
+        .transpose()?;
+
+    let (decline_cycles, decline_start) = if let Some(previous) = previous_expected {
+        if signal.expected_funding_usd.raw < previous.raw {
+            (
+                previous_decline_cycles.saturating_add(1),
+                previous_decline_start.unwrap_or(previous),
+            )
+        } else {
+            (0, signal.expected_funding_usd)
+        }
+    } else {
+        (0, signal.expected_funding_usd)
+    };
+    let negative_net_funding_cycles = if signal.net_funding_bps.raw < 0 {
+        state
+            .exit_risk_negative_net_funding_cycles
+            .saturating_add(1)
+    } else {
+        0
+    };
+    let decline_usd = decline_start.checked_sub(
+        signal.expected_funding_usd,
+        "funding arb exit expected funding decline USD calculation",
+    )?;
+    let expected_funding_decline_bps = if decline_usd.raw > 0 {
+        Some(monitor_decimal_ratio_bps(
+            decline_usd.raw,
+            double_notional.raw,
+            "funding arb exit expected funding decline bps",
+        )?)
+    } else {
+        None
+    };
+    let ms_to_target_funding = funding_arb_exit_ms_to_target_funding(state, observed_at)?;
+
+    state.exit_risk_last_expected_funding_usd = Some(signal.expected_funding_usd.format_trimmed());
+    state.exit_risk_decline_streak_start_expected_funding_usd =
+        Some(decline_start.format_trimmed());
+    state.exit_risk_expected_funding_decline_cycles = decline_cycles;
+    state.exit_risk_negative_net_funding_cycles = negative_net_funding_cycles;
+
+    let hard_loss_bps = funding_arb_exit_bps_threshold(
+        FUNDING_ARB_EXIT_EXPECTED_RETURN_HARD_LOSS_BPS,
+        "funding arb exit hard loss threshold",
+    )?;
+    let severe_loss_bps = funding_arb_exit_bps_threshold(
+        FUNDING_ARB_EXIT_EXPECTED_RETURN_SEVERE_LOSS_BPS,
+        "funding arb exit severe loss threshold",
+    )?;
+    let early_loss_bps = funding_arb_exit_bps_threshold(
+        FUNDING_ARB_EXIT_EARLY_WINDOW_NEGATIVE_RETURN_BPS,
+        "funding arb exit early window threshold",
+    )?;
+    let decline_limit_bps = funding_arb_exit_bps_threshold(
+        FUNDING_ARB_EXIT_EXPECTED_FUNDING_DECLINE_BPS,
+        "funding arb exit expected funding decline threshold",
+    )?;
+
+    let severe_loss_triggered = signal.expected_return_bps.raw <= severe_loss_bps.raw;
+    let hard_loss_triggered = signal.expected_return_bps.raw <= hard_loss_bps.raw;
+    let negative_streak_triggered = signal.net_funding_bps.raw < 0
+        && negative_net_funding_cycles >= FUNDING_ARB_EXIT_NEGATIVE_NET_FUNDING_STREAK_CYCLES;
+    let decline_streak_triggered = decline_cycles
+        >= FUNDING_ARB_EXIT_EXPECTED_FUNDING_DECLINE_STREAK_CYCLES
+        && expected_funding_decline_bps.is_some_and(|bps| bps.raw >= decline_limit_bps.raw);
+    let early_window_triggered = ms_to_target_funding.is_some_and(|ms| {
+        ms > FUNDING_ARB_EXIT_EARLY_WINDOW_MS
+            && signal.expected_return_bps.raw <= early_loss_bps.raw
+    });
+    let near_settlement_window = ms_to_target_funding
+        .is_some_and(|ms| (0..=FUNDING_ARB_EXIT_NEAR_SETTLEMENT_SOFT_SUPPRESS_MS).contains(&ms));
+
+    let mut reason_codes = Vec::new();
+    let mut reasons = Vec::new();
+    let mut warning_codes = Vec::new();
+    let mut warnings = Vec::new();
+    if severe_loss_triggered {
+        funding_arb_push_unique_reason_code(&mut reason_codes, "expected_return_severe_loss_limit");
+        reasons.push(format!(
+            "expected return {} bps is at or below severe loss limit {} bps",
+            signal.expected_return_bps.format_trimmed(),
+            FUNDING_ARB_EXIT_EXPECTED_RETURN_SEVERE_LOSS_BPS
+        ));
+    } else if near_settlement_window {
+        if hard_loss_triggered
+            || negative_streak_triggered
+            || decline_streak_triggered
+            || early_window_triggered
+        {
+            funding_arb_push_unique_reason_code(
+                &mut warning_codes,
+                "near_funding_settlement_soft_exit_suppressed",
+            );
+            warnings.push(format!(
+                "soft financial exit is suppressed within {} ms of target funding; expected_return_bps={}",
+                FUNDING_ARB_EXIT_NEAR_SETTLEMENT_SOFT_SUPPRESS_MS,
+                signal.expected_return_bps.format_trimmed()
+            ));
+        }
+    } else {
+        if hard_loss_triggered {
+            funding_arb_push_unique_reason_code(&mut reason_codes, "expected_return_loss_limit");
+            reasons.push(format!(
+                "expected return {} bps is at or below hard loss limit {} bps",
+                signal.expected_return_bps.format_trimmed(),
+                FUNDING_ARB_EXIT_EXPECTED_RETURN_HARD_LOSS_BPS
+            ));
+        }
+        if negative_streak_triggered {
+            funding_arb_push_unique_reason_code(&mut reason_codes, "negative_net_funding_streak");
+            reasons.push(format!(
+                "net funding bps {} has been negative for {} consecutive exit cycles",
+                signal.net_funding_bps.format_trimmed(),
+                negative_net_funding_cycles
+            ));
+        }
+        if decline_streak_triggered {
+            funding_arb_push_unique_reason_code(
+                &mut reason_codes,
+                "expected_funding_decline_streak",
+            );
+            reasons.push(format!(
+                "expected funding has declined for {} consecutive exit cycles by {} bps",
+                decline_cycles,
+                expected_funding_decline_bps
+                    .map(MonitorDecimal::format_trimmed)
+                    .unwrap_or_else(|| "0".to_owned())
+            ));
+        }
+        if early_window_triggered {
+            funding_arb_push_unique_reason_code(
+                &mut reason_codes,
+                "pre_settlement_negative_expected_return",
+            );
+            reasons.push(format!(
+                "target funding is more than {} ms away and expected return {} bps is at or below {} bps",
+                FUNDING_ARB_EXIT_EARLY_WINDOW_MS,
+                signal.expected_return_bps.format_trimmed(),
+                FUNDING_ARB_EXIT_EARLY_WINDOW_NEGATIVE_RETURN_BPS
+            ));
+        }
+    }
+
+    Ok(FundingArbExitFinancialRiskSummary {
+        status: if !reason_codes.is_empty() {
+            "Triggered"
+        } else if !warning_codes.is_empty() {
+            "Warning"
+        } else {
+            "Matched"
+        }
+        .to_owned(),
+        reason_codes,
+        reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
+        warning_codes,
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        expected_funding_usd: Some(signal.expected_funding_usd.format_trimmed()),
+        expected_return_bps: Some(signal.expected_return_bps.format_trimmed()),
+        net_funding_bps: Some(signal.net_funding_bps.format_trimmed()),
+        expected_funding_decline_bps: expected_funding_decline_bps
+            .map(MonitorDecimal::format_trimmed),
+        expected_funding_decline_cycles: decline_cycles,
+        negative_net_funding_cycles,
+        ms_to_target_funding,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_current_position_signal(
+    row: &FundingArbMarketRow,
+    state: &FundingArbPositionState,
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<FundingArbExitPositionSignal> {
+    let long_family =
+        funding_arb_position_leg_family_by_direction(state, "long").ok_or_else(|| {
+            RuntimeError::LiveMarketData {
+                message: "funding arb exit cannot determine active long venue family".to_owned(),
+            }
+        })?;
+    let short_family =
+        funding_arb_position_leg_family_by_direction(state, "short").ok_or_else(|| {
+            RuntimeError::LiveMarketData {
+                message: "funding arb exit cannot determine active short venue family".to_owned(),
+            }
+        })?;
+    let long = funding_arb_row_venue_fields(row, &long_family)?;
+    let short = funding_arb_row_venue_fields(row, &short_family)?;
+    let signal = evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+        symbol: row.symbol.clone(),
+        long_venue_id: long.family.to_owned(),
+        short_venue_id: short.family.to_owned(),
+        long_best_bid: long.bid.to_owned(),
+        long_best_ask: long.ask.to_owned(),
+        long_ask_size: Some(long.ask_qty.to_owned()),
+        long_ask_depth: long.ask_depth.to_vec(),
+        short_best_bid: short.bid.to_owned(),
+        short_best_ask: short.ask.to_owned(),
+        short_bid_size: Some(short.bid_qty.to_owned()),
+        short_bid_depth: short.bid_depth.to_vec(),
+        long_funding_rate: long.funding_rate.to_owned(),
+        short_funding_rate: short.funding_rate.to_owned(),
+        funding_interval_hours: "8".to_owned(),
+        notional_usd: state.notional_usd.clone(),
+        long_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            long.family,
+            &options.taker_fee_bps,
+        ),
+        short_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            short.family,
+            &options.taker_fee_bps,
+        ),
+        slippage_buffer_bps: options.slippage_buffer_bps,
+        max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+        min_net_funding_bps: options.min_net_funding_bps,
+    })
+    .map_err(|message| RuntimeError::LiveMarketData { message })?;
+    let expected_funding_usd = MonitorDecimal::parse(
+        "funding_arb_exit.current_expected_funding_usd",
+        &signal.expected_funding_usd,
+    )?;
+    let notional = MonitorDecimal::parse(
+        "funding_arb_exit.position_notional_usd",
+        &state.notional_usd,
+    )?;
+    let double_notional = notional.checked_mul_i128(
+        2,
+        "funding arb exit current signal double-leg notional calculation",
+    )?;
+    let expected_return_bps = monitor_decimal_ratio_bps(
+        expected_funding_usd.raw,
+        double_notional.raw,
+        "funding arb exit current expected return bps",
+    )?;
+    let net_funding_bps = MonitorDecimal::parse(
+        "funding_arb_exit.current_net_funding_bps",
+        &signal.net_funding_bps,
+    )?;
+    Ok(FundingArbExitPositionSignal {
+        expected_funding_usd,
+        expected_return_bps,
+        net_funding_bps,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_row_venue_fields<'a>(
+    row: &'a FundingArbMarketRow,
+    family: &str,
+) -> RuntimeResult<FundingArbRowVenueFields<'a>> {
+    let normalized = normalize_venue_family(family);
+    if normalize_venue_family(&row.venue_a_family) == normalized {
+        return Ok(FundingArbRowVenueFields {
+            family: &row.venue_a_family,
+            bid: &row.venue_a_bid,
+            ask: &row.venue_a_ask,
+            bid_qty: &row.venue_a_bid_qty,
+            ask_qty: &row.venue_a_ask_qty,
+            bid_depth: &row.venue_a_bid_depth,
+            ask_depth: &row.venue_a_ask_depth,
+            funding_rate: &row.venue_a_funding_rate,
+        });
+    }
+    if normalize_venue_family(&row.venue_b_family) == normalized {
+        return Ok(FundingArbRowVenueFields {
+            family: &row.venue_b_family,
+            bid: &row.venue_b_bid,
+            ask: &row.venue_b_ask,
+            bid_qty: &row.venue_b_bid_qty,
+            ask_qty: &row.venue_b_ask_qty,
+            bid_depth: &row.venue_b_bid_depth,
+            ask_depth: &row.venue_b_ask_depth,
+            funding_rate: &row.venue_b_funding_rate,
+        });
+    }
+    Err(RuntimeError::LiveMarketData {
+        message: format!(
+            "funding arb exit active venue family `{family}` is missing from current market row"
+        ),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_ms_to_target_funding(
+    state: &FundingArbPositionState,
+    observed_at: &str,
+) -> RuntimeResult<Option<i128>> {
+    let Some(target_ms) = state.target_funding_time_ms else {
+        return Ok(None);
+    };
+    let observed = UtcTimestamp::from_str(observed_at).map_err(|error| RuntimeError::Module {
+        module: "arb-runtime",
+        message: format!("funding arb exit observed_at is invalid: {error}"),
+    })?;
+    Ok(Some(
+        i128::from(target_ms)
+            .checked_sub(runtime_timestamp_millis(observed)?)
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "funding arb exit ms_to_target_funding calculation overflowed".to_owned(),
+            })?,
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_bps_threshold(
+    value: i128,
+    context: &'static str,
+) -> RuntimeResult<MonitorDecimal> {
+    monitor_decimal_from_i128(value).ok_or_else(|| RuntimeError::LiveMarketData {
+        message: format!("{context} overflowed"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
 #[derive(Clone, Copy)]
 struct FundingArbExitCycleDecisionInput<'a> {
     private_position_matched: bool,
@@ -30769,6 +31248,7 @@ struct FundingArbExitCycleDecisionInput<'a> {
     rollover_allowed: bool,
     close_required_count: usize,
     runtime_risk: Option<&'a FundingArbExitRuntimeRiskSummary>,
+    financial_risk: Option<&'a FundingArbExitFinancialRiskSummary>,
     unknown_recovery_exit: bool,
 }
 
@@ -30799,6 +31279,10 @@ fn funding_arb_exit_cycle_decision(
     if let Some(runtime_risk) = input.runtime_risk.filter(|risk| risk.is_triggered()) {
         reason_codes.extend(runtime_risk.reason_codes.iter().cloned());
         return "emergency_de_risk".to_owned();
+    }
+    if let Some(financial_risk) = input.financial_risk.filter(|risk| risk.is_triggered()) {
+        reason_codes.extend(financial_risk.reason_codes.iter().cloned());
+        return "close".to_owned();
     }
     if input.settlement_observed_mismatch {
         reason_codes.push("funding_settlement_observed_mismatch".to_owned());
@@ -32620,7 +33104,7 @@ fn write_funding_arb_exit_cycle_artifacts(
 #[cfg(feature = "live-exec")]
 fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> String {
     format!(
-        "{{\"blocking_reasons\":[{}],\"decision\":{},\"dispatch_attempted\":{},\"funding_settlement_status\":{},\"output_dir\":{},\"pair_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason_codes\":{},\"residual_risk\":{},\"runtime_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":[{}],\"decision\":{},\"dispatch_attempted\":{},\"financial_risk\":{},\"funding_settlement_status\":{},\"output_dir\":{},\"pair_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason_codes\":{},\"residual_risk\":{},\"runtime_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         report
             .blocking_reasons
             .iter()
@@ -32629,6 +33113,7 @@ fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> Str
             .join(","),
         json_string(&report.decision),
         report.dispatch_attempted,
+        funding_arb_exit_financial_risk_json(&report.financial_risk),
         json_string(&report.funding_settlement_status),
         optional_json_string(report.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
         json_string(&report.pair_id),
@@ -32639,6 +33124,25 @@ fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> Str
         funding_arb_exit_runtime_risk_json(&report.runtime_risk),
         report.submitted_receipt_count,
         json_string(&report.symbol),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exit_financial_risk_json(summary: &FundingArbExitFinancialRiskSummary) -> String {
+    format!(
+        "{{\"expected_funding_decline_bps\":{},\"expected_funding_decline_cycles\":{},\"expected_funding_usd\":{},\"expected_return_bps\":{},\"ms_to_target_funding\":{},\"negative_net_funding_cycles\":{},\"net_funding_bps\":{},\"reason\":{},\"reason_codes\":{},\"status\":{},\"warning\":{},\"warning_codes\":{}}}",
+        json_option_string(&summary.expected_funding_decline_bps),
+        summary.expected_funding_decline_cycles,
+        json_option_string(&summary.expected_funding_usd),
+        json_option_string(&summary.expected_return_bps),
+        optional_i128_json(summary.ms_to_target_funding),
+        summary.negative_net_funding_cycles,
+        json_option_string(&summary.net_funding_bps),
+        optional_json_string(summary.reason.as_deref()),
+        json_string_array(&summary.reason_codes),
+        json_string(&summary.status),
+        optional_json_string(summary.warning.as_deref()),
+        json_string_array(&summary.warning_codes),
     )
 }
 
@@ -43285,6 +43789,92 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_test_resident_options() -> FundingArbResidentLiveOptions {
+        FundingArbResidentLiveOptions {
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: None,
+            snapshot_path: None,
+            pair_id: None,
+            sources: Vec::new(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            private_order_events_dir: None,
+            poll_interval_secs: 60,
+            max_cycles: None,
+            notional_usd: "100.00".to_owned(),
+            taker_fee_bps: "5".to_owned(),
+            slippage_buffer_bps: 15,
+            max_entry_price_divergence_bps: 100,
+            min_net_funding_bps: 5,
+            execute_live: false,
+            acknowledge_funding_arb_live_orders: true,
+            allow_unknown_recovery: false,
+            auto_residual_de_risk: true,
+            exit_only: false,
+            hyperliquid_user: None,
+            hyperliquid_source: "a".to_owned(),
+            hyperliquid_vault_address: None,
+            hyperliquid_expires_after_ms: None,
+            hyperliquid_asset_ids: BTreeMap::new(),
+            aster_user: None,
+            aster_signer: None,
+            aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
+        }
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_test_timestamp_ms(value: &str) -> u64 {
+        let timestamp = UtcTimestamp::from_str(value).expect("timestamp");
+        u64::try_from(runtime_timestamp_millis(timestamp).expect("timestamp ms"))
+            .expect("positive timestamp")
+    }
+
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_test_position_state(
+        row: &FundingArbMarketRow,
+        target_funding_time_ms: u64,
+    ) -> FundingArbPositionState {
+        FundingArbPositionState {
+            pair_id: row.pair_id.clone(),
+            symbol: row.symbol.clone(),
+            plan_hash: Some("hash:funding-arb-test".to_owned()),
+            notional_usd: "100.00".to_owned(),
+            entry_net_funding_bps: Some(17),
+            target_funding_time_ms: Some(target_funding_time_ms),
+            target_gross_funding_spread_bps: Some(42),
+            target_expected_gross_funding_usd: Some("0.42".to_owned()),
+            target_expected_net_funding_usd: Some("0.17".to_owned()),
+            exit_risk_last_expected_funding_usd: Some("0.17".to_owned()),
+            exit_risk_decline_streak_start_expected_funding_usd: Some("0.17".to_owned()),
+            exit_risk_expected_funding_decline_cycles: 0,
+            exit_risk_negative_net_funding_cycles: 0,
+            opened_at: "2026-05-13T00:00:00Z".to_owned(),
+            private_order_events_dir: None,
+            leg_a: FundingArbPositionLegState {
+                role: "funding_perp_long".to_owned(),
+                venue_family: "binance".to_owned(),
+                venue_id: BINANCE_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                instrument_id: BINANCE_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                side: OrderSide::Buy,
+                quantity: "1".to_owned(),
+                entry_limit_price: row.venue_a_ask.clone(),
+            },
+            leg_b: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "bybit".to_owned(),
+                venue_id: BYBIT_BASIS_PERP_VENUE_ID.to_owned(),
+                account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                instrument_id: BYBIT_BASIS_PERP_INSTRUMENT_ID.to_owned(),
+                side: OrderSide::Sell,
+                quantity: "1".to_owned(),
+                entry_limit_price: row.venue_b_bid.clone(),
+            },
+        }
+    }
+
     fn funding_arb_test_snapshot(
         rows: Vec<FundingArbMarketRow>,
         updated_at: String,
@@ -49659,6 +50249,10 @@ mod tests {
             target_gross_funding_spread_bps: Some(27),
             target_expected_gross_funding_usd: Some("0.027".to_owned()),
             target_expected_net_funding_usd: Some("0.012".to_owned()),
+            exit_risk_last_expected_funding_usd: Some("0.012".to_owned()),
+            exit_risk_decline_streak_start_expected_funding_usd: Some("0.015".to_owned()),
+            exit_risk_expected_funding_decline_cycles: 2,
+            exit_risk_negative_net_funding_cycles: 1,
             opened_at: "2026-05-13T00:00:00Z".to_owned(),
             private_order_events_dir: Some("target/private-order-events".to_owned()),
             leg_a: FundingArbPositionLegState {
@@ -49689,6 +50283,7 @@ mod tests {
         assert_eq!(parsed, state);
         assert!(json.contains("\"schema_version\":\"1.0.0\""));
         assert!(json.contains("\"private_order_events_dir\""));
+        assert!(json.contains("\"exit_risk_negative_net_funding_cycles\":\"1\""));
     }
 
     #[test]
@@ -49846,6 +50441,7 @@ mod tests {
             decision: "close".to_owned(),
             reason_codes: Vec::new(),
             runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
+            financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
             funding_settlement_status: "Matched".to_owned(),
             private_position_status: "Flat".to_owned(),
             dispatch_attempted: true,
@@ -50392,6 +50988,10 @@ mod tests {
             target_gross_funding_spread_bps: None,
             target_expected_gross_funding_usd: None,
             target_expected_net_funding_usd: None,
+            exit_risk_last_expected_funding_usd: None,
+            exit_risk_decline_streak_start_expected_funding_usd: None,
+            exit_risk_expected_funding_decline_cycles: 0,
+            exit_risk_negative_net_funding_cycles: 0,
             opened_at: "2026-05-20T14:51:00Z".to_owned(),
             private_order_events_dir: None,
             leg_a: FundingArbPositionLegState {
@@ -50553,6 +51153,10 @@ mod tests {
             target_gross_funding_spread_bps: Some(0),
             target_expected_gross_funding_usd: Some("0".to_owned()),
             target_expected_net_funding_usd: Some("-0.15".to_owned()),
+            exit_risk_last_expected_funding_usd: Some("-0.15".to_owned()),
+            exit_risk_decline_streak_start_expected_funding_usd: Some("0".to_owned()),
+            exit_risk_expected_funding_decline_cycles: 1,
+            exit_risk_negative_net_funding_cycles: 1,
             opened_at: "2026-05-26T06:54:32Z".to_owned(),
             private_order_events_dir: None,
             leg_a: FundingArbPositionLegState {
@@ -50653,6 +51257,7 @@ mod tests {
                 rollover_allowed: false,
                 close_required_count: 2,
                 runtime_risk: None,
+                financial_risk: None,
                 unknown_recovery_exit: true,
             },
             &mut reason_codes,
@@ -50678,6 +51283,7 @@ mod tests {
                 rollover_allowed: false,
                 close_required_count: 2,
                 runtime_risk: None,
+                financial_risk: None,
                 unknown_recovery_exit: false,
             },
             &mut reason_codes,
@@ -50726,6 +51332,7 @@ mod tests {
                 rollover_allowed: false,
                 close_required_count: 2,
                 runtime_risk: Some(&runtime_risk),
+                financial_risk: None,
                 unknown_recovery_exit: false,
             },
             &mut reason_codes,
@@ -50767,6 +51374,7 @@ mod tests {
                 rollover_allowed: false,
                 close_required_count: 2,
                 runtime_risk: Some(&runtime_risk),
+                financial_risk: None,
                 unknown_recovery_exit: false,
             },
             &mut reason_codes,
@@ -50776,6 +51384,151 @@ mod tests {
         assert_eq!(decision, "emergency_de_risk");
         assert_eq!(reason_codes, vec!["liquidation_buffer_too_thin".to_owned()]);
         assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_financial_loss_limit_closes_before_settlement() {
+        let row = funding_arb_test_row("0.00060000", "0.00010000");
+        let options = funding_arb_test_resident_options();
+        let mut state = funding_arb_test_position_state(
+            &row,
+            funding_arb_test_timestamp_ms("2026-05-13T00:20:00Z"),
+        );
+        let financial_risk = funding_arb_exit_financial_risk_summary(
+            &row,
+            &mut state,
+            &options,
+            "2026-05-13T00:00:00Z",
+        )
+        .expect("financial risk");
+
+        assert_eq!(financial_risk.status, "Triggered");
+        assert_eq!(
+            financial_risk.reason_codes,
+            vec!["expected_return_loss_limit".to_owned()]
+        );
+        assert_eq!(financial_risk.expected_return_bps.as_deref(), Some("-20"));
+
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+        let decision = funding_arb_exit_cycle_decision(
+            FundingArbExitCycleDecisionInput {
+                private_position_matched: true,
+                private_position_reason: None,
+                settlement_matched: false,
+                settlement_observed_complete: false,
+                settlement_observed_mismatch: false,
+                rollover_allowed: false,
+                close_required_count: 2,
+                runtime_risk: None,
+                financial_risk: Some(&financial_risk),
+                unknown_recovery_exit: false,
+            },
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert_eq!(decision, "close");
+        assert_eq!(reason_codes, vec!["expected_return_loss_limit".to_owned()]);
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_financial_negative_net_funding_streak_closes() {
+        let row = funding_arb_test_row("0.00050000", "0.00010000");
+        let options = funding_arb_test_resident_options();
+        let mut state = funding_arb_test_position_state(
+            &row,
+            funding_arb_test_timestamp_ms("2026-05-13T00:20:00Z"),
+        );
+        state.exit_risk_negative_net_funding_cycles = 2;
+        let financial_risk = funding_arb_exit_financial_risk_summary(
+            &row,
+            &mut state,
+            &options,
+            "2026-05-13T00:00:00Z",
+        )
+        .expect("financial risk");
+
+        assert_eq!(financial_risk.status, "Triggered");
+        assert!(financial_risk
+            .reason_codes
+            .contains(&"negative_net_funding_streak".to_owned()));
+        assert_eq!(financial_risk.negative_net_funding_cycles, 3);
+        assert_eq!(state.exit_risk_negative_net_funding_cycles, 3);
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_financial_expected_funding_decline_streak_closes() {
+        let row = funding_arb_test_row("0.00010000", "0.00400000");
+        let options = funding_arb_test_resident_options();
+        let mut state = funding_arb_test_position_state(
+            &row,
+            funding_arb_test_timestamp_ms("2026-05-13T00:20:00Z"),
+        );
+        state.exit_risk_last_expected_funding_usd = Some("0.20".to_owned());
+        state.exit_risk_decline_streak_start_expected_funding_usd = Some("0.45".to_owned());
+        state.exit_risk_expected_funding_decline_cycles = 2;
+        let financial_risk = funding_arb_exit_financial_risk_summary(
+            &row,
+            &mut state,
+            &options,
+            "2026-05-13T00:00:00Z",
+        )
+        .expect("financial risk");
+
+        assert_eq!(financial_risk.status, "Triggered");
+        assert!(financial_risk
+            .reason_codes
+            .contains(&"expected_funding_decline_streak".to_owned()));
+        assert_eq!(financial_risk.expected_funding_decline_cycles, 3);
+        assert_eq!(state.exit_risk_expected_funding_decline_cycles, 3);
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_financial_time_window_closes_early_and_suppresses_near_funding() {
+        let row = funding_arb_test_row("0.00050000", "0.00010000");
+        let options = funding_arb_test_resident_options();
+        let mut early_state = funding_arb_test_position_state(
+            &row,
+            funding_arb_test_timestamp_ms("2026-05-13T01:00:00Z"),
+        );
+        let early_risk = funding_arb_exit_financial_risk_summary(
+            &row,
+            &mut early_state,
+            &options,
+            "2026-05-13T00:00:00Z",
+        )
+        .expect("early financial risk");
+
+        assert_eq!(early_risk.status, "Triggered");
+        assert!(early_risk
+            .reason_codes
+            .contains(&"pre_settlement_negative_expected_return".to_owned()));
+
+        let mut near_state = funding_arb_test_position_state(
+            &row,
+            funding_arb_test_timestamp_ms("2026-05-13T00:03:00Z"),
+        );
+        near_state.exit_risk_negative_net_funding_cycles = 2;
+        let near_risk = funding_arb_exit_financial_risk_summary(
+            &row,
+            &mut near_state,
+            &options,
+            "2026-05-13T00:00:00Z",
+        )
+        .expect("near financial risk");
+
+        assert_eq!(near_risk.status, "Warning");
+        assert!(near_risk.reason_codes.is_empty());
+        assert_eq!(
+            near_risk.warning_codes,
+            vec!["near_funding_settlement_soft_exit_suppressed".to_owned()]
+        );
     }
 
     #[test]
@@ -50794,6 +51547,7 @@ mod tests {
                 rollover_allowed: false,
                 close_required_count: 2,
                 runtime_risk: None,
+                financial_risk: None,
                 unknown_recovery_exit: false,
             },
             &mut reason_codes,
@@ -50827,6 +51581,7 @@ mod tests {
                 rollover_allowed: true,
                 close_required_count: 2,
                 runtime_risk: None,
+                financial_risk: None,
                 unknown_recovery_exit: false,
             },
             &mut reason_codes,
@@ -53691,6 +54446,10 @@ mod tests {
             target_gross_funding_spread_bps: Some(35),
             target_expected_gross_funding_usd: Some("0.315".to_owned()),
             target_expected_net_funding_usd: Some("0.18".to_owned()),
+            exit_risk_last_expected_funding_usd: Some("0.18".to_owned()),
+            exit_risk_decline_streak_start_expected_funding_usd: Some("0.18".to_owned()),
+            exit_risk_expected_funding_decline_cycles: 0,
+            exit_risk_negative_net_funding_cycles: 0,
             opened_at: "2026-05-23T11:27:10Z".to_owned(),
             private_order_events_dir: None,
             leg_a: FundingArbPositionLegState {

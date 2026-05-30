@@ -204,6 +204,13 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         .into_iter()
         .filter(|required| *required)
         .count();
+    let mut position_state_changed = false;
+    let financial_risk = if position_status.is_matched() && close_required_count == 2 {
+        position_state_changed = true;
+        funding_arb_exit_financial_risk_summary(row, &mut state, options, &snapshot.updated_at)?
+    } else {
+        FundingArbExitFinancialRiskSummary::not_checked()
+    };
     let rollover_allowed = settlement.is_observed_complete()
         && funding_arb_exit_rollover_allowed(row, &state, options.min_net_funding_bps);
     let decision = funding_arb_exit_cycle_decision(
@@ -216,6 +223,7 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
             rollover_allowed,
             close_required_count,
             runtime_risk: Some(&runtime_risk),
+            financial_risk: Some(&financial_risk),
             unknown_recovery_exit: funding_arb_unknown_recovery_enabled(options)
                 && state.plan_hash.is_none(),
         },
@@ -223,9 +231,11 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         &mut blocking_reasons,
     );
     if decision == "rollover" {
-        let mut rollover_state = state.clone();
-        funding_arb_rollover_position_state_target(&mut rollover_state, row)?;
-        write_funding_arb_position_state_path(position_state_path, &rollover_state)?;
+        funding_arb_rollover_position_state_target(&mut state, row)?;
+        position_state_changed = true;
+    }
+    if position_state_changed {
+        write_funding_arb_position_state_path(position_state_path, &state)?;
     }
 
     if matches!(decision.as_str(), "close" | "emergency_de_risk") {
@@ -290,6 +300,7 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         decision,
         reason_codes,
         runtime_risk,
+        financial_risk,
         funding_settlement_status: settlement.status,
         private_position_status: position_status.status,
         dispatch_attempted,
