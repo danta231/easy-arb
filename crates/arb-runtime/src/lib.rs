@@ -46594,6 +46594,32 @@ mod tests {
     }
 
     #[test]
+    fn public_wss_disconnect_after_stream_is_reconnecting_not_offline() {
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty(
+            "BTCUSDT",
+            BinancePublicMarket::Spot,
+            "wss://example.test/ws/btcusdt@bookTicker",
+        );
+        snapshot.total_rows = 1;
+        snapshot.wss_update_count = 42;
+
+        snapshot.record_wss_read_error("connection reset", true);
+
+        let health = snapshot.health_json();
+        let status = snapshot.to_json();
+        assert!(health.contains("\"fail_closed\":false"));
+        assert!(health.contains("\"disconnect_count\":1"));
+        assert!(status.contains("\"status\":\"reconnecting\""));
+        assert!(status.contains("\"last_error\":\"connection reset\""));
+
+        snapshot.record_wss_read_error("subscribe failed", false);
+
+        let failed_health = snapshot.health_json();
+        assert!(failed_health.contains("\"fail_closed\":true"));
+        assert!(failed_health.contains("\"disconnect_count\":2"));
+    }
+
+    #[test]
     fn public_wss_monitor_row_stale_keeps_global_streaming_status() {
         let observed_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("observed at");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:06Z").expect("ingested at");

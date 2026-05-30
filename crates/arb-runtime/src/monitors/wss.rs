@@ -621,7 +621,10 @@ pub(crate) fn run_binance_wss_book_ticker_monitor_cycle(
                 state
                     .write()
                     .expect("Public WSS monitor state lock poisoned")
-                    .record_stream_end();
+                    .record_stream_end_with_label_and_observed(
+                        "Binance public WSS",
+                        observed_wss_event,
+                    );
             }
             Ok(())
         }
@@ -629,7 +632,7 @@ pub(crate) fn run_binance_wss_book_ticker_monitor_cycle(
             state
                 .write()
                 .expect("Public WSS monitor state lock poisoned")
-                .record_failure(error.to_string(), !observed_wss_event);
+                .record_wss_read_error(error.to_string(), observed_wss_event);
             Err(error.into())
         }
     }
@@ -880,7 +883,10 @@ pub(crate) fn run_bybit_wss_book_ticker_monitor_cycle(
                 state
                     .write()
                     .expect("Bybit WSS monitor state lock poisoned")
-                    .record_stream_end_with_label("Bybit public WSS");
+                    .record_stream_end_with_label_and_observed(
+                        "Bybit public WSS",
+                        observed_wss_event,
+                    );
             }
             Ok(())
         }
@@ -888,7 +894,7 @@ pub(crate) fn run_bybit_wss_book_ticker_monitor_cycle(
             state
                 .write()
                 .expect("Bybit WSS monitor state lock poisoned")
-                .record_failure(error.to_string(), !observed_wss_event);
+                .record_wss_read_error(error.to_string(), observed_wss_event);
             Err(error.into())
         }
     }
@@ -1057,7 +1063,10 @@ pub(crate) fn run_okx_wss_book_ticker_monitor_cycle(
                 state
                     .write()
                     .expect("OKX WSS monitor state lock poisoned")
-                    .record_stream_end_with_label("OKX public WSS");
+                    .record_stream_end_with_label_and_observed(
+                        "OKX public WSS",
+                        observed_wss_event,
+                    );
             }
             Ok(())
         }
@@ -1065,7 +1074,7 @@ pub(crate) fn run_okx_wss_book_ticker_monitor_cycle(
             state
                 .write()
                 .expect("OKX WSS monitor state lock poisoned")
-                .record_failure(error.to_string(), !observed_wss_event);
+                .record_wss_read_error(error.to_string(), observed_wss_event);
             Err(error.into())
         }
     }
@@ -1236,7 +1245,10 @@ pub(crate) fn run_bitget_wss_book_ticker_monitor_cycle(
                 state
                     .write()
                     .expect("Bitget WSS monitor state lock poisoned")
-                    .record_stream_end_with_label("Bitget public WSS");
+                    .record_stream_end_with_label_and_observed(
+                        "Bitget public WSS",
+                        observed_wss_event,
+                    );
             }
             Ok(())
         }
@@ -1244,7 +1256,7 @@ pub(crate) fn run_bitget_wss_book_ticker_monitor_cycle(
             state
                 .write()
                 .expect("Bitget WSS monitor state lock poisoned")
-                .record_failure(error.to_string(), !observed_wss_event);
+                .record_wss_read_error(error.to_string(), observed_wss_event);
             Err(error.into())
         }
     }
@@ -1413,7 +1425,10 @@ pub(crate) fn run_aster_wss_book_ticker_monitor_cycle(
                 state
                     .write()
                     .expect("Aster WSS monitor state lock poisoned")
-                    .record_stream_end_with_label("Aster public WSS");
+                    .record_stream_end_with_label_and_observed(
+                        "Aster public WSS",
+                        observed_wss_event,
+                    );
             }
             Ok(())
         }
@@ -1421,7 +1436,7 @@ pub(crate) fn run_aster_wss_book_ticker_monitor_cycle(
             state
                 .write()
                 .expect("Aster WSS monitor state lock poisoned")
-                .record_failure(error.to_string(), !observed_wss_event);
+                .record_wss_read_error(error.to_string(), observed_wss_event);
             Err(error.into())
         }
     }
@@ -1593,7 +1608,10 @@ pub(crate) fn run_hyperliquid_wss_book_ticker_monitor_cycle(
                 state
                     .write()
                     .expect("Hyperliquid WSS monitor state lock poisoned")
-                    .record_stream_end_with_label("Hyperliquid public WSS");
+                    .record_stream_end_with_label_and_observed(
+                        "Hyperliquid public WSS",
+                        observed_wss_event,
+                    );
             }
             Ok(())
         }
@@ -1601,7 +1619,7 @@ pub(crate) fn run_hyperliquid_wss_book_ticker_monitor_cycle(
             state
                 .write()
                 .expect("Hyperliquid WSS monitor state lock poisoned")
-                .record_failure(error.to_string(), !observed_wss_event);
+                .record_wss_read_error(error.to_string(), observed_wss_event);
             Err(error.into())
         }
     }
@@ -4522,8 +4540,18 @@ impl PublicTopOfBookMonitorSnapshot {
         self.last_error = Some(detail.into());
     }
 
-    pub(crate) fn record_stream_end(&mut self) {
-        self.record_stream_end_with_label("Binance public WSS");
+    pub(crate) fn record_reconnect_required(
+        &mut self,
+        detail: impl Into<String>,
+        count_disconnect: bool,
+    ) {
+        self.status = "reconnecting".to_owned();
+        self.updated_at = current_utc_timestamp_string();
+        self.fail_closed = false;
+        if count_disconnect {
+            self.disconnect_count += 1;
+        }
+        self.last_error = Some(detail.into());
     }
 
     pub(crate) fn record_stream_end_with_label(&mut self, label: &str) {
@@ -4536,6 +4564,34 @@ impl PublicTopOfBookMonitorSnapshot {
         }
         if self.last_error.is_none() {
             self.last_error = Some(format!("{label} ended; rebuilding from REST"));
+        }
+    }
+
+    pub(crate) fn record_stream_end_with_label_and_observed(
+        &mut self,
+        label: &str,
+        observed_wss_event: bool,
+    ) {
+        if observed_wss_event {
+            self.record_reconnect_required(
+                format!("{label} ended before reconnect; rebuilding from REST"),
+                true,
+            );
+        } else {
+            self.record_stream_end_with_label(label);
+        }
+    }
+
+    pub(crate) fn record_wss_read_error(
+        &mut self,
+        detail: impl Into<String>,
+        observed_wss_event: bool,
+    ) {
+        let detail = detail.into();
+        if observed_wss_event {
+            self.record_reconnect_required(detail, true);
+        } else {
+            self.record_failure(detail, true);
         }
     }
 
