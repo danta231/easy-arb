@@ -1811,6 +1811,39 @@ impl PublicJsonWssTextStreamClient {
         self.read_live_text_messages_after_connect(
             subscribe_payloads,
             max_text_messages,
+            Duration::from_millis(120),
+            &mut observer,
+        )
+    }
+
+    /// 连接真实公开 WSS，发送多条订阅请求，并允许调用方指定订阅节流。
+    ///
+    /// 中文说明：Hyperliquid 这类按交易对逐条订阅的公开流可能一次需要发送上百条
+    /// 订阅。调用方可以降低间隔，避免长时间只写不读造成服务端心跳或缓冲压力。
+    pub fn read_live_text_messages_observed_many_with_subscribe_delay<F>(
+        &self,
+        subscribe_payloads: &[String],
+        max_text_messages: usize,
+        subscribe_delay: Duration,
+        mut observer: F,
+    ) -> VenueDataResult<()>
+    where
+        F: FnMut(&str, UtcTimestamp) -> bool,
+    {
+        if subscribe_payloads.is_empty()
+            || subscribe_payloads
+                .iter()
+                .any(|payload| payload.trim().is_empty())
+        {
+            return Err(VenueDataError::InvalidQuery {
+                field: "public_json.wss.subscribe_payloads",
+                reason: "must contain at least one non-empty public subscribe payload",
+            });
+        }
+        self.read_live_text_messages_after_connect(
+            subscribe_payloads,
+            max_text_messages,
+            subscribe_delay,
             &mut observer,
         )
     }
@@ -1826,13 +1859,19 @@ impl PublicJsonWssTextStreamClient {
     where
         F: FnMut(&str, UtcTimestamp) -> bool,
     {
-        self.read_live_text_messages_after_connect(&[], max_text_messages, &mut observer)
+        self.read_live_text_messages_after_connect(
+            &[],
+            max_text_messages,
+            Duration::from_millis(120),
+            &mut observer,
+        )
     }
 
     fn read_live_text_messages_after_connect<F>(
         &self,
         subscribe_payloads: &[String],
         max_text_messages: usize,
+        subscribe_delay: Duration,
         observer: &mut F,
     ) -> VenueDataResult<()>
     where
@@ -1867,8 +1906,8 @@ impl PublicJsonWssTextStreamClient {
                         format!("{} public WSS subscribe send failed: {error}", self.label),
                     ))
                 })?;
-            if index + 1 < subscribe_payloads.len() {
-                std::thread::sleep(Duration::from_millis(120));
+            if index + 1 < subscribe_payloads.len() && !subscribe_delay.is_zero() {
+                std::thread::sleep(subscribe_delay);
             }
         }
 

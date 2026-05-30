@@ -573,11 +573,11 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         run_hyperliquid_wss_book_ticker_monitor(options)?;
         if once {
             return Ok(format!(
-                "ok: ran one Hyperliquid public WSS bbo monitor cycle; market={market}; symbol={symbol}; api_bind={bind_addr}; mutable_execution_started=false"
+                "ok: ran one Hyperliquid public WSS top-of-book monitor cycle; market={market}; symbol={symbol}; api_bind={bind_addr}; mutable_execution_started=false"
             ));
         }
         return Ok(format!(
-            "ok: Hyperliquid public WSS bbo monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+            "ok: Hyperliquid public WSS top-of-book monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
     if args[0] == "binance-basis-monitor" {

@@ -45979,6 +45979,10 @@ mod tests {
             hyperliquid_wss_bbo_subscribe_payload("BTC").expect("payload"),
             r#"{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}"#
         );
+        assert_eq!(
+            hyperliquid_wss_top_of_book_subscribe_payload("BTC").expect("payload"),
+            r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#
+        );
 
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
         let aster_raw = r#"{"u":400900301,"s":"BTCUSDT","b":"43250.10","B":"1.00000000","a":"43251.20","A":"1.50000000","T":1778630400000}"#;
@@ -46002,6 +46006,23 @@ mod tests {
         assert_eq!(hyperliquid_parsed.symbol, "BTC");
         assert_eq!(hyperliquid_parsed.best_ask.to_string(), "43251.20");
         assert_eq!(hyperliquid_parsed.ask_size.to_string(), "1.50000000");
+
+        let hyperliquid_l2_book = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1778630401000,"levels":[[{"px":"43249.90","sz":"2.00000000","n":1}],[{"px":"43252.00","sz":"2.50000000","n":1}]]}}"#;
+        let hyperliquid_l2_parsed =
+            parse_hyperliquid_wss_bbo_runtime_raw(hyperliquid_l2_book, ingested_at)
+                .expect("hyperliquid l2Book raw")
+                .expect("l2Book update");
+        assert_eq!(hyperliquid_l2_parsed.symbol, "BTC");
+        assert_eq!(hyperliquid_l2_parsed.best_bid.to_string(), "43249.90");
+        assert_eq!(hyperliquid_l2_parsed.ask_size.to_string(), "2.50000000");
+
+        let hyperliquid_empty_l2_book =
+            r#"{"channel":"l2Book","data":{"coin":"BTC","time":1778630402000,"levels":[[],[]]}}"#;
+        assert!(
+            parse_hyperliquid_wss_bbo_runtime_raw(hyperliquid_empty_l2_book, ingested_at)
+                .expect("empty l2Book should not fail stream")
+                .is_none()
+        );
     }
 
     #[test]
@@ -46030,7 +46051,7 @@ mod tests {
         );
 
         let mut hyperliquid_state = hyperliquid_wss_test_market_state("BTC", false);
-        let hyperliquid_raw = r#"{"channel":"bbo","data":{"coin":"BTC","time":1778630400000,"bbo":[["43250.10","1.00000000"],["43251.20","1.50000000"]]}}"#;
+        let hyperliquid_raw = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1778630400000,"levels":[[["43250.10","1.00000000"]],[["43251.20","1.50000000"]]]}}"#;
         let hyperliquid_update = apply_hyperliquid_wss_book_ticker_text(
             hyperliquid_raw,
             ingested_at,

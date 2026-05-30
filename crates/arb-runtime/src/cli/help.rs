@@ -82,7 +82,7 @@ pub(crate) fn legacy_help_text() -> String {
         "  aster-wss-book-ticker [--bind 127.0.0.1:8794] [--symbol ALL_USDT|BTCUSDT[,ETHUSDT]] [--market usdt-futures] [--reconnect-delay-secs 2] [--once --updates 3]",
         "                                    Run Aster public WSS bookTicker scoped/all-market monitor and serve /api/aster-wss-book-ticker/status",
         "  hyperliquid-wss-book-ticker [--bind 127.0.0.1:8795] [--symbol ALL_USDT|BTC[,ETH]] [--market perp] [--reconnect-delay-secs 2] [--once --updates 3]",
-        "                                    Run Hyperliquid public WSS bbo scoped/all-market monitor and serve /api/hyperliquid-wss-book-ticker/status",
+        "                                    Run Hyperliquid public WSS top-of-book scoped/all-market monitor and serve /api/hyperliquid-wss-book-ticker/status",
         "  binance-basis-monitor [--bind 127.0.0.1:8796] [--interval-secs 5] [--min-abs-funding-rate 0] [--min-net-bps 5] [--once] [--out dir]",
         "                                    Monitor all Binance public USDT spot/perp basis rows and serve /api/basis/status",
         "  basis-exit-supervisor --position-state file [--config file] [--spot-wss-monitor-url url] [--perp-wss-monitor-url url] [--adl-events-dir dir] [--once] [--execute-live --i-understand-basis-live-orders] [--out dir]",

@@ -64,6 +64,7 @@ pub(crate) const ASTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8794
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8795";
 pub(crate) const ASTER_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+pub(crate) const HYPERLIQUID_WSS_SUBSCRIBE_DELAY_MS: u64 = 10;
 pub(crate) const ASTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const BYBIT_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/spot";
@@ -202,7 +203,7 @@ impl AsterPublicWssMarket {
     }
 }
 
-/// Hyperliquid 公开 WSS BBO 支持的市场。
+/// Hyperliquid 公开 WSS 顶层盘口支持的市场。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum HyperliquidPublicWssMarket {
     Perp,
@@ -294,7 +295,7 @@ impl Default for AsterWssBookTickerMonitorOptions {
     }
 }
 
-/// Hyperliquid `bbo` WSS 公开行情常驻任务选项。
+/// Hyperliquid 顶层盘口 WSS 公开行情常驻任务选项。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidWssBookTickerMonitorOptions {
     pub bind_addr: String,
@@ -1442,7 +1443,7 @@ pub(crate) fn run_aster_wss_book_ticker_monitor_cycle(
     }
 }
 
-/// 运行 Hyperliquid 公开 `bbo` WSS 常驻任务。
+/// 运行 Hyperliquid 公开顶层盘口 WSS 常驻任务。
 pub fn run_hyperliquid_wss_book_ticker_monitor(
     options: HyperliquidWssBookTickerMonitorOptions,
 ) -> RuntimeResult<()> {
@@ -1569,9 +1570,10 @@ pub(crate) fn run_hyperliquid_wss_book_ticker_monitor_cycle(
     };
     let mut observed_wss_event = false;
     let mut observer_error = None;
-    let read_result = text_client.read_live_text_messages_observed_many(
+    let read_result = text_client.read_live_text_messages_observed_many_with_subscribe_delay(
         &subscribe_payloads,
         max_text_messages,
+        Duration::from_millis(HYPERLIQUID_WSS_SUBSCRIBE_DELAY_MS),
         |raw_json, ingested_at| match apply_hyperliquid_wss_book_ticker_text(
             raw_json,
             ingested_at,
@@ -2287,7 +2289,7 @@ pub(crate) fn bootstrap_hyperliquid_wss_book_ticker(
         local_sequences.insert(row.coin.clone(), 1_u64);
         coordinators.insert(row.coin.clone(), coordinator);
         rest_updates.push(update);
-        subscribe_args.push(hyperliquid_wss_bbo_subscribe_payload(&row.coin)?);
+        subscribe_args.push(hyperliquid_wss_top_of_book_subscribe_payload(&row.coin)?);
     }
 
     Ok(PublicTopOfBookAllMarketState {
@@ -3137,7 +3139,7 @@ pub(crate) fn parse_hyperliquid_wss_bbo_runtime_raw(
     ) {
         return Ok(None);
     }
-    if channel.as_deref() != Some("bbo") {
+    if !matches!(channel.as_deref(), Some("bbo") | Some("l2Book")) {
         return Ok(None);
     }
     let Some(data) = root.get("data") else {
@@ -3145,19 +3147,24 @@ pub(crate) fn parse_hyperliquid_wss_bbo_runtime_raw(
     };
     let fields = parse_json_object_value_slices(data)?;
     let coin = required_json_value_string(&fields, "coin", "hyperliquid wss bbo")?;
-    let bbo = fields
-        .get("bbo")
-        .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: "Hyperliquid WSS bbo lacks `bbo` array".to_owned(),
-        })?;
-    let levels = json_array_value_slices(bbo)?;
-    if levels.len() < 2 {
-        return Err(RuntimeError::LiveMarketData {
-            message: "Hyperliquid WSS bbo must contain bid and ask levels".to_owned(),
-        });
-    }
-    let (best_bid, bid_size) = hyperliquid_wss_bbo_level(levels[0], "bid")?;
-    let (best_ask, ask_size) = hyperliquid_wss_bbo_level(levels[1], "ask")?;
+    let top_of_book = if channel.as_deref() == Some("l2Book") {
+        let levels = fields
+            .get("levels")
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "Hyperliquid WSS l2Book lacks `levels` array".to_owned(),
+            })?;
+        hyperliquid_wss_l2_book_top_of_book(levels)?
+    } else {
+        let bbo = fields
+            .get("bbo")
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "Hyperliquid WSS bbo lacks `bbo` array".to_owned(),
+            })?;
+        hyperliquid_wss_bbo_top_of_book(bbo)?
+    };
+    let Some((best_bid, bid_size, best_ask, ask_size)) = top_of_book else {
+        return Ok(None);
+    };
     let update_id = optional_json_scalar_u64(&fields, "time", "hyperliquid wss bbo")?
         .or(optional_json_scalar_u64(
             &fields,
@@ -3178,6 +3185,56 @@ pub(crate) fn parse_hyperliquid_wss_bbo_runtime_raw(
         ask_size,
         observed_at,
     }))
+}
+
+fn hyperliquid_wss_bbo_top_of_book(
+    value: &str,
+) -> RuntimeResult<Option<(Price, Quantity, Price, Quantity)>> {
+    let levels = json_array_value_slices(value)?;
+    if levels.len() < 2 {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Hyperliquid WSS bbo must contain bid and ask levels".to_owned(),
+        });
+    }
+    let Some((best_bid, bid_size)) = hyperliquid_wss_optional_level(levels[0], "bid")? else {
+        return Ok(None);
+    };
+    let Some((best_ask, ask_size)) = hyperliquid_wss_optional_level(levels[1], "ask")? else {
+        return Ok(None);
+    };
+    Ok(Some((best_bid, bid_size, best_ask, ask_size)))
+}
+
+fn hyperliquid_wss_l2_book_top_of_book(
+    value: &str,
+) -> RuntimeResult<Option<(Price, Quantity, Price, Quantity)>> {
+    let sides = json_array_value_slices(value)?;
+    if sides.len() < 2 {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Hyperliquid WSS l2Book must contain bid and ask sides".to_owned(),
+        });
+    }
+    let bids = json_array_value_slices(sides[0])?;
+    let asks = json_array_value_slices(sides[1])?;
+    let Some(bid) = bids.first() else {
+        return Ok(None);
+    };
+    let Some(ask) = asks.first() else {
+        return Ok(None);
+    };
+    let (best_bid, bid_size) = hyperliquid_wss_bbo_level(bid, "bid")?;
+    let (best_ask, ask_size) = hyperliquid_wss_bbo_level(ask, "ask")?;
+    Ok(Some((best_bid, bid_size, best_ask, ask_size)))
+}
+
+fn hyperliquid_wss_optional_level(
+    value: &str,
+    side: &'static str,
+) -> RuntimeResult<Option<(Price, Quantity)>> {
+    if value.trim() == "null" {
+        return Ok(None);
+    }
+    hyperliquid_wss_bbo_level(value, side).map(Some)
 }
 
 pub(crate) fn hyperliquid_wss_bbo_level(
@@ -3501,10 +3558,19 @@ pub(crate) fn aster_wss_book_ticker_stream_url(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn hyperliquid_wss_bbo_subscribe_payload(coin: &str) -> RuntimeResult<String> {
     let coin = validate_hyperliquid_public_wss_coin(coin)?;
     Ok(format!(
         "{{\"method\":\"subscribe\",\"subscription\":{{\"type\":\"bbo\",\"coin\":{}}}}}",
+        json_string(&coin)
+    ))
+}
+
+pub(crate) fn hyperliquid_wss_top_of_book_subscribe_payload(coin: &str) -> RuntimeResult<String> {
+    let coin = validate_hyperliquid_public_wss_coin(coin)?;
+    Ok(format!(
+        "{{\"method\":\"subscribe\",\"subscription\":{{\"type\":\"l2Book\",\"coin\":{}}}}}",
         json_string(&coin)
     ))
 }
