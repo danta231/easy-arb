@@ -1151,6 +1151,27 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                 }
                 0
             };
+            let recovered_flat_cancelled_orphan_positions = if unknown_recovery_enabled {
+                recover_funding_arb_flat_cancelled_orphan_positions_for_exit(
+                    &options,
+                    &output_root,
+                    cycles,
+                    &cycle_dir,
+                )?
+            } else {
+                let orphans =
+                    load_funding_arb_flat_cancelled_orphan_recovery_records(&output_root)?;
+                if !orphans.is_empty() {
+                    halt_reason = Some(format!(
+                        "{} unresolved flat-cancelled funding arb position candidate(s) exist; orphan recovery requires --allow-unknown-recovery or auto residual de-risk",
+                        orphans.len()
+                    ));
+                    break;
+                }
+                0
+            };
+            let recovered_positions =
+                recovered_unknown_positions + recovered_flat_cancelled_orphan_positions;
             let registry = load_funding_arb_resident_position_registry(&output_root)?;
             let active_positions = registry.active_positions();
             let mut residual_de_risk_pending = false;
@@ -1247,9 +1268,9 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                 thread::sleep(Duration::from_secs(options.poll_interval_secs));
                 continue;
             }
-            if recovered_unknown_positions > 0 {
+            if recovered_positions > 0 {
                 halt_reason = Some(
-                    "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
+                    "funding arb position recovery cycle completed; resident live stopped before new entries"
                         .to_owned(),
                 );
                 break;

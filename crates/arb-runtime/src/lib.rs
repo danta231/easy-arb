@@ -10244,15 +10244,17 @@ where
         | OrderConfirmationStatus::Expired => {
             if private_order_update_has_positive_fill(&second_update) {
                 handle_second_funding_perp_terminal_positive_fill(
-                    first_adapter,
-                    second_adapter,
-                    first,
-                    second,
-                    first_filled_quantity,
-                    &second_update,
-                    first_context,
-                    second_context,
-                    &mut outcome,
+                    SecondFundingPerpTerminalPositiveFillInput {
+                        first_adapter,
+                        second_adapter,
+                        first,
+                        second,
+                        first_filled_quantity,
+                        second_update: &second_update,
+                        first_context,
+                        second_context,
+                        outcome: &mut outcome,
+                    },
                 )?;
                 return Ok(outcome);
             }
@@ -10416,21 +10418,37 @@ where
 }
 
 #[cfg(feature = "live-exec")]
-fn handle_second_funding_perp_terminal_positive_fill<F, S>(
-    first_adapter: &mut F,
-    second_adapter: &mut S,
-    first: &PlannedSubmitOrder,
-    second: &PlannedSubmitOrder,
+struct SecondFundingPerpTerminalPositiveFillInput<'a, F, S> {
+    first_adapter: &'a mut F,
+    second_adapter: &'a mut S,
+    first: &'a PlannedSubmitOrder,
+    second: &'a PlannedSubmitOrder,
     first_filled_quantity: Quantity,
-    second_update: &PrivateOrderUpdate,
-    first_context: BasisOrderConfirmContext<'_>,
-    second_context: BasisOrderConfirmContext<'_>,
-    outcome: &mut BasisLiveExecutionOutcome,
+    second_update: &'a PrivateOrderUpdate,
+    first_context: BasisOrderConfirmContext<'a>,
+    second_context: BasisOrderConfirmContext<'a>,
+    outcome: &'a mut BasisLiveExecutionOutcome,
+}
+
+#[cfg(feature = "live-exec")]
+fn handle_second_funding_perp_terminal_positive_fill<F, S>(
+    input: SecondFundingPerpTerminalPositiveFillInput<'_, F, S>,
 ) -> RuntimeResult<()>
 where
     F: SubmitOrder + ConfirmOrderStatus,
     S: SubmitOrder + ConfirmOrderStatus,
 {
+    let SecondFundingPerpTerminalPositiveFillInput {
+        first_adapter,
+        second_adapter,
+        first,
+        second,
+        first_filled_quantity,
+        second_update,
+        first_context,
+        second_context,
+        outcome,
+    } = input;
     outcome.blocking_reasons.push(format!(
         "second funding perp leg reached terminal status `{}` with a positive fill; submitting reduce-only unwind for both filled legs",
         second_update.status.as_str()
@@ -29850,6 +29868,58 @@ fn recover_funding_arb_unknown_positions_for_exit(
 }
 
 #[cfg(feature = "live-exec")]
+fn recover_funding_arb_flat_cancelled_orphan_positions_for_exit(
+    options: &FundingArbResidentLiveOptions,
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+) -> RuntimeResult<usize> {
+    let candidates = load_funding_arb_flat_cancelled_orphan_recovery_records(output_root)?;
+    let mut recovered = 0_usize;
+    for candidate in candidates {
+        let recovery_dir = cycle_dir
+            .join("flat-cancelled-orphan-recovery")
+            .join(basis_identifier_component(&candidate.position_id));
+        match write_funding_arb_unknown_recovery_position_state(options, &candidate, &recovery_dir)
+        {
+            Ok(FundingArbUnknownRecoveryPositionStateOutcome::Open {
+                position_state_path,
+            }) => {
+                append_funding_arb_resident_flat_cancelled_orphan_position_opened(
+                    output_root,
+                    cycle,
+                    cycle_dir,
+                    &candidate,
+                    &position_state_path,
+                )?;
+                recovered += 1;
+            }
+            Ok(FundingArbUnknownRecoveryPositionStateOutcome::Flat { reason }) => {
+                append_funding_arb_resident_flat_cancelled_orphan_position_closed(
+                    output_root,
+                    cycle,
+                    cycle_dir,
+                    &candidate,
+                    &reason,
+                )?;
+            }
+            Err(error) => {
+                append_funding_arb_resident_error_event(
+                    output_root,
+                    cycle,
+                    &recovery_dir,
+                    &format!(
+                        "flat-cancelled orphan recovery failed for {}: {error}",
+                        candidate.position_id
+                    ),
+                )?;
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+#[cfg(feature = "live-exec")]
 fn load_funding_arb_unknown_position_recovery_records(
     output_root: &Path,
 ) -> RuntimeResult<Vec<FundingArbUnknownPositionRecovery>> {
@@ -29905,6 +29975,133 @@ fn load_funding_arb_unknown_position_recovery_records(
     }
 
     Ok(latest.into_values().flatten().collect())
+}
+
+#[cfg(feature = "live-exec")]
+fn load_funding_arb_flat_cancelled_orphan_recovery_records(
+    output_root: &Path,
+) -> RuntimeResult<Vec<FundingArbUnknownPositionRecovery>> {
+    let path = output_root.join("funding_arb_resident_positions.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut latest_by_pair: BTreeMap<String, Option<FundingArbUnknownPositionRecovery>> =
+        BTreeMap::new();
+    let contents = read_utf8(&path)?;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = parse_json_object_value_slices(line)?;
+        let event_type = required_json_value_string(
+            &fields,
+            "event_type",
+            "funding arb flat-cancelled orphan recovery",
+        )?;
+        let position_id = optional_json_value_string(
+            &fields,
+            "position_id",
+            "funding arb flat-cancelled orphan recovery",
+        )?;
+        let pair_id = optional_json_value_string(
+            &fields,
+            "pair_id",
+            "funding arb flat-cancelled orphan recovery",
+        )?;
+        match event_type.as_str() {
+            "position_flat_cancelled" => {
+                let Some(position_id) = position_id else {
+                    continue;
+                };
+                let Some(recovery) = funding_arb_flat_cancelled_orphan_recovery_record_from_fields(
+                    &fields,
+                    position_id,
+                )?
+                else {
+                    continue;
+                };
+                latest_by_pair.insert(recovery.pair_id.clone(), Some(recovery));
+            }
+            "position_opened" | "position_unknown" | "position_closed" => {
+                if let Some(pair_id) = pair_id {
+                    latest_by_pair.insert(pair_id, None);
+                } else if let Some(position_id) = position_id {
+                    for latest in latest_by_pair.values_mut() {
+                        if latest
+                            .as_ref()
+                            .is_some_and(|recovery| recovery.position_id == position_id)
+                        {
+                            *latest = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(latest_by_pair.into_values().flatten().collect())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_flat_cancelled_orphan_recovery_record_from_fields(
+    fields: &BTreeMap<String, &str>,
+    position_id: String,
+) -> RuntimeResult<Option<FundingArbUnknownPositionRecovery>> {
+    let Some(cycle_dir) = optional_json_value_string(
+        fields,
+        "cycle_dir",
+        "funding arb flat-cancelled orphan recovery",
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(pair_id) = optional_json_value_string(
+        fields,
+        "pair_id",
+        "funding arb flat-cancelled orphan recovery",
+    )?
+    .filter(|value| value != "unknown") else {
+        return Ok(None);
+    };
+    let Some(symbol) = optional_json_value_string(
+        fields,
+        "symbol",
+        "funding arb flat-cancelled orphan recovery",
+    )?
+    .filter(|value| value != "unknown") else {
+        return Ok(None);
+    };
+    let notional_usdt = funding_arb_flat_cancelled_orphan_recovery_notional(fields)?;
+    Ok(Some(FundingArbUnknownPositionRecovery {
+        position_id,
+        pair_id,
+        symbol,
+        cycle_dir: PathBuf::from(cycle_dir),
+        notional_usdt,
+    }))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_flat_cancelled_orphan_recovery_notional(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<String> {
+    let Some(raw) = optional_json_value_string(
+        fields,
+        "notional_usdt",
+        "funding arb flat-cancelled orphan recovery",
+    )?
+    else {
+        return Ok("unknown".to_owned());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return Ok("unknown".to_owned());
+    }
+    let parsed = MonitorDecimal::parse("funding arb flat-cancelled notional_usdt", trimmed)?;
+    if parsed.raw == 0 {
+        Ok("unknown".to_owned())
+    } else {
+        Ok(raw)
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -30306,6 +30503,29 @@ fn append_funding_arb_resident_recovered_position_opened(
 }
 
 #[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_flat_cancelled_orphan_position_opened(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    candidate: &FundingArbUnknownPositionRecovery,
+    position_state_path: &Path,
+) -> RuntimeResult<()> {
+    let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_opened\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"reason\":\"flat-cancelled funding arb entry still has non-zero private position; recovered for reduce-only exit/de-risk\",\"recovered_from_flat_cancelled\":true,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"open\",\"symbol\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&position_state.notional_usd),
+        json_string(&candidate.pair_id),
+        json_string(&candidate.position_id),
+        json_string(&position_state_path.display().to_string()),
+        json_string(&candidate.symbol),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
 fn append_funding_arb_resident_recovered_position_closed(
     output_root: &Path,
     cycle: u64,
@@ -30322,6 +30542,28 @@ fn append_funding_arb_resident_recovered_position_closed(
         json_string(&unknown.position_id),
         json_string(reason),
         json_string(&unknown.symbol),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_flat_cancelled_orphan_position_closed(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    candidate: &FundingArbUnknownPositionRecovery,
+    reason: &str,
+) -> RuntimeResult<()> {
+    let line = format!(
+        "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"notional_usdt\":{},\"pair_id\":{},\"position_id\":{},\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_flat_cancelled\":true,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&candidate.notional_usdt),
+        json_string(&candidate.pair_id),
+        json_string(&candidate.position_id),
+        json_string(reason),
+        json_string(&candidate.symbol),
     );
     append_funding_arb_resident_position_jsonl(output_root, &line)?;
     append_funding_arb_resident_event(output_root, &line)
@@ -49652,6 +49894,263 @@ mod tests {
             .as_deref()
             .expect("halt reason")
             .contains("--allow-unknown-recovery"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_flat_cancelled_orphan_recovery_uses_latest_candidate_per_pair() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let old_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(1).expect("old cycle"));
+        let latest_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(2).expect("latest cycle"));
+        let prove_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(3).expect("prove cycle"));
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":1,\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0\",\"pair_id\":\"binance:bybit:HEMIUSDT:HEMIUSDT\",\"position_id\":\"pos:old-hemi\",\"status\":\"flat_cancelled\",\"symbol\":\"HEMIUSDT\"}}\n\
+                 {{\"cycle\":2,\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0.00\",\"pair_id\":\"binance:bybit:HEMIUSDT:HEMIUSDT\",\"position_id\":\"pos:latest-hemi\",\"status\":\"flat_cancelled\",\"symbol\":\"HEMIUSDT\"}}\n\
+                 {{\"cycle\":3,\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0\",\"pair_id\":\"bybit:okx:PROVEUSDT:PROVE-USDT\",\"position_id\":\"pos:prove-flat\",\"status\":\"flat_cancelled\",\"symbol\":\"PROVEUSDT\"}}\n\
+                 {{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"pair_id\":\"bybit:okx:PROVEUSDT:PROVE-USDT\",\"position_id\":\"pos:prove-open\",\"position_state_path\":\"target/position.json\",\"status\":\"open\",\"symbol\":\"PROVEUSDT\"}}\n",
+                json_string(&old_cycle.display().to_string()),
+                json_string(&latest_cycle.display().to_string()),
+                json_string(&prove_cycle.display().to_string()),
+            ),
+        )
+        .expect("write registry");
+
+        let candidates = load_funding_arb_flat_cancelled_orphan_recovery_records(root.path())
+            .expect("flat-cancelled candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].position_id, "pos:latest-hemi");
+        assert_eq!(candidates[0].pair_id, "binance:bybit:HEMIUSDT:HEMIUSDT");
+        assert_eq!(candidates[0].symbol, "HEMIUSDT");
+        assert_eq!(candidates[0].cycle_dir, latest_cycle);
+        assert_eq!(candidates[0].notional_usdt, "unknown");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_flat_cancelled_orphan_recovery_reopens_bybit_short_for_exit() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let previous_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(367).expect("previous cycle"));
+        fs::create_dir_all(&previous_cycle).expect("create previous cycle");
+        let mut row = funding_arb_test_row("0.00600000", "0.00010000");
+        row.pair_id = "binance:bybit:HEMIUSDT:HEMIUSDT".to_owned();
+        row.symbol = "HEMIUSDT".to_owned();
+        row.venue_a_bid = "0.0072600".to_owned();
+        row.venue_a_ask = "0.0072624".to_owned();
+        row.venue_a_bid_qty = "50000".to_owned();
+        row.venue_a_ask_qty = "50000".to_owned();
+        row.venue_a_bid_depth = signal_depth_from_top_strings("0.0072600", "50000");
+        row.venue_a_ask_depth = signal_depth_from_top_strings("0.0072624", "50000");
+        row.venue_a_mark_price = "0.0072610".to_owned();
+        row.venue_a_index_price = "0.0072610".to_owned();
+        row.venue_b_bid = "0.0072700".to_owned();
+        row.venue_b_ask = "0.0072720".to_owned();
+        row.venue_b_bid_qty = "50000".to_owned();
+        row.venue_b_ask_qty = "50000".to_owned();
+        row.venue_b_bid_depth = signal_depth_from_top_strings("0.0072700", "50000");
+        row.venue_b_ask_depth = signal_depth_from_top_strings("0.0072720", "50000");
+        row.venue_b_mark_price = "0.0072700".to_owned();
+        row.venue_b_index_price = "0.0072700".to_owned();
+        row.long_venue_family = Some("binance".to_owned());
+        row.short_venue_family = Some("bybit".to_owned());
+        let snapshot = funding_arb_test_snapshot(vec![row], "2026-05-28T12:00:00Z".to_owned());
+        write_utf8(
+            previous_cycle.join("funding_arb_monitor_snapshot.json"),
+            &snapshot.to_json(),
+        )
+        .expect("write previous snapshot");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":367,\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0\",\"pair_id\":\"binance:bybit:HEMIUSDT:HEMIUSDT\",\"position_id\":\"pos:funding-arb:binance-bybit-hemiusdt:367\",\"status\":\"flat_cancelled\",\"symbol\":\"HEMIUSDT\"}}\n",
+                json_string(&previous_cycle.display().to_string()),
+            ),
+        )
+        .expect("write flat-cancelled registry");
+        let options = FundingArbResidentLiveOptions {
+            config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
+            output_dir: Some(root.path().to_path_buf()),
+            snapshot_path: None,
+            pair_id: None,
+            sources: Vec::new(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            private_order_events_dir: Some(root.path().join("private-order-events")),
+            poll_interval_secs: 60,
+            max_cycles: None,
+            notional_usd: "10.00".to_owned(),
+            taker_fee_bps: "5".to_owned(),
+            slippage_buffer_bps: 5,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: 5,
+            execute_live: true,
+            acknowledge_funding_arb_live_orders: true,
+            allow_unknown_recovery: false,
+            auto_residual_de_risk: true,
+            exit_only: false,
+            hyperliquid_user: None,
+            hyperliquid_source: "a".to_owned(),
+            hyperliquid_vault_address: None,
+            hyperliquid_expires_after_ms: None,
+            hyperliquid_asset_ids: BTreeMap::new(),
+            aster_user: None,
+            aster_signer: None,
+            aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
+        };
+        let current_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(368).expect("current cycle"));
+
+        let mut candidates = load_funding_arb_flat_cancelled_orphan_recovery_records(root.path())
+            .expect("flat-cancelled candidates");
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.remove(0);
+        assert_eq!(candidate.notional_usdt, "unknown");
+        let recovery_dir = current_cycle
+            .join("flat-cancelled-orphan-recovery")
+            .join(basis_identifier_component(&candidate.position_id));
+        let (_snapshot_path, recovery_row, recovery_state) =
+            build_funding_arb_unknown_recovery_position_state_template(&options, &candidate)
+                .expect("recovery state template");
+        let private_snapshot = FundingPrivatePositionSnapshot {
+            status: "complete".to_owned(),
+            updated_at: Some("2026-05-28T12:01:00Z".to_owned()),
+            positions: vec![
+                FundingPrivatePositionEntry {
+                    venue_family: "binance".to_owned(),
+                    symbol: "HEMIUSDT".to_owned(),
+                    account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                    quantity: "0".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Long),
+                    mark_price: Some("0.0072610".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+                FundingPrivatePositionEntry {
+                    venue_family: "bybit".to_owned(),
+                    symbol: "HEMIUSDT".to_owned(),
+                    account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                    quantity: "8302".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Short),
+                    mark_price: Some("0.0072700".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+            ],
+        };
+        let position_state_path =
+            match write_funding_arb_unknown_recovery_position_state_from_private_snapshot(
+                &recovery_dir,
+                &recovery_row,
+                recovery_state,
+                &private_snapshot,
+            )
+            .expect("write recovered state")
+            {
+                FundingArbUnknownRecoveryPositionStateOutcome::Open {
+                    position_state_path,
+                } => position_state_path,
+                FundingArbUnknownRecoveryPositionStateOutcome::Flat { reason } => {
+                    panic!("expected nonzero orphan state, got flat: {reason}")
+                }
+            };
+        append_funding_arb_resident_flat_cancelled_orphan_position_opened(
+            root.path(),
+            368,
+            &current_cycle,
+            &candidate,
+            &position_state_path,
+        )
+        .expect("append recovered orphan position");
+
+        let registry =
+            load_funding_arb_resident_position_registry(root.path()).expect("resident registry");
+        let active = registry.active_positions();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].notional_usdt, "10.00");
+        assert_eq!(registry.unknown_position_count(), 0);
+        let state_json = read_utf8(&active[0].position_state_path).expect("position state");
+        let state = parse_funding_arb_position_state_json(&state_json).expect("parsed state");
+        assert_eq!(state.pair_id, "binance:bybit:HEMIUSDT:HEMIUSDT");
+        assert_eq!(state.symbol, "HEMIUSDT");
+        assert_eq!(state.notional_usd, "10.00");
+        assert_eq!(state.leg_a.venue_family, "binance");
+        assert_eq!(state.leg_a.side, OrderSide::Buy);
+        assert_eq!(state.leg_a.quantity, "0");
+        assert_eq!(state.leg_b.venue_family, "bybit");
+        assert_eq!(state.leg_b.role, "funding_perp_short");
+        assert_eq!(state.leg_b.side, OrderSide::Sell);
+        assert_eq!(state.leg_b.quantity, "8302");
+        let leg_b_exit =
+            funding_arb_exit_leg_snapshot(&recovery_row, &state.leg_b, &private_snapshot, 5)
+                .expect("bybit orphan exit leg");
+        assert!(leg_b_exit.close_required);
+        assert!(leg_b_exit.signed_quantity.raw < 0);
+        assert_eq!(leg_b_exit.close_quantity.to_string(), "8302");
+        assert!(
+            load_funding_arb_flat_cancelled_orphan_recovery_records(root.path())
+                .expect("pending orphan candidates")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_flat_cancelled_orphan_recovery_marks_flat_snapshot_closed() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let cycle_dir = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(4).expect("cycle"));
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":3,\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0\",\"pair_id\":\"binance:bybit:HEMIUSDT:HEMIUSDT\",\"position_id\":\"pos:flat-hemi\",\"status\":\"flat_cancelled\",\"symbol\":\"HEMIUSDT\"}}\n",
+                json_string(&cycle_dir.display().to_string()),
+            ),
+        )
+        .expect("write flat-cancelled registry");
+        let mut candidates = load_funding_arb_flat_cancelled_orphan_recovery_records(root.path())
+            .expect("flat-cancelled candidates");
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.remove(0);
+
+        append_funding_arb_resident_flat_cancelled_orphan_position_closed(
+            root.path(),
+            4,
+            &cycle_dir,
+            &candidate,
+            "flat-cancelled recovery private snapshot has no non-zero legs",
+        )
+        .expect("append flat orphan closed");
+
+        let registry =
+            load_funding_arb_resident_position_registry(root.path()).expect("resident registry");
+        assert_eq!(registry.active_positions().len(), 0);
+        assert_eq!(registry.closed_position_count(), 1);
+        assert!(
+            load_funding_arb_flat_cancelled_orphan_recovery_records(root.path())
+                .expect("pending orphan candidates")
+                .is_empty()
+        );
     }
 
     #[test]
