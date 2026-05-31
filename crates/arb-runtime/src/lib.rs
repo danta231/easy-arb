@@ -5333,6 +5333,10 @@ fn resident_entry_cycle_error_can_retry(error: &RuntimeError) -> bool {
                     "ingested timestamp must be greater than or equal to observed timestamp",
                 )
         }
+        RuntimeError::Module {
+            module: "arb-runtime",
+            message,
+        } => message.starts_with("funding arb monitor row is not a candidate: "),
         _ => false,
     }
 }
@@ -5386,6 +5390,12 @@ fn resident_retryable_error_class(error: &RuntimeError) -> &'static str {
             ) =>
         {
             "private_snapshot_timestamp_skew"
+        }
+        RuntimeError::Module {
+            module: "arb-runtime",
+            message,
+        } if message.starts_with("funding arb monitor row is not a candidate: ") => {
+            "stale_funding_arb_candidate"
         }
         _ => "non_retryable",
     }
@@ -57468,6 +57478,10 @@ mod tests {
             module: "arb-venue-data",
             message: "venue data query field `freshness.ingested_at` is invalid: ingested timestamp must be greater than or equal to observed timestamp".to_owned(),
         };
+        let stale_funding_arb_candidate = RuntimeError::Module {
+            module: "arb-runtime",
+            message: "funding arb monitor row is not a candidate: forward=net_funding_bps=-4.37885 below minimum 5; reverse=insufficient order-book depth".to_owned(),
+        };
         let private_http = RuntimeError::LiveMarketData {
             message: "curl failed before a reliable Bitget private HTTP response was available"
                 .to_owned(),
@@ -57491,6 +57505,13 @@ mod tests {
         assert!(resident_entry_cycle_error_can_retry(
             &private_timestamp_skew
         ));
+        assert!(resident_entry_cycle_error_can_retry(
+            &stale_funding_arb_candidate
+        ));
+        assert_eq!(
+            resident_retryable_error_class(&stale_funding_arb_candidate),
+            "stale_funding_arb_candidate"
+        );
         assert!(!resident_entry_cycle_error_can_retry(&private_http));
         assert!(!resident_entry_cycle_error_can_retry(&unsafe_config));
         assert!(!resident_entry_cycle_error_can_isolate_venue(
