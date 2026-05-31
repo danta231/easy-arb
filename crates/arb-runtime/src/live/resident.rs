@@ -1336,7 +1336,7 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                                         &cycle_dir,
                                         &outcome,
                                     )?;
-                                } else if funding_arb_entry_dispatch_missing_position_state_requires_halt(
+                                } else if funding_arb_entry_dispatch_missing_position_state_requires_reconciliation(
                                     outcome.canary.submitted_receipt_count,
                                     outcome.canary.private_confirmation_count,
                                     outcome.canary.residual_risk.as_deref(),
@@ -1349,11 +1349,38 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                                         &outcome,
                                         "funding arb entry dispatch left unknown or residual state before a durable position state was written",
                                     )?;
-                                    halt_reason = Some(
-                                        "funding arb entry dispatch attempted but no durable position state was written; resident live stopped"
-                                            .to_owned(),
-                                    );
-                                    break;
+                                    if options.auto_residual_de_risk {
+                                        append_funding_arb_resident_residual_retry_event(
+                                            &output_root,
+                                            cycles,
+                                            &cycle_dir,
+                                            "funding arb entry dispatch left unknown state; auto residual de-risk will retry from private position snapshot before new entries",
+                                        )?;
+                                        position_recovery_drain_mode = true;
+                                        force_residual_de_risk_cycle = true;
+                                        write_funding_arb_resident_live_progress_summary(
+                                            &output_root,
+                                            FundingArbResidentLiveProgressInput {
+                                                phase: "running",
+                                                cycles,
+                                                last_pair_id: &last_pair_id,
+                                                last_symbol: &last_symbol,
+                                                last_net_funding_bps,
+                                                dispatch_attempted,
+                                                halt_reason: None,
+                                            },
+                                        )?;
+                                        thread::sleep(Duration::from_secs(
+                                            options.poll_interval_secs,
+                                        ));
+                                        continue;
+                                    } else {
+                                        halt_reason = Some(
+                                            "funding arb entry dispatch attempted but no durable position state was written; resident live stopped"
+                                                .to_owned(),
+                                        );
+                                        break;
+                                    }
                                 } else if funding_arb_entry_dispatch_rejection_requires_halt(
                                     outcome.canary.mutable_execution_started,
                                     !outcome.canary.blocking_reasons.is_empty(),

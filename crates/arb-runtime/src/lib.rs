@@ -30612,7 +30612,7 @@ struct FundingArbExitCycleReport {
 }
 
 #[cfg(feature = "live-exec")]
-fn funding_arb_entry_dispatch_missing_position_state_requires_halt(
+fn funding_arb_entry_dispatch_missing_position_state_requires_reconciliation(
     submitted_receipt_count: usize,
     private_confirmation_count: usize,
     residual_risk: Option<&str>,
@@ -49537,7 +49537,7 @@ mod tests {
         .expect("position raw snapshot");
         write_utf8(
             settlement_dir.join("funding_settlement_raw_snapshot.json"),
-            r#"{"schema_version":"1.0.0","source_errors":[],"status":"complete","statements":[{"account_id":"acct:binance-funding-arb-readonly","payload":"[{\"symbol\":\"FIDAUSDT\",\"incomeType\":\"FUNDING_FEE\",\"income\":\"-0.29304005\",\"asset\":\"USDT\",\"time\":1779681602000}]","venue_family":"binance"},{"account_id":"acct:bitget-funding-arb-readonly","payload":"[{\"symbol\":\"FIDAUSDT\",\"businessType\":\"funding_fee\",\"amount\":\"0.111\",\"ts\":1779681602000}]","venue_family":"bitget"}],"updated_at":"2026-05-25T01:54:00Z"}"#,
+            r#"{"schema_version":"1.0.0","source_errors":[],"status":"complete","statements":[{"account_id":"acct:binance-funding-arb-readonly","payload":"[{\"symbol\":\"FIDAUSDT\",\"incomeType\":\"FUNDING_FEE\",\"income\":\"9.99\",\"asset\":\"USDT\",\"time\":1779670000000},{\"symbol\":\"FIDAUSDT\",\"incomeType\":\"FUNDING_FEE\",\"income\":\"-0.29304005\",\"asset\":\"USDT\",\"time\":1779681602000}]","venue_family":"binance"},{"account_id":"acct:bitget-funding-arb-readonly","payload":"[{\"symbol\":\"FIDAUSDT\",\"businessType\":\"funding_fee\",\"amount\":\"8.88\",\"ts\":1779670000000},{\"symbol\":\"FIDAUSDT\",\"businessType\":\"funding_fee\",\"amount\":\"0.111\",\"ts\":1779681602000}]","venue_family":"bitget"}],"updated_at":"2026-05-25T01:54:00Z"}"#,
         )
         .expect("settlement raw snapshot");
         write_utf8(
@@ -54914,19 +54914,35 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
-    fn funding_arb_entry_dispatch_missing_position_state_only_halts_on_durable_evidence() {
-        assert!(!funding_arb_entry_dispatch_missing_position_state_requires_halt(0, 0, None, true));
-        assert!(funding_arb_entry_dispatch_missing_position_state_requires_halt(1, 0, None, true));
-        assert!(funding_arb_entry_dispatch_missing_position_state_requires_halt(0, 1, None, true));
+    fn funding_arb_entry_dispatch_missing_position_state_only_reconciles_on_durable_evidence() {
         assert!(
-            funding_arb_entry_dispatch_missing_position_state_requires_halt(
+            !funding_arb_entry_dispatch_missing_position_state_requires_reconciliation(
+                0, 0, None, true
+            )
+        );
+        assert!(
+            funding_arb_entry_dispatch_missing_position_state_requires_reconciliation(
+                1, 0, None, true
+            )
+        );
+        assert!(
+            funding_arb_entry_dispatch_missing_position_state_requires_reconciliation(
+                0, 1, None, true
+            )
+        );
+        assert!(
+            funding_arb_entry_dispatch_missing_position_state_requires_reconciliation(
                 0,
                 0,
                 Some("first leg state is unknown"),
                 true
             )
         );
-        assert!(funding_arb_entry_dispatch_missing_position_state_requires_halt(0, 0, None, false));
+        assert!(
+            funding_arb_entry_dispatch_missing_position_state_requires_reconciliation(
+                0, 0, None, false
+            )
+        );
         assert!(funding_arb_entry_dispatch_rejection_requires_halt(
             true, true, 0, 0, None
         ));

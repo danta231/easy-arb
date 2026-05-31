@@ -3,12 +3,15 @@ use std::fs;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use crate::monitors::dashboard::system_navigation_pages_json_with_wss_pid_file;
 use crate::*;
+
+const PORTFOLIO_FUNDING_SETTLEMENT_GRACE_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioDashboardSnapshot {
@@ -613,10 +616,96 @@ pub(crate) fn portfolio_position_row_matches_funding_settlement(
     if !venue_matches {
         return false;
     }
-    row.account_id
+    if !row
+        .account_id
         .split('/')
         .map(str::trim)
         .any(|account_id| account_id == entry.account_id)
+    {
+        return false;
+    }
+
+    portfolio_position_row_matches_funding_settlement_window(row, entry)
+}
+
+pub(crate) fn portfolio_position_row_matches_funding_settlement_window(
+    row: &PortfolioPositionRow,
+    entry: &FundingSettlementLedgerEntry,
+) -> bool {
+    let opened_at_ms = row
+        .opened_at
+        .as_deref()
+        .and_then(portfolio_timestamp_ms_from_value);
+    let settlement_ms = row
+        .funding_settlement_time
+        .as_deref()
+        .and_then(portfolio_max_timestamp_ms_from_value);
+    let requires_window = row.position_group_id.is_some() || opened_at_ms.is_some();
+
+    if !requires_window {
+        return true;
+    }
+
+    let Some(entry_ms) = entry.timestamp_ms else {
+        return false;
+    };
+
+    if opened_at_ms.is_some_and(|opened_at_ms| entry_ms < opened_at_ms) {
+        return false;
+    }
+    if settlement_ms.is_some_and(|settlement_ms| {
+        entry_ms > settlement_ms.saturating_add(PORTFOLIO_FUNDING_SETTLEMENT_GRACE_MS)
+    }) {
+        return false;
+    }
+
+    true
+}
+
+pub(crate) fn portfolio_timestamp_ms_from_value(value: &str) -> Option<u64> {
+    let raw = value.trim();
+    if raw.is_empty() || raw == "-" {
+        return None;
+    }
+    if raw.chars().all(|ch| ch.is_ascii_digit()) {
+        return match raw.len() {
+            13 => raw.parse::<u64>().ok(),
+            10 => raw
+                .parse::<u64>()
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1000)),
+            _ => None,
+        };
+    }
+    UtcTimestamp::from_str(raw)
+        .ok()
+        .and_then(|timestamp| runtime_timestamp_millis(timestamp).ok())
+        .and_then(|timestamp_ms| u64::try_from(timestamp_ms).ok())
+}
+
+pub(crate) fn portfolio_max_timestamp_ms_from_value(value: &str) -> Option<u64> {
+    let mut timestamps = Vec::new();
+    let mut start = None::<usize>;
+    for (index, ch) in value.char_indices() {
+        if ch.is_ascii_digit() {
+            if start.is_none() {
+                start = Some(index);
+            }
+        } else if let Some(start_index) = start.take() {
+            if let Some(timestamp) = portfolio_timestamp_ms_from_value(&value[start_index..index]) {
+                timestamps.push(timestamp);
+            }
+        }
+    }
+    if let Some(start_index) = start {
+        if let Some(timestamp) = portfolio_timestamp_ms_from_value(&value[start_index..]) {
+            timestamps.push(timestamp);
+        }
+    }
+    timestamps
+        .into_iter()
+        .max()
+        .or_else(|| portfolio_timestamp_ms_from_value(value))
 }
 
 pub(crate) fn portfolio_dashboard_snapshot_json(snapshot: &PortfolioDashboardSnapshot) -> String {
