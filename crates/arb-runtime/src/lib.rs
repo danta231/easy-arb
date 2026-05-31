@@ -353,6 +353,13 @@ const RUNTIME_JSONL_ROTATE_DEFAULT_BYTES: u64 = 32 * 1024 * 1024;
 const RUNTIME_JSONL_ROTATE_DEFAULT_KEEP: usize = 3;
 #[cfg(feature = "live-exec")]
 const RUNTIME_JSONL_ROTATE_KEEP_LIMIT: usize = 32;
+#[cfg(feature = "live-exec")]
+const OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_MAX_BYTES_ENV: &str =
+    "ARB_RUNTIME_FULL_POLL_PROVENANCE_MAX_BYTES";
+#[cfg(feature = "live-exec")]
+const OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "live-exec")]
+const OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_MAX_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 const FUNDING_ARB_FULL_DEBUG_ARTIFACTS_ENV: &str = "ARB_RUNTIME_FUNDING_ARB_FULL_DEBUG_ARTIFACTS";
 const FUNDING_ARB_BLOCKING_PATH_GROUP_LIMIT: usize = 24;
 const FUNDING_ARB_BLOCKING_PATH_GROUP_SAMPLE_LIMIT: usize = 3;
@@ -5074,7 +5081,7 @@ fn append_binance_basis_resident_position_jsonl(
 
 #[cfg(feature = "live-exec")]
 fn append_line_to_jsonl(path: PathBuf, line: &str) -> RuntimeResult<()> {
-    rotate_append_jsonl_if_needed(&path)?;
+    rotate_append_jsonl_for_pending_line(&path, line.len().saturating_add(1))?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -5125,15 +5132,39 @@ fn runtime_jsonl_rotate_keep() -> RuntimeResult<usize> {
 }
 
 #[cfg(feature = "live-exec")]
-fn rotate_append_jsonl_if_needed(path: &Path) -> RuntimeResult<()> {
-    rotate_append_jsonl_if_needed_with_limits(
+fn opportunity_recorder_full_poll_provenance_max_bytes() -> RuntimeResult<usize> {
+    let Ok(raw) = std::env::var(OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_MAX_BYTES_ENV) else {
+        return Ok(OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_DEFAULT_MAX_BYTES);
+    };
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| RuntimeError::UnsafeConfig {
+            message: format!(
+                "{OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_MAX_BYTES_ENV} must be a non-negative integer"
+            ),
+        })?;
+    if value > OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_MAX_BYTES_LIMIT {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "{OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_MAX_BYTES_ENV} must be between 0 and {OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_MAX_BYTES_LIMIT}"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "live-exec")]
+fn rotate_append_jsonl_for_pending_line(path: &Path, pending_bytes: usize) -> RuntimeResult<()> {
+    rotate_append_jsonl_for_pending_line_with_limits(
         path,
+        pending_bytes,
         runtime_jsonl_rotate_bytes()?,
         runtime_jsonl_rotate_keep()?,
     )
 }
 
-#[cfg(feature = "live-exec")]
+#[cfg(all(feature = "live-exec", test))]
 fn rotate_append_jsonl_if_needed_with_limits(
     path: &Path,
     max_bytes: u64,
@@ -5155,7 +5186,41 @@ fn rotate_append_jsonl_if_needed_with_limits(
     if len < max_bytes {
         return Ok(());
     }
+    rotate_append_jsonl_now(path, keep)
+}
 
+#[cfg(feature = "live-exec")]
+fn rotate_append_jsonl_for_pending_line_with_limits(
+    path: &Path,
+    pending_bytes: usize,
+    max_bytes: u64,
+    keep: usize,
+) -> RuntimeResult<()> {
+    if max_bytes == 0 || keep == 0 {
+        return Ok(());
+    }
+    let len = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(RuntimeError::Io {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if len == 0 {
+        return Ok(());
+    }
+    let pending_bytes = u64::try_from(pending_bytes).unwrap_or(u64::MAX);
+    if len.saturating_add(pending_bytes) <= max_bytes {
+        return Ok(());
+    }
+    rotate_append_jsonl_now(path, keep)
+}
+
+#[cfg(feature = "live-exec")]
+fn rotate_append_jsonl_now(path: &Path, keep: usize) -> RuntimeResult<()> {
     let oldest = rotated_append_jsonl_path(path, keep);
     if oldest.exists() {
         fs::remove_file(&oldest).map_err(|error| RuntimeError::Io {
@@ -21689,33 +21754,162 @@ fn append_opportunity_recorder_provenance_snapshot(
     endpoint: &str,
 ) -> RuntimeResult<()> {
     let full_provenance = runtime_bool_env(OPPORTUNITY_RECORDER_FULL_POLL_PROVENANCE_ENV, false)?;
-    let provenance_body;
-    let mut extras = vec![
-        ("recorded_at", json_string(recorded_at)),
-        ("strategy", json_string(strategy)),
-        ("endpoint", json_string(endpoint)),
-        ("mutable_execution_started", "false".to_owned()),
-    ];
-    let body = if full_provenance {
-        extras.push(("artifact_mode", json_string("full_poll_provenance")));
-        body
-    } else {
-        provenance_body = opportunity_recorder_compact_candidate_snapshot_json(
+    let line =
+        build_opportunity_recorder_provenance_line(OpportunityRecorderProvenanceLineRequest {
             body,
             updated_at_fields,
-            options.blocking_path_limit,
-            "compact_poll_provenance",
-        )?;
-        provenance_body.as_str()
-    };
-    if let Some(venue) = venue {
-        extras.push(("venue", json_string(venue)));
-    }
-    let line = json_object_with_extra_fields(body, &extras)?;
+            recorded_at,
+            strategy,
+            venue,
+            endpoint,
+            blocking_path_limit: options.blocking_path_limit,
+            full_provenance,
+            full_provenance_max_bytes: opportunity_recorder_full_poll_provenance_max_bytes()?,
+        })?;
     append_line_to_jsonl(
         opportunity_recorder_provenance_path(options, strategy, venue),
         &line,
     )
+}
+
+#[cfg(feature = "live-exec")]
+struct OpportunityRecorderProvenanceLineRequest<'a> {
+    body: &'a str,
+    updated_at_fields: &'a [&'static str],
+    recorded_at: &'a str,
+    strategy: &'static str,
+    venue: Option<&'a str>,
+    endpoint: &'a str,
+    blocking_path_limit: usize,
+    full_provenance: bool,
+    full_provenance_max_bytes: usize,
+}
+
+#[cfg(feature = "live-exec")]
+fn build_opportunity_recorder_provenance_line(
+    request: OpportunityRecorderProvenanceLineRequest<'_>,
+) -> RuntimeResult<String> {
+    let mut extras = vec![
+        ("recorded_at", json_string(request.recorded_at)),
+        ("strategy", json_string(request.strategy)),
+        ("endpoint", json_string(request.endpoint)),
+        ("mutable_execution_started", "false".to_owned()),
+    ];
+    if let Some(venue) = request.venue {
+        extras.push(("venue", json_string(venue)));
+    }
+    if request.full_provenance {
+        extras.push(("artifact_mode", json_string("full_poll_provenance")));
+        let line = json_object_with_extra_fields(request.body, &extras)?;
+        if request.full_provenance_max_bytes == 0 || line.len() <= request.full_provenance_max_bytes
+        {
+            return Ok(line);
+        }
+        return opportunity_recorder_bounded_full_provenance_line(
+            request.body,
+            request.updated_at_fields,
+            request.blocking_path_limit,
+            &extras,
+            line.len(),
+            request.full_provenance_max_bytes,
+        );
+    }
+    let compact_body = opportunity_recorder_compact_candidate_snapshot_json(
+        request.body,
+        request.updated_at_fields,
+        request.blocking_path_limit,
+        "compact_poll_provenance",
+    )?;
+    json_object_with_extra_fields(&compact_body, &extras)
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_bounded_full_provenance_line(
+    body: &str,
+    updated_at_fields: &[&'static str],
+    blocking_path_limit: usize,
+    base_extras: &[(&'static str, String)],
+    original_line_bytes: usize,
+    max_line_bytes: usize,
+) -> RuntimeResult<String> {
+    let mut extras = base_extras
+        .iter()
+        .filter(|(key, _)| *key != "artifact_mode")
+        .cloned()
+        .collect::<Vec<_>>();
+    extras.push((
+        "requested_artifact_mode",
+        json_string("full_poll_provenance"),
+    ));
+    extras.push(("full_poll_provenance_compacted", "true".to_owned()));
+    extras.push((
+        "full_poll_provenance_line_bytes",
+        original_line_bytes.to_string(),
+    ));
+    extras.push((
+        "full_poll_provenance_max_line_bytes",
+        max_line_bytes.to_string(),
+    ));
+    let compact_body = opportunity_recorder_compact_candidate_snapshot_json(
+        body,
+        updated_at_fields,
+        blocking_path_limit,
+        "bounded_full_poll_provenance",
+    )?;
+    let compact_line = json_object_with_extra_fields(&compact_body, &extras)?;
+    if max_line_bytes == 0 || compact_line.len() <= max_line_bytes {
+        return Ok(compact_line);
+    }
+
+    let minimal_body = opportunity_recorder_minimal_provenance_snapshot_json(
+        body,
+        updated_at_fields,
+        "bounded_full_poll_provenance_minimal",
+    )?;
+    let mut minimal_extras = extras;
+    minimal_extras.push(("compact_line_bytes", compact_line.len().to_string()));
+    json_object_with_extra_fields(&minimal_body, &minimal_extras)
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_minimal_provenance_snapshot_json(
+    body: &str,
+    updated_at_fields: &[&'static str],
+    artifact_mode: &'static str,
+) -> RuntimeResult<String> {
+    let fields = parse_json_object_value_slices(body)?;
+    let candidate_count =
+        opportunity_recorder_usize_field(&fields, "candidate_count")?.unwrap_or(0);
+    let row_values = json_object_array_field_slices(&fields, "rows")?;
+    let mut non_candidate_row_count = 0usize;
+    for row in &row_values {
+        let row_fields = parse_json_object_value_slices(row)?;
+        if !json_field_is_true(&row_fields, "is_candidate")? {
+            non_candidate_row_count = non_candidate_row_count.saturating_add(1);
+        }
+    }
+    let status = opportunity_recorder_optional_field(&fields, "status")
+        .unwrap_or_else(|| "unknown".to_owned());
+    let updated_at = updated_at_fields
+        .iter()
+        .find_map(|field| opportunity_recorder_optional_field(&fields, field))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let blocking_path_total_count = fields
+        .get("blocking_path")
+        .filter(|value| value.trim() != "null")
+        .map(|value| json_array_value_slices(value).map(|values| values.len()))
+        .transpose()?
+        .unwrap_or(0);
+    Ok(format!(
+        "{{\"artifact_mode\":{},\"blocking_path\":[],\"blocking_path_total_count\":{},\"blocking_path_truncated\":true,\"candidate_count\":{},\"minimal_due_to_max_line_bytes\":true,\"non_candidate_row_count\":{},\"retained_rows\":0,\"rows\":[],\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+        json_string(artifact_mode),
+        blocking_path_total_count,
+        candidate_count,
+        non_candidate_row_count,
+        json_string(&status),
+        row_values.len(),
+        json_string(&updated_at),
+    ))
 }
 
 #[cfg(feature = "live-exec")]
@@ -22483,8 +22677,8 @@ fn opportunity_recorder_strategy_list(options: &OpportunityRecorderOptions) -> S
 
 #[cfg(feature = "live-exec")]
 fn append_text_line_to_file(path: PathBuf, line: &str) -> RuntimeResult<()> {
-    rotate_append_jsonl_if_needed(&path)?;
     let compacted_line = compact_repeated_pipe_segments(line);
+    rotate_append_jsonl_for_pending_line(&path, compacted_line.len().saturating_add(1))?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -30759,6 +30953,21 @@ fn recover_funding_arb_flat_cancelled_orphan_positions_for_exit(
         let recovery_dir = cycle_dir
             .join("flat-cancelled-orphan-recovery")
             .join(basis_identifier_component(&candidate.position_id));
+        let snapshot_path = funding_arb_unknown_recovery_snapshot_path(&candidate);
+        if !funding_arb_recovery_snapshot_artifact_available(&snapshot_path)? {
+            append_funding_arb_resident_flat_cancelled_orphan_position_closed_with_decision(
+                output_root,
+                cycle,
+                cycle_dir,
+                &candidate,
+                "missing_recovery_artifact",
+                &format!(
+                    "flat-cancelled orphan recovery skipped because legacy funding arb monitor snapshot is missing or not a file: {}",
+                    snapshot_path.display()
+                ),
+            )?;
+            continue;
+        }
         match write_funding_arb_unknown_recovery_position_state(options, &candidate, &recovery_dir)
         {
             Ok(FundingArbUnknownRecoveryPositionStateOutcome::Open {
@@ -30918,6 +31127,25 @@ fn load_funding_arb_flat_cancelled_orphan_recovery_records(
     }
 
     Ok(latest_by_pair.into_values().flatten().collect())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_unknown_recovery_snapshot_path(
+    unknown: &FundingArbUnknownPositionRecovery,
+) -> PathBuf {
+    unknown.cycle_dir.join("funding_arb_monitor_snapshot.json")
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_recovery_snapshot_artifact_available(snapshot_path: &Path) -> RuntimeResult<bool> {
+    match fs::metadata(snapshot_path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(RuntimeError::Io {
+            path: snapshot_path.to_path_buf(),
+            message: error.to_string(),
+        }),
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -31084,7 +31312,7 @@ fn build_funding_arb_unknown_recovery_position_state_template(
     options: &FundingArbResidentLiveOptions,
     unknown: &FundingArbUnknownPositionRecovery,
 ) -> RuntimeResult<(PathBuf, FundingArbMarketRow, FundingArbPositionState)> {
-    let snapshot_path = unknown.cycle_dir.join("funding_arb_monitor_snapshot.json");
+    let snapshot_path = funding_arb_unknown_recovery_snapshot_path(unknown);
     let snapshot_json = read_utf8(&snapshot_path)?;
     let snapshot = parse_funding_arb_monitor_snapshot_json(&snapshot_json)?;
     let row = snapshot
@@ -31461,12 +31689,32 @@ fn append_funding_arb_resident_flat_cancelled_orphan_position_closed(
     candidate: &FundingArbUnknownPositionRecovery,
     reason: &str,
 ) -> RuntimeResult<()> {
+    append_funding_arb_resident_flat_cancelled_orphan_position_closed_with_decision(
+        output_root,
+        cycle,
+        cycle_dir,
+        candidate,
+        "flat_private_snapshot",
+        reason,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_flat_cancelled_orphan_position_closed_with_decision(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    candidate: &FundingArbUnknownPositionRecovery,
+    decision: &str,
+    reason: &str,
+) -> RuntimeResult<()> {
     let closed_at = current_utc_timestamp()?.to_string();
     let line = format!(
-        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_flat_cancelled\":true,\"residual_risk\":null,\"source\":\"flat-cancelled-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
         json_string(&closed_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
+        json_string(decision),
         json_string(&candidate.notional_usdt),
         optional_json_string(candidate.opened_at.as_deref()),
         json_string(&candidate.pair_id),
@@ -51921,6 +52169,63 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_flat_cancelled_orphan_recovery_marks_missing_snapshot_terminal() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let previous_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(8).expect("previous cycle"));
+        let current_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(9).expect("current cycle"));
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":8,\"cycle_dir\":{},\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0\",\"pair_id\":\"binance:bybit:LABUSDT:LABUSDT\",\"position_id\":\"pos:flat-lab\",\"status\":\"flat_cancelled\",\"symbol\":\"LABUSDT\"}}\n",
+                json_string(&previous_cycle.display().to_string()),
+            ),
+        )
+        .expect("write flat-cancelled registry");
+        let options = funding_arb_test_resident_options();
+
+        let recovered = recover_funding_arb_flat_cancelled_orphan_positions_for_exit(
+            &options,
+            root.path(),
+            9,
+            &current_cycle,
+        )
+        .expect("recover missing legacy snapshot");
+
+        assert_eq!(recovered, 0);
+        let history =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
+        assert!(history.contains("\"decision\":\"missing_recovery_artifact\""));
+        assert!(history.contains("legacy funding arb monitor snapshot is missing or not a file"));
+        assert!(!history.contains("\"event_type\":\"cycle_error\""));
+        assert!(
+            load_funding_arb_flat_cancelled_orphan_recovery_records(root.path())
+                .expect("pending orphan candidates")
+                .is_empty()
+        );
+        let before_second_recovery = history;
+
+        let recovered_again = recover_funding_arb_flat_cancelled_orphan_positions_for_exit(
+            &options,
+            root.path(),
+            10,
+            &current_cycle,
+        )
+        .expect("recover after terminal missing snapshot marker");
+
+        assert_eq!(recovered_again, 0);
+        let after_second_recovery =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
+        assert_eq!(after_second_recovery, before_second_recovery);
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_unknown_position_recovery_reopens_nonzero_private_state_for_exit_supervisor() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let previous_cycle = root
@@ -55463,6 +55768,21 @@ mod tests {
             read_utf8(&path).expect("read current"),
             "{\"event\":\"new\"}\n"
         );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn append_jsonl_rotation_accounts_for_pending_line_bytes() {
+        let temp = RuntimeTempDir::new().expect("tempdir");
+        let path = temp.path().join("resident_live_events.jsonl");
+        let first = rotated_append_jsonl_path(&path, 1);
+
+        write_utf8(path.clone(), "1234567\n").expect("write current");
+
+        rotate_append_jsonl_for_pending_line_with_limits(&path, 3, 10, 2).expect("rotate");
+
+        assert!(!path.exists());
+        assert_eq!(read_utf8(&first).expect("read first rotated"), "1234567\n");
     }
 
     #[cfg(all(feature = "live-exec", unix))]
@@ -59263,6 +59583,68 @@ mod tests {
         assert!(provenance.contains("binance:hyperliquid:ETHUSDT:ETH"));
         assert!(!provenance.contains("venue_b.perp_bid_qty"));
         assert!(!provenance.contains("\"is_candidate\":false"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_full_provenance_falls_back_when_line_exceeds_limit() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        let opportunity_dir = root.path().join("opportunities");
+        let options = OpportunityRecorderOptions {
+            root: root.path().to_path_buf(),
+            opportunity_dir,
+            logs_dir: logs_dir.clone(),
+            feedback_log: logs_dir.join("realtime-feedback.log"),
+            health_events_jsonl: logs_dir.join("health-events.jsonl"),
+            basis_resident_out_dir: root.path().join("resident-live/spot-perp-basis"),
+            funding_arb_resident_out_dir: root
+                .path()
+                .join("resident-live/cross-exchange-funding-arb"),
+            spot_sources: Vec::new(),
+            funding_arb_url: None,
+            strategies: BTreeSet::new(),
+            execution_mode: "live".to_owned(),
+            spot_perp_basis_mode: "resident".to_owned(),
+            funding_arb_mode: "resident".to_owned(),
+            interval_secs: 5,
+            timeout_secs: 1,
+            retries: 1,
+            retry_sleep_ms: 0,
+            blocking_path_limit: 12,
+            health_sample_secs: 0,
+            resident_health_tail_lines: 200,
+            once: true,
+        };
+        let long_reason = "missing required funding arb fields: venue_b.perp_bid_qty; ".repeat(200);
+        let body = format!(
+            "{{\"status\":\"healthy\",\"updated_at\":\"2026-05-21T00:00:00Z\",\"candidate_count\":0,\"rows\":[],\"blocking_path\":[{{\"stage\":\"opportunity_row\",\"blocker\":\"missing_perp_top_of_book\",\"reason\":{}}}]}}",
+            json_string(&long_reason),
+        );
+
+        let line =
+            build_opportunity_recorder_provenance_line(OpportunityRecorderProvenanceLineRequest {
+                body: &body,
+                updated_at_fields: &["updated_at"],
+                recorded_at: "2026-05-21T00:00:01Z",
+                strategy: CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY,
+                venue: None,
+                endpoint: "http://127.0.0.1:9904/api/funding-arb/status",
+                blocking_path_limit: options.blocking_path_limit,
+                full_provenance: true,
+                full_provenance_max_bytes: 1_500,
+            })
+            .expect("bounded provenance line");
+
+        assert!(
+            line.len() <= 1_500,
+            "bounded provenance line exceeded cap: {}",
+            line.len()
+        );
+        assert!(line.contains("\"artifact_mode\":\"bounded_full_poll_provenance\""));
+        assert!(line.contains("\"requested_artifact_mode\":\"full_poll_provenance\""));
+        assert!(line.contains("\"full_poll_provenance_compacted\":true"));
+        assert!(!line.contains(&long_reason));
     }
 
     #[cfg(feature = "live-exec")]

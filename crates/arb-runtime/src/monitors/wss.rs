@@ -42,7 +42,7 @@ use crate::{
 pub(crate) const HYPERLIQUID_PUBLIC_WSS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub(crate) const ASTER_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.asterdex.com";
 pub(crate) const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
-pub(crate) const PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL: u32 = 100;
+pub(crate) const PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL: u32 = 500;
 pub(crate) const BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8801";
 pub(crate) const BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
@@ -3643,10 +3643,7 @@ impl PublicWssCycleFailureLogger {
         } else {
             self.repeated_count = self.repeated_count.saturating_add(1);
         }
-        if changed
-            || self.repeated_count == 1
-            || self.repeated_count % PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL == 0
-        {
+        if public_wss_should_log_failure(changed, self.repeated_count) {
             eprintln!(
                 "{} cycle failed: {}; consecutive_failures={} repeated_count={} next_reconnect_delay_secs={}",
                 self.label,
@@ -3657,6 +3654,12 @@ impl PublicWssCycleFailureLogger {
             );
         }
     }
+}
+
+fn public_wss_should_log_failure(message_changed: bool, repeated_count: u32) -> bool {
+    message_changed
+        || repeated_count == 1
+        || repeated_count % PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL == 0
 }
 
 pub(crate) fn validate_binance_wss_probe_options(
@@ -5065,5 +5068,16 @@ mod tests {
             public_wss_reconnect_backoff_with_jitter_seed(2, 64, 1),
             Duration::from_secs(PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS)
         );
+    }
+
+    #[test]
+    fn public_wss_failure_logging_suppresses_repeated_network_noise() {
+        assert!(public_wss_should_log_failure(true, 1));
+        assert!(public_wss_should_log_failure(false, 1));
+        assert!(!public_wss_should_log_failure(false, 100));
+        assert!(public_wss_should_log_failure(
+            false,
+            PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL
+        ));
     }
 }
