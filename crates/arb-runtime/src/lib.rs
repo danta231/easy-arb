@@ -32799,15 +32799,22 @@ fn append_funding_arb_resident_entry_position_unknown(
     reason: &str,
 ) -> RuntimeResult<()> {
     let position_id = funding_arb_position_id(outcome, cycle);
+    let terminal_at = current_utc_timestamp()?.to_string();
+    let exchange_pnl_fields = funding_arb_exchange_pnl_pending_terminal_event_fields(
+        "entry 阶段 position_unknown 已触发交易所动作；历史净盈亏必须通过交易所后台手动同步确认。",
+    );
     let line = format!(
-        "{{\"blocking_reasons\":{},\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_unknown\",\"net_funding_bps\":{},\"notional_usdt\":\"unknown\",\"opened_at\":null,\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":{},\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_unknown\",{},\"net_funding_bps\":{},\"notional_usdt\":\"unknown\",\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string_array(&outcome.canary.blocking_reasons),
+        json_string(&terminal_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
+        exchange_pnl_fields,
         outcome
             .net_funding_bps
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
+        json_string(&terminal_at),
         json_string(&outcome.pair_id),
         json_string(&position_id),
         outcome.canary.private_confirmation_count,
@@ -32828,15 +32835,22 @@ fn append_funding_arb_resident_entry_flat_cancelled(
     outcome: &FundingArbResidentCycleOutcome,
 ) -> RuntimeResult<()> {
     let position_id = funding_arb_position_id(outcome, cycle);
+    let terminal_at = current_utc_timestamp()?.to_string();
+    let exchange_pnl_fields = funding_arb_exchange_pnl_pending_terminal_event_fields(
+        "entry 阶段 flat_cancelled 仍可能存在真实交易所成交或手续费；历史净盈亏必须通过交易所后台手动同步确认。",
+    );
     let line = format!(
-        "{{\"blocking_reasons\":{},\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_flat_cancelled\",\"net_funding_bps\":{},\"notional_usdt\":\"0\",\"opened_at\":null,\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":\"funding arb entry ended flat after terminal/cancel confirmation or reduce-only protection\",\"residual_risk\":null,\"status\":\"flat_cancelled\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":{},\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_flat_cancelled\",{},\"net_funding_bps\":{},\"notional_usdt\":\"0\",\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":{},\"reason\":\"funding arb entry ended flat after terminal/cancel confirmation or reduce-only protection\",\"residual_risk\":null,\"status\":\"flat_cancelled\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string_array(&outcome.canary.blocking_reasons),
+        json_string(&terminal_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
+        exchange_pnl_fields,
         outcome
             .net_funding_bps
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
+        json_string(&terminal_at),
         json_string(&outcome.pair_id),
         json_string(&position_id),
         outcome.canary.private_confirmation_count,
@@ -33017,11 +33031,14 @@ fn append_funding_arb_resident_position_unknown(
     report: &FundingArbExitCycleReport,
     reason: &str,
 ) -> RuntimeResult<()> {
+    let closed_at = current_utc_timestamp()?.to_string();
     let line = format!(
-        "{{\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",{},\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        json_string(&closed_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
+        funding_arb_exchange_pnl_position_event_fields(&report.exchange_pnl),
         json_string(&position.notional_usdt),
         optional_json_string(position.opened_at.as_deref()),
         json_string(&position.pair_id),
@@ -35530,6 +35547,13 @@ fn funding_arb_exchange_pnl_position_event_fields(
         json_string(&summary.status),
         json_option_string(&summary.position_pnl_usd),
     )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_pending_terminal_event_fields(reason: &str) -> String {
+    let mut summary = FundingArbExchangePnlSummary::pending_manual_sync();
+    summary.notes.push(reason.to_owned());
+    funding_arb_exchange_pnl_position_event_fields(&summary)
 }
 
 #[cfg(feature = "live-exec")]
@@ -53361,7 +53385,12 @@ mod tests {
         ] {
             assert!(fields.contains_key(field), "missing {field} in {line}");
         }
-        if fields.get("event_type").copied() == Some("\"position_closed\"") {
+        if matches!(
+            fields.get("event_type").copied(),
+            Some("\"position_closed\"")
+                | Some("\"position_flat_cancelled\"")
+                | Some("\"position_unknown\"")
+        ) {
             for field in [
                 "exchange_fee_usd",
                 "exchange_funding_pnl_usd",
@@ -53438,6 +53467,76 @@ mod tests {
         assert!(registry.contains("\"submitted_receipt_count\":2"));
         assert!(registry.contains("\"exchange_pnl_status\":\"PendingManualSync\""));
         assert!(registry.contains("\"exchange_net_pnl_usd\":null"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_position_unknown_event_marks_exchange_pnl_required() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let cycle_dir = root.path().join("exit/pos:one/000001-test");
+        ensure_dir(&cycle_dir).expect("cycle dir");
+        let position = FundingArbResidentPosition {
+            position_id: "pos:one".to_owned(),
+            position_state_path: root.path().join("position.json"),
+            pair_id: "binance:bybit:BTCUSDT:BTCUSDT".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            notional_usdt: "10.00".to_owned(),
+            status: "open".to_owned(),
+            opened_at: Some("2026-05-13T00:00:00Z".to_owned()),
+            closed_at: None,
+        };
+        let report = FundingArbExitCycleReport {
+            pair_id: position.pair_id.clone(),
+            symbol: position.symbol.clone(),
+            decision: "emergency_de_risk".to_owned(),
+            reason_codes: vec!["private_position_unknown".to_owned()],
+            runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
+            financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
+            partial_close: true,
+            requested_close_quantity: None,
+            funding_settlement_status: "NotChecked".to_owned(),
+            private_position_status: "Unknown".to_owned(),
+            dispatch_attempted: true,
+            submitted_receipt_count: 1,
+            private_confirmation_count: 1,
+            exchange_pnl: FundingArbExchangePnlSummary::not_checked(
+                "position_unknown 仍可能存在交易所已实现盈亏，必须由历史对账手动同步。",
+            ),
+            residual_risk: Some("confirmation unavailable".to_owned()),
+            blocking_reasons: vec!["private position unknown".to_owned()],
+            output_dir: Some(cycle_dir.clone()),
+        };
+
+        append_funding_arb_resident_position_unknown(
+            root.path(),
+            &position,
+            1,
+            &cycle_dir,
+            &report,
+            "funding arb exit/de-risk dispatch left unknown or residual state",
+        )
+        .expect("append unknown event");
+
+        let registry =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("registry");
+        let line = last_nonempty_line(&registry);
+        assert_funding_arb_position_history_line_complete(line);
+        assert!(line.contains("\"event_type\":\"position_unknown\""));
+        assert!(line.contains("\"closed_at\":\""));
+        assert!(!line.contains("\"closed_at\":null"));
+        assert!(line.contains("\"exchange_pnl_status\":\"NotChecked\""));
+        assert!(line.contains("\"exchange_net_pnl_usd\":null"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_pending_terminal_event_fields_mark_manual_sync() {
+        let fields = funding_arb_exchange_pnl_pending_terminal_event_fields(
+            "flat_cancelled 已触发交易所动作，必须手动同步后台 PnL。",
+        );
+        assert!(fields.contains("\"exchange_pnl_status\":\"PendingManualSync\""));
+        assert!(fields.contains("\"exchange_net_pnl_usd\":null"));
+        assert!(fields.contains("flat_cancelled"));
     }
 
     #[test]
