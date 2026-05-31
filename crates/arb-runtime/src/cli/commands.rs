@@ -845,8 +845,13 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             output_note
         ));
     }
-    if args[0] == "funding-arb-resident-live" {
+    if args[0] == "funding-arb-resident-live" || args[0] == "funding-carry-resident-live" {
         let options = parse_funding_arb_resident_live_args(&args[1..])?;
+        let strategy_label = if args[0] == "funding-carry-resident-live" {
+            "funding carry resident live"
+        } else {
+            "funding arb resident live"
+        };
         let output_dir = options.output_dir.clone();
         let report = run_funding_arb_resident_live(options)?;
         let prefix = live_report_cli_prefix(&report.phase, report.halt_reason.as_deref());
@@ -856,7 +861,7 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             .map(|path| format!("; wrote artifacts to {}", path.display()))
             .unwrap_or_else(|| "; no artifacts written".to_owned());
         return Ok(format!(
-            "{prefix}: funding arb resident live completed; phase={}; cycles={}; last_pair_id={}; last_symbol={}; last_net_funding_bps={}; dispatch_attempted={}; live_entry_count={}; open_positions={}; closed_positions={}; unknown_positions={}; halt_reason={}; mutable_execution_started={}{}",
+            "{prefix}: {strategy_label} completed; phase={}; cycles={}; last_pair_id={}; last_symbol={}; last_net_funding_bps={}; dispatch_attempted={}; live_entry_count={}; open_positions={}; closed_positions={}; unknown_positions={}; halt_reason={}; mutable_execution_started={}{}",
             report.phase,
             report.cycles,
             report.last_pair_id.as_deref().unwrap_or("none"),
@@ -925,7 +930,7 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live, opportunity-recorder",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live, funding-carry-resident-live, opportunity-recorder",
                 args[0]
             ),
         });

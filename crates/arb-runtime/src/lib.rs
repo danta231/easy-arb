@@ -514,6 +514,14 @@ const UNIFIED_RUNTIME_LIVE_DEFAULT_OUT: &str = "target/arb-runtime/live";
 const UNIFIED_RUNTIME_DEFAULT_INTERVAL_SECS: u64 = 5;
 const UNIFIED_RUNTIME_DEFAULT_STRATEGIES: &str = "spot-perp-basis,cross-exchange-funding-arb";
 const UNIFIED_RUNTIME_DEFAULT_MONITORS: &str = "binance bybit okx bitget aster hyperliquid";
+const FUNDING_CARRY_STRATEGY_FAMILY: &str = "funding_carry";
+const FUNDING_CARRY_MODE_SPOT_PERP: &str = "spot_perp";
+const FUNDING_CARRY_MODE_PERP_PERP: &str = "perp_perp";
+const FUNDING_CARRY_MODE_PERP_PERP_STAGGERED: &str = "perp_perp_staggered";
+const FUNDING_CARRY_SETTLEMENT_PLAN_SPOT_PERP: &str = "spot_perp_next_perp_settlement";
+const FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP: &str = "sync_next_funding_settlement";
+const FUNDING_CARRY_SETTLEMENT_PLAN_STAGGERED_PERP_PERP: &str =
+    "staggered_first_settlement_then_reprice";
 const FUNDING_SETTLEMENT_DEFAULT_TOLERANCE_USD: &str = "0.01";
 #[cfg(feature = "live-exec")]
 const FUNDING_SETTLEMENT_RAW_SNAPSHOT_LOOKBACK_MS: u64 = 36 * 60 * 60 * 1_000;
@@ -538,6 +546,31 @@ const FUNDING_ARB_EXIT_EMERGENCY_DE_RISK_SLIPPAGE_BPS: i128 = 100;
 const FUNDING_ARB_EXIT_EXPECTED_RETURN_HARD_LOSS_BPS: i128 = -20;
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_EXIT_EXPECTED_RETURN_SEVERE_LOSS_BPS: i128 = -30;
+
+fn default_funding_carry_perp_modes() -> Vec<String> {
+    vec![
+        FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+        FUNDING_CARRY_MODE_PERP_PERP_STAGGERED.to_owned(),
+    ]
+}
+
+fn funding_carry_mode_is_supported(mode: &str) -> bool {
+    matches!(
+        mode,
+        FUNDING_CARRY_MODE_SPOT_PERP
+            | FUNDING_CARRY_MODE_PERP_PERP
+            | FUNDING_CARRY_MODE_PERP_PERP_STAGGERED
+    )
+}
+
+fn normalize_funding_carry_mode(mode: &str) -> Option<String> {
+    let normalized = mode.trim().replace('-', "_").to_ascii_lowercase();
+    if funding_carry_mode_is_supported(&normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_EXIT_EARLY_WINDOW_NEGATIVE_RETURN_BPS: i128 = -10;
 #[cfg(feature = "live-exec")]
@@ -1756,6 +1789,7 @@ pub struct FundingArbMonitorOptions {
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
+    pub funding_carry_modes: Vec<String>,
     pub once: bool,
     pub output_dir: Option<PathBuf>,
     pub execution_reports_path: Option<PathBuf>,
@@ -1774,6 +1808,7 @@ impl Default for FundingArbMonitorOptions {
             slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+            funding_carry_modes: default_funding_carry_perp_modes(),
             once: false,
             output_dir: None,
             execution_reports_path: None,
@@ -1943,10 +1978,12 @@ pub struct FundingArbResidentLiveOptions {
     pub poll_interval_secs: u64,
     pub max_cycles: Option<u64>,
     pub notional_usd: String,
+    pub max_total_notional_usdt: String,
     pub taker_fee_bps: String,
     pub slippage_buffer_bps: i128,
     pub max_entry_price_divergence_bps: i128,
     pub min_net_funding_bps: i128,
+    pub funding_carry_modes: Vec<String>,
     pub execute_live: bool,
     pub acknowledge_funding_arb_live_orders: bool,
     pub allow_unknown_recovery: bool,
@@ -15003,7 +15040,12 @@ fn validate_funding_arb_monitor_options(options: &FundingArbMonitorOptions) -> R
             "funding-arb-monitor requires at least two venue sources",
         ));
     }
-    MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    let notional = MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    if notional.raw <= 0 {
+        return Err(cli_arg_error(
+            "funding-arb-monitor notional_usd must be greater than zero",
+        ));
+    }
     let taker_fee_bps = MonitorDecimal::parse("taker_fee_bps", &options.taker_fee_bps)?;
     if taker_fee_bps.raw < 0
         || options.slippage_buffer_bps < 0
@@ -15012,6 +15054,27 @@ fn validate_funding_arb_monitor_options(options: &FundingArbMonitorOptions) -> R
     {
         return Err(cli_arg_error(
             "funding-arb-monitor bps values must be non-negative",
+        ));
+    }
+    if options.funding_carry_modes.is_empty() {
+        return Err(cli_arg_error(
+            "funding-arb-monitor requires at least one funding carry mode",
+        ));
+    }
+    let mut normalized_modes = BTreeSet::new();
+    for mode in &options.funding_carry_modes {
+        let Some(normalized) = normalize_funding_carry_mode(mode) else {
+            return Err(cli_arg_error(format!(
+                "unsupported funding carry mode `{mode}`; supported modes are spot_perp, perp_perp, perp_perp_staggered",
+            )));
+        };
+        normalized_modes.insert(normalized);
+    }
+    if !normalized_modes.contains(FUNDING_CARRY_MODE_PERP_PERP)
+        && !normalized_modes.contains(FUNDING_CARRY_MODE_PERP_PERP_STAGGERED)
+    {
+        return Err(cli_arg_error(
+            "funding-arb-monitor needs perp_perp or perp_perp_staggered; spot_perp is served by basis monitors",
         ));
     }
     if options
@@ -19595,6 +19658,10 @@ fn funding_arb_pair_row(
     let base_row = |is_candidate: bool,
                     reason: Option<String>,
                     source_status: String,
+                    funding_carry_mode: String,
+                    funding_carry_settlement_plan: String,
+                    funding_carry_first_settlement_time_ms: Option<String>,
+                    funding_carry_second_settlement_time_ms: Option<String>,
                     long_venue_family: Option<String>,
                     short_venue_family: Option<String>,
                     gross_funding_spread_bps: Option<String>,
@@ -19604,6 +19671,11 @@ fn funding_arb_pair_row(
                     expected_funding_usd: Option<String>| FundingArbMarketRow {
         pair_id: pair_id.clone(),
         symbol: symbol.clone(),
+        strategy_family: FUNDING_CARRY_STRATEGY_FAMILY.to_owned(),
+        funding_carry_mode,
+        funding_carry_settlement_plan,
+        funding_carry_first_settlement_time_ms,
+        funding_carry_second_settlement_time_ms,
         venue_a_family: venue_a.venue_family.clone(),
         venue_b_family: venue_b.venue_family.clone(),
         venue_a_bid: venue_a.perp_bid.clone().unwrap_or_default(),
@@ -19659,6 +19731,10 @@ fn funding_arb_pair_row(
             false,
             Some(reason),
             "invalid_symbol".to_owned(),
+            FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            None,
+            None,
             None,
             None,
             None,
@@ -19682,6 +19758,10 @@ fn funding_arb_pair_row(
                 venue_b.source_status
             )),
             "source_not_ready".to_owned(),
+            FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            None,
+            None,
             None,
             None,
             None,
@@ -19701,6 +19781,10 @@ fn funding_arb_pair_row(
                 missing.join(", ")
             )),
             "missing_perp_top_of_book".to_owned(),
+            FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            None,
+            None,
             None,
             None,
             None,
@@ -19716,6 +19800,10 @@ fn funding_arb_pair_row(
             false,
             Some(reason),
             "invalid_perp_top_of_book".to_owned(),
+            FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            None,
+            None,
             None,
             None,
             None,
@@ -19731,6 +19819,10 @@ fn funding_arb_pair_row(
             false,
             Some(reason),
             "mark_index_divergence".to_owned(),
+            FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            None,
+            None,
             None,
             None,
             None,
@@ -19829,15 +19921,27 @@ fn funding_arb_pair_row(
         } else {
             (venue_b, venue_a)
         };
-    let next_settlement_rejection = if selected.0.is_candidate {
-        funding_arb_next_settlement_rejection(selected_long_market, selected_short_market)?
+    let staggered_entry_checks_allowed =
+        funding_arb_signal_entry_checks_allow_staggered(selected.0);
+    let settlement_decision = if selected.0.is_candidate || staggered_entry_checks_allowed {
+        funding_arb_next_settlement_decision(
+            selected.0,
+            selected_long_market,
+            selected_short_market,
+            options,
+        )?
     } else {
-        None
+        FundingCarrySettlementDecision::not_candidate()
     };
-    let is_candidate = selected.0.is_candidate && next_settlement_rejection.is_none();
-    let reason = if let Some(reason) = next_settlement_rejection {
+    let is_candidate = settlement_decision.rejection.is_none()
+        && if settlement_decision.mode == FUNDING_CARRY_MODE_PERP_PERP_STAGGERED {
+            staggered_entry_checks_allowed
+        } else {
+            selected.0.is_candidate
+        };
+    let reason = if let Some(reason) = settlement_decision.rejection.clone() {
         Some(reason)
-    } else if selected.0.is_candidate {
+    } else if is_candidate {
         None
     } else {
         Some(format!(
@@ -19856,13 +19960,17 @@ fn funding_arb_pair_row(
         is_candidate,
         reason,
         "complete".to_owned(),
+        settlement_decision.mode,
+        settlement_decision.plan,
+        settlement_decision.first_settlement_time_ms,
+        settlement_decision.second_settlement_time_ms,
         Some(selected.1),
         Some(selected.2),
-        Some(selected.0.gross_funding_spread_bps.to_string()),
+        Some(settlement_decision.gross_funding_bps),
         Some(selected.0.total_cost_bps.to_string()),
-        Some(selected.0.net_funding_bps.to_string()),
+        Some(settlement_decision.net_funding_bps),
         Some(selected.0.entry_price_edge_bps.clone()),
-        Some(selected.0.expected_funding_usd.clone()),
+        Some(settlement_decision.expected_funding_usd),
     ))
 }
 
@@ -19875,28 +19983,133 @@ fn funding_arb_signal_net_funding_bps_decimal(
     )
 }
 
-fn funding_arb_next_settlement_rejection(
+fn funding_arb_signal_entry_checks_allow_staggered(signal: &CrossExchangeFundingArbSignal) -> bool {
+    signal.is_candidate
+        || signal
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("net_funding_bps="))
+}
+
+struct FundingCarrySettlementDecision {
+    mode: String,
+    plan: String,
+    first_settlement_time_ms: Option<String>,
+    second_settlement_time_ms: Option<String>,
+    gross_funding_bps: String,
+    net_funding_bps: String,
+    expected_funding_usd: String,
+    rejection: Option<String>,
+}
+
+impl FundingCarrySettlementDecision {
+    fn not_candidate() -> Self {
+        Self {
+            mode: FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            plan: FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            first_settlement_time_ms: None,
+            second_settlement_time_ms: None,
+            gross_funding_bps: "0".to_owned(),
+            net_funding_bps: "0".to_owned(),
+            expected_funding_usd: "0".to_owned(),
+            rejection: None,
+        }
+    }
+}
+
+fn funding_carry_modes_contains(modes: &[String], mode: &str) -> bool {
+    modes
+        .iter()
+        .filter_map(|value| normalize_funding_carry_mode(value))
+        .any(|value| value == mode)
+}
+
+fn funding_carry_decimal_from_i128(
+    value: i128,
+    context: &'static str,
+) -> RuntimeResult<MonitorDecimal> {
+    let scale = 10_i128.pow(MonitorDecimal::SCALE_DIGITS as u32);
+    Ok(MonitorDecimal {
+        raw: value
+            .checked_mul(scale)
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: format!("{context} overflowed"),
+            })?,
+    })
+}
+
+fn funding_carry_adverse_entry_bps(edge_bps: MonitorDecimal) -> RuntimeResult<MonitorDecimal> {
+    if edge_bps.raw >= 0 {
+        return Ok(MonitorDecimal { raw: 0 });
+    }
+    Ok(MonitorDecimal {
+        raw: edge_bps
+            .raw
+            .checked_neg()
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "funding carry entry adverse bps overflowed".to_owned(),
+            })?,
+    })
+}
+
+fn funding_carry_expected_usd_from_single_leg_bps(
+    notional_usd: &str,
+    bps: MonitorDecimal,
+) -> RuntimeResult<String> {
+    MonitorDecimal::parse("funding_carry.notional_usd", notional_usd)?
+        .checked_mul_decimal(bps, "funding carry expected USD")?
+        .checked_div_i128(10_000, "funding carry expected USD")
+        .map(|value| value.format_trimmed())
+}
+
+fn funding_arb_next_settlement_decision(
+    signal: &CrossExchangeFundingArbSignal,
     long_market: &FundingArbVenueMarket,
     short_market: &FundingArbVenueMarket,
-) -> RuntimeResult<Option<String>> {
+    options: &FundingArbMonitorOptions,
+) -> RuntimeResult<FundingCarrySettlementDecision> {
     let long_next = match funding_arb_required_next_funding_time_ms(long_market) {
         Ok(value) => value,
-        Err(reason) => return Ok(Some(reason)),
+        Err(reason) => {
+            return Ok(FundingCarrySettlementDecision {
+                rejection: Some(reason),
+                ..FundingCarrySettlementDecision::not_candidate()
+            })
+        }
     };
     let short_next = match funding_arb_required_next_funding_time_ms(short_market) {
         Ok(value) => value,
-        Err(reason) => return Ok(Some(reason)),
+        Err(reason) => {
+            return Ok(FundingCarrySettlementDecision {
+                rejection: Some(reason),
+                ..FundingCarrySettlementDecision::not_candidate()
+            })
+        }
     };
     if long_next != short_next {
-        return Ok(Some(format!(
-            "next_funding_time_ms mismatch: long {} {}={}, short {} {}={}",
-            long_market.venue_family,
-            long_market.symbol,
+        return funding_arb_staggered_settlement_decision(
+            signal,
+            long_market,
+            short_market,
             long_next,
-            short_market.venue_family,
-            short_market.symbol,
-            short_next
-        )));
+            short_next,
+            options,
+        );
+    }
+    if !funding_carry_modes_contains(&options.funding_carry_modes, FUNDING_CARRY_MODE_PERP_PERP) {
+        return Ok(FundingCarrySettlementDecision {
+            mode: FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            plan: FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            first_settlement_time_ms: Some(long_next.to_string()),
+            second_settlement_time_ms: Some(short_next.to_string()),
+            gross_funding_bps: signal.gross_funding_spread_bps.clone(),
+            net_funding_bps: signal.net_funding_bps.clone(),
+            expected_funding_usd: signal.expected_funding_usd.clone(),
+            rejection: Some(
+                "funding carry mode perp_perp is disabled for synchronous funding settlement"
+                    .to_owned(),
+            ),
+        });
     }
 
     let long_rate = MonitorDecimal::parse("long_next_funding_rate", &long_market.funding_rate)?;
@@ -19904,16 +20117,133 @@ fn funding_arb_next_settlement_rejection(
     let next_spread = short_rate.checked_sub(long_rate, "next funding spread calculation")?;
     let next_gross_bps = funding_rate_bps(next_spread)?;
     if next_spread.raw <= 0 {
-        return Ok(Some(format!(
+        return Ok(FundingCarrySettlementDecision {
+            mode: FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            plan: FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            first_settlement_time_ms: Some(long_next.to_string()),
+            second_settlement_time_ms: Some(short_next.to_string()),
+            gross_funding_bps: signal.gross_funding_spread_bps.clone(),
+            net_funding_bps: signal.net_funding_bps.clone(),
+            expected_funding_usd: signal.expected_funding_usd.clone(),
+            rejection: Some(format!(
             "next funding gross spread bps={next_gross_bps} is not positive before the next settlement; long {} raw_rate={}, short {} raw_rate={}",
             long_market.venue_family,
             long_market.funding_rate,
             short_market.venue_family,
             short_market.funding_rate
-        )));
+            )),
+        });
     }
 
-    Ok(None)
+    Ok(FundingCarrySettlementDecision {
+        mode: FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+        plan: FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+        first_settlement_time_ms: Some(long_next.to_string()),
+        second_settlement_time_ms: Some(short_next.to_string()),
+        gross_funding_bps: signal.gross_funding_spread_bps.clone(),
+        net_funding_bps: signal.net_funding_bps.clone(),
+        expected_funding_usd: signal.expected_funding_usd.clone(),
+        rejection: None,
+    })
+}
+
+fn funding_arb_staggered_settlement_decision(
+    signal: &CrossExchangeFundingArbSignal,
+    long_market: &FundingArbVenueMarket,
+    short_market: &FundingArbVenueMarket,
+    long_next: i128,
+    short_next: i128,
+    options: &FundingArbMonitorOptions,
+) -> RuntimeResult<FundingCarrySettlementDecision> {
+    if !funding_carry_modes_contains(
+        &options.funding_carry_modes,
+        FUNDING_CARRY_MODE_PERP_PERP_STAGGERED,
+    ) {
+        return Ok(FundingCarrySettlementDecision {
+            mode: FUNDING_CARRY_MODE_PERP_PERP_STAGGERED.to_owned(),
+            plan: FUNDING_CARRY_SETTLEMENT_PLAN_STAGGERED_PERP_PERP.to_owned(),
+            first_settlement_time_ms: Some(long_next.min(short_next).to_string()),
+            second_settlement_time_ms: Some(long_next.max(short_next).to_string()),
+            gross_funding_bps: signal.gross_funding_spread_bps.clone(),
+            net_funding_bps: signal.net_funding_bps.clone(),
+            expected_funding_usd: signal.expected_funding_usd.clone(),
+            rejection: Some(format!(
+                "next_funding_time_ms mismatch: long {} {}={}, short {} {}={}",
+                long_market.venue_family,
+                long_market.symbol,
+                long_next,
+                short_market.venue_family,
+                short_market.symbol,
+                short_next
+            )),
+        });
+    }
+
+    let (first_market, first_side, first_next, second_next) = if long_next < short_next {
+        (long_market, "long", long_next, short_next)
+    } else {
+        (short_market, "short", short_next, long_next)
+    };
+    let first_rate = MonitorDecimal::parse(
+        "staggered_first_settlement_funding_rate",
+        &first_market.funding_rate,
+    )?;
+    let first_cashflow_rate = if first_side == "long" {
+        MonitorDecimal {
+            raw: first_rate
+                .raw
+                .checked_neg()
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: "staggered funding long cashflow rate overflowed".to_owned(),
+                })?,
+        }
+    } else {
+        first_rate
+    };
+    let gross_funding_bps =
+        first_cashflow_rate.checked_mul_i128(10_000, "staggered first funding bps")?;
+    let total_cost_bps = MonitorDecimal::parse("staggered_total_cost_bps", &signal.total_cost_bps)?;
+    let entry_edge_bps = MonitorDecimal::parse(
+        "staggered_entry_price_edge_bps",
+        &signal.entry_price_edge_bps,
+    )?;
+    let entry_adverse_bps = funding_carry_adverse_entry_bps(entry_edge_bps)?;
+    let single_leg_net_bps = gross_funding_bps
+        .checked_sub(total_cost_bps, "staggered funding net bps")?
+        .checked_sub(entry_adverse_bps, "staggered entry-adjusted net bps")?;
+    let net_funding_bps =
+        single_leg_net_bps.checked_div_i128(2, "staggered funding two-leg return bps")?;
+    let min_net = funding_carry_decimal_from_i128(
+        options.min_net_funding_bps,
+        "funding carry min net funding bps",
+    )?;
+    let expected_funding_usd =
+        funding_carry_expected_usd_from_single_leg_bps(&options.notional_usd, single_leg_net_bps)?;
+    let rejection = if net_funding_bps.raw < min_net.raw {
+        Some(format!(
+            "staggered first settlement net_funding_bps={} below minimum {}; first_leg={} side={} raw_rate={}, gross_first_settlement_bps={}, total_cost_bps={}, entry_price_adverse_bps={}",
+            net_funding_bps.format_trimmed(),
+            options.min_net_funding_bps,
+            first_market.venue_family,
+            first_side,
+            first_market.funding_rate,
+            gross_funding_bps.format_trimmed(),
+            signal.total_cost_bps,
+            entry_adverse_bps.format_trimmed(),
+        ))
+    } else {
+        None
+    };
+    Ok(FundingCarrySettlementDecision {
+        mode: FUNDING_CARRY_MODE_PERP_PERP_STAGGERED.to_owned(),
+        plan: FUNDING_CARRY_SETTLEMENT_PLAN_STAGGERED_PERP_PERP.to_owned(),
+        first_settlement_time_ms: Some(first_next.to_string()),
+        second_settlement_time_ms: Some(second_next.to_string()),
+        gross_funding_bps: gross_funding_bps.format_trimmed(),
+        net_funding_bps: net_funding_bps.format_trimmed(),
+        expected_funding_usd,
+        rejection,
+    })
 }
 
 fn funding_arb_required_next_funding_time_ms(
@@ -25228,6 +25558,11 @@ struct OkxBasisRawInputs<'a> {
 pub struct FundingArbMarketRow {
     pub pair_id: String,
     pub symbol: String,
+    pub strategy_family: String,
+    pub funding_carry_mode: String,
+    pub funding_carry_settlement_plan: String,
+    pub funding_carry_first_settlement_time_ms: Option<String>,
+    pub funding_carry_second_settlement_time_ms: Option<String>,
     pub venue_a_family: String,
     pub venue_b_family: String,
     pub venue_a_bid: String,
@@ -30913,6 +31248,7 @@ fn validate_funding_arb_resident_live_options(
             slippage_buffer_bps: options.slippage_buffer_bps,
             max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
             min_net_funding_bps: options.min_net_funding_bps,
+            funding_carry_modes: options.funding_carry_modes.clone(),
             once: true,
             output_dir: None,
             execution_reports_path: None,
@@ -30921,7 +31257,20 @@ fn validate_funding_arb_resident_live_options(
             sources: options.sources.clone(),
         })?;
     }
-    MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    let notional = MonitorDecimal::parse("notional_usd", &options.notional_usd)?;
+    if notional.raw <= 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live notional_usd must be greater than zero".to_owned(),
+        });
+    }
+    let max_total =
+        MonitorDecimal::parse("max_total_notional_usdt", &options.max_total_notional_usdt)?;
+    if max_total.raw <= 0 {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live max_total_notional_usdt must be greater than zero"
+                .to_owned(),
+        });
+    }
     let taker_fee_bps = MonitorDecimal::parse("taker_fee_bps", &options.taker_fee_bps)?;
     if taker_fee_bps.raw < 0
         || options.slippage_buffer_bps < 0
@@ -30930,6 +31279,32 @@ fn validate_funding_arb_resident_live_options(
     {
         return Err(RuntimeError::UnsafeConfig {
             message: "funding-arb resident live bps values must be non-negative".to_owned(),
+        });
+    }
+    if options.funding_carry_modes.is_empty() {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "funding-arb resident live requires at least one funding carry mode"
+                .to_owned(),
+        });
+    }
+    let mut normalized_modes = BTreeSet::new();
+    for mode in &options.funding_carry_modes {
+        let Some(normalized) = normalize_funding_carry_mode(mode) else {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "unsupported funding carry mode `{mode}`; supported modes are spot_perp, perp_perp, perp_perp_staggered"
+                ),
+            });
+        };
+        normalized_modes.insert(normalized);
+    }
+    if !normalized_modes.contains(FUNDING_CARRY_MODE_PERP_PERP)
+        && !normalized_modes.contains(FUNDING_CARRY_MODE_PERP_PERP_STAGGERED)
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message:
+                "funding-arb resident live needs perp_perp or perp_perp_staggered; spot_perp uses basis resident live"
+                    .to_owned(),
         });
     }
     if !matches!(options.hyperliquid_source.as_str(), "a" | "b") {
@@ -31036,6 +31411,7 @@ fn load_funding_arb_resident_snapshot(
         slippage_buffer_bps: options.slippage_buffer_bps,
         max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
         min_net_funding_bps: options.min_net_funding_bps,
+        funding_carry_modes: options.funding_carry_modes.clone(),
         once: true,
         output_dir: None,
         execution_reports_path: None,
@@ -31366,6 +31742,14 @@ fn funding_arb_post_fill_entry_economics_blocking_reason(
 
 #[cfg(feature = "live-exec")]
 fn funding_arb_row_target_funding_time_ms(row: &FundingArbMarketRow) -> Option<u64> {
+    if row.funding_carry_mode == FUNDING_CARRY_MODE_PERP_PERP_STAGGERED {
+        return row
+            .funding_carry_first_settlement_time_ms
+            .as_deref()?
+            .trim()
+            .parse::<u64>()
+            .ok();
+    }
     let long_family = normalize_venue_family(row.long_venue_family.as_ref()?);
     let short_family = normalize_venue_family(row.short_venue_family.as_ref()?);
     let venue_a_family = normalize_venue_family(&row.venue_a_family);
@@ -31503,6 +31887,14 @@ impl FundingArbResidentPositionRegistry {
             .values()
             .filter(|position| position.status == "unknown")
             .count()
+    }
+
+    fn total_active_notional(&self) -> RuntimeResult<Decimal> {
+        let mut total = Decimal::from_scaled_atoms(0, 0);
+        for position in self.active_positions() {
+            total = total.checked_add(Decimal::from_str(&position.notional_usdt)?)?;
+        }
+        Ok(total)
     }
 }
 
@@ -32342,6 +32734,17 @@ fn funding_arb_resident_entry_capacity(
         return Ok(ResidentEntryCapacity::Blocked(
             "unknown funding arb resident position exists; new entries are blocked".to_owned(),
         ));
+    }
+    let max_total = Decimal::from_str(&options.max_total_notional_usdt)?;
+    let next_notional = Decimal::from_str(&options.notional_usd)?;
+    let after_next = registry
+        .total_active_notional()?
+        .checked_add(next_notional)?;
+    if after_next > max_total {
+        return Ok(ResidentEntryCapacity::Blocked(format!(
+            "funding carry max total notional would be exceeded: after_next={} max={}",
+            after_next, max_total
+        )));
     }
     Ok(ResidentEntryCapacity::Allowed)
 }
@@ -35232,7 +35635,7 @@ fn write_funding_arb_resident_live_config(
     options: &FundingArbResidentLiveOptions,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"auto_residual_de_risk\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"taker_fee_bps\":{}}}",
+        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"auto_residual_de_risk\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_carry_modes\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_total_notional_usdt\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"strategy_family\":{},\"taker_fee_bps\":{}}}",
         options.allow_unknown_recovery,
         json_string(&options.aster_signer_cmd_env),
         optional_json_string(options.aster_user.as_deref()),
@@ -35240,6 +35643,7 @@ fn write_funding_arb_resident_live_config(
         json_string(&options.config_path.display().to_string()),
         options.execute_live,
         options.exit_only,
+        json_string_array(&options.funding_carry_modes),
         optional_json_string(options.funding_settlement_ledger_path.as_ref().map(|path| path.display().to_string()).as_deref()),
         optional_json_string(options.funding_settlement_raw_snapshot_path.as_ref().map(|path| path.display().to_string()).as_deref()),
         options.hyperliquid_asset_ids.len(),
@@ -35255,6 +35659,7 @@ fn write_funding_arb_resident_live_config(
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
         options.max_entry_price_divergence_bps,
+        json_string(&options.max_total_notional_usdt),
         options.min_net_funding_bps,
         json_string(&options.notional_usd),
         optional_json_string(options.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
@@ -35266,6 +35671,7 @@ fn write_funding_arb_resident_live_config(
         optional_json_string(options.snapshot_path.as_ref().map(|path| path.display().to_string()).as_deref()),
         options.sources.len(),
         funding_arb_sources_json(&options.sources),
+        json_string(FUNDING_CARRY_STRATEGY_FAMILY),
         options.taker_fee_bps,
     );
     write_utf8(
@@ -42834,6 +43240,35 @@ fn parse_funding_arb_market_row_json_fields(
     Ok(FundingArbMarketRow {
         pair_id: required_json_value_string(fields, "pair_id", "funding arb monitor row")?,
         symbol,
+        strategy_family: optional_json_value_string(
+            fields,
+            "strategy_family",
+            "funding arb monitor row",
+        )?
+        .unwrap_or_else(|| FUNDING_CARRY_STRATEGY_FAMILY.to_owned()),
+        funding_carry_mode: optional_json_value_string(
+            fields,
+            "funding_carry_mode",
+            "funding arb monitor row",
+        )?
+        .and_then(|value| normalize_funding_carry_mode(&value))
+        .unwrap_or_else(|| FUNDING_CARRY_MODE_PERP_PERP.to_owned()),
+        funding_carry_settlement_plan: optional_json_value_string(
+            fields,
+            "funding_carry_settlement_plan",
+            "funding arb monitor row",
+        )?
+        .unwrap_or_else(|| FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned()),
+        funding_carry_first_settlement_time_ms: optional_json_value_string(
+            fields,
+            "funding_carry_first_settlement_time_ms",
+            "funding arb monitor row",
+        )?,
+        funding_carry_second_settlement_time_ms: optional_json_value_string(
+            fields,
+            "funding_carry_second_settlement_time_ms",
+            "funding arb monitor row",
+        )?,
         venue_a_family: required_json_value_string(
             fields,
             "venue_a_family",
@@ -43595,6 +44030,13 @@ fn write_funding_arb_guarded_dry_run_artifacts(
         ),
     )?;
     write_utf8(
+        output_dir.join("funding_carry_minimal_preflight_report.json"),
+        &format!(
+            "{}\n",
+            funding_carry_minimal_preflight_report_json(row, report)
+        ),
+    )?;
+    write_utf8(
         output_dir.join("funding_arb_guarded_dry_run_report.md"),
         &funding_arb_guarded_dry_run_report_markdown(row, spec, report),
     )
@@ -43841,8 +44283,10 @@ fn signal_depth_levels_strategy_json(levels: &[SignalDepthLevel]) -> String {
 impl BinanceBasisMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"expected_profit_usd\":{},\"funding_interval_hours\":{},\"gross_basis_bps\":{},\"index_price\":{},\"is_candidate\":{},\"last_funding_rate\":{},\"mark_price\":{},\"net_basis_bps\":{},\"next_funding_time_ms\":{},\"perp_ask\":{},\"perp_ask_depth_levels\":{},\"perp_ask_qty\":{},\"perp_bid\":{},\"perp_bid_depth_levels\":{},\"perp_bid_qty\":{},\"quantity\":{},\"reason\":{},\"source_status\":{},\"spot_ask\":{},\"spot_ask_depth_levels\":{},\"spot_ask_qty\":{},\"spot_bid\":{},\"spot_bid_depth_levels\":{},\"spot_bid_qty\":{},\"symbol\":{},\"total_cost_bps\":{}}}",
+            "{{\"expected_profit_usd\":{},\"funding_carry_mode\":{},\"funding_carry_settlement_plan\":{},\"funding_interval_hours\":{},\"gross_basis_bps\":{},\"index_price\":{},\"is_candidate\":{},\"last_funding_rate\":{},\"mark_price\":{},\"net_basis_bps\":{},\"next_funding_time_ms\":{},\"perp_ask\":{},\"perp_ask_depth_levels\":{},\"perp_ask_qty\":{},\"perp_bid\":{},\"perp_bid_depth_levels\":{},\"perp_bid_qty\":{},\"quantity\":{},\"reason\":{},\"source_status\":{},\"spot_ask\":{},\"spot_ask_depth_levels\":{},\"spot_ask_qty\":{},\"spot_bid\":{},\"spot_bid_depth_levels\":{},\"spot_bid_qty\":{},\"strategy_family\":{},\"symbol\":{},\"total_cost_bps\":{}}}",
             json_option_string(&self.expected_profit_usd),
+            json_string(FUNDING_CARRY_MODE_SPOT_PERP),
+            json_string(FUNDING_CARRY_SETTLEMENT_PLAN_SPOT_PERP),
             json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_basis_bps),
             json_string(&self.index_price),
@@ -43866,6 +44310,7 @@ impl BinanceBasisMarketRow {
             json_option_string(&self.spot_bid),
             signal_depth_levels_json(&self.spot_bid_depth),
             json_option_string(&self.spot_bid_qty),
+            json_string(FUNDING_CARRY_STRATEGY_FAMILY),
             json_string(&self.symbol),
             json_option_string(&self.total_cost_bps),
         )
@@ -44027,9 +44472,13 @@ fn funding_arb_history_json(context: &FundingArbDashboardContext) -> String {
 impl FundingArbMarketRow {
     fn to_json(&self) -> String {
         format!(
-            "{{\"entry_price_edge_bps\":{},\"expected_funding_usd\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_depth_levels\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_depth_levels\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_native_funding_interval_hours\":{},\"venue_a_native_funding_rate\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_depth_levels\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_depth_levels\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_native_funding_interval_hours\":{},\"venue_b_native_funding_rate\":{},\"venue_b_next_funding_time_ms\":{}}}",
+            "{{\"entry_price_edge_bps\":{},\"expected_funding_usd\":{},\"funding_carry_first_settlement_time_ms\":{},\"funding_carry_mode\":{},\"funding_carry_second_settlement_time_ms\":{},\"funding_carry_settlement_plan\":{},\"funding_interval_hours\":{},\"gross_funding_spread_bps\":{},\"is_candidate\":{},\"long_venue_family\":{},\"net_funding_bps\":{},\"pair_id\":{},\"product_tags\":{},\"reason\":{},\"short_venue_family\":{},\"source_status\":{},\"strategy_family\":{},\"symbol\":{},\"total_cost_bps\":{},\"venue_a_ask\":{},\"venue_a_ask_depth_levels\":{},\"venue_a_ask_qty\":{},\"venue_a_bid\":{},\"venue_a_bid_depth_levels\":{},\"venue_a_bid_qty\":{},\"venue_a_family\":{},\"venue_a_funding_interval_hours\":{},\"venue_a_funding_rate\":{},\"venue_a_index_price\":{},\"venue_a_mark_price\":{},\"venue_a_native_funding_interval_hours\":{},\"venue_a_native_funding_rate\":{},\"venue_a_next_funding_time_ms\":{},\"venue_b_ask\":{},\"venue_b_ask_depth_levels\":{},\"venue_b_ask_qty\":{},\"venue_b_bid\":{},\"venue_b_bid_depth_levels\":{},\"venue_b_bid_qty\":{},\"venue_b_family\":{},\"venue_b_funding_interval_hours\":{},\"venue_b_funding_rate\":{},\"venue_b_index_price\":{},\"venue_b_mark_price\":{},\"venue_b_native_funding_interval_hours\":{},\"venue_b_native_funding_rate\":{},\"venue_b_next_funding_time_ms\":{}}}",
             json_option_string(&self.entry_price_edge_bps),
             json_option_string(&self.expected_funding_usd),
+            json_option_string(&self.funding_carry_first_settlement_time_ms),
+            json_string(&self.funding_carry_mode),
+            json_option_string(&self.funding_carry_second_settlement_time_ms),
+            json_string(&self.funding_carry_settlement_plan),
             json_string(&self.funding_interval_hours),
             json_option_string(&self.gross_funding_spread_bps),
             self.is_candidate,
@@ -44040,6 +44489,7 @@ impl FundingArbMarketRow {
             json_option_string(&self.reason),
             json_option_string(&self.short_venue_family),
             json_string(&self.source_status),
+            json_string(&self.strategy_family),
             json_string(&self.symbol),
             json_option_string(&self.total_cost_bps),
             json_string(&self.venue_a_ask),
@@ -45154,7 +45604,7 @@ fn funding_arb_guarded_dry_run_report_json(
             dispatch_attempted: report.dispatch_attempted,
         });
     format!(
-        "{{\"blocking_path\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_constraints\":{},\"execution_preflight\":{},\"exit_readiness\":{},\"expected_funding_usd\":{},\"funding_settlement\":{},\"funding_settlement_ingestion\":{},\"live_blocking_reasons\":{},\"live_readiness\":{},\"live_ready\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_accounts\":{},\"private_execution\":{},\"private_positions\":{},\"product_tags\":{},\"risk_decision\":{},\"risk_reason_codes\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"snapshot_lineage\":{},\"strategy_id\":{},\"strategy_rejection_detail\":{},\"strategy_rejection_reason\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{},\"venue_execution_capability\":{}}}",
+        "{{\"blocking_path\":{},\"dispatch_attempted\":{},\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"execution_constraints\":{},\"execution_preflight\":{},\"exit_readiness\":{},\"expected_funding_usd\":{},\"funding_carry_first_settlement_time_ms\":{},\"funding_carry_mode\":{},\"funding_carry_second_settlement_time_ms\":{},\"funding_carry_settlement_plan\":{},\"funding_settlement\":{},\"funding_settlement_ingestion\":{},\"live_blocking_reasons\":{},\"live_readiness\":{},\"live_ready\":{},\"manual_gate_released\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_accounts\":{},\"private_execution\":{},\"private_positions\":{},\"product_tags\":{},\"risk_decision\":{},\"risk_reason_codes\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"snapshot_lineage\":{},\"strategy_family\":{},\"strategy_id\":{},\"strategy_rejection_detail\":{},\"strategy_rejection_reason\":{},\"symbol\":{},\"transition_id\":{},\"venue_a_family\":{},\"venue_b_family\":{},\"venue_execution_capability\":{}}}",
         blocking_path_json,
         report.dispatch_attempted,
         report.dispatch_plan_built,
@@ -45163,6 +45613,10 @@ fn funding_arb_guarded_dry_run_report_json(
         funding_arb_execution_preflight_json(&report.execution_preflight),
         funding_arb_exit_readiness_json(&report.exit_readiness),
         json_option_string(&row.expected_funding_usd),
+        json_option_string(&row.funding_carry_first_settlement_time_ms),
+        json_string(&row.funding_carry_mode),
+        json_option_string(&row.funding_carry_second_settlement_time_ms),
+        json_string(&row.funding_carry_settlement_plan),
         funding_settlement_reconciliation_json(&report.funding_settlement),
         funding_settlement_ingestion_json(&report.funding_settlement_ingestion),
         json_string_array(&report.live_blocking_reasons),
@@ -45180,6 +45634,7 @@ fn funding_arb_guarded_dry_run_report_json(
         json_string_array(&report.risk_reason_codes),
         report.signal_allowed,
         funding_arb_snapshot_lineage_json(&report.snapshot_lineage),
+        json_string(&row.strategy_family),
         json_string(&spec.strategy_config.instance.strategy_id),
         json_option_string(&report.strategy_rejection_detail),
         json_option_string(&report.strategy_rejection_reason),
@@ -45188,6 +45643,35 @@ fn funding_arb_guarded_dry_run_report_json(
         json_string(&row.venue_a_family),
         json_string(&row.venue_b_family),
         funding_arb_venue_execution_capability_json(&report.venue_execution_capability),
+    )
+}
+
+fn funding_carry_minimal_preflight_report_json(
+    row: &FundingArbMarketRow,
+    report: &FundingArbGuardedDryRunReport,
+) -> String {
+    format!(
+        "{{\"dispatch_plan_built\":{},\"dispatch_request_count\":{},\"expected_funding_usd\":{},\"funding_carry_first_settlement_time_ms\":{},\"funding_carry_mode\":{},\"funding_carry_second_settlement_time_ms\":{},\"funding_carry_settlement_plan\":{},\"funding_settlement_ingestion_status\":{},\"funding_settlement_status\":{},\"live_blocking_reasons\":{},\"live_ready\":{},\"mutable_execution_started\":{},\"net_funding_bps\":{},\"pair_id\":{},\"private_account_status\":{},\"private_position_status\":{},\"risk_decision\":{},\"schema_version\":\"1.0.0\",\"signal_allowed\":{},\"strategy_family\":{},\"symbol\":{}}}",
+        report.dispatch_plan_built,
+        report.dispatch_request_count,
+        json_option_string(&row.expected_funding_usd),
+        json_option_string(&row.funding_carry_first_settlement_time_ms),
+        json_string(&row.funding_carry_mode),
+        json_option_string(&row.funding_carry_second_settlement_time_ms),
+        json_string(&row.funding_carry_settlement_plan),
+        json_string(&report.funding_settlement_ingestion.status),
+        json_string(&report.funding_settlement.status),
+        json_string_array(&report.live_blocking_reasons),
+        report.live_ready,
+        report.mutable_execution_started,
+        json_option_string(&row.net_funding_bps),
+        json_string(&row.pair_id),
+        json_string(&report.private_accounts.status),
+        json_string(&report.private_positions.status),
+        json_string(&report.risk_decision),
+        report.signal_allowed,
+        json_string(&row.strategy_family),
+        json_string(&row.symbol),
     )
 }
 
@@ -45752,6 +46236,11 @@ mod tests {
         FundingArbMarketRow {
             pair_id: "binance:bybit:BTCUSDT:BTCUSDT".to_owned(),
             symbol: "BTCUSDT".to_owned(),
+            strategy_family: FUNDING_CARRY_STRATEGY_FAMILY.to_owned(),
+            funding_carry_mode: FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            funding_carry_settlement_plan: FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            funding_carry_first_settlement_time_ms: Some("1778659200000".to_owned()),
+            funding_carry_second_settlement_time_ms: Some("1778659200000".to_owned()),
             venue_a_family: "binance".to_owned(),
             venue_b_family: "bybit".to_owned(),
             venue_a_bid: "99.95".to_owned(),
@@ -45927,10 +46416,12 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: None,
             notional_usd: "100.00".to_owned(),
+            max_total_notional_usdt: "100.00".to_owned(),
             taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 15,
             max_entry_price_divergence_bps: 100,
             min_net_funding_bps: 5,
+            funding_carry_modes: default_funding_carry_perp_modes(),
             execute_live: false,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
@@ -49924,6 +50415,198 @@ mod tests {
     }
 
     #[test]
+    fn funding_arb_monitor_promotes_mismatched_next_funding_to_staggered_carry() {
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "LABUSDT",
+                "0.00010000",
+                "8",
+                "1778659200000",
+                "complete",
+                Some("1000"),
+                Some("1000"),
+            ),
+        );
+        let aster = funding_arb_test_venue_snapshot(
+            "aster",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "LABUSDT",
+                "0.00500000",
+                "1",
+                "1778655600000",
+                "complete",
+                Some("1000"),
+                Some("1000"),
+            ),
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "bybit".to_owned(),
+                    status_url: "http://127.0.0.1/bybit/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "aster".to_owned(),
+                    status_url: "http://127.0.0.1/aster/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![bybit, aster], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.candidate_count, 1);
+        let row = &snapshot.rows[0];
+        assert!(row.is_candidate, "{:?}", row.reason);
+        assert_eq!(
+            row.funding_carry_mode,
+            FUNDING_CARRY_MODE_PERP_PERP_STAGGERED
+        );
+        assert_eq!(
+            row.funding_carry_settlement_plan,
+            FUNDING_CARRY_SETTLEMENT_PLAN_STAGGERED_PERP_PERP
+        );
+        assert_eq!(
+            row.funding_carry_first_settlement_time_ms.as_deref(),
+            Some("1778655600000")
+        );
+        assert_eq!(
+            row.funding_carry_second_settlement_time_ms.as_deref(),
+            Some("1778659200000")
+        );
+        assert_eq!(row.long_venue_family.as_deref(), Some("bybit"));
+        assert_eq!(row.short_venue_family.as_deref(), Some("aster"));
+        let net = MonitorDecimal::parse(
+            "test staggered net funding bps",
+            row.net_funding_bps.as_deref().expect("net funding bps"),
+        )
+        .expect("parse net funding bps");
+        let min = funding_carry_decimal_from_i128(5, "test min bps").expect("min bps");
+        assert!(net.raw >= min.raw);
+    }
+
+    #[test]
+    fn funding_arb_monitor_allows_staggered_carry_when_sync_spread_is_below_minimum() {
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "LABUSDT",
+                "0.03100000",
+                "8",
+                "1778659200000",
+                "complete",
+                Some("1000"),
+                Some("1000"),
+            ),
+        );
+        let aster = funding_arb_test_venue_snapshot(
+            "aster",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "LABUSDT",
+                "0.00400000",
+                "1",
+                "1778655600000",
+                "complete",
+                Some("1000"),
+                Some("1000"),
+            ),
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "bybit".to_owned(),
+                    status_url: "http://127.0.0.1/bybit/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "aster".to_owned(),
+                    status_url: "http://127.0.0.1/aster/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![bybit, aster], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.candidate_count, 1);
+        let row = &snapshot.rows[0];
+        assert!(row.is_candidate, "{:?}", row.reason);
+        assert_eq!(
+            row.funding_carry_mode,
+            FUNDING_CARRY_MODE_PERP_PERP_STAGGERED
+        );
+        assert_eq!(row.gross_funding_spread_bps.as_deref(), Some("40"));
+        let net = MonitorDecimal::parse(
+            "test staggered net funding bps",
+            row.net_funding_bps.as_deref().expect("net funding bps"),
+        )
+        .expect("parse net funding bps");
+        let min = funding_carry_decimal_from_i128(5, "test min bps").expect("min bps");
+        assert!(net.raw >= min.raw);
+    }
+
+    #[test]
+    fn funding_arb_monitor_blocks_staggered_carry_when_mode_disabled() {
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "LABUSDT",
+                "0.00010000",
+                "8",
+                "1778659200000",
+                "complete",
+                Some("1000"),
+                Some("1000"),
+            ),
+        );
+        let aster = funding_arb_test_venue_snapshot(
+            "aster",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "LABUSDT",
+                "0.00500000",
+                "1",
+                "1778655600000",
+                "complete",
+                Some("1000"),
+                Some("1000"),
+            ),
+        );
+        let options = FundingArbMonitorOptions {
+            funding_carry_modes: vec![FUNDING_CARRY_MODE_PERP_PERP.to_owned()],
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "bybit".to_owned(),
+                    status_url: "http://127.0.0.1/bybit/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "aster".to_owned(),
+                    status_url: "http://127.0.0.1/aster/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![bybit, aster], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.candidate_count, 0);
+        let row = &snapshot.rows[0];
+        assert_eq!(
+            row.funding_carry_mode,
+            FUNDING_CARRY_MODE_PERP_PERP_STAGGERED
+        );
+        assert!(row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("next_funding_time_ms mismatch")));
+    }
+
+    #[test]
     fn funding_arb_monitor_rejects_non_exchange_native_symbols() {
         let binance = funding_arb_test_venue_snapshot(
             "binance",
@@ -50668,10 +51351,12 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: Some(1),
             notional_usd: "10.00".to_owned(),
+            max_total_notional_usdt: "100.00".to_owned(),
             taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
+            funding_carry_modes: default_funding_carry_perp_modes(),
             execute_live: false,
             acknowledge_funding_arb_live_orders: false,
             allow_unknown_recovery: false,
@@ -52428,8 +53113,12 @@ mod tests {
             "2".to_owned(),
             "--notional-usd".to_owned(),
             "11.25".to_owned(),
+            "--max-total-notional-usdt".to_owned(),
+            "40.00".to_owned(),
             "--min-net-funding-bps".to_owned(),
             "8".to_owned(),
+            "--funding-carry-mode".to_owned(),
+            "perp-perp-staggered".to_owned(),
             "--execute-live".to_owned(),
             "--i-understand-funding-arb-live-orders".to_owned(),
             "--allow-unknown-recovery".to_owned(),
@@ -52469,7 +53158,12 @@ mod tests {
         assert_eq!(options.poll_interval_secs, 30);
         assert_eq!(options.max_cycles, Some(2));
         assert_eq!(options.notional_usd, "11.25");
+        assert_eq!(options.max_total_notional_usdt, "40.00");
         assert_eq!(options.min_net_funding_bps, 8);
+        assert_eq!(
+            options.funding_carry_modes,
+            vec![FUNDING_CARRY_MODE_PERP_PERP_STAGGERED.to_owned()]
+        );
         assert!(options.execute_live);
         assert!(options.acknowledge_funding_arb_live_orders);
         assert!(options.allow_unknown_recovery);
@@ -52535,7 +53229,7 @@ mod tests {
     fn funding_arb_resident_registry_allows_open_positions_and_blocks_unknown_positions() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let registry_path = root.path().join("funding_arb_resident_positions.jsonl");
-        let options = FundingArbResidentLiveOptions {
+        let mut options = FundingArbResidentLiveOptions {
             config_path: PathBuf::from("templates/personal_guarded_live.preflight.yaml"),
             output_dir: Some(root.path().to_path_buf()),
             snapshot_path: None,
@@ -52548,10 +53242,12 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: None,
             notional_usd: "10.00".to_owned(),
+            max_total_notional_usdt: "100.00".to_owned(),
             taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
+            funding_carry_modes: default_funding_carry_perp_modes(),
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
@@ -52576,6 +53272,15 @@ mod tests {
         let active_capacity =
             funding_arb_resident_entry_capacity(&options, root.path()).expect("capacity");
         assert!(matches!(active_capacity, ResidentEntryCapacity::Allowed));
+
+        options.max_total_notional_usdt = "15.00".to_owned();
+        let capped_capacity =
+            funding_arb_resident_entry_capacity(&options, root.path()).expect("capped capacity");
+        assert!(matches!(
+            capped_capacity,
+            ResidentEntryCapacity::Blocked(reason)
+                if reason.contains("max total notional would be exceeded")
+        ));
 
         write_utf8(
             registry_path.clone(),
@@ -52832,10 +53537,12 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: Some(1),
             notional_usd: "10.00".to_owned(),
+            max_total_notional_usdt: "100.00".to_owned(),
             taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
+            funding_carry_modes: default_funding_carry_perp_modes(),
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
@@ -52965,10 +53672,12 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: None,
             notional_usd: "10.00".to_owned(),
+            max_total_notional_usdt: "100.00".to_owned(),
             taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
+            funding_carry_modes: default_funding_carry_perp_modes(),
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: false,
@@ -53231,10 +53940,12 @@ mod tests {
             poll_interval_secs: 60,
             max_cycles: None,
             notional_usd: "10.00".to_owned(),
+            max_total_notional_usdt: "100.00".to_owned(),
             taker_fee_bps: "5".to_owned(),
             slippage_buffer_bps: 5,
             max_entry_price_divergence_bps: 20,
             min_net_funding_bps: 5,
+            funding_carry_modes: default_funding_carry_perp_modes(),
             execute_live: true,
             acknowledge_funding_arb_live_orders: true,
             allow_unknown_recovery: true,
@@ -57191,6 +57902,11 @@ mod tests {
         let row = FundingArbMarketRow {
             pair_id: "bybit:bitget:DRIFTUSDT:DRIFTUSDT".to_owned(),
             symbol: "DRIFTUSDT".to_owned(),
+            strategy_family: FUNDING_CARRY_STRATEGY_FAMILY.to_owned(),
+            funding_carry_mode: FUNDING_CARRY_MODE_PERP_PERP.to_owned(),
+            funding_carry_settlement_plan: FUNDING_CARRY_SETTLEMENT_PLAN_SYNC_PERP_PERP.to_owned(),
+            funding_carry_first_settlement_time_ms: Some("1779624000000".to_owned()),
+            funding_carry_second_settlement_time_ms: Some("1779624000000".to_owned()),
             venue_a_family: "bybit".to_owned(),
             venue_b_family: "bitget".to_owned(),
             venue_a_bid: "0.02731".to_owned(),

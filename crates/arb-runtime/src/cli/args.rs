@@ -3322,6 +3322,13 @@ pub(crate) fn parse_funding_arb_monitor_args(
                     .parse::<i128>()
                     .map_err(|_| cli_arg_error("--min-net-funding-bps must be an integer"))?;
             }
+            "--funding-carry-mode" | "--funding-carry-modes" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--funding-carry-mode requires a value"));
+                };
+                options.funding_carry_modes = parse_funding_carry_mode_list_arg(value)?;
+            }
             "--source" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -3517,6 +3524,24 @@ fn parse_funding_arb_source_arg(value: &str) -> RuntimeResult<(String, String)> 
         return Err(cli_arg_error("--source requires non-empty venue and URL"));
     }
     Ok((venue.trim().to_owned(), status_url.trim().to_owned()))
+}
+
+fn parse_funding_carry_mode_list_arg(value: &str) -> RuntimeResult<Vec<String>> {
+    let mut modes = Vec::new();
+    for raw in value.split(',') {
+        let Some(mode) = normalize_funding_carry_mode(raw) else {
+            return Err(cli_arg_error(format!(
+                "unsupported funding carry mode `{raw}`; supported modes are spot_perp, perp_perp, perp_perp_staggered"
+            )));
+        };
+        if !modes.contains(&mode) {
+            modes.push(mode);
+        }
+    }
+    if modes.is_empty() {
+        return Err(cli_arg_error("--funding-carry-mode cannot be empty"));
+    }
+    Ok(modes)
 }
 
 fn set_funding_arb_source_url(
@@ -4166,10 +4191,12 @@ pub(crate) fn parse_funding_arb_resident_live_args(
     let mut poll_interval_secs = 60_u64;
     let mut max_cycles = None;
     let mut notional_usd = BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned();
+    let mut max_total_notional_usdt = BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT.to_owned();
     let mut taker_fee_bps = BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned();
     let mut slippage_buffer_bps = BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS;
     let mut max_entry_price_divergence_bps = 20;
     let mut min_net_funding_bps = BASIS_MONITOR_DEFAULT_MIN_NET_BPS;
+    let mut funding_carry_modes = default_funding_carry_perp_modes();
     let mut execute_live = false;
     let mut acknowledge_funding_arb_live_orders = false;
     let mut allow_unknown_recovery = false;
@@ -4332,6 +4359,15 @@ pub(crate) fn parse_funding_arb_resident_live_args(
                 };
                 notional_usd = value.clone();
             }
+            "--max-total-notional-usdt" | "--max-total-notional-usd" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--max-total-notional-usdt requires a decimal",
+                    ));
+                };
+                max_total_notional_usdt = value.clone();
+            }
             "--taker-fee-bps" | "--perp-fee-bps" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -4367,6 +4403,13 @@ pub(crate) fn parse_funding_arb_resident_live_args(
                 min_net_funding_bps = value
                     .parse::<i128>()
                     .map_err(|_| cli_arg_error("--min-net-funding-bps must be an integer"))?;
+            }
+            "--funding-carry-mode" | "--funding-carry-modes" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--funding-carry-mode requires a value"));
+                };
+                funding_carry_modes = parse_funding_carry_mode_list_arg(value)?;
             }
             "--execute-live" => execute_live = true,
             "--dry-run" => execute_live = false,
@@ -4470,10 +4513,12 @@ pub(crate) fn parse_funding_arb_resident_live_args(
         poll_interval_secs,
         max_cycles,
         notional_usd,
+        max_total_notional_usdt,
         taker_fee_bps,
         slippage_buffer_bps,
         max_entry_price_divergence_bps,
         min_net_funding_bps,
+        funding_carry_modes,
         execute_live,
         acknowledge_funding_arb_live_orders,
         allow_unknown_recovery,
