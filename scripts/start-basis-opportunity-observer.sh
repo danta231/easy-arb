@@ -1326,6 +1326,8 @@ funding_arb_resident_exit_is_accepted() {
     and (((.unknown_position_count // 0) | as_count) == 0)
     and (
       (.halt_reason // "") == "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
+      or (.halt_reason // "") == "funding arb position recovery cycle completed; resident live stopped before new entries"
+      or (.halt_reason // "") == "funding arb exit-only cycle completed; resident live stopped before new entries"
       or (
         ((.halt_reason // "") | startswith("max live entries reached: "))
         and (((.open_position_count // 0) | as_count) == 0)

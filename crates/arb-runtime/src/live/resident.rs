@@ -1098,6 +1098,7 @@ pub(crate) fn run_funding_arb_resident_live_inner(
     let mut dispatch_attempted = false;
     let mut halt_reason = None;
     let mut force_residual_de_risk_cycle = false;
+    let mut position_recovery_drain_mode = false;
     write_funding_arb_resident_live_progress_summary(
         &output_root,
         FundingArbResidentLiveProgressInput {
@@ -1172,6 +1173,9 @@ pub(crate) fn run_funding_arb_resident_live_inner(
             };
             let recovered_positions =
                 recovered_unknown_positions + recovered_flat_cancelled_orphan_positions;
+            if recovered_positions > 0 {
+                position_recovery_drain_mode = true;
+            }
             let registry = load_funding_arb_resident_position_registry(&output_root)?;
             let active_positions = registry.active_positions();
             let mut residual_de_risk_pending = false;
@@ -1268,12 +1272,29 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                 thread::sleep(Duration::from_secs(options.poll_interval_secs));
                 continue;
             }
-            if recovered_positions > 0 {
-                halt_reason = Some(
-                    "funding arb position recovery cycle completed; resident live stopped before new entries"
-                        .to_owned(),
-                );
-                break;
+            if position_recovery_drain_mode {
+                let registry = load_funding_arb_resident_position_registry(&output_root)?;
+                if funding_arb_position_recovery_drain_is_complete(&registry) {
+                    halt_reason = Some(
+                        "funding arb position recovery cycle completed; resident live stopped before new entries"
+                            .to_owned(),
+                    );
+                    break;
+                }
+                write_funding_arb_resident_live_progress_summary(
+                    &output_root,
+                    FundingArbResidentLiveProgressInput {
+                        phase: "running",
+                        cycles,
+                        last_pair_id: &last_pair_id,
+                        last_symbol: &last_symbol,
+                        last_net_funding_bps,
+                        dispatch_attempted,
+                        halt_reason: None,
+                    },
+                )?;
+                thread::sleep(Duration::from_secs(options.poll_interval_secs));
+                continue;
             }
             if options.exit_only {
                 halt_reason = Some(
@@ -1439,4 +1460,59 @@ pub(crate) fn run_funding_arb_resident_live_inner(
     write_funding_arb_resident_live_summary(&output_root, &report)?;
     log_funding_arb_resident_live_heartbeat(&report);
     Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_position_recovery_drain_is_complete(
+    registry: &FundingArbResidentPositionRegistry,
+) -> bool {
+    registry.active_positions().is_empty() && registry.unknown_position_count() == 0
+}
+
+#[cfg(all(test, feature = "live-exec"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn funding_arb_position_recovery_drain_requires_no_open_or_unknown_positions() {
+        let mut registry = FundingArbResidentPositionRegistry::default();
+        assert!(funding_arb_position_recovery_drain_is_complete(&registry));
+
+        registry.positions.insert(
+            "pos:open".to_owned(),
+            FundingArbResidentPosition {
+                position_id: "pos:open".to_owned(),
+                position_state_path: PathBuf::from("position.json"),
+                pair_id: "binance:bybit:LABUSDT:LABUSDT".to_owned(),
+                symbol: "LABUSDT".to_owned(),
+                notional_usdt: "50.00".to_owned(),
+                status: "open".to_owned(),
+                opened_at: None,
+                closed_at: None,
+            },
+        );
+        assert!(!funding_arb_position_recovery_drain_is_complete(&registry));
+
+        registry
+            .positions
+            .get_mut("pos:open")
+            .expect("open position")
+            .status = "closed".to_owned();
+        assert!(funding_arb_position_recovery_drain_is_complete(&registry));
+
+        registry.positions.insert(
+            "pos:unknown".to_owned(),
+            FundingArbResidentPosition {
+                position_id: "pos:unknown".to_owned(),
+                position_state_path: PathBuf::new(),
+                pair_id: "bybit:bitget:PRLUSDT:PRLUSDT".to_owned(),
+                symbol: "PRLUSDT".to_owned(),
+                notional_usdt: "unknown".to_owned(),
+                status: "unknown".to_owned(),
+                opened_at: None,
+                closed_at: None,
+            },
+        );
+        assert!(!funding_arb_position_recovery_drain_is_complete(&registry));
+    }
 }
