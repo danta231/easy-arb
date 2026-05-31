@@ -329,6 +329,16 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         }
     }
 
+    let exchange_pnl = funding_arb_exit_cycle_exchange_pnl_summary(
+        options,
+        &state,
+        dispatch_attempted,
+        partial_close,
+        &residual_risk,
+        &blocking_reasons,
+        &confirmations,
+    );
+
     let report = FundingArbExitCycleReport {
         pair_id: state.pair_id,
         symbol: state.symbol,
@@ -343,6 +353,7 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         dispatch_attempted,
         submitted_receipt_count: receipts.len(),
         private_confirmation_count: confirmations.len(),
+        exchange_pnl,
         residual_risk,
         blocking_reasons,
         output_dir: Some(output_dir.to_path_buf()),
