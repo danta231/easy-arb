@@ -29882,6 +29882,7 @@ impl FundingArbExchangePnlSummary {
 struct FundingArbExchangePnlQueryWindow {
     start_ms: u64,
     end_ms: u64,
+    backend_end_ms: u64,
 }
 
 #[cfg(feature = "live-exec")]
@@ -29965,9 +29966,26 @@ fn funding_arb_exchange_pnl_query_window(
             module: "arb-runtime",
             message: format!("funding arb exchange pnl closed_at is before unix epoch: {error}"),
         })?;
+    let end_ms = closed_ms.saturating_add(60 * 60 * 1000);
+    let backend_end_candidate = closed_ms.saturating_add(72 * 60 * 60 * 1000);
+    let now_ms =
+        u64::try_from(runtime_timestamp_millis(current_utc_timestamp()?)?).map_err(|error| {
+            RuntimeError::Module {
+                module: "arb-runtime",
+                message: format!(
+                    "funding arb exchange pnl current time is before unix epoch: {error}"
+                ),
+            }
+        })?;
+    let backend_end_ms = if now_ms > closed_ms {
+        backend_end_candidate.min(now_ms.saturating_add(60 * 1000))
+    } else {
+        backend_end_candidate
+    };
     Ok(FundingArbExchangePnlQueryWindow {
         start_ms: opened_ms.saturating_sub(10 * 60 * 1000),
-        end_ms: closed_ms.saturating_add(60 * 60 * 1000),
+        end_ms,
+        backend_end_ms,
     })
 }
 
@@ -30074,14 +30092,31 @@ fn funding_arb_exchange_pnl_row_time_ms(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_row_in_range(
+    fields: &BTreeMap<String, &str>,
+    start_ms: u64,
+    end_ms: u64,
+) -> RuntimeResult<bool> {
+    Ok(match funding_arb_exchange_pnl_row_time_ms(fields)? {
+        Some(timestamp_ms) => timestamp_ms >= start_ms && timestamp_ms <= end_ms,
+        None => true,
+    })
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_pnl_row_in_window(
     fields: &BTreeMap<String, &str>,
     window: &FundingArbExchangePnlQueryWindow,
 ) -> RuntimeResult<bool> {
-    Ok(match funding_arb_exchange_pnl_row_time_ms(fields)? {
-        Some(timestamp_ms) => timestamp_ms >= window.start_ms && timestamp_ms <= window.end_ms,
-        None => true,
-    })
+    funding_arb_exchange_pnl_row_in_range(fields, window.start_ms, window.end_ms)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_row_in_backend_window(
+    fields: &BTreeMap<String, &str>,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<bool> {
+    funding_arb_exchange_pnl_row_in_range(fields, window.start_ms, window.backend_end_ms)
 }
 
 #[cfg(feature = "live-exec")]
@@ -30128,6 +30163,24 @@ fn funding_arb_exchange_pnl_matched_rows<'a>(
         let fields = parse_json_object_value_slices(row)?;
         if funding_arb_exchange_pnl_row_matches_symbol(&fields, symbol)?
             && funding_arb_exchange_pnl_row_in_window(&fields, window)?
+        {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_backend_matched_rows<'a>(
+    payload: &'a str,
+    symbol: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<Vec<&'a str>> {
+    let mut rows = Vec::new();
+    for row in funding_arb_exchange_pnl_payload_rows(payload)? {
+        let fields = parse_json_object_value_slices(row)?;
+        if funding_arb_exchange_pnl_row_matches_symbol(&fields, symbol)?
+            && funding_arb_exchange_pnl_row_in_backend_window(&fields, window)?
         {
             rows.push(row);
         }
@@ -30373,12 +30426,12 @@ fn funding_arb_exchange_pnl_fetch_binance_leg(
             BinanceRequestParam::new("symbol", symbol.to_owned())?,
             BinanceRequestParam::new("incomeType", "REALIZED_PNL")?,
             BinanceRequestParam::new("startTime", window.start_ms.to_string())?,
-            BinanceRequestParam::new("endTime", window.end_ms.to_string())?,
+            BinanceRequestParam::new("endTime", window.backend_end_ms.to_string())?,
             BinanceRequestParam::new("limit", "1000")?,
             BinanceRequestParam::new("recvWindow", recv_window_ms.to_string())?,
         ],
     )?;
-    let rows = funding_arb_exchange_pnl_matched_rows(&payload, symbol, window)?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, symbol, window)?;
     let position_pnl = funding_arb_exchange_pnl_sum_fields(
         &rows,
         &["income", "amount", "pnl", "realizedPnl"],
@@ -30414,7 +30467,7 @@ fn funding_arb_exchange_pnl_fetch_bybit_leg(
     let recv_window_ms = bybit_private_readonly_recv_window_ms()?;
     let query = format!(
         "category=linear&symbol={symbol}&startTime={}&endTime={}&limit=100",
-        window.start_ms, window.end_ms
+        window.start_ms, window.backend_end_ms
     );
     let signed = signer.sign_bybit_hmac(
         BybitHmacSigningInput::new(
@@ -30433,7 +30486,7 @@ fn funding_arb_exchange_pnl_fetch_bybit_leg(
     )?;
     let payload =
         fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, "/v5/position/closed-pnl", &signed)?;
-    let rows = funding_arb_exchange_pnl_matched_rows(&payload, symbol, window)?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, symbol, window)?;
     let position_pnl =
         funding_arb_exchange_pnl_sum_fields(&rows, &["closedPnl", "pnl", "realizedPnl"], false)?;
     let Some(position_pnl) = position_pnl else {
@@ -30531,7 +30584,7 @@ fn funding_arb_exchange_pnl_fetch_okx_leg(
         .unwrap_or_else(|_| symbol.to_owned());
     let endpoint = format!(
         "/api/v5/account/bills?instType=SWAP&instId={inst_id}&begin={}&end={}&limit=100",
-        window.start_ms, window.end_ms
+        window.start_ms, window.backend_end_ms
     );
     let signed = signer.sign_okx_hmac(
         OkxHmacSigningInput::new(
@@ -30550,7 +30603,7 @@ fn funding_arb_exchange_pnl_fetch_okx_leg(
         &signing_policy,
     )?;
     let payload = fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)?;
-    let rows = funding_arb_exchange_pnl_matched_rows(&payload, symbol, window)?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, symbol, window)?;
     let pnl_rows = rows
         .iter()
         .copied()
@@ -30664,7 +30717,7 @@ fn funding_arb_exchange_pnl_fetch_bitget_leg(
         .unwrap_or_else(|_| symbol.to_owned());
     let endpoint = format!(
         "/api/v2/mix/position/history-position?productType=USDT-FUTURES&symbol={bitget_symbol}&startTime={}&endTime={}&limit=100",
-        window.start_ms, window.end_ms
+        window.start_ms, window.backend_end_ms
     );
     let signed = signer.sign_bitget_hmac(
         BitgetHmacSigningInput::new(
@@ -30682,7 +30735,7 @@ fn funding_arb_exchange_pnl_fetch_bitget_leg(
         &signing_policy,
     )?;
     let payload = fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)?;
-    let rows = funding_arb_exchange_pnl_matched_rows(&payload, &bitget_symbol, window)?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, &bitget_symbol, window)?;
     let position_pnl = funding_arb_exchange_pnl_sum_fields(
         &rows,
         &[
@@ -30785,7 +30838,7 @@ fn funding_arb_exchange_pnl_fetch_bitget_account_bill_leg(
     let signer = BitgetRealSigningProviderFromEnv::from_default_env()?;
     let endpoint = format!(
         "/api/v2/mix/account/bill?productType=USDT-FUTURES&symbol={bitget_symbol}&startTime={}&endTime={}&limit=100",
-        window.start_ms, window.end_ms
+        window.start_ms, window.backend_end_ms
     );
     let signed = signer.sign_bitget_hmac(
         BitgetHmacSigningInput::new(
@@ -30803,7 +30856,7 @@ fn funding_arb_exchange_pnl_fetch_bitget_account_bill_leg(
         &signing_policy,
     )?;
     let payload = fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)?;
-    let rows = funding_arb_exchange_pnl_matched_rows(&payload, bitget_symbol, window)?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, bitget_symbol, window)?;
     let pnl_rows = funding_arb_exchange_pnl_bitget_account_bill_pnl_rows(&rows)?;
     let position_pnl = funding_arb_exchange_pnl_sum_fields(
         &pnl_rows,
@@ -30862,12 +30915,12 @@ fn funding_arb_exchange_pnl_fetch_aster_leg(
             AsterRequestParam::new("symbol", symbol.to_owned())?,
             AsterRequestParam::new("incomeType", "REALIZED_PNL")?,
             AsterRequestParam::new("startTime", window.start_ms.to_string())?,
-            AsterRequestParam::new("endTime", window.end_ms.to_string())?,
+            AsterRequestParam::new("endTime", window.backend_end_ms.to_string())?,
             AsterRequestParam::new("limit", "1000")?,
         ],
         "/fapi/v3/income",
     )?;
-    let rows = funding_arb_exchange_pnl_matched_rows(&payload, symbol, window)?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, symbol, window)?;
     let position_pnl = funding_arb_exchange_pnl_sum_fields(
         &rows,
         &["income", "amount", "pnl", "realizedPnl"],
@@ -31404,7 +31457,7 @@ fn funding_arb_exchange_pnl_http_success_json(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"backendStatus\":{},\"closedAt\":{},\"configured\":true,\"feeUsd\":{},\"fundingPnlUsd\":{},\"legs\":[{}],\"netPnlUsd\":{},\"notes\":{},\"openedAt\":{},\"pairId\":{},\"pnlSemantics\":\"sum_exchange_reported_closed_position_pnl\",\"positionPnlUsd\":{},\"queryWindow\":{{\"endMs\":{},\"startMs\":{}}},\"source\":\"easy_arb_current_system_exchange_pnl\",\"status\":{},\"symbol\":{}}}",
+        "{{\"backendStatus\":{},\"closedAt\":{},\"configured\":true,\"feeUsd\":{},\"fundingPnlUsd\":{},\"legs\":[{}],\"netPnlUsd\":{},\"notes\":{},\"openedAt\":{},\"pairId\":{},\"pnlSemantics\":\"sum_exchange_reported_closed_position_pnl\",\"positionPnlUsd\":{},\"queryWindow\":{{\"backendEndMs\":{},\"endMs\":{},\"startMs\":{}}},\"source\":\"easy_arb_current_system_exchange_pnl\",\"status\":{},\"symbol\":{}}}",
         json_string(&summary.status),
         json_string(closed_at),
         funding_arb_exchange_pnl_http_decimal_json(summary.fee_usd.as_deref()),
@@ -31415,6 +31468,7 @@ fn funding_arb_exchange_pnl_http_success_json(
         json_string(&state.opened_at),
         json_string(&state.pair_id),
         funding_arb_exchange_pnl_http_decimal_json(summary.position_pnl_usd.as_deref()),
+        window.backend_end_ms,
         window.end_ms,
         window.start_ms,
         json_string(funding_arb_exchange_pnl_http_status(&summary.status)),
@@ -55109,6 +55163,7 @@ mod tests {
         let window = FundingArbExchangePnlQueryWindow {
             start_ms: 1_779_971_000_000,
             end_ms: 1_779_985_000_000,
+            backend_end_ms: 1_780_230_200_000,
         };
         let payload = r#"{"code":"00000","data":{"list":[{"symbol":"ESPORTSUSDT","pnl":"4.73","uTime":"1779978266000"},{"symbol":"OTHERUSDT","pnl":"99","uTime":"1779978266000"}]}}"#;
         let rows = funding_arb_exchange_pnl_matched_rows(payload, "ESPORTSUSDT", &window)
@@ -55124,10 +55179,37 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_pnl_backend_rows_accept_delayed_settlement_window() {
+        let window = FundingArbExchangePnlQueryWindow {
+            start_ms: 1_779_971_000_000,
+            end_ms: 1_779_985_000_000,
+            backend_end_ms: 1_780_230_200_000,
+        };
+        let payload = r#"{"retCode":0,"result":{"list":[{"symbol":"COAIUSDT","closedPnl":"1.25","updatedTime":"1780000000000"}]}}"#;
+
+        let trade_rows = funding_arb_exchange_pnl_matched_rows(payload, "COAIUSDT", &window)
+            .expect("trade window rows");
+        let backend_rows =
+            funding_arb_exchange_pnl_backend_matched_rows(payload, "COAIUSDT", &window)
+                .expect("backend rows");
+        let backend_pnl = funding_arb_exchange_pnl_sum_fields(&backend_rows, &["closedPnl"], false)
+            .expect("backend pnl");
+
+        assert_eq!(trade_rows.len(), 0);
+        assert_eq!(backend_rows.len(), 1);
+        assert_eq!(
+            backend_pnl.map(MonitorDecimal::format_trimmed).as_deref(),
+            Some("1.25")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_exchange_pnl_rows_accept_trade_time_fields() {
         let window = FundingArbExchangePnlQueryWindow {
             start_ms: 1_779_971_000_000,
             end_ms: 1_779_985_000_000,
+            backend_end_ms: 1_780_230_200_000,
         };
 
         let bybit_payload = r#"{"retCode":0,"result":{"list":[{"symbol":"COAIUSDT","execPnl":"1.25","execFee":"-0.01","execTime":"1779978266000"},{"symbol":"COAIUSDT","execPnl":"99","execTime":"1779999999000"}]}}"#;
