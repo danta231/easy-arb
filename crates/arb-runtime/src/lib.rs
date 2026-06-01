@@ -30863,14 +30863,30 @@ fn funding_arb_exchange_pnl_http_leg_state(
 ) -> RuntimeResult<FundingArbPositionLegState> {
     let venue_family =
         funding_arb_exchange_pnl_http_required_param(params, &format!("{prefix}_venue_family"))?;
+    let default_leg_config = funding_arb_leg_config(&venue_family, fallback_symbol).ok();
     let venue_id = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_venue_id"))
+        .or_else(|| {
+            default_leg_config
+                .as_ref()
+                .map(|config| config.venue_id.as_str())
+        })
         .unwrap_or(&venue_family)
         .to_owned();
     let account_id = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_account_id"))
+        .or_else(|| {
+            default_leg_config
+                .as_ref()
+                .map(|config| config.account_id.as_str())
+        })
         .unwrap_or("")
         .to_owned();
     let instrument_id =
         funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_instrument_id"))
+            .or_else(|| {
+                default_leg_config
+                    .as_ref()
+                    .map(|config| config.instrument_id.as_str())
+            })
             .unwrap_or(fallback_symbol)
             .to_owned();
     let role = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_role"))
@@ -52367,6 +52383,38 @@ mod tests {
         assert!(window.end_ms > window.start_ms);
         assert_eq!(status, 503);
         assert!(body.contains("exchange_pnl_config_unavailable"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_arb_exchange_pnl_http_state_backfills_missing_account_id() {
+        let path = concat!(
+            "/api/funding-arb/exchange-pnl/reconcile?",
+            "pair_id=bitget%3Aaster%3AESPORTSUSDT%3AESPORTSUSDT",
+            "&symbol=ESPORTSUSDT",
+            "&opened_at=2026-05-30T04%3A04%3A02Z",
+            "&closed_at=2026-05-30T07%3A24%3A26Z",
+            "&leg_a_venue_family=bitget",
+            "&leg_a_side=buy",
+            "&leg_b_venue_family=aster",
+            "&leg_b_side=sell"
+        );
+
+        let params = funding_arb_exchange_pnl_http_query_params(path).expect("query params");
+        let state = funding_arb_exchange_pnl_http_state(&params).expect("state");
+
+        assert_eq!(state.leg_a.account_id, "acct:bitget-funding-arb-readonly");
+        assert_eq!(state.leg_a.venue_id, "venue:BITGET-USDT-FUTURES");
+        assert_eq!(
+            state.leg_a.instrument_id,
+            "inst:BITGET:ESPORTSUSDT:USDT-FUTURES"
+        );
+        assert_eq!(state.leg_b.account_id, "acct:aster-funding-arb-readonly");
+        assert_eq!(state.leg_b.venue_id, "venue:ASTER-USDT-FUTURES");
+        assert_eq!(
+            state.leg_b.instrument_id,
+            "inst:ASTER:ESPORTSUSDT:USDT-FUTURES"
+        );
     }
 
     #[test]
