@@ -31135,6 +31135,23 @@ fn funding_arb_exchange_history_record_json(
         ],
         "exchange history row",
     )?;
+    let order_id = optional_first_json_value_string(
+        &fields,
+        &[
+            "orderId",
+            "ordId",
+            "clOrdId",
+            "clientOrderId",
+            "order_id",
+            "client_order_id",
+        ],
+        "exchange history row",
+    )?;
+    let trade_id = optional_first_json_value_string(
+        &fields,
+        &["tradeId", "execId", "fillId", "billId", "id", "tid"],
+        "exchange history row",
+    )?;
     let side = optional_first_json_value_string(
         &fields,
         &["side", "posSide", "positionSide", "direction"],
@@ -31168,6 +31185,46 @@ fn funding_arb_exchange_history_record_json(
         &fields,
         &[
             "income", "amount", "balChg", "cashFlow", "change", "sz", "qty",
+        ],
+    )?;
+    let quantity = funding_arb_exchange_history_decimal_from_fields(
+        &fields,
+        &[
+            "qty",
+            "quantity",
+            "execQty",
+            "fillSz",
+            "sz",
+            "size",
+            "vol",
+            "closedSize",
+            "closeSize",
+            "baseVolume",
+        ],
+    )?;
+    let price = funding_arb_exchange_history_decimal_from_fields(
+        &fields,
+        &[
+            "price",
+            "execPrice",
+            "fillPx",
+            "px",
+            "avgPrice",
+            "avgEntryPrice",
+            "avgExitPrice",
+        ],
+    )?;
+    let notional_usd = funding_arb_exchange_history_decimal_from_fields(
+        &fields,
+        &[
+            "notional",
+            "execValue",
+            "value",
+            "quoteQty",
+            "quoteVolume",
+            "fillNotionalUsd",
+            "fillQuoteSz",
+            "closedValue",
         ],
     )?;
     let kind = income_type
@@ -31221,7 +31278,7 @@ fn funding_arb_exchange_history_record_json(
     };
     let amount_usd = amount_like;
     Ok(format!(
-        "{{\"accountId\":{},\"amountUsd\":{},\"businessType\":{},\"currency\":{},\"eventTimeMs\":{},\"exchangeRecordId\":{},\"feeUsd\":{},\"fundingPnlUsd\":{},\"incomeType\":{},\"instrumentId\":{},\"pnlUsd\":{},\"rawPayload\":{},\"recordSource\":{},\"recordType\":{},\"side\":{},\"symbol\":{},\"venueFamily\":{},\"venueId\":{}}}",
+        "{{\"accountId\":{},\"amountUsd\":{},\"businessType\":{},\"currency\":{},\"eventTimeMs\":{},\"exchangeRecordId\":{},\"feeUsd\":{},\"fundingPnlUsd\":{},\"incomeType\":{},\"instrumentId\":{},\"notionalUsd\":{},\"orderId\":{},\"pnlUsd\":{},\"price\":{},\"quantity\":{},\"rawPayload\":{},\"recordSource\":{},\"recordType\":{},\"side\":{},\"symbol\":{},\"tradeId\":{},\"venueFamily\":{},\"venueId\":{}}}",
         json_string(&leg.account_id),
         funding_arb_exchange_history_decimal_json(amount_usd),
         funding_arb_exchange_history_string_json(business_type),
@@ -31234,12 +31291,17 @@ fn funding_arb_exchange_history_record_json(
         funding_arb_exchange_history_decimal_json(funding_pnl_usd),
         funding_arb_exchange_history_string_json(income_type),
         funding_arb_exchange_history_string_json(instrument_id),
+        funding_arb_exchange_history_decimal_json(notional_usd),
+        funding_arb_exchange_history_string_json(order_id),
         funding_arb_exchange_history_decimal_json(pnl_usd),
+        funding_arb_exchange_history_decimal_json(price),
+        funding_arb_exchange_history_decimal_json(quantity),
         row.trim(),
         json_string(source),
         json_string(record_type),
         funding_arb_exchange_history_string_json(side),
         json_string(&symbol),
+        funding_arb_exchange_history_string_json(trade_id),
         json_string(&leg.venue_family),
         json_string(&leg.venue_id),
     ))
@@ -56125,6 +56187,19 @@ mod tests {
         assert!(record.contains("\"amountUsd\":-0.12"));
         assert!(record.contains("\"feeUsd\":-0.001"));
         assert!(record.contains("\"rawPayload\":{\"symbol\":\"MAGMAUSDT\""));
+
+        let fill_record = funding_arb_exchange_history_record_json(
+            &leg,
+            "bitget /api/v2/mix/account/bill",
+            "trade_fill",
+            r#"{"symbol":"MAGMAUSDT","orderId":"order-1","tradeId":"trade-1","qty":"12.5","price":"0.031","notional":"0.3875","ts":"1779978266000"}"#,
+        )
+        .expect("fill history record json");
+        assert!(fill_record.contains("\"orderId\":\"order-1\""));
+        assert!(fill_record.contains("\"tradeId\":\"trade-1\""));
+        assert!(fill_record.contains("\"quantity\":12.5"));
+        assert!(fill_record.contains("\"price\":0.031"));
+        assert!(fill_record.contains("\"notionalUsd\":0.3875"));
     }
 
     #[test]
