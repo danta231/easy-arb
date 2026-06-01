@@ -3411,6 +3411,93 @@ pub(crate) fn parse_funding_arb_monitor_args(
                 };
                 options.opportunity_history_path = Some(PathBuf::from(value));
             }
+            "--exchange-pnl-config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-config requires a config path",
+                    ));
+                };
+                options.exchange_pnl_config_path = Some(PathBuf::from(value));
+            }
+            "--exchange-pnl-hyperliquid-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-hyperliquid-user requires an address",
+                    ));
+                };
+                options.exchange_pnl_hyperliquid_user = Some(value.clone());
+            }
+            "--exchange-pnl-hyperliquid-source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-hyperliquid-source requires a|b",
+                    ));
+                };
+                options.exchange_pnl_hyperliquid_source = value.clone();
+            }
+            "--exchange-pnl-hyperliquid-vault-address" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-hyperliquid-vault-address requires an address",
+                    ));
+                };
+                options.exchange_pnl_hyperliquid_vault_address = Some(value.clone());
+            }
+            "--exchange-pnl-hyperliquid-expires-after-ms" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-hyperliquid-expires-after-ms requires a millisecond timestamp",
+                    ));
+                };
+                options.exchange_pnl_hyperliquid_expires_after_ms =
+                    Some(value.parse::<u64>().map_err(|_| {
+                        cli_arg_error("--exchange-pnl-hyperliquid-expires-after-ms must be a u64")
+                    })?);
+            }
+            "--exchange-pnl-hyperliquid-asset-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-hyperliquid-asset-id requires SYMBOL=ID",
+                    ));
+                };
+                let (symbol, asset_id) = parse_hyperliquid_asset_id_arg(value)?;
+                options
+                    .exchange_pnl_hyperliquid_asset_ids
+                    .insert(symbol, asset_id);
+            }
+            "--exchange-pnl-aster-user" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-aster-user requires an address",
+                    ));
+                };
+                options.exchange_pnl_aster_user = Some(value.clone());
+            }
+            "--exchange-pnl-aster-signer" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-aster-signer requires an address",
+                    ));
+                };
+                options.exchange_pnl_aster_signer = Some(value.clone());
+            }
+            "--exchange-pnl-aster-signer-cmd-env" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error(
+                        "--exchange-pnl-aster-signer-cmd-env requires an env var name",
+                    ));
+                };
+                options.exchange_pnl_aster_signer_cmd_env = value.clone();
+            }
             value if value.starts_with('-') => {
                 return Err(cli_arg_error(format!(
                     "unknown funding-arb-monitor option `{value}`"

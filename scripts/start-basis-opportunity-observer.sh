@@ -3205,13 +3205,31 @@ start_funding_arb_monitor() {
   local pid
   local monitor
   local source
+  local asset_id_arg
   local -a source_args
+  local -a exchange_pnl_args
+  local -a hyperliquid_asset_id_args
 
   source_args=(--clear-sources)
   for monitor in "${MONITORS[@]}"; do
     source="$(status_url "${monitor}")"
     source_args+=(--source "${monitor}=${source}")
   done
+  exchange_pnl_args=(--exchange-pnl-config "${CONFIG_PATH}")
+  [[ -n "${HYPERLIQUID_USER:-}" ]] && exchange_pnl_args+=(--exchange-pnl-hyperliquid-user "${HYPERLIQUID_USER}")
+  [[ -n "${HYPERLIQUID_SOURCE:-}" ]] && exchange_pnl_args+=(--exchange-pnl-hyperliquid-source "${HYPERLIQUID_SOURCE}")
+  [[ -n "${HYPERLIQUID_VAULT_ADDRESS:-}" ]] && exchange_pnl_args+=(--exchange-pnl-hyperliquid-vault-address "${HYPERLIQUID_VAULT_ADDRESS}")
+  [[ -n "${HYPERLIQUID_EXPIRES_AFTER_MS:-}" ]] && exchange_pnl_args+=(--exchange-pnl-hyperliquid-expires-after-ms "${HYPERLIQUID_EXPIRES_AFTER_MS}")
+  if [[ -n "${HYPERLIQUID_ASSET_IDS:-}" ]]; then
+    IFS=',' read -r -a hyperliquid_asset_id_args <<< "${HYPERLIQUID_ASSET_IDS}"
+    for asset_id_arg in "${hyperliquid_asset_id_args[@]}"; do
+      asset_id_arg="${asset_id_arg//[[:space:]]/}"
+      [[ -n "${asset_id_arg}" ]] && exchange_pnl_args+=(--exchange-pnl-hyperliquid-asset-id "${asset_id_arg}")
+    done
+  fi
+  [[ -n "${ASTER_USER:-}" ]] && exchange_pnl_args+=(--exchange-pnl-aster-user "${ASTER_USER}")
+  [[ -n "${ASTER_SIGNER:-}" ]] && exchange_pnl_args+=(--exchange-pnl-aster-signer "${ASTER_SIGNER}")
+  [[ -n "${ASTER_SIGNER_CMD_ENV:-}" ]] && exchange_pnl_args+=(--exchange-pnl-aster-signer-cmd-env "${ASTER_SIGNER_CMD_ENV}")
 
   reclaim_stale_monitor_port "funding-arb-monitor" "${FUNDING_ARB_BIND}"
   echo "starting funding arb monitor: http://${FUNDING_ARB_BIND}/api/funding-arb/status"
@@ -3228,6 +3246,7 @@ start_funding_arb_monitor() {
     --resident-events "${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_events.jsonl" \
     --opportunity-history "${OPPORTUNITY_DIR}/cross-exchange-funding-arb.jsonl" \
     "${source_args[@]}" \
+    "${exchange_pnl_args[@]}" \
     >> "${log_file}" 2>&1 &
   pid="$!"
   printf '%s\t%s\t%s\n' "${pid}" "funding-arb-monitor" "${log_file}" >> "${PID_FILE}"

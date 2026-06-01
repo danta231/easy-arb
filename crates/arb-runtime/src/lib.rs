@@ -1795,6 +1795,15 @@ pub struct FundingArbMonitorOptions {
     pub execution_reports_path: Option<PathBuf>,
     pub resident_events_path: Option<PathBuf>,
     pub opportunity_history_path: Option<PathBuf>,
+    pub exchange_pnl_config_path: Option<PathBuf>,
+    pub exchange_pnl_hyperliquid_user: Option<String>,
+    pub exchange_pnl_hyperliquid_source: String,
+    pub exchange_pnl_hyperliquid_vault_address: Option<String>,
+    pub exchange_pnl_hyperliquid_expires_after_ms: Option<u64>,
+    pub exchange_pnl_hyperliquid_asset_ids: BTreeMap<String, u32>,
+    pub exchange_pnl_aster_user: Option<String>,
+    pub exchange_pnl_aster_signer: Option<String>,
+    pub exchange_pnl_aster_signer_cmd_env: String,
     pub sources: Vec<FundingArbVenueSource>,
 }
 
@@ -1814,6 +1823,15 @@ impl Default for FundingArbMonitorOptions {
             execution_reports_path: None,
             resident_events_path: None,
             opportunity_history_path: None,
+            exchange_pnl_config_path: None,
+            exchange_pnl_hyperliquid_user: None,
+            exchange_pnl_hyperliquid_source: "a".to_owned(),
+            exchange_pnl_hyperliquid_vault_address: None,
+            exchange_pnl_hyperliquid_expires_after_ms: None,
+            exchange_pnl_hyperliquid_asset_ids: BTreeMap::new(),
+            exchange_pnl_aster_user: None,
+            exchange_pnl_aster_signer: None,
+            exchange_pnl_aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
             sources: default_funding_arb_venue_sources(),
         }
     }
@@ -14858,6 +14876,18 @@ pub fn run_funding_arb_monitor(options: FundingArbMonitorOptions) -> RuntimeResu
             execution_reports_path: options.execution_reports_path.clone(),
             resident_events_path: options.resident_events_path.clone(),
             opportunity_history_path: options.opportunity_history_path.clone(),
+            exchange_pnl_config_path: options.exchange_pnl_config_path.clone(),
+            exchange_pnl_hyperliquid_user: options.exchange_pnl_hyperliquid_user.clone(),
+            exchange_pnl_hyperliquid_source: options.exchange_pnl_hyperliquid_source.clone(),
+            exchange_pnl_hyperliquid_vault_address: options
+                .exchange_pnl_hyperliquid_vault_address
+                .clone(),
+            exchange_pnl_hyperliquid_expires_after_ms: options
+                .exchange_pnl_hyperliquid_expires_after_ms,
+            exchange_pnl_hyperliquid_asset_ids: options.exchange_pnl_hyperliquid_asset_ids.clone(),
+            exchange_pnl_aster_user: options.exchange_pnl_aster_user.clone(),
+            exchange_pnl_aster_signer: options.exchange_pnl_aster_signer.clone(),
+            exchange_pnl_aster_signer_cmd_env: options.exchange_pnl_aster_signer_cmd_env.clone(),
         });
         start_funding_arb_http_api(&options.bind_addr, state.clone(), context)?;
         println!(
@@ -15099,9 +15129,13 @@ fn validate_funding_arb_monitor_options(options: &FundingArbMonitorOptions) -> R
             .opportunity_history_path
             .as_ref()
             .is_some_and(|path| path.as_os_str().is_empty())
+        || options
+            .exchange_pnl_config_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
     {
         return Err(cli_arg_error(
-            "funding-arb-monitor report path options cannot be empty",
+            "funding-arb-monitor path options cannot be empty",
         ));
     }
     let mut seen = BTreeSet::new();
@@ -25647,6 +25681,34 @@ struct FundingArbDashboardContext {
     execution_reports_path: Option<PathBuf>,
     resident_events_path: Option<PathBuf>,
     opportunity_history_path: Option<PathBuf>,
+    exchange_pnl_config_path: Option<PathBuf>,
+    exchange_pnl_hyperliquid_user: Option<String>,
+    exchange_pnl_hyperliquid_source: String,
+    exchange_pnl_hyperliquid_vault_address: Option<String>,
+    exchange_pnl_hyperliquid_expires_after_ms: Option<u64>,
+    exchange_pnl_hyperliquid_asset_ids: BTreeMap<String, u32>,
+    exchange_pnl_aster_user: Option<String>,
+    exchange_pnl_aster_signer: Option<String>,
+    exchange_pnl_aster_signer_cmd_env: String,
+}
+
+impl Default for FundingArbDashboardContext {
+    fn default() -> Self {
+        Self {
+            execution_reports_path: None,
+            resident_events_path: None,
+            opportunity_history_path: None,
+            exchange_pnl_config_path: None,
+            exchange_pnl_hyperliquid_user: None,
+            exchange_pnl_hyperliquid_source: "a".to_owned(),
+            exchange_pnl_hyperliquid_vault_address: None,
+            exchange_pnl_hyperliquid_expires_after_ms: None,
+            exchange_pnl_hyperliquid_asset_ids: BTreeMap::new(),
+            exchange_pnl_aster_user: None,
+            exchange_pnl_aster_signer: None,
+            exchange_pnl_aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30180,6 +30242,95 @@ fn funding_arb_exchange_pnl_summary_from_legs(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_leg_is_absent_no_pnl(leg: &FundingArbExchangePnlLegSummary) -> bool {
+    leg.status != "Confirmed"
+        && leg.evidence_count == 0
+        && leg
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("未返回"))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_summary_from_legs(
+    legs: &[FundingArbExchangePnlLegSummary],
+    terminal_status: &str,
+) -> FundingArbExchangePnlSummary {
+    let normalized_status = terminal_status.trim().to_ascii_lowercase();
+    let partial_terminal_status =
+        matches!(normalized_status.as_str(), "flat_cancelled" | "unknown");
+    if !partial_terminal_status {
+        return funding_arb_exchange_pnl_summary_from_legs(legs);
+    }
+
+    let confirmed = legs
+        .iter()
+        .filter(|leg| leg.is_confirmed())
+        .collect::<Vec<_>>();
+    let absent_no_pnl = legs
+        .iter()
+        .filter(|leg| funding_arb_exchange_pnl_leg_is_absent_no_pnl(leg))
+        .collect::<Vec<_>>();
+    if legs.is_empty()
+        || confirmed.is_empty()
+        || confirmed.len() + absent_no_pnl.len() != legs.len()
+    {
+        return funding_arb_exchange_pnl_summary_from_legs(legs);
+    }
+
+    let mut position_total = MonitorDecimal { raw: 0 };
+    let mut fee_total = MonitorDecimal { raw: 0 };
+    let mut fee_seen = false;
+    let mut funding_total = MonitorDecimal { raw: 0 };
+    let mut funding_seen = false;
+    let mut notes = Vec::new();
+
+    for leg in confirmed {
+        if let Some(value) = leg.position_pnl_usd {
+            position_total = position_total
+                .checked_add(value, "partial terminal exchange position pnl aggregate")
+                .unwrap_or(position_total);
+        }
+        if let Some(value) = leg.fee_usd {
+            fee_total = fee_total
+                .checked_add(value, "partial terminal exchange fee aggregate")
+                .unwrap_or(fee_total);
+            fee_seen = true;
+        }
+        if let Some(value) = leg.funding_pnl_usd {
+            funding_total = funding_total
+                .checked_add(value, "partial terminal exchange funding aggregate")
+                .unwrap_or(funding_total);
+            funding_seen = true;
+        }
+        notes.push(format!(
+            "{} confirmed via {}; evidence_count={}",
+            leg.venue_family, leg.source, leg.evidence_count
+        ));
+    }
+    for leg in absent_no_pnl {
+        notes.push(format!(
+            "{} returned no exchange backend PnL rows in partial terminal status {}; treated as no realized PnL for that leg.",
+            leg.venue_family, normalized_status
+        ));
+    }
+    notes.push(
+        "partial terminal status 使用交易所后台已实现/已关闭仓位盈亏逐腿相加；无后台 PnL 行的未成交腿不阻塞已成交腿回填。"
+            .to_owned(),
+    );
+
+    FundingArbExchangePnlSummary {
+        status: "Confirmed".to_owned(),
+        source: "exchange_backend_realized_pnl".to_owned(),
+        position_pnl_usd: Some(position_total.format_trimmed()),
+        fee_usd: fee_seen.then(|| fee_total.format_trimmed()),
+        funding_pnl_usd: funding_seen.then(|| funding_total.format_trimmed()),
+        net_pnl_usd: Some(position_total.format_trimmed()),
+        notes,
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_pnl_fetch_binance_leg(
     options: &FundingArbResidentLiveOptions,
     leg: &FundingArbPositionLegState,
@@ -30612,6 +30763,432 @@ fn funding_arb_exit_cycle_exchange_pnl_summary(
                 format!("交易所后台已实现盈亏同步失败：{error}"),
             )
         },
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_resident_options_from_context(
+    context: &FundingArbDashboardContext,
+) -> RuntimeResult<FundingArbResidentLiveOptions> {
+    let config_path =
+        context
+            .exchange_pnl_config_path
+            .clone()
+            .ok_or_else(|| RuntimeError::UnsafeConfig {
+                message:
+                    "funding-arb-monitor 未配置 --exchange-pnl-config，不能执行交易所后台 PnL 对账"
+                        .to_owned(),
+            })?;
+
+    Ok(FundingArbResidentLiveOptions {
+        config_path,
+        output_dir: None,
+        snapshot_path: None,
+        pair_id: None,
+        sources: default_funding_arb_venue_sources(),
+        funding_settlement_ledger_path: None,
+        funding_settlement_raw_snapshot_path: None,
+        private_execution_snapshot_path: None,
+        private_order_events_dir: None,
+        poll_interval_secs: BASIS_MONITOR_DEFAULT_POLL_INTERVAL_SECS,
+        max_cycles: None,
+        notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+        max_total_notional_usdt: BINANCE_GUARDED_LIVE_CAPITAL_LIMIT_USDT.to_owned(),
+        taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
+        slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+        max_entry_price_divergence_bps: 20,
+        min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        funding_carry_modes: default_funding_carry_perp_modes(),
+        execute_live: false,
+        acknowledge_funding_arb_live_orders: false,
+        allow_unknown_recovery: false,
+        auto_residual_de_risk: true,
+        exit_only: false,
+        hyperliquid_user: context.exchange_pnl_hyperliquid_user.clone(),
+        hyperliquid_source: context.exchange_pnl_hyperliquid_source.clone(),
+        hyperliquid_vault_address: context.exchange_pnl_hyperliquid_vault_address.clone(),
+        hyperliquid_expires_after_ms: context.exchange_pnl_hyperliquid_expires_after_ms,
+        hyperliquid_asset_ids: context.exchange_pnl_hyperliquid_asset_ids.clone(),
+        aster_user: context.exchange_pnl_aster_user.clone(),
+        aster_signer: context.exchange_pnl_aster_signer.clone(),
+        aster_signer_cmd_env: context.exchange_pnl_aster_signer_cmd_env.clone(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_param<'a>(
+    params: &'a BTreeMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    params
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_required_param(
+    params: &BTreeMap<String, String>,
+    key: &str,
+) -> RuntimeResult<String> {
+    funding_arb_exchange_pnl_http_param(params, key)
+        .map(str::to_owned)
+        .ok_or_else(|| RuntimeError::UnsafeConfig {
+            message: format!("missing required query parameter `{key}`"),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_side(
+    params: &BTreeMap<String, String>,
+    prefix: &str,
+    default: OrderSide,
+) -> RuntimeResult<OrderSide> {
+    let Some(value) = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_side")) else {
+        return Ok(default);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "buy" | "long" => Ok(OrderSide::Buy),
+        "sell" | "short" => Ok(OrderSide::Sell),
+        _ => parse_order_side(value),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_leg_state(
+    params: &BTreeMap<String, String>,
+    prefix: &str,
+    fallback_symbol: &str,
+    default_side: OrderSide,
+) -> RuntimeResult<FundingArbPositionLegState> {
+    let venue_family =
+        funding_arb_exchange_pnl_http_required_param(params, &format!("{prefix}_venue_family"))?;
+    let venue_id = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_venue_id"))
+        .unwrap_or(&venue_family)
+        .to_owned();
+    let account_id = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_account_id"))
+        .unwrap_or("")
+        .to_owned();
+    let instrument_id =
+        funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_instrument_id"))
+            .unwrap_or(fallback_symbol)
+            .to_owned();
+    let role = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_role"))
+        .unwrap_or(prefix)
+        .to_owned();
+    let quantity = funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_quantity"))
+        .unwrap_or("0")
+        .to_owned();
+    let entry_limit_price =
+        funding_arb_exchange_pnl_http_param(params, &format!("{prefix}_entry_limit_price"))
+            .unwrap_or("0")
+            .to_owned();
+
+    Ok(FundingArbPositionLegState {
+        role,
+        venue_family,
+        venue_id,
+        account_id,
+        instrument_id,
+        side: funding_arb_exchange_pnl_http_side(params, prefix, default_side)?,
+        quantity,
+        entry_limit_price,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_state(
+    params: &BTreeMap<String, String>,
+) -> RuntimeResult<FundingArbPositionState> {
+    let symbol = funding_arb_exchange_pnl_http_required_param(params, "symbol")?;
+    Ok(FundingArbPositionState {
+        pair_id: funding_arb_exchange_pnl_http_param(params, "pair_id")
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("manual:{symbol}")),
+        symbol: symbol.clone(),
+        plan_hash: None,
+        notional_usd: "0".to_owned(),
+        entry_net_funding_bps: None,
+        target_funding_time_ms: None,
+        target_gross_funding_spread_bps: None,
+        target_expected_gross_funding_usd: None,
+        target_expected_net_funding_usd: None,
+        exit_risk_last_expected_funding_usd: None,
+        exit_risk_decline_streak_start_expected_funding_usd: None,
+        exit_risk_expected_funding_decline_cycles: 0,
+        exit_risk_negative_net_funding_cycles: 0,
+        opened_at: funding_arb_exchange_pnl_http_required_param(params, "opened_at")?,
+        private_order_events_dir: None,
+        leg_a: funding_arb_exchange_pnl_http_leg_state(params, "leg_a", &symbol, OrderSide::Buy)?,
+        leg_b: funding_arb_exchange_pnl_http_leg_state(params, "leg_b", &symbol, OrderSide::Sell)?,
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_url_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_url_decode_component(input: &str) -> RuntimeResult<String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let Some(high) = funding_arb_url_hex_value(bytes[index + 1]) else {
+                    return Err(RuntimeError::UnsafeConfig {
+                        message: format!("invalid URL escape in query component `{input}`"),
+                    });
+                };
+                let Some(low) = funding_arb_url_hex_value(bytes[index + 2]) else {
+                    return Err(RuntimeError::UnsafeConfig {
+                        message: format!("invalid URL escape in query component `{input}`"),
+                    });
+                };
+                output.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => {
+                return Err(RuntimeError::UnsafeConfig {
+                    message: format!("truncated URL escape in query component `{input}`"),
+                });
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).map_err(|error| RuntimeError::UnsafeConfig {
+        message: format!("query component is not UTF-8: {error}"),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_query_params(
+    path: &str,
+) -> RuntimeResult<BTreeMap<String, String>> {
+    let Some((_, query)) = path.split_once('?') else {
+        return Ok(BTreeMap::new());
+    };
+    let mut params = BTreeMap::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.insert(
+            funding_arb_url_decode_component(key)?,
+            funding_arb_url_decode_component(value)?,
+        );
+    }
+    Ok(params)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_decimal_json(value: Option<&str>) -> String {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "null".to_owned();
+    };
+    if MonitorDecimal::parse("exchange pnl HTTP decimal", value).is_ok() {
+        value.to_owned()
+    } else {
+        "null".to_owned()
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_status(status: &str) -> &'static str {
+    if status == "Confirmed" {
+        "exchange_pnl_confirmed"
+    } else {
+        "exchange_pnl_incomplete"
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_error_json(error: &str, message: &str) -> String {
+    format!(
+        "{{\"configured\":false,\"error\":{},\"feeUsd\":null,\"fundingPnlUsd\":null,\"legs\":[],\"message\":{},\"netPnlUsd\":null,\"notes\":[{}],\"pnlSemantics\":\"sum_exchange_reported_closed_position_pnl\",\"positionPnlUsd\":null,\"queryWindow\":null,\"source\":\"easy_arb_current_system_exchange_pnl\",\"status\":\"exchange_pnl_incomplete\"}}",
+        json_string(error),
+        json_string(message),
+        json_string(message),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_leg_json(
+    leg_key: &str,
+    state: &FundingArbPositionState,
+    leg: &FundingArbPositionLegState,
+    summary: &FundingArbExchangePnlLegSummary,
+) -> String {
+    let position_pnl = summary.position_pnl_usd.map(|value| value.format_trimmed());
+    let fee = summary.fee_usd.map(|value| value.format_trimmed());
+    let funding = summary.funding_pnl_usd.map(|value| value.format_trimmed());
+    format!(
+        "{{\"accountId\":{},\"backendStatus\":{},\"evidenceCount\":{},\"feeUsd\":{},\"fundingPnlUsd\":{},\"instrumentId\":{},\"legKey\":{},\"netPnlUsd\":{},\"note\":{},\"positionPnlUsd\":{},\"side\":{},\"source\":{},\"status\":{},\"symbol\":{},\"venueFamily\":{},\"venueId\":{}}}",
+        json_string(&leg.account_id),
+        json_string(&summary.status),
+        summary.evidence_count,
+        funding_arb_exchange_pnl_http_decimal_json(fee.as_deref()),
+        funding_arb_exchange_pnl_http_decimal_json(funding.as_deref()),
+        json_string(&leg.instrument_id),
+        json_string(leg_key),
+        funding_arb_exchange_pnl_http_decimal_json(position_pnl.as_deref()),
+        optional_json_string(summary.note.as_deref()),
+        funding_arb_exchange_pnl_http_decimal_json(position_pnl.as_deref()),
+        json_string(leg.side.as_str()),
+        json_string(&summary.source),
+        json_string(funding_arb_exchange_pnl_http_status(&summary.status)),
+        json_string(&funding_arb_exchange_pnl_symbol(&state.symbol, &leg.instrument_id)),
+        json_string(&summary.venue_family),
+        json_string(&leg.venue_id),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_http_success_json(
+    state: &FundingArbPositionState,
+    closed_at: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+    summary: &FundingArbExchangePnlSummary,
+    leg_summaries: &[(
+        &str,
+        &FundingArbPositionLegState,
+        FundingArbExchangePnlLegSummary,
+    )],
+) -> String {
+    let legs_json = leg_summaries
+        .iter()
+        .map(|(leg_key, leg, leg_summary)| {
+            funding_arb_exchange_pnl_http_leg_json(leg_key, state, leg, leg_summary)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"backendStatus\":{},\"closedAt\":{},\"configured\":true,\"feeUsd\":{},\"fundingPnlUsd\":{},\"legs\":[{}],\"netPnlUsd\":{},\"notes\":{},\"openedAt\":{},\"pairId\":{},\"pnlSemantics\":\"sum_exchange_reported_closed_position_pnl\",\"positionPnlUsd\":{},\"queryWindow\":{{\"endMs\":{},\"startMs\":{}}},\"source\":\"easy_arb_current_system_exchange_pnl\",\"status\":{},\"symbol\":{}}}",
+        json_string(&summary.status),
+        json_string(closed_at),
+        funding_arb_exchange_pnl_http_decimal_json(summary.fee_usd.as_deref()),
+        funding_arb_exchange_pnl_http_decimal_json(summary.funding_pnl_usd.as_deref()),
+        legs_json,
+        funding_arb_exchange_pnl_http_decimal_json(summary.net_pnl_usd.as_deref()),
+        json_string_array(&summary.notes),
+        json_string(&state.opened_at),
+        json_string(&state.pair_id),
+        funding_arb_exchange_pnl_http_decimal_json(summary.position_pnl_usd.as_deref()),
+        window.end_ms,
+        window.start_ms,
+        json_string(funding_arb_exchange_pnl_http_status(&summary.status)),
+        json_string(&state.symbol),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_reconcile_http_json(
+    context: &FundingArbDashboardContext,
+    path: &str,
+) -> (u16, String) {
+    let params = match funding_arb_exchange_pnl_http_query_params(path) {
+        Ok(params) => params,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_pnl_http_error_json("bad_query", &error.to_string()),
+            );
+        }
+    };
+    let state = match funding_arb_exchange_pnl_http_state(&params) {
+        Ok(state) => state,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_pnl_http_error_json("bad_request", &error.to_string()),
+            );
+        }
+    };
+    let closed_at = match funding_arb_exchange_pnl_http_required_param(&params, "closed_at") {
+        Ok(closed_at) => closed_at,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_pnl_http_error_json("bad_request", &error.to_string()),
+            );
+        }
+    };
+    let terminal_status = funding_arb_exchange_pnl_http_param(&params, "terminal_status")
+        .unwrap_or("closed")
+        .to_owned();
+    let window = match funding_arb_exchange_pnl_query_window(&state.opened_at, &closed_at) {
+        Ok(window) => window,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_pnl_http_error_json("bad_time_window", &error.to_string()),
+            );
+        }
+    };
+    let options = match funding_arb_exchange_pnl_resident_options_from_context(context) {
+        Ok(options) => options,
+        Err(error) => {
+            return (
+                503,
+                funding_arb_exchange_pnl_http_error_json(
+                    "exchange_pnl_config_unavailable",
+                    &error.to_string(),
+                ),
+            );
+        }
+    };
+
+    let mut leg_summaries = Vec::new();
+    for (leg_key, leg) in [("leg_a", &state.leg_a), ("leg_b", &state.leg_b)] {
+        let summary = funding_arb_exchange_pnl_fetch_leg(&options, &state, leg, &window)
+            .unwrap_or_else(|error| {
+                FundingArbExchangePnlLegSummary::incomplete(
+                    leg,
+                    "exchange backend realized pnl",
+                    error.to_string(),
+                    0,
+                )
+            });
+        leg_summaries.push((leg_key, leg, summary));
+    }
+    let summary_inputs = leg_summaries
+        .iter()
+        .map(|(_, _, summary)| summary.clone())
+        .collect::<Vec<_>>();
+    let summary =
+        funding_arb_exchange_pnl_http_summary_from_legs(&summary_inputs, &terminal_status);
+    (
+        200,
+        funding_arb_exchange_pnl_http_success_json(
+            &state,
+            &closed_at,
+            &window,
+            &summary,
+            &leg_summaries,
+        ),
+    )
+}
+
+#[cfg(not(feature = "live-exec"))]
+fn funding_arb_exchange_pnl_reconcile_http_json(
+    _context: &FundingArbDashboardContext,
+    _path: &str,
+) -> (u16, String) {
+    (
+        501,
+        "{\"configured\":false,\"error\":\"live_exec_feature_not_enabled\",\"feeUsd\":null,\"fundingPnlUsd\":null,\"legs\":[],\"netPnlUsd\":null,\"notes\":[\"当前 easy-arb 二进制未启用 live-exec，不能执行交易所后台 PnL 对账。\"],\"pnlSemantics\":\"sum_exchange_reported_closed_position_pnl\",\"positionPnlUsd\":null,\"queryWindow\":null,\"source\":\"easy_arb_current_system_exchange_pnl\",\"status\":\"exchange_pnl_incomplete\"}".to_owned(),
     )
 }
 
@@ -31280,6 +31857,15 @@ fn validate_funding_arb_resident_live_options(
             execution_reports_path: None,
             resident_events_path: None,
             opportunity_history_path: None,
+            exchange_pnl_config_path: Some(options.config_path.clone()),
+            exchange_pnl_hyperliquid_user: options.hyperliquid_user.clone(),
+            exchange_pnl_hyperliquid_source: options.hyperliquid_source.clone(),
+            exchange_pnl_hyperliquid_vault_address: options.hyperliquid_vault_address.clone(),
+            exchange_pnl_hyperliquid_expires_after_ms: options.hyperliquid_expires_after_ms,
+            exchange_pnl_hyperliquid_asset_ids: options.hyperliquid_asset_ids.clone(),
+            exchange_pnl_aster_user: options.aster_user.clone(),
+            exchange_pnl_aster_signer: options.aster_signer.clone(),
+            exchange_pnl_aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
             sources: options.sources.clone(),
         })?;
     }
@@ -31443,6 +32029,15 @@ fn load_funding_arb_resident_snapshot(
         execution_reports_path: None,
         resident_events_path: None,
         opportunity_history_path: None,
+        exchange_pnl_config_path: Some(options.config_path.clone()),
+        exchange_pnl_hyperliquid_user: options.hyperliquid_user.clone(),
+        exchange_pnl_hyperliquid_source: options.hyperliquid_source.clone(),
+        exchange_pnl_hyperliquid_vault_address: options.hyperliquid_vault_address.clone(),
+        exchange_pnl_hyperliquid_expires_after_ms: options.hyperliquid_expires_after_ms,
+        exchange_pnl_hyperliquid_asset_ids: options.hyperliquid_asset_ids.clone(),
+        exchange_pnl_aster_user: options.aster_user.clone(),
+        exchange_pnl_aster_signer: options.aster_signer.clone(),
+        exchange_pnl_aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
         sources: options.sources.clone(),
     })
 }
@@ -46320,10 +46915,12 @@ fn write_http_response(
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         410 => "Gone",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         503 => "Service Unavailable",
         _ => "OK",
     };
@@ -49008,8 +49605,7 @@ mod tests {
 
         let json = funding_arb_execution_status_json(&FundingArbDashboardContext {
             execution_reports_path: Some(report_path),
-            resident_events_path: None,
-            opportunity_history_path: None,
+            ..FundingArbDashboardContext::default()
         });
 
         assert!(json.contains("\"dispatch_status\":\"blocked\""));
@@ -49036,8 +49632,7 @@ mod tests {
 
         let json = funding_arb_execution_status_json(&FundingArbDashboardContext {
             execution_reports_path: Some(report_path),
-            resident_events_path: None,
-            opportunity_history_path: None,
+            ..FundingArbDashboardContext::default()
         });
 
         assert!(json.contains("\"venue_a_family\":\"binance\""));
@@ -49062,9 +49657,8 @@ mod tests {
         .expect("write resident event");
 
         let json = funding_arb_execution_status_json(&FundingArbDashboardContext {
-            execution_reports_path: None,
             resident_events_path: Some(resident_events_path),
-            opportunity_history_path: None,
+            ..FundingArbDashboardContext::default()
         });
 
         assert!(json.contains("\"dispatch_status\":\"blocked\""));
@@ -49095,9 +49689,8 @@ mod tests {
         .expect("write history");
 
         let json = funding_arb_history_json(&FundingArbDashboardContext {
-            execution_reports_path: None,
-            resident_events_path: None,
             opportunity_history_path: Some(history_path),
+            ..FundingArbDashboardContext::default()
         });
 
         assert!(json.contains("\"record_count\":1"));
@@ -51684,6 +52277,14 @@ mod tests {
             "target/arb-opportunity-observer/resident-live/cross-exchange-funding-arb/funding_arb_resident_live_events.jsonl".to_owned(),
             "--opportunity-history".to_owned(),
             "target/arb-opportunity-observer/opportunities/cross-exchange-funding-arb.jsonl".to_owned(),
+            "--exchange-pnl-config".to_owned(),
+            "templates/personal_guarded_live.preflight.yaml".to_owned(),
+            "--exchange-pnl-aster-signer".to_owned(),
+            "0x0000000000000000000000000000000000000001".to_owned(),
+            "--exchange-pnl-hyperliquid-user".to_owned(),
+            "0x0000000000000000000000000000000000000002".to_owned(),
+            "--exchange-pnl-hyperliquid-asset-id".to_owned(),
+            "BTCUSDT=42".to_owned(),
             "--once".to_owned(),
         ];
 
@@ -51705,6 +52306,67 @@ mod tests {
             .opportunity_history_path
             .as_deref()
             .is_some_and(|path| path.ends_with("cross-exchange-funding-arb.jsonl")));
+        assert!(options
+            .exchange_pnl_config_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("personal_guarded_live.preflight.yaml")));
+        assert_eq!(
+            options.exchange_pnl_aster_signer.as_deref(),
+            Some("0x0000000000000000000000000000000000000001")
+        );
+        assert_eq!(
+            options.exchange_pnl_hyperliquid_user.as_deref(),
+            Some("0x0000000000000000000000000000000000000002")
+        );
+        assert_eq!(
+            options.exchange_pnl_hyperliquid_asset_ids.get("BTCUSDT"),
+            Some(&42)
+        );
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_arb_exchange_pnl_http_request_uses_exchange_instrument_symbol() {
+        let path = concat!(
+            "/api/funding-arb/exchange-pnl/reconcile?",
+            "pair_id=bitget%3Aaster%3AESPORTSUSDT%3AESPORTSUSDT",
+            "&symbol=ESPORTSUSDT",
+            "&opened_at=2026-05-30T04%3A04%3A02Z",
+            "&closed_at=2026-05-30T07%3A24%3A26Z",
+            "&leg_a_venue_family=bitget",
+            "&leg_a_venue_id=bitget",
+            "&leg_a_account_id=acct-a",
+            "&leg_a_instrument_id=inst%3ABITGET%3AESPORTSUSDT%3AUSDT-FUTURES",
+            "&leg_a_side=buy",
+            "&leg_b_venue_family=aster",
+            "&leg_b_venue_id=aster",
+            "&leg_b_account_id=acct-b",
+            "&leg_b_instrument_id=inst%3AASTER%3AESPORTSUSDT%3AUSDT-FUTURES",
+            "&leg_b_side=sell"
+        );
+
+        let params = funding_arb_exchange_pnl_http_query_params(path).expect("query params");
+        let state = funding_arb_exchange_pnl_http_state(&params).expect("state");
+        let closed_at =
+            funding_arb_exchange_pnl_http_required_param(&params, "closed_at").expect("closed_at");
+        let window =
+            funding_arb_exchange_pnl_query_window(&state.opened_at, &closed_at).expect("window");
+        let (status, body) = funding_arb_exchange_pnl_reconcile_http_json(
+            &FundingArbDashboardContext::default(),
+            path,
+        );
+
+        assert_eq!(
+            funding_arb_exchange_pnl_symbol(&state.symbol, &state.leg_a.instrument_id),
+            "ESPORTSUSDT"
+        );
+        assert_eq!(
+            funding_arb_exchange_pnl_symbol(&state.symbol, &state.leg_b.instrument_id),
+            "ESPORTSUSDT"
+        );
+        assert!(window.end_ms > window.start_ms);
+        assert_eq!(status, 503);
+        assert!(body.contains("exchange_pnl_config_unavailable"));
     }
 
     #[test]
@@ -54008,6 +54670,55 @@ mod tests {
         assert_eq!(summary.position_pnl_usd.as_deref(), Some("-0.58"));
         assert_eq!(summary.net_pnl_usd.as_deref(), Some("-0.58"));
         assert!(summary.fee_usd.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_pnl_http_summary_accepts_partial_terminal_confirmed_leg() {
+        let bitget_leg = FundingArbPositionLegState {
+            role: "long".to_owned(),
+            venue_family: "bitget".to_owned(),
+            venue_id: "bitget".to_owned(),
+            account_id: "acct:bitget".to_owned(),
+            instrument_id: "ESPORTSUSDT".to_owned(),
+            side: OrderSide::Buy,
+            quantity: "1".to_owned(),
+            entry_limit_price: "1".to_owned(),
+        };
+        let aster_leg = FundingArbPositionLegState {
+            role: "short".to_owned(),
+            venue_family: "aster".to_owned(),
+            venue_id: "aster".to_owned(),
+            account_id: "acct:aster".to_owned(),
+            instrument_id: "ESPORTSUSDT".to_owned(),
+            side: OrderSide::Sell,
+            quantity: "1".to_owned(),
+            entry_limit_price: "1".to_owned(),
+        };
+        let bitget = FundingArbExchangePnlLegSummary::confirmed(
+            &bitget_leg,
+            "bitget history-position",
+            MonitorDecimal::parse("test pnl", "4.73").expect("bitget pnl"),
+            None,
+            None,
+            1,
+        );
+        let aster = FundingArbExchangePnlLegSummary::incomplete(
+            &aster_leg,
+            "aster income REALIZED_PNL",
+            "交易所未返回该仓位窗口内的 REALIZED_PNL 流水",
+            0,
+        );
+
+        let summary =
+            funding_arb_exchange_pnl_http_summary_from_legs(&[bitget, aster], "flat_cancelled");
+
+        assert_eq!(summary.status, "Confirmed");
+        assert_eq!(summary.net_pnl_usd.as_deref(), Some("4.73"));
+        assert!(summary
+            .notes
+            .iter()
+            .any(|note| note.contains("无后台 PnL 行的未成交腿不阻塞")));
     }
 
     #[test]
