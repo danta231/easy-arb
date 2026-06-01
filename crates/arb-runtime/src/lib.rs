@@ -34121,6 +34121,29 @@ fn funding_arb_exit_private_position_status(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exit_private_position_flat_status(
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    snapshot: &FundingPrivatePositionSnapshot,
+) -> RuntimeResult<FundingPrivatePositionReconciliationSummary> {
+    let summary = funding_arb_exit_private_position_status(row, spec, snapshot)?;
+    if !summary.is_matched() || summary.nonzero_position_count == 0 {
+        return Ok(summary);
+    }
+    let expected_symbol = funding_display_symbol(&funding_base_asset_from_symbol(&row.symbol));
+    Ok(FundingPrivatePositionReconciliationSummary {
+        status: "Mismatch".to_owned(),
+        snapshot_updated_at: summary.snapshot_updated_at,
+        checked_position_count: summary.checked_position_count,
+        nonzero_position_count: summary.nonzero_position_count,
+        reason: Some(format!(
+            "post-dispatch private position snapshot still has {} non-zero {} positions",
+            summary.nonzero_position_count, expected_symbol
+        )),
+    })
+}
+
+#[cfg(feature = "live-exec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FundingArbExitCloseLiquidity {
     venue_family: String,
@@ -54953,6 +54976,75 @@ mod tests {
         assert!(summary
             .warning_codes
             .contains(&"private_margin_buffer_too_thin".to_owned()));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exit_post_dispatch_flat_status_rejects_nonzero_positions() {
+        let row = funding_arb_test_row("0.00010000", "0.00600000");
+        let options = FundingArbGuardedDryRunOnceOptions {
+            config_path: PathBuf::from("unused.yaml"),
+            snapshot_path: PathBuf::from("unused.json"),
+            pair_id: row.pair_id.clone(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: None,
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: None,
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        };
+        let spec =
+            funding_arb_pipeline_spec_from_monitor_row(&row, &options).expect("funding arb spec");
+        let snapshot = FundingPrivatePositionSnapshot {
+            status: "complete".to_owned(),
+            updated_at: Some("2026-06-01T02:11:10Z".to_owned()),
+            positions: vec![
+                FundingPrivatePositionEntry {
+                    venue_family: "binance".to_owned(),
+                    symbol: "BTCUSDT".to_owned(),
+                    account_id: "acct:binance-funding-arb-readonly".to_owned(),
+                    quantity: "0".to_owned(),
+                    position_side: None,
+                    mark_price: Some("100".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+                FundingPrivatePositionEntry {
+                    venue_family: "bybit".to_owned(),
+                    symbol: "BTCUSDT".to_owned(),
+                    account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+                    quantity: "45".to_owned(),
+                    position_side: Some(FundingPrivatePositionSide::Short),
+                    mark_price: Some("100".to_owned()),
+                    liquidation_price: None,
+                    adl_rank_indicator: None,
+                    adl_state: None,
+                },
+            ],
+        };
+
+        let pre_dispatch_status = funding_arb_exit_private_position_status(&row, &spec, &snapshot)
+            .expect("pre-dispatch position status");
+        let post_dispatch_status =
+            funding_arb_exit_private_position_flat_status(&row, &spec, &snapshot)
+                .expect("post-dispatch flat status");
+
+        assert_eq!(pre_dispatch_status.status, "Matched");
+        assert_eq!(pre_dispatch_status.nonzero_position_count, 1);
+        assert_eq!(post_dispatch_status.status, "Mismatch");
+        assert_eq!(post_dispatch_status.nonzero_position_count, 1);
+        assert!(post_dispatch_status
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("still has 1 non-zero BTCUSDT positions")));
     }
 
     #[test]

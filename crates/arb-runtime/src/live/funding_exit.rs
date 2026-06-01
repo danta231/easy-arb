@@ -102,6 +102,7 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
     let position_snapshot =
         funding_private_position_snapshot_from_raw_snapshot(row, &position_raw)?;
     let position_status = funding_arb_exit_private_position_status(row, &spec, &position_snapshot)?;
+    let mut private_position_report_status = position_status.status.clone();
     let account_raw_json = read_utf8(&private.account_raw_snapshot_path)?;
     let account_raw = parse_funding_private_raw_snapshot_json(
         &account_raw_json,
@@ -325,6 +326,42 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
                 confirmations = outcome.confirmations;
                 residual_risk = outcome.protection.residual_risk;
                 blocking_reasons.extend(outcome.blocking_reasons);
+                if dispatch_attempted && blocking_reasons.is_empty() && residual_risk.is_none() {
+                    match verify_funding_arb_exit_post_dispatch_private_flat(
+                        options, row, &spec, &state, output_dir,
+                    ) {
+                        Ok(post_position_status) => {
+                            private_position_report_status = post_position_status.status.clone();
+                            if !post_position_status.is_matched() {
+                                let reason = post_position_status.reason.unwrap_or_else(|| {
+                                    format!(
+                                        "post-dispatch private position snapshot status is {} with {} non-zero positions",
+                                        post_position_status.status,
+                                        post_position_status.nonzero_position_count
+                                    )
+                                });
+                                blocking_reasons.push(format!(
+                                    "funding exit post-dispatch private flat verification failed: {reason}"
+                                ));
+                                residual_risk = Some(
+                                    "funding arb exit dispatch was confirmed but post-dispatch private snapshot was not flat; resident exit will retry before marking closed"
+                                        .to_owned(),
+                                );
+                            }
+                        }
+                        Err(error) if funding_arb_private_readonly_error_is_unavailable(&error) => {
+                            private_position_report_status = "Missing".to_owned();
+                            blocking_reasons.push(format!(
+                                "funding exit post-dispatch private flat verification unavailable: {error}"
+                            ));
+                            residual_risk = Some(
+                                "funding arb exit post-dispatch private snapshot unavailable; resident exit will retry before marking closed"
+                                    .to_owned(),
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
     }
@@ -349,7 +386,7 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         partial_close,
         requested_close_quantity,
         funding_settlement_status: settlement.status,
-        private_position_status: position_status.status,
+        private_position_status: private_position_report_status,
         dispatch_attempted,
         submitted_receipt_count: receipts.len(),
         private_confirmation_count: confirmations.len(),
@@ -360,4 +397,37 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
     };
     write_funding_arb_exit_cycle_artifacts(output_dir, &report, &receipts, &confirmations)?;
     Ok(report)
+}
+
+#[cfg(feature = "live-exec")]
+fn verify_funding_arb_exit_post_dispatch_private_flat(
+    options: &FundingArbResidentLiveOptions,
+    row: &FundingArbMarketRow,
+    spec: &CrossExchangeFundingArbPipelineSpec,
+    state: &FundingArbPositionState,
+    output_dir: &Path,
+) -> RuntimeResult<FundingPrivatePositionReconciliationSummary> {
+    let private = run_funding_arb_private_readonly_snapshot_once(
+        FundingArbPrivateReadonlySnapshotOnceOptions {
+            config_path: options.config_path.clone(),
+            snapshot_path: output_dir.join("funding_arb_monitor_snapshot.json"),
+            pair_id: state.pair_id.clone(),
+            output_dir: Some(output_dir.join("post-close-private-readonly")),
+            funding_settlement_raw_snapshot_path: options
+                .funding_settlement_raw_snapshot_path
+                .clone(),
+            hyperliquid_user: options.hyperliquid_user.clone(),
+            aster_user: options.aster_user.clone(),
+            aster_signer: options.aster_signer.clone(),
+            aster_signer_cmd_env: options.aster_signer_cmd_env.clone(),
+        },
+    )?;
+    let position_raw_json = read_utf8(&private.position_raw_snapshot_path)?;
+    let position_raw = parse_funding_private_raw_snapshot_json(
+        &position_raw_json,
+        "funding arb exit post-dispatch private position raw snapshot",
+    )?;
+    let position_snapshot =
+        funding_private_position_snapshot_from_raw_snapshot(row, &position_raw)?;
+    funding_arb_exit_private_position_flat_status(row, spec, &position_snapshot)
 }
