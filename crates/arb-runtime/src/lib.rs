@@ -30048,10 +30048,16 @@ fn funding_arb_exchange_pnl_row_time_ms(
         "timestamp",
         "time",
         "transactionTime",
+        "transactTime",
+        "execTime",
+        "fillTime",
+        "tradeTime",
         "ts",
         "cTime",
         "uTime",
         "createdTime",
+        "createdAt",
+        "updatedTime",
     ] {
         let Some(value) = optional_json_value_string_dynamic(fields, field, "exchange pnl row")?
         else {
@@ -30170,6 +30176,15 @@ fn funding_arb_exchange_pnl_sum_fields(
         found = true;
     }
     Ok(found.then_some(total))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_row_has_decimal_field(
+    row: &str,
+    field_names: &[&str],
+) -> RuntimeResult<bool> {
+    let fields = parse_json_object_value_slices(row)?;
+    Ok(funding_arb_exchange_pnl_decimal_from_fields(&fields, field_names)?.is_some())
 }
 
 #[cfg(feature = "live-exec")]
@@ -30422,17 +30437,76 @@ fn funding_arb_exchange_pnl_fetch_bybit_leg(
     let position_pnl =
         funding_arb_exchange_pnl_sum_fields(&rows, &["closedPnl", "pnl", "realizedPnl"], false)?;
     let Some(position_pnl) = position_pnl else {
-        return Ok(FundingArbExchangePnlLegSummary::incomplete(
-            leg,
-            "bybit position closed-pnl",
-            "交易所未返回该仓位窗口内的 closed-pnl 记录",
-            rows.len(),
-        ));
+        return funding_arb_exchange_pnl_fetch_bybit_execution_leg(options, leg, symbol, window)
+            .or_else(|_| {
+                Ok(FundingArbExchangePnlLegSummary::incomplete(
+                    leg,
+                    "bybit position closed-pnl",
+                    "交易所未返回该仓位窗口内的 closed-pnl 记录",
+                    rows.len(),
+                ))
+            });
     };
     let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["openFee", "closeFee", "fee"], true)?;
     Ok(FundingArbExchangePnlLegSummary::confirmed(
         leg,
         "bybit position closed-pnl",
+        position_pnl,
+        fee,
+        None,
+        rows.len(),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_fetch_bybit_execution_leg(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    symbol: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<FundingArbExchangePnlLegSummary> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
+    let recv_window_ms = bybit_private_readonly_recv_window_ms()?;
+    let query = format!(
+        "category=linear&symbol={symbol}&startTime={}&endTime={}&limit=100",
+        window.start_ms, window.end_ms
+    );
+    let signed = signer.sign_bybit_hmac(
+        BybitHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-exchange-pnl/bybit-execution/{symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(&leg.venue_id)?,
+            AccountId::new(&leg.account_id)?,
+            recv_window_ms,
+            BybitSigningPayloadKind::QueryString,
+            &query,
+        )?,
+        &signing_policy,
+    )?;
+    let payload =
+        fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, "/v5/execution/list", &signed)?;
+    let rows = funding_arb_exchange_pnl_matched_rows(&payload, symbol, window)?;
+    let position_pnl = funding_arb_exchange_pnl_sum_fields(
+        &rows,
+        &["execPnl", "closedPnl", "pnl", "realizedPnl"],
+        false,
+    )?;
+    let Some(position_pnl) = position_pnl else {
+        return Ok(FundingArbExchangePnlLegSummary::incomplete(
+            leg,
+            "bybit execution list",
+            "交易所未返回该仓位窗口内带 execPnl 的成交记录",
+            rows.len(),
+        ));
+    };
+    let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["execFee", "fee"], true)?;
+    Ok(FundingArbExchangePnlLegSummary::confirmed(
+        leg,
+        "bybit execution list",
         position_pnl,
         fee,
         None,
@@ -30494,12 +30568,17 @@ fn funding_arb_exchange_pnl_fetch_okx_leg(
         false,
     )?;
     let Some(position_pnl) = position_pnl else {
-        return Ok(FundingArbExchangePnlLegSummary::incomplete(
-            leg,
-            "okx account bills",
-            "交易所账单未返回该仓位窗口内的已实现 PnL 字段",
-            rows.len(),
-        ));
+        return funding_arb_exchange_pnl_fetch_okx_fills_history_leg(
+            options, leg, symbol, &inst_id, window,
+        )
+        .or_else(|_| {
+            Ok(FundingArbExchangePnlLegSummary::incomplete(
+                leg,
+                "okx account bills",
+                "交易所账单未返回该仓位窗口内的已实现 PnL 字段",
+                rows.len(),
+            ))
+        });
     };
     let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["fee"], true)?;
     Ok(FundingArbExchangePnlLegSummary::confirmed(
@@ -30509,6 +30588,62 @@ fn funding_arb_exchange_pnl_fetch_okx_leg(
         fee,
         None,
         pnl_rows.len(),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_fetch_okx_fills_history_leg(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    symbol: &str,
+    inst_id: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<FundingArbExchangePnlLegSummary> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = OkxRealSigningProviderFromEnv::from_default_env()?;
+    let endpoint = format!(
+        "/api/v5/trade/fills-history?instType=SWAP&instId={inst_id}&begin={}&end={}&limit=100",
+        window.start_ms, window.end_ms
+    );
+    let signed = signer.sign_okx_hmac(
+        OkxHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-exchange-pnl/okx-fills/{}",
+                basis_identifier_component(inst_id)
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(&leg.venue_id)?,
+            AccountId::new(&leg.account_id)?,
+            OkxRestMethod::Get,
+            &endpoint,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let payload = fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)?;
+    let rows = funding_arb_exchange_pnl_matched_rows(&payload, symbol, window)?;
+    let position_pnl = funding_arb_exchange_pnl_sum_fields(
+        &rows,
+        &["fillPnl", "pnl", "realizedPnl", "realisedPnl"],
+        false,
+    )?;
+    let Some(position_pnl) = position_pnl else {
+        return Ok(FundingArbExchangePnlLegSummary::incomplete(
+            leg,
+            "okx trade fills-history",
+            "交易所未返回该仓位窗口内带 fillPnl 的成交记录",
+            rows.len(),
+        ));
+    };
+    let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["fee"], true)?;
+    Ok(FundingArbExchangePnlLegSummary::confirmed(
+        leg,
+        "okx trade fills-history",
+        position_pnl,
+        fee,
+        None,
+        rows.len(),
     ))
 }
 
@@ -30560,12 +30695,20 @@ fn funding_arb_exchange_pnl_fetch_bitget_leg(
         false,
     )?;
     let Some(position_pnl) = position_pnl else {
-        return Ok(FundingArbExchangePnlLegSummary::incomplete(
+        return funding_arb_exchange_pnl_fetch_bitget_account_bill_leg(
+            options,
             leg,
-            "bitget history-position",
-            "交易所未返回该仓位窗口内的历史仓位 PnL 记录",
-            rows.len(),
-        ));
+            &bitget_symbol,
+            window,
+        )
+        .or_else(|_| {
+            Ok(FundingArbExchangePnlLegSummary::incomplete(
+                leg,
+                "bitget history-position",
+                "交易所未返回该仓位窗口内的历史仓位 PnL 记录",
+                rows.len(),
+            ))
+        });
     };
     let fee = funding_arb_exchange_pnl_sum_fields(
         &rows,
@@ -30579,6 +30722,111 @@ fn funding_arb_exchange_pnl_fetch_bitget_leg(
         fee,
         None,
         rows.len(),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_bitget_account_bill_pnl_rows<'a>(
+    rows: &[&'a str],
+) -> RuntimeResult<Vec<&'a str>> {
+    let mut pnl_rows = Vec::new();
+    for row in rows {
+        let fields = parse_json_object_value_slices(row)?;
+        let business_type =
+            optional_json_value_string_dynamic(&fields, "businessType", "bitget account bill")?
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+        let is_position_pnl_business = matches!(
+            business_type.as_str(),
+            "buy"
+                | "sell"
+                | "force_buy"
+                | "force_sell"
+                | "close_long"
+                | "close_short"
+                | "force_close_long"
+                | "force_close_short"
+                | "burst_long_loss_query"
+                | "burst_short_loss_query"
+                | "burst_buy"
+                | "burst_sell"
+                | "delivery_long"
+                | "delivery_short"
+                | "adl_close_long"
+                | "adl_close_short"
+                | "adl_buy_in_single_side_mode"
+                | "adl_sell_in_single_side_mode"
+        );
+        let has_explicit_pnl_field = funding_arb_exchange_pnl_row_has_decimal_field(
+            row,
+            &["pnl", "realizedPnl", "realisedPnl", "profit", "netProfit"],
+        )?;
+        if is_position_pnl_business || has_explicit_pnl_field {
+            pnl_rows.push(*row);
+        }
+    }
+    Ok(pnl_rows)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_fetch_bitget_account_bill_leg(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    bitget_symbol: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<FundingArbExchangePnlLegSummary> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = BitgetRealSigningProviderFromEnv::from_default_env()?;
+    let endpoint = format!(
+        "/api/v2/mix/account/bill?productType=USDT-FUTURES&symbol={bitget_symbol}&startTime={}&endTime={}&limit=100",
+        window.start_ms, window.end_ms
+    );
+    let signed = signer.sign_bitget_hmac(
+        BitgetHmacSigningInput::new(
+            SigningRequestId::new(format!(
+                "signing-request/funding-arb-exchange-pnl/bitget-bill/{bitget_symbol}"
+            ))?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(&leg.venue_id)?,
+            AccountId::new(&leg.account_id)?,
+            BitgetRestMethod::Get,
+            &endpoint,
+            "",
+        )?,
+        &signing_policy,
+    )?;
+    let payload = fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)?;
+    let rows = funding_arb_exchange_pnl_matched_rows(&payload, bitget_symbol, window)?;
+    let pnl_rows = funding_arb_exchange_pnl_bitget_account_bill_pnl_rows(&rows)?;
+    let position_pnl = funding_arb_exchange_pnl_sum_fields(
+        &pnl_rows,
+        &[
+            "pnl",
+            "realizedPnl",
+            "realisedPnl",
+            "profit",
+            "netProfit",
+            "amount",
+        ],
+        false,
+    )?;
+    let Some(position_pnl) = position_pnl else {
+        return Ok(FundingArbExchangePnlLegSummary::incomplete(
+            leg,
+            "bitget account bill",
+            "交易所未返回该仓位窗口内的平仓账单 PnL 记录",
+            pnl_rows.len(),
+        ));
+    };
+    let fee = funding_arb_exchange_pnl_sum_fields(&pnl_rows, &["fee", "totalFee"], true)?;
+    Ok(FundingArbExchangePnlLegSummary::confirmed(
+        leg,
+        "bitget account bill",
+        position_pnl,
+        fee,
+        None,
+        pnl_rows.len(),
     ))
 }
 
@@ -30620,18 +30868,73 @@ fn funding_arb_exchange_pnl_fetch_aster_leg(
         false,
     )?;
     let Some(position_pnl) = position_pnl else {
-        return Ok(FundingArbExchangePnlLegSummary::incomplete(
-            leg,
-            "aster income REALIZED_PNL",
-            "交易所未返回该仓位窗口内的 REALIZED_PNL 流水",
-            rows.len(),
-        ));
+        return funding_arb_exchange_pnl_fetch_aster_user_trades_leg(options, leg, symbol, window)
+            .or_else(|_| {
+                Ok(FundingArbExchangePnlLegSummary::incomplete(
+                    leg,
+                    "aster income REALIZED_PNL",
+                    "交易所未返回该仓位窗口内的 REALIZED_PNL 流水",
+                    rows.len(),
+                ))
+            });
     };
     Ok(FundingArbExchangePnlLegSummary::confirmed(
         leg,
         "aster income REALIZED_PNL",
         position_pnl,
         None,
+        None,
+        rows.len(),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_fetch_aster_user_trades_leg(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    symbol: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<FundingArbExchangePnlLegSummary> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let aster_signer =
+        resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
+    let signer_command = resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
+    let signer = AsterEip712ExternalSigningProvider::new(
+        LiteralAsterExternalSignerCommandProvider::new(signer_command)?,
+        SystemAsterNonceProvider,
+    );
+    let payload = fetch_signed_aster_readonly_get_with_retry(
+        &signer,
+        &signing_policy,
+        &format!("signing-request/funding-arb-exchange-pnl/aster-user-trades/{symbol}"),
+        &leg.venue_id,
+        &leg.account_id,
+        &aster_signer,
+        vec![
+            AsterRequestParam::new("symbol", symbol.to_owned())?,
+            AsterRequestParam::new("startTime", window.start_ms.to_string())?,
+            AsterRequestParam::new("endTime", window.end_ms.to_string())?,
+            AsterRequestParam::new("limit", "1000")?,
+        ],
+        "/fapi/v3/userTrades",
+    )?;
+    let rows = funding_arb_exchange_pnl_matched_rows(&payload, symbol, window)?;
+    let position_pnl =
+        funding_arb_exchange_pnl_sum_fields(&rows, &["realizedPnl", "realisedPnl", "pnl"], false)?;
+    let Some(position_pnl) = position_pnl else {
+        return Ok(FundingArbExchangePnlLegSummary::incomplete(
+            leg,
+            "aster userTrades",
+            "交易所未返回该仓位窗口内带 realizedPnl 的成交记录",
+            rows.len(),
+        ));
+    };
+    let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["commission", "fee"], true)?;
+    Ok(FundingArbExchangePnlLegSummary::confirmed(
+        leg,
+        "aster userTrades",
+        position_pnl,
+        fee,
         None,
         rows.len(),
     ))
@@ -54806,6 +55109,83 @@ mod tests {
         assert_eq!(
             pnl.map(MonitorDecimal::format_trimmed).as_deref(),
             Some("4.73")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_pnl_rows_accept_trade_time_fields() {
+        let window = FundingArbExchangePnlQueryWindow {
+            start_ms: 1_779_971_000_000,
+            end_ms: 1_779_985_000_000,
+        };
+
+        let bybit_payload = r#"{"retCode":0,"result":{"list":[{"symbol":"COAIUSDT","execPnl":"1.25","execFee":"-0.01","execTime":"1779978266000"},{"symbol":"COAIUSDT","execPnl":"99","execTime":"1779999999000"}]}}"#;
+        let bybit_rows = funding_arb_exchange_pnl_matched_rows(bybit_payload, "COAIUSDT", &window)
+            .expect("bybit execution rows");
+        let bybit_pnl = funding_arb_exchange_pnl_sum_fields(&bybit_rows, &["execPnl"], false)
+            .expect("bybit execution pnl");
+        assert_eq!(bybit_rows.len(), 1);
+        assert_eq!(
+            bybit_pnl.map(MonitorDecimal::format_trimmed).as_deref(),
+            Some("1.25")
+        );
+
+        let okx_payload = r#"{"code":"0","data":[{"instId":"COAI-USDT-SWAP","fillPnl":"-0.40","fee":"-0.02","fillTime":"1779978266000"}]}"#;
+        let okx_rows =
+            funding_arb_exchange_pnl_matched_rows(okx_payload, "COAI-USDT-SWAP", &window)
+                .expect("okx fill rows");
+        let okx_pnl = funding_arb_exchange_pnl_sum_fields(&okx_rows, &["fillPnl"], false)
+            .expect("okx fill pnl");
+        assert_eq!(okx_rows.len(), 1);
+        assert_eq!(
+            okx_pnl.map(MonitorDecimal::format_trimmed).as_deref(),
+            Some("-0.4")
+        );
+
+        let aster_payload = r#"[{"symbol":"MAGMAUSDT","realizedPnl":"0.33","commission":"-0.01","time":"1779978266000"}]"#;
+        let aster_rows = funding_arb_exchange_pnl_matched_rows(aster_payload, "MAGMAUSDT", &window)
+            .expect("aster trade rows");
+        let aster_pnl = funding_arb_exchange_pnl_sum_fields(&aster_rows, &["realizedPnl"], false)
+            .expect("aster trade pnl");
+        assert_eq!(aster_rows.len(), 1);
+        assert_eq!(
+            aster_pnl.map(MonitorDecimal::format_trimmed).as_deref(),
+            Some("0.33")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_pnl_bitget_account_bill_filters_position_pnl_rows() {
+        let rows = vec![
+            r#"{"symbol":"MAGMAUSDT","businessType":"funding_fee","amount":"9.99","ts":"1779978266000"}"#,
+            r#"{"symbol":"MAGMAUSDT","businessType":"close_long","amount":"-0.12","fee":"-0.001","ts":"1779978266000"}"#,
+            r#"{"symbol":"MAGMAUSDT","businessType":"buy","amount":"0.08","fee":"-0.001","ts":"1779978266000"}"#,
+            r#"{"symbol":"MAGMAUSDT","businessType":"transfer","amount":"999","ts":"1779978266000"}"#,
+            r#"{"symbol":"MAGMAUSDT","businessType":"position_pnl_adjustment","realizedPnl":"0.22","ts":"1779978266000"}"#,
+        ];
+
+        let pnl_rows =
+            funding_arb_exchange_pnl_bitget_account_bill_pnl_rows(&rows).expect("bitget pnl rows");
+        let pnl = funding_arb_exchange_pnl_sum_fields(
+            &pnl_rows,
+            &[
+                "pnl",
+                "realizedPnl",
+                "realisedPnl",
+                "profit",
+                "netProfit",
+                "amount",
+            ],
+            false,
+        )
+        .expect("bitget account bill pnl");
+
+        assert_eq!(pnl_rows.len(), 3);
+        assert_eq!(
+            pnl.map(MonitorDecimal::format_trimmed).as_deref(),
+            Some("0.18")
         );
     }
 
