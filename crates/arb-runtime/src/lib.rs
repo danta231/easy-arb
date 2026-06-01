@@ -29910,8 +29910,24 @@ fn funding_arb_exchange_pnl_query_window(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_instrument_symbol(instrument_id: &str) -> Option<String> {
+    let mut parts = instrument_id.split(':').map(str::trim);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(prefix), Some(_venue), Some(symbol))
+            if prefix.eq_ignore_ascii_case("inst") && !symbol.is_empty() =>
+        {
+            Some(symbol.to_owned())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_pnl_symbol(symbol: &str, instrument_id: &str) -> String {
-    if instrument_id.contains(':') || instrument_id.trim().is_empty() {
+    let instrument_id = instrument_id.trim();
+    if let Some(exchange_symbol) = funding_arb_exchange_pnl_instrument_symbol(instrument_id) {
+        exchange_symbol
+    } else if instrument_id.contains(':') || instrument_id.is_empty() {
         symbol.to_owned()
     } else {
         instrument_id.to_owned()
@@ -53595,6 +53611,27 @@ mod tests {
         assert_eq!(summary.position_pnl_usd.as_deref(), Some("-0.58"));
         assert_eq!(summary.net_pnl_usd.as_deref(), Some("-0.58"));
         assert!(summary.fee_usd.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_pnl_symbol_uses_internal_instrument_symbol() {
+        assert_eq!(
+            funding_arb_exchange_pnl_symbol("ESPORTSUSDT", "inst:BITGET:ESPORTSUSDT:USDT-FUTURES"),
+            "ESPORTSUSDT"
+        );
+        assert_eq!(
+            funding_arb_exchange_pnl_symbol("PROVEUSDT", "inst:OKX:PROVE-USDT-SWAP:SWAP"),
+            "PROVE-USDT-SWAP"
+        );
+        assert_eq!(
+            funding_arb_exchange_pnl_symbol("FALLBACKUSDT", "venue:unknown:value"),
+            "FALLBACKUSDT"
+        );
+        assert_eq!(
+            funding_arb_exchange_pnl_symbol("BTCUSDT", "BTCUSDT"),
+            "BTCUSDT"
+        );
     }
 
     #[test]
