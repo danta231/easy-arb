@@ -30437,15 +30437,19 @@ fn funding_arb_exchange_pnl_fetch_bybit_leg(
     let position_pnl =
         funding_arb_exchange_pnl_sum_fields(&rows, &["closedPnl", "pnl", "realizedPnl"], false)?;
     let Some(position_pnl) = position_pnl else {
-        return funding_arb_exchange_pnl_fetch_bybit_execution_leg(options, leg, symbol, window)
-            .or_else(|_| {
-                Ok(FundingArbExchangePnlLegSummary::incomplete(
-                    leg,
-                    "bybit position closed-pnl",
-                    "交易所未返回该仓位窗口内的 closed-pnl 记录",
-                    rows.len(),
-                ))
-            });
+        return match funding_arb_exchange_pnl_fetch_bybit_execution_leg(
+            options, leg, symbol, window,
+        ) {
+            Ok(summary) => Ok(summary),
+            Err(error) => Ok(FundingArbExchangePnlLegSummary::incomplete(
+                leg,
+                "bybit position closed-pnl",
+                format!(
+                    "交易所未返回该仓位窗口内的 closed-pnl 记录；execution-list 兜底失败：{error}"
+                ),
+                rows.len(),
+            )),
+        };
     };
     let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["openFee", "closeFee", "fee"], true)?;
     Ok(FundingArbExchangePnlLegSummary::confirmed(
@@ -30568,17 +30572,17 @@ fn funding_arb_exchange_pnl_fetch_okx_leg(
         false,
     )?;
     let Some(position_pnl) = position_pnl else {
-        return funding_arb_exchange_pnl_fetch_okx_fills_history_leg(
+        return match funding_arb_exchange_pnl_fetch_okx_fills_history_leg(
             options, leg, symbol, &inst_id, window,
-        )
-        .or_else(|_| {
-            Ok(FundingArbExchangePnlLegSummary::incomplete(
+        ) {
+            Ok(summary) => Ok(summary),
+            Err(error) => Ok(FundingArbExchangePnlLegSummary::incomplete(
                 leg,
                 "okx account bills",
-                "交易所账单未返回该仓位窗口内的已实现 PnL 字段",
+                format!("交易所账单未返回该仓位窗口内的已实现 PnL 字段；fills-history 兜底失败：{error}"),
                 rows.len(),
-            ))
-        });
+            )),
+        };
     };
     let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["fee"], true)?;
     Ok(FundingArbExchangePnlLegSummary::confirmed(
@@ -30695,20 +30699,22 @@ fn funding_arb_exchange_pnl_fetch_bitget_leg(
         false,
     )?;
     let Some(position_pnl) = position_pnl else {
-        return funding_arb_exchange_pnl_fetch_bitget_account_bill_leg(
+        return match funding_arb_exchange_pnl_fetch_bitget_account_bill_leg(
             options,
             leg,
             &bitget_symbol,
             window,
-        )
-        .or_else(|_| {
-            Ok(FundingArbExchangePnlLegSummary::incomplete(
+        ) {
+            Ok(summary) => Ok(summary),
+            Err(error) => Ok(FundingArbExchangePnlLegSummary::incomplete(
                 leg,
                 "bitget history-position",
-                "交易所未返回该仓位窗口内的历史仓位 PnL 记录",
+                format!(
+                    "交易所未返回该仓位窗口内的历史仓位 PnL 记录；account/bill 兜底失败：{error}"
+                ),
                 rows.len(),
-            ))
-        });
+            )),
+        };
     };
     let fee = funding_arb_exchange_pnl_sum_fields(
         &rows,
@@ -30868,15 +30874,19 @@ fn funding_arb_exchange_pnl_fetch_aster_leg(
         false,
     )?;
     let Some(position_pnl) = position_pnl else {
-        return funding_arb_exchange_pnl_fetch_aster_user_trades_leg(options, leg, symbol, window)
-            .or_else(|_| {
-                Ok(FundingArbExchangePnlLegSummary::incomplete(
-                    leg,
-                    "aster income REALIZED_PNL",
-                    "交易所未返回该仓位窗口内的 REALIZED_PNL 流水",
-                    rows.len(),
-                ))
-            });
+        return match funding_arb_exchange_pnl_fetch_aster_user_trades_leg(
+            options, leg, symbol, window,
+        ) {
+            Ok(summary) => Ok(summary),
+            Err(error) => Ok(FundingArbExchangePnlLegSummary::incomplete(
+                leg,
+                "aster income REALIZED_PNL",
+                format!(
+                    "交易所未返回该仓位窗口内的 REALIZED_PNL 流水；userTrades 兜底失败：{error}"
+                ),
+                rows.len(),
+            )),
+        };
     };
     Ok(FundingArbExchangePnlLegSummary::confirmed(
         leg,
