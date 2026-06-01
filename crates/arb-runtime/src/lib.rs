@@ -32262,6 +32262,73 @@ fn recover_funding_arb_flat_cancelled_orphan_positions_for_exit(
 }
 
 #[cfg(feature = "live-exec")]
+fn recover_funding_arb_closed_orphan_positions_for_exit(
+    options: &FundingArbResidentLiveOptions,
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+) -> RuntimeResult<usize> {
+    let candidates = load_funding_arb_closed_orphan_recovery_records(output_root)?;
+    let mut recovered = 0_usize;
+    for candidate in candidates {
+        let recovery_dir = cycle_dir
+            .join("closed-orphan-recovery")
+            .join(basis_identifier_component(&candidate.position_id));
+        let snapshot_path = funding_arb_unknown_recovery_snapshot_path(&candidate);
+        if !funding_arb_recovery_snapshot_artifact_available(&snapshot_path)? {
+            append_funding_arb_resident_closed_orphan_position_closed_with_decision(
+                output_root,
+                cycle,
+                cycle_dir,
+                &candidate,
+                "missing_recovery_artifact",
+                &format!(
+                    "closed orphan recovery skipped because legacy funding arb monitor snapshot is missing or not a file: {}",
+                    snapshot_path.display()
+                ),
+            )?;
+            continue;
+        }
+        match write_funding_arb_unknown_recovery_position_state(options, &candidate, &recovery_dir)
+        {
+            Ok(FundingArbUnknownRecoveryPositionStateOutcome::Open {
+                position_state_path,
+            }) => {
+                append_funding_arb_resident_closed_orphan_position_opened(
+                    output_root,
+                    cycle,
+                    cycle_dir,
+                    &candidate,
+                    &position_state_path,
+                )?;
+                recovered += 1;
+            }
+            Ok(FundingArbUnknownRecoveryPositionStateOutcome::Flat { reason }) => {
+                append_funding_arb_resident_closed_orphan_position_closed(
+                    output_root,
+                    cycle,
+                    cycle_dir,
+                    &candidate,
+                    &reason,
+                )?;
+            }
+            Err(error) => {
+                append_funding_arb_resident_error_event(
+                    output_root,
+                    cycle,
+                    &recovery_dir,
+                    &format!(
+                        "closed orphan recovery failed for {}: {error}",
+                        candidate.position_id
+                    ),
+                )?;
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+#[cfg(feature = "live-exec")]
 fn load_funding_arb_unknown_position_recovery_records(
     output_root: &Path,
 ) -> RuntimeResult<Vec<FundingArbUnknownPositionRecovery>> {
@@ -32384,6 +32451,56 @@ fn load_funding_arb_flat_cancelled_orphan_recovery_records(
 }
 
 #[cfg(feature = "live-exec")]
+fn load_funding_arb_closed_orphan_recovery_records(
+    output_root: &Path,
+) -> RuntimeResult<Vec<FundingArbUnknownPositionRecovery>> {
+    let path = output_root.join("funding_arb_resident_positions.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut latest_by_position: BTreeMap<String, Option<FundingArbUnknownPositionRecovery>> =
+        BTreeMap::new();
+    let contents = read_utf8(&path)?;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = parse_json_object_value_slices(line)?;
+        let event_type = required_json_value_string(
+            &fields,
+            "event_type",
+            "funding arb closed orphan recovery",
+        )?;
+        let Some(position_id) = optional_json_value_string(
+            &fields,
+            "position_id",
+            "funding arb closed orphan recovery",
+        )?
+        else {
+            continue;
+        };
+        match event_type.as_str() {
+            "position_closed" => {
+                if funding_arb_closed_orphan_recovery_terminal_marker(&fields)? {
+                    latest_by_position.insert(position_id, None);
+                    continue;
+                }
+                let Some(recovery) =
+                    funding_arb_closed_orphan_recovery_record_from_fields(&fields, position_id)?
+                else {
+                    continue;
+                };
+                latest_by_position.insert(recovery.position_id.clone(), Some(recovery));
+            }
+            "position_opened" | "position_unknown" | "position_flat_cancelled" => {
+                latest_by_position.insert(position_id, None);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(latest_by_position.into_values().flatten().collect())
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_unknown_recovery_snapshot_path(
     unknown: &FundingArbUnknownPositionRecovery,
 ) -> PathBuf {
@@ -32449,6 +32566,68 @@ fn funding_arb_flat_cancelled_orphan_recovery_record_from_fields(
             "funding arb flat-cancelled orphan recovery",
         )?,
     }))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_closed_orphan_recovery_terminal_marker(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<bool> {
+    if optional_json_value_string(fields, "source", "funding arb closed orphan recovery")?
+        .is_some_and(|source| source == "closed-orphan-recovery")
+    {
+        return Ok(true);
+    }
+    Ok(fields
+        .get("post_close_private_verified_flat")
+        .is_some_and(|value| value.trim() == "true"))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_closed_orphan_recovery_record_from_fields(
+    fields: &BTreeMap<String, &str>,
+    position_id: String,
+) -> RuntimeResult<Option<FundingArbUnknownPositionRecovery>> {
+    let decision =
+        optional_json_value_string(fields, "decision", "funding arb closed orphan recovery")?
+            .unwrap_or_default();
+    if !matches!(decision.as_str(), "close" | "emergency_de_risk") {
+        return Ok(None);
+    }
+    let submitted_receipt_count = optional_json_usize_field(
+        fields,
+        "submitted_receipt_count",
+        "funding arb closed orphan recovery",
+    )?;
+    let private_confirmation_count = optional_json_usize_field(
+        fields,
+        "private_confirmation_count",
+        "funding arb closed orphan recovery",
+    )?;
+    if submitted_receipt_count == 0 && private_confirmation_count == 0 {
+        return Ok(None);
+    }
+    funding_arb_flat_cancelled_orphan_recovery_record_from_fields(fields, position_id)
+}
+
+#[cfg(feature = "live-exec")]
+fn optional_json_usize_field(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<usize> {
+    let Some(raw) = fields.get(field) else {
+        return Ok(0);
+    };
+    let value = raw.trim().trim_matches('"');
+    if value.is_empty() || value == "null" {
+        return Ok(0);
+    }
+    value
+        .parse::<usize>()
+        .map_err(|error| RuntimeError::Module {
+            module: "arb-runtime",
+            message: format!("{source} `{field}` must be a non-negative integer: {error}"),
+        })
 }
 
 #[cfg(feature = "live-exec")]
@@ -32936,6 +33115,30 @@ fn append_funding_arb_resident_flat_cancelled_orphan_position_opened(
 }
 
 #[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_closed_orphan_position_opened(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    candidate: &FundingArbUnknownPositionRecovery,
+    position_state_path: &Path,
+) -> RuntimeResult<()> {
+    let position_state = parse_funding_arb_position_state_json(&read_utf8(position_state_path)?)?;
+    let line = format!(
+        "{{\"closed_at\":null,\"cycle\":{},\"cycle_dir\":{},\"decision\":null,\"event_type\":\"position_opened\",\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":0,\"reason\":\"closed funding arb position still has non-zero private position; recovered for reduce-only exit/de-risk\",\"recovered_from_closed\":true,\"residual_risk\":null,\"source\":\"closed-orphan-recovery\",\"status\":\"open\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(&position_state.notional_usd),
+        json_string(&position_state.opened_at),
+        json_string(&candidate.pair_id),
+        json_string(&candidate.position_id),
+        json_string(&position_state_path.display().to_string()),
+        json_string(&candidate.symbol),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
 fn append_funding_arb_resident_recovered_position_closed(
     output_root: &Path,
     cycle: u64,
@@ -33014,6 +33217,55 @@ fn append_funding_arb_resident_flat_cancelled_orphan_position_closed_with_decisi
 }
 
 #[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_closed_orphan_position_closed(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    candidate: &FundingArbUnknownPositionRecovery,
+    reason: &str,
+) -> RuntimeResult<()> {
+    append_funding_arb_resident_closed_orphan_position_closed_with_decision(
+        output_root,
+        cycle,
+        cycle_dir,
+        candidate,
+        "flat_private_snapshot",
+        reason,
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_closed_orphan_position_closed_with_decision(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    candidate: &FundingArbUnknownPositionRecovery,
+    decision: &str,
+    reason: &str,
+) -> RuntimeResult<()> {
+    let closed_at = current_utc_timestamp()?.to_string();
+    let exchange_pnl = FundingArbExchangePnlSummary::not_checked(
+        "closed orphan 恢复路径仅确认交易所已无残余仓位，未执行交易所后台 PnL 同步。",
+    );
+    let line = format!(
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",{},\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":null,\"private_confirmation_count\":0,\"reason\":{},\"recovered_from_closed\":true,\"residual_risk\":null,\"source\":\"closed-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":{}}}",
+        json_string(&closed_at),
+        cycle,
+        json_string(&cycle_dir.display().to_string()),
+        json_string(decision),
+        funding_arb_exchange_pnl_position_event_fields(&exchange_pnl),
+        json_string(&candidate.notional_usdt),
+        optional_json_string(candidate.opened_at.as_deref()),
+        json_string(&candidate.pair_id),
+        json_string(&candidate.position_id),
+        json_string(reason),
+        json_string(&candidate.symbol),
+    );
+    append_funding_arb_resident_position_jsonl(output_root, &line)?;
+    append_funding_arb_resident_event(output_root, &line)
+}
+
+#[cfg(feature = "live-exec")]
 fn append_funding_arb_resident_position_closed(
     output_root: &Path,
     position: &FundingArbResidentPosition,
@@ -33023,7 +33275,7 @@ fn append_funding_arb_resident_position_closed(
 ) -> RuntimeResult<()> {
     let closed_at = current_utc_timestamp()?.to_string();
     let line = format!(
-        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"exchange_fee_usd\":{},\"exchange_funding_pnl_usd\":{},\"exchange_net_pnl_usd\":{},\"exchange_pnl\":{},\"exchange_pnl_status\":{},\"exchange_position_pnl_usd\":{},\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":{},\"status\":\"closed\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_closed\",\"exchange_fee_usd\":{},\"exchange_funding_pnl_usd\":{},\"exchange_net_pnl_usd\":{},\"exchange_pnl\":{},\"exchange_pnl_status\":{},\"exchange_position_pnl_usd\":{},\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"post_close_private_verified_flat\":{},\"private_confirmation_count\":{},\"reason\":null,\"residual_risk\":{},\"status\":\"closed\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string(&closed_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
@@ -33039,6 +33291,7 @@ fn append_funding_arb_resident_position_closed(
         json_string(&position.pair_id),
         json_string(&position.position_id),
         json_string(&position.position_state_path.display().to_string()),
+        report.private_position_status == "Matched",
         report.private_confirmation_count,
         optional_json_string(report.residual_risk.as_deref()),
         report.submitted_receipt_count,
@@ -49324,6 +49577,51 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_position_json_normalizes_epoch_datetime_strings() {
+        assert_eq!(
+            portfolio_normalize_datetime_display("1780279799194"),
+            "2026-06-01T02:09:59.194Z"
+        );
+        assert_eq!(
+            portfolio_normalize_datetime_display("2026-06-01 14:17:33 / 1780294665684"),
+            "2026-06-01T06:17:45.684Z"
+        );
+
+        let row = PortfolioPositionRow {
+            coin: "PUNDIX".to_owned(),
+            symbol: "PUNDIXUSDT".to_owned(),
+            strategy: "cross-exchange-funding-arb-resident-live".to_owned(),
+            venue_family: "bybit".to_owned(),
+            account_id: "acct:bybit-funding-arb-readonly".to_owned(),
+            fee: None,
+            fee_rate_bps: None,
+            settled_funding_usd: None,
+            accumulated_position: Some("50 USDT".to_owned()),
+            open_average_price: None,
+            close_average_price: None,
+            open_close_spread_pct: None,
+            realtime_funding_rate: None,
+            realtime_funding_interval_hours: None,
+            funding_settlement_time: None,
+            opened_at: Some("1780279799194".to_owned()),
+            closed_at: Some("2026-06-01 14:17:33 / 1780294665684".to_owned()),
+            open_close_condition: None,
+            position_status: "closed".to_owned(),
+            position_quantity: "0".to_owned(),
+            position_group_id: None,
+            position_group_label: None,
+            position_leg_role: None,
+            position_limit: None,
+            source: "position-raw-snapshot".to_owned(),
+        };
+
+        let json = portfolio_position_row_json(&row);
+
+        assert!(json.contains("\"opened_at\":\"2026-06-01T02:09:59.194Z\""));
+        assert!(json.contains("\"closed_at\":\"2026-06-01T06:17:45.684Z\""));
+    }
+
+    #[test]
     fn portfolio_dashboard_reads_nested_funding_arb_resident_positions() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let account_path = root.path().join("accounts.json");
@@ -49682,6 +49980,82 @@ mod tests {
             .position_limit
             .as_deref()
             .is_some_and(|value| value.contains("单仓名义 90.00 USDT")));
+    }
+
+    #[test]
+    fn portfolio_dashboard_uses_cycle_settlement_when_latest_mirror_is_unrelated() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let resident_dir = root
+            .path()
+            .join("resident-live")
+            .join("cross-exchange-funding-arb");
+        let private_dir = root.path().join("portfolio-private-readonly");
+        let latest_settlement_dir = root.path().join("private-readonly");
+        let cycle_settlement_dir = resident_dir
+            .join("cycles")
+            .join("000001")
+            .join("private-readonly");
+        let funding_dir = root.path().join("snapshots").join("funding-arb");
+        fs::create_dir_all(&resident_dir).expect("resident dir");
+        fs::create_dir_all(&private_dir).expect("private dir");
+        fs::create_dir_all(&latest_settlement_dir).expect("latest settlement dir");
+        fs::create_dir_all(&cycle_settlement_dir).expect("cycle settlement dir");
+        fs::create_dir_all(&funding_dir).expect("funding dir");
+        write_utf8(
+            resident_dir.join("funding_arb_resident_live_config.json"),
+            r#"{"notional_usd":"90.00","taker_fee_bps":5}"#,
+        )
+        .expect("resident config");
+        write_utf8(
+            resident_dir.join("funding_arb_resident_positions.jsonl"),
+            "{\"cycle\":1,\"event_type\":\"position_opened\",\"net_funding_bps\":50,\"notional_usdt\":\"90.00\",\"pair_id\":\"binance:bitget:FIDAUSDT:FIDAUSDT\",\"position_id\":\"pos:funding-arb:fida:1\",\"position_state_path\":\"funding_position.json\",\"status\":\"open\",\"symbol\":\"FIDAUSDT\"}\n",
+        )
+        .expect("resident registry");
+        write_utf8(
+            resident_dir.join("funding_position.json"),
+            r#"{"entry_net_funding_bps":"50","leg_a_account_id":"acct:binance-funding-arb-readonly","leg_a_entry_limit_price":"0.03659","leg_a_quantity":"2457","leg_a_role":"funding_perp_short","leg_a_side":"sell","leg_a_venue_family":"binance","leg_b_account_id":"acct:bitget-funding-arb-readonly","leg_b_entry_limit_price":"0.03665","leg_b_quantity":"2457","leg_b_role":"funding_perp_long","leg_b_side":"buy","leg_b_venue_family":"bitget","notional_usd":"90.00","opened_at":"2026-05-25T01:41:25Z","pair_id":"binance:bitget:FIDAUSDT:FIDAUSDT","schema_version":"1.0.0","symbol":"FIDAUSDT"}"#,
+        )
+        .expect("position state");
+        write_utf8(
+            private_dir.join("funding_arb_private_position_raw_snapshot.json"),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-25T01:52:49Z","statements":[{"venue_family":"binance","account_id":"acct:binance-funding-arb-readonly","payload":[{"symbol":"FIDAUSDT","positionAmt":"-2457.0","positionSide":"SHORT","entryPrice":"0.03659","markPrice":"0.03651"}]},{"venue_family":"bitget","account_id":"acct:bitget-funding-arb-readonly","payload":{"data":[{"symbol":"FIDAUSDT","holdSide":"long","total":"2457","openPriceAvg":"0.03665","markPrice":"0.03661"}]}}]}"#,
+        )
+        .expect("position raw snapshot");
+        write_utf8(
+            latest_settlement_dir.join("funding_settlement_raw_snapshot.json"),
+            r#"{"schema_version":"1.0.0","source_errors":[],"status":"complete","statements":[{"account_id":"acct:binance-funding-arb-readonly","payload":"[{\"symbol\":\"BTCUSDT\",\"incomeType\":\"FUNDING_FEE\",\"income\":\"1.23\",\"asset\":\"USDT\",\"time\":1779681602000}]","venue_family":"binance"},{"account_id":"acct:bitget-funding-arb-readonly","payload":"[{\"symbol\":\"BTCUSDT\",\"businessType\":\"funding_fee\",\"amount\":\"2.34\",\"ts\":1779681602000}]","venue_family":"bitget"}],"updated_at":"2026-05-25T02:00:00Z"}"#,
+        )
+        .expect("latest settlement raw snapshot");
+        write_utf8(
+            cycle_settlement_dir.join("funding_arb_funding_settlement_raw_snapshot.json"),
+            r#"{"schema_version":"1.0.0","source_errors":[],"status":"complete","statements":[{"account_id":"acct:binance-funding-arb-readonly","payload":"[{\"symbol\":\"FIDAUSDT\",\"incomeType\":\"FUNDING_FEE\",\"income\":\"-0.29304005\",\"asset\":\"USDT\",\"time\":1779681602000}]","venue_family":"binance"},{"account_id":"acct:bitget-funding-arb-readonly","payload":"[{\"symbol\":\"FIDAUSDT\",\"businessType\":\"funding_fee\",\"amount\":\"0.111\",\"ts\":1779681602000}]","venue_family":"bitget"}],"updated_at":"2026-05-25T01:54:00Z"}"#,
+        )
+        .expect("cycle settlement raw snapshot");
+        write_utf8(
+            funding_dir.join("funding_arb_monitor_snapshot.json"),
+            r#"{"candidate_count":1,"rows":[{"funding_interval_hours":"8","is_candidate":true,"pair_id":"binance-bitget-fida","source_status":"complete","symbol":"FIDAUSDT","venue_a_ask":"0.03660","venue_a_ask_qty":"1000","venue_a_bid":"0.03650","venue_a_bid_qty":"1000","venue_a_family":"binance","venue_a_funding_interval_hours":"8","venue_a_funding_rate":"-0.00459231","venue_a_index_price":"0.03655","venue_a_mark_price":"0.03651","venue_a_next_funding_time_ms":"1779681600000","venue_b_ask":"0.03662","venue_b_ask_qty":"1000","venue_b_bid":"0.03658","venue_b_bid_qty":"1000","venue_b_family":"bitget","venue_b_funding_interval_hours":"8","venue_b_funding_rate":"-0.00997","venue_b_index_price":"0.03655","venue_b_mark_price":"0.03661","venue_b_next_funding_time_ms":"1779681600000"}],"source_count":2,"source_error_count":0,"status":"healthy","total_rows":1,"updated_at":"2026-05-25T01:53:50Z"}"#,
+        )
+        .expect("funding snapshot");
+        let options = PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            once: true,
+            ..PortfolioDashboardOptions::default()
+        };
+
+        let snapshot = build_portfolio_dashboard_snapshot(&options).expect("snapshot");
+
+        let binance = snapshot
+            .positions
+            .iter()
+            .find(|row| row.venue_family == "binance")
+            .expect("binance row");
+        assert_eq!(binance.settled_funding_usd.as_deref(), Some("-0.29304005"));
+        let bitget = snapshot
+            .positions
+            .iter()
+            .find(|row| row.venue_family == "bitget")
+            .expect("bitget row");
+        assert_eq!(bitget.settled_funding_usd.as_deref(), Some("0.111"));
     }
 
     #[test]
@@ -53782,6 +54156,37 @@ mod tests {
         assert_eq!(candidates[0].symbol, "HEMIUSDT");
         assert_eq!(candidates[0].cycle_dir, latest_cycle);
         assert_eq!(candidates[0].notional_usdt, "unknown");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_closed_orphan_recovery_loads_unverified_closed_positions() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let pundi_exit = root.path().join("exit/pos:pundi/000056-test");
+        let verified_exit = root.path().join("exit/pos:verified/000057-test");
+        let recovered_exit = root.path().join("exit/pos:recovered/000058-test");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":56,\"cycle_dir\":{},\"decision\":\"emergency_de_risk\",\"event_type\":\"position_closed\",\"notional_usdt\":\"50.00\",\"opened_at\":\"2026-06-01T02:09:59Z\",\"pair_id\":\"bybit:bitget:PUNDIXUSDT:PUNDIXUSDT\",\"position_id\":\"pos:pundi\",\"position_state_path\":\"target/pundi-position.json\",\"private_confirmation_count\":1,\"status\":\"closed\",\"submitted_receipt_count\":1,\"symbol\":\"PUNDIXUSDT\"}}\n\
+                 {{\"cycle\":57,\"cycle_dir\":{},\"decision\":\"close\",\"event_type\":\"position_closed\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:verified\",\"post_close_private_verified_flat\":true,\"private_confirmation_count\":2,\"status\":\"closed\",\"submitted_receipt_count\":2,\"symbol\":\"BTCUSDT\"}}\n\
+                 {{\"cycle\":58,\"cycle_dir\":{},\"decision\":\"flat_private_snapshot\",\"event_type\":\"position_closed\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:ETHUSDT:ETHUSDT\",\"position_id\":\"pos:recovered\",\"private_confirmation_count\":0,\"source\":\"closed-orphan-recovery\",\"status\":\"closed\",\"submitted_receipt_count\":0,\"symbol\":\"ETHUSDT\"}}\n",
+                json_string(&pundi_exit.display().to_string()),
+                json_string(&verified_exit.display().to_string()),
+                json_string(&recovered_exit.display().to_string()),
+            ),
+        )
+        .expect("write registry");
+
+        let candidates =
+            load_funding_arb_closed_orphan_recovery_records(root.path()).expect("candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].position_id, "pos:pundi");
+        assert_eq!(candidates[0].pair_id, "bybit:bitget:PUNDIXUSDT:PUNDIXUSDT");
+        assert_eq!(candidates[0].symbol, "PUNDIXUSDT");
+        assert_eq!(candidates[0].notional_usdt, "50.00");
+        assert_eq!(candidates[0].cycle_dir, pundi_exit);
     }
 
     #[test]

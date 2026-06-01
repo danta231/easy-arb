@@ -546,30 +546,58 @@ pub(crate) fn portfolio_funding_settlement_entries_from_resident_root(
         }
     }
     portfolio_collect_named_files(root, "funding_settlement_raw_snapshot.json", 8, &mut paths)?;
+    portfolio_collect_named_files(
+        root,
+        "funding_arb_funding_settlement_raw_snapshot.json",
+        8,
+        &mut paths,
+    )?;
     paths.sort();
     paths.dedup();
     if paths.is_empty() {
         return Ok(None);
     }
 
-    let mut latest = None::<(String, Option<String>, Vec<FundingSettlementLedgerEntry>)>;
+    let mut latest_updated_at = None::<String>;
+    let mut entries_by_key = BTreeMap::<String, FundingSettlementLedgerEntry>::new();
     for path in paths {
         let input = read_utf8(&path)?;
         let snapshot = parse_funding_settlement_raw_snapshot_json(&input)?;
-        let sort_key = format!(
-            "{}\u{1f}{}",
-            snapshot.updated_at.as_deref().unwrap_or_default(),
-            path.display()
-        );
         let entries = funding_settlement_entries_from_raw_snapshot(&snapshot)?;
-        if latest
-            .as_ref()
-            .is_none_or(|(current_key, _, _)| &sort_key > current_key)
-        {
-            latest = Some((sort_key, snapshot.updated_at, entries));
+        if let Some(updated_at) = snapshot.updated_at {
+            if latest_updated_at
+                .as_ref()
+                .is_none_or(|current| &updated_at > current)
+            {
+                latest_updated_at = Some(updated_at);
+            }
+        }
+        for entry in entries {
+            entries_by_key
+                .entry(portfolio_funding_settlement_entry_dedupe_key(&entry))
+                .or_insert(entry);
         }
     }
-    Ok(latest.map(|(_, updated_at, entries)| (updated_at, entries)))
+    Ok(Some((
+        latest_updated_at,
+        entries_by_key.into_values().collect(),
+    )))
+}
+
+pub(crate) fn portfolio_funding_settlement_entry_dedupe_key(
+    entry: &FundingSettlementLedgerEntry,
+) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        normalize_venue_family(&entry.venue_family),
+        funding_settlement_display_symbol_from_raw(&entry.symbol),
+        entry.account_id,
+        entry
+            .timestamp_ms
+            .map(|timestamp| timestamp.to_string())
+            .unwrap_or_default(),
+        entry.amount_usd.trim_start_matches('+')
+    )
 }
 
 pub(crate) fn portfolio_apply_funding_settlement_entries(
@@ -1992,17 +2020,25 @@ pub(crate) fn portfolio_balance_row_json(row: &PortfolioBalanceRow) -> String {
 }
 
 pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String {
+    let opened_at = row
+        .opened_at
+        .as_ref()
+        .map(|value| portfolio_normalize_datetime_display(value));
+    let closed_at = row
+        .closed_at
+        .as_ref()
+        .map(|value| portfolio_normalize_datetime_display(value));
     format!(
         "{{\"account_id\":{},\"accumulated_position\":{},\"closed_at\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"opened_at\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
         json_string(&row.account_id),
         json_option_string(&row.accumulated_position),
-        json_option_string(&row.closed_at),
+        json_option_string(&closed_at),
         json_option_string(&row.close_average_price),
         json_string(&row.coin),
         json_option_string(&row.fee),
         json_option_string(&row.fee_rate_bps),
         json_option_string(&row.funding_settlement_time),
-        json_option_string(&row.opened_at),
+        json_option_string(&opened_at),
         json_option_string(&row.open_average_price),
         json_option_string(&row.open_close_condition),
         json_option_string(&row.open_close_spread_pct),
@@ -2020,6 +2056,26 @@ pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String 
         json_string(&row.symbol),
         json_string(&row.venue_family),
     )
+}
+
+pub(crate) fn portfolio_normalize_datetime_display(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_owned();
+    }
+    portfolio_max_timestamp_ms_from_value(trimmed)
+        .and_then(portfolio_timestamp_string_from_unix_millis)
+        .unwrap_or_else(|| trimmed.to_owned())
+}
+
+pub(crate) fn portfolio_timestamp_string_from_unix_millis(timestamp_ms: u64) -> Option<String> {
+    let seconds = i64::try_from(timestamp_ms / 1_000).ok()?;
+    let nanos = u32::try_from(timestamp_ms % 1_000)
+        .ok()?
+        .checked_mul(1_000_000)?;
+    UtcTimestamp::from_unix_parts(seconds, nanos)
+        .ok()
+        .map(|timestamp| timestamp.to_string())
 }
 
 pub(crate) fn portfolio_balance_rows_from_snapshot_json(
