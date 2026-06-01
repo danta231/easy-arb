@@ -31067,6 +31067,832 @@ fn funding_arb_exchange_pnl_fetch_leg(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_leg(
+    venue_family: &str,
+) -> RuntimeResult<FundingArbPositionLegState> {
+    let normalized = normalize_venue_family(venue_family);
+    let config = funding_arb_leg_config(&normalized, "BTCUSDT")?;
+    Ok(FundingArbPositionLegState {
+        role: "exchange_history".to_owned(),
+        venue_family: normalized,
+        venue_id: config.venue_id,
+        account_id: config.account_id,
+        instrument_id: config.instrument_id,
+        side: OrderSide::Buy,
+        quantity: "0".to_owned(),
+        entry_limit_price: "0".to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_decimal_json(value: Option<MonitorDecimal>) -> String {
+    match value {
+        Some(value) => value.format_trimmed(),
+        None => "null".to_owned(),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_decimal_from_fields(
+    fields: &BTreeMap<String, &str>,
+    field_names: &[&str],
+) -> RuntimeResult<Option<MonitorDecimal>> {
+    funding_arb_exchange_pnl_decimal_from_fields(fields, field_names)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_string_json(value: Option<String>) -> String {
+    match value {
+        Some(value) => json_string(&value),
+        None => "null".to_owned(),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_record_json(
+    leg: &FundingArbPositionLegState,
+    source: &str,
+    record_type: &str,
+    row: &str,
+) -> RuntimeResult<String> {
+    let fields = parse_json_object_value_slices(row)?;
+    let symbol = optional_first_json_value_string(
+        &fields,
+        &["symbol", "instId", "coin", "instrument", "market", "coinId"],
+        "exchange history row",
+    )?
+    .unwrap_or_default();
+    let instrument_id = optional_first_json_value_string(
+        &fields,
+        &["instId", "instrument", "market", "symbol"],
+        "exchange history row",
+    )?;
+    let exchange_record_id = optional_first_json_value_string(
+        &fields,
+        &[
+            "id", "billId", "tradeId", "execId", "orderId", "ordId", "tranId", "incomeId", "hash",
+            "tid",
+        ],
+        "exchange history row",
+    )?;
+    let side = optional_first_json_value_string(
+        &fields,
+        &["side", "posSide", "positionSide", "direction"],
+        "exchange history row",
+    )?;
+    let business_type = optional_first_json_value_string(
+        &fields,
+        &["businessType", "bizType", "type", "subType", "category"],
+        "exchange history row",
+    )?;
+    let income_type = optional_first_json_value_string(
+        &fields,
+        &["incomeType", "income_type", "type"],
+        "exchange history row",
+    )?;
+    let currency = optional_first_json_value_string(
+        &fields,
+        &[
+            "asset",
+            "ccy",
+            "currency",
+            "marginCoin",
+            "feeCcy",
+            "commissionAsset",
+            "coin",
+        ],
+        "exchange history row",
+    )?;
+    let event_time_ms = funding_arb_exchange_pnl_row_time_ms(&fields)?;
+    let amount_like = funding_arb_exchange_history_decimal_from_fields(
+        &fields,
+        &[
+            "income", "amount", "balChg", "cashFlow", "change", "sz", "qty",
+        ],
+    )?;
+    let kind = income_type
+        .as_deref()
+        .or(business_type.as_deref())
+        .unwrap_or("");
+    let explicit_pnl_usd = funding_arb_exchange_history_decimal_from_fields(
+        &fields,
+        &[
+            "closedPnl",
+            "execPnl",
+            "fillPnl",
+            "realizedPnl",
+            "realisedPnl",
+            "realizedPL",
+            "totalPL",
+            "pnl",
+            "profit",
+            "netProfit",
+            "closeProfit",
+        ],
+    )?;
+    let pnl_usd = explicit_pnl_usd.or_else(|| {
+        kind.eq_ignore_ascii_case("REALIZED_PNL")
+            .then_some(amount_like)
+            .flatten()
+    });
+    let explicit_fee_usd = funding_arb_exchange_history_decimal_from_fields(
+        &fields,
+        &[
+            "fee",
+            "execFee",
+            "openFee",
+            "closeFee",
+            "totalFee",
+            "commission",
+        ],
+    )?;
+    let fee_usd = explicit_fee_usd.or_else(|| {
+        kind.eq_ignore_ascii_case("COMMISSION")
+            .then_some(amount_like)
+            .flatten()
+    });
+    let funding_pnl_usd = if kind.eq_ignore_ascii_case("FUNDING_FEE")
+        || kind.eq_ignore_ascii_case("funding_fee")
+        || kind == "8"
+    {
+        amount_like
+    } else {
+        None
+    };
+    let amount_usd = amount_like;
+    Ok(format!(
+        "{{\"accountId\":{},\"amountUsd\":{},\"businessType\":{},\"currency\":{},\"eventTimeMs\":{},\"exchangeRecordId\":{},\"feeUsd\":{},\"fundingPnlUsd\":{},\"incomeType\":{},\"instrumentId\":{},\"pnlUsd\":{},\"rawPayload\":{},\"recordSource\":{},\"recordType\":{},\"side\":{},\"symbol\":{},\"venueFamily\":{},\"venueId\":{}}}",
+        json_string(&leg.account_id),
+        funding_arb_exchange_history_decimal_json(amount_usd),
+        funding_arb_exchange_history_string_json(business_type),
+        funding_arb_exchange_history_string_json(currency),
+        event_time_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        funding_arb_exchange_history_string_json(exchange_record_id),
+        funding_arb_exchange_history_decimal_json(fee_usd),
+        funding_arb_exchange_history_decimal_json(funding_pnl_usd),
+        funding_arb_exchange_history_string_json(income_type),
+        funding_arb_exchange_history_string_json(instrument_id),
+        funding_arb_exchange_history_decimal_json(pnl_usd),
+        row.trim(),
+        json_string(source),
+        json_string(record_type),
+        funding_arb_exchange_history_string_json(side),
+        json_string(&symbol),
+        json_string(&leg.venue_family),
+        json_string(&leg.venue_id),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_source_error_json(
+    venue_family: &str,
+    source: &str,
+    message: &str,
+) -> String {
+    format!(
+        "{{\"message\":{},\"source\":{},\"venueFamily\":{}}}",
+        json_string(message),
+        json_string(source),
+        json_string(venue_family),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FundingArbExchangeHistoryWindow {
+    start_ms: u64,
+    end_ms: u64,
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_capture_payload(
+    records: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    leg: &FundingArbPositionLegState,
+    source: &str,
+    record_type: &str,
+    payload: RuntimeResult<String>,
+    window: FundingArbExchangeHistoryWindow,
+) {
+    let payload = match payload {
+        Ok(payload) => payload,
+        Err(error) => {
+            errors.push(funding_arb_exchange_history_source_error_json(
+                &leg.venue_family,
+                source,
+                &error.to_string(),
+            ));
+            return;
+        }
+    };
+    let rows = match funding_arb_exchange_pnl_payload_rows(&payload) {
+        Ok(rows) => rows,
+        Err(error) => {
+            errors.push(funding_arb_exchange_history_source_error_json(
+                &leg.venue_family,
+                source,
+                &error.to_string(),
+            ));
+            return;
+        }
+    };
+    for row in rows {
+        let fields = match parse_json_object_value_slices(row) {
+            Ok(fields) => fields,
+            Err(error) => {
+                errors.push(funding_arb_exchange_history_source_error_json(
+                    &leg.venue_family,
+                    source,
+                    &error.to_string(),
+                ));
+                continue;
+            }
+        };
+        match funding_arb_exchange_pnl_row_in_range(&fields, window.start_ms, window.end_ms) {
+            Ok(true) => {
+                match funding_arb_exchange_history_record_json(leg, source, record_type, row) {
+                    Ok(record) => records.push(record),
+                    Err(error) => errors.push(funding_arb_exchange_history_source_error_json(
+                        &leg.venue_family,
+                        source,
+                        &error.to_string(),
+                    )),
+                }
+            }
+            Ok(false) => {}
+            Err(error) => errors.push(funding_arb_exchange_history_source_error_json(
+                &leg.venue_family,
+                source,
+                &error.to_string(),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_binance(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let recv_window_ms = binance_private_readonly_recv_window_ms()?;
+    let (base_url, endpoint) = match resolve_binance_private_account_mode()? {
+        BinancePrivateAccountMode::PortfolioMargin => {
+            (BINANCE_PORTFOLIO_MARGIN_BASE_URL, "/papi/v1/um/income")
+        }
+        BinancePrivateAccountMode::UsdmFutures => {
+            (BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/income")
+        }
+    };
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    for (income_type, record_type) in [
+        ("REALIZED_PNL", "realized_pnl"),
+        ("COMMISSION", "commission"),
+        ("FUNDING_FEE", "funding_fee"),
+    ] {
+        let payload = sign_and_fetch_binance_private_get_with_retry(
+            base_url,
+            endpoint,
+            &format!("signing-request/funding-arb-exchange-history/binance/{income_type}"),
+            &signing_policy,
+            &leg.venue_id,
+            &leg.account_id,
+            vec![
+                BinanceRequestParam::new("incomeType", income_type)?,
+                BinanceRequestParam::new("startTime", start_ms.to_string())?,
+                BinanceRequestParam::new("endTime", end_ms.to_string())?,
+                BinanceRequestParam::new("limit", limit.min(1000).to_string())?,
+                BinanceRequestParam::new("recvWindow", recv_window_ms.to_string())?,
+            ],
+        );
+        funding_arb_exchange_history_capture_payload(
+            &mut records,
+            &mut errors,
+            leg,
+            &format!("binance {endpoint} {income_type}"),
+            record_type,
+            payload,
+            window,
+        );
+    }
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_bybit(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = BybitRealSigningProviderFromEnv::from_default_env()?;
+    let recv_window_ms = bybit_private_readonly_recv_window_ms()?;
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    let closed_limit = limit.min(100);
+    let closed_payload = (|| -> RuntimeResult<String> {
+        let query =
+            format!("category=linear&startTime={start_ms}&endTime={end_ms}&limit={closed_limit}");
+        let signed = signer.sign_bybit_hmac(
+            BybitHmacSigningInput::new(
+                SigningRequestId::new(
+                    "signing-request/funding-arb-exchange-history/bybit-closed-pnl",
+                )?,
+                signing_policy.policy_ref().clone(),
+                SigningPurpose::QueryAccount,
+                VenueId::new(&leg.venue_id)?,
+                AccountId::new(&leg.account_id)?,
+                recv_window_ms,
+                BybitSigningPayloadKind::QueryString,
+                &query,
+            )?,
+            &signing_policy,
+        )?;
+        fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, "/v5/position/closed-pnl", &signed)
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "bybit /v5/position/closed-pnl",
+        "closed_pnl",
+        closed_payload,
+        window,
+    );
+
+    let execution_limit = limit.min(100);
+    let execution_payload = (|| -> RuntimeResult<String> {
+        let query = format!(
+            "category=linear&startTime={start_ms}&endTime={end_ms}&limit={execution_limit}"
+        );
+        let signed = signer.sign_bybit_hmac(
+            BybitHmacSigningInput::new(
+                SigningRequestId::new(
+                    "signing-request/funding-arb-exchange-history/bybit-execution",
+                )?,
+                signing_policy.policy_ref().clone(),
+                SigningPurpose::QueryAccount,
+                VenueId::new(&leg.venue_id)?,
+                AccountId::new(&leg.account_id)?,
+                recv_window_ms,
+                BybitSigningPayloadKind::QueryString,
+                &query,
+            )?,
+            &signing_policy,
+        )?;
+        fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, "/v5/execution/list", &signed)
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "bybit /v5/execution/list",
+        "execution",
+        execution_payload,
+        window,
+    );
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_okx(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = OkxRealSigningProviderFromEnv::from_default_env()?;
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    let okx_limit = limit.min(100);
+    let bills_payload = (|| -> RuntimeResult<String> {
+        let endpoint = format!(
+            "/api/v5/account/bills?instType=SWAP&begin={start_ms}&end={end_ms}&limit={okx_limit}"
+        );
+        let signed = signer.sign_okx_hmac(
+            OkxHmacSigningInput::new(
+                SigningRequestId::new("signing-request/funding-arb-exchange-history/okx-bills")?,
+                signing_policy.policy_ref().clone(),
+                SigningPurpose::QueryAccount,
+                VenueId::new(&leg.venue_id)?,
+                AccountId::new(&leg.account_id)?,
+                OkxRestMethod::Get,
+                &endpoint,
+                "",
+            )?,
+            &signing_policy,
+        )?;
+        fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "okx /api/v5/account/bills",
+        "account_bill",
+        bills_payload,
+        window,
+    );
+
+    let fills_payload = (|| -> RuntimeResult<String> {
+        let endpoint =
+            format!("/api/v5/trade/fills-history?instType=SWAP&begin={start_ms}&end={end_ms}&limit={okx_limit}");
+        let signed = signer.sign_okx_hmac(
+            OkxHmacSigningInput::new(
+                SigningRequestId::new("signing-request/funding-arb-exchange-history/okx-fills")?,
+                signing_policy.policy_ref().clone(),
+                SigningPurpose::QueryAccount,
+                VenueId::new(&leg.venue_id)?,
+                AccountId::new(&leg.account_id)?,
+                OkxRestMethod::Get,
+                &endpoint,
+                "",
+            )?,
+            &signing_policy,
+        )?;
+        fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "okx /api/v5/trade/fills-history",
+        "trade_fill",
+        fills_payload,
+        window,
+    );
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_bitget(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = BitgetRealSigningProviderFromEnv::from_default_env()?;
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    let bitget_limit = limit.min(100);
+    let history_payload = (|| -> RuntimeResult<String> {
+        let endpoint =
+            format!("/api/v2/mix/position/history-position?productType=USDT-FUTURES&startTime={start_ms}&endTime={end_ms}&limit={bitget_limit}");
+        let signed = signer.sign_bitget_hmac(
+            BitgetHmacSigningInput::new(
+                SigningRequestId::new(
+                    "signing-request/funding-arb-exchange-history/bitget-history-position",
+                )?,
+                signing_policy.policy_ref().clone(),
+                SigningPurpose::QueryAccount,
+                VenueId::new(&leg.venue_id)?,
+                AccountId::new(&leg.account_id)?,
+                BitgetRestMethod::Get,
+                &endpoint,
+                "",
+            )?,
+            &signing_policy,
+        )?;
+        fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "bitget /api/v2/mix/position/history-position",
+        "history_position",
+        history_payload,
+        window,
+    );
+
+    let bill_payload = (|| -> RuntimeResult<String> {
+        let endpoint =
+            format!("/api/v2/mix/account/bill?productType=USDT-FUTURES&startTime={start_ms}&endTime={end_ms}&limit={bitget_limit}");
+        let signed = signer.sign_bitget_hmac(
+            BitgetHmacSigningInput::new(
+                SigningRequestId::new(
+                    "signing-request/funding-arb-exchange-history/bitget-account-bill",
+                )?,
+                signing_policy.policy_ref().clone(),
+                SigningPurpose::QueryAccount,
+                VenueId::new(&leg.venue_id)?,
+                AccountId::new(&leg.account_id)?,
+                BitgetRestMethod::Get,
+                &endpoint,
+                "",
+            )?,
+            &signing_policy,
+        )?;
+        fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "bitget /api/v2/mix/account/bill",
+        "account_bill",
+        bill_payload,
+        window,
+    );
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_aster(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let aster_signer =
+        resolve_required_aster_v3_address(options.aster_signer.as_deref(), "ASTER_SIGNER")?;
+    let signer_command = resolve_aster_eip712_signer_command(&options.aster_signer_cmd_env)?;
+    let signer = AsterEip712ExternalSigningProvider::new(
+        LiteralAsterExternalSignerCommandProvider::new(signer_command)?,
+        SystemAsterNonceProvider,
+    );
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    for (income_type, record_type) in [
+        ("REALIZED_PNL", "realized_pnl"),
+        ("COMMISSION", "commission"),
+        ("FUNDING_FEE", "funding_fee"),
+    ] {
+        let payload = fetch_signed_aster_readonly_get_with_retry(
+            &signer,
+            &signing_policy,
+            &format!("signing-request/funding-arb-exchange-history/aster/{income_type}"),
+            &leg.venue_id,
+            &leg.account_id,
+            &aster_signer,
+            vec![
+                AsterRequestParam::new("incomeType", income_type.to_owned())?,
+                AsterRequestParam::new("startTime", start_ms.to_string())?,
+                AsterRequestParam::new("endTime", end_ms.to_string())?,
+                AsterRequestParam::new("limit", limit.min(1000).to_string())?,
+            ],
+            "/fapi/v3/income",
+        );
+        funding_arb_exchange_history_capture_payload(
+            &mut records,
+            &mut errors,
+            leg,
+            &format!("aster /fapi/v3/income {income_type}"),
+            record_type,
+            payload,
+            window,
+        );
+    }
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_hyperliquid(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    _limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let user = resolve_required_hyperliquid_user(options.hyperliquid_user.as_deref())?;
+    let body = format!(
+        "{{\"type\":\"userFillsByTime\",\"user\":{},\"startTime\":{},\"endTime\":{}}}",
+        json_string(user.trim()),
+        start_ms,
+        end_ms
+    );
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "hyperliquid info.userFillsByTime",
+        "user_fill",
+        fetch_public_json_post_with_curl(HYPERLIQUID_INFO_URL, &body),
+        window,
+    );
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_venue(
+    options: &FundingArbResidentLiveOptions,
+    venue_family: &str,
+    start_ms: u64,
+    end_ms: u64,
+    limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let leg = funding_arb_exchange_history_leg(venue_family)?;
+    match leg.venue_family.as_str() {
+        "binance" => {
+            funding_arb_exchange_history_fetch_binance(options, &leg, start_ms, end_ms, limit)
+        }
+        "bybit" => funding_arb_exchange_history_fetch_bybit(options, &leg, start_ms, end_ms, limit),
+        "okx" => funding_arb_exchange_history_fetch_okx(options, &leg, start_ms, end_ms, limit),
+        "bitget" => {
+            funding_arb_exchange_history_fetch_bitget(options, &leg, start_ms, end_ms, limit)
+        }
+        "aster" => funding_arb_exchange_history_fetch_aster(options, &leg, start_ms, end_ms, limit),
+        "hyperliquid" => {
+            funding_arb_exchange_history_fetch_hyperliquid(options, &leg, start_ms, end_ms, limit)
+        }
+        other => Ok((
+            Vec::new(),
+            vec![funding_arb_exchange_history_source_error_json(
+                other,
+                "exchange_history",
+                &format!("尚未实现 {other} 的交易所历史记录拉取"),
+            )],
+        )),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_parse_u64_param(
+    params: &BTreeMap<String, String>,
+    key: &str,
+) -> RuntimeResult<u64> {
+    let value = funding_arb_exchange_pnl_http_required_param(params, key)?;
+    value
+        .parse::<u64>()
+        .map_err(|error| RuntimeError::UnsafeConfig {
+            message: format!(
+                "query parameter `{key}` is not a valid unix millisecond value: {error}"
+            ),
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_venues(params: &BTreeMap<String, String>) -> Vec<String> {
+    let raw = funding_arb_exchange_pnl_http_param(params, "venues")
+        .or_else(|| funding_arb_exchange_pnl_http_param(params, "venue"))
+        .unwrap_or("binance,bybit,okx,bitget,aster,hyperliquid");
+    let mut seen = BTreeSet::new();
+    let mut venues = Vec::new();
+    for item in raw.split(',') {
+        let venue = normalize_venue_family(item.trim());
+        if !venue.is_empty() && seen.insert(venue.clone()) {
+            venues.push(venue);
+        }
+    }
+    venues
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_limit(params: &BTreeMap<String, String>) -> RuntimeResult<u64> {
+    let Some(raw) = funding_arb_exchange_pnl_http_param(params, "limit") else {
+        return Ok(1000);
+    };
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|error| RuntimeError::UnsafeConfig {
+            message: format!("query parameter `limit` is invalid: {error}"),
+        })?;
+    Ok(parsed.clamp(1, 1000))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_http_error_json(error: &str, message: &str) -> String {
+    format!(
+        "{{\"configured\":false,\"endMs\":null,\"error\":{},\"errors\":[{}],\"message\":{},\"records\":[],\"source\":\"easy_arb_current_system_exchange_history\",\"startMs\":null,\"status\":\"error\",\"summary\":{{\"errorCount\":1,\"recordCount\":0,\"venueCount\":0}}}}",
+        json_string(error),
+        funding_arb_exchange_history_source_error_json("all", "exchange_history", message),
+        json_string(message),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_records_http_json(
+    context: &FundingArbDashboardContext,
+    path: &str,
+) -> (u16, String) {
+    let params = match funding_arb_exchange_pnl_http_query_params(path) {
+        Ok(params) => params,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_history_http_error_json("bad_query", &error.to_string()),
+            );
+        }
+    };
+    let start_ms = match funding_arb_exchange_history_parse_u64_param(&params, "start_ms") {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_history_http_error_json("bad_request", &error.to_string()),
+            );
+        }
+    };
+    let end_ms = match funding_arb_exchange_history_parse_u64_param(&params, "end_ms") {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_history_http_error_json("bad_request", &error.to_string()),
+            );
+        }
+    };
+    if end_ms <= start_ms {
+        return (
+            400,
+            funding_arb_exchange_history_http_error_json(
+                "bad_time_window",
+                "query parameter `end_ms` must be greater than `start_ms`",
+            ),
+        );
+    }
+    let limit = match funding_arb_exchange_history_limit(&params) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                400,
+                funding_arb_exchange_history_http_error_json("bad_request", &error.to_string()),
+            );
+        }
+    };
+    let venues = funding_arb_exchange_history_venues(&params);
+    let options = match funding_arb_exchange_pnl_resident_options_from_context(context) {
+        Ok(options) => options,
+        Err(error) => {
+            return (
+                503,
+                funding_arb_exchange_history_http_error_json(
+                    "exchange_history_config_unavailable",
+                    &error.to_string(),
+                ),
+            );
+        }
+    };
+
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    for venue in &venues {
+        match funding_arb_exchange_history_fetch_venue(&options, venue, start_ms, end_ms, limit) {
+            Ok((mut venue_records, mut venue_errors)) => {
+                records.append(&mut venue_records);
+                errors.append(&mut venue_errors);
+            }
+            Err(error) => errors.push(funding_arb_exchange_history_source_error_json(
+                venue,
+                "exchange_history",
+                &error.to_string(),
+            )),
+        }
+    }
+
+    let status = if errors.is_empty() { "ok" } else { "partial" };
+    (
+        200,
+        format!(
+            "{{\"configured\":true,\"endMs\":{},\"errors\":[{}],\"limit\":{},\"records\":[{}],\"source\":\"easy_arb_current_system_exchange_history\",\"startMs\":{},\"status\":{},\"summary\":{{\"errorCount\":{},\"recordCount\":{},\"venueCount\":{}}},\"venues\":{}}}",
+            end_ms,
+            errors.join(","),
+            limit,
+            records.join(","),
+            start_ms,
+            json_string(status),
+            errors.len(),
+            records.len(),
+            venues.len(),
+            json_string_array(&venues),
+        ),
+    )
+}
+
+#[cfg(not(feature = "live-exec"))]
+fn funding_arb_exchange_history_records_http_json(
+    _context: &FundingArbDashboardContext,
+    _path: &str,
+) -> (u16, String) {
+    (
+        501,
+        "{\"configured\":false,\"endMs\":null,\"error\":\"live_exec_feature_not_enabled\",\"errors\":[{\"message\":\"当前 easy-arb 二进制未启用 live-exec，不能拉取交易所历史记录。\",\"source\":\"exchange_history\",\"venueFamily\":\"all\"}],\"records\":[],\"source\":\"easy_arb_current_system_exchange_history\",\"startMs\":null,\"status\":\"error\",\"summary\":{\"errorCount\":1,\"recordCount\":0,\"venueCount\":0}}".to_owned(),
+    )
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_pnl_summary_from_backend(
     options: &FundingArbResidentLiveOptions,
     state: &FundingArbPositionState,
@@ -55279,6 +56105,69 @@ mod tests {
             pnl.map(MonitorDecimal::format_trimmed).as_deref(),
             Some("0.18")
         );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_record_json_keeps_exchange_payload() {
+        let leg = funding_arb_exchange_history_leg("bitget").expect("history leg");
+        let record = funding_arb_exchange_history_record_json(
+            &leg,
+            "bitget /api/v2/mix/account/bill",
+            "account_bill",
+            r#"{"symbol":"MAGMAUSDT","businessType":"close_long","amount":"-0.12","fee":"-0.001","ts":"1779978266000","billId":"abc"}"#,
+        )
+        .expect("history record json");
+
+        assert!(record.contains("\"venueFamily\":\"bitget\""));
+        assert!(record.contains("\"symbol\":\"MAGMAUSDT\""));
+        assert!(record.contains("\"businessType\":\"close_long\""));
+        assert!(record.contains("\"amountUsd\":-0.12"));
+        assert!(record.contains("\"feeUsd\":-0.001"));
+        assert!(record.contains("\"rawPayload\":{\"symbol\":\"MAGMAUSDT\""));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_http_requires_config() {
+        let (status, body) = funding_arb_exchange_history_records_http_json(
+            &FundingArbDashboardContext::default(),
+            "/api/funding-arb/exchange-history/records?start_ms=1779970000000&end_ms=1779980000000&venues=bitget",
+        );
+
+        assert_eq!(status, 503);
+        assert!(body.contains("exchange_history_config_unavailable"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_income_records_map_amount_by_type() {
+        let leg = funding_arb_exchange_history_leg("binance").expect("history leg");
+        let realized = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income REALIZED_PNL",
+            "realized_pnl",
+            r#"{"symbol":"COAIUSDT","incomeType":"REALIZED_PNL","income":"1.25","time":"1779978266000"}"#,
+        )
+        .expect("realized income json");
+        let commission = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income COMMISSION",
+            "commission",
+            r#"{"symbol":"COAIUSDT","incomeType":"COMMISSION","income":"-0.01","time":"1779978266000"}"#,
+        )
+        .expect("commission income json");
+        let funding = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income FUNDING_FEE",
+            "funding_fee",
+            r#"{"symbol":"COAIUSDT","incomeType":"FUNDING_FEE","income":"0.03","time":"1779978266000"}"#,
+        )
+        .expect("funding income json");
+
+        assert!(realized.contains("\"pnlUsd\":1.25"));
+        assert!(commission.contains("\"feeUsd\":-0.01"));
+        assert!(funding.contains("\"fundingPnlUsd\":0.03"));
     }
 
     #[test]

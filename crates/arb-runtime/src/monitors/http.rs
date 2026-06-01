@@ -607,10 +607,12 @@ fn handle_funding_arb_http_connection(
         (200, funding_arb_history_json(context.as_ref()))
     } else if route == "/api/funding-arb/exchange-pnl/reconcile" {
         funding_arb_exchange_pnl_reconcile_http_json(context.as_ref(), path)
+    } else if route == "/api/funding-arb/exchange-history/records" {
+        funding_arb_exchange_history_records_http_json(context.as_ref(), path)
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/funding-arb/status\",\"/api/funding-arb/opportunities\",\"/api/funding-arb/execution-status\",\"/api/funding-arb/history\",\"/api/funding-arb/exchange-pnl/reconcile\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/funding-arb/status\",\"/api/funding-arb/opportunities\",\"/api/funding-arb/execution-status\",\"/api/funding-arb/history\",\"/api/funding-arb/exchange-pnl/reconcile\",\"/api/funding-arb/exchange-history/records\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
