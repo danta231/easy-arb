@@ -31101,6 +31101,52 @@ fn funding_arb_exchange_history_decimal_from_fields(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_optional_delta_fields<'a>(
+    fields: &BTreeMap<String, &'a str>,
+) -> RuntimeResult<Option<BTreeMap<String, &'a str>>> {
+    let Some(delta) = fields.get("delta") else {
+        return Ok(None);
+    };
+    if !delta.trim().starts_with('{') {
+        return Ok(None);
+    }
+    parse_json_object_value_slices(delta).map(Some)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_string_from_field_sets(
+    fields: &BTreeMap<String, &str>,
+    delta_fields: Option<&BTreeMap<String, &str>>,
+    field_names: &[&'static str],
+    context: &'static str,
+) -> RuntimeResult<Option<String>> {
+    if let Some(value) = optional_first_json_value_string(fields, field_names, context)? {
+        return Ok(Some(value));
+    }
+    match delta_fields {
+        Some(delta_fields) => optional_first_json_value_string(delta_fields, field_names, context),
+        None => Ok(None),
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_decimal_from_field_sets(
+    fields: &BTreeMap<String, &str>,
+    delta_fields: Option<&BTreeMap<String, &str>>,
+    field_names: &[&str],
+) -> RuntimeResult<Option<MonitorDecimal>> {
+    if let Some(value) = funding_arb_exchange_history_decimal_from_fields(fields, field_names)? {
+        return Ok(Some(value));
+    }
+    match delta_fields {
+        Some(delta_fields) => {
+            funding_arb_exchange_history_decimal_from_fields(delta_fields, field_names)
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_string_json(value: Option<String>) -> String {
     match value {
         Some(value) => json_string(&value),
@@ -31116,27 +31162,33 @@ fn funding_arb_exchange_history_record_json(
     row: &str,
 ) -> RuntimeResult<String> {
     let fields = parse_json_object_value_slices(row)?;
-    let symbol = optional_first_json_value_string(
+    let delta_fields = funding_arb_exchange_history_optional_delta_fields(&fields)?;
+    let delta_fields_ref = delta_fields.as_ref();
+    let symbol = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &["symbol", "instId", "coin", "instrument", "market", "coinId"],
         "exchange history row",
     )?
     .unwrap_or_default();
-    let instrument_id = optional_first_json_value_string(
+    let instrument_id = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &["instId", "instrument", "market", "symbol"],
         "exchange history row",
     )?;
-    let exchange_record_id = optional_first_json_value_string(
+    let exchange_record_id = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "id", "billId", "tradeId", "execId", "orderId", "ordId", "tranId", "incomeId", "hash",
             "tid",
         ],
         "exchange history row",
     )?;
-    let order_id = optional_first_json_value_string(
+    let order_id = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "orderId",
             "ordId",
@@ -31147,28 +31199,33 @@ fn funding_arb_exchange_history_record_json(
         ],
         "exchange history row",
     )?;
-    let trade_id = optional_first_json_value_string(
+    let trade_id = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &["tradeId", "execId", "fillId", "billId", "id", "tid"],
         "exchange history row",
     )?;
-    let side = optional_first_json_value_string(
+    let side = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &["side", "posSide", "positionSide", "direction"],
         "exchange history row",
     )?;
-    let business_type = optional_first_json_value_string(
+    let business_type = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &["businessType", "bizType", "type", "subType", "category"],
         "exchange history row",
     )?;
-    let income_type = optional_first_json_value_string(
+    let income_type = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &["incomeType", "income_type", "type"],
         "exchange history row",
     )?;
-    let currency = optional_first_json_value_string(
+    let currency = funding_arb_exchange_history_string_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "asset",
             "ccy",
@@ -31181,19 +31238,24 @@ fn funding_arb_exchange_history_record_json(
         "exchange history row",
     )?;
     let event_time_ms = funding_arb_exchange_pnl_row_time_ms(&fields)?;
-    let amount_like = funding_arb_exchange_history_decimal_from_fields(
+    let amount_like = funding_arb_exchange_history_decimal_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
-            "income", "amount", "balChg", "cashFlow", "change", "sz", "qty",
+            "income", "amount", "balChg", "cashFlow", "change", "usdc", "sz", "qty",
         ],
     )?;
-    let quantity = funding_arb_exchange_history_decimal_from_fields(
+    let quantity = funding_arb_exchange_history_decimal_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "qty",
             "quantity",
             "execQty",
+            "cumExecQty",
+            "cumQty",
             "fillSz",
+            "fillQty",
             "sz",
             "size",
             "vol",
@@ -31202,23 +31264,29 @@ fn funding_arb_exchange_history_record_json(
             "baseVolume",
         ],
     )?;
-    let price = funding_arb_exchange_history_decimal_from_fields(
+    let price = funding_arb_exchange_history_decimal_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "price",
             "execPrice",
             "fillPx",
+            "fillPrice",
             "px",
             "avgPrice",
+            "avgPx",
+            "priceAvg",
             "avgEntryPrice",
             "avgExitPrice",
         ],
     )?;
-    let notional_usd = funding_arb_exchange_history_decimal_from_fields(
+    let notional_usd = funding_arb_exchange_history_decimal_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "notional",
             "execValue",
+            "cumExecValue",
             "value",
             "quoteQty",
             "quoteVolume",
@@ -31231,8 +31299,9 @@ fn funding_arb_exchange_history_record_json(
         .as_deref()
         .or(business_type.as_deref())
         .unwrap_or("");
-    let explicit_pnl_usd = funding_arb_exchange_history_decimal_from_fields(
+    let explicit_pnl_usd = funding_arb_exchange_history_decimal_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "closedPnl",
             "execPnl",
@@ -31252,8 +31321,9 @@ fn funding_arb_exchange_history_record_json(
             .then_some(amount_like)
             .flatten()
     });
-    let explicit_fee_usd = funding_arb_exchange_history_decimal_from_fields(
+    let explicit_fee_usd = funding_arb_exchange_history_decimal_from_field_sets(
         &fields,
+        delta_fields_ref,
         &[
             "fee",
             "execFee",
@@ -31261,6 +31331,8 @@ fn funding_arb_exchange_history_record_json(
             "closeFee",
             "totalFee",
             "commission",
+            "fillFee",
+            "cumExecFee",
         ],
     )?;
     let fee_usd = explicit_fee_usd.or_else(|| {
@@ -31268,9 +31340,11 @@ fn funding_arb_exchange_history_record_json(
             .then_some(amount_like)
             .flatten()
     });
-    let funding_pnl_usd = if kind.eq_ignore_ascii_case("FUNDING_FEE")
-        || kind.eq_ignore_ascii_case("funding_fee")
-        || kind == "8"
+    let kind_lower = kind.to_ascii_lowercase();
+    let funding_pnl_usd = if kind_lower.contains("fund")
+        || kind_lower.contains("settlement")
+        || kind_lower.contains("settle")
+        || kind_lower == "8"
     {
         amount_like
     } else {
@@ -31394,6 +31468,25 @@ fn funding_arb_exchange_history_capture_payload(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_record_symbols(records: &[String]) -> RuntimeResult<Vec<String>> {
+    let mut symbols = BTreeSet::new();
+    for record in records {
+        let fields = parse_json_object_value_slices(record)?;
+        if let Some(symbol) = optional_first_json_value_string(
+            &fields,
+            &["symbol", "instrumentId"],
+            "exchange history normalized record",
+        )? {
+            let symbol = symbol.trim();
+            if !symbol.is_empty() {
+                symbols.insert(symbol.to_owned());
+            }
+        }
+    }
+    Ok(symbols.into_iter().collect())
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_fetch_binance(
     options: &FundingArbResidentLiveOptions,
     leg: &FundingArbPositionLegState,
@@ -31403,14 +31496,19 @@ fn funding_arb_exchange_history_fetch_binance(
 ) -> RuntimeResult<(Vec<String>, Vec<String>)> {
     let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
     let recv_window_ms = binance_private_readonly_recv_window_ms()?;
-    let (base_url, endpoint) = match resolve_binance_private_account_mode()? {
-        BinancePrivateAccountMode::PortfolioMargin => {
-            (BINANCE_PORTFOLIO_MARGIN_BASE_URL, "/papi/v1/um/income")
-        }
-        BinancePrivateAccountMode::UsdmFutures => {
-            (BINANCE_USDM_FUTURES_BASE_URL, "/fapi/v1/income")
-        }
-    };
+    let (base_url, income_endpoint, user_trades_endpoint) =
+        match resolve_binance_private_account_mode()? {
+            BinancePrivateAccountMode::PortfolioMargin => (
+                BINANCE_PORTFOLIO_MARGIN_BASE_URL,
+                "/papi/v1/um/income",
+                "/papi/v1/um/userTrades",
+            ),
+            BinancePrivateAccountMode::UsdmFutures => (
+                BINANCE_USDM_FUTURES_BASE_URL,
+                "/fapi/v1/income",
+                "/fapi/v1/userTrades",
+            ),
+        };
     let mut records = Vec::new();
     let mut errors = Vec::new();
     let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
@@ -31421,7 +31519,7 @@ fn funding_arb_exchange_history_fetch_binance(
     ] {
         let payload = sign_and_fetch_binance_private_get_with_retry(
             base_url,
-            endpoint,
+            income_endpoint,
             &format!("signing-request/funding-arb-exchange-history/binance/{income_type}"),
             &signing_policy,
             &leg.venue_id,
@@ -31438,8 +31536,35 @@ fn funding_arb_exchange_history_fetch_binance(
             &mut records,
             &mut errors,
             leg,
-            &format!("binance {endpoint} {income_type}"),
+            &format!("binance {income_endpoint} {income_type}"),
             record_type,
+            payload,
+            window,
+        );
+    }
+    let symbols = funding_arb_exchange_history_record_symbols(&records)?;
+    for symbol in symbols {
+        let payload = sign_and_fetch_binance_private_get_with_retry(
+            base_url,
+            user_trades_endpoint,
+            &format!("signing-request/funding-arb-exchange-history/binance-user-trades/{symbol}"),
+            &signing_policy,
+            &leg.venue_id,
+            &leg.account_id,
+            vec![
+                BinanceRequestParam::new("symbol", symbol.clone())?,
+                BinanceRequestParam::new("startTime", start_ms.to_string())?,
+                BinanceRequestParam::new("endTime", end_ms.to_string())?,
+                BinanceRequestParam::new("limit", limit.min(1000).to_string())?,
+                BinanceRequestParam::new("recvWindow", recv_window_ms.to_string())?,
+            ],
+        );
+        funding_arb_exchange_history_capture_payload(
+            &mut records,
+            &mut errors,
+            leg,
+            &format!("binance {user_trades_endpoint}"),
+            "trade_fill",
             payload,
             window,
         );
@@ -31521,6 +31646,42 @@ fn funding_arb_exchange_history_fetch_bybit(
         "bybit /v5/execution/list",
         "execution",
         execution_payload,
+        window,
+    );
+
+    let settlement_limit = limit.min(100);
+    let settlement_payload = (|| -> RuntimeResult<String> {
+        let query = format!(
+            "accountType=UNIFIED&category=linear&type=SETTLEMENT&startTime={start_ms}&endTime={end_ms}&limit={settlement_limit}"
+        );
+        let signed = signer.sign_bybit_hmac(
+            BybitHmacSigningInput::new(
+                SigningRequestId::new(
+                    "signing-request/funding-arb-exchange-history/bybit-settlement",
+                )?,
+                signing_policy.policy_ref().clone(),
+                SigningPurpose::QueryAccount,
+                VenueId::new(&leg.venue_id)?,
+                AccountId::new(&leg.account_id)?,
+                recv_window_ms,
+                BybitSigningPayloadKind::QueryString,
+                &query,
+            )?,
+            &signing_policy,
+        )?;
+        fetch_signed_bybit_get_with_curl(
+            BYBIT_REST_BASE_URL,
+            "/v5/account/transaction-log",
+            &signed,
+        )
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "bybit /v5/account/transaction-log SETTLEMENT",
+        "funding_fee",
+        settlement_payload,
         window,
     );
     Ok((records, errors))
@@ -31672,6 +31833,39 @@ fn funding_arb_exchange_history_fetch_bitget(
         bill_payload,
         window,
     );
+
+    let symbols = funding_arb_exchange_history_record_symbols(&records)?;
+    for symbol in symbols {
+        let fills_payload = (|| -> RuntimeResult<String> {
+            let endpoint =
+                format!("/api/v2/mix/order/fills?productType=USDT-FUTURES&symbol={symbol}&startTime={start_ms}&endTime={end_ms}&limit={bitget_limit}");
+            let signed = signer.sign_bitget_hmac(
+                BitgetHmacSigningInput::new(
+                    SigningRequestId::new(format!(
+                        "signing-request/funding-arb-exchange-history/bitget-fills/{symbol}"
+                    ))?,
+                    signing_policy.policy_ref().clone(),
+                    SigningPurpose::QueryAccount,
+                    VenueId::new(&leg.venue_id)?,
+                    AccountId::new(&leg.account_id)?,
+                    BitgetRestMethod::Get,
+                    &endpoint,
+                    "",
+                )?,
+                &signing_policy,
+            )?;
+            fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)
+        })();
+        funding_arb_exchange_history_capture_payload(
+            &mut records,
+            &mut errors,
+            leg,
+            "bitget /api/v2/mix/order/fills",
+            "trade_fill",
+            fills_payload,
+            window,
+        );
+    }
     Ok((records, errors))
 }
 
@@ -31724,6 +31918,33 @@ fn funding_arb_exchange_history_fetch_aster(
             window,
         );
     }
+    let symbols = funding_arb_exchange_history_record_symbols(&records)?;
+    for symbol in symbols {
+        let payload = fetch_signed_aster_readonly_get_with_retry(
+            &signer,
+            &signing_policy,
+            &format!("signing-request/funding-arb-exchange-history/aster-user-trades/{symbol}"),
+            &leg.venue_id,
+            &leg.account_id,
+            &aster_signer,
+            vec![
+                AsterRequestParam::new("symbol", symbol.clone())?,
+                AsterRequestParam::new("startTime", start_ms.to_string())?,
+                AsterRequestParam::new("endTime", end_ms.to_string())?,
+                AsterRequestParam::new("limit", limit.min(1000).to_string())?,
+            ],
+            "/fapi/v3/userTrades",
+        );
+        funding_arb_exchange_history_capture_payload(
+            &mut records,
+            &mut errors,
+            leg,
+            "aster /fapi/v3/userTrades",
+            "trade_fill",
+            payload,
+            window,
+        );
+    }
     Ok((records, errors))
 }
 
@@ -31752,6 +31973,21 @@ fn funding_arb_exchange_history_fetch_hyperliquid(
         "hyperliquid info.userFillsByTime",
         "user_fill",
         fetch_public_json_post_with_curl(HYPERLIQUID_INFO_URL, &body),
+        window,
+    );
+    let funding_body = format!(
+        "{{\"type\":\"userFunding\",\"user\":{},\"startTime\":{},\"endTime\":{}}}",
+        json_string(user.trim()),
+        start_ms,
+        end_ms
+    );
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "hyperliquid info.userFunding",
+        "funding_fee",
+        fetch_public_json_post_with_curl(HYPERLIQUID_INFO_URL, &funding_body),
         window,
     );
     Ok((records, errors))
@@ -56243,6 +56479,28 @@ mod tests {
         assert!(realized.contains("\"pnlUsd\":1.25"));
         assert!(commission.contains("\"feeUsd\":-0.01"));
         assert!(funding.contains("\"fundingPnlUsd\":0.03"));
+
+        let bitget_leg = funding_arb_exchange_history_leg("bitget").expect("bitget history leg");
+        let bitget_funding = funding_arb_exchange_history_record_json(
+            &bitget_leg,
+            "bitget /api/v2/mix/account/bill",
+            "account_bill",
+            r#"{"symbol":"COAIUSDT","businessType":"contract_settle_fee","amount":"-0.04","cTime":"1779978266000"}"#,
+        )
+        .expect("bitget funding bill json");
+        assert!(bitget_funding.contains("\"fundingPnlUsd\":-0.04"));
+
+        let hyperliquid_leg =
+            funding_arb_exchange_history_leg("hyperliquid").expect("hyperliquid history leg");
+        let hyperliquid_funding = funding_arb_exchange_history_record_json(
+            &hyperliquid_leg,
+            "hyperliquid info.userFunding",
+            "funding_fee",
+            r#"{"time":1779978266000,"hash":"0xabc","delta":{"type":"funding","coin":"COAI","usdc":"0.05","szi":"10"}}"#,
+        )
+        .expect("hyperliquid funding json");
+        assert!(hyperliquid_funding.contains("\"symbol\":\"COAI\""));
+        assert!(hyperliquid_funding.contains("\"fundingPnlUsd\":0.05"));
     }
 
     #[test]
