@@ -31336,21 +31336,21 @@ fn funding_arb_exchange_history_record_json(
             "cumExecFee",
         ],
     )?;
-    let fee_usd = explicit_fee_usd.or_else(|| {
-        kind.eq_ignore_ascii_case("COMMISSION")
-            .then_some(amount_like)
-            .flatten()
-    });
     let kind_lower = kind.to_ascii_lowercase();
-    let funding_pnl_usd = if kind_lower.contains("fund")
+    let is_funding_kind = kind_lower.contains("fund")
         || kind_lower.contains("settlement")
         || kind_lower.contains("settle")
-        || kind_lower == "8"
-    {
-        amount_like
-    } else {
+        || kind_lower == "8";
+    let fee_usd = if is_funding_kind {
         None
+    } else {
+        explicit_fee_usd.or_else(|| {
+            kind.eq_ignore_ascii_case("COMMISSION")
+                .then_some(amount_like)
+                .flatten()
+        })
     };
+    let funding_pnl_usd = if is_funding_kind { amount_like } else { None };
     let amount_usd = amount_like;
     Ok(format!(
         "{{\"accountId\":{},\"amountUsd\":{},\"businessType\":{},\"currency\":{},\"eventTimeMs\":{},\"exchangeRecordId\":{},\"feeUsd\":{},\"fundingPnlUsd\":{},\"incomeType\":{},\"instrumentId\":{},\"notionalUsd\":{},\"orderId\":{},\"pnlUsd\":{},\"price\":{},\"quantity\":{},\"rawPayload\":{},\"recordSource\":{},\"recordType\":{},\"side\":{},\"symbol\":{},\"tradeId\":{},\"venueFamily\":{},\"venueId\":{}}}",
@@ -31617,37 +31617,6 @@ fn funding_arb_exchange_history_fetch_bybit(
     let mut records = Vec::new();
     let mut errors = Vec::new();
     let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
-    let closed_limit = limit.min(100);
-    let closed_payload = (|| -> RuntimeResult<String> {
-        let query =
-            format!("category=linear&startTime={start_ms}&endTime={end_ms}&limit={closed_limit}");
-        let signed = signer.sign_bybit_hmac(
-            BybitHmacSigningInput::new(
-                SigningRequestId::new(
-                    "signing-request/funding-arb-exchange-history/bybit-closed-pnl",
-                )?,
-                signing_policy.policy_ref().clone(),
-                SigningPurpose::QueryAccount,
-                VenueId::new(&leg.venue_id)?,
-                AccountId::new(&leg.account_id)?,
-                recv_window_ms,
-                BybitSigningPayloadKind::QueryString,
-                &query,
-            )?,
-            &signing_policy,
-        )?;
-        fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, "/v5/position/closed-pnl", &signed)
-    })();
-    funding_arb_exchange_history_capture_payload(
-        &mut records,
-        &mut errors,
-        leg,
-        "bybit /v5/position/closed-pnl",
-        "closed_pnl",
-        closed_payload,
-        window,
-    );
-
     let execution_limit = limit.min(100);
     let execution_payload = (|| -> RuntimeResult<String> {
         let query = format!(
@@ -31807,6 +31776,7 @@ fn funding_arb_exchange_history_fetch_bitget(
     let mut errors = Vec::new();
     let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
     let bitget_limit = limit.min(100);
+    let mut position_records = Vec::new();
     let history_payload = (|| -> RuntimeResult<String> {
         let endpoint =
             format!("/api/v2/mix/position/history-position?productType=USDT-FUTURES&startTime={start_ms}&endTime={end_ms}&limit={bitget_limit}");
@@ -31828,7 +31798,7 @@ fn funding_arb_exchange_history_fetch_bitget(
         fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)
     })();
     funding_arb_exchange_history_capture_payload(
-        &mut records,
+        &mut position_records,
         &mut errors,
         leg,
         "bitget /api/v2/mix/position/history-position",
@@ -31869,7 +31839,7 @@ fn funding_arb_exchange_history_fetch_bitget(
     );
     funding_arb_exchange_history_extend_funding_records(&mut records, &bill_records)?;
 
-    let symbols = funding_arb_exchange_history_record_symbols(&records)?;
+    let symbols = funding_arb_exchange_history_record_symbols(&position_records)?;
     for symbol in symbols {
         let fills_payload = (|| -> RuntimeResult<String> {
             let endpoint =
@@ -56570,6 +56540,17 @@ mod tests {
         .expect("hyperliquid funding json");
         assert!(hyperliquid_funding.contains("\"symbol\":\"COAI\""));
         assert!(hyperliquid_funding.contains("\"fundingPnlUsd\":0.05"));
+
+        let bybit_leg = funding_arb_exchange_history_leg("bybit").expect("bybit history leg");
+        let bybit_settlement = funding_arb_exchange_history_record_json(
+            &bybit_leg,
+            "bybit /v5/account/transaction-log SETTLEMENT",
+            "funding_fee",
+            r#"{"symbol":"COAIUSDT","type":"SETTLEMENT","cashFlow":"0.30","fee":"0.30","transactionTime":"1779978266000"}"#,
+        )
+        .expect("bybit funding settlement json");
+        assert!(bybit_settlement.contains("\"feeUsd\":null"));
+        assert!(bybit_settlement.contains("\"fundingPnlUsd\":0.3"));
     }
 
     #[test]
