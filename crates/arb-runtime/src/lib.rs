@@ -22968,18 +22968,63 @@ fn opportunity_recorder_resident_event_is_recent(
     let Ok(fields) = parse_json_object_value_slices(line) else {
         return true;
     };
-    let Ok(Some(recorded_at)) =
-        optional_json_value_string(&fields, "recorded_at", "resident health event")
-    else {
-        return true;
-    };
-    let Ok(recorded_at) = UtcTimestamp::from_str(&recorded_at) else {
-        return true;
+    let Some(recorded_at) = opportunity_recorder_resident_event_timestamp(&fields) else {
+        return false;
     };
     let age_secs = now
         .unix_seconds()
         .saturating_sub(recorded_at.unix_seconds());
     age_secs <= max_age_secs
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_event_timestamp(
+    fields: &BTreeMap<String, &str>,
+) -> Option<UtcTimestamp> {
+    optional_json_value_string(fields, "recorded_at", "resident health event")
+        .ok()
+        .flatten()
+        .and_then(|value| UtcTimestamp::from_str(&value).ok())
+        .or_else(|| {
+            optional_json_value_string(fields, "cycle_dir", "resident health event")
+                .ok()
+                .flatten()
+                .and_then(|value| opportunity_recorder_resident_cycle_dir_timestamp(&value))
+        })
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_cycle_dir_timestamp(path: &str) -> Option<UtcTimestamp> {
+    path.split('/')
+        .find_map(opportunity_recorder_resident_cycle_segment_timestamp)
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_cycle_segment_timestamp(segment: &str) -> Option<UtcTimestamp> {
+    let start = segment.find("-20")? + 1;
+    let raw = &segment[start..];
+    if raw.len() < 18 || raw.as_bytes().get(10) != Some(&b'T') {
+        return None;
+    }
+    let end = raw.find('Z')?;
+    if end < 17 {
+        return None;
+    }
+    let date = &raw[..10];
+    let hour = &raw[11..13];
+    let minute = &raw[13..15];
+    let second = &raw[15..17];
+    let fractional = &raw[17..end];
+    let timestamp = if fractional.is_empty() {
+        format!("{date}T{hour}:{minute}:{second}Z")
+    } else {
+        let mut nanos = fractional.chars().take(9).collect::<String>();
+        while nanos.len() < 9 {
+            nanos.push('0');
+        }
+        format!("{date}T{hour}:{minute}:{second}.{nanos}Z")
+    };
+    UtcTimestamp::from_str(&timestamp).ok()
 }
 
 #[cfg(feature = "live-exec")]
@@ -34484,12 +34529,14 @@ fn recover_funding_arb_closed_orphan_positions_for_exit(
                 )?;
             }
             Err(error) => {
-                append_funding_arb_resident_error_event(
+                append_funding_arb_resident_closed_orphan_position_closed_with_decision(
                     output_root,
                     cycle,
-                    &recovery_dir,
+                    cycle_dir,
+                    &candidate,
+                    "unrecoverable_recovery_artifact",
                     &format!(
-                        "closed orphan recovery failed for {}: {error}",
+                        "closed orphan recovery skipped because legacy funding arb monitor snapshot cannot build recovery state for {}: {error}",
                         candidate.position_id
                     ),
                 )?;
@@ -35550,12 +35597,14 @@ fn append_funding_arb_resident_capacity_event(
     cycle: u64,
     reason: &str,
 ) -> RuntimeResult<()> {
+    let recorded_at = current_utc_timestamp_string();
     append_funding_arb_resident_event(
         output_root,
         &format!(
-            "{{\"cycle\":{},\"event_type\":\"entry_capacity_blocked\",\"reason\":{}}}",
+            "{{\"cycle\":{},\"event_type\":\"entry_capacity_blocked\",\"reason\":{},\"recorded_at\":{}}}",
             cycle,
             json_string(reason),
+            json_string(&recorded_at),
         ),
     )
 }
@@ -38398,13 +38447,15 @@ fn append_funding_arb_resident_error_event(
     cycle_dir: &Path,
     error: &str,
 ) -> RuntimeResult<()> {
+    let recorded_at = current_utc_timestamp_string();
     append_funding_arb_resident_event(
         output_root,
         &format!(
-            "{{\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"event_type\":\"cycle_error\"}}",
+            "{{\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"event_type\":\"cycle_error\",\"recorded_at\":{}}}",
             cycle,
             json_string(&cycle_dir.display().to_string()),
             json_string(error),
+            json_string(&recorded_at),
         ),
     )
 }
@@ -38416,13 +38467,15 @@ fn append_funding_arb_resident_residual_retry_event(
     cycle_dir: &Path,
     reason: &str,
 ) -> RuntimeResult<()> {
+    let recorded_at = current_utc_timestamp_string();
     append_funding_arb_resident_event(
         output_root,
         &format!(
-            "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"residual_de_risk_retry\",\"reason\":{}}}",
+            "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"residual_de_risk_retry\",\"reason\":{},\"recorded_at\":{}}}",
             cycle,
             json_string(&cycle_dir.display().to_string()),
             json_string(reason),
+            json_string(&recorded_at),
         ),
     )
 }
@@ -56826,6 +56879,73 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_closed_orphan_recovery_marks_unrecoverable_snapshot_terminal() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let previous_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(5).expect("previous cycle"));
+        let current_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(6).expect("current cycle"));
+        fs::create_dir_all(&previous_cycle).expect("create previous cycle");
+        let mut row = funding_arb_test_row("0.00600000", "0.00010000");
+        row.pair_id = "binance:bitget:PORTALUSDT:PORTALUSDT".to_owned();
+        row.symbol = "PORTALUSDT".to_owned();
+        row.long_venue_family = None;
+        row.short_venue_family = None;
+        let snapshot = funding_arb_test_snapshot(vec![row], "2026-06-02T03:30:00Z".to_owned());
+        write_utf8(
+            previous_cycle.join("funding_arb_monitor_snapshot.json"),
+            &snapshot.to_json(),
+        )
+        .expect("write previous snapshot");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":5,\"cycle_dir\":{},\"decision\":\"close\",\"event_type\":\"position_closed\",\"notional_usdt\":\"50.00\",\"pair_id\":\"binance:bitget:PORTALUSDT:PORTALUSDT\",\"position_id\":\"pos:portal\",\"private_confirmation_count\":1,\"status\":\"closed\",\"submitted_receipt_count\":1,\"symbol\":\"PORTALUSDT\"}}\n",
+                json_string(&previous_cycle.display().to_string()),
+            ),
+        )
+        .expect("write closed orphan registry");
+        let options = funding_arb_test_resident_options();
+
+        let recovered = recover_funding_arb_closed_orphan_positions_for_exit(
+            &options,
+            root.path(),
+            6,
+            &current_cycle,
+        )
+        .expect("recover malformed legacy snapshot");
+
+        assert_eq!(recovered, 0);
+        let history =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
+        assert!(history.contains("\"decision\":\"unrecoverable_recovery_artifact\""));
+        assert!(history.contains("legacy funding arb monitor snapshot cannot build recovery state"));
+        assert!(!history.contains("\"event_type\":\"cycle_error\""));
+        assert!(load_funding_arb_closed_orphan_recovery_records(root.path())
+            .expect("pending closed orphan candidates")
+            .is_empty());
+        let before_second_recovery = history;
+
+        let recovered_again = recover_funding_arb_closed_orphan_positions_for_exit(
+            &options,
+            root.path(),
+            7,
+            &current_cycle,
+        )
+        .expect("recover after terminal malformed snapshot marker");
+
+        assert_eq!(recovered_again, 0);
+        let after_second_recovery =
+            read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
+        assert_eq!(after_second_recovery, before_second_recovery);
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_flat_cancelled_orphan_recovery_reopens_bybit_short_for_exit() {
         let root = RuntimeTempDir::new().expect("temp dir");
         let previous_cycle = root
@@ -64534,6 +64654,11 @@ mod tests {
             60,
         ));
         assert!(opportunity_recorder_resident_event_is_recent(
+            r#"{"cycle_dir":"/tmp/cycles/000001-2026-05-29T001430000000000Z","event_type":"cycle_error"}"#,
+            now,
+            60,
+        ));
+        assert!(!opportunity_recorder_resident_event_is_recent(
             r#"{"event_type":"cycle_error"}"#,
             now,
             60,

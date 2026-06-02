@@ -4448,14 +4448,15 @@ impl PublicTopOfBookQuoteSnapshot {
         }
     }
 
-    pub(crate) fn to_json(&self) -> String {
+    fn to_json_with_now(&self, now: Option<UtcTimestamp>) -> String {
+        let freshness_status = public_wss_quote_effective_freshness_status(self, now);
         format!(
             "{{\"ask_size\":{},\"best_ask\":{},\"best_bid\":{},\"bid_size\":{},\"freshness_status\":{},\"ingested_at\":{},\"instrument_id\":{},\"observed_at\":{},\"source_event_id\":{},\"source_sequence\":{},\"symbol\":{},\"venue_id\":{}}}",
             json_option_string(&self.ask_size),
             json_option_string(&self.best_ask),
             json_option_string(&self.best_bid),
             json_option_string(&self.bid_size),
-            json_string(&self.freshness_status),
+            json_string(&freshness_status),
             json_string(&self.ingested_at),
             json_string(&self.instrument_id),
             json_string(&self.observed_at),
@@ -4479,6 +4480,55 @@ pub(crate) fn public_top_of_book_snapshot_symbol(quote: &MarketQuote) -> &str {
     } else {
         symbol
     }
+}
+
+fn public_wss_quote_effective_freshness_status(
+    quote: &PublicTopOfBookQuoteSnapshot,
+    now: Option<UtcTimestamp>,
+) -> String {
+    if quote.freshness_status == "Fresh"
+        && now.is_some_and(|now| !public_wss_quote_timestamps_are_current(quote, now))
+    {
+        "Stale".to_owned()
+    } else {
+        quote.freshness_status.clone()
+    }
+}
+
+fn public_wss_quote_is_current_usable(
+    quote: &PublicTopOfBookQuoteSnapshot,
+    now: UtcTimestamp,
+) -> bool {
+    quote.freshness_status == "Fresh"
+        && quote
+            .source_event_id
+            .as_deref()
+            .is_some_and(|source| source.contains(":wss-book-ticker:"))
+        && public_wss_quote_timestamps_are_current(quote, now)
+}
+
+fn public_wss_quote_timestamps_are_current(
+    quote: &PublicTopOfBookQuoteSnapshot,
+    now: UtcTimestamp,
+) -> bool {
+    public_wss_timestamp_string_is_current(&quote.observed_at, now)
+        && public_wss_timestamp_string_is_current(&quote.ingested_at, now)
+}
+
+fn public_wss_timestamp_string_is_current(value: &str, now: UtcTimestamp) -> bool {
+    let Ok(timestamp) = UtcTimestamp::from_str(value) else {
+        return false;
+    };
+    let Ok(timestamp_ms) = runtime_timestamp_millis(timestamp) else {
+        return false;
+    };
+    let Ok(now_ms) = runtime_timestamp_millis(now) else {
+        return false;
+    };
+    if timestamp_ms > now_ms + 1_000 {
+        return false;
+    }
+    now_ms.saturating_sub(timestamp_ms) <= i128::from(MARKET_DATA_MAX_AGE_MS)
 }
 
 fn public_wss_update_is_row_level_stale(update: &HybridMarketDataUpdate) -> bool {
@@ -4664,31 +4714,74 @@ impl PublicTopOfBookMonitorSnapshot {
         }
     }
 
-    pub(crate) fn latest_quote_json_value(&self) -> String {
-        self.latest_quote
-            .as_ref()
-            .map(PublicTopOfBookQuoteSnapshot::to_json)
-            .unwrap_or_else(|| "null".to_owned())
-    }
-
-    fn availability_status(&self) -> &str {
+    fn availability_status(&self, now: Option<UtcTimestamp>) -> String {
         if self.fail_closed {
-            return "fail_closed";
+            return "fail_closed".to_owned();
+        }
+        if now.is_some_and(|now| self.has_current_usable_wss_quote(now)) {
+            return "streaming".to_owned();
+        }
+        if self.status == "reconnecting"
+            && self.rows.is_empty()
+            && self.latest_quote.is_none()
+            && (self.total_rows > 0 || self.wss_update_count > 0)
+        {
+            return "streaming".to_owned();
         }
         if self.total_rows > 0 || self.latest_quote.is_some() || self.wss_update_count > 0 {
-            return "streaming";
+            if now.is_some() && self.status == "streaming" {
+                return "stale".to_owned();
+            }
+            if now.is_some() && self.status == "reconnecting" {
+                return "reconnecting".to_owned();
+            }
+            return "streaming".to_owned();
         }
-        &self.status
+        self.status.clone()
+    }
+
+    fn has_current_usable_wss_quote(&self, now: UtcTimestamp) -> bool {
+        self.latest_quote
+            .as_ref()
+            .is_some_and(|quote| public_wss_quote_is_current_usable(quote, now))
+            || self
+                .rows
+                .iter()
+                .any(|quote| public_wss_quote_is_current_usable(quote, now))
+    }
+
+    fn effective_last_error(&self, availability_status: &str) -> Option<String> {
+        if availability_status == "stale" {
+            Some(self.last_error.clone().unwrap_or_else(|| {
+                format!(
+                    "no currently usable WSS quote rows; latest update at {}",
+                    self.updated_at
+                )
+            }))
+        } else {
+            self.last_error.clone()
+        }
+    }
+
+    pub(crate) fn health_http_status(&self) -> u16 {
+        let status = self.availability_status(current_utc_timestamp().ok());
+        if self.fail_closed || status == "stale" {
+            503
+        } else {
+            200
+        }
     }
 
     pub(crate) fn health_json(&self) -> String {
+        let now = current_utc_timestamp().ok();
+        let status = self.availability_status(now);
         format!(
             "{{\"disconnect_count\":{},\"fail_closed\":{},\"latest_quote\":{},\"rest_rebuild_count\":{},\"status\":{},\"stream_status\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
             self.disconnect_count,
             self.fail_closed,
-            self.latest_quote_json_value(),
+            self.latest_quote_json_value_with_now(now),
             self.rest_rebuild_count,
-            json_string(self.availability_status()),
+            json_string(&status),
             json_string(&self.status),
             self.total_rows,
             json_string(&self.updated_at),
@@ -4697,26 +4790,30 @@ impl PublicTopOfBookMonitorSnapshot {
     }
 
     pub(crate) fn quote_json(&self) -> String {
+        let now = current_utc_timestamp().ok();
+        let status = self.availability_status(now);
         format!(
             "{{\"fail_closed\":{},\"latest_quote\":{},\"status\":{},\"stream_status\":{},\"updated_at\":{}}}",
             self.fail_closed,
-            self.latest_quote_json_value(),
-            json_string(self.availability_status()),
+            self.latest_quote_json_value_with_now(now),
+            json_string(&status),
             json_string(&self.status),
             json_string(&self.updated_at),
         )
     }
 
     pub(crate) fn quotes_json(&self) -> String {
+        let now = current_utc_timestamp().ok();
+        let status = self.availability_status(now);
         format!(
             "{{\"fail_closed\":{},\"rows\":[{}],\"status\":{},\"stream_status\":{},\"total_rows\":{},\"updated_at\":{}}}",
             self.fail_closed,
             self.rows
                 .iter()
-                .map(PublicTopOfBookQuoteSnapshot::to_json)
+                .map(|quote| quote.to_json_with_now(now))
                 .collect::<Vec<_>>()
                 .join(","),
-            json_string(self.availability_status()),
+            json_string(&status),
             json_string(&self.status),
             self.total_rows,
             json_string(&self.updated_at),
@@ -4724,22 +4821,25 @@ impl PublicTopOfBookMonitorSnapshot {
     }
 
     pub(crate) fn to_json(&self) -> String {
+        let now = current_utc_timestamp().ok();
+        let status = self.availability_status(now);
+        let last_error = self.effective_last_error(&status);
         format!(
             "{{\"coordinator_status\":{},\"disconnect_count\":{},\"fail_closed\":{},\"fail_closed_count\":{},\"last_error\":{},\"latest_quote\":{},\"market\":{},\"rest_rebuild_count\":{},\"rows\":[{}],\"status\":{},\"stream_status\":{},\"stream_url\":{},\"symbol\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
             json_string(&self.coordinator_status),
             self.disconnect_count,
             self.fail_closed,
             self.fail_closed_count,
-            json_option_string(&self.last_error),
-            self.latest_quote_json_value(),
+            json_option_string(&last_error),
+            self.latest_quote_json_value_with_now(now),
             json_string(&self.market),
             self.rest_rebuild_count,
             self.rows
                 .iter()
-                .map(PublicTopOfBookQuoteSnapshot::to_json)
+                .map(|quote| quote.to_json_with_now(now))
                 .collect::<Vec<_>>()
                 .join(","),
-            json_string(self.availability_status()),
+            json_string(&status),
             json_string(&self.status),
             json_string(&self.stream_url),
             json_string(&self.symbol),
@@ -4747,6 +4847,13 @@ impl PublicTopOfBookMonitorSnapshot {
             json_string(&self.updated_at),
             self.wss_update_count,
         )
+    }
+
+    pub(crate) fn latest_quote_json_value_with_now(&self, now: Option<UtcTimestamp>) -> String {
+        self.latest_quote
+            .as_ref()
+            .map(|quote| quote.to_json_with_now(now))
+            .unwrap_or_else(|| "null".to_owned())
     }
 }
 
@@ -4810,10 +4917,7 @@ pub(crate) fn handle_binance_wss_book_ticker_http_connection(
         .read()
         .expect("Public WSS monitor state lock poisoned");
     let (status, body) = if route == "/health" {
-        (
-            if snapshot.fail_closed { 503 } else { 200 },
-            snapshot.health_json(),
-        )
+        (snapshot.health_http_status(), snapshot.health_json())
     } else if route == "/api/binance-wss-book-ticker/status" {
         (200, snapshot.to_json())
     } else if route == "/api/binance-wss-book-ticker/quote" {
@@ -4872,10 +4976,7 @@ pub(crate) fn handle_bybit_wss_book_ticker_http_connection(
 
     let snapshot = state.read().expect("Bybit WSS monitor state lock poisoned");
     let (status, body) = if route == "/health" {
-        (
-            if snapshot.fail_closed { 503 } else { 200 },
-            snapshot.health_json(),
-        )
+        (snapshot.health_http_status(), snapshot.health_json())
     } else if route == "/api/bybit-wss-book-ticker/status" {
         (200, snapshot.to_json())
     } else if route == "/api/bybit-wss-book-ticker/quote" {
@@ -5022,10 +5123,7 @@ pub(crate) fn handle_public_wss_book_ticker_http_connection(
     let quote_path = format!("/api/{api_name}/quote");
     let quotes_path = format!("/api/{api_name}/quotes");
     let (status, body) = if route == "/health" {
-        (
-            if snapshot.fail_closed { 503 } else { 200 },
-            snapshot.health_json(),
-        )
+        (snapshot.health_http_status(), snapshot.health_json())
     } else if route == status_path {
         (200, snapshot.to_json())
     } else if route == quote_path {
@@ -5079,5 +5177,43 @@ mod tests {
             false,
             PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL
         ));
+    }
+
+    #[test]
+    fn public_wss_monitor_snapshot_reports_stale_when_rows_stop_updating() {
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            AsterPublicWssMarket::UsdtFutures.as_str(),
+            ASTER_PUBLIC_WSS_BASE_URL,
+        );
+        let quote = PublicTopOfBookQuoteSnapshot {
+            symbol: "BTCUSDT".to_owned(),
+            venue_id: "venue:ASTER-USDT-FUTURES".to_owned(),
+            instrument_id: "inst:ASTER:BTCUSDT:USDT-FUTURES".to_owned(),
+            best_bid: Some("100.01".to_owned()),
+            best_ask: Some("100.02".to_owned()),
+            bid_size: Some("1.2".to_owned()),
+            ask_size: Some("1.3".to_owned()),
+            source_sequence: Some("42".to_owned()),
+            source_event_id: Some("aster:wss-book-ticker:usdt-futures:BTCUSDT:42".to_owned()),
+            observed_at: "2000-01-01T00:00:00Z".to_owned(),
+            ingested_at: "2000-01-01T00:00:00Z".to_owned(),
+            freshness_status: "Fresh".to_owned(),
+        };
+        snapshot.status = "streaming".to_owned();
+        snapshot.updated_at = "2000-01-01T00:00:00Z".to_owned();
+        snapshot.wss_update_count = 1;
+        snapshot.latest_quote = Some(quote.clone());
+        snapshot.upsert_quote_row(quote);
+
+        let health = snapshot.health_json();
+        let status = snapshot.to_json();
+
+        assert_eq!(snapshot.health_http_status(), 503);
+        assert!(health.contains("\"status\":\"stale\""));
+        assert!(status.contains("\"status\":\"stale\""));
+        assert!(status.contains("\"stream_status\":\"streaming\""));
+        assert!(status.contains("no currently usable WSS quote rows"));
+        assert!(status.contains("\"freshness_status\":\"Stale\""));
     }
 }
