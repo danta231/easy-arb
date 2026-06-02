@@ -31102,6 +31102,46 @@ fn funding_arb_exchange_history_decimal_from_fields(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fee_cost_usd(
+    value: Option<MonitorDecimal>,
+) -> RuntimeResult<Option<MonitorDecimal>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.raw > 0 {
+        return Ok(Some(MonitorDecimal {
+            raw: value
+                .raw
+                .checked_neg()
+                .ok_or_else(|| RuntimeError::LiveMarketData {
+                    message: "exchange history fee normalization overflowed".to_owned(),
+                })?,
+        }));
+    }
+    Ok(Some(value))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_notional_from_price_quantity(
+    price: Option<MonitorDecimal>,
+    quantity: Option<MonitorDecimal>,
+) -> RuntimeResult<Option<MonitorDecimal>> {
+    let (Some(price), Some(quantity)) = (price, quantity) else {
+        return Ok(None);
+    };
+    let mut notional = price.checked_mul_decimal(quantity, "exchange history notional")?;
+    if notional.raw < 0 {
+        notional.raw = notional
+            .raw
+            .checked_neg()
+            .ok_or_else(|| RuntimeError::LiveMarketData {
+                message: "exchange history notional absolute value overflowed".to_owned(),
+            })?;
+    }
+    Ok(Some(notional))
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_optional_delta_fields<'a>(
     fields: &BTreeMap<String, &'a str>,
 ) -> RuntimeResult<Option<BTreeMap<String, &'a str>>> {
@@ -31274,6 +31314,7 @@ fn funding_arb_exchange_history_record_json(
             "fillPx",
             "fillPrice",
             "px",
+            "tradePrice",
             "avgPrice",
             "avgPx",
             "priceAvg",
@@ -31296,6 +31337,10 @@ fn funding_arb_exchange_history_record_json(
             "closedValue",
         ],
     )?;
+    let notional_usd = match notional_usd {
+        Some(value) => Some(value),
+        None => funding_arb_exchange_history_notional_from_price_quantity(price, quantity)?,
+    };
     let kind = income_type
         .as_deref()
         .or(business_type.as_deref())
@@ -31336,6 +31381,18 @@ fn funding_arb_exchange_history_record_json(
             "cumExecFee",
         ],
     )?;
+    let explicit_funding_usd = funding_arb_exchange_history_decimal_from_field_sets(
+        &fields,
+        delta_fields_ref,
+        &[
+            "funding",
+            "fundingFee",
+            "funding_fee",
+            "fundingPnl",
+            "fundingPnlUsd",
+            "funding_pnl_usd",
+        ],
+    )?;
     let kind_lower = kind.to_ascii_lowercase();
     let is_funding_kind = kind_lower.contains("fund")
         || kind_lower.contains("settlement")
@@ -31350,7 +31407,12 @@ fn funding_arb_exchange_history_record_json(
                 .flatten()
         })
     };
-    let funding_pnl_usd = if is_funding_kind { amount_like } else { None };
+    let fee_usd = funding_arb_exchange_history_fee_cost_usd(fee_usd)?;
+    let funding_pnl_usd = if is_funding_kind {
+        explicit_funding_usd.or(amount_like)
+    } else {
+        None
+    };
     let amount_usd = amount_like;
     Ok(format!(
         "{{\"accountId\":{},\"amountUsd\":{},\"businessType\":{},\"currency\":{},\"eventTimeMs\":{},\"exchangeRecordId\":{},\"feeUsd\":{},\"fundingPnlUsd\":{},\"incomeType\":{},\"instrumentId\":{},\"notionalUsd\":{},\"orderId\":{},\"pnlUsd\":{},\"price\":{},\"quantity\":{},\"rawPayload\":{},\"recordSource\":{},\"recordType\":{},\"side\":{},\"symbol\":{},\"tradeId\":{},\"venueFamily\":{},\"venueId\":{}}}",
@@ -56546,11 +56608,43 @@ mod tests {
             &bybit_leg,
             "bybit /v5/account/transaction-log SETTLEMENT",
             "funding_fee",
-            r#"{"symbol":"COAIUSDT","type":"SETTLEMENT","cashFlow":"0.30","fee":"0.30","transactionTime":"1779978266000"}"#,
+            r#"{"symbol":"COAIUSDT","type":"SETTLEMENT","cashFlow":"0","funding":"0.30","fee":"0","qty":"935","tradePrice":"0.05247","transactionTime":"1779978266000"}"#,
         )
         .expect("bybit funding settlement json");
         assert!(bybit_settlement.contains("\"feeUsd\":null"));
         assert!(bybit_settlement.contains("\"fundingPnlUsd\":0.3"));
+        assert!(bybit_settlement.contains("\"price\":0.05247"));
+        assert!(bybit_settlement.contains("\"quantity\":935"));
+        assert!(bybit_settlement.contains("\"notionalUsd\":49.05945"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_trade_fees_are_costs() {
+        for (venue, fee_field, fee_value, expected) in [
+            ("binance", "commission", "0.01", "\"feeUsd\":-0.01"),
+            ("bybit", "execFee", "0.02", "\"feeUsd\":-0.02"),
+            ("okx", "fee", "-0.03", "\"feeUsd\":-0.03"),
+            ("bitget", "fillFee", "-0.04", "\"feeUsd\":-0.04"),
+            ("aster", "commission", "0.05", "\"feeUsd\":-0.05"),
+            ("hyperliquid", "fee", "0.06", "\"feeUsd\":-0.06"),
+        ] {
+            let leg = funding_arb_exchange_history_leg(venue).expect("history leg");
+            let row = format!(
+                r#"{{"symbol":"COAIUSDT","type":"TRADE","{fee_field}":"{fee_value}","qty":"1","price":"1","time":"1779978266000"}}"#
+            );
+            let record = funding_arb_exchange_history_record_json(
+                &leg,
+                "test trade fee source",
+                "trade_fill",
+                &row,
+            )
+            .expect("history record json");
+            assert!(
+                record.contains(expected),
+                "venue {venue} should normalize fee {fee_value} as a negative cost: {record}"
+            );
+        }
     }
 
     #[test]
