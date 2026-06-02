@@ -69,6 +69,7 @@ pub(crate) const ASTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const BYBIT_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 pub(crate) const BYBIT_LINEAR_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/linear";
+pub(crate) const BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT: usize = 100;
 
 /// Binance `bookTicker` WSS 公开行情常驻任务选项。
 ///
@@ -101,10 +102,11 @@ impl Default for BinanceWssBookTickerMonitorOptions {
 /// 兼容旧名称：历史上该命令只做有限条探测。
 pub type BinanceWssBookTickerProbeOptions = BinanceWssBookTickerMonitorOptions;
 
-/// Bybit V5 `orderbook.1` WSS 公开行情常驻任务选项。
+/// Bybit V5 WSS 公开行情常驻任务选项。
 ///
 /// 中文说明：该选项只允许公开行情 WSS。Bybit V5 连接后通过公开 topic 订阅
-/// `orderbook.1.<symbol>`，不读取账户、不下单、不撤单、不转账、不签名。
+/// 小范围 `orderbook.1.<symbol>` 或大范围 Linear Perp 的 `tickers.<symbol>`，
+/// 不读取账户、不下单、不撤单、不转账、不签名。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitWssBookTickerMonitorOptions {
     pub bind_addr: String,
@@ -1631,7 +1633,7 @@ pub(crate) struct PublicTopOfBookAllMarketState {
     pub(crate) venue_id: VenueId,
     pub(crate) stream_url: String,
     pub(crate) subscribe_args: Vec<String>,
-    pub(crate) all_symbols_scope: bool,
+    pub(crate) ignore_untracked_wss_symbols: bool,
     pub(crate) coordinators: BTreeMap<String, RestWssMarketDataCoordinator>,
     pub(crate) local_sequences: BTreeMap<String, u64>,
     pub(crate) last_exchange_update_ids: BTreeMap<String, u64>,
@@ -1741,7 +1743,7 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_all_market(
         venue_id,
         stream_url,
         subscribe_args: Vec::new(),
-        all_symbols_scope,
+        ignore_untracked_wss_symbols: all_symbols_scope,
         coordinators,
         local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
@@ -1831,6 +1833,8 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
     let mut local_sequences = BTreeMap::new();
     let mut rest_updates = Vec::with_capacity(rows.len());
     let mut subscribe_args = Vec::with_capacity(rows.len());
+    let use_ticker_topics =
+        bybit_wss_should_use_ticker_topics(market, rows.len(), all_symbols_scope);
     for row in rows {
         let symbol = row.symbol.clone();
         let instrument = bybit_public_wss_instrument(&symbol, market)?;
@@ -1848,14 +1852,14 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
         local_sequences.insert(symbol.clone(), sequence);
         coordinators.insert(symbol.clone(), coordinator);
         rest_updates.push(update);
-        subscribe_args.push(bybit_wss_orderbook_topic(&symbol));
+        subscribe_args.push(bybit_wss_top_of_book_topic(&symbol, use_ticker_topics));
     }
 
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url: bybit_wss_book_ticker_public_stream_url(market),
         subscribe_args,
-        all_symbols_scope,
+        ignore_untracked_wss_symbols: all_symbols_scope,
         coordinators,
         local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
@@ -1944,7 +1948,7 @@ pub(crate) fn bootstrap_okx_wss_book_ticker(
         venue_id,
         stream_url: OKX_PUBLIC_WSS_URL.to_owned(),
         subscribe_args: okx_wss_ticker_subscribe_payloads(&subscribe_symbols, market),
-        all_symbols_scope,
+        ignore_untracked_wss_symbols: all_symbols_scope,
         coordinators,
         local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
@@ -2026,7 +2030,7 @@ pub(crate) fn bootstrap_bitget_wss_book_ticker(
             market,
             all_symbols_scope,
         ),
-        all_symbols_scope,
+        ignore_untracked_wss_symbols: all_symbols_scope,
         coordinators,
         local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
@@ -2154,6 +2158,10 @@ pub(crate) fn bootstrap_aster_wss_book_ticker(
     let target_symbols =
         explicit_wss_symbol_scope_set(&symbol_scope, is_aster_wss_all_symbols_scope);
     let all_symbols_scope = target_symbols.is_none();
+    let ignore_untracked_wss_symbols = all_symbols_scope
+        || target_symbols
+            .as_ref()
+            .is_some_and(|symbols| symbols.len() > 1);
     let raw_rest_snapshot = match target_symbols.as_ref() {
         None => fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?,
         Some(symbols) if symbols.len() == 1 => {
@@ -2214,7 +2222,7 @@ pub(crate) fn bootstrap_aster_wss_book_ticker(
         venue_id,
         stream_url: aster_wss_book_ticker_stream_url(market, &symbol_scope)?,
         subscribe_args: Vec::new(),
-        all_symbols_scope,
+        ignore_untracked_wss_symbols,
         coordinators,
         local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
@@ -2296,7 +2304,7 @@ pub(crate) fn bootstrap_hyperliquid_wss_book_ticker(
         venue_id,
         stream_url: HYPERLIQUID_PUBLIC_WSS_URL.to_owned(),
         subscribe_args,
-        all_symbols_scope,
+        ignore_untracked_wss_symbols: all_symbols_scope,
         coordinators,
         local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
@@ -2480,11 +2488,11 @@ pub(crate) fn apply_binance_wss_book_ticker_text(
     let mut raw = parse_binance_wss_book_ticker_runtime_raw(raw_json, ingested_at)?;
     raw.symbol = match validate_binance_public_wss_symbol(&raw.symbol) {
         Ok(symbol) => symbol,
-        Err(_) if state.all_symbols_scope => return Ok(None),
+        Err(_) if state.ignore_untracked_wss_symbols => return Ok(None),
         Err(error) => return Err(error),
     };
     if !state.coordinators.contains_key(&raw.symbol) {
-        if state.all_symbols_scope {
+        if state.ignore_untracked_wss_symbols {
             return Ok(None);
         }
         return Err(RuntimeError::LiveMarketData {
@@ -2558,11 +2566,11 @@ pub(crate) fn apply_bybit_wss_book_ticker_text(
     };
     raw.symbol = match validate_bybit_public_wss_symbol(&raw.symbol) {
         Ok(symbol) => symbol,
-        Err(_) if state.all_symbols_scope => return Ok(None),
+        Err(_) if state.ignore_untracked_wss_symbols => return Ok(None),
         Err(error) => return Err(error),
     };
     if !state.coordinators.contains_key(&raw.symbol) {
-        if state.all_symbols_scope {
+        if state.ignore_untracked_wss_symbols {
             return Ok(None);
         }
         return Err(RuntimeError::LiveMarketData {
@@ -2675,7 +2683,7 @@ pub(crate) fn apply_okx_wss_book_ticker_text(
         return Ok(None);
     };
     if !state.coordinators.contains_key(&raw.symbol) {
-        if state.all_symbols_scope {
+        if state.ignore_untracked_wss_symbols {
             return Ok(None);
         }
         return Err(RuntimeError::LiveMarketData {
@@ -2726,7 +2734,7 @@ pub(crate) fn apply_bitget_wss_book_ticker_text(
         return Ok(None);
     };
     if !state.coordinators.contains_key(&raw.symbol) {
-        if state.all_symbols_scope {
+        if state.ignore_untracked_wss_symbols {
             return Ok(None);
         }
         return Err(RuntimeError::LiveMarketData {
@@ -2776,11 +2784,11 @@ pub(crate) fn apply_aster_wss_book_ticker_text(
     let mut raw = parse_aster_wss_book_ticker_runtime_raw(raw_json, ingested_at)?;
     raw.symbol = match validate_aster_public_wss_symbol(&raw.symbol) {
         Ok(symbol) => symbol,
-        Err(_) if state.all_symbols_scope => return Ok(None),
+        Err(_) if state.ignore_untracked_wss_symbols => return Ok(None),
         Err(error) => return Err(error),
     };
     if !state.coordinators.contains_key(&raw.symbol) {
-        if state.all_symbols_scope {
+        if state.ignore_untracked_wss_symbols {
             return Ok(None);
         }
         return Err(RuntimeError::LiveMarketData {
@@ -2853,7 +2861,7 @@ pub(crate) fn apply_hyperliquid_wss_book_ticker_text(
         return Ok(None);
     };
     if !state.coordinators.contains_key(&raw.symbol) {
-        if state.all_symbols_scope {
+        if state.ignore_untracked_wss_symbols {
             return Ok(None);
         }
         return Err(RuntimeError::LiveMarketData {
@@ -2919,7 +2927,17 @@ pub(crate) fn parse_bybit_wss_book_ticker_runtime_raw(
 ) -> RuntimeResult<Option<BybitTopOfBookRuntimeRaw>> {
     let root = parse_json_object_value_slices(raw_json)?;
     if let Some(op) = optional_json_value_string(&root, "op", "bybit wss")? {
-        if op == "subscribe" || op == "pong" {
+        if op == "subscribe" {
+            if optional_json_scalar_bool(&root, "success", "bybit wss subscribe")? == Some(false) {
+                let ret_msg = optional_json_value_string(&root, "ret_msg", "bybit wss subscribe")?
+                    .unwrap_or_else(|| "unknown error".to_owned());
+                return Err(RuntimeError::LiveMarketData {
+                    message: format!("Bybit public WSS subscribe failed: {ret_msg}"),
+                });
+            }
+            return Ok(None);
+        }
+        if op == "pong" {
             return Ok(None);
         }
     }
@@ -2938,10 +2956,11 @@ pub(crate) fn parse_bybit_wss_book_ticker_runtime_raw(
         .or(optional_json_scalar_u64(
             &fields,
             "seq",
-            "bybit wss orderbook",
+            "bybit wss ticker",
         )?)
+        .or(optional_json_scalar_u64(&root, "cs", "bybit wss ticker")?)
         .ok_or_else(|| RuntimeError::LiveMarketData {
-            message: "Bybit WSS orderbook lacks `u` or `seq` update id".to_owned(),
+            message: "Bybit WSS top-of-book update lacks `u`, `seq`, or `cs` update id".to_owned(),
         })?;
     let bid = if is_orderbook {
         fields
@@ -3346,6 +3365,23 @@ pub(crate) fn optional_json_scalar_u64(
         })
 }
 
+pub(crate) fn optional_json_scalar_bool(
+    fields: &BTreeMap<String, &str>,
+    field: &'static str,
+    source: &'static str,
+) -> RuntimeResult<Option<bool>> {
+    let Some(value) = optional_json_value_string(fields, field, source)? else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        other => Err(RuntimeError::LiveMarketData {
+            message: format!("{source} field `{field}` is not bool: `{other}`"),
+        }),
+    }
+}
+
 pub(crate) fn decode_json_scalar_string(
     value: &str,
     source: &'static str,
@@ -3536,22 +3572,7 @@ pub(crate) fn aster_wss_book_ticker_stream_url(
                         symbol.to_ascii_lowercase()
                     ))
                 } else {
-                    if symbols.len() > 1_024 {
-                        return Err(RuntimeError::LiveMarketData {
-                            message: format!(
-                                "Aster combined stream supports at most 1024 streams; got {}",
-                                symbols.len()
-                            ),
-                        });
-                    }
-                    let streams = symbols
-                        .iter()
-                        .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    Ok(format!(
-                        "{ASTER_PUBLIC_WSS_BASE_URL}/stream?streams={streams}"
-                    ))
+                    Ok(format!("{ASTER_PUBLIC_WSS_BASE_URL}/ws/!bookTicker"))
                 }
             }
         }
@@ -4418,6 +4439,27 @@ pub(crate) fn bybit_wss_orderbook_topic(symbol: &str) -> String {
     format!("orderbook.1.{symbol}")
 }
 
+pub(crate) fn bybit_wss_ticker_topic(symbol: &str) -> String {
+    format!("tickers.{symbol}")
+}
+
+pub(crate) fn bybit_wss_top_of_book_topic(symbol: &str, use_ticker_topic: bool) -> String {
+    if use_ticker_topic {
+        bybit_wss_ticker_topic(symbol)
+    } else {
+        bybit_wss_orderbook_topic(symbol)
+    }
+}
+
+pub(crate) fn bybit_wss_should_use_ticker_topics(
+    market: BybitPublicMarket,
+    symbol_count: usize,
+    all_symbols_scope: bool,
+) -> bool {
+    market == BybitPublicMarket::LinearPerpetual
+        && (all_symbols_scope || symbol_count > BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT)
+}
+
 pub(crate) fn bybit_wss_book_ticker_public_stream_url(market: BybitPublicMarket) -> String {
     match market {
         BybitPublicMarket::Spot => BYBIT_SPOT_PUBLIC_WSS_BASE_URL,
@@ -4765,7 +4807,7 @@ impl PublicTopOfBookMonitorSnapshot {
 
     pub(crate) fn health_http_status(&self) -> u16 {
         let status = self.availability_status(current_utc_timestamp().ok());
-        if self.fail_closed || status == "stale" {
+        if self.fail_closed || status == "stale" || status == "reconnecting" {
             503
         } else {
             200
@@ -5214,6 +5256,44 @@ mod tests {
         assert!(status.contains("\"status\":\"stale\""));
         assert!(status.contains("\"stream_status\":\"streaming\""));
         assert!(status.contains("no currently usable WSS quote rows"));
+        assert!(status.contains("\"freshness_status\":\"Stale\""));
+    }
+
+    #[test]
+    fn public_wss_monitor_snapshot_reports_unhealthy_when_reconnecting_without_current_rows() {
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BybitPublicMarket::LinearPerpetual.as_str(),
+            BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+        );
+        let quote = PublicTopOfBookQuoteSnapshot {
+            symbol: "BTCUSDT".to_owned(),
+            venue_id: "venue:BYBIT-PERP".to_owned(),
+            instrument_id: "inst:BYBIT:BTCUSDT:LINEAR-PERP".to_owned(),
+            best_bid: Some("100.01".to_owned()),
+            best_ask: Some("100.02".to_owned()),
+            bid_size: Some("1.2".to_owned()),
+            ask_size: Some("1.3".to_owned()),
+            source_sequence: Some("42".to_owned()),
+            source_event_id: Some("bybit:wss-book-ticker:linear-perp:BTCUSDT:42".to_owned()),
+            observed_at: "2000-01-01T00:00:00Z".to_owned(),
+            ingested_at: "2000-01-01T00:00:00Z".to_owned(),
+            freshness_status: "Fresh".to_owned(),
+        };
+        snapshot.status = "reconnecting".to_owned();
+        snapshot.updated_at = "2000-01-01T00:00:00Z".to_owned();
+        snapshot.wss_update_count = 1;
+        snapshot.latest_quote = Some(quote.clone());
+        snapshot.upsert_quote_row(quote);
+
+        let health = snapshot.health_json();
+        let status = snapshot.to_json();
+
+        assert_eq!(snapshot.health_http_status(), 503);
+        assert!(health.contains("\"status\":\"reconnecting\""));
+        assert!(health.contains("\"stream_status\":\"reconnecting\""));
+        assert!(status.contains("\"status\":\"reconnecting\""));
+        assert!(status.contains("\"stream_status\":\"reconnecting\""));
         assert!(status.contains("\"freshness_status\":\"Stale\""));
     }
 }

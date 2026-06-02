@@ -49309,7 +49309,7 @@ mod tests {
             venue_id,
             stream_url: "wss://example.test/ws".to_owned(),
             subscribe_args: Vec::new(),
-            all_symbols_scope,
+            ignore_untracked_wss_symbols: all_symbols_scope,
             coordinators,
             local_sequences,
             last_exchange_update_ids: BTreeMap::new(),
@@ -49353,7 +49353,7 @@ mod tests {
             venue_id,
             stream_url: BYBIT_SPOT_PUBLIC_WSS_BASE_URL.to_owned(),
             subscribe_args: vec![bybit_wss_orderbook_topic(symbol)],
-            all_symbols_scope,
+            ignore_untracked_wss_symbols: all_symbols_scope,
             coordinators,
             local_sequences,
             last_exchange_update_ids: BTreeMap::new(),
@@ -49405,7 +49405,7 @@ mod tests {
             venue_id,
             stream_url: aster_wss_book_ticker_stream_url(market, symbol).expect("stream url"),
             subscribe_args: Vec::new(),
-            all_symbols_scope,
+            ignore_untracked_wss_symbols: all_symbols_scope,
             coordinators,
             local_sequences,
             last_exchange_update_ids: BTreeMap::new(),
@@ -49458,7 +49458,7 @@ mod tests {
             subscribe_args: vec![
                 hyperliquid_wss_bbo_subscribe_payload(symbol).expect("subscribe payload")
             ],
-            all_symbols_scope,
+            ignore_untracked_wss_symbols: all_symbols_scope,
             coordinators,
             local_sequences,
             last_exchange_update_ids: BTreeMap::new(),
@@ -50162,6 +50162,11 @@ mod tests {
                 .expect("single stream"),
             "wss://fstream.asterdex.com/ws/btcusdt@bookTicker"
         );
+        assert_eq!(
+            aster_wss_book_ticker_stream_url(AsterPublicWssMarket::UsdtFutures, "BTCUSDT,ETHUSDT")
+                .expect("scoped multi stream"),
+            "wss://fstream.asterdex.com/ws/!bookTicker"
+        );
 
         let hyperliquid_args = vec![
             "--bind".to_owned(),
@@ -50254,6 +50259,35 @@ mod tests {
         assert_eq!(
             aster_state.last_exchange_update_ids.get("BTCUSDT"),
             Some(&400900301)
+        );
+
+        let mut aster_scoped_state = aster_wss_test_market_state("BTCUSDT", false);
+        aster_scoped_state.ignore_untracked_wss_symbols = true;
+        let aster_extra_raw = r#"{"u":400900302,"s":"ETHUSDT","b":"2500.10","B":"1.00000000","a":"2501.20","A":"1.50000000","T":1778630400000}"#;
+        assert!(apply_aster_wss_book_ticker_text(
+            aster_extra_raw,
+            ingested_at,
+            AsterPublicWssMarket::UsdtFutures,
+            &mut aster_scoped_state,
+        )
+        .expect("extra Aster all-stream symbol")
+        .is_none());
+        let aster_scoped_raw = r#"{"u":400900303,"s":"BTCUSDT","b":"43255.10","B":"2.00000000","a":"43256.20","A":"2.50000000","T":1778630400000}"#;
+        let aster_scoped_update = apply_aster_wss_book_ticker_text(
+            aster_scoped_raw,
+            ingested_at,
+            AsterPublicWssMarket::UsdtFutures,
+            &mut aster_scoped_state,
+        )
+        .expect("scoped Aster target update")
+        .expect("scoped Aster quote");
+        assert_eq!(
+            aster_scoped_update
+                .quote
+                .expect("scoped quote")
+                .source_event_id
+                .as_deref(),
+            Some("aster:wss-book-ticker:usdt-futures:BTCUSDT:400900303")
         );
 
         let mut hyperliquid_state = hyperliquid_wss_test_market_state("BTC", false);
@@ -50703,6 +50737,76 @@ mod tests {
             Some("bybit:wss-book-ticker:spot:BTCUSDT:400900301")
         );
         assert_eq!(quote.freshness.observed_at, ingested_at);
+    }
+
+    #[test]
+    fn bybit_wss_ticker_message_updates_quote() {
+        let mut state = bybit_wss_test_market_state("BTCUSDT", false);
+        let raw = r#"{"topic":"tickers.BTCUSDT","type":"snapshot","cs":9001,"ts":1778630401123,"data":{"symbol":"BTCUSDT","bid1Price":"43250.10","bid1Size":"1.00000000","ask1Price":"43251.20","ask1Size":"1.50000000"}}"#;
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+
+        let update =
+            apply_bybit_wss_book_ticker_text(raw, ingested_at, BybitPublicMarket::Spot, &mut state)
+                .expect("bybit wss ticker update")
+                .expect("quote update");
+
+        let quote = update.quote.expect("quote");
+        assert_eq!(quote.best_bid.expect("bid").to_string(), "43250.10");
+        assert_eq!(quote.ask_size.expect("ask size").to_string(), "1.50000000");
+        assert_eq!(quote.source_sequence.as_deref(), Some("2"));
+        assert_eq!(
+            quote.source_event_id.as_deref(),
+            Some("bybit:wss-book-ticker:spot:BTCUSDT:9001")
+        );
+        assert_eq!(quote.freshness.observed_at, ingested_at);
+    }
+
+    #[test]
+    fn bybit_wss_rejected_subscribe_ack_errors() {
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        let rejected_ack =
+            r#"{"op":"subscribe","success":false,"ret_msg":"too many subscribe topics"}"#;
+
+        let error = match parse_bybit_wss_book_ticker_runtime_raw(rejected_ack, ingested_at) {
+            Ok(_) => panic!("rejected subscribe ack should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("Bybit public WSS subscribe failed: too many subscribe topics"));
+    }
+
+    #[test]
+    fn bybit_linear_large_scope_uses_ticker_topics() {
+        assert_eq!(
+            bybit_wss_top_of_book_topic("BTCUSDT", false),
+            "orderbook.1.BTCUSDT"
+        );
+        assert_eq!(
+            bybit_wss_top_of_book_topic("BTCUSDT", true),
+            "tickers.BTCUSDT"
+        );
+        assert!(!bybit_wss_should_use_ticker_topics(
+            BybitPublicMarket::LinearPerpetual,
+            BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT,
+            false
+        ));
+        assert!(bybit_wss_should_use_ticker_topics(
+            BybitPublicMarket::LinearPerpetual,
+            BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT + 1,
+            false
+        ));
+        assert!(bybit_wss_should_use_ticker_topics(
+            BybitPublicMarket::LinearPerpetual,
+            1,
+            true
+        ));
+        assert!(!bybit_wss_should_use_ticker_topics(
+            BybitPublicMarket::Spot,
+            BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT + 1,
+            true
+        ));
     }
 
     #[test]
