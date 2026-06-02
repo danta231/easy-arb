@@ -1876,12 +1876,25 @@ pub(crate) fn prepare_bybit_wss_book_ticker_rest_rows(
     let all_symbols_scope = all_symbols_scope || is_bybit_wss_all_symbols_scope(&normalized_scope);
     let target_symbols =
         explicit_wss_symbol_scope_set(&normalized_scope, is_bybit_wss_all_symbols_scope);
+    let broad_explicit_scope = target_symbols
+        .as_ref()
+        .is_some_and(|symbols| symbols.len() > BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT);
     let mut prepared = Vec::with_capacity(rows.len());
     for mut row in rows {
         match validate_bybit_public_wss_symbol(&row.symbol) {
             Ok(symbol)
                 if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
             {
+                if !bybit_wss_rest_row_has_usable_top_of_book(&row) {
+                    if all_symbols_scope || broad_explicit_scope {
+                        continue;
+                    }
+                    return Err(RuntimeError::LiveMarketData {
+                        message: format!(
+                            "Bybit WSS orderbook REST bootstrap row for `{symbol}` has empty top-of-book field"
+                        ),
+                    });
+                }
                 row.symbol = symbol;
                 prepared.push(row);
             }
@@ -1891,12 +1904,25 @@ pub(crate) fn prepare_bybit_wss_book_ticker_rest_rows(
     }
     prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
     prepared.dedup_by(|left, right| left.symbol == right.symbol);
-    ensure_wss_requested_symbols_present(
-        "Bybit WSS orderbook REST bootstrap",
-        target_symbols.as_ref(),
-        prepared.iter().map(|row| row.symbol.clone()).collect(),
-    )?;
+    if !broad_explicit_scope {
+        ensure_wss_requested_symbols_present(
+            "Bybit WSS orderbook REST bootstrap",
+            target_symbols.as_ref(),
+            prepared.iter().map(|row| row.symbol.clone()).collect(),
+        )?;
+    }
     Ok(prepared)
+}
+
+pub(crate) fn bybit_wss_rest_row_has_usable_top_of_book(row: &MonitorBookTickerRow) -> bool {
+    [
+        row.bid_price.as_str(),
+        row.bid_qty.as_str(),
+        row.ask_price.as_str(),
+        row.ask_qty.as_str(),
+    ]
+    .into_iter()
+    .all(|value| !value.trim().is_empty())
 }
 
 pub(crate) fn bootstrap_okx_wss_book_ticker(

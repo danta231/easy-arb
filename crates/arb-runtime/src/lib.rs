@@ -49829,6 +49829,60 @@ mod tests {
     }
 
     #[test]
+    fn bybit_wss_broad_rest_bootstrap_skips_empty_top_of_book_rows() {
+        let symbols = (0..=BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT)
+            .map(|index| format!("T{index:03}USDT"))
+            .collect::<Vec<_>>();
+        let empty_symbol = symbols[7].clone();
+        let rows = symbols
+            .iter()
+            .map(|symbol| {
+                if symbol == &empty_symbol {
+                    MonitorBookTickerRow {
+                        symbol: symbol.clone(),
+                        bid_price: String::new(),
+                        bid_qty: "1".to_owned(),
+                        ask_price: "101".to_owned(),
+                        ask_qty: "1".to_owned(),
+                        bid_depth: Vec::new(),
+                        ask_depth: Vec::new(),
+                    }
+                } else {
+                    monitor_book_ticker_row(symbol)
+                }
+            })
+            .collect::<Vec<_>>();
+        let scope = symbols.join(",");
+
+        let prepared =
+            prepare_bybit_wss_book_ticker_rest_rows(rows, &scope, false).expect("prepared rows");
+
+        assert_eq!(prepared.len(), symbols.len() - 1);
+        assert!(!prepared.iter().any(|row| row.symbol == empty_symbol));
+        assert!(prepared.iter().any(|row| row.symbol == symbols[0]));
+    }
+
+    #[test]
+    fn bybit_wss_single_rest_bootstrap_rejects_empty_top_of_book_row() {
+        let rows = vec![MonitorBookTickerRow {
+            symbol: "BTCUSDT".to_owned(),
+            bid_price: String::new(),
+            bid_qty: "1".to_owned(),
+            ask_price: "101".to_owned(),
+            ask_qty: "1".to_owned(),
+            bid_depth: Vec::new(),
+            ask_depth: Vec::new(),
+        }];
+
+        let error = prepare_bybit_wss_book_ticker_rest_rows(rows, "BTCUSDT", false)
+            .expect_err("empty single symbol top-of-book should fail");
+
+        assert!(error.to_string().contains(
+            "Bybit WSS orderbook REST bootstrap row for `BTCUSDT` has empty top-of-book field"
+        ));
+    }
+
+    #[test]
     fn okx_and_bitget_wss_args_parse_market_and_messages() {
         let okx_args = vec![
             "--bind".to_owned(),
