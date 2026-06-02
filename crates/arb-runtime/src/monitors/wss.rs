@@ -35,12 +35,12 @@ use crate::{
     static_dashboard_gone_json, write_http_json, MonitorBookTickerRow, MonitorJsonScalar,
     OkxTickerRow, RuntimeError, RuntimeResult, BASIS_SYMBOL, BITGET_BASIS_SYMBOL,
     BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID, HYPERLIQUID_INFO_URL,
-    MARKET_DATA_MAX_AGE_MS, MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR,
-    MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
+    MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR, MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
 };
 
 pub(crate) const HYPERLIQUID_PUBLIC_WSS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub(crate) const ASTER_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.asterdex.com";
+pub(crate) const PUBLIC_WSS_MONITOR_MAX_AGE_MS: u64 = 20_000;
 pub(crate) const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
 pub(crate) const PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL: u32 = 500;
 pub(crate) const BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8801";
@@ -407,7 +407,7 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_client(
         instrument.clone(),
         market,
         started_at,
-        MARKET_DATA_MAX_AGE_MS,
+        PUBLIC_WSS_MONITOR_MAX_AGE_MS,
     )?;
     let rest_batch = rest_adapter.ingest_book_ticker_json(
         &raw_rest_snapshot,
@@ -419,7 +419,7 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_client(
         venue_id.clone(),
         instrument.clone(),
         market,
-        MARKET_DATA_MAX_AGE_MS,
+        PUBLIC_WSS_MONITOR_MAX_AGE_MS,
     )?;
     let mut client = BinancePublicWssBookTickerClient::new(config, started_at)?;
     let rest_update = client.apply_rest_snapshot(rest_batch.quote)?;
@@ -641,7 +641,7 @@ pub(crate) fn run_binance_wss_book_ticker_monitor_cycle(
                 .write()
                 .expect("Public WSS monitor state lock poisoned")
                 .record_wss_read_error(error.to_string(), observed_wss_event);
-            Err(error.into())
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
         }
     }
 }
@@ -903,7 +903,7 @@ pub(crate) fn run_bybit_wss_book_ticker_monitor_cycle(
                 .write()
                 .expect("Bybit WSS monitor state lock poisoned")
                 .record_wss_read_error(error.to_string(), observed_wss_event);
-            Err(error.into())
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
         }
     }
 }
@@ -1083,7 +1083,7 @@ pub(crate) fn run_okx_wss_book_ticker_monitor_cycle(
                 .write()
                 .expect("OKX WSS monitor state lock poisoned")
                 .record_wss_read_error(error.to_string(), observed_wss_event);
-            Err(error.into())
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
         }
     }
 }
@@ -1265,7 +1265,7 @@ pub(crate) fn run_bitget_wss_book_ticker_monitor_cycle(
                 .write()
                 .expect("Bitget WSS monitor state lock poisoned")
                 .record_wss_read_error(error.to_string(), observed_wss_event);
-            Err(error.into())
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
         }
     }
 }
@@ -1445,7 +1445,7 @@ pub(crate) fn run_aster_wss_book_ticker_monitor_cycle(
                 .write()
                 .expect("Aster WSS monitor state lock poisoned")
                 .record_wss_read_error(error.to_string(), observed_wss_event);
-            Err(error.into())
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
         }
     }
 }
@@ -1629,7 +1629,7 @@ pub(crate) fn run_hyperliquid_wss_book_ticker_monitor_cycle(
                 .write()
                 .expect("Hyperliquid WSS monitor state lock poisoned")
                 .record_wss_read_error(error.to_string(), observed_wss_event);
-            Err(error.into())
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
         }
     }
 }
@@ -1733,7 +1733,7 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_all_market(
             venue_id.clone(),
             instrument.instrument_id.clone(),
             started_at,
-            MARKET_DATA_MAX_AGE_MS,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
         )?;
         let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
         local_sequences.insert(symbol.clone(), sequence);
@@ -1849,7 +1849,7 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
             venue_id.clone(),
             instrument.instrument_id.clone(),
             started_at,
-            MARKET_DATA_MAX_AGE_MS,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
         )?;
         let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
         local_sequences.insert(symbol.clone(), sequence);
@@ -1964,7 +1964,7 @@ pub(crate) fn bootstrap_okx_wss_book_ticker(
             venue_id.clone(),
             instrument_id,
             observed_at,
-            MARKET_DATA_MAX_AGE_MS,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
         )?;
         let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
         local_sequences.insert(symbol.clone(), 1_u64);
@@ -2042,7 +2042,7 @@ pub(crate) fn bootstrap_bitget_wss_book_ticker(
             venue_id.clone(),
             instrument_id,
             observed_at,
-            MARKET_DATA_MAX_AGE_MS,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
         )?;
         let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
         local_sequences.insert(symbol.clone(), 1_u64);
@@ -2238,7 +2238,7 @@ pub(crate) fn bootstrap_aster_wss_book_ticker(
             venue_id.clone(),
             instrument_id,
             observed_at,
-            MARKET_DATA_MAX_AGE_MS,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
         )?;
         let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
         local_sequences.insert(symbol.clone(), 1_u64);
@@ -2297,7 +2297,8 @@ pub(crate) fn bootstrap_hyperliquid_wss_book_ticker(
     let mut subscribe_args = Vec::with_capacity(rows.len());
     for row in rows {
         let instrument_id = hyperliquid_public_wss_instrument_id(&row.coin, market)?;
-        let freshness = DataFreshness::new(observed_at, observed_at, MARKET_DATA_MAX_AGE_MS)?;
+        let freshness =
+            DataFreshness::new(observed_at, observed_at, PUBLIC_WSS_MONITOR_MAX_AGE_MS)?;
         let quote = MarketQuote {
             venue_id: venue_id.clone(),
             instrument_id: instrument_id.clone(),
@@ -2319,7 +2320,7 @@ pub(crate) fn bootstrap_hyperliquid_wss_book_ticker(
             venue_id.clone(),
             instrument_id,
             observed_at,
-            MARKET_DATA_MAX_AGE_MS,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
         )?;
         let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
         local_sequences.insert(row.coin.clone(), 1_u64);
@@ -2379,7 +2380,7 @@ pub(crate) fn binance_wss_rest_quote_from_row(
     instrument: &BinancePublicInstrument,
     observed_at: UtcTimestamp,
 ) -> RuntimeResult<MarketQuote> {
-    let freshness = DataFreshness::new(observed_at, observed_at, MARKET_DATA_MAX_AGE_MS)?;
+    let freshness = DataFreshness::new(observed_at, observed_at, PUBLIC_WSS_MONITOR_MAX_AGE_MS)?;
     Ok(MarketQuote {
         venue_id: venue_id.clone(),
         instrument_id: instrument.instrument_id.clone(),
@@ -2403,7 +2404,7 @@ pub(crate) fn bybit_wss_rest_quote_from_row(
     market: BybitPublicMarket,
     observed_at: UtcTimestamp,
 ) -> RuntimeResult<MarketQuote> {
-    let freshness = DataFreshness::new(observed_at, observed_at, MARKET_DATA_MAX_AGE_MS)?;
+    let freshness = DataFreshness::new(observed_at, observed_at, PUBLIC_WSS_MONITOR_MAX_AGE_MS)?;
     Ok(MarketQuote {
         venue_id: venue_id.clone(),
         instrument_id: instrument.instrument_id.clone(),
@@ -2484,7 +2485,11 @@ pub(crate) fn public_wss_top_of_book_quote(
     raw: PublicTopOfBookRuntimeRaw,
     source_event_id: String,
 ) -> RuntimeResult<MarketQuote> {
-    let freshness = DataFreshness::new(raw.observed_at, raw.observed_at, MARKET_DATA_MAX_AGE_MS)?;
+    let freshness = DataFreshness::new(
+        raw.observed_at,
+        raw.observed_at,
+        PUBLIC_WSS_MONITOR_MAX_AGE_MS,
+    )?;
     Ok(MarketQuote {
         venue_id,
         instrument_id,
@@ -3632,6 +3637,20 @@ pub(crate) fn public_wss_reconnect_backoff(base_secs: u64, consecutive_failures:
     public_wss_reconnect_backoff_with_jitter_seed(base_secs, consecutive_failures, jitter_seed)
 }
 
+fn public_wss_monitor_cycle_result_after_read_error<E>(
+    error: E,
+    observed_wss_event: bool,
+) -> RuntimeResult<()>
+where
+    E: Into<RuntimeError>,
+{
+    if observed_wss_event {
+        Ok(())
+    } else {
+        Err(error.into())
+    }
+}
+
 fn public_wss_reconnect_backoff_with_jitter_seed(
     base_secs: u64,
     consecutive_failures: u32,
@@ -4647,7 +4666,7 @@ fn public_wss_timestamp_string_is_current(value: &str, now: UtcTimestamp) -> boo
     if timestamp_ms > now_ms + 1_000 {
         return false;
     }
-    now_ms.saturating_sub(timestamp_ms) <= i128::from(MARKET_DATA_MAX_AGE_MS)
+    now_ms.saturating_sub(timestamp_ms) <= i128::from(PUBLIC_WSS_MONITOR_MAX_AGE_MS)
 }
 
 fn public_wss_update_is_row_level_stale(update: &HybridMarketDataUpdate) -> bool {
@@ -5293,6 +5312,24 @@ mod tests {
     }
 
     #[test]
+    fn public_wss_read_error_after_observed_event_resets_cycle() {
+        assert!(public_wss_monitor_cycle_result_after_read_error(
+            RuntimeError::LiveMarketData {
+                message: "connection reset".to_owned()
+            },
+            true,
+        )
+        .is_ok());
+        assert!(public_wss_monitor_cycle_result_after_read_error(
+            RuntimeError::LiveMarketData {
+                message: "connect failed".to_owned()
+            },
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn public_wss_failure_logging_suppresses_repeated_network_noise() {
         assert!(public_wss_should_log_failure(true, 1));
         assert!(public_wss_should_log_failure(false, 1));
@@ -5301,6 +5338,42 @@ mod tests {
             false,
             PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL
         ));
+    }
+
+    #[test]
+    fn public_wss_monitor_allows_exchange_cadence_jitter() {
+        let now = UtcTimestamp::from_str("2026-05-13T00:00:20Z").expect("now");
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BitgetPublicWssMarket::UsdtFutures.as_str(),
+            BITGET_PUBLIC_WSS_URL,
+        );
+        let quote = PublicTopOfBookQuoteSnapshot {
+            symbol: "BTCUSDT".to_owned(),
+            venue_id: "venue:BITGET-USDT-FUTURES".to_owned(),
+            instrument_id: "inst:BITGET:BTCUSDT:USDT-FUTURES".to_owned(),
+            best_bid: Some("100.01".to_owned()),
+            best_ask: Some("100.02".to_owned()),
+            bid_size: Some("1.2".to_owned()),
+            ask_size: Some("1.3".to_owned()),
+            source_sequence: Some("42".to_owned()),
+            source_event_id: Some(
+                "event:venue-data:bitget-public:wss-book-ticker:usdt-futures:BTCUSDT:42".to_owned(),
+            ),
+            observed_at: "2026-05-13T00:00:01Z".to_owned(),
+            ingested_at: "2026-05-13T00:00:01Z".to_owned(),
+            freshness_status: "Fresh".to_owned(),
+        };
+        snapshot.status = "streaming".to_owned();
+        snapshot.updated_at = quote.ingested_at.clone();
+        snapshot.wss_update_count = 1;
+        snapshot.latest_quote = Some(quote.clone());
+        snapshot.upsert_quote_row(quote);
+
+        assert_eq!(snapshot.availability_status(Some(now)), "streaming");
+
+        let stale_now = UtcTimestamp::from_str("2026-05-13T00:00:22Z").expect("stale now");
+        assert_eq!(snapshot.availability_status(Some(stale_now)), "stale");
     }
 
     #[test]
