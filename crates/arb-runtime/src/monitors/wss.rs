@@ -70,6 +70,11 @@ pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT"
 pub(crate) const BYBIT_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 pub(crate) const BYBIT_LINEAR_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 pub(crate) const BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT: usize = 100;
+pub(crate) const BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT: usize = 100;
+pub(crate) const BYBIT_LINEAR_WSS_PRIORITY_SYMBOLS: &[&str] = &[
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "SUIUSDT",
+    "TRXUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT",
+];
 
 /// Binance `bookTicker` WSS 公开行情常驻任务选项。
 ///
@@ -1832,9 +1837,7 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
     let mut coordinators = BTreeMap::new();
     let mut local_sequences = BTreeMap::new();
     let mut rest_updates = Vec::with_capacity(rows.len());
-    let mut subscribe_args = Vec::with_capacity(rows.len());
-    let use_ticker_topics =
-        bybit_wss_should_use_ticker_topics(market, rows.len(), all_symbols_scope);
+    let subscribe_args = bybit_wss_subscribe_topics_for_rows(&rows, market, all_symbols_scope);
     for row in rows {
         let symbol = row.symbol.clone();
         let instrument = bybit_public_wss_instrument(&symbol, market)?;
@@ -1852,7 +1855,6 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
         local_sequences.insert(symbol.clone(), sequence);
         coordinators.insert(symbol.clone(), coordinator);
         rest_updates.push(update);
-        subscribe_args.push(bybit_wss_top_of_book_topic(&symbol, use_ticker_topics));
     }
 
     Ok(PublicTopOfBookAllMarketState {
@@ -4486,6 +4488,50 @@ pub(crate) fn bybit_wss_should_use_ticker_topics(
         && (all_symbols_scope || symbol_count > BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT)
 }
 
+pub(crate) fn bybit_wss_subscribe_topic_limit(
+    market: BybitPublicMarket,
+    symbol_count: usize,
+    all_symbols_scope: bool,
+) -> Option<usize> {
+    if market == BybitPublicMarket::LinearPerpetual
+        && (all_symbols_scope || symbol_count > BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT)
+    {
+        Some(BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn bybit_wss_subscribe_topics_for_rows(
+    rows: &[MonitorBookTickerRow],
+    market: BybitPublicMarket,
+    all_symbols_scope: bool,
+) -> Vec<String> {
+    let use_ticker_topics =
+        bybit_wss_should_use_ticker_topics(market, rows.len(), all_symbols_scope);
+    let topic_limit = bybit_wss_subscribe_topic_limit(market, rows.len(), all_symbols_scope);
+    let mut rows = rows.iter().collect::<Vec<_>>();
+    if market == BybitPublicMarket::LinearPerpetual && topic_limit.is_some() {
+        rows.sort_by(|left, right| {
+            let left_rank = bybit_linear_wss_priority_rank(&left.symbol).unwrap_or(usize::MAX);
+            let right_rank = bybit_linear_wss_priority_rank(&right.symbol).unwrap_or(usize::MAX);
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| left.symbol.cmp(&right.symbol))
+        });
+    }
+    rows.into_iter()
+        .take(topic_limit.unwrap_or(usize::MAX))
+        .map(|row| bybit_wss_top_of_book_topic(&row.symbol, use_ticker_topics))
+        .collect()
+}
+
+fn bybit_linear_wss_priority_rank(symbol: &str) -> Option<usize> {
+    BYBIT_LINEAR_WSS_PRIORITY_SYMBOLS
+        .iter()
+        .position(|priority| *priority == symbol)
+}
+
 pub(crate) fn bybit_wss_book_ticker_public_stream_url(market: BybitPublicMarket) -> String {
     match market {
         BybitPublicMarket::Spot => BYBIT_SPOT_PUBLIC_WSS_BASE_URL,
@@ -4568,11 +4614,16 @@ fn public_wss_quote_is_current_usable(
     now: UtcTimestamp,
 ) -> bool {
     quote.freshness_status == "Fresh"
-        && quote
-            .source_event_id
-            .as_deref()
-            .is_some_and(|source| source.contains(":wss-book-ticker:"))
+        && public_wss_source_event_id_is_book_ticker(quote.source_event_id.as_deref())
         && public_wss_quote_timestamps_are_current(quote, now)
+}
+
+fn public_wss_source_event_id_is_book_ticker(source_event_id: Option<&str>) -> bool {
+    source_event_id.is_some_and(|source| source.contains(":wss-book-ticker:"))
+}
+
+fn market_quote_is_public_wss_book_ticker(quote: &MarketQuote) -> bool {
+    public_wss_source_event_id_is_book_ticker(quote.source_event_id.as_deref())
 }
 
 fn public_wss_quote_timestamps_are_current(
@@ -4690,7 +4741,12 @@ impl PublicTopOfBookMonitorSnapshot {
         if update.status == HybridMarketDataStatus::Reconnecting {
             self.disconnect_count += 1;
         }
-        if update.transport == MarketDataTransport::WebSocketStream && update.quote.is_some() {
+        let has_wss_book_ticker_quote = update.transport == MarketDataTransport::WebSocketStream
+            && update
+                .quote
+                .as_ref()
+                .is_some_and(market_quote_is_public_wss_book_ticker);
+        if has_wss_book_ticker_quote {
             self.wss_update_count += 1;
         }
         if let Some(quote) = &update.quote {
@@ -4698,7 +4754,7 @@ impl PublicTopOfBookMonitorSnapshot {
                 .map(|symbol| PublicTopOfBookQuoteSnapshot::from_quote_with_symbol(quote, symbol))
                 .unwrap_or_else(|| PublicTopOfBookQuoteSnapshot::from_quote(quote));
             self.upsert_quote_row(quote_snapshot.clone());
-            if update.transport == MarketDataTransport::WebSocketStream {
+            if has_wss_book_ticker_quote {
                 self.latest_quote = Some(quote_snapshot);
             }
         } else if update.status == HybridMarketDataStatus::Streaming {

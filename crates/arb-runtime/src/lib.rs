@@ -50864,6 +50864,31 @@ mod tests {
     }
 
     #[test]
+    fn bybit_linear_large_scope_caps_ticker_topics_with_priority_symbols() {
+        let mut rows = (0..=BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT + 20)
+            .map(|index| monitor_book_ticker_row(&format!("SYM{index:03}USDT")))
+            .collect::<Vec<_>>();
+        rows.push(monitor_book_ticker_row("ETHUSDT"));
+        rows.push(monitor_book_ticker_row("BTCUSDT"));
+
+        let topics =
+            bybit_wss_subscribe_topics_for_rows(&rows, BybitPublicMarket::LinearPerpetual, false);
+
+        assert_eq!(topics.len(), BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT);
+        assert_eq!(topics[0], "tickers.BTCUSDT");
+        assert_eq!(topics[1], "tickers.ETHUSDT");
+        assert!(topics.iter().all(|topic| topic.starts_with("tickers.")));
+        assert_eq!(
+            bybit_wss_subscribe_topic_limit(BybitPublicMarket::LinearPerpetual, rows.len(), false),
+            Some(BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT)
+        );
+        assert_eq!(
+            bybit_wss_subscribe_topic_limit(BybitPublicMarket::Spot, rows.len(), true),
+            None
+        );
+    }
+
+    #[test]
     fn bybit_wss_empty_top_of_book_payloads_are_ignored() {
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
         let empty_ticker_raw = r#"{"topic":"tickers.PRLUSDT","type":"delta","ts":1778630401000,"data":{"symbol":"PRLUSDT","bid1Price":"","bid1Size":"","ask1Price":"","ask1Size":"","seq":9002}}"#;
@@ -51047,6 +51072,61 @@ mod tests {
     }
 
     #[test]
+    fn public_wss_connected_rest_quote_does_not_count_as_wss_update() {
+        let observed_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("observed at");
+        let venue_id = VenueId::new(BYBIT_BASIS_PERP_VENUE_ID).expect("venue id");
+        let instrument_id =
+            InstrumentId::new(BYBIT_BASIS_PERP_INSTRUMENT_ID).expect("instrument id");
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id.clone(),
+            observed_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )
+        .expect("coordinator");
+        let rest_quote = MarketQuote {
+            venue_id,
+            instrument_id,
+            last_price: None,
+            best_bid: Some(Price::from_str("100.00").expect("rest bid")),
+            best_ask: Some(Price::from_str("100.10").expect("rest ask")),
+            mark_price: None,
+            index_price: None,
+            bid_size: Some(Quantity::from_str("1.0").expect("rest bid size")),
+            ask_size: Some(Quantity::from_str("1.0").expect("rest ask size")),
+            source_sequence: Some("1".to_owned()),
+            source_event_id: Some("bybit:rest-tickers:linear-perp:BTCUSDT".to_owned()),
+            freshness: DataFreshness::new(observed_at, observed_at, MARKET_DATA_MAX_AGE_MS)
+                .expect("rest freshness"),
+        };
+        let rest_update = coordinator
+            .apply(HybridMarketDataInput::RestSnapshot { quote: rest_quote })
+            .expect("rest snapshot");
+        let connected_update = coordinator
+            .apply(HybridMarketDataInput::WssConnected {
+                occurred_at: observed_at,
+                ingested_at: observed_at,
+            })
+            .expect("wss connected");
+
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BybitPublicMarket::LinearPerpetual.as_str(),
+            BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+        );
+        snapshot.record_update(&rest_update);
+        snapshot.record_update(&connected_update);
+
+        assert_eq!(snapshot.wss_update_count, 0);
+        assert!(snapshot.latest_quote.is_none());
+        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(
+            snapshot.rows[0].source_event_id.as_deref(),
+            Some("bybit:rest-tickers:linear-perp:BTCUSDT")
+        );
+    }
+
+    #[test]
     fn public_wss_monitor_row_stale_keeps_global_streaming_status() {
         let observed_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("observed at");
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:06Z").expect("ingested at");
@@ -51091,7 +51171,7 @@ mod tests {
                     bid_size: Some(Quantity::from_str("1.1").expect("bid size")),
                     ask_size: Some(Quantity::from_str("1.2").expect("ask size")),
                     source_sequence: 1,
-                    source_event_id: Some("test:wss:stale".to_owned()),
+                    source_event_id: Some("test:wss-book-ticker:stale".to_owned()),
                     observed_at,
                     ingested_at,
                 },
