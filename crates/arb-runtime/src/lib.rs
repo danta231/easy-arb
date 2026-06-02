@@ -29737,6 +29737,7 @@ struct FundingArbUnknownPositionRecovery {
     pair_id: String,
     symbol: String,
     cycle_dir: PathBuf,
+    position_state_path: Option<PathBuf>,
     notional_usdt: String,
     opened_at: Option<String>,
     closed_at: Option<String>,
@@ -34692,6 +34693,13 @@ fn funding_arb_flat_cancelled_orphan_recovery_record_from_fields(
         pair_id,
         symbol,
         cycle_dir: PathBuf::from(cycle_dir),
+        position_state_path: optional_json_value_string(
+            fields,
+            "position_state_path",
+            "funding arb flat-cancelled orphan recovery",
+        )?
+        .filter(|value| value != "null" && !value.trim().is_empty())
+        .map(PathBuf::from),
         notional_usdt,
         opened_at: optional_json_value_string(
             fields,
@@ -34831,6 +34839,14 @@ fn funding_arb_unknown_recovery_record_with_fallback(
         )?
         .or_else(|| fallback.map(|known| known.notional_usdt.clone()))
         .unwrap_or_else(|| "unknown".to_owned()),
+        position_state_path: optional_json_value_string(
+            fields,
+            "position_state_path",
+            "funding arb unknown recovery",
+        )?
+        .filter(|value| value != "null" && !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| fallback.and_then(|known| known.position_state_path.clone())),
         opened_at: optional_json_value_string(fields, "opened_at", "funding arb unknown recovery")?
             .or_else(|| fallback.and_then(|known| known.opened_at.clone())),
         closed_at: optional_json_value_string(fields, "closed_at", "funding arb unknown recovery")?
@@ -34898,6 +34914,9 @@ fn build_funding_arb_unknown_recovery_position_state_template(
                 unknown.pair_id
             ),
         })?;
+    if let Some(state) = funding_arb_unknown_recovery_existing_position_state(unknown)? {
+        return Ok((snapshot_path, row, state));
+    }
     let spec = funding_arb_pipeline_spec_from_monitor_row(
         &row,
         &funding_arb_resident_dry_run_options(
@@ -34948,6 +34967,20 @@ fn build_funding_arb_unknown_recovery_position_state_template(
         )?,
     };
     Ok((snapshot_path, row, state))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_unknown_recovery_existing_position_state(
+    unknown: &FundingArbUnknownPositionRecovery,
+) -> RuntimeResult<Option<FundingArbPositionState>> {
+    let Some(path) = unknown.position_state_path.as_ref() else {
+        return Ok(None);
+    };
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Ok(None);
+    }
+    let state = parse_funding_arb_position_state_json(&read_utf8(path)?)?;
+    Ok(Some(state))
 }
 
 #[cfg(feature = "live-exec")]
@@ -56997,6 +57030,65 @@ mod tests {
         let after_second_recovery =
             read_utf8(&root.path().join("funding_arb_resident_positions.jsonl")).expect("history");
         assert_eq!(after_second_recovery, before_second_recovery);
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_unknown_position_recovery_reuses_existing_position_state_path() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let previous_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(11).expect("cycle dir"));
+        fs::create_dir_all(&previous_cycle).expect("create previous cycle");
+        let mut row = funding_arb_test_row("0.00600000", "0.00010000");
+        row.pair_id = "binance:bybit:EWTUSDT:EWTUSDT".to_owned();
+        row.symbol = "EWTUSDT".to_owned();
+        row.long_venue_family = None;
+        row.short_venue_family = None;
+        let snapshot =
+            funding_arb_test_snapshot(vec![row.clone()], "2026-06-02T03:30:00Z".to_owned());
+        write_utf8(
+            previous_cycle.join("funding_arb_monitor_snapshot.json"),
+            &snapshot.to_json(),
+        )
+        .expect("write previous snapshot");
+        let state = funding_arb_test_position_state(&row, 1_780_383_600_000);
+        let position_state_path =
+            write_funding_arb_position_state(&previous_cycle.join("existing-state"), &state)
+                .expect("write existing position state");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":11,\"cycle_dir\":{},\"event_type\":\"position_opened\",\"notional_usdt\":\"50.00\",\"pair_id\":\"binance:bybit:EWTUSDT:EWTUSDT\",\"position_id\":\"pos:funding-arb:ewt:11\",\"position_state_path\":{},\"status\":\"open\",\"symbol\":\"EWTUSDT\"}}\n\
+                 {{\"cycle\":12,\"cycle_dir\":{},\"event_type\":\"position_unknown\",\"notional_usdt\":\"50.00\",\"pair_id\":\"binance:bybit:EWTUSDT:EWTUSDT\",\"position_id\":\"pos:funding-arb:ewt:11\",\"position_state_path\":{},\"reason\":\"post-dispatch private snapshot was not flat\",\"residual_risk\":\"resident exit will retry before marking closed\",\"status\":\"unknown\",\"symbol\":\"EWTUSDT\"}}\n",
+                json_string(&previous_cycle.display().to_string()),
+                json_string(&position_state_path.display().to_string()),
+                json_string(&previous_cycle.display().to_string()),
+                json_string(&position_state_path.display().to_string()),
+            ),
+        )
+        .expect("write unknown registry");
+        let mut pending =
+            load_funding_arb_unknown_position_recovery_records(root.path()).expect("pending");
+        assert_eq!(pending.len(), 1);
+        let unknown = pending.remove(0);
+        assert_eq!(
+            unknown.position_state_path.as_ref(),
+            Some(&position_state_path)
+        );
+
+        let (_snapshot_path, _recovery_row, recovery_state) =
+            build_funding_arb_unknown_recovery_position_state_template(
+                &funding_arb_test_resident_options(),
+                &unknown,
+            )
+            .expect("recovery state template from existing position state");
+
+        assert_eq!(recovery_state.pair_id, "binance:bybit:EWTUSDT:EWTUSDT");
+        assert_eq!(recovery_state.symbol, "EWTUSDT");
+        assert_eq!(recovery_state.leg_a.venue_family, "binance");
+        assert_eq!(recovery_state.leg_b.venue_family, "bybit");
     }
 
     #[test]
