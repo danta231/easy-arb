@@ -31487,6 +31487,34 @@ fn funding_arb_exchange_history_record_symbols(records: &[String]) -> RuntimeRes
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_record_has_non_null_field(
+    record: &str,
+    field: &str,
+) -> RuntimeResult<bool> {
+    let fields = parse_json_object_value_slices(record)?;
+    Ok(fields
+        .get(field)
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "null"
+        })
+        .unwrap_or(false))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_extend_funding_records(
+    records: &mut Vec<String>,
+    candidates: &[String],
+) -> RuntimeResult<()> {
+    for record in candidates {
+        if funding_arb_exchange_history_record_has_non_null_field(record, "fundingPnlUsd")? {
+            records.push(record.clone());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_fetch_binance(
     options: &FundingArbResidentLiveOptions,
     leg: &FundingArbPositionLegState,
@@ -31511,6 +31539,7 @@ fn funding_arb_exchange_history_fetch_binance(
         };
     let mut records = Vec::new();
     let mut errors = Vec::new();
+    let mut income_records = Vec::new();
     let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
     for (income_type, record_type) in [
         ("REALIZED_PNL", "realized_pnl"),
@@ -31533,7 +31562,7 @@ fn funding_arb_exchange_history_fetch_binance(
             ],
         );
         funding_arb_exchange_history_capture_payload(
-            &mut records,
+            &mut income_records,
             &mut errors,
             leg,
             &format!("binance {income_endpoint} {income_type}"),
@@ -31542,7 +31571,8 @@ fn funding_arb_exchange_history_fetch_binance(
             window,
         );
     }
-    let symbols = funding_arb_exchange_history_record_symbols(&records)?;
+    funding_arb_exchange_history_extend_funding_records(&mut records, &income_records)?;
+    let symbols = funding_arb_exchange_history_record_symbols(&income_records)?;
     for symbol in symbols {
         let payload = sign_and_fetch_binance_private_get_with_retry(
             base_url,
@@ -31701,6 +31731,7 @@ fn funding_arb_exchange_history_fetch_okx(
     let mut errors = Vec::new();
     let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
     let okx_limit = limit.min(100);
+    let mut bill_records = Vec::new();
     let bills_payload = (|| -> RuntimeResult<String> {
         let endpoint = format!(
             "/api/v5/account/bills?instType=SWAP&begin={start_ms}&end={end_ms}&limit={okx_limit}"
@@ -31721,14 +31752,15 @@ fn funding_arb_exchange_history_fetch_okx(
         fetch_signed_okx_get_with_curl(OKX_REST_BASE_URL, &signed)
     })();
     funding_arb_exchange_history_capture_payload(
-        &mut records,
+        &mut bill_records,
         &mut errors,
         leg,
         "okx /api/v5/account/bills",
-        "account_bill",
+        "funding_fee",
         bills_payload,
         window,
     );
+    funding_arb_exchange_history_extend_funding_records(&mut records, &bill_records)?;
 
     let fills_payload = (|| -> RuntimeResult<String> {
         let endpoint =
@@ -31804,9 +31836,10 @@ fn funding_arb_exchange_history_fetch_bitget(
         window,
     );
 
+    let mut bill_records = Vec::new();
     let bill_payload = (|| -> RuntimeResult<String> {
         let endpoint =
-            format!("/api/v2/mix/account/bill?productType=USDT-FUTURES&startTime={start_ms}&endTime={end_ms}&limit={bitget_limit}");
+            format!("/api/v2/mix/account/bill?productType=USDT-FUTURES&businessType=contract_settle_fee&startTime={start_ms}&endTime={end_ms}&limit={bitget_limit}");
         let signed = signer.sign_bitget_hmac(
             BitgetHmacSigningInput::new(
                 SigningRequestId::new(
@@ -31825,14 +31858,15 @@ fn funding_arb_exchange_history_fetch_bitget(
         fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)
     })();
     funding_arb_exchange_history_capture_payload(
-        &mut records,
+        &mut bill_records,
         &mut errors,
         leg,
-        "bitget /api/v2/mix/account/bill",
-        "account_bill",
+        "bitget /api/v2/mix/account/bill contract_settle_fee",
+        "funding_fee",
         bill_payload,
         window,
     );
+    funding_arb_exchange_history_extend_funding_records(&mut records, &bill_records)?;
 
     let symbols = funding_arb_exchange_history_record_symbols(&records)?;
     for symbol in symbols {
@@ -31887,6 +31921,7 @@ fn funding_arb_exchange_history_fetch_aster(
     );
     let mut records = Vec::new();
     let mut errors = Vec::new();
+    let mut income_records = Vec::new();
     let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
     for (income_type, record_type) in [
         ("REALIZED_PNL", "realized_pnl"),
@@ -31909,7 +31944,7 @@ fn funding_arb_exchange_history_fetch_aster(
             "/fapi/v3/income",
         );
         funding_arb_exchange_history_capture_payload(
-            &mut records,
+            &mut income_records,
             &mut errors,
             leg,
             &format!("aster /fapi/v3/income {income_type}"),
@@ -31918,7 +31953,8 @@ fn funding_arb_exchange_history_fetch_aster(
             window,
         );
     }
-    let symbols = funding_arb_exchange_history_record_symbols(&records)?;
+    funding_arb_exchange_history_extend_funding_records(&mut records, &income_records)?;
+    let symbols = funding_arb_exchange_history_record_symbols(&income_records)?;
     for symbol in symbols {
         let payload = fetch_signed_aster_readonly_get_with_retry(
             &signer,
@@ -56501,6 +56537,44 @@ mod tests {
         .expect("hyperliquid funding json");
         assert!(hyperliquid_funding.contains("\"symbol\":\"COAI\""));
         assert!(hyperliquid_funding.contains("\"fundingPnlUsd\":0.05"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_extend_funding_records_filters_ledger_duplicates() {
+        let leg = funding_arb_exchange_history_leg("binance").expect("history leg");
+        let realized = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income REALIZED_PNL",
+            "realized_pnl",
+            r#"{"symbol":"HUSDT","incomeType":"REALIZED_PNL","income":"1.25","time":"1779978266000"}"#,
+        )
+        .expect("realized income json");
+        let commission = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income COMMISSION",
+            "commission",
+            r#"{"symbol":"HUSDT","incomeType":"COMMISSION","income":"-0.01","time":"1779978266000"}"#,
+        )
+        .expect("commission income json");
+        let funding = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income FUNDING_FEE",
+            "funding_fee",
+            r#"{"symbol":"HUSDT","incomeType":"FUNDING_FEE","income":"0.03","time":"1779978266000"}"#,
+        )
+        .expect("funding income json");
+        let candidates = vec![realized, commission, funding];
+        let symbols =
+            funding_arb_exchange_history_record_symbols(&candidates).expect("record symbols");
+        assert_eq!(symbols, vec!["HUSDT".to_owned()]);
+
+        let mut records = Vec::new();
+        funding_arb_exchange_history_extend_funding_records(&mut records, &candidates)
+            .expect("filter funding records");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].contains("\"recordType\":\"funding_fee\""));
+        assert!(records[0].contains("\"fundingPnlUsd\":0.03"));
     }
 
     #[test]
