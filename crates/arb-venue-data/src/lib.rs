@@ -9426,16 +9426,7 @@ fn parse_decimal_string_field(
     field: &'static str,
     venue_id: &VenueId,
 ) -> VenueDataResult<String> {
-    let value = required_string(object, field, venue_id.clone(), ReadOnlySurface::MarketData)?;
-    value.parse::<Decimal>().map_err(|error| {
-        VenueDataError::External(ClassifiedExternalError::new(
-            venue_id.clone(),
-            ReadOnlySurface::MarketData,
-            ExternalErrorClass::MalformedPayload,
-            format!("field `{field}` is not a valid decimal: {error}"),
-        ))
-    })?;
-    Ok(value)
+    required_decimal_text(object, field, venue_id, ReadOnlySurface::MarketData)
 }
 
 fn zero_amount() -> Amount {
@@ -11857,6 +11848,23 @@ mod tests {
         assert_eq!(
             canonical_normalized_event_hash(&batch.normalized_event),
             batch.normalized_event.checksum.as_str()
+        );
+    }
+
+    #[test]
+    fn bybit_linear_ticker_accepts_numeric_funding_rate() {
+        let adapter = bybit_premium_index_adapter();
+        let batch = adapter
+            .ingest_premium_index_json(
+                r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","bid1Price":"43250.00","bid1Size":"2.00000000","ask1Price":"43251.00","ask1Size":"1.50000000","markPrice":"43240.12345678","indexPrice":"43190.00000000","fundingRate":0.00010000,"nextFundingTime":"1767254400000"}]},"retExtInfo":{},"time":1767225601000}"#,
+                "https://api.bybit.com/v5/market/tickers?category=linear",
+                timestamp("2026-01-01T00:00:02Z"),
+            )
+            .expect("premium index with numeric funding rate");
+
+        assert_eq!(
+            payload_string(&batch.normalized_event, "last_funding_rate"),
+            "0.00010000"
         );
     }
 

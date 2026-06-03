@@ -31395,16 +31395,27 @@ fn funding_arb_exchange_history_record_json(
         delta_fields_ref,
         &[
             "closedPnl",
+            "closed_pnl",
             "execPnl",
+            "exec_pnl",
             "fillPnl",
+            "fill_pnl",
             "realizedPnl",
+            "realized_pnl",
             "realisedPnl",
+            "realised_pnl",
             "realizedPL",
+            "realized_pl",
             "totalPL",
+            "total_pl",
             "pnl",
+            "positionPnl",
+            "position_pnl",
             "profit",
             "netProfit",
+            "net_profit",
             "closeProfit",
+            "close_profit",
         ],
     )?;
     let pnl_usd = explicit_pnl_usd.or_else(|| {
@@ -31610,12 +31621,73 @@ fn funding_arb_exchange_history_record_has_non_null_field(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_record_symbol(record: &str) -> RuntimeResult<Option<String>> {
+    let fields = parse_json_object_value_slices(record)?;
+    Ok(optional_first_json_value_string(
+        &fields,
+        &["symbol", "instrumentId"],
+        "exchange history normalized record",
+    )?
+    .map(|symbol| symbol.trim().to_owned())
+    .filter(|symbol| !symbol.is_empty()))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_symbols_with_field(
+    records: &[String],
+    field: &str,
+) -> RuntimeResult<BTreeSet<String>> {
+    let mut symbols = BTreeSet::new();
+    for record in records {
+        if !funding_arb_exchange_history_record_has_non_null_field(record, field)? {
+            continue;
+        }
+        if let Some(symbol) = funding_arb_exchange_history_record_symbol(record)? {
+            symbols.insert(symbol);
+        }
+    }
+    Ok(symbols)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_extend_records_with_field(
+    records: &mut Vec<String>,
+    candidates: &[String],
+    field: &str,
+) -> RuntimeResult<()> {
+    for record in candidates {
+        if funding_arb_exchange_history_record_has_non_null_field(record, field)? {
+            records.push(record.clone());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_extend_funding_records(
     records: &mut Vec<String>,
     candidates: &[String],
 ) -> RuntimeResult<()> {
+    funding_arb_exchange_history_extend_records_with_field(records, candidates, "fundingPnlUsd")
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+    records: &mut Vec<String>,
+    candidates: &[String],
+    existing_pnl_records: &[String],
+) -> RuntimeResult<()> {
+    let existing_pnl_symbols =
+        funding_arb_exchange_history_symbols_with_field(existing_pnl_records, "pnlUsd")?;
     for record in candidates {
-        if funding_arb_exchange_history_record_has_non_null_field(record, "fundingPnlUsd")? {
+        if !funding_arb_exchange_history_record_has_non_null_field(record, "pnlUsd")? {
+            continue;
+        }
+        let Some(symbol) = funding_arb_exchange_history_record_symbol(record)? else {
+            records.push(record.clone());
+            continue;
+        };
+        if !existing_pnl_symbols.contains(&symbol) {
             records.push(record.clone());
         }
     }
@@ -31679,7 +31751,7 @@ fn funding_arb_exchange_history_fetch_binance(
             window,
         );
     }
-    funding_arb_exchange_history_extend_funding_records(&mut records, &income_records)?;
+    let mut trade_records = Vec::new();
     let symbols = funding_arb_exchange_history_record_symbols(&income_records)?;
     for symbol in symbols {
         let payload = sign_and_fetch_binance_private_get_with_retry(
@@ -31698,7 +31770,7 @@ fn funding_arb_exchange_history_fetch_binance(
             ],
         );
         funding_arb_exchange_history_capture_payload(
-            &mut records,
+            &mut trade_records,
             &mut errors,
             leg,
             &format!("binance {user_trades_endpoint}"),
@@ -31707,6 +31779,13 @@ fn funding_arb_exchange_history_fetch_binance(
             window,
         );
     }
+    funding_arb_exchange_history_extend_funding_records(&mut records, &income_records)?;
+    funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+        &mut records,
+        &income_records,
+        &trade_records,
+    )?;
+    records.append(&mut trade_records);
     Ok((records, errors))
 }
 
@@ -31947,6 +32026,7 @@ fn funding_arb_exchange_history_fetch_bitget(
     funding_arb_exchange_history_extend_funding_records(&mut records, &bill_records)?;
 
     let symbols = funding_arb_exchange_history_record_symbols(&position_records)?;
+    let mut fill_records = Vec::new();
     for symbol in symbols {
         let fills_payload = (|| -> RuntimeResult<String> {
             let endpoint =
@@ -31969,7 +32049,7 @@ fn funding_arb_exchange_history_fetch_bitget(
             fetch_signed_bitget_get_with_curl(BITGET_REST_BASE_URL, &signed)
         })();
         funding_arb_exchange_history_capture_payload(
-            &mut records,
+            &mut fill_records,
             &mut errors,
             leg,
             "bitget /api/v2/mix/order/fills",
@@ -31978,6 +32058,12 @@ fn funding_arb_exchange_history_fetch_bitget(
             window,
         );
     }
+    funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+        &mut records,
+        &position_records,
+        &fill_records,
+    )?;
+    records.append(&mut fill_records);
     Ok((records, errors))
 }
 
@@ -32031,7 +32117,7 @@ fn funding_arb_exchange_history_fetch_aster(
             window,
         );
     }
-    funding_arb_exchange_history_extend_funding_records(&mut records, &income_records)?;
+    let mut trade_records = Vec::new();
     let symbols = funding_arb_exchange_history_record_symbols(&income_records)?;
     for symbol in symbols {
         let payload = fetch_signed_aster_readonly_get_with_retry(
@@ -32050,7 +32136,7 @@ fn funding_arb_exchange_history_fetch_aster(
             "/fapi/v3/userTrades",
         );
         funding_arb_exchange_history_capture_payload(
-            &mut records,
+            &mut trade_records,
             &mut errors,
             leg,
             "aster /fapi/v3/userTrades",
@@ -32059,6 +32145,13 @@ fn funding_arb_exchange_history_fetch_aster(
             window,
         );
     }
+    funding_arb_exchange_history_extend_funding_records(&mut records, &income_records)?;
+    funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+        &mut records,
+        &income_records,
+        &trade_records,
+    )?;
+    records.append(&mut trade_records);
     Ok((records, errors))
 }
 
@@ -49989,6 +50082,19 @@ mod tests {
                 .expect("bitget empty quote raw")
                 .is_none()
         );
+        let bitget_null_quote_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":null,"bidSz":"1.2","askPr":"101.10","askSz":"1.3","ts":"1778630400000"}]}"#;
+        assert!(
+            parse_bitget_wss_book_ticker_runtime_raw(bitget_null_quote_raw, ingested_at)
+                .expect("bitget null quote raw")
+                .is_none()
+        );
+        let bitget_invalid_decimal_quote_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","bidPr":"bad-price","bidSz":"1.2","askPr":"101.10","askSz":"1.3","ts":"1778630400000"}]}"#;
+        assert!(parse_bitget_wss_book_ticker_runtime_raw(
+            bitget_invalid_decimal_quote_raw,
+            ingested_at
+        )
+        .expect("bitget invalid decimal quote raw")
+        .is_none());
 
         let bitget_metadata_only_raw = r#"{"action":"snapshot","arg":{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},"data":[{"instId":"BTCUSDT","ts":"1778630400000","change24h":"0.01"}]}"#;
         assert!(
@@ -50128,6 +50234,13 @@ mod tests {
                 "2".to_owned(),
             ),
             monitor_book_ticker_row_with_top_depth(
+                "BADUSDT".to_owned(),
+                String::new(),
+                "2".to_owned(),
+                "51".to_owned(),
+                "2".to_owned(),
+            ),
+            monitor_book_ticker_row_with_top_depth(
                 "BTCUSDC".to_owned(),
                 "100".to_owned(),
                 "1".to_owned(),
@@ -50149,6 +50262,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["BTCUSDT", "1INCHUSDT", "ETHUSDT"]
         );
+        let explicit_bad_bitget_rows = vec![monitor_book_ticker_row_with_top_depth(
+            "BADUSDT".to_owned(),
+            String::new(),
+            "2".to_owned(),
+            "51".to_owned(),
+            "2".to_owned(),
+        )];
+        let explicit_bad_error = prepare_bitget_wss_book_ticker_rest_rows(
+            explicit_bad_bitget_rows,
+            "BADUSDT",
+            BitgetPublicWssMarket::Spot,
+            false,
+        )
+        .expect_err("single bad bitget row should fail");
+        assert!(explicit_bad_error
+            .to_string()
+            .contains("Bitget WSS REST bootstrap row for `BADUSDT` has empty top-of-book field"));
         let bitget_symbols = (0..123)
             .map(|index| format!("SYM{index}USDT"))
             .collect::<Vec<_>>();
@@ -56940,7 +57070,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
-    fn funding_arb_exchange_history_extend_funding_records_filters_ledger_duplicates() {
+    fn funding_arb_exchange_history_extends_pnl_when_trade_rows_do_not_have_pnl() {
         let leg = funding_arb_exchange_history_leg("binance").expect("history leg");
         let realized = funding_arb_exchange_history_record_json(
             &leg,
@@ -56971,9 +57101,94 @@ mod tests {
         let mut records = Vec::new();
         funding_arb_exchange_history_extend_funding_records(&mut records, &candidates)
             .expect("filter funding records");
-        assert_eq!(records.len(), 1);
+        funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+            &mut records,
+            &candidates,
+            &[],
+        )
+        .expect("extend pnl records");
+        assert_eq!(records.len(), 2);
         assert!(records[0].contains("\"recordType\":\"funding_fee\""));
         assert!(records[0].contains("\"fundingPnlUsd\":0.03"));
+        assert!(records[1].contains("\"recordType\":\"realized_pnl\""));
+        assert!(records[1].contains("\"pnlUsd\":1.25"));
+        assert!(!records.iter().any(|record| {
+            record.contains("\"recordType\":\"commission\"") && record.contains("\"feeUsd\":-0.01")
+        }));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_skips_income_pnl_when_trade_rows_have_symbol_pnl() {
+        let leg = funding_arb_exchange_history_leg("binance").expect("history leg");
+        let realized = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income REALIZED_PNL",
+            "realized_pnl",
+            r#"{"symbol":"HUSDT","incomeType":"REALIZED_PNL","income":"1.25","time":"1779978266000"}"#,
+        )
+        .expect("realized income json");
+        let funding = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/income FUNDING_FEE",
+            "funding_fee",
+            r#"{"symbol":"HUSDT","incomeType":"FUNDING_FEE","income":"0.03","time":"1779978266000"}"#,
+        )
+        .expect("funding income json");
+        let trade = funding_arb_exchange_history_record_json(
+            &leg,
+            "binance /fapi/v1/userTrades",
+            "trade_fill",
+            r#"{"symbol":"HUSDT","id":12,"orderId":"order-1","realizedPnl":"1.25","commission":"0.01","qty":"1","price":"2","time":"1779978266000"}"#,
+        )
+        .expect("trade fill json");
+        let candidates = vec![realized, funding];
+        let trade_records = vec![trade.clone()];
+
+        let mut records = Vec::new();
+        funding_arb_exchange_history_extend_funding_records(&mut records, &candidates)
+            .expect("filter funding records");
+        funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+            &mut records,
+            &candidates,
+            &trade_records,
+        )
+        .expect("extend pnl records");
+        records.extend(trade_records);
+
+        assert_eq!(records.len(), 2);
+        assert!(records[0].contains("\"recordType\":\"funding_fee\""));
+        assert!(records[1].contains("\"recordType\":\"trade_fill\""));
+        assert!(records[1].contains("\"pnlUsd\":1.25"));
+        assert!(!records
+            .iter()
+            .any(|record| record.contains("\"recordType\":\"realized_pnl\"")));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_bitget_position_history_can_supply_pnl() {
+        let leg = funding_arb_exchange_history_leg("bitget").expect("history leg");
+        let position = funding_arb_exchange_history_record_json(
+            &leg,
+            "bitget /api/v2/mix/position/history-position",
+            "history_position",
+            r#"{"symbol":"HUSDT","netProfit":"0.77","totalFee":"0.02","cTime":"1779978266000","positionId":"pos-1"}"#,
+        )
+        .expect("position history json");
+        assert!(position.contains("\"pnlUsd\":0.77"));
+        assert!(position.contains("\"feeUsd\":-0.02"));
+
+        let mut records = Vec::new();
+        funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+            &mut records,
+            &[position],
+            &[],
+        )
+        .expect("extend bitget pnl records");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].contains("\"recordType\":\"history_position\""));
+        assert!(records[0].contains("\"pnlUsd\":0.77"));
     }
 
     #[test]

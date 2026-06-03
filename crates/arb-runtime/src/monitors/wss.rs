@@ -21,21 +21,21 @@ use crate::{
     aster_futures_book_ticker_all_url, aster_futures_book_ticker_url, basis_identifier_component,
     binance_spot_book_ticker_all_url, binance_spot_book_ticker_url,
     binance_usdm_book_ticker_all_url, binance_usdm_book_ticker_url, bitget_spot_tickers_url,
-    bitget_usdt_futures_tickers_url, bybit_linear_tickers_url, bybit_spot_tickers_url,
-    cli_arg_error, current_utc_timestamp, current_utc_timestamp_string, decode_json_string_literal,
-    fetch_public_json_post_with_curl, fetch_public_json_with_curl, funding_display_symbol,
-    hyperliquid_info_request_body, json_array_value_slices, json_option_string, json_string,
-    json_string_end, normalize_cex_usdt_basis_symbol, normalize_okx_usdt_basis_symbol,
-    okx_tickers_url, optional_json_value_string, parse_bitget_spot_ticker_rows,
-    parse_bitget_usdt_futures_ticker_rows, parse_book_ticker_rows, parse_bybit_linear_ticker_rows,
-    parse_bybit_spot_ticker_rows, parse_flat_json_object, parse_hyperliquid_perp_context_rows,
-    parse_json_object_value_slices, parse_okx_ticker_rows,
-    required_first_bitget_ticker_value_string, required_first_json_value_string,
-    required_json_string, required_json_value_string, runtime_timestamp_millis,
-    static_dashboard_gone_json, write_http_json, MonitorBookTickerRow, MonitorJsonScalar,
-    OkxTickerRow, RuntimeError, RuntimeResult, BASIS_SYMBOL, BITGET_BASIS_SYMBOL,
-    BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID, HYPERLIQUID_INFO_URL,
-    MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR, MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
+    bitget_ticker_value_to_string, bitget_usdt_futures_tickers_url, bybit_linear_tickers_url,
+    bybit_spot_tickers_url, cli_arg_error, current_utc_timestamp, current_utc_timestamp_string,
+    decode_json_string_literal, fetch_public_json_post_with_curl, fetch_public_json_with_curl,
+    funding_display_symbol, hyperliquid_info_request_body, json_array_value_slices,
+    json_option_string, json_string, json_string_end, normalize_cex_usdt_basis_symbol,
+    normalize_okx_usdt_basis_symbol, okx_tickers_url, optional_json_value_string,
+    parse_bitget_spot_ticker_rows, parse_bitget_usdt_futures_ticker_rows, parse_book_ticker_rows,
+    parse_bybit_linear_ticker_rows, parse_bybit_spot_ticker_rows, parse_flat_json_object,
+    parse_hyperliquid_perp_context_rows, parse_json_object_value_slices, parse_okx_ticker_rows,
+    required_first_json_value_string, required_json_string, required_json_value_string,
+    runtime_timestamp_millis, static_dashboard_gone_json, write_http_json, MonitorBookTickerRow,
+    MonitorJsonScalar, OkxTickerRow, RuntimeError, RuntimeResult, BASIS_SYMBOL,
+    BITGET_BASIS_SYMBOL, BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID,
+    HYPERLIQUID_INFO_URL, MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR,
+    MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
 };
 
 pub(crate) const HYPERLIQUID_PUBLIC_WSS_URL: &str = "wss://api.hyperliquid.xyz/ws";
@@ -1887,7 +1887,7 @@ pub(crate) fn prepare_bybit_wss_book_ticker_rest_rows(
             Ok(symbol)
                 if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
             {
-                if !bybit_wss_rest_row_has_usable_top_of_book(&row) {
+                if !monitor_book_ticker_row_has_usable_top_of_book(&row) {
                     if all_symbols_scope || broad_explicit_scope {
                         continue;
                     }
@@ -1916,7 +1916,7 @@ pub(crate) fn prepare_bybit_wss_book_ticker_rest_rows(
     Ok(prepared)
 }
 
-pub(crate) fn bybit_wss_rest_row_has_usable_top_of_book(row: &MonitorBookTickerRow) -> bool {
+pub(crate) fn monitor_book_ticker_row_has_usable_top_of_book(row: &MonitorBookTickerRow) -> bool {
     [
         row.bid_price.as_str(),
         row.bid_qty.as_str(),
@@ -2150,6 +2150,16 @@ pub(crate) fn prepare_bitget_wss_book_ticker_rest_rows(
                         continue;
                     }
                     return Err(error);
+                }
+                if !monitor_book_ticker_row_has_usable_top_of_book(&row) {
+                    if all_symbols_scope {
+                        continue;
+                    }
+                    return Err(RuntimeError::LiveMarketData {
+                        message: format!(
+                            "Bitget WSS REST bootstrap row for `{symbol}` has empty top-of-book field"
+                        ),
+                    });
                 }
                 row.symbol = symbol;
                 prepared.push(row);
@@ -3119,26 +3129,38 @@ pub(crate) fn parse_bitget_wss_book_ticker_runtime_raw(
     if !bitget_wss_ticker_has_top_of_book_fields(&fields) {
         return Ok(None);
     }
-    let bid_price = required_first_bitget_ticker_value_string(
+    let Some(bid_price) = optional_first_bitget_wss_ticker_value_string(
         &fields,
         &["bidPr", "bidPx", "bidPrice"],
         "bitget wss ticker",
-    )?;
-    let ask_price = required_first_bitget_ticker_value_string(
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(ask_price) = optional_first_bitget_wss_ticker_value_string(
         &fields,
         &["askPr", "askPx", "askPrice"],
         "bitget wss ticker",
-    )?;
-    let bid_qty = required_first_bitget_ticker_value_string(
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(bid_qty) = optional_first_bitget_wss_ticker_value_string(
         &fields,
         &["bidSz", "bidSize", "bidQty"],
         "bitget wss ticker",
-    )?;
-    let ask_qty = required_first_bitget_ticker_value_string(
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(ask_qty) = optional_first_bitget_wss_ticker_value_string(
         &fields,
         &["askSz", "askSize", "askQty"],
         "bitget wss ticker",
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     if [
         bid_price.as_str(),
         ask_price.as_str(),
@@ -3150,13 +3172,25 @@ pub(crate) fn parse_bitget_wss_book_ticker_runtime_raw(
     {
         return Ok(None);
     }
+    let Ok(best_bid) = Price::from_str(&bid_price) else {
+        return Ok(None);
+    };
+    let Ok(best_ask) = Price::from_str(&ask_price) else {
+        return Ok(None);
+    };
+    let Ok(bid_size) = Quantity::from_str(&bid_qty) else {
+        return Ok(None);
+    };
+    let Ok(ask_size) = Quantity::from_str(&ask_qty) else {
+        return Ok(None);
+    };
     Ok(Some(PublicWssTickerRuntimeRaw {
         symbol,
         venue_symbol,
-        best_bid: Price::from_str(&bid_price)?,
-        best_ask: Price::from_str(&ask_price)?,
-        bid_size: Quantity::from_str(&bid_qty)?,
-        ask_size: Quantity::from_str(&ask_qty)?,
+        best_bid,
+        best_ask,
+        bid_size,
+        ask_size,
         observed_at,
     }))
 }
@@ -3170,6 +3204,38 @@ fn bitget_wss_ticker_has_top_of_book_fields(fields: &BTreeMap<String, &str>) -> 
     ]
     .iter()
     .all(|names| names.iter().any(|name| fields.contains_key(*name)))
+}
+
+fn optional_first_bitget_wss_ticker_value_string(
+    fields: &BTreeMap<String, &str>,
+    field_names: &[&'static str],
+    source: &'static str,
+) -> RuntimeResult<Option<String>> {
+    for field in field_names {
+        let Some(value) = fields.get(*field) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return Ok(None);
+        }
+        match bitget_ticker_value_to_string(trimmed, field, source) {
+            Ok(value) if value.trim().is_empty() => return Ok(None),
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if bitget_wss_ticker_value_error_is_unusable_quote(&error) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn bitget_wss_ticker_value_error_is_unusable_quote(error: &RuntimeError) -> bool {
+    let message = error.to_string();
+    message.contains("is not a scalar string")
+        || message.contains("is an ambiguous JSON array")
+        || message.contains("JSON array nesting is too deep")
 }
 
 pub(crate) fn parse_aster_wss_book_ticker_runtime_raw(

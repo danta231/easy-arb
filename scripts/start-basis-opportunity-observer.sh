@@ -1371,6 +1371,47 @@ resident_exit_is_accepted() {
   esac
 }
 
+funding_arb_resident_exit_should_restart() {
+  local summary_path="${FUNDING_ARB_RESIDENT_OUT_DIR}/funding_arb_resident_live_summary.json"
+
+  [[ -s "${summary_path}" ]] || return 1
+  jq -e '
+    def as_count:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      elif type == "array" then length
+      else 0 end;
+    (.phase // "") == "halted"
+    and (((.open_position_count // 0) | as_count) == 0)
+    and (((.unknown_position_count // 0) | as_count) == 0)
+    and (
+      (.halt_reason // "") == "funding arb unknown position recovery cycle completed; resident live stopped before new entries"
+      or (.halt_reason // "") == "funding arb position recovery cycle completed; resident live stopped before new entries"
+      or (.halt_reason // "") == "funding arb exit-only cycle completed; resident live stopped before new entries"
+      or (.halt_reason // "") == "funding arb entry dispatch was rejected after mutable execution started; resident live stopped"
+    )
+  ' "${summary_path}" >/dev/null 2>&1
+}
+
+remove_supervised_process_pid_entry() {
+  local remove_pid="$1"
+  local remove_name="$2"
+  local tmp="${PID_FILE}.tmp.$$"
+  local pid
+  local name
+  local log_file
+
+  [[ -s "${PID_FILE}" ]] || return 0
+  : > "${tmp}"
+  while IFS=$'\t' read -r pid name log_file; do
+    if [[ "${pid}" == "${remove_pid}" && "${name}" == "${remove_name}" ]]; then
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "${pid}" "${name}" "${log_file}" >> "${tmp}"
+  done < "${PID_FILE}"
+  mv "${tmp}" "${PID_FILE}"
+}
+
 record_accepted_resident_exit_once() {
   local pid="$1"
   local name="$2"
@@ -1401,6 +1442,9 @@ supervise_started_processes() {
   local name
   local log_file
   local failed
+  local restart_funding_arb_resident_pid
+  local restart_funding_arb_resident_name
+  local restart_funding_arb_resident_log_file
 
   trap 'echo "stopping foreground basis opportunity observer..."; graceful_stop_started_processes; rm -f "${PID_FILE}"; exit 0' INT TERM
   echo "foreground supervision enabled; press Ctrl-C to stop."
@@ -1412,10 +1456,22 @@ supervise_started_processes() {
     fi
 
     failed=0
+    restart_funding_arb_resident_pid=""
+    restart_funding_arb_resident_name=""
+    restart_funding_arb_resident_log_file=""
     while IFS=$'\t' read -r pid name log_file; do
       if is_supervised_core_process_name "${name}" && ! is_alive "${pid}"; then
         if resident_exit_is_accepted "${name}"; then
           record_accepted_resident_exit_once "${pid}" "${name}" "${log_file}"
+          if [[ "${name}" == "funding-arb-resident-live" ]] \
+            && [[ "${FUNDING_ARB_MODE}" == "resident" ]] \
+            && strategy_enabled "cross-exchange-funding-arb" \
+            && [[ -z "${FUNDING_ARB_RESIDENT_MAX_CYCLES:-}" ]] \
+            && funding_arb_resident_exit_should_restart; then
+            restart_funding_arb_resident_pid="${pid}"
+            restart_funding_arb_resident_name="${name}"
+            restart_funding_arb_resident_log_file="${log_file}"
+          fi
           continue
         fi
         echo "error: supervised process exited: ${name} pid=${pid}" >&2
@@ -1425,6 +1481,24 @@ supervise_started_processes() {
         failed=1
       fi
     done < "${PID_FILE}"
+
+    if (( failed == 0 )) && [[ -n "${restart_funding_arb_resident_pid}" ]]; then
+      if resident_process_alive "funding-arb-resident-live"; then
+        remove_supervised_process_pid_entry \
+          "${restart_funding_arb_resident_pid}" \
+          "${restart_funding_arb_resident_name}"
+      else
+        echo "funding_arb_resident_restart_after_accepted_exit pid=${restart_funding_arb_resident_pid} log=${restart_funding_arb_resident_log_file}"
+        remove_supervised_process_pid_entry \
+          "${restart_funding_arb_resident_pid}" \
+          "${restart_funding_arb_resident_name}"
+        if check_funding_arb_resident_startup_risk; then
+          start_funding_arb_resident_live
+        else
+          failed=1
+        fi
+      fi
+    fi
 
     if (( failed != 0 )); then
       graceful_stop_started_processes
