@@ -1245,6 +1245,9 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                                     cycles,
                                     &exit_dir,
                                     "funding arb residual state detected; auto residual de-risk will retry from private position snapshot before new entries",
+                                    Some(&position.position_id),
+                                    Some(&position.pair_id),
+                                    Some(&position.symbol),
                                 )?;
                                 residual_de_risk_pending = true;
                             } else {
@@ -1374,6 +1377,9 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                                             cycles,
                                             &cycle_dir,
                                             "funding arb entry dispatch left unknown state; auto residual de-risk will retry from private position snapshot before new entries",
+                                            None,
+                                            Some(&outcome.pair_id),
+                                            Some(&outcome.symbol),
                                         )?;
                                         position_recovery_drain_mode = true;
                                         force_residual_de_risk_cycle = true;

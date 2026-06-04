@@ -2233,6 +2233,8 @@ pub struct BinanceBasisMonitorSnapshot {
     pub filtered_funding_count: usize,
     pub missing_spot_count: usize,
     pub missing_perp_count: usize,
+    pub wss_missing_quote_count: usize,
+    pub wss_unusable_quote_count: usize,
     pub last_error: Option<String>,
     pub rows: Vec<BinanceBasisMarketRow>,
 }
@@ -15734,6 +15736,8 @@ fn build_binance_basis_monitor_snapshot_from_parsed_with_depth(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
+        wss_missing_quote_count: 0,
+        wss_unusable_quote_count: 0,
         last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
@@ -16211,6 +16215,8 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
+        wss_missing_quote_count: missing_wss_quote_count,
+        wss_unusable_quote_count: unusable_wss_quote_count,
         last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
@@ -16629,6 +16635,8 @@ fn build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
+        wss_missing_quote_count: 0,
+        wss_unusable_quote_count: 0,
         last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
@@ -17310,6 +17318,8 @@ fn build_okx_basis_monitor_snapshot_from_parsed_with_depth(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
+        wss_missing_quote_count: 0,
+        wss_unusable_quote_count: 0,
         last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
@@ -17673,6 +17683,8 @@ fn build_bitget_basis_monitor_snapshot_from_parsed_with_depth(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
+        wss_missing_quote_count: 0,
+        wss_unusable_quote_count: 0,
         last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
@@ -18039,6 +18051,8 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         filtered_funding_count,
         missing_spot_count,
         missing_perp_count,
+        wss_missing_quote_count: missing_wss_quote_count,
+        wss_unusable_quote_count: unusable_wss_quote_count,
         last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
         rows,
     })
@@ -22869,16 +22883,37 @@ fn append_opportunity_recorder_resident_tail_health(
     let scoped_lines = &lines[start..];
     let recent_lines = opportunity_recorder_resident_recent_health_lines(scoped_lines);
     let health_lines = recent_lines.as_slice();
-    let cycle_error_count = count_lines_containing(health_lines, "\"event_type\":\"cycle_error\"");
+    let cycle_error_count = count_lines_matching(health_lines, |line| {
+        opportunity_recorder_resident_line_is_material_cycle_error(line)
+    });
+    let stale_candidate_count = count_lines_matching(health_lines, |line| {
+        opportunity_recorder_resident_line_is_stale_candidate(line)
+    });
     let residual_de_risk_retry_count =
         count_lines_containing(health_lines, "\"event_type\":\"residual_de_risk_retry\"");
     let blocked_decision_count = count_lines_containing(health_lines, "\"decision\":\"blocked\"");
     let entry_capacity_blocked_count =
         count_lines_containing(health_lines, "\"event_type\":\"entry_capacity_blocked\"");
+    let partial_execution_count = count_lines_containing(
+        health_lines,
+        "\"execution_report_status\":\"PartiallySucceeded\"",
+    );
+    let position_unknown_count =
+        count_lines_containing(health_lines, "\"event_type\":\"position_unknown\"");
+    let pending_pnl_sync_count = count_lines_containing(
+        health_lines,
+        "\"exchange_pnl_status\":\"PendingManualSync\"",
+    );
+    let exit_position_mismatch_count =
+        count_lines_containing(health_lines, "\"private_position_status\":\"Mismatch\"");
+    let execution_risk_event_count = partial_execution_count
+        + position_unknown_count
+        + pending_pnl_sync_count
+        + exit_position_mismatch_count;
     let status = if cycle_error_count > 0
         || residual_de_risk_retry_count > 0
         || blocked_decision_count > 0
-        || entry_capacity_blocked_count > 0
+        || execution_risk_event_count > 0
     {
         "warning"
     } else {
@@ -22888,7 +22923,7 @@ fn append_opportunity_recorder_resident_tail_health(
         .then(|| opportunity_recorder_resident_tail_last_error(health_lines))
         .flatten();
     let key = format!(
-        "resident_tail_health|status={status}|cycle_errors={cycle_error_count}|residual_retry={residual_de_risk_retry_count}|blocked={blocked_decision_count}|capacity={entry_capacity_blocked_count}"
+        "resident_tail_health|status={status}|cycle_errors={cycle_error_count}|stale={stale_candidate_count}|residual_retry={residual_de_risk_retry_count}|blocked={blocked_decision_count}|capacity={entry_capacity_blocked_count}|partial={partial_execution_count}|unknown={position_unknown_count}|pnl={pending_pnl_sync_count}|mismatch={exit_position_mismatch_count}"
     );
     if !sampler.should_emit(&format!("resident:{source}"), &key) {
         return Ok(());
@@ -22896,7 +22931,7 @@ fn append_opportunity_recorder_resident_tail_health(
     append_line_to_jsonl(
         options.health_events_jsonl.clone(),
         &format!(
-            "{{\"recorded_at\":{},\"strategy\":{},\"source\":{},\"event\":\"resident_tail_health\",\"status\":{},\"event_file\":{},\"tail_lines\":{},\"cycle_error_count\":{},\"residual_de_risk_retry_count\":{},\"blocked_decision_count\":{},\"entry_capacity_blocked_count\":{},\"last_error\":{},\"mutable_execution_started\":false}}",
+            "{{\"recorded_at\":{},\"strategy\":{},\"source\":{},\"event\":\"resident_tail_health\",\"status\":{},\"event_file\":{},\"tail_lines\":{},\"cycle_error_count\":{},\"stale_candidate_count\":{},\"residual_de_risk_retry_count\":{},\"blocked_decision_count\":{},\"entry_capacity_blocked_count\":{},\"partial_execution_count\":{},\"position_unknown_count\":{},\"pending_pnl_sync_count\":{},\"exit_position_mismatch_count\":{},\"execution_risk_event_count\":{},\"last_error\":{},\"mutable_execution_started\":false}}",
             json_string(&current_utc_timestamp_string()),
             json_string(strategy),
             json_string(source),
@@ -22904,9 +22939,15 @@ fn append_opportunity_recorder_resident_tail_health(
             json_string(&event_file.display().to_string()),
             options.resident_health_tail_lines,
             cycle_error_count,
+            stale_candidate_count,
             residual_de_risk_retry_count,
             blocked_decision_count,
             entry_capacity_blocked_count,
+            partial_execution_count,
+            position_unknown_count,
+            pending_pnl_sync_count,
+            exit_position_mismatch_count,
+            execution_risk_event_count,
             optional_json_string(last_error.as_deref())
         ),
     )
@@ -22928,15 +22969,42 @@ fn count_lines_containing(lines: &[&str], pattern: &str) -> usize {
 }
 
 #[cfg(feature = "live-exec")]
+fn count_lines_matching(lines: &[&str], predicate: impl Fn(&str) -> bool) -> usize {
+    lines.iter().filter(|line| predicate(*line)).count()
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_line_is_stale_candidate(line: &str) -> bool {
+    line.contains("\"event_type\":\"candidate_stale\"")
+        || (line.contains("\"event_type\":\"cycle_error\"")
+            && line.contains("funding arb monitor row is not a candidate: "))
+        || line.contains("\"error_class\":\"stale_funding_arb_candidate\"")
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_line_is_material_cycle_error(line: &str) -> bool {
+    line.contains("\"event_type\":\"cycle_error\"")
+        && !opportunity_recorder_resident_line_is_stale_candidate(line)
+}
+
+#[cfg(feature = "live-exec")]
+fn opportunity_recorder_resident_line_is_execution_risk(line: &str) -> bool {
+    line.contains("\"event_type\":\"residual_de_risk_retry\"")
+        || line.contains("\"decision\":\"blocked\"")
+        || line.contains("\"execution_report_status\":\"PartiallySucceeded\"")
+        || line.contains("\"event_type\":\"position_unknown\"")
+        || line.contains("\"exchange_pnl_status\":\"PendingManualSync\"")
+        || line.contains("\"private_position_status\":\"Mismatch\"")
+}
+
+#[cfg(feature = "live-exec")]
 fn opportunity_recorder_resident_tail_last_error(lines: &[&str]) -> Option<String> {
     lines
         .iter()
         .rev()
         .find(|line| {
-            line.contains("\"event_type\":\"cycle_error\"")
-                || line.contains("\"event_type\":\"residual_de_risk_retry\"")
-                || line.contains("\"decision\":\"blocked\"")
-                || line.contains("\"event_type\":\"entry_capacity_blocked\"")
+            opportunity_recorder_resident_line_is_material_cycle_error(line)
+                || opportunity_recorder_resident_line_is_execution_risk(line)
         })
         .map(|line| truncate_log_string(line.trim()))
 }
@@ -35655,7 +35723,7 @@ fn append_funding_arb_resident_position_unknown(
 ) -> RuntimeResult<()> {
     let closed_at = current_utc_timestamp()?.to_string();
     let line = format!(
-        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",{},\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"closed_at\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"event_type\":\"position_unknown\",{},\"net_funding_bps\":null,\"notional_usdt\":{},\"opened_at\":{},\"pair_id\":{},\"partial_close\":{},\"position_id\":{},\"position_state_path\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason\":{},\"residual_risk\":{},\"status\":\"unknown\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         json_string(&closed_at),
         cycle,
         json_string(&cycle_dir.display().to_string()),
@@ -35664,9 +35732,11 @@ fn append_funding_arb_resident_position_unknown(
         json_string(&position.notional_usdt),
         optional_json_string(position.opened_at.as_deref()),
         json_string(&position.pair_id),
+        report.partial_close,
         json_string(&position.position_id),
         json_string(&position.position_state_path.display().to_string()),
         report.private_confirmation_count,
+        json_string(&report.private_position_status),
         json_string(reason),
         optional_json_string(report.residual_risk.as_deref()),
         report.submitted_receipt_count,
@@ -38541,16 +38611,33 @@ fn append_funding_arb_resident_error_event(
     error: &str,
 ) -> RuntimeResult<()> {
     let recorded_at = current_utc_timestamp_string();
+    let error_class = funding_arb_resident_cycle_error_class(error);
+    let event_type = if error_class == "stale_funding_arb_candidate" {
+        "candidate_stale"
+    } else {
+        "cycle_error"
+    };
     append_funding_arb_resident_event(
         output_root,
         &format!(
-            "{{\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"event_type\":\"cycle_error\",\"recorded_at\":{}}}",
+            "{{\"cycle\":{},\"cycle_dir\":{},\"error\":{},\"error_class\":{},\"event_type\":{},\"recorded_at\":{}}}",
             cycle,
             json_string(&cycle_dir.display().to_string()),
             json_string(error),
+            json_string(error_class),
+            json_string(event_type),
             json_string(&recorded_at),
         ),
     )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_cycle_error_class(error: &str) -> &'static str {
+    if error.contains("funding arb monitor row is not a candidate: ") {
+        "stale_funding_arb_candidate"
+    } else {
+        "cycle_error"
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -38559,16 +38646,22 @@ fn append_funding_arb_resident_residual_retry_event(
     cycle: u64,
     cycle_dir: &Path,
     reason: &str,
+    position_id: Option<&str>,
+    pair_id: Option<&str>,
+    symbol: Option<&str>,
 ) -> RuntimeResult<()> {
     let recorded_at = current_utc_timestamp_string();
     append_funding_arb_resident_event(
         output_root,
         &format!(
-            "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"residual_de_risk_retry\",\"reason\":{},\"recorded_at\":{}}}",
+            "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"residual_de_risk_retry\",\"pair_id\":{},\"position_id\":{},\"reason\":{},\"recorded_at\":{},\"symbol\":{}}}",
             cycle,
             json_string(&cycle_dir.display().to_string()),
+            optional_json_string(pair_id),
+            optional_json_string(position_id),
             json_string(reason),
             json_string(&recorded_at),
+            optional_json_string(symbol),
         ),
     )
 }
@@ -45728,13 +45821,17 @@ fn funding_arb_monitor_snapshot_compact_json(
     artifact_mode: &str,
 ) -> String {
     let blocking_path = funding_arb_monitor_compact_blocking_path(snapshot);
+    let source_status_counts = funding_arb_monitor_source_status_counts_json(&snapshot.rows);
+    let non_complete_source_status_count =
+        funding_arb_monitor_non_complete_source_status_count(&snapshot.rows);
     format!(
-        "{{\"artifact_mode\":{},\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"retained_rows\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+        "{{\"artifact_mode\":{},\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"non_complete_source_status_count\":{},\"retained_rows\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"source_status_counts\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
         json_string(artifact_mode),
         funding_arb_blocking_path_json(&blocking_path),
         snapshot.candidate_count,
         json_option_string(&snapshot.last_error),
         json_string(&snapshot.min_net_funding_bps),
+        non_complete_source_status_count,
         retained_rows.len(),
         retained_rows
             .iter()
@@ -45743,6 +45840,7 @@ fn funding_arb_monitor_snapshot_compact_json(
             .join(","),
         snapshot.source_count,
         snapshot.source_error_count,
+        source_status_counts,
         json_string(&snapshot.status),
         snapshot.total_rows,
         json_string(&snapshot.updated_at),
@@ -46769,6 +46867,8 @@ impl BinanceBasisMonitorSnapshot {
             filtered_funding_count: 0,
             missing_spot_count: 0,
             missing_perp_count: 0,
+            wss_missing_quote_count: 0,
+            wss_unusable_quote_count: 0,
             last_error: None,
             rows: Vec::new(),
         }
@@ -46785,6 +46885,8 @@ impl BinanceBasisMonitorSnapshot {
             filtered_funding_count: 0,
             missing_spot_count: 0,
             missing_perp_count: 0,
+            wss_missing_quote_count: 0,
+            wss_unusable_quote_count: 0,
             last_error: None,
             rows: Vec::new(),
         }
@@ -46801,6 +46903,8 @@ impl BinanceBasisMonitorSnapshot {
             filtered_funding_count: 0,
             missing_spot_count: 0,
             missing_perp_count: 0,
+            wss_missing_quote_count: 0,
+            wss_unusable_quote_count: 0,
             last_error: None,
             rows: Vec::new(),
         }
@@ -46817,6 +46921,8 @@ impl BinanceBasisMonitorSnapshot {
             filtered_funding_count: 0,
             missing_spot_count: 0,
             missing_perp_count: 0,
+            wss_missing_quote_count: 0,
+            wss_unusable_quote_count: 0,
             last_error: None,
             rows: Vec::new(),
         }
@@ -46833,6 +46939,8 @@ impl BinanceBasisMonitorSnapshot {
             filtered_funding_count: 0,
             missing_spot_count: 0,
             missing_perp_count: 0,
+            wss_missing_quote_count: 0,
+            wss_unusable_quote_count: 0,
             last_error: None,
             rows: Vec::new(),
         }
@@ -46849,6 +46957,8 @@ impl BinanceBasisMonitorSnapshot {
             filtered_funding_count: 0,
             missing_spot_count: 0,
             missing_perp_count: 0,
+            wss_missing_quote_count: 0,
+            wss_unusable_quote_count: 0,
             last_error: None,
             rows: Vec::new(),
         }
@@ -46865,6 +46975,9 @@ impl BinanceBasisMonitorSnapshot {
 
     fn to_json_limited(&self, row_limit: Option<usize>, summary_only: bool) -> String {
         let blocking_path = basis_monitor_blocking_path(self);
+        let source_status_counts = basis_monitor_source_status_counts_json(&self.rows);
+        let non_complete_source_status_count =
+            basis_monitor_non_complete_source_status_count(&self.rows);
         let rows_json = if summary_only {
             String::new()
         } else {
@@ -46876,7 +46989,7 @@ impl BinanceBasisMonitorSnapshot {
                 .join(",")
         };
         format!(
-            "{{\"blocking_path\":{},\"candidate_count\":{},\"filtered_funding_count\":{},\"last_error\":{},\"min_abs_funding_rate\":{},\"min_net_bps\":{},\"missing_perp_count\":{},\"missing_spot_count\":{},\"rows\":[{}],\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+            "{{\"blocking_path\":{},\"candidate_count\":{},\"filtered_funding_count\":{},\"last_error\":{},\"min_abs_funding_rate\":{},\"min_net_bps\":{},\"missing_perp_count\":{},\"missing_spot_count\":{},\"non_complete_source_status_count\":{},\"rows\":[{}],\"source_status_counts\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{},\"wss_missing_quote_count\":{},\"wss_unusable_quote_count\":{}}}",
             funding_arb_blocking_path_json(&blocking_path),
             self.candidate_count,
             self.filtered_funding_count,
@@ -46885,10 +46998,14 @@ impl BinanceBasisMonitorSnapshot {
             json_string(&self.min_net_bps),
             self.missing_perp_count,
             self.missing_spot_count,
+            non_complete_source_status_count,
             rows_json,
+            source_status_counts,
             json_string(&self.status),
             self.total_rows,
             json_string(&self.updated_at),
+            self.wss_missing_quote_count,
+            self.wss_unusable_quote_count,
         )
     }
 
@@ -46955,6 +47072,43 @@ fn signal_depth_levels_strategy_json(levels: &[SignalDepthLevel]) -> String {
     )
 }
 
+fn source_status_counts_json_from_iter<'a>(
+    source_statuses: impl Iterator<Item = &'a str>,
+) -> String {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for source_status in source_statuses {
+        *counts.entry(source_status.to_owned()).or_default() += 1;
+    }
+    format!(
+        "{{{}}}",
+        counts
+            .into_iter()
+            .map(|(source_status, count)| format!("{}:{}", json_string(&source_status), count))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn basis_monitor_source_status_counts_json(rows: &[BinanceBasisMarketRow]) -> String {
+    source_status_counts_json_from_iter(rows.iter().map(|row| row.source_status.as_str()))
+}
+
+fn basis_monitor_non_complete_source_status_count(rows: &[BinanceBasisMarketRow]) -> usize {
+    rows.iter()
+        .filter(|row| row.source_status != "complete")
+        .count()
+}
+
+fn funding_arb_monitor_source_status_counts_json(rows: &[FundingArbMarketRow]) -> String {
+    source_status_counts_json_from_iter(rows.iter().map(|row| row.source_status.as_str()))
+}
+
+fn funding_arb_monitor_non_complete_source_status_count(rows: &[FundingArbMarketRow]) -> usize {
+    rows.iter()
+        .filter(|row| row.source_status != "complete")
+        .count()
+}
+
 impl BinanceBasisMarketRow {
     fn to_json(&self) -> String {
         format!(
@@ -47018,6 +47172,9 @@ impl FundingArbMonitorSnapshot {
 
     fn to_json_limited(&self, row_limit: Option<usize>, summary_only: bool) -> String {
         let blocking_path = funding_arb_monitor_blocking_path(self);
+        let source_status_counts = funding_arb_monitor_source_status_counts_json(&self.rows);
+        let non_complete_source_status_count =
+            funding_arb_monitor_non_complete_source_status_count(&self.rows);
         let rows_json = if summary_only {
             String::new()
         } else {
@@ -47029,14 +47186,16 @@ impl FundingArbMonitorSnapshot {
                 .join(",")
         };
         format!(
-            "{{\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+            "{{\"blocking_path\":{},\"candidate_count\":{},\"last_error\":{},\"min_net_funding_bps\":{},\"non_complete_source_status_count\":{},\"rows\":[{}],\"source_count\":{},\"source_error_count\":{},\"source_status_counts\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
             funding_arb_blocking_path_json(&blocking_path),
             self.candidate_count,
             json_option_string(&self.last_error),
             json_string(&self.min_net_funding_bps),
+            non_complete_source_status_count,
             rows_json,
             self.source_count,
             self.source_error_count,
+            source_status_counts,
             json_string(&self.status),
             self.total_rows,
             json_string(&self.updated_at),
@@ -62426,6 +62585,8 @@ mod tests {
             filtered_funding_count: 0,
             missing_spot_count: 0,
             missing_perp_count: 0,
+            wss_missing_quote_count: 0,
+            wss_unusable_quote_count: 0,
             last_error: None,
             rows: vec![BinanceBasisMarketRow {
                 symbol: "ETHUSDT".to_owned(),
@@ -65381,10 +65542,17 @@ mod tests {
         ensure_dir(&logs_dir).expect("logs dir");
         ensure_dir(&opportunity_dir).expect("opportunity dir");
         ensure_dir(&funding_arb_dir).expect("funding arb dir");
+        let recorded_at = current_utc_timestamp_string();
         write_utf8(
             funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
-            r#"{"event_type":"resident_started"}
-{"event_type":"cycle_error","error":"forced test failure"}"#,
+            &format!(
+                "{}\n{}",
+                r#"{"event_type":"resident_started"}"#,
+                format!(
+                    r#"{{"event_type":"cycle_error","error":"forced test failure","recorded_at":{}}}"#,
+                    json_string(&recorded_at)
+                )
+            ),
         )
         .expect("write resident event log");
 
@@ -65424,6 +65592,159 @@ mod tests {
         assert!(health_events.contains("\"cycle_error_count\":1"));
         assert!(health_events.contains("\"last_error\""));
         assert!(health_events.contains("forced test failure"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_resident_health_classifies_stale_candidates_as_healthy() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        let opportunity_dir = root.path().join("opportunities");
+        let funding_arb_dir = root.path().join("resident-live/cross-exchange-funding-arb");
+        ensure_dir(&logs_dir).expect("logs dir");
+        ensure_dir(&opportunity_dir).expect("opportunity dir");
+        ensure_dir(&funding_arb_dir).expect("funding arb dir");
+        let recorded_at = current_utc_timestamp_string();
+        write_utf8(
+            funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
+            &format!(
+                "{}\n{}",
+                r#"{"event_type":"resident_started"}"#,
+                format!(
+                    r#"{{"event_type":"candidate_stale","error":"arb-runtime: funding arb monitor row is not a candidate: forward=net_funding_bps=-4 below minimum 5","error_class":"stale_funding_arb_candidate","recorded_at":{}}}"#,
+                    json_string(&recorded_at)
+                )
+            ),
+        )
+        .expect("write resident event log");
+
+        let mut strategies = BTreeSet::new();
+        strategies.insert(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY.to_owned());
+        let health_events_jsonl = logs_dir.join("health-events.jsonl");
+        let options = OpportunityRecorderOptions {
+            root: root.path().to_path_buf(),
+            opportunity_dir,
+            logs_dir: logs_dir.clone(),
+            feedback_log: logs_dir.join("realtime-feedback.log"),
+            health_events_jsonl: health_events_jsonl.clone(),
+            basis_resident_out_dir: root.path().join("resident-live/spot-perp-basis"),
+            funding_arb_resident_out_dir: funding_arb_dir,
+            spot_sources: Vec::new(),
+            funding_arb_url: None,
+            strategies,
+            execution_mode: "live".to_owned(),
+            spot_perp_basis_mode: "resident".to_owned(),
+            funding_arb_mode: "resident".to_owned(),
+            interval_secs: 5,
+            timeout_secs: 1,
+            retries: 1,
+            retry_sleep_ms: 0,
+            blocking_path_limit: 12,
+            health_sample_secs: 0,
+            resident_health_tail_lines: 200,
+            once: true,
+        };
+        let mut sampler = OpportunityRecorderHealthSampler::new(0);
+
+        append_opportunity_recorder_resident_health_events(&options, &mut sampler)
+            .expect("append health events");
+
+        let health_events = read_utf8(&health_events_jsonl).expect("health events");
+        assert!(health_events.contains("\"status\":\"healthy\""));
+        assert!(health_events.contains("\"stale_candidate_count\":1"));
+        assert!(health_events.contains("\"cycle_error_count\":0"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn opportunity_recorder_resident_health_counts_execution_risk_events() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let logs_dir = root.path().join("logs");
+        let opportunity_dir = root.path().join("opportunities");
+        let funding_arb_dir = root.path().join("resident-live/cross-exchange-funding-arb");
+        ensure_dir(&logs_dir).expect("logs dir");
+        ensure_dir(&opportunity_dir).expect("opportunity dir");
+        ensure_dir(&funding_arb_dir).expect("funding arb dir");
+        let recorded_at = current_utc_timestamp_string();
+        write_utf8(
+            funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
+            &format!(
+                "{}\n{}\n{}\n{}",
+                r#"{"event_type":"resident_started"}"#,
+                format!(
+                    r#"{{"event_type":"candidate_cycle","execution_report_status":"PartiallySucceeded","exchange_pnl_status":"PendingManualSync","recorded_at":{}}}"#,
+                    json_string(&recorded_at)
+                ),
+                format!(
+                    r#"{{"event_type":"position_unknown","private_position_status":"Mismatch","pair_id":"binance:bybit:BTRUSDT:BTRUSDT","recorded_at":{}}}"#,
+                    json_string(&recorded_at)
+                ),
+                format!(
+                    r#"{{"event_type":"residual_de_risk_retry","pair_id":"binance:bybit:BTRUSDT:BTRUSDT","recorded_at":{}}}"#,
+                    json_string(&recorded_at)
+                )
+            ),
+        )
+        .expect("write resident event log");
+
+        let mut strategies = BTreeSet::new();
+        strategies.insert(CROSS_EXCHANGE_FUNDING_ARB_OBSERVER_STRATEGY.to_owned());
+        let health_events_jsonl = logs_dir.join("health-events.jsonl");
+        let options = OpportunityRecorderOptions {
+            root: root.path().to_path_buf(),
+            opportunity_dir,
+            logs_dir: logs_dir.clone(),
+            feedback_log: logs_dir.join("realtime-feedback.log"),
+            health_events_jsonl: health_events_jsonl.clone(),
+            basis_resident_out_dir: root.path().join("resident-live/spot-perp-basis"),
+            funding_arb_resident_out_dir: funding_arb_dir,
+            spot_sources: Vec::new(),
+            funding_arb_url: None,
+            strategies,
+            execution_mode: "live".to_owned(),
+            spot_perp_basis_mode: "resident".to_owned(),
+            funding_arb_mode: "resident".to_owned(),
+            interval_secs: 5,
+            timeout_secs: 1,
+            retries: 1,
+            retry_sleep_ms: 0,
+            blocking_path_limit: 12,
+            health_sample_secs: 0,
+            resident_health_tail_lines: 200,
+            once: true,
+        };
+        let mut sampler = OpportunityRecorderHealthSampler::new(0);
+
+        append_opportunity_recorder_resident_health_events(&options, &mut sampler)
+            .expect("append health events");
+
+        let health_events = read_utf8(&health_events_jsonl).expect("health events");
+        assert!(health_events.contains("\"status\":\"warning\""));
+        assert!(health_events.contains("\"partial_execution_count\":1"));
+        assert!(health_events.contains("\"position_unknown_count\":1"));
+        assert!(health_events.contains("\"pending_pnl_sync_count\":1"));
+        assert!(health_events.contains("\"exit_position_mismatch_count\":1"));
+        assert!(health_events.contains("\"execution_risk_event_count\":4"));
+        assert!(health_events.contains("BTRUSDT"));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_arb_resident_stale_candidate_event_is_not_cycle_error() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        append_funding_arb_resident_error_event(
+            root.path(),
+            7,
+            &root.path().join("cycles/000007-2026-06-03T114053075963642Z"),
+            "arb-runtime: funding arb monitor row is not a candidate: forward=net_funding_bps=-5 below minimum 5",
+        )
+        .expect("append event");
+
+        let events =
+            read_utf8(&root.path().join("funding_arb_resident_live_events.jsonl")).expect("events");
+        assert!(events.contains("\"event_type\":\"candidate_stale\""));
+        assert!(events.contains("\"error_class\":\"stale_funding_arb_candidate\""));
+        assert!(!events.contains("\"event_type\":\"cycle_error\""));
     }
 
     #[test]
