@@ -1744,11 +1744,13 @@ pub(crate) fn bootstrap_binance_wss_book_ticker_all_market(
 
     let stream_url =
         binance_wss_book_ticker_all_market_stream_url(market, &symbols, all_symbols_scope)?;
+    let ignore_untracked_wss_symbols = all_symbols_scope
+        || binance_usdm_wss_book_ticker_uses_all_market_stream(market, &symbols, all_symbols_scope);
     Ok(PublicTopOfBookAllMarketState {
         venue_id,
         stream_url,
         subscribe_args: Vec::new(),
-        ignore_untracked_wss_symbols: all_symbols_scope,
+        ignore_untracked_wss_symbols,
         coordinators,
         local_sequences,
         last_exchange_update_ids: BTreeMap::new(),
@@ -3622,7 +3624,11 @@ pub(crate) fn binance_wss_book_ticker_all_market_stream_url(
             ))
         }
         BinancePublicMarket::UsdmPerpetual => {
-            if all_symbols_scope {
+            if binance_usdm_wss_book_ticker_uses_all_market_stream(
+                market,
+                symbols,
+                all_symbols_scope,
+            ) {
                 Ok("wss://fstream.binance.com/public/ws/!bookTicker".to_owned())
             } else if symbols.len() == 1 {
                 Ok(format!(
@@ -3649,6 +3655,14 @@ pub(crate) fn binance_wss_book_ticker_all_market_stream_url(
             }
         }
     }
+}
+
+pub(crate) fn binance_usdm_wss_book_ticker_uses_all_market_stream(
+    market: BinancePublicMarket,
+    symbols: &[String],
+    all_symbols_scope: bool,
+) -> bool {
+    matches!(market, BinancePublicMarket::UsdmPerpetual) && (all_symbols_scope || symbols.len() > 1)
 }
 
 pub(crate) fn aster_wss_book_ticker_stream_url(

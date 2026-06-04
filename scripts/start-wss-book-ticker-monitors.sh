@@ -93,7 +93,7 @@ start_monitor() {
   local log_file="${LOG_DIR}/${name}.log"
 
   echo "starting ${name}: http://${bind_addr}/api/binance-wss-book-ticker/status"
-  "${RUNTIME_BIN}" "${command}" \
+  env ARB_RUNTIME_ENABLE_LEGACY_COMMANDS=1 "${RUNTIME_BIN}" "${command}" \
     --bind "${bind_addr}" \
     --symbol "${symbol}" \
     --market "${market}" \

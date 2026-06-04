@@ -51127,10 +51127,23 @@ mod tests {
             false,
         )
         .expect("scoped usdm url");
+        let scoped_usdm_single = binance_wss_book_ticker_all_market_stream_url(
+            BinancePublicMarket::UsdmPerpetual,
+            &["BTCUSDT".to_owned()],
+            false,
+        )
+        .expect("scoped usdm single url");
 
         assert!(spot.contains("/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"));
         assert_eq!(usdm, "wss://fstream.binance.com/public/ws/!bookTicker");
-        assert!(scoped_usdm.contains("/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"));
+        assert_eq!(
+            scoped_usdm,
+            "wss://fstream.binance.com/public/ws/!bookTicker"
+        );
+        assert_eq!(
+            scoped_usdm_single,
+            "wss://fstream.binance.com/public/ws/btcusdt@bookTicker"
+        );
     }
 
     #[test]
