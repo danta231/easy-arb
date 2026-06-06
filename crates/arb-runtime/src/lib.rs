@@ -546,6 +546,8 @@ const FUNDING_ARB_EXIT_EMERGENCY_DE_RISK_SLIPPAGE_BPS: i128 = 100;
 const FUNDING_ARB_EXIT_EXPECTED_RETURN_HARD_LOSS_BPS: i128 = -20;
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_EXIT_EXPECTED_RETURN_SEVERE_LOSS_BPS: i128 = -30;
+#[cfg(feature = "live-exec")]
+const FUNDING_ARB_ENTRY_TERMINAL_NON_FILL_COOLDOWN_SECS: u64 = 15 * 60;
 
 fn default_funding_carry_perp_modes() -> Vec<String> {
     vec![
@@ -19708,6 +19710,9 @@ fn funding_arb_pair_row(
     venue_b: &FundingArbVenueMarket,
     options: &FundingArbMonitorOptions,
 ) -> RuntimeResult<FundingArbMarketRow> {
+    let (venue_a, venue_b) = funding_arb_instrument_registry_pair(venue_a, venue_b);
+    let venue_a = &venue_a;
+    let venue_b = &venue_b;
     let symbol = funding_display_symbol(&venue_a.base_asset);
     let pair_id = format!(
         "{}:{}:{}:{}",
@@ -20030,6 +20035,57 @@ fn funding_arb_pair_row(
         Some(selected.0.entry_price_edge_bps.clone()),
         Some(settlement_decision.expected_funding_usd),
     ))
+}
+
+fn funding_arb_instrument_registry_pair(
+    venue_a: &FundingArbVenueMarket,
+    venue_b: &FundingArbVenueMarket,
+) -> (FundingArbVenueMarket, FundingArbVenueMarket) {
+    let mut registered_a = venue_a.clone();
+    let mut registered_b = venue_b.clone();
+    funding_arb_apply_hyperliquid_derived_next_funding_time(&mut registered_a, venue_b);
+    funding_arb_apply_hyperliquid_derived_next_funding_time(&mut registered_b, venue_a);
+    (registered_a, registered_b)
+}
+
+fn funding_arb_apply_hyperliquid_derived_next_funding_time(
+    target: &mut FundingArbVenueMarket,
+    other: &FundingArbVenueMarket,
+) {
+    if normalize_venue_family(&target.venue_family) != "hyperliquid" {
+        return;
+    }
+    if target
+        .next_funding_time_ms
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return;
+    }
+    if parse_positive_u64_runtime(
+        "hyperliquid funding_interval_hours",
+        &target.funding_interval_hours,
+    )
+    .ok()
+        != Some(1)
+    {
+        return;
+    }
+    let Some(other_next) =
+        funding_arb_optional_positive_next_funding_time_ms(other.next_funding_time_ms.as_deref())
+    else {
+        return;
+    };
+    if other_next % 3_600_000 != 0 {
+        return;
+    }
+    target.next_funding_time_ms = Some(other_next.to_string());
+}
+
+fn funding_arb_optional_positive_next_funding_time_ms(value: Option<&str>) -> Option<i128> {
+    let parsed = value?.trim().parse::<i128>().ok()?;
+    (parsed > 0).then_some(parsed)
 }
 
 fn funding_arb_signal_net_funding_bps_decimal(
@@ -22970,7 +23026,7 @@ fn count_lines_containing(lines: &[&str], pattern: &str) -> usize {
 
 #[cfg(feature = "live-exec")]
 fn count_lines_matching(lines: &[&str], predicate: impl Fn(&str) -> bool) -> usize {
-    lines.iter().filter(|line| predicate(*line)).count()
+    lines.iter().filter(|line| predicate(line)).count()
 }
 
 #[cfg(feature = "live-exec")]
@@ -33046,6 +33102,7 @@ fn run_funding_arb_resident_cycle(
         path: cycle_dir.to_path_buf(),
         message: error.to_string(),
     })?;
+    let output_root = funding_arb_resident_output_root(options);
     let snapshot = load_funding_arb_resident_snapshot(options)?;
     let snapshot_path = cycle_dir.join("funding_arb_monitor_snapshot.json");
     let selected_row = select_funding_arb_resident_candidate(&snapshot, options).cloned();
@@ -33074,6 +33131,31 @@ fn run_funding_arb_resident_cycle(
     let pair_id = row.pair_id.clone();
     let symbol = row.symbol.clone();
     let net_funding_bps = funding_arb_row_net_funding_bps(row);
+    if let Some(cooldown) = funding_arb_resident_pair_cooldown_blocking_entry(&output_root, row)? {
+        return Ok(FundingArbResidentCycleResult::NoCandidate {
+            pair_id: Some(pair_id),
+            symbol: Some(symbol),
+            reason: cooldown.reason.clone(),
+            blocking_path: vec![cooldown],
+            snapshot_path,
+        });
+    }
+    let pre_entry_blocking_path =
+        funding_arb_resident_pre_entry_quality_blocking_path(row, options)?;
+    if !pre_entry_blocking_path.is_empty() {
+        let reason = pre_entry_blocking_path
+            .iter()
+            .map(|entry| entry.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Ok(FundingArbResidentCycleResult::NoCandidate {
+            pair_id: Some(pair_id),
+            symbol: Some(symbol),
+            reason,
+            blocking_path: pre_entry_blocking_path,
+            snapshot_path,
+        });
+    }
     let private = match run_funding_arb_private_readonly_snapshot_once(
         FundingArbPrivateReadonlySnapshotOnceOptions {
             config_path: options.config_path.clone(),
@@ -33825,6 +33907,14 @@ fn load_funding_arb_resident_snapshot(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_resident_output_root(options: &FundingArbResidentLiveOptions) -> PathBuf {
+    options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(FUNDING_ARB_RESIDENT_LIVE_DEFAULT_OUT))
+}
+
+#[cfg(feature = "live-exec")]
 fn select_funding_arb_resident_candidate<'a>(
     snapshot: &'a FundingArbMonitorSnapshot,
     options: &FundingArbResidentLiveOptions,
@@ -33893,6 +33983,198 @@ fn funding_arb_row_gross_funding_spread_bps_decimal(
 fn funding_arb_row_total_cost_bps_decimal(row: &FundingArbMarketRow) -> Option<MonitorDecimal> {
     let value = row.total_cost_bps.as_deref()?;
     MonitorDecimal::parse("funding_arb.total_cost_bps", value).ok()
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_pre_entry_quality_blocking_path(
+    row: &FundingArbMarketRow,
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<Vec<FundingArbBlockingPathEntry>> {
+    let mut entries = Vec::new();
+    if row.source_status != "complete" {
+        entries.push(
+            FundingArbBlockingPathEntry::new(
+                "pre_entry_quality",
+                "source_status_not_complete",
+                format!(
+                    "阻断原因：入场前行情状态不是 complete；source_status={}",
+                    row.source_status
+                ),
+            )
+            .with_pair(row.pair_id.clone(), row.symbol.clone())
+            .with_venues(row.venue_a_family.clone(), row.venue_b_family.clone())
+            .with_source_status(row.source_status.clone()),
+        );
+    }
+    if funding_arb_row_target_funding_time_ms(row).is_none() {
+        entries.push(
+            FundingArbBlockingPathEntry::new(
+                "pre_entry_quality",
+                "target_funding_time_missing",
+                "阻断原因：入场前无法确认两腿目标资金费结算时间",
+            )
+            .with_pair(row.pair_id.clone(), row.symbol.clone())
+            .with_venues(row.venue_a_family.clone(), row.venue_b_family.clone())
+            .with_source_status(row.source_status.clone()),
+        );
+    }
+    if let Some(reason) = funding_arb_resident_pre_entry_executability_reason(row, options)? {
+        entries.push(
+            FundingArbBlockingPathEntry::new(
+                "pre_entry_quality",
+                "two_leg_executability",
+                format!("阻断原因：入场前两腿可执行性检查失败；{reason}"),
+            )
+            .with_pair(row.pair_id.clone(), row.symbol.clone())
+            .with_venues(row.venue_a_family.clone(), row.venue_b_family.clone())
+            .with_source_status(row.source_status.clone()),
+        );
+    }
+    if let Some(reason) =
+        funding_arb_pre_entry_economics_blocking_reason_from_row(row, options.min_net_funding_bps)?
+    {
+        entries.push(
+            FundingArbBlockingPathEntry::new(
+                "pre_entry_quality",
+                "pre_dispatch_entry_economics",
+                format!("阻断原因：入场前净收益保护失败；{reason}"),
+            )
+            .with_pair(row.pair_id.clone(), row.symbol.clone())
+            .with_venues(row.venue_a_family.clone(), row.venue_b_family.clone())
+            .with_source_status(row.source_status.clone()),
+        );
+    }
+    Ok(entries)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_pre_entry_executability_reason(
+    row: &FundingArbMarketRow,
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<Option<String>> {
+    let Some(long_family) = row.long_venue_family.as_ref() else {
+        return Ok(Some("missing long_venue_family".to_owned()));
+    };
+    let Some(short_family) = row.short_venue_family.as_ref() else {
+        return Ok(Some("missing short_venue_family".to_owned()));
+    };
+    let (venue_a_symbol, venue_b_symbol) =
+        funding_arb_row_venue_symbols(row).ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("cannot parse funding arb pair_id `{}`", row.pair_id),
+        })?;
+    let depths = FundingArbDepthBackfillMaps::default();
+    let venue_a = funding_arb_market_from_monitor_row(row, true, &venue_a_symbol, &depths);
+    let venue_b = funding_arb_market_from_monitor_row(row, false, &venue_b_symbol, &depths);
+    let long_family = normalize_venue_family(long_family);
+    let short_family = normalize_venue_family(short_family);
+    let venue_a_family = normalize_venue_family(&venue_a.venue_family);
+    let venue_b_family = normalize_venue_family(&venue_b.venue_family);
+    let (long_market, short_market) =
+        if long_family == venue_a_family && short_family == venue_b_family {
+            (&venue_a, &venue_b)
+        } else if long_family == venue_b_family && short_family == venue_a_family {
+            (&venue_b, &venue_a)
+        } else {
+            return Ok(Some(format!(
+            "row direction does not match venue pair: long={}, short={}, venue_a={}, venue_b={}",
+            long_family, short_family, venue_a.venue_family, venue_b.venue_family
+        )));
+        };
+    let signal = evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+        symbol: row.symbol.clone(),
+        long_venue_id: long_market.venue_family.clone(),
+        short_venue_id: short_market.venue_family.clone(),
+        long_best_bid: long_market.perp_bid.clone().unwrap_or_default(),
+        long_best_ask: long_market.perp_ask.clone().unwrap_or_default(),
+        long_ask_size: long_market.perp_ask_qty.clone(),
+        long_ask_depth: long_market.perp_ask_depth.clone(),
+        short_best_bid: short_market.perp_bid.clone().unwrap_or_default(),
+        short_best_ask: short_market.perp_ask.clone().unwrap_or_default(),
+        short_bid_size: short_market.perp_bid_qty.clone(),
+        short_bid_depth: short_market.perp_bid_depth.clone(),
+        long_funding_rate: long_market.funding_rate.clone(),
+        short_funding_rate: short_market.funding_rate.clone(),
+        funding_interval_hours: "8".to_owned(),
+        notional_usd: options.notional_usd.clone(),
+        long_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            &long_market.venue_family,
+            &options.taker_fee_bps,
+        ),
+        short_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            &short_market.venue_family,
+            &options.taker_fee_bps,
+        ),
+        slippage_buffer_bps: options.slippage_buffer_bps,
+        max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+        min_net_funding_bps: options.min_net_funding_bps,
+    })
+    .map_err(|message| RuntimeError::LiveMarketData { message })?;
+    if signal.is_candidate {
+        return Ok(None);
+    }
+    let reason = signal
+        .reason
+        .unwrap_or_else(|| "not a candidate".to_owned());
+    if reason.contains("insufficient order-book depth")
+        || reason.contains("entry_price_divergence_bps")
+    {
+        Ok(Some(reason))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_pre_entry_economics_blocking_reason_from_row(
+    row: &FundingArbMarketRow,
+    min_net_funding_bps: i128,
+) -> RuntimeResult<Option<String>> {
+    let Some(gross_funding_spread_bps) = funding_arb_row_gross_funding_spread_bps_decimal(row)
+    else {
+        return Ok(Some(
+            "pre_dispatch_entry_economics: missing gross_funding_spread_bps".to_owned(),
+        ));
+    };
+    let Some(total_cost_bps) = funding_arb_row_total_cost_bps_decimal(row) else {
+        return Ok(Some(
+            "pre_dispatch_entry_economics: missing total_cost_bps".to_owned(),
+        ));
+    };
+    let Some(entry_price_edge_bps) = row
+        .entry_price_edge_bps
+        .as_deref()
+        .map(|value| MonitorDecimal::parse("funding_arb.entry_price_edge_bps", value))
+        .transpose()?
+    else {
+        return Ok(Some(
+            "pre_dispatch_entry_economics: missing entry_price_edge_bps".to_owned(),
+        ));
+    };
+    let min_net = monitor_decimal_from_i128(min_net_funding_bps).ok_or_else(|| {
+        RuntimeError::LiveMarketData {
+            message: "funding arb min_net_funding_bps overflowed".to_owned(),
+        }
+    })?;
+    let entry_price_adverse_bps = funding_arb_adverse_entry_bps(entry_price_edge_bps)?;
+    let single_leg_net_bps = gross_funding_spread_bps
+        .checked_sub(total_cost_bps, "funding arb pre-dispatch net funding bps")?
+        .checked_sub(
+            entry_price_adverse_bps,
+            "funding arb pre-dispatch entry-adjusted net funding bps",
+        )?;
+    let net_funding_bps = funding_arb_two_leg_monitor_return_bps(single_leg_net_bps)?;
+    if net_funding_bps.raw >= min_net.raw {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "pre_dispatch_entry_economics: expected_net_funding_bps={} below minimum {}; gross_funding_spread_bps={}, total_cost_bps={}, entry_price_edge_bps={}, entry_price_adverse_bps={}",
+        net_funding_bps.format_trimmed(),
+        min_net_funding_bps,
+        gross_funding_spread_bps.format_trimmed(),
+        total_cost_bps.format_trimmed(),
+        entry_price_edge_bps.format_trimmed(),
+        entry_price_adverse_bps.format_trimmed()
+    )))
 }
 
 #[cfg(feature = "live-exec")]
@@ -34259,6 +34541,135 @@ fn funding_arb_resident_no_candidate_blocking_path(
         }
     }
     entries
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_pair_cooldown_blocking_entry(
+    output_root: &Path,
+    row: &FundingArbMarketRow,
+) -> RuntimeResult<Option<FundingArbBlockingPathEntry>> {
+    let now_ms = runtime_timestamp_millis(current_utc_timestamp()?)?;
+    let Some(reason) = funding_arb_resident_pair_terminal_non_fill_cooldown_reason_at(
+        output_root,
+        &row.pair_id,
+        now_ms,
+        FUNDING_ARB_ENTRY_TERMINAL_NON_FILL_COOLDOWN_SECS,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        FundingArbBlockingPathEntry::new(
+            "pre_entry_cooldown",
+            "terminal_non_fill_pair_cooldown",
+            reason,
+        )
+        .with_pair(row.pair_id.clone(), row.symbol.clone())
+        .with_venues(row.venue_a_family.clone(), row.venue_b_family.clone())
+        .with_source_status("cooldown"),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_pair_terminal_non_fill_cooldown_reason_at(
+    output_root: &Path,
+    pair_id: &str,
+    now_ms: i128,
+    cooldown_secs: u64,
+) -> RuntimeResult<Option<String>> {
+    let path = output_root.join("funding_arb_resident_positions.jsonl");
+    if !path.exists() || cooldown_secs == 0 {
+        return Ok(None);
+    }
+    let cooldown_ms = i128::from(cooldown_secs).saturating_mul(1_000);
+    let mut latest_terminal = None::<(i128, String, String)>;
+    let mut latest_clear = None::<i128>;
+    let contents = read_utf8(&path)?;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = match parse_json_object_value_slices(line) {
+            Ok(fields) => fields,
+            Err(_) => continue,
+        };
+        let event_pair_id = match optional_json_value_string(
+            &fields,
+            "pair_id",
+            "funding arb resident pair cooldown",
+        ) {
+            Ok(event_pair_id) => event_pair_id,
+            Err(_) => continue,
+        };
+        if event_pair_id.as_deref() != Some(pair_id) {
+            continue;
+        }
+        let event_type = match required_json_value_string(
+            &fields,
+            "event_type",
+            "funding arb resident pair cooldown",
+        ) {
+            Ok(event_type) => event_type,
+            Err(_) => continue,
+        };
+        let event_ms = match funding_arb_resident_event_timestamp_ms(&fields) {
+            Ok(Some(event_ms)) => event_ms,
+            Ok(None) | Err(_) => continue,
+        };
+        if funding_arb_resident_terminal_non_fill_event_type(&event_type) {
+            if latest_terminal
+                .as_ref()
+                .is_none_or(|(latest_ms, _, _)| event_ms >= *latest_ms)
+            {
+                latest_terminal = Some((event_ms, event_type, line.to_owned()));
+            }
+        } else if funding_arb_resident_pair_cooldown_clear_event_type(&event_type)
+            && latest_clear.is_none_or(|latest_ms| event_ms >= latest_ms)
+        {
+            latest_clear = Some(event_ms);
+        }
+    }
+    let Some((terminal_ms, event_type, line)) = latest_terminal else {
+        return Ok(None);
+    };
+    if latest_clear.is_some_and(|clear_ms| clear_ms >= terminal_ms) {
+        return Ok(None);
+    }
+    let elapsed_ms = now_ms.saturating_sub(terminal_ms).max(0);
+    if elapsed_ms >= cooldown_ms {
+        return Ok(None);
+    }
+    let remaining_secs = (cooldown_ms - elapsed_ms + 999) / 1_000;
+    Ok(Some(format!(
+        "阻断原因：同一交易对 `{pair_id}` 最近发生 `{event_type}`，进入 {} 秒冷却窗口；remaining_secs={}；terminal_event={}",
+        cooldown_secs,
+        remaining_secs,
+        line
+    )))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_event_timestamp_ms(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<i128>> {
+    for field in ["closed_at", "recorded_at", "opened_at"] {
+        let Some(value) =
+            optional_json_value_string(fields, field, "funding arb resident event timestamp")?
+        else {
+            continue;
+        };
+        if let Ok(timestamp) = UtcTimestamp::from_str(&value) {
+            return runtime_timestamp_millis(timestamp).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_terminal_non_fill_event_type(event_type: &str) -> bool {
+    matches!(event_type, "position_flat_cancelled" | "position_unknown")
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_pair_cooldown_clear_event_type(event_type: &str) -> bool {
+    matches!(event_type, "position_opened" | "position_closed")
 }
 
 #[cfg(feature = "live-exec")]
@@ -35751,7 +36162,91 @@ fn append_funding_arb_resident_position_jsonl(output_root: &Path, line: &str) ->
     append_line_to_jsonl(
         output_root.join("funding_arb_resident_positions.jsonl"),
         line,
+    )?;
+    if let Err(error) =
+        append_funding_arb_reconciliation_state_from_position_event(output_root, line)
+    {
+        let warning = format!(
+            "{{\"error\":{},\"event_type\":\"reconciliation_state_append_failed\",\"recorded_at\":{}}}",
+            json_string(&error.to_string()),
+            json_string(&current_utc_timestamp_string()),
+        );
+        let _ = append_funding_arb_resident_event(output_root, &warning);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_reconciliation_state_from_position_event(
+    output_root: &Path,
+    line: &str,
+) -> RuntimeResult<()> {
+    let fields = parse_json_object_value_slices(line)?;
+    let event_type = required_json_value_string(
+        &fields,
+        "event_type",
+        "funding arb reconciliation state event",
+    )?;
+    if !funding_arb_resident_terminal_position_event_type(&event_type) {
+        return Ok(());
+    }
+    let exchange_pnl_status = optional_json_value_string(
+        &fields,
+        "exchange_pnl_status",
+        "funding arb reconciliation state event",
+    )?
+    .unwrap_or_else(|| "PendingManualSync".to_owned());
+    let (to_state, reason_code) =
+        funding_arb_reconciliation_state_for_exchange_pnl_status(&exchange_pnl_status);
+    let recorded_at = current_utc_timestamp_string();
+    let position_id = optional_json_value_string(
+        &fields,
+        "position_id",
+        "funding arb reconciliation state event",
+    )?;
+    let pair_id =
+        optional_json_value_string(&fields, "pair_id", "funding arb reconciliation state event")?;
+    let symbol =
+        optional_json_value_string(&fields, "symbol", "funding arb reconciliation state event")?;
+    let position_status =
+        optional_json_value_string(&fields, "status", "funding arb reconciliation state event")?;
+    let line = format!(
+        "{{\"event_type\":\"reconciliation_state_transition\",\"exchange_pnl_status\":{},\"from_state\":\"TerminalObserved\",\"pair_id\":{},\"position_id\":{},\"position_status\":{},\"reason_code\":{},\"recorded_at\":{},\"schema_version\":\"1.0.0\",\"source_event_type\":{},\"state_machine\":\"funding_arb_terminal_reconciliation\",\"symbol\":{},\"to_state\":{}}}",
+        json_string(&exchange_pnl_status),
+        optional_json_string(pair_id.as_deref()),
+        optional_json_string(position_id.as_deref()),
+        optional_json_string(position_status.as_deref()),
+        json_string(reason_code),
+        json_string(&recorded_at),
+        json_string(&event_type),
+        optional_json_string(symbol.as_deref()),
+        json_string(to_state),
+    );
+    append_line_to_jsonl(
+        output_root.join("funding_arb_reconciliation_state.jsonl"),
+        &line,
     )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_terminal_position_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "position_closed" | "position_unknown" | "position_flat_cancelled"
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_reconciliation_state_for_exchange_pnl_status(
+    status: &str,
+) -> (&'static str, &'static str) {
+    match status {
+        "Confirmed" => ("Confirmed", "exchange_pnl_confirmed"),
+        "Incomplete" => ("RetryRequired", "exchange_pnl_incomplete"),
+        "PendingManualSync" => ("ManualRequired", "exchange_pnl_pending_manual_sync"),
+        "NotChecked" => ("ManualRequired", "exchange_pnl_not_checked"),
+        _ => ("ManualRequired", "exchange_pnl_status_unknown"),
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -38376,12 +38871,13 @@ fn write_funding_arb_resident_live_config(
     options: &FundingArbResidentLiveOptions,
 ) -> RuntimeResult<()> {
     let contents = format!(
-        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"auto_residual_de_risk\":{},\"config_path\":{},\"execute_live\":{},\"exit_only\":{},\"funding_carry_modes\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_total_notional_usdt\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"strategy_family\":{},\"taker_fee_bps\":{}}}",
+        "{{\"allow_unknown_recovery\":{},\"aster_signer_cmd_env\":{},\"aster_user\":{},\"auto_residual_de_risk\":{},\"config_path\":{},\"entry_terminal_non_fill_cooldown_secs\":{},\"execute_live\":{},\"exit_only\":{},\"funding_carry_modes\":{},\"funding_settlement_ledger_path\":{},\"funding_settlement_raw_snapshot_path\":{},\"hyperliquid_asset_id_count\":{},\"hyperliquid_expires_after_ms\":{},\"hyperliquid_source\":{},\"hyperliquid_user\":{},\"hyperliquid_vault_address\":{},\"max_cycles\":{},\"max_entry_price_divergence_bps\":{},\"max_total_notional_usdt\":{},\"min_net_funding_bps\":{},\"mutable_execution_started\":false,\"notional_usd\":{},\"output_dir\":{},\"pair_id\":{},\"poll_interval_secs\":{},\"private_execution_snapshot_path\":{},\"private_order_events_dir\":{},\"slippage_buffer_bps\":{},\"snapshot_path\":{},\"source_count\":{},\"sources\":{},\"strategy_family\":{},\"taker_fee_bps\":{}}}",
         options.allow_unknown_recovery,
         json_string(&options.aster_signer_cmd_env),
         optional_json_string(options.aster_user.as_deref()),
         options.auto_residual_de_risk,
         json_string(&options.config_path.display().to_string()),
+        FUNDING_ARB_ENTRY_TERMINAL_NON_FILL_COOLDOWN_SECS,
         options.execute_live,
         options.exit_only,
         json_string_array(&options.funding_carry_modes),
@@ -38662,6 +39158,26 @@ fn append_funding_arb_resident_residual_retry_event(
             json_string(reason),
             json_string(&recorded_at),
             optional_json_string(symbol),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_resident_recovery_complete_event(
+    output_root: &Path,
+    cycle: u64,
+    cycle_dir: &Path,
+    reason: &str,
+) -> RuntimeResult<()> {
+    let recorded_at = current_utc_timestamp_string();
+    append_funding_arb_resident_event(
+        output_root,
+        &format!(
+            "{{\"cycle\":{},\"cycle_dir\":{},\"event_type\":\"position_recovery_complete\",\"recovery_action\":\"continue_after_safe_recovery\",\"recorded_at\":{},\"reason\":{}}}",
+            cycle,
+            json_string(&cycle_dir.display().to_string()),
+            json_string(&recorded_at),
+            json_string(reason),
         ),
     )
 }
@@ -54189,7 +54705,7 @@ mod tests {
     }
 
     #[test]
-    fn funding_arb_monitor_blocks_missing_next_funding_time() {
+    fn funding_arb_monitor_derives_hyperliquid_missing_next_funding_time() {
         let aster = funding_arb_test_venue_snapshot(
             "aster",
             &funding_arb_basis_status_json_with_interval_and_next(
@@ -54240,6 +54756,62 @@ mod tests {
         assert_eq!(snapshot.candidate_count, 0);
         let row = &snapshot.rows[0];
         assert_eq!(row.long_venue_family.as_deref(), Some("hyperliquid"));
+        assert_eq!(row.venue_b_next_funding_time_ms, "1779436800000");
+        assert!(!row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("next_funding_time_ms is missing")));
+    }
+
+    #[test]
+    fn funding_arb_monitor_blocks_non_hyperliquid_missing_next_funding_time() {
+        let aster = funding_arb_test_venue_snapshot(
+            "aster",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "PROVEUSDT",
+                "-0.00424802",
+                "8",
+                "1779436800000",
+                "complete",
+                Some("2985"),
+                Some("7621"),
+            ),
+        );
+        let bybit = funding_arb_test_venue_snapshot(
+            "bybit",
+            &funding_arb_basis_status_json_with_interval_and_next(
+                "PROVEUSDT",
+                "-0.0009435025",
+                "8",
+                "",
+                "complete",
+                Some("643"),
+                Some("1995"),
+            ),
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "aster".to_owned(),
+                    status_url: "http://127.0.0.1/aster/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "bybit".to_owned(),
+                    status_url: "http://127.0.0.1/bybit/status".to_owned(),
+                },
+            ],
+            taker_fee_bps: "1".to_owned(),
+            slippage_buffer_bps: 0,
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![aster, bybit], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.candidate_count, 0);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.short_venue_family.as_deref(), Some("bybit"));
         assert!(row
             .reason
             .as_deref()
@@ -56679,6 +57251,93 @@ mod tests {
         ));
     }
 
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_pair_cooldown_blocks_recent_terminal_non_fill() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            r#"{"closed_at":"2026-05-13T00:00:00Z","event_type":"position_flat_cancelled","pair_id":"binance:bybit:BTCUSDT:BTCUSDT","position_id":"pos:cooldown","status":"flat_cancelled","symbol":"BTCUSDT"}"#,
+        )
+        .expect("write flat-cancelled event");
+        let now_ms = i128::from(funding_arb_test_timestamp_ms("2026-05-13T00:05:00Z"));
+
+        let reason = funding_arb_resident_pair_terminal_non_fill_cooldown_reason_at(
+            root.path(),
+            "binance:bybit:BTCUSDT:BTCUSDT",
+            now_ms,
+            FUNDING_ARB_ENTRY_TERMINAL_NON_FILL_COOLDOWN_SECS,
+        )
+        .expect("cooldown reason")
+        .expect("recent terminal non-fill should block");
+
+        assert!(reason.contains("position_flat_cancelled"));
+        assert!(reason.contains("remaining_secs=600"));
+
+        let after_cooldown_ms = i128::from(funding_arb_test_timestamp_ms("2026-05-13T00:15:01Z"));
+        assert!(
+            funding_arb_resident_pair_terminal_non_fill_cooldown_reason_at(
+                root.path(),
+                "binance:bybit:BTCUSDT:BTCUSDT",
+                after_cooldown_ms,
+                FUNDING_ARB_ENTRY_TERMINAL_NON_FILL_COOLDOWN_SECS,
+            )
+            .expect("cooldown elapsed")
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_pair_cooldown_skips_malformed_history_lines() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            concat!(
+                "not-json\n",
+                "{\"event_type\":42,\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\"}\n",
+                "{\"closed_at\":\"2026-05-13T00:00:00Z\",\"event_type\":\"position_flat_cancelled\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:cooldown\",\"status\":\"flat_cancelled\",\"symbol\":\"BTCUSDT\"}\n"
+            ),
+        )
+        .expect("write mixed history");
+        let now_ms = i128::from(funding_arb_test_timestamp_ms("2026-05-13T00:05:00Z"));
+
+        let reason = funding_arb_resident_pair_terminal_non_fill_cooldown_reason_at(
+            root.path(),
+            "binance:bybit:BTCUSDT:BTCUSDT",
+            now_ms,
+            FUNDING_ARB_ENTRY_TERMINAL_NON_FILL_COOLDOWN_SECS,
+        )
+        .expect("cooldown scan should ignore malformed lines")
+        .expect("valid terminal non-fill should still block");
+
+        assert!(reason.contains("position_flat_cancelled"));
+        assert!(reason.contains("remaining_secs=600"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_recovery_complete_event_records_continue_action() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let cycle_dir = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(1).expect("cycle dir"));
+
+        append_funding_arb_resident_recovery_complete_event(
+            root.path(),
+            1,
+            &cycle_dir,
+            "recovery complete",
+        )
+        .expect("append recovery complete event");
+
+        let events =
+            read_utf8(&root.path().join("funding_arb_resident_live_events.jsonl")).expect("events");
+        assert!(events.contains("\"event_type\":\"position_recovery_complete\""));
+        assert!(events.contains("\"recovery_action\":\"continue_after_safe_recovery\""));
+    }
+
     #[cfg(feature = "live-exec")]
     fn assert_funding_arb_position_history_line_complete(line: &str) {
         let fields = parse_json_object_value_slices(line).expect("position history line fields");
@@ -56785,6 +57444,12 @@ mod tests {
         assert!(registry.contains("\"submitted_receipt_count\":2"));
         assert!(registry.contains("\"exchange_pnl_status\":\"PendingManualSync\""));
         assert!(registry.contains("\"exchange_net_pnl_usd\":null"));
+        let reconciliation = read_utf8(&root.path().join("funding_arb_reconciliation_state.jsonl"))
+            .expect("reconciliation state");
+        assert!(reconciliation.contains("\"event_type\":\"reconciliation_state_transition\""));
+        assert!(reconciliation.contains("\"source_event_type\":\"position_closed\""));
+        assert!(reconciliation.contains("\"to_state\":\"ManualRequired\""));
+        assert!(reconciliation.contains("\"reason_code\":\"exchange_pnl_pending_manual_sync\""));
     }
 
     #[test]
@@ -56844,6 +57509,11 @@ mod tests {
         assert!(!line.contains("\"closed_at\":null"));
         assert!(line.contains("\"exchange_pnl_status\":\"NotChecked\""));
         assert!(line.contains("\"exchange_net_pnl_usd\":null"));
+        let reconciliation = read_utf8(&root.path().join("funding_arb_reconciliation_state.jsonl"))
+            .expect("reconciliation state");
+        assert!(reconciliation.contains("\"source_event_type\":\"position_unknown\""));
+        assert!(reconciliation.contains("\"to_state\":\"ManualRequired\""));
+        assert!(reconciliation.contains("\"reason_code\":\"exchange_pnl_not_checked\""));
     }
 
     #[test]
@@ -59071,6 +59741,23 @@ mod tests {
         .expect("post-fill economics");
 
         assert!(reason.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_pre_entry_economics_blocks_row_below_min_after_entry_edge() {
+        let mut row = funding_arb_test_row("0.00010000", "0.00600000");
+        row.gross_funding_spread_bps = Some("20".to_owned());
+        row.total_cost_bps = Some("10".to_owned());
+        row.entry_price_edge_bps = Some("-20".to_owned());
+
+        let reason = funding_arb_pre_entry_economics_blocking_reason_from_row(&row, 5)
+            .expect("pre-entry economics")
+            .expect("blocking reason");
+
+        assert!(reason.contains("pre_dispatch_entry_economics"));
+        assert!(reason.contains("below minimum 5"));
+        assert!(reason.contains("entry_price_adverse_bps=20"));
     }
 
     #[test]
@@ -65546,12 +66233,9 @@ mod tests {
         write_utf8(
             funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
             &format!(
-                "{}\n{}",
+                "{}\n{{\"event_type\":\"cycle_error\",\"error\":\"forced test failure\",\"recorded_at\":{}}}",
                 r#"{"event_type":"resident_started"}"#,
-                format!(
-                    r#"{{"event_type":"cycle_error","error":"forced test failure","recorded_at":{}}}"#,
-                    json_string(&recorded_at)
-                )
+                json_string(&recorded_at)
             ),
         )
         .expect("write resident event log");
@@ -65608,12 +66292,9 @@ mod tests {
         write_utf8(
             funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
             &format!(
-                "{}\n{}",
+                "{}\n{{\"event_type\":\"candidate_stale\",\"error\":\"arb-runtime: funding arb monitor row is not a candidate: forward=net_funding_bps=-4 below minimum 5\",\"error_class\":\"stale_funding_arb_candidate\",\"recorded_at\":{}}}",
                 r#"{"event_type":"resident_started"}"#,
-                format!(
-                    r#"{{"event_type":"candidate_stale","error":"arb-runtime: funding arb monitor row is not a candidate: forward=net_funding_bps=-4 below minimum 5","error_class":"stale_funding_arb_candidate","recorded_at":{}}}"#,
-                    json_string(&recorded_at)
-                )
+                json_string(&recorded_at)
             ),
         )
         .expect("write resident event log");
@@ -65669,20 +66350,11 @@ mod tests {
         write_utf8(
             funding_arb_dir.join("funding_arb_resident_live_events.jsonl"),
             &format!(
-                "{}\n{}\n{}\n{}",
+                "{}\n{{\"event_type\":\"candidate_cycle\",\"execution_report_status\":\"PartiallySucceeded\",\"exchange_pnl_status\":\"PendingManualSync\",\"recorded_at\":{}}}\n{{\"event_type\":\"position_unknown\",\"private_position_status\":\"Mismatch\",\"pair_id\":\"binance:bybit:BTRUSDT:BTRUSDT\",\"recorded_at\":{}}}\n{{\"event_type\":\"residual_de_risk_retry\",\"pair_id\":\"binance:bybit:BTRUSDT:BTRUSDT\",\"recorded_at\":{}}}",
                 r#"{"event_type":"resident_started"}"#,
-                format!(
-                    r#"{{"event_type":"candidate_cycle","execution_report_status":"PartiallySucceeded","exchange_pnl_status":"PendingManualSync","recorded_at":{}}}"#,
-                    json_string(&recorded_at)
-                ),
-                format!(
-                    r#"{{"event_type":"position_unknown","private_position_status":"Mismatch","pair_id":"binance:bybit:BTRUSDT:BTRUSDT","recorded_at":{}}}"#,
-                    json_string(&recorded_at)
-                ),
-                format!(
-                    r#"{{"event_type":"residual_de_risk_retry","pair_id":"binance:bybit:BTRUSDT:BTRUSDT","recorded_at":{}}}"#,
-                    json_string(&recorded_at)
-                )
+                json_string(&recorded_at),
+                json_string(&recorded_at),
+                json_string(&recorded_at)
             ),
         )
         .expect("write resident event log");

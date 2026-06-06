@@ -1297,26 +1297,29 @@ pub(crate) fn run_funding_arb_resident_live_inner(
             if position_recovery_drain_mode {
                 let registry = load_funding_arb_resident_position_registry(&output_root)?;
                 if funding_arb_position_recovery_drain_is_complete(&registry) {
-                    halt_reason = Some(
-                        "funding arb position recovery cycle completed; resident live stopped before new entries"
-                            .to_owned(),
-                    );
-                    break;
-                }
-                write_funding_arb_resident_live_progress_summary(
-                    &output_root,
-                    FundingArbResidentLiveProgressInput {
-                        phase: "running",
+                    append_funding_arb_resident_recovery_complete_event(
+                        &output_root,
                         cycles,
-                        last_pair_id: &last_pair_id,
-                        last_symbol: &last_symbol,
-                        last_net_funding_bps,
-                        dispatch_attempted,
-                        halt_reason: None,
-                    },
-                )?;
-                thread::sleep(Duration::from_secs(options.poll_interval_secs));
-                continue;
+                        &cycle_dir,
+                        "funding arb position recovery drain completed with no open or unknown positions; resident continues to new-entry checks",
+                    )?;
+                    position_recovery_drain_mode = false;
+                } else {
+                    write_funding_arb_resident_live_progress_summary(
+                        &output_root,
+                        FundingArbResidentLiveProgressInput {
+                            phase: "running",
+                            cycles,
+                            last_pair_id: &last_pair_id,
+                            last_symbol: &last_symbol,
+                            last_net_funding_bps,
+                            dispatch_attempted,
+                            halt_reason: None,
+                        },
+                    )?;
+                    thread::sleep(Duration::from_secs(options.poll_interval_secs));
+                    continue;
+                }
             }
             if options.exit_only {
                 halt_reason = Some(
