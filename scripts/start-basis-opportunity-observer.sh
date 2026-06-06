@@ -1822,6 +1822,11 @@ funding_arb_guarded_dry_run_report_is_stale_candidate_skip() {
   ' "${report_path}" >/dev/null
 }
 
+funding_arb_guarded_dry_run_log_is_stale_candidate_skip() {
+  local log_file="$1"
+  grep -F "funding arb monitor row is not a candidate: " "${log_file}" >/dev/null 2>&1
+}
+
 clear_funding_arb_startup_block_report() {
   local report_path="${FUNDING_ARB_STARTUP_PRECHECK_DIR}/funding_arb_startup_block_report.json"
   [[ -e "${report_path}" ]] || return 0
@@ -2364,6 +2369,10 @@ run_funding_arb_startup_dry_run_precheck_for_pair() {
 
   echo "funding_arb_startup_precheck_guarded_dry_run pair_id=${pair_id} out=${guarded_dir}"
   if ! "${dry_run_args[@]}" >> "${log_file}" 2>&1; then
+    if funding_arb_guarded_dry_run_log_is_stale_candidate_skip "${log_file}"; then
+      echo "funding_arb_startup_precheck_skip_stale_candidate pair_id=${pair_id} log=${log_file}"
+      return 2
+    fi
     write_funding_arb_startup_block_report "guarded_dry_run_failed" "[]" "${pair_id}" "${log_file}" 0
     echo "error: funding-arb startup guarded dry-run failed for pair_id=${pair_id}; log=${log_file}" >&2
     tail -n 40 "${log_file}" >&2 || true
