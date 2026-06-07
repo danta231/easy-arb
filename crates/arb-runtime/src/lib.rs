@@ -970,6 +970,10 @@ impl FundingPrivatePositionReconciliationSummary {
     fn is_matched(&self) -> bool {
         self.status == "Matched"
     }
+
+    fn has_position_snapshot(&self) -> bool {
+        self.status == "Matched" || self.status == "Mismatch"
+    }
 }
 
 /// funding arb 私有订单和成交对账摘要。
@@ -26114,7 +26118,7 @@ fn run_funding_arb_guarded_dry_run_from_normalized_events_with_reconciliations(
             funding_settlement.is_matched(),
             private_accounts.has_balance_snapshot() && private_account_fresh,
             private_accounts.has_margin_snapshot() && private_account_fresh,
-            private_positions.is_matched() && private_position_fresh,
+            private_positions.has_position_snapshot() && private_position_fresh,
             private_execution.is_matched(),
         ),
         &private_account_balances,
@@ -27111,7 +27115,7 @@ fn funding_arb_live_readiness(
                 .then(|| "private position snapshot reconciliation is not matched".to_owned())
         }),
     ));
-    if !input.private_positions.is_matched() {
+    if !input.private_positions.has_position_snapshot() {
         for leg in [
             &input.spec.strategy_config.venues.venue_a,
             &input.spec.strategy_config.venues.venue_b,
@@ -33566,7 +33570,7 @@ fn build_funding_arb_live_canary_pending_plan(
             dry_run.funding_settlement.is_matched(),
             dry_run.private_accounts.has_balance_snapshot() && private_account_fresh,
             dry_run.private_accounts.has_margin_snapshot() && private_account_fresh,
-            dry_run.private_positions.is_matched() && private_position_fresh,
+            dry_run.private_positions.has_position_snapshot() && private_position_fresh,
             dry_run.private_execution.is_matched(),
         ),
         &private_account_balances,
@@ -35577,6 +35581,7 @@ fn build_funding_arb_unknown_recovery_position_state_template(
             None,
         ),
     )?;
+    let (long_family, short_family) = funding_arb_recovery_row_direction_families(&row, options)?;
     let opened_at_value = unknown.opened_at.as_deref().unwrap_or(&snapshot.updated_at);
     let opened_at =
         UtcTimestamp::from_str(opened_at_value).map_err(|error| RuntimeError::Module {
@@ -35610,11 +35615,15 @@ fn build_funding_arb_unknown_recovery_position_state_template(
             &row,
             &spec.strategy_config.venues.venue_a,
             "venue_a",
+            &long_family,
+            &short_family,
         )?,
         leg_b: funding_arb_recovery_position_leg_state(
             &row,
             &spec.strategy_config.venues.venue_b,
             "venue_b",
+            &long_family,
+            &short_family,
         )?,
     };
     Ok((snapshot_path, row, state))
@@ -35672,27 +35681,104 @@ fn funding_arb_recovery_notional_usdt(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_recovery_row_direction_families(
+    row: &FundingArbMarketRow,
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<(String, String)> {
+    let row_long = row
+        .long_venue_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let row_short = row
+        .short_venue_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(long_family), Some(short_family)) = (row_long, row_short) {
+        return Ok((
+            normalize_venue_family(long_family),
+            normalize_venue_family(short_family),
+        ));
+    }
+
+    let venue_a = funding_arb_row_venue_fields(row, &row.venue_a_family)?;
+    let venue_b = funding_arb_row_venue_fields(row, &row.venue_b_family)?;
+    let forward = funding_arb_recovery_row_direction_signal(row, venue_a, venue_b, options)?;
+    let reverse = funding_arb_recovery_row_direction_signal(row, venue_b, venue_a, options)?;
+    if funding_arb_signal_net_funding_bps_decimal(&forward)?.raw
+        >= funding_arb_signal_net_funding_bps_decimal(&reverse)?.raw
+    {
+        Ok((
+            normalize_venue_family(venue_a.family),
+            normalize_venue_family(venue_b.family),
+        ))
+    } else {
+        Ok((
+            normalize_venue_family(venue_b.family),
+            normalize_venue_family(venue_a.family),
+        ))
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_recovery_row_direction_signal(
+    row: &FundingArbMarketRow,
+    long: FundingArbRowVenueFields<'_>,
+    short: FundingArbRowVenueFields<'_>,
+    options: &FundingArbResidentLiveOptions,
+) -> RuntimeResult<CrossExchangeFundingArbSignal> {
+    evaluate_cross_exchange_funding_arb_signal(&CrossExchangeFundingArbSignalInput {
+        symbol: row.symbol.clone(),
+        long_venue_id: long.family.to_owned(),
+        short_venue_id: short.family.to_owned(),
+        long_best_bid: long.bid.to_owned(),
+        long_best_ask: long.ask.to_owned(),
+        long_ask_size: Some(long.ask_qty.to_owned()),
+        long_ask_depth: long.ask_depth.to_vec(),
+        short_best_bid: short.bid.to_owned(),
+        short_best_ask: short.ask.to_owned(),
+        short_bid_size: Some(short.bid_qty.to_owned()),
+        short_bid_depth: short.bid_depth.to_vec(),
+        long_funding_rate: long.funding_rate.to_owned(),
+        short_funding_rate: short.funding_rate.to_owned(),
+        funding_interval_hours: "8".to_owned(),
+        notional_usd: funding_arb_recovery_default_notional_usdt(options),
+        long_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            long.family,
+            &options.taker_fee_bps,
+        ),
+        short_taker_fee_bps: funding_arb_perp_taker_fee_bps_for_venue_family(
+            short.family,
+            &options.taker_fee_bps,
+        ),
+        slippage_buffer_bps: options.slippage_buffer_bps,
+        max_entry_price_divergence_bps: options.max_entry_price_divergence_bps,
+        min_net_funding_bps: options.min_net_funding_bps,
+    })
+    .map_err(|message| RuntimeError::LiveMarketData { message })
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_recovery_default_notional_usdt(options: &FundingArbResidentLiveOptions) -> String {
+    let notional = options.notional_usd.trim();
+    if notional.is_empty() {
+        BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned()
+    } else {
+        options.notional_usd.clone()
+    }
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_recovery_position_leg_state(
     row: &FundingArbMarketRow,
     leg: &CrossExchangeFundingLegConfig,
     row_leg: &'static str,
+    long_family: &str,
+    short_family: &str,
 ) -> RuntimeResult<FundingArbPositionLegState> {
     let venue_id = VenueId::new(&leg.venue_id)?;
     let venue_family = funding_arb_venue_family_from_venue_id(&venue_id)?;
-    let long_family = row
-        .long_venue_family
-        .as_deref()
-        .ok_or_else(|| RuntimeError::Module {
-            module: "arb-runtime",
-            message: "unknown position recovery row lacks long venue family".to_owned(),
-        })?;
-    let short_family = row
-        .short_venue_family
-        .as_deref()
-        .ok_or_else(|| RuntimeError::Module {
-            module: "arb-runtime",
-            message: "unknown position recovery row lacks short venue family".to_owned(),
-        })?;
     let side = if normalize_venue_family(&venue_family) == normalize_venue_family(long_family) {
         OrderSide::Buy
     } else if normalize_venue_family(&venue_family) == normalize_venue_family(short_family) {
@@ -56757,6 +56843,155 @@ mod tests {
         assert_eq!(btr_positions[0].adl_rank_indicator.as_deref(), Some("4"));
     }
 
+    #[test]
+    fn funding_arb_private_position_mismatch_is_snapshot_available_for_all_live_venues() {
+        let venue_pairs = [
+            ("binance", "bybit"),
+            ("bybit", "okx"),
+            ("okx", "bitget"),
+            ("bitget", "aster"),
+            ("aster", "hyperliquid"),
+        ];
+        for (venue_a, venue_b) in venue_pairs {
+            let mut row = funding_arb_test_row("0.00010000", "0.00600000");
+            row.pair_id = format!("{venue_a}:{venue_b}:BTCUSDT:BTCUSDT");
+            row.venue_a_family = venue_a.to_owned();
+            row.venue_b_family = venue_b.to_owned();
+            row.long_venue_family = Some(venue_a.to_owned());
+            row.short_venue_family = Some(venue_b.to_owned());
+            let options = FundingArbGuardedDryRunOnceOptions {
+                config_path: PathBuf::from("unused.yaml"),
+                snapshot_path: PathBuf::from("unused.json"),
+                pair_id: row.pair_id.clone(),
+                funding_settlement_ledger_path: None,
+                funding_settlement_raw_snapshot_path: None,
+                private_account_snapshot_path: None,
+                private_account_raw_snapshot_path: None,
+                private_position_snapshot_path: None,
+                private_position_raw_snapshot_path: None,
+                private_execution_snapshot_path: None,
+                output_dir: None,
+                notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+                taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
+                slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+                max_entry_price_divergence_bps: 20,
+                min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+            };
+            let spec = funding_arb_pipeline_spec_from_monitor_row(&row, &options)
+                .expect("funding arb spec");
+            let snapshot = FundingPrivatePositionSnapshot {
+                status: "complete".to_owned(),
+                updated_at: Some("2026-05-13T00:00:01Z".to_owned()),
+                positions: vec![
+                    FundingPrivatePositionEntry {
+                        venue_family: venue_a.to_owned(),
+                        symbol: "BTCUSDT".to_owned(),
+                        account_id: spec.strategy_config.venues.venue_a.account_id.clone(),
+                        quantity: "1".to_owned(),
+                        position_side: Some(FundingPrivatePositionSide::Long),
+                        mark_price: None,
+                        liquidation_price: None,
+                        adl_rank_indicator: None,
+                        adl_state: None,
+                    },
+                    FundingPrivatePositionEntry {
+                        venue_family: venue_b.to_owned(),
+                        symbol: "BTCUSDT".to_owned(),
+                        account_id: spec.strategy_config.venues.venue_b.account_id.clone(),
+                        quantity: "0".to_owned(),
+                        position_side: Some(FundingPrivatePositionSide::Short),
+                        mark_price: None,
+                        liquidation_price: None,
+                        adl_rank_indicator: None,
+                        adl_state: None,
+                    },
+                ],
+            };
+
+            let summary = reconcile_funding_private_position_snapshot(&row, &spec, &snapshot)
+                .expect("private position summary");
+            assert_eq!(summary.status, "Mismatch", "{venue_a}-{venue_b}");
+            assert!(summary.has_position_snapshot(), "{venue_a}-{venue_b}");
+            let flags = funding_arb_public_missing_data_flags(
+                false,
+                false,
+                false,
+                summary.has_position_snapshot(),
+                false,
+            );
+            assert!(
+                !flags
+                    .iter()
+                    .any(|flag| flag == "PRIVATE_POSITION_UNAVAILABLE"),
+                "{venue_a}-{venue_b}"
+            );
+        }
+    }
+
+    #[test]
+    fn funding_arb_guarded_dry_run_private_position_mismatch_does_not_report_runtime_unattached() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let config_path = root.path().join("guarded-live.yaml");
+        write_utf8(config_path.clone(), simulated_config_yaml()).expect("write config");
+        let mut row = funding_arb_test_row("0.00010000", "0.00600000");
+        row.pair_id = "aster:bybit:BTCUSDT:BTCUSDT".to_owned();
+        row.venue_a_family = "aster".to_owned();
+        row.venue_b_family = "bybit".to_owned();
+        row.long_venue_family = Some("aster".to_owned());
+        row.short_venue_family = Some("bybit".to_owned());
+        let pair_id = row.pair_id.clone();
+        let snapshot = funding_arb_test_snapshot(vec![row], "2026-05-13T00:00:00Z".to_owned());
+        let snapshot_path = root.path().join("funding-opportunities.json");
+        write_utf8(snapshot_path.clone(), &snapshot.opportunities_json()).expect("write snapshot");
+        let private_accounts_path = root.path().join("funding-private-accounts.json");
+        write_utf8(
+            private_accounts_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","accounts":[{"venue_family":"aster","account_id":"acct:aster-funding-arb-readonly","available_usd":"125","margin_balance_usd":"125","maintenance_margin_usd":"1"},{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","available_usd":"130","margin_balance_usd":"130","maintenance_margin_usd":"1"}]}"#,
+        )
+        .expect("write private accounts");
+        let private_positions_path = root.path().join("funding-private-positions.json");
+        write_utf8(
+            private_positions_path.clone(),
+            r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-13T00:00:01Z","positions":[{"venue_family":"aster","symbol":"BTCUSDT","account_id":"acct:aster-funding-arb-readonly","quantity":"1","position_side":"Long"},{"venue_family":"bybit","symbol":"BTCUSDT","account_id":"acct:bybit-funding-arb-readonly","quantity":"0","position_side":"Short"}]}"#,
+        )
+        .expect("write private positions");
+
+        let report = run_funding_arb_guarded_dry_run_once(FundingArbGuardedDryRunOnceOptions {
+            config_path,
+            snapshot_path,
+            pair_id,
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_account_snapshot_path: Some(private_accounts_path),
+            private_account_raw_snapshot_path: None,
+            private_position_snapshot_path: Some(private_positions_path),
+            private_position_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            output_dir: None,
+            notional_usd: BASIS_MONITOR_DEFAULT_NOTIONAL_USD.to_owned(),
+            taker_fee_bps: BASIS_MONITOR_DEFAULT_PERP_TAKER_FEE_BPS.to_owned(),
+            slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: BASIS_MONITOR_DEFAULT_MIN_NET_BPS,
+        })
+        .expect("funding arb dry-run once report");
+
+        assert_eq!(report.private_positions.status, "Mismatch");
+        assert_eq!(report.private_positions.nonzero_position_count, 1);
+        assert!(!report.live_ready);
+        assert!(report.live_blocking_reasons.iter().any(|reason| {
+            reason.contains("private position snapshot has 1 non-zero BTCUSDT positions")
+        }));
+        assert!(!report
+            .live_blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("PRIVATE_POSITION_UNAVAILABLE")));
+        assert!(!report.live_blocking_reasons.iter().any(|reason| {
+            reason.contains("private account runtime reconciliation")
+                || reason.contains("VENUE_PRIVATE_RUNTIME_NOT_ATTACHED")
+        }));
+    }
+
     #[cfg(feature = "live-exec")]
     #[test]
     fn funding_arb_live_canary_releases_manual_gate_for_requires_manual_approval() {
@@ -58579,6 +58814,57 @@ mod tests {
         assert_eq!(recovery_state.symbol, "EWTUSDT");
         assert_eq!(recovery_state.leg_a.venue_family, "binance");
         assert_eq!(recovery_state.leg_b.venue_family, "bybit");
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_unknown_position_recovery_derives_missing_row_direction_from_market_signal() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let previous_cycle = root
+            .path()
+            .join("cycles")
+            .join(resident_cycle_dir_name(21).expect("cycle dir"));
+        fs::create_dir_all(&previous_cycle).expect("create previous cycle");
+        let mut row = funding_arb_test_row("0.00600000", "0.00010000");
+        row.pair_id = "binance:bybit:CHIPUSDT:CHIPUSDT".to_owned();
+        row.symbol = "CHIPUSDT".to_owned();
+        row.long_venue_family = None;
+        row.short_venue_family = None;
+        let snapshot =
+            funding_arb_test_snapshot(vec![row.clone()], "2026-05-20T14:51:00Z".to_owned());
+        write_utf8(
+            previous_cycle.join("funding_arb_monitor_snapshot.json"),
+            &snapshot.to_json(),
+        )
+        .expect("write previous snapshot");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"cycle\":21,\"cycle_dir\":{},\"event_type\":\"position_unknown\",\"notional_usdt\":\"unknown\",\"pair_id\":\"binance:bybit:CHIPUSDT:CHIPUSDT\",\"position_id\":\"pos:funding-arb:manual-reconcile:binance-bybit-chipusdt:21\",\"reason\":\"accepted receipt requires manual reconciliation\",\"residual_risk\":\"first funding perp order state is unknown after accepted REST receipt; private reconciliation is required\",\"status\":\"unknown\",\"symbol\":\"CHIPUSDT\"}}\n",
+                json_string(&previous_cycle.display().to_string())
+            ),
+        )
+        .expect("write unknown registry");
+
+        let mut pending =
+            load_funding_arb_unknown_position_recovery_records(root.path()).expect("pending");
+        assert_eq!(pending.len(), 1);
+        let unknown = pending.remove(0);
+        let (_snapshot_path, _recovery_row, recovery_state) =
+            build_funding_arb_unknown_recovery_position_state_template(
+                &funding_arb_test_resident_options(),
+                &unknown,
+            )
+            .expect("recovery state template");
+
+        assert_eq!(recovery_state.pair_id, "binance:bybit:CHIPUSDT:CHIPUSDT");
+        assert_eq!(recovery_state.symbol, "CHIPUSDT");
+        assert_eq!(recovery_state.leg_a.venue_family, "binance");
+        assert_eq!(recovery_state.leg_a.role, "funding_perp_short");
+        assert_eq!(recovery_state.leg_a.side, OrderSide::Sell);
+        assert_eq!(recovery_state.leg_b.venue_family, "bybit");
+        assert_eq!(recovery_state.leg_b.role, "funding_perp_long");
+        assert_eq!(recovery_state.leg_b.side, OrderSide::Buy);
     }
 
     #[test]
