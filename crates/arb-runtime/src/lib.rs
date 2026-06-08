@@ -2096,6 +2096,7 @@ pub(crate) fn append_funding_arb_manual_close_requested(
 }
 
 #[cfg(feature = "live-exec")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_funding_arb_manual_close_status_event(
     output_root: &Path,
     request: &FundingArbManualCloseRequest,
@@ -12785,6 +12786,13 @@ where
             receipt
         }
         Err(error) => {
+            if funding_arb_exit_close_submit_error_confirms_flat(&error) {
+                outcome.protection.record_action(format!(
+                    "funding_reduce_only_unwind_already_flat:{reason}:{}",
+                    planned.plan_leg_id
+                ));
+                return Ok(true);
+            }
             outcome.blocking_reasons.push(format!(
                 "funding reduce-only unwind submit failed after `{reason}`: {error}"
             ));
@@ -12806,16 +12814,93 @@ where
     ) {
         Ok(update) => {
             unwind_filled = update.status == OrderConfirmationStatus::Filled;
-            if !unwind_filled {
+            let retry_allowed = funding_arb_exit_close_update_allows_market_retry(&update);
+            let initial_status = update.status;
+            if unwind_filled {
+                outcome.confirmations.push(private_confirmation_from_update(
+                    &unwind_plan.plan_leg_id,
+                    &update,
+                ));
+            } else if retry_allowed {
+                outcome.confirmations.push(private_confirmation_from_update(
+                    &unwind_plan.plan_leg_id,
+                    &update,
+                ));
+                let retry = funding_arb_exit_close_market_retry_planned_order(&unwind_plan)?;
+                outcome.protection.record_action(format!(
+                    "funding_reduce_only_unwind_market_retry:{reason}:{}",
+                    planned.plan_leg_id
+                ));
+                let retry_receipt = match adapter.submit_order(retry.request.clone()) {
+                    Ok(receipt) => {
+                        outcome.protection.record_receipt();
+                        outcome.receipts.push(receipt.clone());
+                        receipt
+                    }
+                    Err(error) => {
+                        if funding_arb_exit_close_submit_error_confirms_flat(&error) {
+                            outcome.protection.record_action(format!(
+                                "funding_reduce_only_unwind_market_retry_already_flat:{reason}:{}",
+                                planned.plan_leg_id
+                            ));
+                            return Ok(true);
+                        }
+                        outcome.blocking_reasons.push(format!(
+                            "funding reduce-only unwind market retry submit failed after `{reason}` and `{}`: {error}",
+                            initial_status.as_str()
+                        ));
+                        outcome.protection.record_residual_risk(format!(
+                            "funding reduce-only unwind returned `{}` and market retry submit failed; manual hedge or close is required",
+                            initial_status.as_str()
+                        ));
+                        return Ok(false);
+                    }
+                };
+                match confirm_planned_receipt_with_private_stream_or_order_query(
+                    adapter,
+                    &retry,
+                    &retry_receipt,
+                    &format!("funding-unwind-market-retry:{reason}"),
+                    context.private_order_events,
+                    context.market,
+                    context.order_query_event_prefix,
+                ) {
+                    Ok(retry_update) => {
+                        unwind_filled = retry_update.status == OrderConfirmationStatus::Filled;
+                        let retry_status = retry_update.status;
+                        outcome.confirmations.push(private_confirmation_from_update(
+                            &retry.plan_leg_id,
+                            &retry_update,
+                        ));
+                        if !unwind_filled {
+                            outcome.protection.record_residual_risk(format!(
+                                "funding reduce-only unwind returned `{}` and market retry returned `{}` instead of filled",
+                                initial_status.as_str(),
+                                retry_status.as_str()
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        outcome.blocking_reasons.push(format!(
+                            "funding reduce-only unwind market retry confirmation failed after `{reason}` and `{}`: {error}",
+                            initial_status.as_str()
+                        ));
+                        outcome.protection.record_residual_risk(format!(
+                            "funding reduce-only unwind returned `{}` and market retry state is unknown; manual reconciliation is required",
+                            initial_status.as_str()
+                        ));
+                    }
+                }
+            } else {
                 outcome.protection.record_residual_risk(format!(
                     "funding reduce-only unwind returned `{}` instead of filled",
-                    update.status.as_str()
+                    initial_status.as_str()
+                ));
+                outcome.confirmations.push(private_confirmation_from_update(
+                    &unwind_plan.plan_leg_id,
+                    &update,
                 ));
             }
-            outcome.confirmations.push(private_confirmation_from_update(
-                &unwind_plan.plan_leg_id,
-                &update,
-            ));
         }
         Err(error) => {
             outcome.blocking_reasons.push(format!(
@@ -31173,6 +31258,8 @@ struct FundingArbResidentPosition {
     status: String,
     opened_at: Option<String>,
     closed_at: Option<String>,
+    exchange_pnl_status: Option<String>,
+    reconciliation_state: Option<String>,
 }
 
 #[cfg(feature = "live-exec")]
@@ -33816,7 +33903,7 @@ fn funding_arb_exchange_history_fetch_gate(
     let gate_limit = limit.min(1000);
 
     let mut account_records = Vec::new();
-    let account_book_payload = (|| -> RuntimeResult<String> {
+    let account_book_payload = {
         let query = format!("from={from_secs}&to={to_secs}&limit={gate_limit}");
         sign_and_fetch_gate_private_get(
             &signer,
@@ -33827,7 +33914,7 @@ fn funding_arb_exchange_history_fetch_gate(
             "/futures/usdt/account_book",
             &query,
         )
-    })();
+    };
     funding_arb_exchange_history_capture_payload(
         &mut account_records,
         &mut errors,
@@ -34176,6 +34263,18 @@ fn funding_arb_exchange_pnl_summary_from_backend(
     state: &FundingArbPositionState,
     closed_at: &str,
 ) -> RuntimeResult<FundingArbExchangePnlSummary> {
+    funding_arb_exchange_pnl_summary_from_backend_for_terminal_status(
+        options, state, closed_at, "closed",
+    )
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_summary_from_backend_for_terminal_status(
+    options: &FundingArbResidentLiveOptions,
+    state: &FundingArbPositionState,
+    closed_at: &str,
+    terminal_status: &str,
+) -> RuntimeResult<FundingArbExchangePnlSummary> {
     let window = funding_arb_exchange_pnl_query_window(&state.opened_at, closed_at)?;
     let mut legs = Vec::new();
     for leg in [&state.leg_a, &state.leg_b] {
@@ -34189,7 +34288,10 @@ fn funding_arb_exchange_pnl_summary_from_backend(
             )),
         }
     }
-    Ok(funding_arb_exchange_pnl_summary_from_legs(&legs))
+    Ok(funding_arb_exchange_pnl_http_summary_from_legs(
+        &legs,
+        terminal_status,
+    ))
 }
 
 #[cfg(feature = "live-exec")]
@@ -36361,6 +36463,40 @@ impl FundingArbResidentPositionRegistry {
         }
         Ok(total)
     }
+
+    fn terminal_pnl_unconfirmed_block_reason(&self) -> Option<String> {
+        let mut count = 0usize;
+        let mut sample: Option<&FundingArbResidentPosition> = None;
+        for position in self.positions.values().filter(|position| {
+            matches!(position.status.as_str(), "closed" | "flat_cancelled")
+                && position.exchange_pnl_status.as_deref() != Some("Confirmed")
+        }) {
+            count += 1;
+            if sample.is_none() {
+                sample = Some(position);
+            }
+        }
+        let sample = sample?;
+        Some(format!(
+            "terminal funding arb resident position requires exchange PnL confirmation before new entries: count={} sample_position_id={} sample_pair_id={} sample_exchange_pnl_status={} sample_reconciliation_state={}",
+            count,
+            sample.position_id,
+            sample.pair_id,
+            sample.exchange_pnl_status.as_deref().unwrap_or("missing"),
+            sample.reconciliation_state.as_deref().unwrap_or("missing"),
+        ))
+    }
+
+    fn terminal_pnl_reconciliation_candidates(&self) -> Vec<FundingArbResidentPosition> {
+        self.positions
+            .values()
+            .filter(|position| {
+                matches!(position.status.as_str(), "closed" | "flat_cancelled")
+                    && position.exchange_pnl_status.as_deref() != Some("Confirmed")
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -36422,6 +36558,12 @@ fn load_funding_arb_resident_position_registry(
                             "closed_at",
                             "funding arb resident registry",
                         )?,
+                        exchange_pnl_status: optional_json_value_string(
+                            &fields,
+                            "exchange_pnl_status",
+                            "funding arb resident registry",
+                        )?,
+                        reconciliation_state: None,
                     },
                 );
             }
@@ -36464,6 +36606,12 @@ fn load_funding_arb_resident_position_registry(
                             "closed_at",
                             "funding arb resident registry",
                         )?,
+                        exchange_pnl_status: optional_json_value_string(
+                            &fields,
+                            "exchange_pnl_status",
+                            "funding arb resident registry",
+                        )?,
+                        reconciliation_state: None,
                     },
                 );
             }
@@ -36513,6 +36661,12 @@ fn load_funding_arb_resident_position_registry(
                                 "closed_at",
                                 "funding arb resident registry",
                             )?,
+                            exchange_pnl_status: optional_json_value_string(
+                                &fields,
+                                "exchange_pnl_status",
+                                "funding arb resident registry",
+                            )?,
+                            reconciliation_state: None,
                         },
                     );
                 }
@@ -36520,6 +36674,7 @@ fn load_funding_arb_resident_position_registry(
             _ => {}
         }
     }
+    apply_funding_arb_reconciliation_state_to_registry(output_root, &mut registry)?;
     Ok(registry)
 }
 
@@ -36553,7 +36708,188 @@ fn funding_arb_update_resident_position_from_registry_fields(
     {
         position.closed_at = Some(closed_at);
     }
+    if let Some(exchange_pnl_status) = optional_json_value_string(
+        fields,
+        "exchange_pnl_status",
+        "funding arb resident registry",
+    )? {
+        position.exchange_pnl_status = Some(exchange_pnl_status);
+    }
     Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn apply_funding_arb_reconciliation_state_to_registry(
+    output_root: &Path,
+    registry: &mut FundingArbResidentPositionRegistry,
+) -> RuntimeResult<()> {
+    let path = output_root.join("funding_arb_reconciliation_state.jsonl");
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents = read_utf8(&path)?;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = parse_json_object_value_slices(line)?;
+        let event_type = optional_json_value_string(
+            &fields,
+            "event_type",
+            "funding arb reconciliation state registry",
+        )?;
+        if event_type.as_deref() != Some("reconciliation_state_transition") {
+            continue;
+        }
+        let Some(position_id) = optional_json_value_string(
+            &fields,
+            "position_id",
+            "funding arb reconciliation state registry",
+        )?
+        else {
+            continue;
+        };
+        let Some(position) = registry.positions.get_mut(&position_id) else {
+            continue;
+        };
+        if let Some(exchange_pnl_status) = optional_json_value_string(
+            &fields,
+            "exchange_pnl_status",
+            "funding arb reconciliation state registry",
+        )? {
+            position.exchange_pnl_status = Some(exchange_pnl_status);
+        }
+        if let Some(to_state) = optional_json_value_string(
+            &fields,
+            "to_state",
+            "funding arb reconciliation state registry",
+        )? {
+            if to_state == "Confirmed" && position.exchange_pnl_status.is_none() {
+                position.exchange_pnl_status = Some("Confirmed".to_owned());
+            }
+            position.reconciliation_state = Some(to_state);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn reconcile_funding_arb_terminal_exchange_pnl_before_entry(
+    options: &FundingArbResidentLiveOptions,
+    output_root: &Path,
+    registry: &FundingArbResidentPositionRegistry,
+) -> RuntimeResult<()> {
+    for position in registry.terminal_pnl_reconciliation_candidates() {
+        let summary =
+            reconcile_funding_arb_terminal_position_exchange_pnl(options, output_root, &position);
+        append_funding_arb_terminal_exchange_pnl_reconciliation_transition(
+            output_root,
+            &position,
+            &summary,
+            "resident_entry_capacity_precheck",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn reconcile_funding_arb_terminal_position_exchange_pnl(
+    options: &FundingArbResidentLiveOptions,
+    output_root: &Path,
+    position: &FundingArbResidentPosition,
+) -> FundingArbExchangePnlSummary {
+    let Some(closed_at) = position
+        .closed_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return FundingArbExchangePnlSummary::not_checked(
+            "终态仓位缺少 closed_at，不能构造交易所后台 PnL 查询窗口。",
+        );
+    };
+    let state = match load_funding_arb_terminal_position_state(output_root, position) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            return FundingArbExchangePnlSummary::not_checked(
+                "终态仓位缺少可读取的 position_state_path，不能反查两腿交易所后台 PnL。",
+            );
+        }
+        Err(error) => {
+            return FundingArbExchangePnlSummary::incomplete(
+                "exchange_backend_realized_pnl",
+                format!("读取终态仓位 position state 失败：{error}"),
+            );
+        }
+    };
+    funding_arb_exchange_pnl_summary_from_backend_for_terminal_status(
+        options,
+        &state,
+        closed_at,
+        &position.status,
+    )
+    .unwrap_or_else(|error| {
+        FundingArbExchangePnlSummary::incomplete(
+            "exchange_backend_realized_pnl",
+            format!("交易所后台已实现盈亏同步失败：{error}"),
+        )
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn load_funding_arb_terminal_position_state(
+    output_root: &Path,
+    position: &FundingArbResidentPosition,
+) -> RuntimeResult<Option<FundingArbPositionState>> {
+    if position.position_state_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let mut paths = vec![
+        position.position_state_path.clone(),
+        output_root.join(&position.position_state_path),
+    ];
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        return parse_funding_arb_position_state_json(&read_utf8(&path)?).map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "live-exec")]
+fn append_funding_arb_terminal_exchange_pnl_reconciliation_transition(
+    output_root: &Path,
+    position: &FundingArbResidentPosition,
+    summary: &FundingArbExchangePnlSummary,
+    source: &str,
+) -> RuntimeResult<()> {
+    let (to_state, reason_code) =
+        funding_arb_reconciliation_state_for_exchange_pnl_status(&summary.status);
+    let recorded_at = current_utc_timestamp_string();
+    let line = format!(
+        "{{\"closed_at\":{},\"event_type\":\"reconciliation_state_transition\",{},\"from_state\":{},\"pair_id\":{},\"position_id\":{},\"position_status\":{},\"reason_code\":{},\"recorded_at\":{},\"schema_version\":\"1.0.0\",\"source\":{},\"source_event_type\":\"exchange_pnl_reconciliation_sweep\",\"state_machine\":\"funding_arb_terminal_reconciliation\",\"symbol\":{},\"to_state\":{}}}",
+        optional_json_string(position.closed_at.as_deref()),
+        funding_arb_exchange_pnl_position_event_fields(summary),
+        json_string(
+            position
+                .reconciliation_state
+                .as_deref()
+                .unwrap_or("TerminalObserved")
+        ),
+        json_string(&position.pair_id),
+        json_string(&position.position_id),
+        json_string(&position.status),
+        json_string(reason_code),
+        json_string(&recorded_at),
+        json_string(source),
+        json_string(&position.symbol),
+        json_string(to_state),
+    );
+    append_line_to_jsonl(
+        output_root.join("funding_arb_reconciliation_state.jsonl"),
+        &line,
+    )?;
+    append_funding_arb_resident_event(output_root, &line)
 }
 
 #[cfg(feature = "live-exec")]
@@ -37494,6 +37830,11 @@ fn funding_arb_resident_entry_capacity(
         return Ok(ResidentEntryCapacity::Blocked(
             "unknown funding arb resident position exists; new entries are blocked".to_owned(),
         ));
+    }
+    reconcile_funding_arb_terminal_exchange_pnl_before_entry(options, output_root, &registry)?;
+    let registry = load_funding_arb_resident_position_registry(output_root)?;
+    if let Some(reason) = registry.terminal_pnl_unconfirmed_block_reason() {
+        return Ok(ResidentEntryCapacity::Blocked(reason));
     }
     let max_total = Decimal::from_str(&options.max_total_notional_usdt)?;
     let next_notional = Decimal::from_str(&options.notional_usd)?;
@@ -54959,6 +55300,29 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_dashboard_health_http_status_keeps_degraded_service_online() {
+        let cache = PortfolioDashboardCacheState {
+            snapshot: Some(PortfolioDashboardSnapshot {
+                status: "degraded".to_owned(),
+                updated_at: "2026-06-08T16:00:00Z".to_owned(),
+                balances: Vec::new(),
+                positions: Vec::new(),
+                source_errors: vec!["gate read-only credentials unavailable".to_owned()],
+            }),
+            cache_refreshed_at: "2026-06-08T16:00:01Z".to_owned(),
+            refresh_error: None,
+        };
+
+        assert_eq!(
+            portfolio_dashboard_health_http_status_from_cache(&cache),
+            200
+        );
+        let health_json = portfolio_dashboard_health_json_from_cache(&cache);
+        assert!(health_json.contains("\"status\":\"degraded\""));
+        assert!(health_json.contains("\"source_error_count\":1"));
+    }
+
+    #[test]
     fn portfolio_position_json_normalizes_epoch_datetime_strings() {
         assert_eq!(
             portfolio_normalize_datetime_display("1780279799194"),
@@ -54980,6 +55344,8 @@ mod tests {
             fee: None,
             fee_rate_bps: None,
             settled_funding_usd: None,
+            realized_pnl_usd: None,
+            estimated_pnl_usd: None,
             accumulated_position: Some("50 USDT".to_owned()),
             open_average_price: None,
             close_average_price: None,
@@ -55007,7 +55373,57 @@ mod tests {
         assert!(json.contains("\"opened_at\":\"2026-06-01T02:09:59.194Z\""));
         assert!(json.contains("\"closed_at\":\"2026-06-01T06:17:45.684Z\""));
         assert!(json.contains("\"close_action\""));
+        assert!(json.contains("\"realized_pnl_usd\":null"));
+        assert!(json.contains("\"estimated_pnl_usd\":null"));
         assert!(json.contains("\"eligible\":false"));
+    }
+
+    #[test]
+    fn portfolio_position_rows_extract_realized_and_estimated_pnl() {
+        let input = r#"{"schema_version":"1.0.0","status":"complete","updated_at":"2026-05-22T06:50:00Z","statements":[{"venue_family":"bybit","account_id":"acct:bybit-funding-arb-readonly","payload":[{"symbol":"BTCUSDT","positionIdx":1,"size":"0.125","avgPrice":"100.00","markPrice":"101.00","curRealisedPnl":"0.32","unrealisedPnl":"1.25"}]}]}"#;
+
+        let (_, rows) =
+            portfolio_position_rows_from_raw_snapshot_json(input, &[]).expect("position rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].realized_pnl_usd.as_deref(), Some("0.32"));
+        assert_eq!(rows[0].estimated_pnl_usd.as_deref(), Some("1.25"));
+
+        let json = portfolio_position_row_json(&rows[0]);
+        assert!(json.contains("\"realized_pnl_usd\":\"0.32\""));
+        assert!(json.contains("\"estimated_pnl_usd\":\"1.25\""));
+    }
+
+    #[test]
+    fn portfolio_dashboard_reads_terminal_registry_realized_pnl() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let resident_dir = root
+            .path()
+            .join("resident-live")
+            .join("cross-exchange-funding-arb");
+        fs::create_dir_all(&resident_dir).expect("resident dir");
+        write_utf8(
+            resident_dir.join("funding_arb_resident_positions.jsonl"),
+            concat!(
+                "{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"pair_id\":\"binance:bybit:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:pnl\",\"position_state_path\":\"missing_position_state.json\",\"status\":\"open\",\"symbol\":\"BTCUSDT\"}\n",
+                "{\"event_type\":\"position_closed\",\"exchange_net_pnl_usd\":\"0.57\",\"exchange_pnl_status\":\"Confirmed\",\"exchange_position_pnl_usd\":\"0.57\",\"position_id\":\"pos:pnl\",\"status\":\"closed\"}\n",
+            ),
+        )
+        .expect("resident registry");
+        let options = PortfolioDashboardOptions {
+            resident_root: Some(root.path().to_path_buf()),
+            once: true,
+            ..PortfolioDashboardOptions::default()
+        };
+
+        let snapshot = build_portfolio_dashboard_snapshot(&options).expect("snapshot");
+
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].position_status, "closed");
+        assert_eq!(
+            snapshot.positions[0].realized_pnl_usd.as_deref(),
+            Some("0.57")
+        );
     }
 
     #[test]
@@ -59535,7 +59951,11 @@ mod tests {
         assert_eq!(flat_registry.live_entry_count(), 1);
         let flat_capacity =
             funding_arb_resident_entry_capacity(&options, root.path()).expect("flat capacity");
-        assert!(matches!(flat_capacity, ResidentEntryCapacity::Allowed));
+        assert!(matches!(
+            flat_capacity,
+            ResidentEntryCapacity::Blocked(reason)
+                if reason.contains("requires exchange PnL confirmation")
+        ));
 
         write_utf8(
             root.path().join("funding_arb_resident_positions.jsonl"),
@@ -59546,8 +59966,127 @@ mod tests {
             .expect("closed history capacity");
         assert!(matches!(
             closed_history_capacity,
+            ResidentEntryCapacity::Blocked(reason)
+                if reason.contains("requires exchange PnL confirmation")
+        ));
+
+        write_utf8(
+            root.path().join("funding_arb_reconciliation_state.jsonl"),
+            "{\"event_type\":\"reconciliation_state_transition\",\"exchange_pnl_status\":\"Confirmed\",\"position_id\":\"pos:closed-history\",\"to_state\":\"Confirmed\"}\n",
+        )
+        .expect("write confirmed reconciliation state");
+        let reconciled_closed_history_capacity =
+            funding_arb_resident_entry_capacity(&options, root.path())
+                .expect("reconciled closed history capacity");
+        assert!(matches!(
+            reconciled_closed_history_capacity,
             ResidentEntryCapacity::Allowed
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_terminal_pnl_sweep_records_backend_incomplete_before_capacity_block() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        let state_path = root.path().join("position.json");
+        let state = FundingArbPositionState {
+            pair_id: "paper:paper:BTCUSDT:BTCUSDT".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            plan_hash: None,
+            notional_usd: "10.00".to_owned(),
+            entry_net_funding_bps: Some(8),
+            target_funding_time_ms: None,
+            target_gross_funding_spread_bps: Some(10),
+            target_expected_gross_funding_usd: Some("0.01".to_owned()),
+            target_expected_net_funding_usd: Some("0.01".to_owned()),
+            exit_risk_last_expected_funding_usd: Some("0.01".to_owned()),
+            exit_risk_decline_streak_start_expected_funding_usd: Some("0.01".to_owned()),
+            exit_risk_expected_funding_decline_cycles: 0,
+            exit_risk_negative_net_funding_cycles: 0,
+            opened_at: "2026-05-13T00:00:00Z".to_owned(),
+            private_order_events_dir: None,
+            leg_a: FundingArbPositionLegState {
+                role: "funding_perp_long".to_owned(),
+                venue_family: "paper".to_owned(),
+                venue_id: "venue:PAPER-A".to_owned(),
+                account_id: "acct:paper-a".to_owned(),
+                instrument_id: "inst:PAPER:BTCUSDT:PERP".to_owned(),
+                side: OrderSide::Buy,
+                quantity: "0.001".to_owned(),
+                entry_limit_price: "100000".to_owned(),
+            },
+            leg_b: FundingArbPositionLegState {
+                role: "funding_perp_short".to_owned(),
+                venue_family: "paper".to_owned(),
+                venue_id: "venue:PAPER-B".to_owned(),
+                account_id: "acct:paper-b".to_owned(),
+                instrument_id: "inst:PAPER:BTCUSDT:PERP".to_owned(),
+                side: OrderSide::Sell,
+                quantity: "0.001".to_owned(),
+                entry_limit_price: "100010".to_owned(),
+            },
+        };
+        write_funding_arb_position_state_path(&state_path, &state).expect("write state");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            &format!(
+                "{{\"event_type\":\"position_opened\",\"notional_usdt\":\"10.00\",\"opened_at\":\"2026-05-13T00:00:00Z\",\"pair_id\":\"paper:paper:BTCUSDT:BTCUSDT\",\"position_id\":\"pos:closed-paper\",\"position_state_path\":{},\"status\":\"open\",\"symbol\":\"BTCUSDT\"}}\n{{\"closed_at\":\"2026-05-13T00:10:00Z\",\"event_type\":\"position_closed\",\"position_id\":\"pos:closed-paper\",\"status\":\"closed\"}}\n",
+                json_string(&state_path.display().to_string()),
+            ),
+        )
+        .expect("write registry");
+        let options = FundingArbResidentLiveOptions {
+            config_path: root.path().join("config.toml"),
+            output_dir: Some(root.path().to_path_buf()),
+            snapshot_path: None,
+            pair_id: None,
+            sources: Vec::new(),
+            funding_settlement_ledger_path: None,
+            funding_settlement_raw_snapshot_path: None,
+            private_execution_snapshot_path: None,
+            private_order_events_dir: None,
+            poll_interval_secs: 60,
+            max_cycles: None,
+            notional_usd: "10.00".to_owned(),
+            max_total_notional_usdt: "100.00".to_owned(),
+            taker_fee_bps: "5".to_owned(),
+            slippage_buffer_bps: 5,
+            max_entry_price_divergence_bps: 20,
+            min_net_funding_bps: 5,
+            funding_carry_modes: default_funding_carry_perp_modes(),
+            execute_live: true,
+            acknowledge_funding_arb_live_orders: true,
+            allow_unknown_recovery: false,
+            auto_residual_de_risk: true,
+            exit_only: false,
+            manual_close_request: None,
+            hyperliquid_user: None,
+            hyperliquid_source: "a".to_owned(),
+            hyperliquid_vault_address: None,
+            hyperliquid_expires_after_ms: None,
+            hyperliquid_asset_ids: BTreeMap::new(),
+            aster_user: None,
+            aster_signer: None,
+            aster_signer_cmd_env: ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT.to_owned(),
+        };
+
+        let capacity =
+            funding_arb_resident_entry_capacity(&options, root.path()).expect("capacity");
+        assert!(matches!(
+            capacity,
+            ResidentEntryCapacity::Blocked(reason)
+                if reason.contains("requires exchange PnL confirmation")
+                    && reason.contains("sample_exchange_pnl_status=Incomplete")
+                    && reason.contains("sample_reconciliation_state=RetryRequired")
+        ));
+        let reconciliation = read_utf8(&root.path().join("funding_arb_reconciliation_state.jsonl"))
+            .expect("reconciliation state");
+        assert!(
+            reconciliation.contains("\"source_event_type\":\"exchange_pnl_reconciliation_sweep\"")
+        );
+        assert!(reconciliation.contains("\"exchange_pnl_status\":\"Incomplete\""));
+        assert!(reconciliation.contains("\"reason_code\":\"exchange_pnl_incomplete\""));
+        assert!(reconciliation.contains("尚未实现 paper 的后台已实现盈亏拉取"));
     }
 
     #[test]
@@ -59704,6 +60243,8 @@ mod tests {
             status: "open".to_owned(),
             opened_at: Some("2026-05-13T00:00:00Z".to_owned()),
             closed_at: None,
+            exchange_pnl_status: None,
+            reconciliation_state: None,
         };
         let report = FundingArbExitCycleReport {
             pair_id: position.pair_id.clone(),
@@ -59767,6 +60308,8 @@ mod tests {
             status: "open".to_owned(),
             opened_at: Some("2026-05-13T00:00:00Z".to_owned()),
             closed_at: None,
+            exchange_pnl_status: None,
+            reconciliation_state: None,
         };
         let report = FundingArbExitCycleReport {
             pair_id: position.pair_id.clone(),
@@ -67975,6 +68518,98 @@ mod tests {
         assert!(adapter.confirmed[0].source_event_id.starts_with(
             "event:funding-test-order-query:funding-unwind:first-terminal-positive-fill"
         ));
+    }
+
+    #[cfg(feature = "live-exec")]
+    #[test]
+    fn funding_reduce_only_unwind_expired_retries_market() {
+        let planned = test_basis_planned_order_for_account(
+            "perp_long",
+            BYBIT_BASIS_PERP_VENUE_ID,
+            BYBIT_BASIS_PERP_INSTRUMENT_ID,
+            BYBIT_GUARDED_LIVE_ACCOUNT_REF,
+            OrderSide::Buy,
+            "100",
+            "0.2900",
+            "bybitFirstTerminalFill",
+            "idem:test:funding-unwind-expired",
+        );
+        let mut adapter = ScriptedBasisLiveAdapter::new(
+            vec![
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    "funding-unwind-expired",
+                )),
+                Ok(test_mutable_receipt(
+                    MutableActionKind::SubmitOrder,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    "funding-unwind-market-retry",
+                )),
+            ],
+            vec![],
+            vec![
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Expired,
+                    None,
+                    Some(OrderSide::Sell),
+                )),
+                Ok(test_private_order_update(
+                    arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                    BYBIT_BASIS_PERP_VENUE_ID,
+                    BYBIT_BASIS_PERP_INSTRUMENT_ID,
+                    OrderConfirmationStatus::Filled,
+                    Some("12"),
+                    Some(OrderSide::Sell),
+                )),
+            ],
+        );
+        let mut outcome = BasisLiveExecutionOutcome::default();
+
+        let unwind_filled = attempt_funding_reduce_only_unwind(
+            &mut adapter,
+            &planned,
+            Quantity::from_str("12").expect("quantity"),
+            "unit-expired",
+            BasisOrderConfirmContext {
+                protection_suffix: "1779466029",
+                private_order_events: None,
+                market: arb_venue_exec::PrivateOrderMarket::BybitLinear,
+                order_query_event_prefix: "event:funding-test-order-query",
+                slippage_buffer_bps: BASIS_MONITOR_DEFAULT_SLIPPAGE_BUFFER_BPS,
+                price_tick_resolver: test_funding_arb_price_tick_for_venue,
+            },
+            &mut outcome,
+        )
+        .expect("expired unwind should market retry");
+
+        assert!(unwind_filled);
+        assert_eq!(outcome.protection.receipt_count, 2);
+        assert!(outcome.protection.residual_risk.is_none());
+        assert!(outcome.blocking_reasons.is_empty());
+        assert_eq!(outcome.confirmations.len(), 2);
+        assert_eq!(adapter.submitted.len(), 2);
+        assert_eq!(adapter.submitted[0].order_type, MutableOrderType::Limit);
+        assert_eq!(
+            adapter.submitted[0].time_in_force,
+            Some(MutableTimeInForce::Ioc)
+        );
+        assert_eq!(adapter.submitted[1].order_type, MutableOrderType::Market);
+        assert_eq!(adapter.submitted[1].time_in_force, None);
+        assert_eq!(adapter.submitted[1].limit_price, None);
+        assert!(adapter.submitted[1].reduce_only);
+        assert!(adapter.submitted[1]
+            .idempotency_key
+            .as_str()
+            .ends_with(":market-retry"));
+        assert!(outcome
+            .protection
+            .actions
+            .iter()
+            .any(|action| action.contains("funding_reduce_only_unwind_market_retry:unit-expired")));
     }
 
     #[cfg(feature = "live-exec")]

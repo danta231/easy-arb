@@ -91,6 +91,8 @@ pub(crate) struct PortfolioPositionRow {
     pub(crate) fee: Option<String>,
     pub(crate) fee_rate_bps: Option<String>,
     pub(crate) settled_funding_usd: Option<String>,
+    pub(crate) realized_pnl_usd: Option<String>,
+    pub(crate) estimated_pnl_usd: Option<String>,
     pub(crate) accumulated_position: Option<String>,
     pub(crate) open_average_price: Option<String>,
     pub(crate) close_average_price: Option<String>,
@@ -145,6 +147,8 @@ pub(crate) struct PortfolioResidentPositionRef {
     pub(crate) status: String,
     pub(crate) net_funding_bps: Option<String>,
     pub(crate) taker_fee_bps: Option<String>,
+    pub(crate) realized_pnl_usd: Option<String>,
+    pub(crate) estimated_pnl_usd: Option<String>,
     pub(crate) position_limit: Option<String>,
     pub(crate) opened_at: Option<String>,
     pub(crate) closed_at: Option<String>,
@@ -349,6 +353,15 @@ pub(crate) fn portfolio_dashboard_health_json_from_cache(
         json_string(&snapshot.status),
         json_string(&snapshot.updated_at)
     )
+}
+
+pub(crate) fn portfolio_dashboard_health_http_status_from_cache(
+    _cache: &PortfolioDashboardCacheState,
+) -> u16 {
+    // 中文说明：/health 表示 portfolio-dashboard HTTP 服务可访问；
+    // 组合数据质量继续由 body.status/source_error_count 表达，避免 Easy Tool
+    // 把业务降级误判成服务器离线。
+    200
 }
 
 fn load_portfolio_account_sources(
@@ -2038,13 +2051,14 @@ pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String 
         .as_ref()
         .map(|value| portfolio_normalize_datetime_display(value));
     format!(
-        "{{\"account_id\":{},\"accumulated_position\":{},\"closed_at\":{},\"close_action\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"manual_close_request_detail\":{},\"manual_close_request_id\":{},\"manual_close_request_status\":{},\"opened_at\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_id\":{},\"position_kind\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
+        "{{\"account_id\":{},\"accumulated_position\":{},\"closed_at\":{},\"close_action\":{},\"close_average_price\":{},\"coin\":{},\"estimated_pnl_usd\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"manual_close_request_detail\":{},\"manual_close_request_id\":{},\"manual_close_request_status\":{},\"opened_at\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_id\":{},\"position_kind\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realized_pnl_usd\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
         json_string(&row.account_id),
         json_option_string(&row.accumulated_position),
         json_option_string(&closed_at),
         portfolio_position_close_action_json(row),
         json_option_string(&row.close_average_price),
         json_string(&row.coin),
+        json_option_string(&row.estimated_pnl_usd),
         json_option_string(&row.fee),
         json_option_string(&row.fee_rate_bps),
         json_option_string(&row.funding_settlement_time),
@@ -2063,6 +2077,7 @@ pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String 
         json_option_string(&row.position_limit),
         json_string(&row.position_quantity),
         json_string(&row.position_status),
+        json_option_string(&row.realized_pnl_usd),
         json_option_string(&row.realtime_funding_interval_hours),
         json_option_string(&row.realtime_funding_rate),
         json_option_string(&row.settled_funding_usd),
@@ -3348,6 +3363,49 @@ pub(crate) fn portfolio_position_row_from_fields(
             "funding_fee_usd",
         ],
     )?;
+    let realized_pnl_usd = first_json_scalar_string(
+        fields,
+        &[
+            "realized_pnl_usd",
+            "realized_pnl",
+            "realised_pnl_usd",
+            "realised_pnl",
+            "realizedPnl",
+            "realisedPnl",
+            "curRealisedPnl",
+            "cumRealisedPnl",
+            "closedPnl",
+            "position_pnl_usd",
+            "exchange_position_pnl_usd",
+            "exchange_net_pnl_usd",
+            "net_pnl_usd",
+            "pnl",
+            "profit",
+            "netProfit",
+        ],
+    )?;
+    let estimated_pnl_usd = first_json_scalar_string(
+        fields,
+        &[
+            "estimated_pnl_usd",
+            "estimated_pnl",
+            "expected_pnl_usd",
+            "expected_pnl",
+            "unrealized_pnl_usd",
+            "unrealized_pnl",
+            "unrealised_pnl_usd",
+            "unrealised_pnl",
+            "unRealizedProfit",
+            "unrealizedProfit",
+            "unrealizedPnl",
+            "unrealisedPnl",
+            "unrealizedPL",
+            "unrealizedPnL",
+            "mark_to_market_pnl_usd",
+            "markToMarketPnl",
+            "upl",
+        ],
+    )?;
     let accumulated_position = first_json_scalar_string(
         fields,
         &[
@@ -3522,6 +3580,8 @@ pub(crate) fn portfolio_position_row_from_fields(
         fee,
         fee_rate_bps,
         settled_funding_usd,
+        realized_pnl_usd,
+        estimated_pnl_usd,
         accumulated_position,
         open_average_price,
         close_average_price,
@@ -3836,6 +3896,8 @@ pub(crate) fn portfolio_funding_arb_leg_metadata_row(
         fee: None,
         fee_rate_bps: position_ref.taker_fee_bps.clone(),
         settled_funding_usd: None,
+        realized_pnl_usd: None,
+        estimated_pnl_usd: None,
         accumulated_position: Some(format!("{notional_usd} USDT")),
         open_average_price: Some(leg.entry_limit_price.clone()),
         close_average_price: None,
@@ -3890,6 +3952,14 @@ pub(crate) fn portfolio_apply_resident_position_metadata(
         portfolio_fill_missing_option(
             &mut row.settled_funding_usd,
             metadata.settled_funding_usd.as_ref(),
+        );
+        portfolio_fill_missing_option(
+            &mut row.realized_pnl_usd,
+            metadata.realized_pnl_usd.as_ref(),
+        );
+        portfolio_fill_missing_option(
+            &mut row.estimated_pnl_usd,
+            metadata.estimated_pnl_usd.as_ref(),
         );
         portfolio_fill_missing_option(
             &mut row.accumulated_position,
@@ -4194,6 +4264,10 @@ pub(crate) fn portfolio_resident_position_refs_from_dir(
                             "resident position registry",
                         )?,
                         taker_fee_bps: taker_fee_bps.clone(),
+                        realized_pnl_usd: portfolio_realized_pnl_usd_from_registry_fields(&fields)?,
+                        estimated_pnl_usd: portfolio_estimated_pnl_usd_from_registry_fields(
+                            &fields,
+                        )?,
                         position_limit: position_limit.clone(),
                         opened_at: optional_json_value_string(
                             &fields,
@@ -4335,6 +4409,8 @@ pub(crate) fn portfolio_resident_position_ref_from_registry_fields(
             "resident position registry",
         )?,
         taker_fee_bps: defaults.taker_fee_bps.cloned(),
+        realized_pnl_usd: portfolio_realized_pnl_usd_from_registry_fields(fields)?,
+        estimated_pnl_usd: portfolio_estimated_pnl_usd_from_registry_fields(fields)?,
         position_limit: defaults.position_limit.clone(),
         opened_at: optional_json_value_string(fields, "opened_at", "resident position registry")?,
         closed_at: optional_json_value_string(fields, "closed_at", "resident position registry")?,
@@ -4374,6 +4450,12 @@ pub(crate) fn portfolio_update_resident_position_ref_from_fields(
     {
         position.net_funding_bps = Some(net_funding_bps);
     }
+    if let Some(realized_pnl_usd) = portfolio_realized_pnl_usd_from_registry_fields(fields)? {
+        position.realized_pnl_usd = Some(realized_pnl_usd);
+    }
+    if let Some(estimated_pnl_usd) = portfolio_estimated_pnl_usd_from_registry_fields(fields)? {
+        position.estimated_pnl_usd = Some(estimated_pnl_usd);
+    }
     if let Some(opened_at) =
         optional_json_value_string(fields, "opened_at", "resident position registry")?
     {
@@ -4385,6 +4467,44 @@ pub(crate) fn portfolio_update_resident_position_ref_from_fields(
         position.closed_at = Some(closed_at);
     }
     Ok(())
+}
+
+pub(crate) fn portfolio_realized_pnl_usd_from_registry_fields(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<String>> {
+    optional_first_json_value_string(
+        fields,
+        &[
+            "realized_pnl_usd",
+            "realized_pnl",
+            "realised_pnl_usd",
+            "realised_pnl",
+            "exchange_position_pnl_usd",
+            "exchange_net_pnl_usd",
+            "position_pnl_usd",
+            "net_pnl_usd",
+        ],
+        "resident position registry",
+    )
+}
+
+pub(crate) fn portfolio_estimated_pnl_usd_from_registry_fields(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<Option<String>> {
+    optional_first_json_value_string(
+        fields,
+        &[
+            "estimated_pnl_usd",
+            "estimated_pnl",
+            "expected_pnl_usd",
+            "expected_pnl",
+            "unrealized_pnl_usd",
+            "unrealized_pnl",
+            "unrealised_pnl_usd",
+            "unrealised_pnl",
+        ],
+        "resident position registry",
+    )
 }
 
 pub(crate) fn portfolio_resident_position_symbol(
@@ -4544,6 +4664,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
                 fee: None,
                 fee_rate_bps: position_ref.taker_fee_bps.clone(),
                 settled_funding_usd: None,
+                realized_pnl_usd: None,
+                estimated_pnl_usd: None,
                 accumulated_position: Some(position_quantity.clone()),
                 open_average_price: None,
                 close_average_price: None,
@@ -4648,6 +4770,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
         fee: entry_total_cost_bps.map(|value| format!("{value} bps")),
         fee_rate_bps: position_ref.taker_fee_bps.clone(),
         settled_funding_usd: None,
+        realized_pnl_usd: None,
+        estimated_pnl_usd: None,
         accumulated_position: Some(format!("{notional_usd} USDT")),
         open_average_price,
         close_average_price: None,
@@ -4693,6 +4817,8 @@ pub(crate) fn portfolio_terminal_position_row_from_resident_ref(
         fee: None,
         fee_rate_bps: position_ref.taker_fee_bps.clone(),
         settled_funding_usd: None,
+        realized_pnl_usd: position_ref.realized_pnl_usd.clone(),
+        estimated_pnl_usd: position_ref.estimated_pnl_usd.clone(),
         accumulated_position: Some(position_quantity.clone()),
         open_average_price: None,
         close_average_price: None,
@@ -4743,6 +4869,8 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
                 fee: None,
                 fee_rate_bps: position_ref.taker_fee_bps.clone(),
                 settled_funding_usd: None,
+                realized_pnl_usd: None,
+                estimated_pnl_usd: None,
                 accumulated_position: Some(position_quantity.clone()),
                 open_average_price: None,
                 close_average_price: None,
@@ -4826,6 +4954,8 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
         fee: None,
         fee_rate_bps: position_ref.taker_fee_bps.clone(),
         settled_funding_usd: None,
+        realized_pnl_usd: None,
+        estimated_pnl_usd: None,
         accumulated_position: Some(format!("{notional_usd} USDT")),
         open_average_price,
         close_average_price: None,
@@ -5343,13 +5473,8 @@ fn handle_portfolio_dashboard_http_connection(
         .clone();
     let snapshot = portfolio_dashboard_snapshot_from_cache(&cache);
     let (status, body) = if route == "/health" {
-        let http_status = if snapshot.status == "healthy" {
-            200
-        } else {
-            503
-        };
         (
-            http_status,
+            portfolio_dashboard_health_http_status_from_cache(&cache),
             portfolio_dashboard_health_json_from_cache(&cache),
         )
     } else if route == "/api/portfolio/status" {

@@ -1616,6 +1616,8 @@ mod tests {
                 status: "open".to_owned(),
                 opened_at: None,
                 closed_at: None,
+                exchange_pnl_status: None,
+                reconciliation_state: None,
             },
         );
         assert!(!funding_arb_position_recovery_drain_is_complete(&registry));
@@ -1638,6 +1640,8 @@ mod tests {
                 status: "unknown".to_owned(),
                 opened_at: None,
                 closed_at: None,
+                exchange_pnl_status: None,
+                reconciliation_state: None,
             },
         );
         assert!(!funding_arb_position_recovery_drain_is_complete(&registry));

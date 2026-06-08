@@ -1100,12 +1100,10 @@ pub fn incidents_from_private_execution_report(
     report: &ExecutionReport,
     opened_at: &str,
 ) -> ExecutionResult<Vec<Incident>> {
-    if report.failures.is_empty()
-        && matches!(
-            &report.status,
-            ExecutionReportStatus::Succeeded | ExecutionReportStatus::Simulated
-        )
-    {
+    if matches!(
+        &report.status,
+        ExecutionReportStatus::Succeeded | ExecutionReportStatus::Simulated
+    ) {
         return Ok(Vec::new());
     }
 
@@ -2844,7 +2842,6 @@ fn apply_private_confirmation(
             push_private_fills(plan, generated_at, index, leg, confirmation, aggregate)?;
             if confirmation.fills.iter().any(|fill| !fill.fee_complete) {
                 aggregate.any_incomplete_fee = true;
-                aggregate.any_failure = true;
                 aggregate.failures.push(render_failure(
                     plan,
                     index,
@@ -4982,7 +4979,7 @@ mod tests {
     }
 
     #[test]
-    fn private_fill_with_incomplete_fee_keeps_reconciliation_pending() {
+    fn private_fill_with_incomplete_fee_succeeds_but_keeps_reconciliation_pending() {
         let plan = pending_manual_plan().plan_preview;
         let order_leg = &plan.legs[1];
         let confirmation = PrivateOrderConfirmation::new(
@@ -5011,9 +5008,10 @@ mod tests {
         ))
         .expect("private confirmation report");
 
-        assert_eq!(report.status, ExecutionReportStatus::PartiallySucceeded);
+        assert_eq!(report.status, ExecutionReportStatus::Succeeded);
         assert_eq!(report.reconciliation_status, ReconciliationStatus::Pending);
         assert_eq!(report.fills.len(), 1);
+        assert_eq!(report.leg_reports[1].status, LegReportStatus::Filled);
         assert!(report.failures.iter().any(|failure| {
             failure.failure_type == FailureMode::ManualInterventionRequired
                 && failure
@@ -5021,6 +5019,11 @@ mod tests {
                     .as_deref()
                     .is_some_and(|detail| detail.contains("手续费明细不完整"))
         }));
+
+        let incidents =
+            incidents_from_private_execution_report(&plan, &report, "2026-01-01T00:00:07Z")
+                .expect("fee reconciliation warning should not generate execution incident");
+        assert!(incidents.is_empty());
     }
 
     #[test]
