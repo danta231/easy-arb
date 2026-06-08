@@ -78,7 +78,10 @@ pub struct CrossExchangeFundingArbVenuePair {
     pub venue_b: String,
 }
 
-/// 返回六交易所能力矩阵。
+/// 返回交易所能力矩阵。
+///
+/// 中文说明：Gate 和 Lighter 已进入公开行情、私有只读和历史同步链路；可变执行
+/// adapter（适配器）仍未开放，因此不能进入策略支持矩阵或默认实盘下单路径。
 pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
     vec![
         ArbVenueCapabilityProfile {
@@ -171,6 +174,36 @@ pub fn arb_venue_capability_profiles() -> Vec<ArbVenueCapabilityProfile> {
             runtime_private_order_confirmation_supported: true,
             runtime_auto_funding_settlement_supported: true,
         },
+        ArbVenueCapabilityProfile {
+            venue_family: "gate".to_owned(),
+            supports_spot: true,
+            supports_linear_perp: true,
+            supports_swap: false,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(8),
+            funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
+            dry_run_execution_supported: false,
+            runtime_live_execution_supported: false,
+            runtime_private_order_confirmation_supported: false,
+            runtime_auto_funding_settlement_supported: false,
+        },
+        ArbVenueCapabilityProfile {
+            venue_family: "lighter".to_owned(),
+            supports_spot: false,
+            supports_linear_perp: true,
+            supports_swap: false,
+            supports_funding_rate: true,
+            supports_mark_index_price: true,
+            supports_top_of_book_size: true,
+            funding_interval_hours: Some(1),
+            funding_settlement_price_source: FundingSettlementPriceSource::MarkPrice,
+            dry_run_execution_supported: false,
+            runtime_live_execution_supported: false,
+            runtime_private_order_confirmation_supported: false,
+            runtime_auto_funding_settlement_supported: false,
+        },
     ]
 }
 
@@ -181,7 +214,7 @@ pub fn arb_venue_capability_profile(venue_family: &str) -> Option<ArbVenueCapabi
         .find(|profile| profile.venue_family == normalized)
 }
 
-/// 返回六交易所双策略支持矩阵。
+/// 返回双策略支持矩阵。
 pub fn arb_venue_strategy_support_matrix() -> Vec<ArbVenueStrategySupport> {
     arb_venue_capability_profiles()
         .into_iter()
@@ -193,7 +226,7 @@ pub fn arb_venue_strategy_support_matrix() -> Vec<ArbVenueStrategySupport> {
         .collect()
 }
 
-/// 返回支持跨所 funding arb 的 15 个无向交易所组合。
+/// 返回已完成 dry-run 验收、支持跨所 funding arb 的 15 个无向交易所组合。
 pub fn cross_exchange_funding_arb_venue_pairs() -> Vec<CrossExchangeFundingArbVenuePair> {
     let venues = arb_venue_capability_profiles()
         .into_iter()
@@ -381,6 +414,54 @@ pub fn arb_venue_capability_descriptors(
                 60_000,
             )?);
         }
+        "gate" => {
+            if profile.supports_spot {
+                descriptors.push(public_venue_capability_descriptor(
+                    "venue:GATE-SPOT",
+                    "Gate Spot Public REST",
+                    &["ProvidesSpotMarkets", "ProvidesOrderBookMarkets"],
+                    &["RESTPolling", "WebSocketStreaming", "RateLimitHeaders"],
+                    "gate-public-spot-rest",
+                    600,
+                    60_000,
+                )?);
+            }
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:GATE-USDT-FUTURES",
+                "Gate USDT Futures Public REST",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &[
+                    "RESTPolling",
+                    "WebSocketStreaming",
+                    "RateLimitHeaders",
+                    "FundingHistory",
+                ],
+                "gate-public-usdt-futures-rest",
+                600,
+                60_000,
+            )?);
+        }
+        "lighter" => {
+            descriptors.push(public_venue_capability_descriptor(
+                "venue:LIGHTER-PERP",
+                "Lighter Perp Public API",
+                &[
+                    "ProvidesPerpetuals",
+                    "ProvidesOrderBookMarkets",
+                    "ProvidesFundingRates",
+                    "ProvidesOraclePrices",
+                ],
+                &["RESTPolling", "WebSocketStreaming", "FundingHistory"],
+                "lighter-public-api",
+                60,
+                60_000,
+            )?);
+        }
         _ => unreachable!("venue family checked above"),
     }
 
@@ -399,6 +480,10 @@ pub(super) fn normalize_venue_family(venue_family: &str) -> String {
         value if value.starts_with("bitget") => "bitget".to_owned(),
         value if value.starts_with("aster") => "aster".to_owned(),
         value if value.starts_with("hyperliquid") => "hyperliquid".to_owned(),
+        value if value.starts_with("gateio") || value.starts_with("gate") => "gate".to_owned(),
+        value if value.starts_with("zklighter") || value.starts_with("lighter") => {
+            "lighter".to_owned()
+        }
         _ => compact,
     }
 }

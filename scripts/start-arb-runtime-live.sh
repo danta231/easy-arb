@@ -44,6 +44,7 @@ usage() {
   ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=0 # funding-arb 直接读取 perp/funding 公开源；0 表示复用 basis monitor status。
+  ARB_RUNTIME_LIVE_STAGED_EXCHANGES_ENABLED=0 # 是否接入 staged 交易所 Gate/Lighter 的只读公开行情；1 要求 direct public sources=1，且仍不启用实盘执行。
   ARB_RUNTIME_LIVE_TARGET_WSS_ENABLED=auto # 是否额外启动实盘 guard 专用 target WSS；auto 表示 spot-perp resident 启用时启动并作为 readiness gate。
   ARB_RUNTIME_LIVE_KEEP_PREREQ_ON_LIVE_FAILURE=1 # foreground live 失败时是否保留只读 API/WSS 便于排查；停止用 scripts/stop-arb-runtime-live.sh。
   ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Binance spot/perp WSS 订阅 symbol，多个用逗号分隔。
@@ -52,7 +53,10 @@ usage() {
   ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL=BTCUSDT # CEX_WSS_SCOPE=custom 时的 Bitget spot/perp WSS 订阅 symbol，多个用逗号分隔。
   ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL=ALL_USDT # all/custom/target 时的 Aster perp WSS monitor 订阅范围；auto 会覆盖为策略解析结果。
   ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL=ALL_USDT # all/custom/target 时的 Hyperliquid perp WSS monitor 订阅范围；auto 会覆盖为策略解析结果。
+  ARB_RUNTIME_LIVE_GATE_WSS_SYMBOL=ALL_USDT # staged 启用时的 Gate USDT futures WSS 订阅范围；auto 会覆盖为策略解析结果。
+  ARB_RUNTIME_LIVE_LIGHTER_WSS_SYMBOL=ALL_USDT # staged 启用时的 Lighter perp WSS 订阅范围；auto 会覆盖为策略解析结果。
   ARB_RUNTIME_LIVE_PORTFOLIO_BIND=127.0.0.1:8805 # portfolio JSON API 监听地址。
+  ARB_RUNTIME_PORTFOLIO_MANUAL_CLOSE_ENABLED=1 # Portfolio 手动平仓控制接口；设为 0 可关闭。
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_ENABLED=1 # 是否启动全账户私有只读采集器；只读仓位和余额，不下单、不撤单、不转账。
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS=60 # 全账户私有只读采集间隔秒数。
   ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_VENUES= # 可选覆盖采集交易所，逗号分隔；留空表示所有支持 funding-arb 的交易所。
@@ -461,6 +465,14 @@ case "${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}" in
   0|1) ;;
   *) die "ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED must be 0 or 1" ;;
 esac
+STAGED_EXCHANGES_ENABLED="${ARB_RUNTIME_LIVE_STAGED_EXCHANGES_ENABLED:-0}"
+case "${STAGED_EXCHANGES_ENABLED}" in
+  0|1) ;;
+  *) die "ARB_RUNTIME_LIVE_STAGED_EXCHANGES_ENABLED must be 0 or 1" ;;
+esac
+if [[ "${STAGED_EXCHANGES_ENABLED}" == "1" && "${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}" != "1" ]]; then
+  die "ARB_RUNTIME_LIVE_STAGED_EXCHANGES_ENABLED=1 requires ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED=1; Gate/Lighter do not expose the legacy basis monitor status path"
+fi
 
 LIVE_MONITORS="${BASIS_OBSERVER_MONITORS:-binance bybit okx bitget}"
 if [[ -z "${BASIS_OBSERVER_MONITORS:-}" ]]; then
@@ -470,6 +482,16 @@ if [[ -z "${BASIS_OBSERVER_MONITORS:-}" ]]; then
   if [[ "${ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED:-0}" == "1" || "${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}" != "1" ]]; then
     LIVE_MONITORS="${LIVE_MONITORS} hyperliquid"
   fi
+  if [[ "${STAGED_EXCHANGES_ENABLED}" == "1" ]]; then
+    LIVE_MONITORS="${LIVE_MONITORS} gate lighter"
+  fi
+fi
+if [[ "${STAGED_EXCHANGES_ENABLED}" == "1" ]]; then
+  for staged_venue in gate lighter; do
+    if [[ " ${LIVE_MONITORS} " != *" ${staged_venue} "* ]]; then
+      LIVE_MONITORS="${LIVE_MONITORS} ${staged_venue}"
+    fi
+  done
 fi
 
 if [[ -e "${LIVE_PAUSE_FILE}" && "${ARB_RUNTIME_LIVE_IGNORE_PAUSE:-0}" != "1" ]]; then
@@ -486,6 +508,8 @@ BITGET_SPOT_WSS_BIND="${ARB_RUNTIME_LIVE_BITGET_SPOT_WSS_BIND:-127.0.0.1:8792}"
 BITGET_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_BITGET_PERP_WSS_BIND:-127.0.0.1:8793}"
 ASTER_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_ASTER_PERP_WSS_BIND:-127.0.0.1:8794}"
 HYPERLIQUID_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_HYPERLIQUID_PERP_WSS_BIND:-127.0.0.1:8795}"
+LIGHTER_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_LIGHTER_PERP_WSS_BIND:-127.0.0.1:8824}"
+GATE_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_GATE_PERP_WSS_BIND:-127.0.0.1:8825}"
 TARGET_BINANCE_SPOT_WSS_BIND="${ARB_RUNTIME_LIVE_TARGET_BINANCE_SPOT_WSS_BIND:-127.0.0.1:8816}"
 TARGET_BINANCE_PERP_WSS_BIND="${ARB_RUNTIME_LIVE_TARGET_BINANCE_PERP_WSS_BIND:-127.0.0.1:8817}"
 TARGET_BYBIT_SPOT_WSS_BIND="${ARB_RUNTIME_LIVE_TARGET_BYBIT_SPOT_WSS_BIND:-127.0.0.1:8818}"
@@ -512,24 +536,32 @@ case "${CEX_WSS_SCOPE}" in
     BYBIT_WSS_SYMBOL=""
     OKX_WSS_SYMBOL=""
     BITGET_WSS_SYMBOL=""
+    GATE_WSS_SYMBOL=""
+    LIGHTER_WSS_SYMBOL=""
     ;;
   target)
     BINANCE_WSS_SYMBOL="${BINANCE_BASIS_READY_SYMBOL}"
     BYBIT_WSS_SYMBOL="${BYBIT_BASIS_READY_SYMBOL}"
     OKX_WSS_SYMBOL="${OKX_BASIS_READY_SYMBOL}"
     BITGET_WSS_SYMBOL="${BITGET_BASIS_READY_SYMBOL}"
+    GATE_WSS_SYMBOL=""
+    LIGHTER_WSS_SYMBOL=""
     ;;
   all)
     BINANCE_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL:-ALL_USDT}"
     BYBIT_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL:-ALL_USDT}"
     OKX_WSS_SYMBOL="${ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL:-ALL_USDT}"
     BITGET_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL:-ALL_USDT}"
+    GATE_WSS_SYMBOL="${ARB_RUNTIME_LIVE_GATE_WSS_SYMBOL:-ALL_USDT}"
+    LIGHTER_WSS_SYMBOL="${ARB_RUNTIME_LIVE_LIGHTER_WSS_SYMBOL:-ALL_USDT}"
     ;;
   custom)
     BINANCE_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BINANCE_WSS_SYMBOL:-${BINANCE_BASIS_READY_SYMBOL}}"
     BYBIT_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BYBIT_WSS_SYMBOL:-${BYBIT_BASIS_READY_SYMBOL}}"
     OKX_WSS_SYMBOL="${ARB_RUNTIME_LIVE_OKX_WSS_SYMBOL:-${OKX_BASIS_READY_SYMBOL}}"
     BITGET_WSS_SYMBOL="${ARB_RUNTIME_LIVE_BITGET_WSS_SYMBOL:-${BITGET_BASIS_READY_SYMBOL}}"
+    GATE_WSS_SYMBOL="${ARB_RUNTIME_LIVE_GATE_WSS_SYMBOL:-ALL_USDT}"
+    LIGHTER_WSS_SYMBOL="${ARB_RUNTIME_LIVE_LIGHTER_WSS_SYMBOL:-ALL_USDT}"
     ;;
   *)
     die "ARB_RUNTIME_LIVE_CEX_WSS_SCOPE must be auto, target, all, or custom"
@@ -545,6 +577,10 @@ case "${SHARED_CEX_WSS_REQUIRED}" in
 esac
 ASTER_WSS_SYMBOL="${ARB_RUNTIME_LIVE_ASTER_WSS_SYMBOL:-ALL_USDT}"
 HYPERLIQUID_WSS_SYMBOL="${ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_SYMBOL:-ALL_USDT}"
+if [[ "${STAGED_EXCHANGES_ENABLED}" != "1" ]]; then
+  GATE_WSS_SYMBOL=""
+  LIGHTER_WSS_SYMBOL=""
+fi
 BINANCE_SPOT_WSS_SYMBOL="${BINANCE_WSS_SYMBOL}"
 BINANCE_PERP_WSS_SYMBOL="${BINANCE_WSS_SYMBOL}"
 BYBIT_SPOT_WSS_SYMBOL="${BYBIT_WSS_SYMBOL}"
@@ -563,7 +599,7 @@ if [[ "${ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED:-1}" != "0" ]]; then
     echo "repo_root=${REPO_ROOT}"
     echo "run_root=${RUN_ROOT}"
     echo "prereq_root=${PREREQ_ROOT}"
-    echo "detach=${DETACH} build=${BUILD} config=${LIVE_CONFIG} interval_secs=${LIVE_INTERVAL_SECS} min_net_bps=${LIVE_MIN_NET_BPS} strategies=${LIVE_STRATEGIES} monitors=${LIVE_MONITORS} spot_perp_basis_mode=${LIVE_SPOT_PERP_BASIS_MODE} funding_arb_mode=${LIVE_FUNDING_ARB_MODE} funding_arb_direct_public_sources=${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED} derisk_only=${LIVE_DERISK_ONLY} cex_wss_scope=${CEX_WSS_SCOPE} shared_cex_wss_required=${SHARED_CEX_WSS_REQUIRED} target_wss_enabled=${TARGET_WSS_ENABLED}"
+    echo "detach=${DETACH} build=${BUILD} config=${LIVE_CONFIG} interval_secs=${LIVE_INTERVAL_SECS} min_net_bps=${LIVE_MIN_NET_BPS} strategies=${LIVE_STRATEGIES} monitors=${LIVE_MONITORS} spot_perp_basis_mode=${LIVE_SPOT_PERP_BASIS_MODE} funding_arb_mode=${LIVE_FUNDING_ARB_MODE} funding_arb_direct_public_sources=${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED} staged_exchanges=${STAGED_EXCHANGES_ENABLED} derisk_only=${LIVE_DERISK_ONLY} cex_wss_scope=${CEX_WSS_SCOPE} shared_cex_wss_required=${SHARED_CEX_WSS_REQUIRED} target_wss_enabled=${TARGET_WSS_ENABLED}"
   } >> "${PRECHECK_LOG}"
   exec > >(tee -a "${PRECHECK_LOG}") 2>&1
 fi
@@ -612,8 +648,12 @@ resolve_auto_wss_symbols() {
   printf '%s\n' "${resolver_output}" > "${resolver_env_file}"
   # shellcheck disable=SC1090
   source "${resolver_env_file}"
+  if [[ "${STAGED_EXCHANGES_ENABLED}" != "1" ]]; then
+    GATE_WSS_SYMBOL=""
+    LIGHTER_WSS_SYMBOL=""
+  fi
   echo "wss_symbol_resolver mode=auto env=${resolver_env_file} spot_perp_symbols=${LIVE_WSS_RESOLVER_SPOT_PERP_SYMBOL_COUNT:-0} funding_bases=${LIVE_WSS_RESOLVER_FUNDING_ARB_BASE_COUNT:-0}"
-  echo "wss_symbols binance_spot=${BINANCE_SPOT_WSS_SYMBOL:-skip} binance_perp=${BINANCE_PERP_WSS_SYMBOL:-skip} bybit_spot=${BYBIT_SPOT_WSS_SYMBOL:-skip} bybit_perp=${BYBIT_PERP_WSS_SYMBOL:-skip} okx_spot=${OKX_SPOT_WSS_SYMBOL:-skip} okx_perp=${OKX_PERP_WSS_SYMBOL:-skip} bitget_spot=${BITGET_SPOT_WSS_SYMBOL:-skip} bitget_perp=${BITGET_PERP_WSS_SYMBOL:-skip} aster_perp=${ASTER_WSS_SYMBOL:-skip} hyperliquid_perp=${HYPERLIQUID_WSS_SYMBOL:-skip}"
+  echo "wss_symbols binance_spot=${BINANCE_SPOT_WSS_SYMBOL:-skip} binance_perp=${BINANCE_PERP_WSS_SYMBOL:-skip} bybit_spot=${BYBIT_SPOT_WSS_SYMBOL:-skip} bybit_perp=${BYBIT_PERP_WSS_SYMBOL:-skip} okx_spot=${OKX_SPOT_WSS_SYMBOL:-skip} okx_perp=${OKX_PERP_WSS_SYMBOL:-skip} bitget_spot=${BITGET_SPOT_WSS_SYMBOL:-skip} bitget_perp=${BITGET_PERP_WSS_SYMBOL:-skip} aster_perp=${ASTER_WSS_SYMBOL:-skip} hyperliquid_perp=${HYPERLIQUID_WSS_SYMBOL:-skip} gate_perp=${GATE_WSS_SYMBOL:-skip} lighter_perp=${LIGHTER_WSS_SYMBOL:-skip}"
 }
 
 if [[ "${CEX_WSS_SCOPE}" == "auto" ]]; then
@@ -755,6 +795,7 @@ start_portfolio_dashboard() {
     --resident-root "${RUN_ROOT}"
     --navigation-wss-pid-file "${WSS_PID_FILE}"
   )
+  [[ "${ARB_RUNTIME_PORTFOLIO_MANUAL_CLOSE_ENABLED:-1}" == "1" ]] && args+=(--enable-manual-close)
   [[ -n "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT:-}" ]] && args+=(--account-snapshot "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT}")
   [[ -n "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_RAW_SNAPSHOT:-}" ]] && args+=(--account-raw-snapshot "${ARB_RUNTIME_PORTFOLIO_ACCOUNT_RAW_SNAPSHOT}")
   [[ -n "${ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT:-}" ]] && args+=(--position-snapshot "${ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT}")
@@ -1042,6 +1083,8 @@ start_wss_monitor_if_configured bitget-spot bitget-wss-book-ticker "${BITGET_SPO
 start_wss_monitor_if_configured bitget-perp bitget-wss-book-ticker "${BITGET_PERP_WSS_BIND}" "${BITGET_PERP_WSS_SYMBOL}" usdt-futures /api/bitget-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
 start_wss_monitor_if_configured aster-perp aster-wss-book-ticker "${ASTER_PERP_WSS_BIND}" "${ASTER_WSS_SYMBOL}" usdt-futures /api/aster-wss-book-ticker "" 0
 start_wss_monitor_if_configured hyperliquid-perp hyperliquid-wss-book-ticker "${HYPERLIQUID_PERP_WSS_BIND}" "${HYPERLIQUID_WSS_SYMBOL}" perp /api/hyperliquid-wss-book-ticker "" 0
+start_wss_monitor_if_configured gate-perp gate-wss-book-ticker "${GATE_PERP_WSS_BIND}" "${GATE_WSS_SYMBOL}" usdt-futures /api/gate-wss-book-ticker "" 0
+start_wss_monitor_if_configured lighter-perp lighter-wss-book-ticker "${LIGHTER_PERP_WSS_BIND}" "${LIGHTER_WSS_SYMBOL}" perp /api/lighter-wss-book-ticker "" 0
 
 if [[ "${TARGET_WSS_ENABLED}" == "1" ]]; then
   start_wss_monitor target-binance-spot binance-wss-book-ticker "${TARGET_BINANCE_SPOT_WSS_BIND}" "${BINANCE_BASIS_READY_SYMBOL}" spot /api/binance-wss-book-ticker "${BINANCE_BASIS_READY_SYMBOL}" 1
@@ -1085,6 +1128,8 @@ print_readonly_apis() {
   Bitget perp:        http://${BITGET_PERP_WSS_BIND}/api/bitget-wss-book-ticker/status
   Aster perp:         http://${ASTER_PERP_WSS_BIND}/api/aster-wss-book-ticker/status
   Hyperliquid perp:   http://${HYPERLIQUID_PERP_WSS_BIND}/api/hyperliquid-wss-book-ticker/status
+  Gate perp:          http://${GATE_PERP_WSS_BIND}/api/gate-wss-book-ticker/status
+  Lighter perp:       http://${LIGHTER_PERP_WSS_BIND}/api/lighter-wss-book-ticker/status
 
 实盘 guard target WSS JSON API:
   Binance spot:       http://${TARGET_BINANCE_SPOT_WSS_BIND}/api/binance-wss-book-ticker/status
@@ -1125,6 +1170,8 @@ BASIS_OKX_SPOT_WSS_BIND="${OKX_SPOT_WSS_BIND}"
 BASIS_OKX_PERP_WSS_BIND="${OKX_PERP_WSS_BIND}"
 BASIS_BITGET_SPOT_WSS_BIND="${BITGET_SPOT_WSS_BIND}"
 BASIS_BITGET_PERP_WSS_BIND="${BITGET_PERP_WSS_BIND}"
+BASIS_GATE_PERP_WSS_BIND="${GATE_PERP_WSS_BIND}"
+BASIS_LIGHTER_PERP_WSS_BIND="${LIGHTER_PERP_WSS_BIND}"
 
 LIVE_ENV=(
   BASIS_OBSERVER_ROOT="${RUN_ROOT}"
@@ -1152,6 +1199,7 @@ LIVE_ENV=(
   BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS="${BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS:-60}"
   BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS="${BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED="${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}"
+  ARB_RUNTIME_FUNDING_ARB_INCLUDE_STAGED_PUBLIC_SOURCES="${STAGED_EXCHANGES_ENABLED}"
   ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED="${ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED:-0}"
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED="${ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED:-0}"
   BINANCE_SPOT_WSS_MONITOR_URL="http://${BASIS_BINANCE_SPOT_WSS_BIND}/api/binance-wss-book-ticker/status"
@@ -1164,6 +1212,8 @@ LIVE_ENV=(
   BITGET_PERP_WSS_MONITOR_URL="http://${BASIS_BITGET_PERP_WSS_BIND}/api/bitget-wss-book-ticker/status"
   ASTER_PERP_WSS_MONITOR_URL="http://${ASTER_PERP_WSS_BIND}/api/aster-wss-book-ticker/status"
   HYPERLIQUID_PERP_WSS_MONITOR_URL="http://${HYPERLIQUID_PERP_WSS_BIND}/api/hyperliquid-wss-book-ticker/status"
+  GATE_PERP_WSS_MONITOR_URL="http://${BASIS_GATE_PERP_WSS_BIND}/api/gate-wss-book-ticker/status"
+  LIGHTER_PERP_WSS_MONITOR_URL="http://${BASIS_LIGHTER_PERP_WSS_BIND}/api/lighter-wss-book-ticker/status"
 )
 
 LIVE_ARGS=(

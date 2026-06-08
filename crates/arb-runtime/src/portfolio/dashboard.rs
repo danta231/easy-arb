@@ -81,6 +81,8 @@ pub(crate) struct PortfolioBalanceRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortfolioPositionRow {
+    pub(crate) position_id: Option<String>,
+    pub(crate) position_kind: Option<String>,
     pub(crate) coin: String,
     pub(crate) symbol: String,
     pub(crate) strategy: String,
@@ -105,6 +107,9 @@ pub(crate) struct PortfolioPositionRow {
     pub(crate) position_group_label: Option<String>,
     pub(crate) position_leg_role: Option<String>,
     pub(crate) position_limit: Option<String>,
+    pub(crate) manual_close_request_id: Option<String>,
+    pub(crate) manual_close_request_status: Option<String>,
+    pub(crate) manual_close_request_detail: Option<String>,
     pub(crate) source: String,
 }
 
@@ -143,6 +148,9 @@ pub(crate) struct PortfolioResidentPositionRef {
     pub(crate) position_limit: Option<String>,
     pub(crate) opened_at: Option<String>,
     pub(crate) closed_at: Option<String>,
+    pub(crate) manual_close_request_id: Option<String>,
+    pub(crate) manual_close_request_status: Option<String>,
+    pub(crate) manual_close_request_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,10 +163,11 @@ pub(crate) struct PortfolioFundingArbLegDisplay {
     pub(crate) entry_limit_price: String,
 }
 
-/// 启动只读组合看板。
+/// 启动组合看板。
 ///
-/// 中文说明：该入口只读取本地文件和 resident live 注册表；不会访问交易所私有
-/// 接口，不读取凭证，不提交订单。
+/// 中文说明：默认只读取本地文件和 resident live 注册表；启用
+/// `--enable-manual-close` 后仅追加 funding-arb 手动平仓请求，真实下单仍由
+/// resident live 进程完成。该入口不会访问交易所私有接口，不读取凭证，不直接提交订单。
 pub fn run_portfolio_dashboard(
     options: PortfolioDashboardOptions,
 ) -> RuntimeResult<PortfolioDashboardReport> {
@@ -2029,21 +2038,27 @@ pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String 
         .as_ref()
         .map(|value| portfolio_normalize_datetime_display(value));
     format!(
-        "{{\"account_id\":{},\"accumulated_position\":{},\"closed_at\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"opened_at\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
+        "{{\"account_id\":{},\"accumulated_position\":{},\"closed_at\":{},\"close_action\":{},\"close_average_price\":{},\"coin\":{},\"fee\":{},\"fee_rate_bps\":{},\"funding_settlement_time\":{},\"manual_close_request_detail\":{},\"manual_close_request_id\":{},\"manual_close_request_status\":{},\"opened_at\":{},\"open_average_price\":{},\"open_close_condition\":{},\"open_close_spread_pct\":{},\"position_group_id\":{},\"position_group_label\":{},\"position_id\":{},\"position_kind\":{},\"position_leg_role\":{},\"position_limit\":{},\"position_quantity\":{},\"position_status\":{},\"realtime_funding_interval_hours\":{},\"realtime_funding_rate\":{},\"settled_funding_usd\":{},\"source\":{},\"strategy\":{},\"symbol\":{},\"venue_family\":{}}}",
         json_string(&row.account_id),
         json_option_string(&row.accumulated_position),
         json_option_string(&closed_at),
+        portfolio_position_close_action_json(row),
         json_option_string(&row.close_average_price),
         json_string(&row.coin),
         json_option_string(&row.fee),
         json_option_string(&row.fee_rate_bps),
         json_option_string(&row.funding_settlement_time),
+        json_option_string(&row.manual_close_request_detail),
+        json_option_string(&row.manual_close_request_id),
+        json_option_string(&row.manual_close_request_status),
         json_option_string(&opened_at),
         json_option_string(&row.open_average_price),
         json_option_string(&row.open_close_condition),
         json_option_string(&row.open_close_spread_pct),
         json_option_string(&row.position_group_id),
         json_option_string(&row.position_group_label),
+        json_option_string(&row.position_id),
+        json_option_string(&row.position_kind),
         json_option_string(&row.position_leg_role),
         json_option_string(&row.position_limit),
         json_string(&row.position_quantity),
@@ -2056,6 +2071,53 @@ pub(crate) fn portfolio_position_row_json(row: &PortfolioPositionRow) -> String 
         json_string(&row.symbol),
         json_string(&row.venue_family),
     )
+}
+
+pub(crate) fn portfolio_position_close_action_json(row: &PortfolioPositionRow) -> String {
+    let disabled_reason = portfolio_position_close_action_disabled_reason(row);
+    let eligible = disabled_reason.is_none();
+    format!(
+        "{{\"disabled_reason\":{},\"eligible\":{},\"order_type\":{},\"position_id\":{},\"request_id\":{},\"status\":{},\"supported\":{}}}",
+        json_option_string(&disabled_reason),
+        eligible,
+        json_string(funding_arb_manual_close_order_type()),
+        json_option_string(&row.position_id),
+        json_option_string(&row.manual_close_request_id),
+        json_option_string(&row.manual_close_request_status),
+        row.position_kind.as_deref() == Some("cross_exchange_funding_arb"),
+    )
+}
+
+pub(crate) fn portfolio_position_close_action_disabled_reason(
+    row: &PortfolioPositionRow,
+) -> Option<String> {
+    let Some(position_id) = row
+        .position_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Some("该仓位行缺少稳定 position_id，不能从 Portfolio 卡片触发平仓。".to_owned());
+    };
+    if row.position_kind.as_deref() != Some("cross_exchange_funding_arb") {
+        return Some(
+            "一键平仓第一版仅支持 funding-arb perp-perp 仓位；spot-perp basis 暂不支持。"
+                .to_owned(),
+        );
+    }
+    if row.position_status != "open" {
+        return Some(format!(
+            "仓位 `{position_id}` 当前状态为 `{}`，不是 active open 仓位。",
+            row.position_status
+        ));
+    }
+    if let Some(status) = row.manual_close_request_status.as_deref() {
+        if funding_arb_manual_close_status_is_pending(status) {
+            return Some(format!(
+                "仓位 `{position_id}` 已有手动平仓请求，当前状态 `{status}`。"
+            ));
+        }
+    }
+    None
 }
 
 pub(crate) fn portfolio_normalize_datetime_display(value: &str) -> String {
@@ -3450,6 +3512,8 @@ pub(crate) fn portfolio_position_row_from_fields(
         ],
     )?;
     Ok(Some(PortfolioPositionRow {
+        position_id: None,
+        position_kind: None,
         coin: funding_base_asset_from_symbol(&symbol),
         symbol,
         strategy,
@@ -3474,6 +3538,9 @@ pub(crate) fn portfolio_position_row_from_fields(
         position_group_label,
         position_leg_role,
         position_limit,
+        manual_close_request_id: None,
+        manual_close_request_status: None,
+        manual_close_request_detail: None,
         source: source.to_owned(),
     }))
 }
@@ -3759,6 +3826,8 @@ pub(crate) fn portfolio_funding_arb_leg_metadata_row(
     let venue_family = normalize_venue_family(&leg.venue_family);
     let funding_context = portfolio_find_funding_context(funding_contexts, &venue_family, symbol);
     PortfolioPositionRow {
+        position_id: Some(position_ref.position_id.clone()),
+        position_kind: Some(portfolio_resident_position_kind_label(position_ref.kind).to_owned()),
         coin: funding_base_asset_from_symbol(symbol),
         symbol: symbol.to_owned(),
         strategy: "cross-exchange-funding-arb-resident-live".to_owned(),
@@ -3787,6 +3856,9 @@ pub(crate) fn portfolio_funding_arb_leg_metadata_row(
         position_group_label: portfolio_resident_position_group_label(position_ref),
         position_leg_role: Some(portfolio_funding_arb_leg_role_label(leg)),
         position_limit: position_ref.position_limit.clone(),
+        manual_close_request_id: position_ref.manual_close_request_id.clone(),
+        manual_close_request_status: position_ref.manual_close_request_status.clone(),
+        manual_close_request_detail: position_ref.manual_close_request_detail.clone(),
         source: "funding-arb-resident-live".to_owned(),
     }
 }
@@ -3812,6 +3884,8 @@ pub(crate) fn portfolio_apply_resident_position_metadata(
         if portfolio_string_is_missing_or_unknown(&row.strategy) {
             row.strategy = metadata.strategy.clone();
         }
+        portfolio_fill_missing_option(&mut row.position_id, metadata.position_id.as_ref());
+        portfolio_fill_missing_option(&mut row.position_kind, metadata.position_kind.as_ref());
         portfolio_fill_missing_option(&mut row.fee_rate_bps, metadata.fee_rate_bps.as_ref());
         portfolio_fill_missing_option(
             &mut row.settled_funding_usd,
@@ -3860,6 +3934,18 @@ pub(crate) fn portfolio_apply_resident_position_metadata(
             metadata.position_leg_role.as_ref(),
         );
         portfolio_fill_missing_option(&mut row.position_limit, metadata.position_limit.as_ref());
+        portfolio_fill_missing_option(
+            &mut row.manual_close_request_id,
+            metadata.manual_close_request_id.as_ref(),
+        );
+        portfolio_fill_missing_option(
+            &mut row.manual_close_request_status,
+            metadata.manual_close_request_status.as_ref(),
+        );
+        portfolio_fill_missing_option(
+            &mut row.manual_close_request_detail,
+            metadata.manual_close_request_detail.as_ref(),
+        );
     }
 }
 
@@ -4119,6 +4205,9 @@ pub(crate) fn portfolio_resident_position_refs_from_dir(
                             "closed_at",
                             "resident position registry",
                         )?,
+                        manual_close_request_id: None,
+                        manual_close_request_status: None,
+                        manual_close_request_detail: None,
                     },
                 );
             }
@@ -4203,6 +4292,16 @@ pub(crate) fn portfolio_resident_position_refs_from_dir(
             _ => {}
         }
     }
+    if kind == PortfolioResidentPositionKind::CrossExchangeFundingArb {
+        let manual_close_states = load_funding_arb_manual_close_request_states(dir)?;
+        for position in positions.values_mut() {
+            if let Some(state) = manual_close_states.get(&position.position_id) {
+                position.manual_close_request_id = Some(state.request.request_id.clone());
+                position.manual_close_request_status = Some(state.status.clone());
+                position.manual_close_request_detail = state.detail.clone();
+            }
+        }
+    }
     Ok(positions.into_values().collect())
 }
 
@@ -4239,6 +4338,9 @@ pub(crate) fn portfolio_resident_position_ref_from_registry_fields(
         position_limit: defaults.position_limit.clone(),
         opened_at: optional_json_value_string(fields, "opened_at", "resident position registry")?,
         closed_at: optional_json_value_string(fields, "closed_at", "resident position registry")?,
+        manual_close_request_id: None,
+        manual_close_request_status: None,
+        manual_close_request_detail: None,
     }))
 }
 
@@ -4316,6 +4418,15 @@ pub(crate) fn portfolio_resident_position_venue_family(
 ) -> String {
     portfolio_resident_pair_venue_family(position_ref.pair_id.as_deref())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+pub(crate) fn portfolio_resident_position_kind_label(
+    kind: PortfolioResidentPositionKind,
+) -> &'static str {
+    match kind {
+        PortfolioResidentPositionKind::SpotPerpBasis => "spot_perp_basis",
+        PortfolioResidentPositionKind::CrossExchangeFundingArb => "cross_exchange_funding_arb",
+    }
 }
 
 pub(crate) fn portfolio_resident_position_account_id(
@@ -4423,6 +4534,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
             let position_status = portfolio_resident_missing_state_status(position_ref);
             let position_quantity = portfolio_resident_position_quantity_display(position_ref);
             return Ok(PortfolioPositionRow {
+                position_id: Some(position_ref.position_id.clone()),
+                position_kind: Some(portfolio_resident_position_kind_label(position_ref.kind).to_owned()),
                 coin: funding_base_asset_from_symbol(&symbol),
                 symbol,
                 strategy: "resident-live".to_owned(),
@@ -4449,6 +4562,9 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
                 position_group_label: portfolio_resident_position_group_label(position_ref),
                 position_leg_role: None,
                 position_limit: position_ref.position_limit.clone(),
+                manual_close_request_id: position_ref.manual_close_request_id.clone(),
+                manual_close_request_status: position_ref.manual_close_request_status.clone(),
+                manual_close_request_detail: position_ref.manual_close_request_detail.clone(),
                 source: "resident-live".to_owned(),
             });
         }
@@ -4522,6 +4638,8 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
     let opened_at = optional_json_value_string(&fields, "opened_at", "resident position state")?
         .or_else(|| position_ref.opened_at.clone());
     Ok(PortfolioPositionRow {
+        position_id: Some(position_ref.position_id.clone()),
+        position_kind: Some(portfolio_resident_position_kind_label(position_ref.kind).to_owned()),
         coin: funding_base_asset_from_symbol(&symbol),
         symbol,
         strategy,
@@ -4548,6 +4666,9 @@ pub(crate) fn portfolio_position_row_from_resident_ref(
         position_group_label: portfolio_resident_position_group_label(position_ref),
         position_leg_role: None,
         position_limit: position_ref.position_limit.clone(),
+        manual_close_request_id: position_ref.manual_close_request_id.clone(),
+        manual_close_request_status: position_ref.manual_close_request_status.clone(),
+        manual_close_request_detail: position_ref.manual_close_request_detail.clone(),
         source: "resident-live".to_owned(),
     })
 }
@@ -4558,6 +4679,8 @@ pub(crate) fn portfolio_terminal_position_row_from_resident_ref(
     let symbol = portfolio_resident_position_symbol(position_ref);
     let position_quantity = portfolio_resident_position_quantity_display(position_ref);
     PortfolioPositionRow {
+        position_id: Some(position_ref.position_id.clone()),
+        position_kind: Some(portfolio_resident_position_kind_label(position_ref.kind).to_owned()),
         coin: funding_base_asset_from_symbol(&symbol),
         symbol,
         strategy: if position_ref.kind == PortfolioResidentPositionKind::CrossExchangeFundingArb {
@@ -4588,6 +4711,9 @@ pub(crate) fn portfolio_terminal_position_row_from_resident_ref(
         position_group_label: portfolio_resident_position_group_label(position_ref),
         position_leg_role: None,
         position_limit: position_ref.position_limit.clone(),
+        manual_close_request_id: position_ref.manual_close_request_id.clone(),
+        manual_close_request_status: position_ref.manual_close_request_status.clone(),
+        manual_close_request_detail: position_ref.manual_close_request_detail.clone(),
         source: if position_ref.kind == PortfolioResidentPositionKind::CrossExchangeFundingArb {
             "funding-arb-resident-live".to_owned()
         } else {
@@ -4607,6 +4733,8 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
             let position_status = portfolio_resident_missing_state_status(position_ref);
             let position_quantity = portfolio_resident_position_quantity_display(position_ref);
             return Ok(PortfolioPositionRow {
+                position_id: Some(position_ref.position_id.clone()),
+                position_kind: Some(portfolio_resident_position_kind_label(position_ref.kind).to_owned()),
                 coin: funding_base_asset_from_symbol(&symbol),
                 symbol,
                 strategy: "cross-exchange-funding-arb-resident-live".to_owned(),
@@ -4633,6 +4761,9 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
                 position_group_label: portfolio_resident_position_group_label(position_ref),
                 position_leg_role: None,
                 position_limit: position_ref.position_limit.clone(),
+                manual_close_request_id: position_ref.manual_close_request_id.clone(),
+                manual_close_request_status: position_ref.manual_close_request_status.clone(),
+                manual_close_request_detail: position_ref.manual_close_request_detail.clone(),
                 source: "funding-arb-resident-live".to_owned(),
             });
         }
@@ -4685,6 +4816,8 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
     let opened_at = optional_json_value_string(&fields, "opened_at", "funding arb position state")?
         .or_else(|| position_ref.opened_at.clone());
     Ok(PortfolioPositionRow {
+        position_id: Some(position_ref.position_id.clone()),
+        position_kind: Some(portfolio_resident_position_kind_label(position_ref.kind).to_owned()),
         coin: funding_base_asset_from_symbol(&symbol),
         symbol,
         strategy: "cross-exchange-funding-arb-resident-live".to_owned(),
@@ -4712,6 +4845,9 @@ pub(crate) fn portfolio_funding_arb_position_row_from_resident_ref(
         position_group_label: portfolio_resident_position_group_label(position_ref),
         position_leg_role: None,
         position_limit: position_ref.position_limit.clone(),
+        manual_close_request_id: position_ref.manual_close_request_id.clone(),
+        manual_close_request_status: position_ref.manual_close_request_status.clone(),
+        manual_close_request_detail: position_ref.manual_close_request_detail.clone(),
         source: "funding-arb-resident-live".to_owned(),
     })
 }
@@ -5158,6 +5294,12 @@ fn handle_portfolio_dashboard_http_connection(
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
     let route = path.split('?').next().unwrap_or(path);
+    if method == "POST" && route == "/api/portfolio/positions/close" {
+        let body = portfolio_http_request_body(&request);
+        let (status, body) = portfolio_manual_close_request_http_json(state.options.as_ref(), body);
+        let _ = write_http_json(&mut stream, status, &body);
+        return;
+    }
     if method != "GET" {
         let _ = write_http_json(&mut stream, 405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -5219,8 +5361,197 @@ fn handle_portfolio_dashboard_http_connection(
     } else {
         (
             404,
-            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/navigation/pages\",\"/api/errors/logs\",\"/api/portfolio/status\",\"/api/portfolio/balances\",\"/api/portfolio/positions\"]}".to_owned(),
+            "{\"error\":\"not_found\",\"paths\":[\"/health\",\"/api/navigation/pages\",\"/api/errors/logs\",\"/api/portfolio/status\",\"/api/portfolio/balances\",\"/api/portfolio/positions\",\"POST /api/portfolio/positions/close\"]}".to_owned(),
         )
     };
     let _ = write_http_json(&mut stream, status, &body);
+}
+
+fn portfolio_http_request_body(request: &str) -> &str {
+    request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .or_else(|| request.split_once("\n\n").map(|(_, body)| body))
+        .unwrap_or("")
+        .trim()
+}
+
+fn portfolio_manual_close_request_http_json(
+    options: &PortfolioDashboardOptions,
+    body: &str,
+) -> (u16, String) {
+    match portfolio_manual_close_request_http_json_inner(options, body) {
+        Ok(result) => result,
+        Err(error) => (
+            400,
+            portfolio_manual_close_error_json("bad_request", &error.to_string()),
+        ),
+    }
+}
+
+fn portfolio_manual_close_request_http_json_inner(
+    options: &PortfolioDashboardOptions,
+    body: &str,
+) -> RuntimeResult<(u16, String)> {
+    if !options.manual_close_enabled {
+        return Ok((
+            403,
+            portfolio_manual_close_error_json(
+                "manual_close_disabled",
+                "portfolio-dashboard 未启用 --enable-manual-close，拒绝写入手动平仓请求。",
+            ),
+        ));
+    }
+    let Some(resident_root) = options.resident_root.as_ref() else {
+        return Ok((
+            503,
+            portfolio_manual_close_error_json(
+                "resident_root_missing",
+                "portfolio-dashboard 未配置 --resident-root，不能定位 resident 仓位。",
+            ),
+        ));
+    };
+    let fields = parse_json_object_value_slices(body)?;
+    let position_id =
+        required_json_value_string(&fields, "position_id", "manual close request body")?;
+    let confirm_position_id =
+        required_json_value_string(&fields, "confirm_position_id", "manual close request body")?;
+    if confirm_position_id != position_id {
+        return Ok((
+            400,
+            portfolio_manual_close_error_json(
+                "confirmation_mismatch",
+                "confirm_position_id 必须与 position_id 完全一致。",
+            ),
+        ));
+    }
+    let idempotency_key =
+        optional_json_value_string(&fields, "idempotency_key", "manual close request body")?;
+    let requested_by =
+        optional_json_value_string(&fields, "requested_by", "manual close request body")?
+            .or_else(|| Some("easy-tool".to_owned()));
+    let reason = optional_json_value_string(&fields, "reason", "manual close request body")?;
+    let Some((output_root, position_ref)) =
+        portfolio_find_open_funding_arb_position(resident_root, &position_id)?
+    else {
+        return Ok((
+            404,
+            portfolio_manual_close_error_json(
+                "position_not_found",
+                "未找到匹配的 active funding-arb resident 仓位；closed、unknown、basis 仓位不会接受一键平仓请求。",
+            ),
+        ));
+    };
+
+    let states = load_funding_arb_manual_close_request_states(&output_root)?;
+    if let Some(state) = states.get(&position_id) {
+        if funding_arb_manual_close_status_is_pending(&state.status) {
+            let same_idempotency = idempotency_key
+                .as_deref()
+                .is_some_and(|key| state.request.idempotency_key.as_deref() == Some(key));
+            if same_idempotency {
+                return Ok((
+                    202,
+                    portfolio_manual_close_success_json(
+                        &output_root,
+                        &state.request,
+                        &state.status,
+                        true,
+                    ),
+                ));
+            }
+            return Ok((
+                409,
+                portfolio_manual_close_error_json(
+                    "manual_close_already_pending",
+                    "该仓位已有未完成的手动平仓请求。",
+                ),
+            ));
+        }
+    }
+
+    let requested_at = current_utc_timestamp_string();
+    let request = FundingArbManualCloseRequest {
+        request_id: portfolio_manual_close_request_id(&position_id, &requested_at),
+        position_id: position_ref.position_id,
+        requested_at,
+        requested_by,
+        reason,
+        idempotency_key,
+    };
+    append_funding_arb_manual_close_requested(&output_root, &request)?;
+    Ok((
+        202,
+        portfolio_manual_close_success_json(&output_root, &request, "requested", false),
+    ))
+}
+
+fn portfolio_find_open_funding_arb_position(
+    resident_root: &Path,
+    position_id: &str,
+) -> RuntimeResult<Option<(PathBuf, PortfolioResidentPositionRef)>> {
+    let mut registry_dirs = Vec::new();
+    portfolio_collect_resident_registry_dirs(resident_root, 4, &mut registry_dirs)?;
+    for registry_dir in registry_dirs {
+        if registry_dir.kind != PortfolioResidentPositionKind::CrossExchangeFundingArb {
+            continue;
+        }
+        let refs = portfolio_resident_position_refs_from_dir(
+            &registry_dir.path,
+            registry_dir.kind,
+            None,
+            None,
+        )?;
+        for position_ref in refs {
+            if position_ref.position_id == position_id && position_ref.status == "open" {
+                return Ok(Some((registry_dir.path, position_ref)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn portfolio_manual_close_request_id(position_id: &str, requested_at: &str) -> String {
+    let position_suffix = position_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let time_suffix = requested_at
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    format!("manual-close:{position_suffix}:{time_suffix}")
+}
+
+fn portfolio_manual_close_success_json(
+    output_root: &Path,
+    request: &FundingArbManualCloseRequest,
+    status: &str,
+    idempotent_replay: bool,
+) -> String {
+    format!(
+        "{{\"idempotent_replay\":{},\"order_type\":{},\"position_id\":{},\"request_id\":{},\"resident_root\":{},\"status\":{}}}",
+        idempotent_replay,
+        json_string(funding_arb_manual_close_order_type()),
+        json_string(&request.position_id),
+        json_string(&request.request_id),
+        json_string(&output_root.display().to_string()),
+        json_string(status),
+    )
+}
+
+fn portfolio_manual_close_error_json(error: &str, message: &str) -> String {
+    format!(
+        "{{\"error\":{},\"message\":{}}}",
+        json_string(error),
+        json_string(message),
+    )
 }

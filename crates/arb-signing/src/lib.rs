@@ -1042,6 +1042,8 @@ pub mod real {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use sha2::{Digest, Sha512};
+
     use super::*;
 
     /// Binance REST API key 认证头名称。
@@ -1070,6 +1072,12 @@ pub mod real {
     pub const BITGET_TIMESTAMP_HEADER: &str = "ACCESS-TIMESTAMP";
     /// Bitget REST passphrase 认证头名称。
     pub const BITGET_PASSPHRASE_HEADER: &str = "ACCESS-PASSPHRASE";
+    /// Gate REST API key 认证头名称。
+    pub const GATE_API_KEY_HEADER: &str = "KEY";
+    /// Gate REST timestamp 认证头名称。
+    pub const GATE_TIMESTAMP_HEADER: &str = "Timestamp";
+    /// Gate REST signature 认证头名称。
+    pub const GATE_SIGNATURE_HEADER: &str = "SIGN";
 
     /// 真实签名提供方接口。
     ///
@@ -1121,6 +1129,20 @@ pub mod real {
             input: BitgetHmacSigningInput,
             policy: &SigningPolicy,
         ) -> SigningResult<BitgetSignedEndpoint>;
+    }
+
+    /// Gate APIv4 真实签名提供方接口。
+    ///
+    /// 中文说明：Gate APIv4 签名串使用
+    /// `method + "\n" + request_path + "\n" + query + "\n" + sha512(body) + "\n" + timestamp`，
+    /// HMAC 算法为 SHA512。Provider 只用于 `QueryAccount` 等只读目的时，由调用方
+    /// 签名策略控制是否允许真实签名。
+    pub trait GateRealSigningProvider {
+        fn sign_gate_hmac(
+            &self,
+            input: GateHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<GateSignedEndpoint>;
     }
 
     /// Aster Futures V3 外部 EIP-712 签名 provider。
@@ -1180,6 +1202,16 @@ pub mod real {
         ) -> SigningResult<BitgetApiCredentials>;
     }
 
+    /// Gate 凭证提供方。
+    ///
+    /// 中文说明：Gate APIv4 key/secret 与其他交易所隔离，避免环境变量错配。
+    pub trait GateCredentialProvider {
+        fn load_gate_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<GateApiCredentials>;
+    }
+
     /// Aster 外部签名命令 provider。
     ///
     /// 中文说明：provider 只返回可执行程序路径。外部程序从 stdin 接收 Aster
@@ -1221,6 +1253,13 @@ pub mod real {
     /// 受控时间源。
     pub trait BitgetTimestampProvider {
         fn timestamp_millis(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
+    }
+
+    /// Gate 时间戳提供方。
+    ///
+    /// 中文说明：Gate APIv4 认证头 `Timestamp` 使用 Unix 秒级时间戳。
+    pub trait GateTimestampProvider {
+        fn timestamp_secs(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64>;
     }
 
     /// Aster Futures V3 nonce 提供方。
@@ -1456,6 +1495,57 @@ pub mod real {
         }
     }
 
+    /// 使用环境变量读取 Gate 凭证的 provider。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct EnvGateCredentialProvider {
+        api_key_env: EnvSecretName,
+        secret_key_env: EnvSecretName,
+    }
+
+    impl EnvGateCredentialProvider {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Self::from_env_names("GATE_API_KEY", "GATE_API_SECRET")
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key_env: EnvSecretName::new(api_key_env)?,
+                secret_key_env: EnvSecretName::new(secret_key_env)?,
+            })
+        }
+
+        pub fn api_key_env(&self) -> &EnvSecretName {
+            &self.api_key_env
+        }
+
+        pub fn secret_key_env(&self) -> &EnvSecretName {
+            &self.secret_key_env
+        }
+    }
+
+    impl fmt::Debug for EnvGateCredentialProvider {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("EnvGateCredentialProvider")
+                .field("api_key_env", &self.api_key_env)
+                .field("secret_key_env", &self.secret_key_env)
+                .finish()
+        }
+    }
+
+    impl GateCredentialProvider for EnvGateCredentialProvider {
+        fn load_gate_credentials(
+            &self,
+            audit_ref: &SigningAuditRef,
+        ) -> SigningResult<GateApiCredentials> {
+            let api_key = read_env_secret(&self.api_key_env, audit_ref)?;
+            let secret_key = read_env_secret(&self.secret_key_env, audit_ref)?;
+            GateApiCredentials::new(api_key, secret_key)
+        }
+    }
+
     /// 使用环境变量读取 Aster 外部 EIP-712 签名命令的 provider。
     #[derive(Clone, Eq, PartialEq)]
     pub struct EnvAsterExternalSignerCommandProvider {
@@ -1640,6 +1730,21 @@ pub mod real {
         }
     }
 
+    /// Gate 系统时间戳提供方。
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct SystemGateTimestampProvider;
+
+    impl GateTimestampProvider for SystemGateTimestampProvider {
+        fn timestamp_secs(&self, audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+                SigningError::ClockUnavailable {
+                    audit_ref: audit_ref.clone(),
+                }
+            })?;
+            Ok(duration.as_secs())
+        }
+    }
+
     static ASTER_LAST_NONCE_MICROS: AtomicU64 = AtomicU64::new(0);
 
     /// Aster V3 系统 nonce 提供方。
@@ -1698,6 +1803,12 @@ pub mod real {
         timestamp: T,
     }
 
+    /// Gate APIv4 HMAC-SHA512 签名提供方。
+    pub struct GateHmacSha512SigningProvider<C, T> {
+        credentials: C,
+        timestamp: T,
+    }
+
     /// Aster Futures V3 外部 EIP-712 签名提供方。
     pub struct AsterEip712ExternalSigningProvider<C, N> {
         signer_command: C,
@@ -1721,6 +1832,10 @@ pub mod real {
     /// 默认 Bitget 真实签名 provider 类型。
     pub type BitgetRealSigningProviderFromEnv =
         BitgetHmacSha256SigningProvider<EnvBitgetCredentialProvider, SystemBitgetTimestampProvider>;
+
+    /// 默认 Gate 真实签名 provider 类型。
+    pub type GateRealSigningProviderFromEnv =
+        GateHmacSha512SigningProvider<EnvGateCredentialProvider, SystemGateTimestampProvider>;
 
     /// 默认 Aster 外部 EIP-712 签名 provider 类型。
     pub type AsterRealSigningProviderFromEnv = AsterEip712ExternalSigningProvider<
@@ -1780,6 +1895,23 @@ pub mod real {
     }
 
     impl<C, T> BitgetHmacSha256SigningProvider<C, T> {
+        pub fn new(credentials: C, timestamp: T) -> Self {
+            Self {
+                credentials,
+                timestamp,
+            }
+        }
+
+        pub fn credentials(&self) -> &C {
+            &self.credentials
+        }
+
+        pub fn timestamp_provider(&self) -> &T {
+            &self.timestamp
+        }
+    }
+
+    impl<C, T> GateHmacSha512SigningProvider<C, T> {
         pub fn new(credentials: C, timestamp: T) -> Self {
             Self {
                 credentials,
@@ -1899,6 +2031,25 @@ pub mod real {
         }
     }
 
+    impl GateRealSigningProviderFromEnv {
+        pub fn from_default_env() -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvGateCredentialProvider::from_default_env()?,
+                SystemGateTimestampProvider,
+            ))
+        }
+
+        pub fn from_env_names(
+            api_key_env: impl Into<String>,
+            secret_key_env: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self::new(
+                EnvGateCredentialProvider::from_env_names(api_key_env, secret_key_env)?,
+                SystemGateTimestampProvider,
+            ))
+        }
+    }
+
     impl AsterRealSigningProviderFromEnv {
         pub fn from_default_env() -> SigningResult<Self> {
             Ok(Self::new(
@@ -1945,6 +2096,15 @@ pub mod real {
     impl<C, T> fmt::Debug for BitgetHmacSha256SigningProvider<C, T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("BitgetHmacSha256SigningProvider")
+                .field("credentials", &"<redacted>")
+                .field("timestamp", &"<configured>")
+                .finish()
+        }
+    }
+
+    impl<C, T> fmt::Debug for GateHmacSha512SigningProvider<C, T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("GateHmacSha512SigningProvider")
                 .field("credentials", &"<redacted>")
                 .field("timestamp", &"<configured>")
                 .finish()
@@ -2176,6 +2336,67 @@ pub mod real {
                     Some(SecretString::new("bitget_body", input.body)?)
                 },
                 signature: BitgetHmacSignature(SecretString::new("signature", signature)?),
+                request,
+                success,
+            })
+        }
+    }
+
+    impl<C, T> GateRealSigningProvider for GateHmacSha512SigningProvider<C, T>
+    where
+        C: GateCredentialProvider,
+        T: GateTimestampProvider,
+    {
+        fn sign_gate_hmac(
+            &self,
+            input: GateHmacSigningInput,
+            policy: &SigningPolicy,
+        ) -> SigningResult<GateSignedEndpoint> {
+            let pending_audit_ref = input.pending_audit_ref()?;
+            let timestamp_secs = self.timestamp.timestamp_secs(&pending_audit_ref)?;
+            let public_payload = input.public_payload(timestamp_secs);
+            let payload_digest = SigningPayloadDigest::new(format!(
+                "sha256:{}",
+                sha256_hex(public_payload.as_bytes())
+            ))?;
+            let request = input.clone().into_signing_request(payload_digest);
+            policy.validate_request(&request)?;
+
+            if policy.mode() != SigningPolicyMode::RealSigningEnabled {
+                return Err(SigningError::RealSigningPolicyNotEnabled {
+                    audit_ref: request.audit_ref(),
+                });
+            }
+
+            let credentials = self
+                .credentials
+                .load_gate_credentials(&request.audit_ref())?;
+            let canonical_payload = input.canonical_payload(timestamp_secs);
+            let signature = hmac_sha512_hex(
+                credentials.secret_key.expose_bytes(),
+                canonical_payload.as_bytes(),
+            );
+            let signature_ref = SignatureRef::new(format!(
+                "signature-ref/gate-hmac/{}",
+                ascii_suffix(request.payload_digest().as_str(), 24)
+            ))?;
+            let success = SigningSuccess::new(request.audit_ref(), signature_ref);
+
+            Ok(GateSignedEndpoint {
+                api_key: credentials.api_key,
+                timestamp_secs,
+                method: input.method,
+                request_path: SecretString::new("gate_request_path", input.request_path)?,
+                query_string: input
+                    .query_string
+                    .map(|query| SecretString::new("gate_query_string", query))
+                    .transpose()?,
+                body: if input.body.is_empty() {
+                    None
+                } else {
+                    Some(SecretString::new("gate_body", input.body)?)
+                },
+                signature: GateHmacSignature(SecretString::new("signature", signature)?),
                 request,
                 success,
             })
@@ -2637,6 +2858,26 @@ pub mod real {
         }
     }
 
+    /// Gate APIv4 REST 签名方法。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum GateRestMethod {
+        Get,
+        Post,
+        Delete,
+        Put,
+    }
+
+    impl GateRestMethod {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Get => "GET",
+                Self::Post => "POST",
+                Self::Delete => "DELETE",
+                Self::Put => "PUT",
+            }
+        }
+    }
+
     /// OKX HMAC 签名输入。
     ///
     /// 中文说明：`request_path` 对 GET 请求应包含 query string，例如
@@ -2899,6 +3140,150 @@ pub mod real {
                     "request_path",
                     &RedactedValue::from_reference(&self.request_path),
                 )
+                .field("body", &"<redacted>")
+                .finish()
+        }
+    }
+
+    /// Gate APIv4 HMAC-SHA512 签名输入。
+    ///
+    /// 中文说明：`request_path` 必须包含 `/api/v4` 前缀，例如
+    /// `/api/v4/futures/usdt/accounts`。GET 请求的 `query_string` 必须与实际 URL
+    /// 上的 query 参数顺序完全一致；无 query 时传空字符串。
+    #[derive(Clone, Eq, PartialEq)]
+    pub struct GateHmacSigningInput {
+        request_id: SigningRequestId,
+        policy_ref: SigningPolicyRef,
+        purpose: SigningPurpose,
+        venue_id: VenueId,
+        account_id: AccountId,
+        audit_context: SigningAuditContext,
+        method: GateRestMethod,
+        request_path: String,
+        query_string: Option<String>,
+        body: String,
+    }
+
+    impl GateHmacSigningInput {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            request_id: SigningRequestId,
+            policy_ref: SigningPolicyRef,
+            purpose: SigningPurpose,
+            venue_id: VenueId,
+            account_id: AccountId,
+            method: GateRestMethod,
+            request_path: impl Into<String>,
+            query_string: impl Into<String>,
+            body: impl Into<String>,
+        ) -> SigningResult<Self> {
+            let request_path = request_path.into();
+            let query_string = query_string.into();
+            let body = body.into();
+            validate_gate_request_path(&request_path)?;
+            validate_gate_query_string(&query_string)?;
+            validate_gate_body(&body)?;
+            if method == GateRestMethod::Get && !body.is_empty() {
+                return Err(SigningError::InvalidRequest {
+                    field: "gate_body",
+                    reason: "GET requests must not carry a signed body",
+                });
+            }
+            Ok(Self {
+                request_id,
+                policy_ref,
+                purpose,
+                venue_id,
+                account_id,
+                audit_context: SigningAuditContext::default(),
+                method,
+                request_path,
+                query_string: (!query_string.is_empty()).then_some(query_string),
+                body,
+            })
+        }
+
+        pub fn with_audit_context(mut self, audit_context: SigningAuditContext) -> Self {
+            self.audit_context = audit_context;
+            self
+        }
+
+        pub fn request_id(&self) -> &SigningRequestId {
+            &self.request_id
+        }
+
+        pub fn policy_ref(&self) -> &SigningPolicyRef {
+            &self.policy_ref
+        }
+
+        pub fn method(&self) -> GateRestMethod {
+            self.method
+        }
+
+        pub fn request_path(&self) -> &str {
+            &self.request_path
+        }
+
+        pub fn query_string(&self) -> &str {
+            self.query_string.as_deref().unwrap_or("")
+        }
+
+        pub fn body(&self) -> &str {
+            &self.body
+        }
+
+        fn pending_audit_ref(&self) -> SigningResult<SigningAuditRef> {
+            SigningAuditRef::pending_for_request_id(&self.request_id)
+        }
+
+        fn public_payload(&self, timestamp_secs: u64) -> String {
+            self.canonical_payload(timestamp_secs)
+        }
+
+        fn canonical_payload(&self, timestamp_secs: u64) -> String {
+            format!(
+                "{}\n{}\n{}\n{}\n{}",
+                self.method.as_str(),
+                self.request_path,
+                self.query_string(),
+                sha512_hex(self.body.as_bytes()),
+                timestamp_secs
+            )
+        }
+
+        fn into_signing_request(self, payload_digest: SigningPayloadDigest) -> SigningRequest {
+            SigningRequest::new(
+                self.request_id,
+                self.policy_ref,
+                self.purpose,
+                self.venue_id,
+                self.account_id,
+                payload_digest,
+            )
+            .with_audit_context(self.audit_context)
+        }
+    }
+
+    impl fmt::Debug for GateHmacSigningInput {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("GateHmacSigningInput")
+                .field("request_id", &self.request_id)
+                .field("policy_ref", &self.policy_ref.redacted())
+                .field("purpose", &self.purpose)
+                .field(
+                    "venue_id",
+                    &RedactedValue::from_reference(self.venue_id.as_str()),
+                )
+                .field(
+                    "account_id",
+                    &RedactedValue::from_reference(self.account_id.as_str()),
+                )
+                .field("method", &self.method)
+                .field(
+                    "request_path",
+                    &RedactedValue::from_reference(&self.request_path),
+                )
+                .field("query_string", &"<redacted>")
                 .field("body", &"<redacted>")
                 .finish()
         }
@@ -3234,6 +3619,43 @@ pub mod real {
         }
     }
 
+    /// Gate API 凭证。
+    ///
+    /// 中文说明：该类型只在内存中短暂持有 Gate API key 和 secret key。`Debug`
+    /// 不输出原文；secret key 用完后随对象 drop 清零。
+    pub struct GateApiCredentials {
+        api_key: GateApiKey,
+        secret_key: GateSecretKey,
+    }
+
+    impl GateApiCredentials {
+        pub fn new(
+            api_key: impl Into<String>,
+            secret_key: impl Into<String>,
+        ) -> SigningResult<Self> {
+            Ok(Self {
+                api_key: GateApiKey::new(api_key)?,
+                secret_key: GateSecretKey::new(secret_key)?,
+            })
+        }
+
+        pub fn from_parts(api_key: GateApiKey, secret_key: GateSecretKey) -> Self {
+            Self {
+                api_key,
+                secret_key,
+            }
+        }
+    }
+
+    impl fmt::Debug for GateApiCredentials {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("GateApiCredentials")
+                .field("api_key", &"<redacted>")
+                .field("secret_key", &"<redacted>")
+                .finish()
+        }
+    }
+
     /// Binance API key。
     pub struct BinanceApiKey(SecretString);
 
@@ -3307,6 +3729,25 @@ pub mod real {
     impl fmt::Debug for BitgetApiKey {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("BitgetApiKey(<redacted>)")
+        }
+    }
+
+    /// Gate API key。
+    pub struct GateApiKey(SecretString);
+
+    impl GateApiKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Ok(Self(SecretString::new("api_key", value.into())?))
+        }
+
+        pub fn expose_for_transport(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for GateApiKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("GateApiKey(<redacted>)")
         }
     }
 
@@ -3399,6 +3840,29 @@ pub mod real {
     impl fmt::Debug for BitgetSecretKey {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("BitgetSecretKey(<redacted>)")
+        }
+    }
+
+    /// Gate API secret。
+    pub struct GateSecretKey(SecretBytes);
+
+    impl GateSecretKey {
+        pub fn new(value: impl Into<String>) -> SigningResult<Self> {
+            Self::from_bytes(value.into().into_bytes())
+        }
+
+        pub fn from_bytes(value: Vec<u8>) -> SigningResult<Self> {
+            Ok(Self(SecretBytes::new("secret_key", value)?))
+        }
+
+        fn expose_bytes(&self) -> &[u8] {
+            self.0.expose_bytes()
+        }
+    }
+
+    impl fmt::Debug for GateSecretKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("GateSecretKey(<redacted>)")
         }
     }
 
@@ -3497,6 +3961,21 @@ pub mod real {
     impl fmt::Debug for BitgetHmacSignature {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("BitgetHmacSignature(<redacted>)")
+        }
+    }
+
+    /// Gate HMAC-SHA512 signature（哈希消息认证码签名）。
+    pub struct GateHmacSignature(SecretString);
+
+    impl GateHmacSignature {
+        pub fn as_str(&self) -> &str {
+            self.0.expose_str()
+        }
+    }
+
+    impl fmt::Debug for GateHmacSignature {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("GateHmacSignature(<redacted>)")
         }
     }
 
@@ -3848,6 +4327,109 @@ pub mod real {
                 .field("timestamp_millis", &self.timestamp_millis)
                 .field("method", &self.method)
                 .field("request_path", &"<redacted>")
+                .field("body", &"<redacted>")
+                .field("signature", &"<redacted>")
+                .field("signing_request", &self.signing_request())
+                .field("signing_success", &self.signing_success())
+                .finish()
+        }
+    }
+
+    /// 已签名 Gate APIv4 endpoint 传输材料。
+    ///
+    /// 中文说明：该对象包含 HTTP 发送所需的 Gate 认证头、request path、query
+    /// 和 body。它不能被直接显示；`Debug` 会脱敏。
+    pub struct GateSignedEndpoint {
+        api_key: GateApiKey,
+        timestamp_secs: u64,
+        method: GateRestMethod,
+        request_path: SecretString,
+        query_string: Option<SecretString>,
+        body: Option<SecretString>,
+        signature: GateHmacSignature,
+        request: SigningRequest,
+        success: SigningSuccess,
+    }
+
+    impl GateSignedEndpoint {
+        pub fn api_key_header_name(&self) -> &'static str {
+            GATE_API_KEY_HEADER
+        }
+
+        pub fn api_key_header_value(&self) -> &str {
+            self.api_key.expose_for_transport()
+        }
+
+        pub fn signature_header_name(&self) -> &'static str {
+            GATE_SIGNATURE_HEADER
+        }
+
+        pub fn signature_header_value(&self) -> &str {
+            self.signature.as_str()
+        }
+
+        pub fn timestamp_header_name(&self) -> &'static str {
+            GATE_TIMESTAMP_HEADER
+        }
+
+        pub fn timestamp_header_value(&self) -> String {
+            self.timestamp_secs.to_string()
+        }
+
+        pub fn timestamp_secs(&self) -> u64 {
+            self.timestamp_secs
+        }
+
+        pub fn method(&self) -> GateRestMethod {
+            self.method
+        }
+
+        pub fn request_path_for_transport(&self) -> &str {
+            self.request_path.expose_str()
+        }
+
+        pub fn query_string_for_transport(&self) -> &str {
+            self.query_string
+                .as_ref()
+                .map(SecretString::expose_str)
+                .unwrap_or("")
+        }
+
+        pub fn body_for_transport(&self) -> &str {
+            self.body
+                .as_ref()
+                .map(SecretString::expose_str)
+                .unwrap_or("")
+        }
+
+        pub fn signature(&self) -> &GateHmacSignature {
+            &self.signature
+        }
+
+        pub fn signing_request(&self) -> &SigningRequest {
+            &self.request
+        }
+
+        pub fn signing_success(&self) -> &SigningSuccess {
+            &self.success
+        }
+
+        pub fn redacted_log_entry(&self) -> RedactedSigningLogEntry {
+            RedactedSigningLogEntry::from_success(&self.request, &self.success)
+        }
+    }
+
+    impl fmt::Debug for GateSignedEndpoint {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("GateSignedEndpoint")
+                .field("api_key_header_name", &GATE_API_KEY_HEADER)
+                .field("api_key_header_value", &"<redacted>")
+                .field("signature_header_name", &GATE_SIGNATURE_HEADER)
+                .field("timestamp_header_name", &GATE_TIMESTAMP_HEADER)
+                .field("timestamp_secs", &self.timestamp_secs)
+                .field("method", &self.method)
+                .field("request_path", &"<redacted>")
+                .field("query_string", &"<redacted>")
                 .field("body", &"<redacted>")
                 .field("signature", &"<redacted>")
                 .field("signing_request", &self.signing_request())
@@ -4360,6 +4942,75 @@ pub mod real {
         Ok(())
     }
 
+    fn validate_gate_request_path(value: &str) -> SigningResult<()> {
+        if value.is_empty() {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_request_path",
+                reason: "request path cannot be empty",
+            });
+        }
+        if value.len() > 4096 {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_request_path",
+                reason: "request path is too long",
+            });
+        }
+        if !value.starts_with("/api/v4/") {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_request_path",
+                reason: "request path must start with /api/v4/",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_request_path",
+                reason: "request path contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_gate_query_string(value: &str) -> SigningResult<()> {
+        if value.len() > 8192 {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_query_string",
+                reason: "query string is too long",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_query_string",
+                reason: "query string contains an unsupported byte",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_gate_body(value: &str) -> SigningResult<()> {
+        if value.len() > 8192 {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_body",
+                reason: "body is too long",
+            });
+        }
+        if value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return Err(SigningError::InvalidRequest {
+                field: "gate_body",
+                reason: "body contains a control byte",
+            });
+        }
+        Ok(())
+    }
+
     fn validate_okx_timestamp(value: &str) -> SigningResult<()> {
         if value.len() != "2026-05-17T12:34:56.789Z".len() {
             return Err(SigningError::InvalidRequest {
@@ -4497,6 +5148,10 @@ pub mod real {
         base64_standard(&hmac_sha256(secret_key, payload))
     }
 
+    fn hmac_sha512_hex(secret_key: &[u8], payload: &[u8]) -> String {
+        hex_lower(&hmac_sha512(secret_key, payload))
+    }
+
     fn hmac_sha256(secret_key: &[u8], payload: &[u8]) -> [u8; 32] {
         let mut key_block = [0_u8; 64];
         if secret_key.len() > key_block.len() {
@@ -4533,8 +5188,48 @@ pub mod real {
         digest
     }
 
+    fn hmac_sha512(secret_key: &[u8], payload: &[u8]) -> [u8; 64] {
+        let mut key_block = [0_u8; 128];
+        if secret_key.len() > key_block.len() {
+            let digest = sha512(secret_key);
+            key_block[..digest.len()].copy_from_slice(&digest);
+        } else {
+            key_block[..secret_key.len()].copy_from_slice(secret_key);
+        }
+
+        let mut inner_pad = [0x36_u8; 128];
+        let mut outer_pad = [0x5c_u8; 128];
+        for index in 0..128 {
+            inner_pad[index] ^= key_block[index];
+            outer_pad[index] ^= key_block[index];
+        }
+
+        let mut inner_input = Vec::with_capacity(inner_pad.len() + payload.len());
+        inner_input.extend_from_slice(&inner_pad);
+        inner_input.extend_from_slice(payload);
+        let mut inner_digest = sha512(&inner_input);
+
+        let mut outer_input = Vec::with_capacity(outer_pad.len() + inner_digest.len());
+        outer_input.extend_from_slice(&outer_pad);
+        outer_input.extend_from_slice(&inner_digest);
+        let digest = sha512(&outer_input);
+
+        wipe_bytes(&mut key_block);
+        wipe_bytes(&mut inner_pad);
+        wipe_bytes(&mut outer_pad);
+        wipe_bytes(&mut inner_input);
+        wipe_bytes(&mut inner_digest);
+        wipe_bytes(&mut outer_input);
+
+        digest
+    }
+
     fn sha256_hex(input: &[u8]) -> String {
         hex_lower(&sha256(input))
+    }
+
+    fn sha512_hex(input: &[u8]) -> String {
+        hex_lower(&sha512(input))
     }
 
     fn base64_standard(input: &[u8]) -> String {
@@ -4679,6 +5374,13 @@ pub mod real {
         }
         wipe_bytes(&mut message);
         digest
+    }
+
+    fn sha512(input: &[u8]) -> [u8; 64] {
+        let digest = Sha512::digest(input);
+        let mut output = [0_u8; 64];
+        output.copy_from_slice(&digest);
+        output
     }
 
     fn wipe_bytes(bytes: &mut [u8]) {
@@ -5291,6 +5993,80 @@ mod tests {
 
     #[cfg(feature = "real-signing")]
     #[test]
+    fn real_signing_build_exposes_gate_hmac_provider_with_official_signature_example() {
+        use crate::real::{
+            GateHmacSha512SigningProvider, GateRealSigningProvider, GateRestMethod,
+            GateTimestampProvider, GATE_API_KEY_HEADER, GATE_SIGNATURE_HEADER,
+            GATE_TIMESTAMP_HEADER,
+        };
+
+        let policy_ref = SigningPolicyRef::new("kms-policy/gate-hmac-unit").expect("policy ref");
+        let policy = SigningPolicy::real_signing_enabled(policy_ref.clone());
+        let input = crate::real::GateHmacSigningInput::new(
+            SigningRequestId::new("signing-request/gate-hmac-unit").expect("request id"),
+            policy_ref,
+            SigningPurpose::QueryAccount,
+            VenueId::new("venue:GATE-USDT-FUTURES").expect("venue id"),
+            AccountId::new("account/paper-gate").expect("account id"),
+            GateRestMethod::Get,
+            "/api/v4/futures/orders",
+            "contract=BTC_USD&status=finished&limit=50",
+            "",
+        )
+        .expect("gate input");
+        let signer = GateHmacSha512SigningProvider::new(
+            FixedGateCredentialProvider,
+            FixedTimestamp(1_541_993_715),
+        );
+
+        let signed = signer
+            .sign_gate_hmac(input, &policy)
+            .expect("real-signing feature should sign Gate payload");
+
+        assert_eq!(signed.api_key_header_name(), GATE_API_KEY_HEADER);
+        assert_eq!(signed.signature_header_name(), GATE_SIGNATURE_HEADER);
+        assert_eq!(signed.timestamp_header_name(), GATE_TIMESTAMP_HEADER);
+        assert_eq!(signed.timestamp_header_value(), "1541993715");
+        assert_eq!(signed.method(), GateRestMethod::Get);
+        assert_eq!(
+            signed.request_path_for_transport(),
+            "/api/v4/futures/orders"
+        );
+        assert_eq!(
+            signed.query_string_for_transport(),
+            "contract=BTC_USD&status=finished&limit=50"
+        );
+        assert_eq!(signed.body_for_transport(), "");
+        assert_eq!(
+            signed.signature().as_str(),
+            "55f84ea195d6fe57ce62464daaa7c3c02fa9d1dde954e4c898289c9a2407a3d6fb3faf24deff16790d726b66ac9f74526668b13bd01029199cc4fcc522418b8a"
+        );
+
+        let raw_api_key = signed.api_key_header_value().to_owned();
+        let raw_signature = signed.signature().as_str().to_owned();
+        let raw_query = signed.query_string_for_transport().to_owned();
+        let rendered_debug = format!("{signed:?}");
+        let rendered_log = signed.redacted_log_entry().to_string();
+
+        assert!(!rendered_debug.contains(&raw_api_key));
+        assert!(!rendered_debug.contains(&raw_signature));
+        assert!(!rendered_debug.contains(&raw_query));
+        assert!(!rendered_log.contains(&raw_api_key));
+        assert!(!rendered_log.contains(&raw_signature));
+        assert!(!rendered_log.contains(&raw_query));
+        assert_eq!(
+            signed.redacted_log_entry().status(),
+            SigningAttemptStatus::Signed
+        );
+
+        fn _assert_timestamp_provider<T: GateTimestampProvider>(provider: T) -> T {
+            provider
+        }
+        let _ = _assert_timestamp_provider(FixedTimestamp(1));
+    }
+
+    #[cfg(feature = "real-signing")]
+    #[test]
     fn binance_params_reserve_signature_and_timestamp_for_boundary() {
         use crate::real::BinanceRequestParam;
 
@@ -5355,6 +6131,13 @@ mod tests {
     #[cfg(feature = "real-signing")]
     impl crate::real::BitgetTimestampProvider for FixedTimestamp {
         fn timestamp_millis(&self, _audit_ref: &SigningAuditRef) -> SigningResult<u64> {
+            Ok(self.0)
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
+    impl crate::real::GateTimestampProvider for FixedTimestamp {
+        fn timestamp_secs(&self, _audit_ref: &SigningAuditRef) -> SigningResult<u64> {
             Ok(self.0)
         }
     }
@@ -5443,6 +6226,33 @@ mod tests {
                 generated_ascii(64, self.seed.wrapping_add(37)),
                 generated_ascii(32, self.seed.wrapping_add(41)),
             )
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
+    impl crate::real::GateCredentialProvider for GeneratedCredentialProvider {
+        fn load_gate_credentials(
+            &self,
+            _audit_ref: &SigningAuditRef,
+        ) -> SigningResult<crate::real::GateApiCredentials> {
+            crate::real::GateApiCredentials::new(
+                generated_ascii(48, self.seed),
+                generated_ascii(64, self.seed.wrapping_add(43)),
+            )
+        }
+    }
+
+    #[cfg(feature = "real-signing")]
+    #[derive(Clone, Copy, Debug)]
+    struct FixedGateCredentialProvider;
+
+    #[cfg(feature = "real-signing")]
+    impl crate::real::GateCredentialProvider for FixedGateCredentialProvider {
+        fn load_gate_credentials(
+            &self,
+            _audit_ref: &SigningAuditRef,
+        ) -> SigningResult<crate::real::GateApiCredentials> {
+            crate::real::GateApiCredentials::new("official-gate-api-key", "secret")
         }
     }
 

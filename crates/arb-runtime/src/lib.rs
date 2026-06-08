@@ -101,7 +101,8 @@ use arb_signing::real::{
     BinanceRequestParam, BinanceSignedEndpoint, BinanceTimestampProvider, BitgetHmacSigningInput,
     BitgetRealSigningProvider, BitgetRealSigningProviderFromEnv, BitgetRestMethod,
     BybitHmacSigningInput, BybitRealSigningProvider, BybitRealSigningProviderFromEnv,
-    BybitSigningPayloadKind, EnvBinanceCredentialProvider,
+    BybitSigningPayloadKind, EnvBinanceCredentialProvider, GateHmacSigningInput,
+    GateRealSigningProvider, GateRealSigningProviderFromEnv, GateRestMethod,
     LiteralAsterExternalSignerCommandProvider, OkxHmacSigningInput, OkxRealSigningProvider,
     OkxRealSigningProviderFromEnv, OkxRestMethod, RealSigningProvider, SystemAsterNonceProvider,
 };
@@ -159,12 +160,15 @@ pub use monitors::wss::{
     run_aster_wss_book_ticker_monitor, run_binance_wss_book_ticker_monitor,
     run_binance_wss_book_ticker_probe, run_bitget_wss_book_ticker_monitor,
     run_bybit_wss_book_ticker_monitor, run_bybit_wss_book_ticker_probe,
-    run_hyperliquid_wss_book_ticker_monitor, run_okx_wss_book_ticker_monitor, AsterPublicWssMarket,
+    run_gate_wss_book_ticker_monitor, run_hyperliquid_wss_book_ticker_monitor,
+    run_lighter_wss_book_ticker_monitor, run_okx_wss_book_ticker_monitor, AsterPublicWssMarket,
     AsterWssBookTickerMonitorOptions, BinanceWssBookTickerMonitorOptions,
     BinanceWssBookTickerProbeOptions, BinanceWssBookTickerProbeReport, BitgetPublicWssMarket,
     BitgetWssBookTickerMonitorOptions, BybitWssBookTickerMonitorOptions,
-    BybitWssBookTickerProbeOptions, BybitWssBookTickerProbeReport, HyperliquidPublicWssMarket,
-    HyperliquidWssBookTickerMonitorOptions, OkxPublicWssMarket, OkxWssBookTickerMonitorOptions,
+    BybitWssBookTickerProbeOptions, BybitWssBookTickerProbeReport, GatePublicWssMarket,
+    GateWssBookTickerMonitorOptions, HyperliquidPublicWssMarket,
+    HyperliquidWssBookTickerMonitorOptions, LighterPublicWssMarket,
+    LighterWssBookTickerMonitorOptions, OkxPublicWssMarket, OkxWssBookTickerMonitorOptions,
     PublicTopOfBookMonitorSnapshot, PublicTopOfBookQuoteSnapshot,
 };
 
@@ -220,15 +224,19 @@ use monitors::wss::bybit_public_market_category;
 use monitors::wss::*;
 use monitors::wss::{
     decode_json_scalar_string, is_binance_wss_all_symbols_scope, is_bybit_wss_all_symbols_scope,
-    normalize_aster_wss_symbol_scope, normalize_binance_wss_symbol_scope,
+    lighter_order_books_url, normalize_aster_wss_symbol_scope, normalize_binance_wss_symbol_scope,
     normalize_bitget_wss_symbol_scope, normalize_bybit_wss_symbol_scope,
-    normalize_hyperliquid_wss_symbol_scope, normalize_okx_wss_symbol_scope,
+    normalize_gate_wss_symbol_scope, normalize_hyperliquid_wss_symbol_scope,
+    normalize_lighter_wss_symbol_scope, normalize_okx_wss_symbol_scope,
     parse_aster_public_wss_market, parse_binance_public_wss_market, parse_bitget_public_wss_market,
-    parse_bybit_public_wss_market, parse_hyperliquid_public_wss_market,
-    parse_okx_public_wss_market, validate_aster_wss_probe_options,
+    parse_bybit_public_wss_market, parse_gate_public_wss_market,
+    parse_hyperliquid_public_wss_market, parse_lighter_order_book_metadata_rows,
+    parse_lighter_public_wss_market, parse_okx_public_wss_market, validate_aster_wss_probe_options,
     validate_binance_wss_probe_options, validate_bitget_wss_probe_options,
-    validate_bybit_wss_probe_options, validate_hyperliquid_public_wss_coin,
-    validate_hyperliquid_wss_probe_options, validate_okx_wss_probe_options,
+    validate_bybit_wss_probe_options, validate_gate_public_wss_symbol,
+    validate_gate_wss_probe_options, validate_hyperliquid_public_wss_coin,
+    validate_hyperliquid_wss_probe_options, validate_lighter_public_wss_symbol,
+    validate_lighter_wss_probe_options, validate_okx_wss_probe_options,
     BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR,
     BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
 };
@@ -249,6 +257,12 @@ const BINANCE_PORTFOLIO_MARGIN_BASE_URL: &str = "https://papi.binance.com";
 const BYBIT_REST_BASE_URL: &str = "https://api.bybit.com";
 const OKX_REST_BASE_URL: &str = "https://www.okx.com";
 const BITGET_REST_BASE_URL: &str = "https://api.bitget.com";
+#[cfg(feature = "live-exec")]
+const GATE_API_HOST_BASE_URL: &str = "https://api.gateio.ws";
+const GATE_REST_BASE_URL: &str = "https://api.gateio.ws/api/v4";
+const LIGHTER_REST_BASE_URL: &str = "https://mainnet.zklighter.elliot.ai/api/v1";
+#[cfg(feature = "live-exec")]
+const LIGHTER_EXPLORER_REST_BASE_URL: &str = "https://explorer.elliot.ai/api";
 const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const ASTER_SPOT_REST_BASE_URL: &str = "https://sapi.asterdex.com";
 const ASTER_FUTURES_REST_BASE_URL: &str = "https://fapi.asterdex.com";
@@ -260,6 +274,11 @@ const ASTER_SIGNED_REST_USER_AGENT: &str = "easy-arb-runtime/aster-signed-rest";
 const ASTER_PRIVATE_READONLY_MAX_SIGNING_ATTEMPTS: u32 = 3;
 #[cfg(feature = "live-exec")]
 const ASTER_PRIVATE_READONLY_RETRY_DELAY_MS: u64 = 150;
+#[cfg(feature = "live-exec")]
+const LIGHTER_READONLY_AUTH_TOKEN_ENV_NAMES: &[&str] =
+    &["LIGHTER_READONLY_AUTH_TOKEN", "LIGHTER_AUTH_TOKEN"];
+#[cfg(feature = "live-exec")]
+const LIGHTER_ACCOUNT_INDEX_ENV: &str = "LIGHTER_ACCOUNT_INDEX";
 const ASTER_EIP712_SIGNER_CMD_ENV_DEFAULT: &str = "ASTER_EIP712_SIGNER_CMD";
 #[cfg(feature = "live-exec")]
 const ASTER_USER_ENV_NAMES: &[&str] = &[
@@ -502,6 +521,8 @@ const HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV: &str =
     "ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED";
 const FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENV: &str =
     "ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED";
+const FUNDING_ARB_INCLUDE_STAGED_PUBLIC_SOURCES_ENV: &str =
+    "ARB_RUNTIME_FUNDING_ARB_INCLUDE_STAGED_PUBLIC_SOURCES";
 const BASIS_MONITOR_DEPTH_PREFILTER_BUFFER_BPS: i128 = 5;
 #[cfg(feature = "live-exec")]
 const FUNDING_ARB_RESIDENT_NO_CANDIDATE_EVENT_BLOCKING_PATH_LIMIT: usize = 5;
@@ -1901,6 +1922,8 @@ pub struct LiveWssSymbolScopeReport {
     pub bitget_perp: String,
     pub aster_perp: String,
     pub hyperliquid_perp: String,
+    pub gate_perp: String,
+    pub lighter_perp: String,
     pub spot_perp_symbol_count: usize,
     pub funding_arb_base_count: usize,
 }
@@ -2013,6 +2036,7 @@ pub struct FundingArbResidentLiveOptions {
     pub allow_unknown_recovery: bool,
     pub auto_residual_de_risk: bool,
     pub exit_only: bool,
+    pub manual_close_request: Option<FundingArbManualCloseRequest>,
     pub hyperliquid_user: Option<String>,
     pub hyperliquid_source: String,
     pub hyperliquid_vault_address: Option<String>,
@@ -2021,6 +2045,215 @@ pub struct FundingArbResidentLiveOptions {
     pub aster_user: Option<String>,
     pub aster_signer: Option<String>,
     pub aster_signer_cmd_env: String,
+}
+
+/// funding arb 手动平仓请求。
+///
+/// 中文说明：该请求只作为 resident live 的控制输入；真正下单仍由 resident
+/// exit cycle 使用私有仓位校验、reduce-only 订单和 post-close flat 验证执行。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingArbManualCloseRequest {
+    pub request_id: String,
+    pub position_id: String,
+    pub requested_at: String,
+    pub requested_by: Option<String>,
+    pub reason: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+pub(crate) const FUNDING_ARB_MANUAL_CLOSE_REQUESTS_FILE: &str =
+    "funding_arb_manual_close_requests.jsonl";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FundingArbManualCloseRequestState {
+    pub(crate) request: FundingArbManualCloseRequest,
+    pub(crate) status: String,
+    pub(crate) updated_at: Option<String>,
+    pub(crate) detail: Option<String>,
+}
+
+pub(crate) fn funding_arb_manual_close_requests_path(output_root: &Path) -> PathBuf {
+    output_root.join(FUNDING_ARB_MANUAL_CLOSE_REQUESTS_FILE)
+}
+
+pub(crate) fn funding_arb_manual_close_order_type() -> &'static str {
+    "reduce_only_ioc_aggressive_limit"
+}
+
+pub(crate) fn append_funding_arb_manual_close_requested(
+    output_root: &Path,
+    request: &FundingArbManualCloseRequest,
+) -> RuntimeResult<()> {
+    append_funding_arb_manual_close_line(
+        funding_arb_manual_close_requests_path(output_root),
+        &format!(
+            "{{\"event_type\":\"manual_close_requested\",{},\"order_type\":{},\"status\":\"requested\",\"updated_at\":{}}}",
+            funding_arb_manual_close_request_json_fields(request),
+            json_string(funding_arb_manual_close_order_type()),
+            json_string(&request.requested_at),
+        ),
+    )
+}
+
+#[cfg(feature = "live-exec")]
+pub(crate) fn append_funding_arb_manual_close_status_event(
+    output_root: &Path,
+    request: &FundingArbManualCloseRequest,
+    event_type: &str,
+    status: &str,
+    cycle: Option<u64>,
+    cycle_dir: Option<&Path>,
+    detail: Option<&str>,
+    decision: Option<&str>,
+) -> RuntimeResult<()> {
+    let updated_at = current_utc_timestamp_string();
+    append_funding_arb_manual_close_line(
+        funding_arb_manual_close_requests_path(output_root),
+        &format!(
+            "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"detail\":{},\"event_type\":{},{},\"order_type\":{},\"status\":{},\"updated_at\":{}}}",
+            cycle
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_owned()),
+            json_optional_str(cycle_dir.map(|path| path.display().to_string()).as_deref()),
+            json_optional_str(decision),
+            json_optional_str(detail),
+            json_string(event_type),
+            funding_arb_manual_close_request_json_fields(request),
+            json_string(funding_arb_manual_close_order_type()),
+            json_string(status),
+            json_string(&updated_at),
+        ),
+    )
+}
+
+pub(crate) fn load_funding_arb_manual_close_request_states(
+    output_root: &Path,
+) -> RuntimeResult<BTreeMap<String, FundingArbManualCloseRequestState>> {
+    let path = funding_arb_manual_close_requests_path(output_root);
+    let mut states = BTreeMap::new();
+    if !path.exists() {
+        return Ok(states);
+    }
+    let input = read_utf8(&path)?;
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let fields = parse_json_object_value_slices(line)?;
+        let event_type =
+            required_json_value_string(&fields, "event_type", "funding arb manual close request")?;
+        if !event_type.starts_with("manual_close_") {
+            continue;
+        }
+        let request = funding_arb_manual_close_request_from_fields(&fields)?;
+        let status =
+            optional_json_value_string(&fields, "status", "funding arb manual close request")?
+                .unwrap_or_else(|| {
+                    funding_arb_manual_close_status_from_event_type(&event_type).to_owned()
+                });
+        let updated_at =
+            optional_json_value_string(&fields, "updated_at", "funding arb manual close request")?;
+        let detail =
+            optional_json_value_string(&fields, "detail", "funding arb manual close request")?;
+        states.insert(
+            request.position_id.clone(),
+            FundingArbManualCloseRequestState {
+                request,
+                status,
+                updated_at,
+                detail,
+            },
+        );
+    }
+    Ok(states)
+}
+
+#[cfg(feature = "live-exec")]
+pub(crate) fn funding_arb_pending_manual_close_request_for_position(
+    output_root: &Path,
+    position_id: &str,
+) -> RuntimeResult<Option<FundingArbManualCloseRequest>> {
+    let states = load_funding_arb_manual_close_request_states(output_root)?;
+    Ok(states.get(position_id).and_then(|state| {
+        funding_arb_manual_close_status_is_pending(&state.status).then(|| state.request.clone())
+    }))
+}
+
+pub(crate) fn funding_arb_manual_close_status_is_pending(status: &str) -> bool {
+    matches!(status, "requested" | "running" | "blocked")
+}
+
+pub(crate) fn funding_arb_manual_close_request_json_fields(
+    request: &FundingArbManualCloseRequest,
+) -> String {
+    format!(
+        "\"idempotency_key\":{},\"position_id\":{},\"reason\":{},\"request_id\":{},\"requested_at\":{},\"requested_by\":{}",
+        json_optional_str(request.idempotency_key.as_deref()),
+        json_string(&request.position_id),
+        json_optional_str(request.reason.as_deref()),
+        json_string(&request.request_id),
+        json_string(&request.requested_at),
+        json_optional_str(request.requested_by.as_deref()),
+    )
+}
+
+fn funding_arb_manual_close_request_from_fields(
+    fields: &BTreeMap<String, &str>,
+) -> RuntimeResult<FundingArbManualCloseRequest> {
+    Ok(FundingArbManualCloseRequest {
+        request_id: required_json_value_string(
+            fields,
+            "request_id",
+            "funding arb manual close request",
+        )?,
+        position_id: required_json_value_string(
+            fields,
+            "position_id",
+            "funding arb manual close request",
+        )?,
+        requested_at: required_json_value_string(
+            fields,
+            "requested_at",
+            "funding arb manual close request",
+        )?,
+        requested_by: optional_json_value_string(
+            fields,
+            "requested_by",
+            "funding arb manual close request",
+        )?,
+        reason: optional_json_value_string(fields, "reason", "funding arb manual close request")?,
+        idempotency_key: optional_json_value_string(
+            fields,
+            "idempotency_key",
+            "funding arb manual close request",
+        )?,
+    })
+}
+
+fn funding_arb_manual_close_status_from_event_type(event_type: &str) -> &'static str {
+    match event_type {
+        "manual_close_started" => "running",
+        "manual_close_blocked" => "blocked",
+        "manual_close_closed" => "closed",
+        "manual_close_failed" => "failed",
+        _ => "requested",
+    }
+}
+
+fn append_funding_arb_manual_close_line(path: PathBuf, line: &str) -> RuntimeResult<()> {
+    #[cfg(feature = "live-exec")]
+    rotate_append_jsonl_for_pending_line(&path, line.len().saturating_add(1))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| RuntimeError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|error| RuntimeError::Io {
+            path,
+            message: error.to_string(),
+        })
 }
 
 /// funding arb 常驻 guarded live 报告。
@@ -2167,6 +2400,7 @@ pub struct PortfolioDashboardOptions {
     pub funding_snapshot_path: Option<PathBuf>,
     pub resident_root: Option<PathBuf>,
     pub navigation_wss_pid_file: Option<PathBuf>,
+    pub manual_close_enabled: bool,
     pub once: bool,
 }
 
@@ -2181,6 +2415,7 @@ impl Default for PortfolioDashboardOptions {
             funding_snapshot_path: None,
             resident_root: None,
             navigation_wss_pid_file: None,
+            manual_close_enabled: false,
             once: false,
         }
     }
@@ -2458,9 +2693,14 @@ pub fn run_funding_arb_private_readonly_snapshot_once(
 fn portfolio_private_readonly_default_venue_families() -> Vec<String> {
     arb_venue_capability_profiles()
         .into_iter()
-        .filter(|profile| profile.supports_cross_exchange_funding_arb())
+        .filter(portfolio_private_readonly_supports_venue_profile)
         .map(|profile| profile.venue_family)
         .collect()
+}
+
+fn portfolio_private_readonly_supports_venue_profile(profile: &ArbVenueCapabilityProfile) -> bool {
+    profile.supports_cross_exchange_funding_arb()
+        || matches!(profile.venue_family.as_str(), "gate" | "lighter")
 }
 
 /// 启动组合看板私有只读全账户采集器。
@@ -2508,7 +2748,7 @@ fn validate_portfolio_private_readonly_snapshot_options(
     for venue in &options.venue_families {
         let family = normalize_venue_family(venue);
         if arb_venue_capability_profile(&family)
-            .is_none_or(|profile| !profile.supports_cross_exchange_funding_arb())
+            .is_none_or(|profile| !portfolio_private_readonly_supports_venue_profile(&profile))
         {
             return Err(cli_arg_error(format!(
                 "portfolio-private-readonly-snapshot unsupported venue `{venue}`"
@@ -2834,6 +3074,12 @@ fn fetch_funding_arb_private_readonly_venue_snapshots(
             fetch_aster_funding_private_readonly_snapshots(symbol, account_id, venue_id, options)
         }
         "hyperliquid" => fetch_hyperliquid_funding_private_readonly_snapshots(account_id, options),
+        "gate" => {
+            fetch_gate_funding_private_readonly_snapshots(symbol, account_id, venue_id, options)
+        }
+        "lighter" => {
+            fetch_lighter_funding_private_readonly_snapshots(account_id, instrument_id, options)
+        }
         other => Err(RuntimeError::UnsafeConfig {
             message: format!("unsupported funding-arb private readonly venue `{other}`"),
         }),
@@ -3930,6 +4176,91 @@ fn fetch_bitget_funding_private_readonly_snapshots(
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_gate_funding_private_readonly_snapshots(
+    symbol: &str,
+    account_id: &str,
+    venue_id: &str,
+    options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = GateRealSigningProviderFromEnv::from_default_env()?;
+    let account_payload_json = sign_and_fetch_gate_private_get(
+        &signer,
+        &signing_policy,
+        format!("signing-request/funding-arb-readonly/gate/account/{symbol}"),
+        venue_id,
+        account_id,
+        "/futures/usdt/accounts",
+        "",
+    )?;
+    let position_payload_json = sign_and_fetch_gate_private_get(
+        &signer,
+        &signing_policy,
+        "signing-request/funding-arb-readonly/gate/positions-all",
+        venue_id,
+        account_id,
+        "/futures/usdt/positions",
+        "",
+    )?;
+    let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
+    let from_secs = unix_millis_floor_secs(start_ms);
+    let to_secs = unix_millis_ceil_secs(end_ms);
+    let settlement_query = format!("type=fund&from={from_secs}&to={to_secs}&limit=1000");
+    let settlement_payload_json = sign_and_fetch_gate_private_get(
+        &signer,
+        &signing_policy,
+        format!("signing-request/funding-arb-readonly/gate/settlement/{symbol}"),
+        venue_id,
+        account_id,
+        "/futures/usdt/account_book",
+        &settlement_query,
+    )?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json,
+        position_payload_json,
+        settlement_payload_json,
+        note:
+            "gate APIv4 futures accounts, all USDT futures positions, and account_book type=fund fetched read-only"
+                .to_owned(),
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_lighter_funding_private_readonly_snapshots(
+    account_id: &str,
+    instrument_id: &str,
+    _options: &FundingArbPrivateReadonlySnapshotOnceOptions,
+) -> RuntimeResult<FundingPrivateReadonlyFetchedVenue> {
+    let auth_token = resolve_lighter_readonly_auth_token()?;
+    let account_index = resolve_lighter_account_index()?;
+    let account_payload_json = fetch_lighter_private_get_with_curl(
+        &format!(
+            "{LIGHTER_REST_BASE_URL}/account?by=index&value={account_index}&active_only=false"
+        ),
+        &auth_token,
+    )?;
+    let positions_payload_json = fetch_lighter_private_get_with_curl(
+        &format!("{LIGHTER_EXPLORER_REST_BASE_URL}/accounts/{account_index}/positions"),
+        &auth_token,
+    )?;
+    let (start_ms, end_ms) = funding_settlement_raw_snapshot_query_window_ms()?;
+    let settlement_payload_json = fetch_lighter_private_get_with_curl(
+        &format!(
+            "{LIGHTER_REST_BASE_URL}/export?account_index={account_index}&market_id=255&type=funding&start_timestamp={start_ms}&end_timestamp={end_ms}&side=all"
+        ),
+        &auth_token,
+    )?;
+    Ok(FundingPrivateReadonlyFetchedVenue {
+        account_payload_json,
+        position_payload_json: positions_payload_json,
+        settlement_payload_json,
+        note: format!(
+            "lighter account, explorer positions, and funding export fetched read-only for account reference {account_id}, instrument {instrument_id}"
+        ),
+    })
+}
+
+#[cfg(feature = "live-exec")]
 fn fetch_aster_funding_private_readonly_snapshots(
     symbol: &str,
     account_id: &str,
@@ -4125,6 +4456,92 @@ fn first_non_empty_env(names: &[&str]) -> Option<String> {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     })
+}
+
+#[cfg(feature = "live-exec")]
+fn gate_contract_from_runtime_symbol(symbol: &str) -> RuntimeResult<String> {
+    let display = funding_display_symbol(&funding_base_asset_from_symbol(symbol));
+    let Some(base) = display.strip_suffix("USDT") else {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("Gate USDT futures symbol `{symbol}` must end with USDT"),
+        });
+    };
+    if base.trim().is_empty()
+        || base
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+    {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("Gate USDT futures symbol `{symbol}` contains unsupported bytes"),
+        });
+    }
+    Ok(format!("{}_USDT", base.to_ascii_uppercase()))
+}
+
+#[cfg(feature = "live-exec")]
+fn unix_millis_floor_secs(value: u64) -> u64 {
+    value / 1_000
+}
+
+#[cfg(feature = "live-exec")]
+fn unix_millis_ceil_secs(value: u64) -> u64 {
+    value.saturating_add(999) / 1_000
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_lighter_readonly_auth_token() -> RuntimeResult<String> {
+    first_non_empty_env(LIGHTER_READONLY_AUTH_TOKEN_ENV_NAMES).ok_or_else(|| {
+        RuntimeError::UnsafeConfig {
+            message: format!(
+                "Lighter read-only private data requires one of {}",
+                LIGHTER_READONLY_AUTH_TOKEN_ENV_NAMES.join(", ")
+            ),
+        }
+    })
+}
+
+#[cfg(feature = "live-exec")]
+fn resolve_lighter_account_index() -> RuntimeResult<String> {
+    let value = std::env::var(LIGHTER_ACCOUNT_INDEX_ENV).map_err(|error| {
+        RuntimeError::UnsafeConfig {
+            message: format!("{LIGHTER_ACCOUNT_INDEX_ENV} is required for Lighter private read-only queries: {error}"),
+        }
+    })?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!("{LIGHTER_ACCOUNT_INDEX_ENV} must be a non-empty integer"),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn sign_and_fetch_gate_private_get(
+    signer: &impl GateRealSigningProvider,
+    signing_policy: &SigningPolicy,
+    request_id: impl Into<String>,
+    venue_id: &str,
+    account_id: &str,
+    endpoint: &str,
+    query_string: &str,
+) -> RuntimeResult<String> {
+    let request_path = format!("/api/v4{endpoint}");
+    let signed = signer.sign_gate_hmac(
+        GateHmacSigningInput::new(
+            SigningRequestId::new(request_id.into())?,
+            signing_policy.policy_ref().clone(),
+            SigningPurpose::QueryAccount,
+            VenueId::new(venue_id)?,
+            AccountId::new(account_id)?,
+            GateRestMethod::Get,
+            request_path,
+            query_string,
+            "",
+        )?,
+        signing_policy,
+    )?;
+    fetch_signed_gate_get_with_curl(GATE_API_HOST_BASE_URL, &signed)
 }
 
 #[cfg(feature = "live-exec")]
@@ -7615,6 +8032,16 @@ fn public_wss_source_event_id_matches_symbol(source_event_id: &str, symbol: &str
     if source_event_id.starts_with("hyperliquid:wss-book-ticker:") {
         if let Ok(base_coin) = validate_hyperliquid_public_wss_coin(symbol) {
             return source_event_id.split(':').any(|part| part == base_coin);
+        }
+    }
+    if source_event_id.starts_with("lighter:wss-book-ticker:") {
+        if let Ok(base_symbol) = validate_lighter_public_wss_symbol(symbol) {
+            return source_event_id.split(':').any(|part| part == base_symbol);
+        }
+    }
+    if source_event_id.starts_with("gate:wss-book-ticker:") {
+        if let Ok(gate_symbol) = validate_gate_public_wss_symbol(symbol) {
+            return source_event_id.split(':').any(|part| part == gate_symbol);
         }
     }
     false
@@ -14935,7 +15362,15 @@ pub fn run_funding_arb_monitor(options: FundingArbMonitorOptions) -> RuntimeResu
 }
 
 fn default_funding_arb_venue_sources() -> Vec<FundingArbVenueSource> {
-    vec![
+    default_funding_arb_venue_sources_with_staged_public(
+        funding_arb_include_staged_public_sources_default(),
+    )
+}
+
+fn default_funding_arb_venue_sources_with_staged_public(
+    include_staged_public_sources: bool,
+) -> Vec<FundingArbVenueSource> {
+    let mut sources = vec![
         FundingArbVenueSource {
             venue_family: "binance".to_owned(),
             status_url: format!("http://{BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/basis/status"),
@@ -14970,7 +15405,31 @@ fn default_funding_arb_venue_sources() -> Vec<FundingArbVenueSource> {
                 "http://{HYPERLIQUID_BASIS_MONITOR_DEFAULT_BIND_ADDR}/api/hyperliquid-basis/status"
             ),
         },
-    ]
+    ];
+    if include_staged_public_sources {
+        sources.push(FundingArbVenueSource {
+            venue_family: "gate".to_owned(),
+            status_url: "direct://gate".to_owned(),
+        });
+        sources.push(FundingArbVenueSource {
+            venue_family: "lighter".to_owned(),
+            status_url: std::env::var("LIGHTER_PERP_WSS_MONITOR_URL").unwrap_or_else(|_| {
+                "http://127.0.0.1:8824/api/lighter-wss-book-ticker/status".to_owned()
+            }),
+        });
+    }
+    sources
+}
+
+fn funding_arb_include_staged_public_sources_default() -> bool {
+    std::env::var(FUNDING_ARB_INCLUDE_STAGED_PUBLIC_SOURCES_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn default_perp_taker_fee_bps_for_venue_family(venue_family: &str) -> &'static str {
@@ -15080,6 +15539,7 @@ fn validate_aster_monitor_options(options: &AsterBasisMonitorOptions) -> Runtime
 }
 
 fn validate_funding_arb_monitor_options(options: &FundingArbMonitorOptions) -> RuntimeResult<()> {
+    let _ = runtime_bool_env(FUNDING_ARB_INCLUDE_STAGED_PUBLIC_SOURCES_ENV, false)?;
     if options.poll_interval_secs == 0 {
         return Err(cli_arg_error("poll interval must be greater than zero"));
     }
@@ -18148,6 +18608,8 @@ fn fetch_funding_arb_direct_public_venue_snapshot(
         "bitget" => fetch_bitget_funding_arb_public_venue_snapshot(),
         "aster" => fetch_aster_funding_arb_public_venue_snapshot(),
         "hyperliquid" => fetch_hyperliquid_funding_arb_public_venue_snapshot(),
+        "gate" => fetch_gate_funding_arb_public_venue_snapshot(),
+        "lighter" => fetch_lighter_funding_arb_public_venue_snapshot(source),
         other => Err(RuntimeError::LiveMarketData {
             message: format!("unsupported funding arb direct public source `{other}`"),
         }),
@@ -18330,6 +18792,205 @@ fn fetch_bitget_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbV
     })
 }
 
+fn fetch_gate_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
+    let tickers_json = fetch_public_json_with_curl(&gate_usdt_futures_tickers_url())?;
+    let contracts_json = fetch_public_json_with_curl(&gate_usdt_futures_contracts_url())?;
+    build_gate_funding_arb_public_venue_snapshot_from_json(&tickers_json, &contracts_json)
+}
+
+fn build_gate_funding_arb_public_venue_snapshot_from_json(
+    tickers_json: &str,
+    contracts_json: &str,
+) -> RuntimeResult<FundingArbVenueSnapshot> {
+    let default_interval_hours = funding_interval_hours_string_for_venue("gate")?;
+    let contracts = parse_gate_futures_contract_rows(contracts_json)?
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let rows = parse_gate_futures_ticker_rows(tickers_json)?
+        .into_iter()
+        .filter(|row| {
+            row.symbol.ends_with("_USDT")
+                && !row.symbol.starts_with("TEST")
+                && !row.funding_rate.trim().is_empty()
+                && contracts
+                    .get(&row.symbol)
+                    .and_then(|contract| contract.status.as_deref())
+                    .is_none_or(|status| status.eq_ignore_ascii_case("trading"))
+        })
+        .map(|ticker| {
+            let contract = contracts.get(&ticker.symbol);
+            let funding_interval_hours = contract
+                .map(|row| row.funding_interval_hours.clone())
+                .unwrap_or_else(|| default_interval_hours.clone());
+            let next_funding_time_ms = contract.map(|row| row.next_funding_time_ms.clone());
+            let source_status = gate_top_of_book_source_status(&ticker);
+            FundingArbVenueMarket {
+                venue_family: "gate".to_owned(),
+                base_asset: gate_funding_base_asset_from_symbol(&ticker.symbol),
+                symbol: ticker.symbol,
+                perp_bid: ticker.bid_price.clone(),
+                perp_ask: ticker.ask_price.clone(),
+                perp_bid_qty: ticker.bid_qty.clone(),
+                perp_ask_qty: ticker.ask_qty.clone(),
+                perp_bid_depth: signal_depth_from_optional_top(&ticker.bid_price, &ticker.bid_qty),
+                perp_ask_depth: signal_depth_from_optional_top(&ticker.ask_price, &ticker.ask_qty),
+                mark_price: Some(ticker.mark_price),
+                index_price: Some(ticker.index_price),
+                funding_rate: ticker.funding_rate,
+                funding_interval_hours,
+                next_funding_time_ms,
+                source_status,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(FundingArbVenueSnapshot {
+        status: "healthy".to_owned(),
+        rows,
+    })
+}
+
+fn gate_top_of_book_source_status(row: &GateFuturesTickerRow) -> String {
+    match (
+        row.bid_price.as_ref(),
+        row.bid_qty.as_ref(),
+        row.ask_price.as_ref(),
+        row.ask_qty.as_ref(),
+    ) {
+        (Some(_), Some(_), Some(_), Some(_)) => "complete",
+        (Some(_), _, Some(_), _) => "missing_top_of_book_size",
+        _ => "missing_top_of_book",
+    }
+    .to_owned()
+}
+
+fn gate_funding_base_asset_from_symbol(symbol: &str) -> String {
+    let upper = symbol.trim().to_ascii_uppercase();
+    if let Some(base) = upper.strip_suffix("_USDT") {
+        return base.to_owned();
+    }
+    funding_base_asset_from_symbol(&upper)
+}
+
+fn fetch_lighter_funding_arb_public_venue_snapshot(
+    source: &FundingArbVenueSource,
+) -> RuntimeResult<FundingArbVenueSnapshot> {
+    let funding_json = fetch_public_json_with_curl(&lighter_funding_rates_url())?;
+    let details_json = fetch_public_json_with_curl(&lighter_order_book_details_url())?;
+    let wss_status_json = if funding_arb_source_status_url_is_http(&source.status_url) {
+        Some(fetch_public_json_with_curl(&source.status_url)?)
+    } else {
+        None
+    };
+    build_lighter_funding_arb_public_venue_snapshot_from_json(
+        &funding_json,
+        &details_json,
+        wss_status_json.as_deref(),
+    )
+}
+
+fn build_lighter_funding_arb_public_venue_snapshot_from_json(
+    funding_json: &str,
+    details_json: &str,
+    wss_status_json: Option<&str>,
+) -> RuntimeResult<FundingArbVenueSnapshot> {
+    let default_interval_hours = funding_interval_hours_string_for_venue("lighter")?;
+    let details = parse_lighter_order_book_detail_rows(details_json)?
+        .into_iter()
+        .filter(|row| row.status.eq_ignore_ascii_case("active"))
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let top_rows = wss_status_json
+        .map(parse_lighter_public_wss_status_top_rows)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for funding in parse_lighter_funding_rate_rows(funding_json)? {
+        if !funding.exchange.eq_ignore_ascii_case("lighter") {
+            continue;
+        }
+        let Some(detail) = details.get(&funding.symbol) else {
+            continue;
+        };
+        let top = top_rows.get(&funding.symbol);
+        let has_native_mark_index = detail
+            .mark_price
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && detail
+                .index_price
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+        let mark_price = detail
+            .mark_price
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| detail.last_trade_price.clone());
+        let index_price = detail
+            .index_price
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| detail.last_trade_price.clone());
+        let source_status = lighter_funding_arb_source_status(top, has_native_mark_index);
+        let funding_rate = normalize_lighter_decimal_string("lighter funding rate", &funding.rate)?;
+        let mark_price = normalize_lighter_decimal_string("lighter mark price", &mark_price)?;
+        let index_price = normalize_lighter_decimal_string("lighter index price", &index_price)?;
+        rows.push(FundingArbVenueMarket {
+            venue_family: "lighter".to_owned(),
+            base_asset: funding_base_asset_from_symbol(&funding.symbol),
+            symbol: funding.symbol,
+            perp_bid: top.and_then(|row| row.bid_price.clone()),
+            perp_ask: top.and_then(|row| row.ask_price.clone()),
+            perp_bid_qty: top.and_then(|row| row.bid_qty.clone()),
+            perp_ask_qty: top.and_then(|row| row.ask_qty.clone()),
+            perp_bid_depth: top
+                .map(|row| signal_depth_from_optional_top(&row.bid_price, &row.bid_qty))
+                .unwrap_or_default(),
+            perp_ask_depth: top
+                .map(|row| signal_depth_from_optional_top(&row.ask_price, &row.ask_qty))
+                .unwrap_or_default(),
+            mark_price: Some(mark_price),
+            index_price: Some(index_price),
+            funding_rate,
+            funding_interval_hours: default_interval_hours.clone(),
+            next_funding_time_ms: None,
+            source_status,
+        });
+    }
+    Ok(FundingArbVenueSnapshot {
+        status: "healthy".to_owned(),
+        rows,
+    })
+}
+
+fn funding_arb_source_status_url_is_http(value: &str) -> bool {
+    let trimmed = value.trim().to_ascii_lowercase();
+    trimmed.starts_with("http://") || trimmed.starts_with("https://")
+}
+
+fn lighter_funding_arb_source_status(
+    top: Option<&LighterPublicWssTopRow>,
+    has_native_mark_index: bool,
+) -> String {
+    let Some(top) = top else {
+        return "missing_top_of_book".to_owned();
+    };
+    if top.bid_price.as_deref().unwrap_or("").trim().is_empty()
+        || top.ask_price.as_deref().unwrap_or("").trim().is_empty()
+        || top.bid_qty.as_deref().unwrap_or("").trim().is_empty()
+        || top.ask_qty.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return "missing_top_of_book".to_owned();
+    }
+    if !has_native_mark_index {
+        return "missing_mark_index".to_owned();
+    }
+    "complete".to_owned()
+}
+
 fn fetch_aster_funding_arb_public_venue_snapshot() -> RuntimeResult<FundingArbVenueSnapshot> {
     let book_json = fetch_public_json_with_curl(&aster_futures_book_ticker_all_url())?;
     let premium_json = fetch_public_json_with_curl(&aster_futures_premium_index_all_url())?;
@@ -18493,6 +19154,8 @@ struct LiveWssSymbolScopeSets {
     bitget_perp: BTreeSet<String>,
     aster_perp: BTreeSet<String>,
     hyperliquid_perp: BTreeSet<String>,
+    gate_perp: BTreeSet<String>,
+    lighter_perp: BTreeSet<String>,
 }
 
 pub fn run_live_wss_symbol_resolver(
@@ -18658,6 +19321,11 @@ fn live_wss_symbol_scope_report_from_sets(
             &scope_sets.hyperliquid_perp,
             normalize_hyperliquid_wss_symbol_scope,
         )?,
+        gate_perp: live_wss_scope_from_set(&scope_sets.gate_perp, normalize_gate_wss_symbol_scope)?,
+        lighter_perp: live_wss_scope_from_set(
+            &scope_sets.lighter_perp,
+            normalize_lighter_wss_symbol_scope,
+        )?,
         spot_perp_symbol_count,
         funding_arb_base_count,
     })
@@ -18718,6 +19386,12 @@ impl LiveWssSymbolScopeSets {
             "hyperliquid" => {
                 self.hyperliquid_perp.insert(symbol.to_owned());
             }
+            "gate" => {
+                self.gate_perp.insert(symbol.to_owned());
+            }
+            "lighter" => {
+                self.lighter_perp.insert(symbol.to_owned());
+            }
             _ => {}
         }
     }
@@ -18734,6 +19408,8 @@ fn fetch_live_wss_venue_symbol_catalog(
         "bitget" => fetch_bitget_live_wss_symbol_catalog(needs_spot),
         "aster" => fetch_aster_live_wss_symbol_catalog(needs_spot),
         "hyperliquid" => fetch_hyperliquid_live_wss_symbol_catalog(needs_spot),
+        "gate" => fetch_gate_live_wss_symbol_catalog(needs_spot),
+        "lighter" => fetch_lighter_live_wss_symbol_catalog(needs_spot),
         other => Err(RuntimeError::LiveMarketData {
             message: format!("unsupported live WSS symbol resolver venue `{other}`"),
         }),
@@ -18926,6 +19602,40 @@ fn fetch_hyperliquid_live_wss_symbol_catalog(
     })
 }
 
+fn fetch_gate_live_wss_symbol_catalog(
+    _needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let perp_by_base = live_wss_gate_symbols_by_base(
+        parse_gate_futures_ticker_rows(&fetch_public_json_with_curl(
+            &gate_usdt_futures_tickers_url(),
+        )?)?
+        .into_iter()
+        .map(|row| row.symbol)
+        .filter(|symbol| !symbol.starts_with("TEST")),
+    );
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "gate".to_owned(),
+        spot_by_base: BTreeMap::new(),
+        perp_by_base,
+    })
+}
+
+fn fetch_lighter_live_wss_symbol_catalog(
+    _needs_spot: bool,
+) -> RuntimeResult<LiveWssVenueSymbolCatalog> {
+    let perp_by_base = parse_lighter_order_book_metadata_rows(&fetch_public_json_with_curl(
+        &lighter_order_books_url(LighterPublicWssMarket::Perp),
+    )?)?
+    .into_iter()
+    .map(|row| (funding_base_asset_from_symbol(&row.symbol), row.symbol))
+    .collect();
+    Ok(LiveWssVenueSymbolCatalog {
+        venue_family: "lighter".to_owned(),
+        spot_by_base: BTreeMap::new(),
+        perp_by_base,
+    })
+}
+
 fn live_wss_book_ticker_symbols_by_base<I>(
     venue_family: &str,
     symbols: I,
@@ -18943,6 +19653,25 @@ where
         }
         by_base
             .entry(funding_base_asset_from_symbol(&symbol))
+            .or_insert(symbol);
+    }
+    by_base
+}
+
+fn live_wss_gate_symbols_by_base<I>(symbols: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut by_base = BTreeMap::new();
+    for symbol in symbols {
+        if !symbol.ends_with("_USDT") {
+            continue;
+        }
+        if funding_arb_exchange_native_symbol_rejection("gate", &symbol).is_some() {
+            continue;
+        }
+        by_base
+            .entry(gate_funding_base_asset_from_symbol(&symbol))
             .or_insert(symbol);
     }
     by_base
@@ -19001,7 +19730,8 @@ fn parse_live_wss_monitor_list(value: &str) -> RuntimeResult<Vec<String>> {
     for item in live_wss_split_list(value) {
         let venue = normalize_venue_family(&item);
         match venue.as_str() {
-            "binance" | "bybit" | "okx" | "bitget" | "aster" | "hyperliquid" => {
+            "binance" | "bybit" | "okx" | "bitget" | "aster" | "hyperliquid" | "gate"
+            | "lighter" => {
                 monitors.insert(venue);
             }
             other => {
@@ -19040,6 +19770,8 @@ fn live_wss_symbol_scope_report_shell_assignments(report: &LiveWssSymbolScopeRep
         ("BITGET_PERP_WSS_SYMBOL", report.bitget_perp.clone()),
         ("ASTER_WSS_SYMBOL", report.aster_perp.clone()),
         ("HYPERLIQUID_WSS_SYMBOL", report.hyperliquid_perp.clone()),
+        ("GATE_WSS_SYMBOL", report.gate_perp.clone()),
+        ("LIGHTER_WSS_SYMBOL", report.lighter_perp.clone()),
         ("BINANCE_WSS_SYMBOL", report.binance_perp.clone()),
         ("BYBIT_WSS_SYMBOL", report.bybit_perp.clone()),
         ("OKX_WSS_SYMBOL", report.okx_perp.clone()),
@@ -19061,7 +19793,7 @@ fn live_wss_symbol_scope_report_shell_assignments(report: &LiveWssSymbolScopeRep
 
 fn live_wss_symbol_scope_report_json(report: &LiveWssSymbolScopeReport) -> String {
     format!(
-        "{{\"status\":\"ok\",\"mutable_execution_started\":false,\"strategies\":{},\"monitors\":{},\"spot_perp_basis_enabled\":{},\"funding_arb_enabled\":{},\"spot_perp_symbol_count\":{},\"funding_arb_base_count\":{},\"scopes\":{{\"binance_spot\":{},\"binance_perp\":{},\"bybit_spot\":{},\"bybit_perp\":{},\"okx_spot\":{},\"okx_perp\":{},\"bitget_spot\":{},\"bitget_perp\":{},\"aster_perp\":{},\"hyperliquid_perp\":{}}}}}",
+        "{{\"status\":\"ok\",\"mutable_execution_started\":false,\"strategies\":{},\"monitors\":{},\"spot_perp_basis_enabled\":{},\"funding_arb_enabled\":{},\"spot_perp_symbol_count\":{},\"funding_arb_base_count\":{},\"scopes\":{{\"binance_spot\":{},\"binance_perp\":{},\"bybit_spot\":{},\"bybit_perp\":{},\"okx_spot\":{},\"okx_perp\":{},\"bitget_spot\":{},\"bitget_perp\":{},\"aster_perp\":{},\"hyperliquid_perp\":{},\"gate_perp\":{},\"lighter_perp\":{}}}}}",
         json_string_array(&report.strategies),
         json_string_array(&report.monitors),
         report.spot_perp_basis_enabled,
@@ -19077,7 +19809,9 @@ fn live_wss_symbol_scope_report_json(report: &LiveWssSymbolScopeReport) -> Strin
         json_string(&report.bitget_spot),
         json_string(&report.bitget_perp),
         json_string(&report.aster_perp),
-        json_string(&report.hyperliquid_perp)
+        json_string(&report.hyperliquid_perp),
+        json_string(&report.gate_perp),
+        json_string(&report.lighter_perp)
     )
 }
 
@@ -20848,6 +21582,22 @@ fn bitget_usdt_futures_funding_rate_url() -> String {
 #[cfg(feature = "live-exec")]
 fn bitget_usdt_futures_contract_config_url(symbol: &str) -> String {
     format!("{BITGET_REST_BASE_URL}/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol={symbol}")
+}
+
+fn gate_usdt_futures_tickers_url() -> String {
+    format!("{GATE_REST_BASE_URL}/futures/usdt/tickers")
+}
+
+fn gate_usdt_futures_contracts_url() -> String {
+    format!("{GATE_REST_BASE_URL}/futures/usdt/contracts")
+}
+
+fn lighter_funding_rates_url() -> String {
+    format!("{LIGHTER_REST_BASE_URL}/funding-rates")
+}
+
+fn lighter_order_book_details_url() -> String {
+    format!("{LIGHTER_REST_BASE_URL}/orderBookDetails?market_id=255&filter=perp")
 }
 
 fn hyperliquid_info_request_body(request_type: &str) -> String {
@@ -23631,6 +24381,32 @@ struct BitgetFundingRateRow {
     next_funding_time_ms: String,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GateFuturesContractRow {
+    symbol: String,
+    mark_price: String,
+    index_price: String,
+    funding_rate: String,
+    funding_interval_hours: String,
+    next_funding_time_ms: String,
+    quanto_multiplier: String,
+    status: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GateFuturesTickerRow {
+    symbol: String,
+    mark_price: String,
+    index_price: String,
+    funding_rate: String,
+    bid_price: Option<String>,
+    bid_qty: Option<String>,
+    ask_price: Option<String>,
+    ask_qty: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BybitLinearInstrumentRow {
     symbol: String,
@@ -23691,6 +24467,44 @@ struct HyperliquidPerpContextRow {
     mark_price: String,
     oracle_price: String,
     funding_rate: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LighterMarketStatsRow {
+    market_id: String,
+    symbol: String,
+    mark_price: String,
+    index_price: String,
+    current_funding_rate: String,
+    last_funding_rate: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LighterFundingRateRow {
+    market_id: String,
+    exchange: String,
+    symbol: String,
+    rate: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LighterOrderBookDetailRow {
+    market_id: String,
+    symbol: String,
+    status: String,
+    last_trade_price: String,
+    mark_price: Option<String>,
+    index_price: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LighterPublicWssTopRow {
+    symbol: String,
+    bid_price: Option<String>,
+    bid_qty: Option<String>,
+    ask_price: Option<String>,
+    ask_qty: Option<String>,
 }
 
 fn parse_book_ticker_rows(
@@ -24334,6 +25148,468 @@ fn parse_bitget_funding_rate_rows(input: &str) -> RuntimeResult<Vec<BitgetFundin
             })
         })
         .collect()
+}
+
+#[allow(dead_code)]
+fn parse_gate_book_ticker_rows(
+    input: &str,
+    source: &'static str,
+) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    gate_result_object_slices(input, source)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            let symbol = required_first_json_value_string(
+                &fields,
+                &["s", "symbol", "contract", "currency_pair"],
+                source,
+            )?;
+            let bid_price =
+                required_first_json_value_string(&fields, &["b", "bid", "highest_bid"], source)?;
+            let bid_qty = required_first_json_value_string(
+                &fields,
+                &["B", "bid_size", "bid_qty", "highest_size"],
+                source,
+            )?;
+            let ask_price =
+                required_first_json_value_string(&fields, &["a", "ask", "lowest_ask"], source)?;
+            let ask_qty = required_first_json_value_string(
+                &fields,
+                &["A", "ask_size", "ask_qty", "lowest_size"],
+                source,
+            )?;
+            Ok(monitor_book_ticker_row_with_top_depth(
+                symbol, bid_price, bid_qty, ask_price, ask_qty,
+            ))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn parse_gate_futures_ticker_rows(input: &str) -> RuntimeResult<Vec<GateFuturesTickerRow>> {
+    gate_result_object_slices(input, "gate futures tickers")?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            Ok(GateFuturesTickerRow {
+                symbol: required_first_json_value_string(
+                    &fields,
+                    &["contract", "name", "s", "symbol"],
+                    "gate futures tickers",
+                )?,
+                mark_price: required_json_value_string(
+                    &fields,
+                    "mark_price",
+                    "gate futures tickers",
+                )?,
+                index_price: required_json_value_string(
+                    &fields,
+                    "index_price",
+                    "gate futures tickers",
+                )?,
+                funding_rate: required_json_value_string(
+                    &fields,
+                    "funding_rate",
+                    "gate futures tickers",
+                )?,
+                bid_price: optional_first_json_value_string(
+                    &fields,
+                    &["highest_bid", "bid", "b"],
+                    "gate futures tickers",
+                )?,
+                bid_qty: optional_first_json_value_string(
+                    &fields,
+                    &["highest_size", "bid_size", "bid_qty", "B"],
+                    "gate futures tickers",
+                )?,
+                ask_price: optional_first_json_value_string(
+                    &fields,
+                    &["lowest_ask", "ask", "a"],
+                    "gate futures tickers",
+                )?,
+                ask_qty: optional_first_json_value_string(
+                    &fields,
+                    &["lowest_size", "ask_size", "ask_qty", "A"],
+                    "gate futures tickers",
+                )?,
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn parse_gate_futures_contract_rows(input: &str) -> RuntimeResult<Vec<GateFuturesContractRow>> {
+    json_object_slices(input)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            let funding_interval_seconds =
+                required_json_value_string(&fields, "funding_interval", "gate futures contracts")?;
+            let funding_next_apply_seconds = required_json_value_string(
+                &fields,
+                "funding_next_apply",
+                "gate futures contracts",
+            )?;
+            Ok(GateFuturesContractRow {
+                symbol: required_json_value_string(&fields, "name", "gate futures contracts")?,
+                mark_price: required_json_value_string(
+                    &fields,
+                    "mark_price",
+                    "gate futures contracts",
+                )?,
+                index_price: required_json_value_string(
+                    &fields,
+                    "index_price",
+                    "gate futures contracts",
+                )?,
+                funding_rate: required_json_value_string(
+                    &fields,
+                    "funding_rate",
+                    "gate futures contracts",
+                )?,
+                funding_interval_hours: gate_funding_interval_hours_from_seconds(
+                    &funding_interval_seconds,
+                )?,
+                next_funding_time_ms: gate_unix_seconds_to_millis(
+                    "funding_next_apply",
+                    &funding_next_apply_seconds,
+                )?,
+                quanto_multiplier: required_json_value_string(
+                    &fields,
+                    "quanto_multiplier",
+                    "gate futures contracts",
+                )?,
+                status: optional_json_value_string(&fields, "status", "gate futures contracts")?,
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn parse_lighter_order_book_top(input: &str, symbol: &str) -> RuntimeResult<MonitorBookTickerRow> {
+    let top_fields = parse_json_object_value_slices(input)?;
+    let book = top_fields.get("order_book").copied().unwrap_or(input);
+    let book_fields = parse_json_object_value_slices(book)?;
+    let bid = lighter_first_order_book_level(&book_fields, "bids")?;
+    let ask = lighter_first_order_book_level(&book_fields, "asks")?;
+    Ok(monitor_book_ticker_row_with_top_depth(
+        symbol.to_owned(),
+        bid.price,
+        bid.size,
+        ask.price,
+        ask.size,
+    ))
+}
+
+#[allow(dead_code)]
+fn parse_lighter_market_stats_rows(input: &str) -> RuntimeResult<Vec<LighterMarketStatsRow>> {
+    lighter_market_stats_object_slices(input)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            Ok(LighterMarketStatsRow {
+                market_id: required_first_json_value_string(
+                    &fields,
+                    &["market_id", "market_index"],
+                    "lighter market stats",
+                )?,
+                symbol: required_json_value_string(&fields, "symbol", "lighter market stats")?,
+                mark_price: required_json_value_string(
+                    &fields,
+                    "mark_price",
+                    "lighter market stats",
+                )?,
+                index_price: required_json_value_string(
+                    &fields,
+                    "index_price",
+                    "lighter market stats",
+                )?,
+                current_funding_rate: required_json_value_string(
+                    &fields,
+                    "current_funding_rate",
+                    "lighter market stats",
+                )?,
+                last_funding_rate: optional_json_value_string(
+                    &fields,
+                    "funding_rate",
+                    "lighter market stats",
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn parse_lighter_funding_rate_rows(input: &str) -> RuntimeResult<Vec<LighterFundingRateRow>> {
+    lighter_funding_rate_object_slices(input)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            Ok(LighterFundingRateRow {
+                market_id: required_json_value_string(
+                    &fields,
+                    "market_id",
+                    "lighter funding rates",
+                )?,
+                exchange: required_json_value_string(&fields, "exchange", "lighter funding rates")?,
+                symbol: validate_lighter_public_symbol_for_funding(&required_json_value_string(
+                    &fields,
+                    "symbol",
+                    "lighter funding rates",
+                )?)?,
+                rate: required_json_value_string(&fields, "rate", "lighter funding rates")?,
+            })
+        })
+        .collect()
+}
+
+fn parse_lighter_order_book_detail_rows(
+    input: &str,
+) -> RuntimeResult<Vec<LighterOrderBookDetailRow>> {
+    lighter_order_book_detail_object_slices(input)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            Ok(LighterOrderBookDetailRow {
+                market_id: required_first_json_value_string(
+                    &fields,
+                    &["market_id", "market_index"],
+                    "lighter orderBookDetails",
+                )?,
+                symbol: validate_lighter_public_symbol_for_funding(&required_json_value_string(
+                    &fields,
+                    "symbol",
+                    "lighter orderBookDetails",
+                )?)?,
+                status: required_json_value_string(&fields, "status", "lighter orderBookDetails")?,
+                last_trade_price: required_json_value_string(
+                    &fields,
+                    "last_trade_price",
+                    "lighter orderBookDetails",
+                )?,
+                mark_price: optional_first_json_value_string(
+                    &fields,
+                    &["mark_price", "markPrice", "mark"],
+                    "lighter orderBookDetails",
+                )?,
+                index_price: optional_first_json_value_string(
+                    &fields,
+                    &["index_price", "indexPrice", "index"],
+                    "lighter orderBookDetails",
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn parse_lighter_public_wss_status_top_rows(
+    input: &str,
+) -> RuntimeResult<Vec<LighterPublicWssTopRow>> {
+    let fields = parse_json_object_value_slices(input)?;
+    let rows_json = fields
+        .get("rows")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: "lighter WSS status is missing rows".to_owned(),
+        })?;
+    json_object_slices(rows_json)?
+        .into_iter()
+        .map(|object| {
+            let fields = parse_json_object_value_slices(object)?;
+            Ok(LighterPublicWssTopRow {
+                symbol: validate_lighter_public_symbol_for_funding(&required_json_value_string(
+                    &fields,
+                    "symbol",
+                    "lighter WSS status row",
+                )?)?,
+                bid_price: optional_first_json_value_string(
+                    &fields,
+                    &["perp_bid", "best_bid"],
+                    "lighter WSS status row",
+                )?,
+                bid_qty: optional_first_json_value_string(
+                    &fields,
+                    &["perp_bid_qty", "bid_size"],
+                    "lighter WSS status row",
+                )?,
+                ask_price: optional_first_json_value_string(
+                    &fields,
+                    &["perp_ask", "best_ask"],
+                    "lighter WSS status row",
+                )?,
+                ask_qty: optional_first_json_value_string(
+                    &fields,
+                    &["perp_ask_qty", "ask_size"],
+                    "lighter WSS status row",
+                )?,
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn gate_result_object_slices<'a>(
+    input: &'a str,
+    source: &'static str,
+) -> RuntimeResult<Vec<&'a str>> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        let fields = parse_json_object_value_slices(trimmed)?;
+        if let Some(error) = fields.get("error") {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("{source} returned error: {error}"),
+            });
+        }
+        if let Some(result) = fields.get("result") {
+            return json_object_slices(result);
+        }
+    }
+    json_object_slices(trimmed)
+}
+
+#[allow(dead_code)]
+fn gate_funding_interval_hours_from_seconds(value: &str) -> RuntimeResult<String> {
+    let seconds = parse_positive_u64_runtime("funding_interval_seconds", value)?;
+    const HOUR_SECONDS: u64 = 3_600;
+    if seconds % HOUR_SECONDS != 0 {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "gate futures funding_interval {seconds}s is not an integer number of hours"
+            ),
+        });
+    }
+    Ok((seconds / HOUR_SECONDS).to_string())
+}
+
+#[allow(dead_code)]
+fn gate_unix_seconds_to_millis(field: &'static str, value: &str) -> RuntimeResult<String> {
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: format!("gate futures `{field}` must be an integer Unix timestamp"),
+        })?;
+    seconds
+        .checked_mul(1_000)
+        .map(|millis| millis.to_string())
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("gate futures `{field}` overflowed when converted to milliseconds"),
+        })
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LighterOrderBookLevel {
+    price: String,
+    size: String,
+}
+
+#[allow(dead_code)]
+fn lighter_first_order_book_level(
+    fields: &BTreeMap<String, &str>,
+    side: &'static str,
+) -> RuntimeResult<LighterOrderBookLevel> {
+    let levels = fields
+        .get(side)
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("lighter order_book is missing `{side}`"),
+        })?;
+    let level = json_array_value_slices(levels)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("lighter order_book `{side}` is empty"),
+        })?;
+    let fields = parse_json_object_value_slices(level)?;
+    Ok(LighterOrderBookLevel {
+        price: required_json_value_string(&fields, "price", "lighter order_book level")?,
+        size: required_json_value_string(&fields, "size", "lighter order_book level")?,
+    })
+}
+
+#[allow(dead_code)]
+fn lighter_market_stats_object_slices(input: &str) -> RuntimeResult<Vec<&str>> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        let fields = parse_json_object_value_slices(trimmed)?;
+        if let Some(stats) = fields.get("market_stats") {
+            return json_object_slices(stats);
+        }
+    }
+    json_object_slices(trimmed)
+}
+
+fn lighter_funding_rate_object_slices(input: &str) -> RuntimeResult<Vec<&str>> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        let fields = parse_json_object_value_slices(trimmed)?;
+        if let Some(rates) = fields.get("funding_rates") {
+            return json_object_slices(rates);
+        }
+    }
+    json_object_slices(trimmed)
+}
+
+fn lighter_order_book_detail_object_slices(input: &str) -> RuntimeResult<Vec<&str>> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        let fields = parse_json_object_value_slices(trimmed)?;
+        if let Some(details) = fields.get("order_book_details") {
+            return json_object_slices(details);
+        }
+    }
+    json_object_slices(trimmed)
+}
+
+fn validate_lighter_public_symbol_for_funding(value: &str) -> RuntimeResult<String> {
+    let symbol = value.trim().to_ascii_uppercase().replace("-USDT", "");
+    if symbol.is_empty()
+        || !symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("lighter public symbol `{value}` is not exchange-native ASCII"),
+        });
+    }
+    Ok(symbol)
+}
+
+fn normalize_lighter_decimal_string(field: &'static str, value: &str) -> RuntimeResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{field} cannot be empty"),
+        });
+    }
+    if value.contains('e') || value.contains('E') {
+        let parsed = value
+            .parse::<f64>()
+            .map_err(|_| RuntimeError::LiveMarketData {
+                message: format!("{field} `{value}` is not a decimal number"),
+            })?;
+        if !parsed.is_finite() {
+            return Err(RuntimeError::LiveMarketData {
+                message: format!("{field} `{value}` is not finite"),
+            });
+        }
+        return Ok(trim_monitor_decimal_fraction(&format!("{parsed:.18}")));
+    }
+    if let Some((integer, fraction)) = value.split_once('.') {
+        if fraction.len() > MonitorDecimal::SCALE_DIGITS {
+            return Ok(trim_monitor_decimal_fraction(&format!(
+                "{}.{}",
+                integer,
+                &fraction[..MonitorDecimal::SCALE_DIGITS]
+            )));
+        }
+    }
+    Ok(trim_monitor_decimal_fraction(value))
+}
+
+fn trim_monitor_decimal_fraction(value: &str) -> String {
+    if !value.contains('.') {
+        return value.to_owned();
+    }
+    value.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 #[cfg(feature = "live-exec")]
@@ -29015,7 +30291,15 @@ fn generic_private_position_entries_from_raw_statement(
         let fields = parse_json_object_value_slices(object)?;
         let Some(raw_symbol) = first_json_scalar_string(
             &fields,
-            &["symbol", "instId", "instrument", "coin", "asset"],
+            &[
+                "symbol",
+                "instId",
+                "instrument",
+                "contract",
+                "market",
+                "coin",
+                "asset",
+            ],
         )?
         else {
             continue;
@@ -29025,6 +30309,7 @@ fn generic_private_position_entries_from_raw_statement(
             &[
                 "quantity",
                 "position_size",
+                "position",
                 "size",
                 "positionAmt",
                 "szi",
@@ -30216,7 +31501,14 @@ fn funding_arb_exchange_pnl_row_matches_symbol(
     let wanted = funding_arb_exchange_pnl_normalized_symbol(symbol);
     let wanted_base = funding_arb_exchange_pnl_symbol_base(symbol);
     let mut saw_symbol_field = false;
-    for field in ["symbol", "instId", "coin", "instrument", "market"] {
+    for field in [
+        "symbol",
+        "instId",
+        "coin",
+        "instrument",
+        "contract",
+        "market",
+    ] {
         let Some(value) = optional_json_value_string_dynamic(fields, field, "exchange pnl row")?
         else {
             continue;
@@ -30250,19 +31542,31 @@ fn funding_arb_exchange_pnl_row_time_ms(
         "createdTime",
         "createdAt",
         "updatedTime",
+        "create_time",
+        "finish_time",
+        "update_time",
     ] {
         let Some(value) = optional_json_value_string_dynamic(fields, field, "exchange pnl row")?
         else {
             continue;
         };
-        return value
+        let parsed = value
             .parse::<u64>()
-            .map(Some)
             .map_err(|error| RuntimeError::LiveMarketData {
                 message: format!("exchange pnl timestamp field `{field}` is invalid: {error}"),
-            });
+            })?;
+        return Ok(Some(normalize_exchange_timestamp_to_millis(parsed)));
     }
     Ok(None)
+}
+
+#[cfg(feature = "live-exec")]
+fn normalize_exchange_timestamp_to_millis(value: u64) -> u64 {
+    if value > 0 && value < 100_000_000_000 {
+        value.saturating_mul(1_000)
+    } else {
+        value
+    }
 }
 
 #[cfg(feature = "live-exec")]
@@ -31215,6 +32519,161 @@ fn funding_arb_exchange_pnl_fetch_hyperliquid_leg(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_fetch_gate_leg(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    symbol: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<FundingArbExchangePnlLegSummary> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = GateRealSigningProviderFromEnv::from_default_env()?;
+    let contract = gate_contract_from_runtime_symbol(symbol)?;
+    let from_secs = unix_millis_floor_secs(window.start_ms);
+    let to_secs = unix_millis_ceil_secs(window.backend_end_ms);
+    let query = format!("contract={contract}&from={from_secs}&to={to_secs}&limit=1000");
+    let payload = sign_and_fetch_gate_private_get(
+        &signer,
+        &signing_policy,
+        format!("signing-request/funding-arb-exchange-pnl/gate/{contract}"),
+        &leg.venue_id,
+        &leg.account_id,
+        "/futures/usdt/position_close",
+        &query,
+    )?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, &contract, window)?;
+    let position_pnl = funding_arb_exchange_pnl_sum_fields(
+        &rows,
+        &[
+            "pnl",
+            "close_profit",
+            "closeProfit",
+            "realized_pnl",
+            "realizedPnl",
+            "realisedPnl",
+            "profit",
+        ],
+        false,
+    )?;
+    let Some(position_pnl) = position_pnl else {
+        return match funding_arb_exchange_pnl_fetch_gate_trades_leg(
+            options, leg, &contract, window,
+        ) {
+            Ok(summary) => Ok(summary),
+            Err(error) => Ok(FundingArbExchangePnlLegSummary::incomplete(
+                leg,
+                "gate position_close",
+                format!(
+                    "交易所未返回该仓位窗口内的 position_close PnL 记录；my_trades 兜底失败：{error}"
+                ),
+                rows.len(),
+            )),
+        };
+    };
+    let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["fee", "total_fee", "totalFee"], true)?;
+    Ok(FundingArbExchangePnlLegSummary::confirmed(
+        leg,
+        "gate position_close",
+        position_pnl,
+        fee,
+        None,
+        rows.len(),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_fetch_gate_trades_leg(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    contract: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<FundingArbExchangePnlLegSummary> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = GateRealSigningProviderFromEnv::from_default_env()?;
+    let from_secs = unix_millis_floor_secs(window.start_ms);
+    let to_secs = unix_millis_ceil_secs(window.end_ms);
+    let query = format!("contract={contract}&from={from_secs}&to={to_secs}&limit=1000");
+    let payload = sign_and_fetch_gate_private_get(
+        &signer,
+        &signing_policy,
+        format!("signing-request/funding-arb-exchange-pnl/gate-trades/{contract}"),
+        &leg.venue_id,
+        &leg.account_id,
+        "/futures/usdt/my_trades",
+        &query,
+    )?;
+    let rows = funding_arb_exchange_pnl_matched_rows(&payload, contract, window)?;
+    let position_pnl = funding_arb_exchange_pnl_sum_fields(
+        &rows,
+        &["pnl", "realized_pnl", "realizedPnl", "realisedPnl"],
+        false,
+    )?;
+    let Some(position_pnl) = position_pnl else {
+        return Ok(FundingArbExchangePnlLegSummary::incomplete(
+            leg,
+            "gate my_trades",
+            "交易所未返回该仓位窗口内带已实现 PnL 的成交记录",
+            rows.len(),
+        ));
+    };
+    let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["fee"], true)?;
+    Ok(FundingArbExchangePnlLegSummary::confirmed(
+        leg,
+        "gate my_trades",
+        position_pnl,
+        fee,
+        None,
+        rows.len(),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_pnl_fetch_lighter_leg(
+    leg: &FundingArbPositionLegState,
+    symbol: &str,
+    window: &FundingArbExchangePnlQueryWindow,
+) -> RuntimeResult<FundingArbExchangePnlLegSummary> {
+    let auth_token = resolve_lighter_readonly_auth_token()?;
+    let account_index = resolve_lighter_account_index()?;
+    let payload = fetch_lighter_private_get_with_curl(
+        &format!(
+            "{LIGHTER_REST_BASE_URL}/export?account_index={account_index}&market_id=255&type=trade&start_timestamp={}&end_timestamp={}&side=all&role=all&trade_type=all",
+            window.start_ms, window.backend_end_ms
+        ),
+        &auth_token,
+    )?;
+    let rows = funding_arb_exchange_pnl_backend_matched_rows(&payload, symbol, window)?;
+    let position_pnl = funding_arb_exchange_pnl_sum_fields(
+        &rows,
+        &[
+            "realized_pnl",
+            "realizedPnl",
+            "realised_pnl",
+            "realisedPnl",
+            "closedPnl",
+            "pnl",
+        ],
+        false,
+    )?;
+    let Some(position_pnl) = position_pnl else {
+        return Ok(FundingArbExchangePnlLegSummary::incomplete(
+            leg,
+            "lighter export trade",
+            "交易所未返回该仓位窗口内带 realized PnL 的成交导出记录",
+            rows.len(),
+        ));
+    };
+    let fee = funding_arb_exchange_pnl_sum_fields(&rows, &["fee", "fees", "trade_fee"], true)?;
+    Ok(FundingArbExchangePnlLegSummary::confirmed(
+        leg,
+        "lighter export trade",
+        position_pnl,
+        fee,
+        None,
+        rows.len(),
+    ))
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_pnl_fetch_leg(
     options: &FundingArbResidentLiveOptions,
     state: &FundingArbPositionState,
@@ -31231,6 +32690,8 @@ fn funding_arb_exchange_pnl_fetch_leg(
         "hyperliquid" => {
             funding_arb_exchange_pnl_fetch_hyperliquid_leg(options, leg, &symbol, window)
         }
+        "gate" => funding_arb_exchange_pnl_fetch_gate_leg(options, leg, &symbol, window),
+        "lighter" => funding_arb_exchange_pnl_fetch_lighter_leg(leg, &symbol, window),
         other => Ok(FundingArbExchangePnlLegSummary::incomplete(
             leg,
             "exchange backend realized pnl",
@@ -31381,14 +32842,22 @@ fn funding_arb_exchange_history_record_json(
     let symbol = funding_arb_exchange_history_string_from_field_sets(
         &fields,
         delta_fields_ref,
-        &["symbol", "instId", "coin", "instrument", "market", "coinId"],
+        &[
+            "symbol",
+            "instId",
+            "coin",
+            "instrument",
+            "contract",
+            "market",
+            "coinId",
+        ],
         "exchange history row",
     )?
     .unwrap_or_default();
     let instrument_id = funding_arb_exchange_history_string_from_field_sets(
         &fields,
         delta_fields_ref,
-        &["instId", "instrument", "market", "symbol"],
+        &["instId", "instrument", "contract", "market", "symbol"],
         "exchange history row",
     )?;
     let exchange_record_id = funding_arb_exchange_history_string_from_field_sets(
@@ -31472,6 +32941,7 @@ fn funding_arb_exchange_history_record_json(
             "fillQty",
             "sz",
             "size",
+            "position",
             "vol",
             "closedSize",
             "closeSize",
@@ -32329,6 +33799,179 @@ fn funding_arb_exchange_history_fetch_hyperliquid(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_gate(
+    options: &FundingArbResidentLiveOptions,
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let signing_policy = read_only_signing_policy_from_config(&options.config_path)?;
+    let signer = GateRealSigningProviderFromEnv::from_default_env()?;
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    let from_secs = unix_millis_floor_secs(start_ms);
+    let to_secs = unix_millis_ceil_secs(end_ms);
+    let gate_limit = limit.min(1000);
+
+    let mut account_records = Vec::new();
+    let account_book_payload = (|| -> RuntimeResult<String> {
+        let query = format!("from={from_secs}&to={to_secs}&limit={gate_limit}");
+        sign_and_fetch_gate_private_get(
+            &signer,
+            &signing_policy,
+            "signing-request/funding-arb-exchange-history/gate-account-book",
+            &leg.venue_id,
+            &leg.account_id,
+            "/futures/usdt/account_book",
+            &query,
+        )
+    })();
+    funding_arb_exchange_history_capture_payload(
+        &mut account_records,
+        &mut errors,
+        leg,
+        "gate /futures/usdt/account_book",
+        "account_book",
+        account_book_payload,
+        window,
+    );
+    funding_arb_exchange_history_extend_funding_records(&mut records, &account_records)?;
+
+    let account_symbols = funding_arb_exchange_history_record_symbols(&account_records)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let close_query_symbols = if account_symbols.is_empty() {
+        BTreeSet::from([gate_contract_from_runtime_symbol("BTCUSDT")?])
+    } else {
+        account_symbols.clone()
+    };
+    let mut close_records = Vec::new();
+    for symbol in close_query_symbols {
+        let payload = (|| -> RuntimeResult<String> {
+            let contract = if symbol.contains('_') {
+                symbol.clone()
+            } else {
+                gate_contract_from_runtime_symbol(&symbol)?
+            };
+            let query =
+                format!("contract={contract}&from={from_secs}&to={to_secs}&limit={gate_limit}");
+            sign_and_fetch_gate_private_get(
+                &signer,
+                &signing_policy,
+                format!(
+                    "signing-request/funding-arb-exchange-history/gate-position-close/{contract}"
+                ),
+                &leg.venue_id,
+                &leg.account_id,
+                "/futures/usdt/position_close",
+                &query,
+            )
+        })();
+        funding_arb_exchange_history_capture_payload(
+            &mut close_records,
+            &mut errors,
+            leg,
+            "gate /futures/usdt/position_close",
+            "history_position",
+            payload,
+            window,
+        );
+    }
+    funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
+        &mut records,
+        &close_records,
+        &[],
+    )?;
+
+    let mut symbols = account_symbols;
+    symbols.extend(funding_arb_exchange_history_record_symbols(&close_records)?);
+    if symbols.is_empty() {
+        symbols.insert(gate_contract_from_runtime_symbol("BTCUSDT")?);
+    }
+    let mut trade_records = Vec::new();
+    for symbol in symbols {
+        let payload = (|| -> RuntimeResult<String> {
+            let contract = if symbol.contains('_') {
+                symbol.clone()
+            } else {
+                gate_contract_from_runtime_symbol(&symbol)?
+            };
+            let query =
+                format!("contract={contract}&from={from_secs}&to={to_secs}&limit={gate_limit}");
+            sign_and_fetch_gate_private_get(
+                &signer,
+                &signing_policy,
+                format!("signing-request/funding-arb-exchange-history/gate-my-trades/{contract}"),
+                &leg.venue_id,
+                &leg.account_id,
+                "/futures/usdt/my_trades",
+                &query,
+            )
+        })();
+        funding_arb_exchange_history_capture_payload(
+            &mut trade_records,
+            &mut errors,
+            leg,
+            "gate /futures/usdt/my_trades",
+            "trade_fill",
+            payload,
+            window,
+        );
+    }
+    records.append(&mut trade_records);
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_fetch_lighter(
+    leg: &FundingArbPositionLegState,
+    start_ms: u64,
+    end_ms: u64,
+    _limit: u64,
+) -> RuntimeResult<(Vec<String>, Vec<String>)> {
+    let auth_token = resolve_lighter_readonly_auth_token()?;
+    let account_index = resolve_lighter_account_index()?;
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+
+    let funding_payload = fetch_lighter_private_get_with_curl(
+        &format!(
+            "{LIGHTER_REST_BASE_URL}/export?account_index={account_index}&market_id=255&type=funding&start_timestamp={start_ms}&end_timestamp={end_ms}&side=all"
+        ),
+        &auth_token,
+    );
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "lighter /api/v1/export type=funding",
+        "funding_fee",
+        funding_payload,
+        window,
+    );
+
+    let trade_payload = fetch_lighter_private_get_with_curl(
+        &format!(
+            "{LIGHTER_REST_BASE_URL}/export?account_index={account_index}&market_id=255&type=trade&start_timestamp={start_ms}&end_timestamp={end_ms}&side=all&role=all&trade_type=all"
+        ),
+        &auth_token,
+    );
+    funding_arb_exchange_history_capture_payload(
+        &mut records,
+        &mut errors,
+        leg,
+        "lighter /api/v1/export type=trade",
+        "trade_fill",
+        trade_payload,
+        window,
+    );
+    Ok((records, errors))
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_fetch_venue(
     options: &FundingArbResidentLiveOptions,
     venue_family: &str,
@@ -32350,6 +33993,8 @@ fn funding_arb_exchange_history_fetch_venue(
         "hyperliquid" => {
             funding_arb_exchange_history_fetch_hyperliquid(options, &leg, start_ms, end_ms, limit)
         }
+        "gate" => funding_arb_exchange_history_fetch_gate(options, &leg, start_ms, end_ms, limit),
+        "lighter" => funding_arb_exchange_history_fetch_lighter(&leg, start_ms, end_ms, limit),
         other => Ok((
             Vec::new(),
             vec![funding_arb_exchange_history_source_error_json(
@@ -32380,7 +34025,7 @@ fn funding_arb_exchange_history_parse_u64_param(
 fn funding_arb_exchange_history_venues(params: &BTreeMap<String, String>) -> Vec<String> {
     let raw = funding_arb_exchange_pnl_http_param(params, "venues")
         .or_else(|| funding_arb_exchange_pnl_http_param(params, "venue"))
-        .unwrap_or("binance,bybit,okx,bitget,aster,hyperliquid");
+        .unwrap_or("binance,bybit,okx,bitget,aster,hyperliquid,gate,lighter");
     let mut seen = BTreeSet::new();
     let mut venues = Vec::new();
     for item in raw.split(',') {
@@ -32629,6 +34274,7 @@ fn funding_arb_exchange_pnl_resident_options_from_context(
         allow_unknown_recovery: false,
         auto_residual_de_risk: true,
         exit_only: false,
+        manual_close_request: None,
         hyperliquid_user: context.exchange_pnl_hyperliquid_user.clone(),
         hyperliquid_source: context.exchange_pnl_hyperliquid_source.clone(),
         hyperliquid_vault_address: context.exchange_pnl_hyperliquid_vault_address.clone(),
@@ -33040,6 +34686,7 @@ struct FundingArbExitCycleReport {
     pair_id: String,
     symbol: String,
     decision: String,
+    manual_close_request_id: Option<String>,
     reason_codes: Vec<String>,
     runtime_risk: FundingArbExitRuntimeRiskSummary,
     financial_risk: FundingArbExitFinancialRiskSummary,
@@ -36369,11 +38016,13 @@ fn funding_arb_exit_cycle_blocked_before_dispatch(
     output_dir: &Path,
     reason_code: &str,
     blocking_reason: String,
+    manual_close_request_id: Option<String>,
 ) -> RuntimeResult<FundingArbExitCycleReport> {
     let report = FundingArbExitCycleReport {
         pair_id: state.pair_id.clone(),
         symbol: state.symbol.clone(),
         decision: "blocked".to_owned(),
+        manual_close_request_id,
         reason_codes: vec![reason_code.to_owned()],
         runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
         financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
@@ -36847,6 +38496,7 @@ struct FundingArbExitCycleDecisionInput<'a> {
     runtime_risk: Option<&'a FundingArbExitRuntimeRiskSummary>,
     financial_risk: Option<&'a FundingArbExitFinancialRiskSummary>,
     unknown_recovery_exit: bool,
+    manual_close_requested: bool,
 }
 
 #[cfg(feature = "live-exec")]
@@ -36880,6 +38530,10 @@ fn funding_arb_exit_cycle_decision(
     if let Some(financial_risk) = input.financial_risk.filter(|risk| risk.is_triggered()) {
         reason_codes.extend(financial_risk.reason_codes.iter().cloned());
         return "close".to_owned();
+    }
+    if input.manual_close_requested {
+        reason_codes.push("manual_close_requested".to_owned());
+        return "manual_close".to_owned();
     }
     if input.settlement_observed_mismatch {
         reason_codes.push("funding_settlement_observed_mismatch".to_owned());
@@ -38755,8 +40409,10 @@ fn funding_private_order_market_for_venue_id(venue_id: &str) -> RuntimeResult<Pr
 #[cfg(feature = "live-exec")]
 fn funding_arb_exit_cycle_cleanly_closed(report: &FundingArbExitCycleReport) -> bool {
     report.decision == "closed"
-        || (matches!(report.decision.as_str(), "close" | "emergency_de_risk")
-            && !report.partial_close
+        || (matches!(
+            report.decision.as_str(),
+            "close" | "emergency_de_risk" | "manual_close"
+        ) && !report.partial_close
             && report.dispatch_attempted
             && report.blocking_reasons.is_empty()
             && report.residual_risk.is_none()
@@ -38792,7 +40448,7 @@ fn write_funding_arb_exit_cycle_artifacts(
 #[cfg(feature = "live-exec")]
 fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> String {
     format!(
-        "{{\"blocking_reasons\":[{}],\"decision\":{},\"dispatch_attempted\":{},\"exchange_pnl\":{},\"financial_risk\":{},\"funding_settlement_status\":{},\"output_dir\":{},\"pair_id\":{},\"partial_close\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason_codes\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"runtime_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+        "{{\"blocking_reasons\":[{}],\"decision\":{},\"dispatch_attempted\":{},\"exchange_pnl\":{},\"financial_risk\":{},\"funding_settlement_status\":{},\"manual_close_request_id\":{},\"output_dir\":{},\"pair_id\":{},\"partial_close\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"reason_codes\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"runtime_risk\":{},\"schema_version\":\"1.0.0\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
         report
             .blocking_reasons
             .iter()
@@ -38804,6 +40460,7 @@ fn funding_arb_exit_cycle_report_json(report: &FundingArbExitCycleReport) -> Str
         funding_arb_exchange_pnl_json(&report.exchange_pnl),
         funding_arb_exit_financial_risk_json(&report.financial_risk),
         json_string(&report.funding_settlement_status),
+        optional_json_string(report.manual_close_request_id.as_deref()),
         optional_json_string(report.output_dir.as_ref().map(|path| path.display().to_string()).as_deref()),
         json_string(&report.pair_id),
         report.partial_close,
@@ -38906,13 +40563,14 @@ fn append_funding_arb_resident_exit_event(
 ) -> RuntimeResult<()> {
     let recorded_at = current_utc_timestamp_string();
     let line = format!(
-        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"funding_settlement_status\":{},\"partial_close\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"submitted_receipt_count\":{}}}",
+        "{{\"blocking_reasons\":{},\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event_type\":\"exit_cycle\",\"funding_settlement_status\":{},\"manual_close_request_id\":{},\"partial_close\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"submitted_receipt_count\":{}}}",
         report.blocking_reasons.len(),
         cycle,
         json_string(&cycle_dir.display().to_string()),
         json_string(&report.decision),
         report.dispatch_attempted,
         json_string(&report.funding_settlement_status),
+        optional_json_string(report.manual_close_request_id.as_deref()),
         report.partial_close,
         json_string(position_id),
         report.private_confirmation_count,
@@ -38928,12 +40586,13 @@ fn append_funding_arb_resident_exit_event(
             output_root,
             "resident_exit_cycle",
             &format!(
-                "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event\":\"resident_exit_cycle\",\"funding_settlement_status\":{},\"mutable_execution_started\":{},\"pair_id\":{},\"partial_close\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"strategy\":\"cross-exchange-funding-arb\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
+                "{{\"cycle\":{},\"cycle_dir\":{},\"decision\":{},\"dispatch_attempted\":{},\"event\":\"resident_exit_cycle\",\"funding_settlement_status\":{},\"manual_close_request_id\":{},\"mutable_execution_started\":{},\"pair_id\":{},\"partial_close\":{},\"position_id\":{},\"private_confirmation_count\":{},\"private_position_status\":{},\"recorded_at\":{},\"requested_close_quantity\":{},\"residual_risk\":{},\"strategy\":\"cross-exchange-funding-arb\",\"submitted_receipt_count\":{},\"symbol\":{}}}",
                 cycle,
                 json_string(&cycle_dir.display().to_string()),
                 json_string(&report.decision),
                 report.dispatch_attempted,
                 json_string(&report.funding_settlement_status),
+                optional_json_string(report.manual_close_request_id.as_deref()),
                 report.dispatch_attempted,
                 json_string(&report.pair_id),
                 report.partial_close,
@@ -39653,6 +41312,22 @@ fn funding_arb_leg_config(
             account_id: "acct:hyperliquid-funding-arb-readonly".to_owned(),
             leg_id: format!("candleg:funding-arb-hyperliquid-perp-{symbol_component}"),
             venue_label: "Hyperliquid".to_owned(),
+            instrument_label: "perp".to_owned(),
+        },
+        "gate" => CrossExchangeFundingLegConfig {
+            venue_id: "venue:GATE-USDT-FUTURES".to_owned(),
+            instrument_id: format!("inst:GATE:{symbol}:USDT-FUTURES"),
+            account_id: "acct:gate-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-gate-usdt-futures-{symbol_component}"),
+            venue_label: "Gate USDT futures".to_owned(),
+            instrument_label: "USDT futures".to_owned(),
+        },
+        "lighter" => CrossExchangeFundingLegConfig {
+            venue_id: "venue:LIGHTER-PERP".to_owned(),
+            instrument_id: format!("inst:LIGHTER:{symbol}:PERP"),
+            account_id: "acct:lighter-funding-arb-readonly".to_owned(),
+            leg_id: format!("candleg:funding-arb-lighter-perp-{symbol_component}"),
+            venue_label: "Lighter".to_owned(),
             instrument_label: "perp".to_owned(),
         },
         other => {
@@ -44905,6 +46580,96 @@ fn fetch_signed_bitget_get_with_curl(
 }
 
 #[cfg(feature = "live-exec")]
+fn fetch_signed_gate_get_with_curl(
+    base_url: &str,
+    signed: &arb_signing::real::GateSignedEndpoint,
+) -> RuntimeResult<String> {
+    if signed.method() != GateRestMethod::Get {
+        return Err(RuntimeError::UnsafeConfig {
+            message: "Gate private signed fetch only supports GET in arb-runtime".to_owned(),
+        });
+    }
+    let query = signed.query_string_for_transport();
+    let url = if query.is_empty() {
+        format!("{base_url}{}", signed.request_path_for_transport())
+    } else {
+        format!("{base_url}{}?{query}", signed.request_path_for_transport())
+    };
+    let headers = [
+        (
+            signed.api_key_header_name(),
+            signed.api_key_header_value().to_owned(),
+        ),
+        (
+            signed.timestamp_header_name(),
+            signed.timestamp_header_value(),
+        ),
+        (
+            signed.signature_header_name(),
+            signed.signature_header_value().to_owned(),
+        ),
+        ("Accept", "application/json".to_owned()),
+        ("Content-Type", "application/json".to_owned()),
+    ];
+    let rendered =
+        run_private_signed_get_with_curl("Gate", "\n__ARB_GATE_HTTP_STATUS__:", &url, &headers)?;
+    let Some((body, status)) = rendered.rsplit_once("\n__ARB_GATE_HTTP_STATUS__:") else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Gate private signed GET lacked HTTP status marker".to_owned(),
+        });
+    };
+    let status_code = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: "Gate private signed GET returned malformed HTTP status".to_owned(),
+        })?;
+    if !(200..=299).contains(&status_code) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Gate private signed GET returned HTTP {status_code}: {}",
+                response_snippet(body)
+            ),
+        });
+    }
+    Ok(body.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
+fn fetch_lighter_private_get_with_curl(url: &str, auth_token: &str) -> RuntimeResult<String> {
+    let headers = [
+        ("Authorization", auth_token.trim().to_owned()),
+        ("Accept", "application/json".to_owned()),
+    ];
+    let rendered = run_private_signed_get_with_curl(
+        "Lighter",
+        "\n__ARB_LIGHTER_HTTP_STATUS__:",
+        url,
+        &headers,
+    )?;
+    let Some((body, status)) = rendered.rsplit_once("\n__ARB_LIGHTER_HTTP_STATUS__:") else {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Lighter private read-only GET lacked HTTP status marker".to_owned(),
+        });
+    };
+    let status_code = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| RuntimeError::LiveMarketData {
+            message: "Lighter private read-only GET returned malformed HTTP status".to_owned(),
+        })?;
+    if !(200..=299).contains(&status_code) {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Lighter private read-only GET returned HTTP {status_code}: {}",
+                response_snippet(body)
+            ),
+        });
+    }
+    Ok(body.to_owned())
+}
+
+#[cfg(feature = "live-exec")]
 fn run_private_signed_get_with_curl(
     venue: &str,
     http_status_marker: &str,
@@ -49501,7 +51266,7 @@ mod tests {
     }
 
     #[test]
-    fn venue_capability_profiles_cover_six_venues_and_strategy_support() {
+    fn venue_capability_profiles_cover_active_and_staged_venues() {
         let profiles = arb_venue_capability_profiles();
         let venue_families = profiles
             .iter()
@@ -49509,7 +51274,16 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             venue_families,
-            BTreeSet::from(["aster", "binance", "bitget", "bybit", "hyperliquid", "okx"])
+            BTreeSet::from([
+                "aster",
+                "binance",
+                "bitget",
+                "bybit",
+                "gate",
+                "hyperliquid",
+                "lighter",
+                "okx"
+            ])
         );
 
         for family in ["binance", "bybit", "okx", "bitget"] {
@@ -49527,11 +51301,35 @@ mod tests {
         assert!(!hyperliquid.supports_spot_perp_basis());
         assert!(hyperliquid.supports_cross_exchange_funding_arb());
         assert_eq!(hyperliquid.funding_interval_hours, Some(1));
+
+        let gate = arb_venue_capability_profile("gate.io").expect("gate profile");
+        assert!(gate.supports_spot);
+        assert!(gate.supports_linear_perp);
+        assert!(!gate.supports_spot_perp_basis());
+        assert!(!gate.supports_cross_exchange_funding_arb());
+        assert!(!gate.runtime_live_execution_supported);
+
+        let lighter = arb_venue_capability_profile("zk-lighter").expect("lighter profile");
+        assert!(!lighter.supports_spot);
+        assert!(lighter.supports_linear_perp);
+        assert!(!lighter.supports_spot_perp_basis());
+        assert!(!lighter.supports_cross_exchange_funding_arb());
+        assert_eq!(lighter.funding_interval_hours, Some(1));
+        assert!(!lighter.runtime_live_execution_supported);
     }
 
     #[test]
     fn venue_capability_descriptors_are_derived_from_profiles() {
-        for family in ["binance", "bybit", "okx", "bitget", "aster", "hyperliquid"] {
+        for family in [
+            "binance",
+            "bybit",
+            "okx",
+            "bitget",
+            "aster",
+            "hyperliquid",
+            "gate",
+            "lighter",
+        ] {
             let profile = arb_venue_capability_profile(family).expect("profile");
             let descriptors = arb_venue_capability_descriptors(family).expect("descriptors");
             assert!(!descriptors.is_empty());
@@ -49556,7 +51354,7 @@ mod tests {
     }
 
     #[test]
-    fn six_venue_strategy_matrix_covers_two_strategy_support() {
+    fn strategy_matrix_keeps_staged_venues_inactive() {
         let matrix = arb_venue_strategy_support_matrix();
         let by_family = matrix
             .iter()
@@ -49565,7 +51363,16 @@ mod tests {
 
         assert_eq!(
             by_family.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["aster", "binance", "bitget", "bybit", "hyperliquid", "okx"])
+            BTreeSet::from([
+                "aster",
+                "binance",
+                "bitget",
+                "bybit",
+                "gate",
+                "hyperliquid",
+                "lighter",
+                "okx"
+            ])
         );
 
         for family in ["binance", "bybit", "okx", "bitget"] {
@@ -49578,6 +51385,12 @@ mod tests {
             let row = by_family.get(family).expect("venue row");
             assert!(!row.supports_spot_perp_basis);
             assert!(row.supports_cross_exchange_funding_arb);
+        }
+
+        for family in ["gate", "lighter"] {
+            let row = by_family.get(family).expect("venue row");
+            assert!(!row.supports_spot_perp_basis);
+            assert!(!row.supports_cross_exchange_funding_arb);
         }
 
         let funding_pairs = cross_exchange_funding_arb_venue_pairs();
@@ -49751,6 +51564,8 @@ mod tests {
             live_wss_test_catalog("bybit", &[], &[("BTC", "BTCUSDT"), ("ETH", "ETHUSDT")]),
             live_wss_test_catalog("okx", &[], &[("BTC", "BTC-USDT"), ("DOGE", "DOGE-USDT")]),
             live_wss_test_catalog("hyperliquid", &[], &[("ETH", "ETH"), ("DOGE", "DOGE")]),
+            live_wss_test_catalog("gate", &[], &[("BTC", "BTC_USDT")]),
+            live_wss_test_catalog("lighter", &[], &[("ETH", "ETH")]),
         ];
 
         let report = live_wss_symbol_scope_report_from_catalogs(
@@ -49760,6 +51575,8 @@ mod tests {
                 "bybit".to_owned(),
                 "okx".to_owned(),
                 "hyperliquid".to_owned(),
+                "gate".to_owned(),
+                "lighter".to_owned(),
             ],
             false,
             true,
@@ -49775,6 +51592,8 @@ mod tests {
         assert_eq!(report.bybit_perp, "BTCUSDT,ETHUSDT");
         assert_eq!(report.okx_perp, "BTC-USDT,DOGE-USDT");
         assert_eq!(report.hyperliquid_perp, "DOGE,ETH");
+        assert_eq!(report.gate_perp, "BTC_USDT");
+        assert_eq!(report.lighter_perp, "ETH");
     }
 
     #[test]
@@ -49787,6 +51606,8 @@ mod tests {
             ),
             live_wss_test_catalog("bybit", &[("ETH", "ETHUSDT")], &[("ETH", "ETHUSDT")]),
             live_wss_test_catalog("aster", &[], &[("BTC", "BTCUSDT")]),
+            live_wss_test_catalog("gate", &[], &[("BTC", "BTC_USDT")]),
+            live_wss_test_catalog("lighter", &[], &[("ETH", "ETH")]),
         ];
 
         let report = live_wss_symbol_scope_report_from_catalogs(
@@ -49794,7 +51615,13 @@ mod tests {
                 "cross-exchange-funding-arb".to_owned(),
                 "spot-perp-basis".to_owned(),
             ],
-            vec!["binance".to_owned(), "bybit".to_owned(), "aster".to_owned()],
+            vec![
+                "binance".to_owned(),
+                "bybit".to_owned(),
+                "aster".to_owned(),
+                "gate".to_owned(),
+                "lighter".to_owned(),
+            ],
             true,
             true,
             &catalogs,
@@ -49808,6 +51635,8 @@ mod tests {
         assert_eq!(report.bybit_spot, "ETHUSDT");
         assert_eq!(report.bybit_perp, "ETHUSDT");
         assert_eq!(report.aster_perp, "BTCUSDT");
+        assert_eq!(report.gate_perp, "BTC_USDT");
+        assert_eq!(report.lighter_perp, "ETH");
     }
 
     #[test]
@@ -49827,6 +51656,8 @@ mod tests {
             bitget_perp: String::new(),
             aster_perp: String::new(),
             hyperliquid_perp: String::new(),
+            gate_perp: String::new(),
+            lighter_perp: String::new(),
             spot_perp_symbol_count: 0,
             funding_arb_base_count: 1,
         };
@@ -49836,6 +51667,8 @@ mod tests {
 
         assert!(output.contains("BINANCE_SPOT_WSS_SYMBOL=''"));
         assert!(output.contains("BINANCE_PERP_WSS_SYMBOL='BTCUSDT'"));
+        assert!(output.contains("GATE_WSS_SYMBOL=''"));
+        assert!(output.contains("LIGHTER_WSS_SYMBOL=''"));
         assert!(output.contains("LIVE_WSS_RESOLVER_FUNDING_ARB_BASE_COUNT='1'"));
     }
 
@@ -49865,6 +51698,7 @@ mod tests {
             allow_unknown_recovery: false,
             auto_residual_de_risk: true,
             exit_only: false,
+            manual_close_request: None,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -50311,6 +52145,101 @@ mod tests {
             stream_url: HYPERLIQUID_PUBLIC_WSS_URL.to_owned(),
             subscribe_args: vec![
                 hyperliquid_wss_bbo_subscribe_payload(symbol).expect("subscribe payload")
+            ],
+            ignore_untracked_wss_symbols: all_symbols_scope,
+            coordinators,
+            local_sequences,
+            last_exchange_update_ids: BTreeMap::new(),
+            rest_updates: Vec::new(),
+        }
+    }
+
+    fn lighter_wss_test_market_state(
+        symbol: &str,
+        all_symbols_scope: bool,
+    ) -> PublicTopOfBookAllMarketState {
+        let market = LighterPublicWssMarket::Perp;
+        let venue_id = VenueId::new(market.venue_id()).expect("venue id");
+        let instrument_id = lighter_public_wss_instrument_id(symbol, market).expect("instrument");
+        let started_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id,
+            started_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )
+        .expect("coordinator");
+        let mut coordinators = BTreeMap::new();
+        coordinators.insert(symbol.to_owned(), coordinator);
+        let mut local_sequences = BTreeMap::new();
+        local_sequences.insert(symbol.to_owned(), 0);
+
+        PublicTopOfBookAllMarketState {
+            venue_id,
+            stream_url: LIGHTER_PUBLIC_WSS_URL.to_owned(),
+            subscribe_args: vec![
+                lighter_wss_ticker_subscribe_payload("0").expect("subscribe payload")
+            ],
+            ignore_untracked_wss_symbols: all_symbols_scope,
+            coordinators,
+            local_sequences,
+            last_exchange_update_ids: BTreeMap::new(),
+            rest_updates: Vec::new(),
+        }
+    }
+
+    fn gate_wss_test_market_state(
+        symbol: &str,
+        all_symbols_scope: bool,
+    ) -> PublicTopOfBookAllMarketState {
+        let market = GatePublicWssMarket::UsdtFutures;
+        let venue_id = VenueId::new(market.venue_id()).expect("venue id");
+        let symbol = validate_gate_public_wss_symbol(symbol).expect("symbol");
+        let instrument_id = gate_public_wss_instrument_id(&symbol, market).expect("instrument");
+        let started_at = UtcTimestamp::from_str("2026-05-13T00:00:00Z").expect("time");
+        let row = monitor_book_ticker_row_with_top_depth(
+            symbol.clone(),
+            "100.01".to_owned(),
+            "1.0".to_owned(),
+            "100.02".to_owned(),
+            "1.1".to_owned(),
+        );
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id.clone(),
+            started_at,
+            MARKET_DATA_MAX_AGE_MS,
+        )
+        .expect("coordinator");
+        let quote = public_wss_top_of_book_quote(
+            &symbol,
+            venue_id.clone(),
+            instrument_id,
+            PublicTopOfBookRuntimeRaw {
+                symbol: symbol.clone(),
+                update_id: 1,
+                best_bid: Price::from_str(&row.bid_price).expect("bid"),
+                best_ask: Price::from_str(&row.ask_price).expect("ask"),
+                bid_size: Quantity::from_str(&row.bid_qty).expect("bid size"),
+                ask_size: Quantity::from_str(&row.ask_qty).expect("ask size"),
+                observed_at: started_at,
+            },
+            format!("gate:rest-tickers:{symbol}:1"),
+        )
+        .expect("rest quote");
+        coordinator
+            .apply(HybridMarketDataInput::RestSnapshot { quote })
+            .expect("rest snapshot");
+        let mut coordinators = BTreeMap::new();
+        coordinators.insert(symbol.clone(), coordinator);
+        let mut local_sequences = BTreeMap::new();
+        local_sequences.insert(symbol.clone(), 1);
+
+        PublicTopOfBookAllMarketState {
+            venue_id,
+            stream_url: GATE_PUBLIC_FUTURES_WSS_URL.to_owned(),
+            subscribe_args: vec![
+                gate_wss_book_ticker_subscribe_payload(&symbol).expect("subscribe payload")
             ],
             ignore_untracked_wss_symbols: all_symbols_scope,
             coordinators,
@@ -51434,6 +53363,63 @@ mod tests {
 
         assert_eq!(hyperliquid_row.bid_price, "1.001");
         assert_eq!(hyperliquid_row.ask_qty, "12.0");
+    }
+
+    #[test]
+    fn lighter_wss_monitor_quote_accepts_base_symbol_event_after_stream_update() {
+        let fetched_at = UtcTimestamp::from_str("2026-05-13T00:00:02Z").expect("fetched at");
+        let raw = r#"{
+          "status":"streaming",
+          "market":"perp",
+          "fail_closed":false,
+          "wss_update_count":2,
+          "last_error":null,
+          "rows":[{
+            "symbol":"BTCUSDT",
+            "venue_id":"venue:LIGHTER-PERP",
+            "instrument_id":"inst:LIGHTER:BTCUSDT:PERP",
+            "best_bid":"100000.00",
+            "best_ask":"100001.00",
+            "bid_size":"0.01",
+            "ask_size":"0.02",
+            "source_sequence":"2",
+            "source_event_id":"lighter:wss-book-ticker:perp:BTC:1558302",
+            "observed_at":"2026-05-13T00:00:01Z",
+            "ingested_at":"2026-05-13T00:00:01Z",
+            "freshness_status":"Fresh"
+          }]
+        }"#;
+        let quotes = parse_public_wss_monitor_quote_map_for_basis(
+            raw,
+            "http://127.0.0.1:8824/api/lighter-wss-book-ticker/status",
+            LighterPublicWssMarket::Perp.as_str(),
+            fetched_at,
+        )
+        .expect("lighter monitor quotes");
+        let row = public_wss_quote_to_monitor_book_ticker_row(
+            quotes.get("BTCUSDT").expect("lighter quote"),
+            "http://127.0.0.1:8824/api/lighter-wss-book-ticker/status",
+            "BTCUSDT",
+            LighterPublicWssMarket::Perp.venue_id(),
+            "inst:LIGHTER:BTCUSDT:PERP",
+            fetched_at,
+        )
+        .expect("lighter row");
+
+        assert_eq!(row.bid_price, "100000.00");
+        assert_eq!(row.ask_qty, "0.02");
+
+        let bootstrap_only = raw.replace(r#""source_sequence":"2","#, r#""source_sequence":null,"#);
+        let error = parse_public_wss_monitor_quote_map_for_basis(
+            &bootstrap_only,
+            "http://127.0.0.1:8824/api/lighter-wss-book-ticker/status",
+            LighterPublicWssMarket::Perp.as_str(),
+            fetched_at,
+        )
+        .expect_err("bootstrap quote without WSS source_sequence must not be usable");
+        assert!(error
+            .to_string()
+            .contains("no currently usable WSS quote rows"));
     }
 
     #[test]
@@ -52984,6 +54970,8 @@ mod tests {
         );
 
         let row = PortfolioPositionRow {
+            position_id: None,
+            position_kind: None,
             coin: "PUNDIX".to_owned(),
             symbol: "PUNDIXUSDT".to_owned(),
             strategy: "cross-exchange-funding-arb-resident-live".to_owned(),
@@ -53008,6 +54996,9 @@ mod tests {
             position_group_label: None,
             position_leg_role: None,
             position_limit: None,
+            manual_close_request_id: None,
+            manual_close_request_status: None,
+            manual_close_request_detail: None,
             source: "position-raw-snapshot".to_owned(),
         };
 
@@ -53015,6 +55006,8 @@ mod tests {
 
         assert!(json.contains("\"opened_at\":\"2026-06-01T02:09:59.194Z\""));
         assert!(json.contains("\"closed_at\":\"2026-06-01T06:17:45.684Z\""));
+        assert!(json.contains("\"close_action\""));
+        assert!(json.contains("\"eligible\":false"));
     }
 
     #[test]
@@ -53780,16 +55773,18 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_private_readonly_defaults_include_binance_and_all_supported_venues() {
+    fn portfolio_private_readonly_defaults_include_all_readonly_venues() {
         let venues = portfolio_private_readonly_default_venue_families();
 
-        assert_eq!(venues.len(), 6);
+        assert_eq!(venues.len(), 8);
         assert!(venues.contains(&"binance".to_owned()));
         assert!(venues.contains(&"bybit".to_owned()));
         assert!(venues.contains(&"okx".to_owned()));
         assert!(venues.contains(&"bitget".to_owned()));
         assert!(venues.contains(&"aster".to_owned()));
         assert!(venues.contains(&"hyperliquid".to_owned()));
+        assert!(venues.contains(&"gate".to_owned()));
+        assert!(venues.contains(&"lighter".to_owned()));
     }
 
     #[test]
@@ -53803,6 +55798,10 @@ mod tests {
                 "okx".to_owned(),
                 "--interval-secs".to_owned(),
                 "30".to_owned(),
+                "--venue".to_owned(),
+                "gate".to_owned(),
+                "--venue".to_owned(),
+                "lighter".to_owned(),
                 "--once".to_owned(),
                 "--out".to_owned(),
                 "target/portfolio-private".to_owned(),
@@ -53811,7 +55810,10 @@ mod tests {
         )
         .expect("parse portfolio private readonly args");
 
-        assert_eq!(options.venue_families, vec!["binance", "okx"]);
+        assert_eq!(
+            options.venue_families,
+            vec!["binance", "okx", "gate", "lighter"]
+        );
         assert_eq!(options.interval_secs, 30);
         assert!(options.once);
         assert_eq!(
@@ -55183,6 +57185,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn funding_arb_monitor_keeps_staged_venues_out_of_default_sources() {
+        let defaults = FundingArbMonitorOptions::default();
+        let default_families = defaults
+            .sources
+            .iter()
+            .map(|source| source.venue_family.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            default_families,
+            BTreeSet::from(["aster", "binance", "bitget", "bybit", "hyperliquid", "okx"])
+        );
+        let staged_defaults = default_funding_arb_venue_sources_with_staged_public(true);
+        let staged_families = staged_defaults
+            .iter()
+            .map(|source| source.venue_family.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            staged_families,
+            BTreeSet::from([
+                "aster",
+                "binance",
+                "bitget",
+                "bybit",
+                "gate",
+                "hyperliquid",
+                "lighter",
+                "okx"
+            ])
+        );
+        assert!(staged_defaults
+            .iter()
+            .any(|source| source.venue_family == "gate" && source.status_url == "direct://gate"));
+        assert!(staged_defaults.iter().any(|source| {
+            source.venue_family == "lighter"
+                && source
+                    .status_url
+                    .ends_with("/api/lighter-wss-book-ticker/status")
+        }));
+
+        let args = vec![
+            "--clear-sources".to_owned(),
+            "--source".to_owned(),
+            "binance=http://127.0.0.1:8796/api/basis/status".to_owned(),
+            "--source".to_owned(),
+            "gate=http://127.0.0.1:8891/api/gate-basis/status".to_owned(),
+            "--source".to_owned(),
+            "lighter=http://127.0.0.1:8892/api/lighter-basis/status".to_owned(),
+            "--once".to_owned(),
+        ];
+
+        let options = parse_funding_arb_monitor_args(&args).expect("options");
+        let families = options
+            .sources
+            .iter()
+            .map(|source| source.venue_family.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(families, BTreeSet::from(["binance", "gate", "lighter"]));
+    }
+
     #[cfg(feature = "live-exec")]
     #[test]
     fn funding_arb_exchange_pnl_http_request_uses_exchange_instrument_symbol() {
@@ -55362,6 +57424,7 @@ mod tests {
             allow_unknown_recovery: false,
             auto_residual_de_risk: true,
             exit_only: false,
+            manual_close_request: None,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -57402,6 +59465,7 @@ mod tests {
             allow_unknown_recovery: false,
             auto_residual_de_risk: true,
             exit_only: false,
+            manual_close_request: None,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -57645,6 +59709,7 @@ mod tests {
             pair_id: position.pair_id.clone(),
             symbol: position.symbol.clone(),
             decision: "close".to_owned(),
+            manual_close_request_id: None,
             reason_codes: Vec::new(),
             runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
             financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
@@ -57707,6 +59772,7 @@ mod tests {
             pair_id: position.pair_id.clone(),
             symbol: position.symbol.clone(),
             decision: "emergency_de_risk".to_owned(),
+            manual_close_request_id: None,
             reason_codes: vec!["private_position_unknown".to_owned()],
             runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
             financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
@@ -58051,6 +60117,36 @@ mod tests {
 
     #[test]
     #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_defaults_to_all_readonly_venues() {
+        let venues = funding_arb_exchange_history_venues(&BTreeMap::new());
+
+        assert_eq!(
+            venues,
+            vec![
+                "binance".to_owned(),
+                "bybit".to_owned(),
+                "okx".to_owned(),
+                "bitget".to_owned(),
+                "aster".to_owned(),
+                "hyperliquid".to_owned(),
+                "gate".to_owned(),
+                "lighter".to_owned(),
+            ]
+        );
+
+        let mut params = BTreeMap::new();
+        params.insert(
+            "venues".to_owned(),
+            "gateio,lighter,gate,zklighter".to_owned(),
+        );
+        assert_eq!(
+            funding_arb_exchange_history_venues(&params),
+            vec!["gate".to_owned(), "lighter".to_owned()]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
     fn funding_arb_exchange_history_income_records_map_amount_by_type() {
         let leg = funding_arb_exchange_history_leg("binance").expect("history leg");
         let realized = funding_arb_exchange_history_record_json(
@@ -58114,6 +60210,31 @@ mod tests {
         assert!(bybit_settlement.contains("\"price\":0.05247"));
         assert!(bybit_settlement.contains("\"quantity\":935"));
         assert!(bybit_settlement.contains("\"notionalUsd\":49.05945"));
+
+        let gate_leg = funding_arb_exchange_history_leg("gate").expect("gate history leg");
+        let gate_funding = funding_arb_exchange_history_record_json(
+            &gate_leg,
+            "gate /futures/usdt/account_book",
+            "account_book",
+            r#"{"contract":"COAI_USDT","type":"fund","change":"0.07","time":1779978266}"#,
+        )
+        .expect("gate funding account book json");
+        assert!(gate_funding.contains("\"venueFamily\":\"gate\""));
+        assert!(gate_funding.contains("\"symbol\":\"COAI_USDT\""));
+        assert!(gate_funding.contains("\"eventTimeMs\":1779978266000"));
+        assert!(gate_funding.contains("\"fundingPnlUsd\":0.07"));
+
+        let lighter_leg = funding_arb_exchange_history_leg("lighter").expect("lighter history leg");
+        let lighter_funding = funding_arb_exchange_history_record_json(
+            &lighter_leg,
+            "lighter /export funding",
+            "funding_fee",
+            r#"{"market":"COAI","type":"funding","funding":"0.08","timestamp":1779978266000}"#,
+        )
+        .expect("lighter funding json");
+        assert!(lighter_funding.contains("\"venueFamily\":\"lighter\""));
+        assert!(lighter_funding.contains("\"symbol\":\"COAI\""));
+        assert!(lighter_funding.contains("\"fundingPnlUsd\":0.08"));
     }
 
     #[test]
@@ -58126,6 +60247,8 @@ mod tests {
             ("bitget", "fillFee", "-0.04", "\"feeUsd\":-0.04"),
             ("aster", "commission", "0.05", "\"feeUsd\":-0.05"),
             ("hyperliquid", "fee", "0.06", "\"feeUsd\":-0.06"),
+            ("gate", "fee", "0.07", "\"feeUsd\":-0.07"),
+            ("lighter", "fee", "0.08", "\"feeUsd\":-0.08"),
         ] {
             let leg = funding_arb_exchange_history_leg(venue).expect("history leg");
             let row = format!(
@@ -58309,6 +60432,7 @@ mod tests {
             allow_unknown_recovery: false,
             auto_residual_de_risk: false,
             exit_only: false,
+            manual_close_request: None,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -58542,6 +60666,7 @@ mod tests {
             allow_unknown_recovery: false,
             auto_residual_de_risk: true,
             exit_only: false,
+            manual_close_request: None,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -58920,6 +61045,7 @@ mod tests {
             allow_unknown_recovery: true,
             auto_residual_de_risk: true,
             exit_only: false,
+            manual_close_request: None,
             hyperliquid_user: None,
             hyperliquid_source: "a".to_owned(),
             hyperliquid_vault_address: None,
@@ -59330,6 +61456,7 @@ mod tests {
                 runtime_risk: None,
                 financial_risk: None,
                 unknown_recovery_exit: true,
+                manual_close_requested: false,
             },
             &mut reason_codes,
             &mut blocking_reasons,
@@ -59356,6 +61483,7 @@ mod tests {
                 runtime_risk: None,
                 financial_risk: None,
                 unknown_recovery_exit: false,
+                manual_close_requested: false,
             },
             &mut reason_codes,
             &mut blocking_reasons,
@@ -59367,6 +61495,62 @@ mod tests {
             vec!["waiting_for_funding_settlement".to_owned()]
         );
         assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_manual_close_bypasses_settlement_wait_but_not_private_match() {
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        let decision = funding_arb_exit_cycle_decision(
+            FundingArbExitCycleDecisionInput {
+                private_position_matched: true,
+                private_position_reason: None,
+                settlement_matched: false,
+                settlement_observed_complete: false,
+                settlement_observed_mismatch: false,
+                rollover_allowed: true,
+                close_required_count: 2,
+                runtime_risk: None,
+                financial_risk: None,
+                unknown_recovery_exit: false,
+                manual_close_requested: true,
+            },
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert_eq!(decision, "manual_close");
+        assert_eq!(reason_codes, vec!["manual_close_requested".to_owned()]);
+        assert!(blocking_reasons.is_empty());
+
+        reason_codes.clear();
+        blocking_reasons.clear();
+        let blocked = funding_arb_exit_cycle_decision(
+            FundingArbExitCycleDecisionInput {
+                private_position_matched: false,
+                private_position_reason: Some("private position snapshot mismatch"),
+                settlement_matched: false,
+                settlement_observed_complete: false,
+                settlement_observed_mismatch: false,
+                rollover_allowed: false,
+                close_required_count: 2,
+                runtime_risk: None,
+                financial_risk: None,
+                unknown_recovery_exit: false,
+                manual_close_requested: true,
+            },
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert_eq!(blocked, "blocked");
+        assert_eq!(reason_codes, vec!["private_position_unknown".to_owned()]);
+        assert_eq!(
+            blocking_reasons,
+            vec!["private position snapshot mismatch".to_owned()]
+        );
     }
 
     #[test]
@@ -59405,6 +61589,7 @@ mod tests {
                 runtime_risk: Some(&runtime_risk),
                 financial_risk: None,
                 unknown_recovery_exit: false,
+                manual_close_requested: false,
             },
             &mut reason_codes,
             &mut blocking_reasons,
@@ -59447,6 +61632,7 @@ mod tests {
                 runtime_risk: Some(&runtime_risk),
                 financial_risk: None,
                 unknown_recovery_exit: false,
+                manual_close_requested: false,
             },
             &mut reason_codes,
             &mut blocking_reasons,
@@ -59495,6 +61681,7 @@ mod tests {
                 runtime_risk: None,
                 financial_risk: Some(&financial_risk),
                 unknown_recovery_exit: false,
+                manual_close_requested: false,
             },
             &mut reason_codes,
             &mut blocking_reasons,
@@ -59620,6 +61807,7 @@ mod tests {
                 runtime_risk: None,
                 financial_risk: None,
                 unknown_recovery_exit: false,
+                manual_close_requested: false,
             },
             &mut reason_codes,
             &mut blocking_reasons,
@@ -59654,6 +61842,7 @@ mod tests {
                 runtime_risk: None,
                 financial_risk: None,
                 unknown_recovery_exit: false,
+                manual_close_requested: false,
             },
             &mut reason_codes,
             &mut blocking_reasons,
@@ -61356,6 +63545,7 @@ mod tests {
             pair_id: "binance:bitget:GENIUSUSDT:GENIUSUSDT".to_owned(),
             symbol: "GENIUSUSDT".to_owned(),
             decision: "close".to_owned(),
+            manual_close_request_id: None,
             reason_codes: vec!["expected_return_loss_limit".to_owned()],
             runtime_risk: FundingArbExitRuntimeRiskSummary::not_checked(),
             financial_risk: FundingArbExitFinancialRiskSummary::not_checked(),
@@ -62769,6 +64959,7 @@ mod tests {
             "private_readonly_snapshot_unavailable",
             "funding arb exit private read-only snapshot unavailable before dispatch; exit will retry"
                 .to_owned(),
+            None,
         )
         .expect("blocked retry report");
 
@@ -63542,6 +65733,414 @@ mod tests {
             assert_eq!(depth.bid_depth[0].size, "0.5");
             assert_eq!(depth.ask_depth[0].price, "102.10");
         }
+    }
+
+    #[test]
+    fn staged_gate_public_parsers_normalize_contract_and_book_ticker_shapes() {
+        let contracts = r#"[
+          {"name":"BTC_USDT","quanto_multiplier":"0.0001","mark_price":"37985.6","index_price":"37954.92","funding_rate":"0.002053","funding_interval":28800,"funding_next_apply":1610035200,"status":"trading"}
+        ]"#;
+        let rows = parse_gate_futures_contract_rows(contracts).expect("gate futures contracts");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "BTC_USDT");
+        assert_eq!(rows[0].funding_interval_hours, "8");
+        assert_eq!(rows[0].next_funding_time_ms, "1610035200000");
+        assert_eq!(rows[0].quanto_multiplier, "0.0001");
+        assert_eq!(rows[0].status.as_deref(), Some("trading"));
+
+        let book = r#"{"channel":"futures.book_ticker","event":"update","result":{"t":1606293275123,"u":48733182,"s":"BTC_USDT","b":"37985.5","B":"12","a":"37986.0","A":"9"}}"#;
+        let book_rows = parse_gate_book_ticker_rows(book, "gate futures book_ticker")
+            .expect("gate book ticker");
+        assert_eq!(book_rows.len(), 1);
+        assert_eq!(book_rows[0].symbol, "BTC_USDT");
+        assert_eq!(book_rows[0].bid_price, "37985.5");
+        assert_eq!(book_rows[0].bid_qty, "12");
+        assert_eq!(book_rows[0].ask_price, "37986.0");
+        assert_eq!(book_rows[0].ask_qty, "9");
+
+        let tickers = r#"[
+          {"contract":"BTC_USDT","mark_price":"37985.6","index_price":"37954.92","funding_rate":"0.002053","highest_bid":"37985.5","highest_size":"12","lowest_ask":"37986.0","lowest_size":"9"}
+        ]"#;
+        let ticker_rows = parse_gate_futures_ticker_rows(tickers).expect("gate futures tickers");
+        assert_eq!(ticker_rows.len(), 1);
+        assert_eq!(ticker_rows[0].symbol, "BTC_USDT");
+        assert_eq!(ticker_rows[0].bid_price.as_deref(), Some("37985.5"));
+        assert_eq!(ticker_rows[0].bid_qty.as_deref(), Some("12"));
+        assert_eq!(ticker_rows[0].ask_price.as_deref(), Some("37986.0"));
+        assert_eq!(ticker_rows[0].ask_qty.as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn staged_gate_direct_public_snapshot_normalizes_futures_rows() {
+        let contracts = r#"[
+          {"name":"BTC_USDT","quanto_multiplier":"0.0001","mark_price":"37985.6","index_price":"37954.92","funding_rate":"0.002053","funding_interval":28800,"funding_next_apply":1610035200,"status":"trading"},
+          {"name":"TEST_USDT","quanto_multiplier":"0.0001","mark_price":"1","index_price":"1","funding_rate":"0.1","funding_interval":28800,"funding_next_apply":1610035200,"status":"trading"},
+          {"name":"OLD_USDT","quanto_multiplier":"0.0001","mark_price":"1","index_price":"1","funding_rate":"0.1","funding_interval":28800,"funding_next_apply":1610035200,"status":"delisting"}
+        ]"#;
+        let tickers = r#"[
+          {"contract":"BTC_USDT","mark_price":"37985.6","index_price":"37954.92","funding_rate":"0.002053","highest_bid":"37985.5","highest_size":"12","lowest_ask":"37986.0","lowest_size":"9"},
+          {"contract":"TEST_USDT","mark_price":"1","index_price":"1","funding_rate":"0.1","highest_bid":"1","highest_size":"1","lowest_ask":"1.1","lowest_size":"1"},
+          {"contract":"OLD_USDT","mark_price":"1","index_price":"1","funding_rate":"0.1","highest_bid":"1","highest_size":"1","lowest_ask":"1.1","lowest_size":"1"}
+        ]"#;
+        let snapshot = build_gate_funding_arb_public_venue_snapshot_from_json(tickers, contracts)
+            .expect("gate direct public snapshot");
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.rows.len(), 1);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.venue_family, "gate");
+        assert_eq!(row.symbol, "BTC_USDT");
+        assert_eq!(row.base_asset, "BTC");
+        assert_eq!(row.perp_bid.as_deref(), Some("37985.5"));
+        assert_eq!(row.perp_bid_qty.as_deref(), Some("12"));
+        assert_eq!(row.perp_ask.as_deref(), Some("37986.0"));
+        assert_eq!(row.perp_ask_qty.as_deref(), Some("9"));
+        assert_eq!(row.funding_interval_hours, "8");
+        assert_eq!(row.next_funding_time_ms.as_deref(), Some("1610035200000"));
+        assert_eq!(row.source_status, "complete");
+    }
+
+    #[test]
+    fn staged_gate_direct_public_snapshot_fails_closed_without_top_sizes() {
+        let contracts = r#"[
+          {"name":"ETH_USDT","quanto_multiplier":"0.01","mark_price":"2064.6","index_price":"2064.2","funding_rate":"0.0001","funding_interval":28800,"funding_next_apply":1610035200,"status":"trading"}
+        ]"#;
+        let tickers = r#"[
+          {"contract":"ETH_USDT","mark_price":"2064.6","index_price":"2064.2","funding_rate":"0.0001","highest_bid":"2064.5","lowest_ask":"2064.8"}
+        ]"#;
+        let snapshot = build_gate_funding_arb_public_venue_snapshot_from_json(tickers, contracts)
+            .expect("gate direct public snapshot");
+        assert_eq!(snapshot.rows.len(), 1);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.symbol, "ETH_USDT");
+        assert_eq!(row.base_asset, "ETH");
+        assert_eq!(row.source_status, "missing_top_of_book_size");
+        assert_eq!(row.perp_bid.as_deref(), Some("2064.5"));
+        assert_eq!(row.perp_bid_qty, None);
+        assert!(row.perp_bid_depth.is_empty());
+    }
+
+    #[test]
+    fn staged_lighter_public_parsers_normalize_order_book_and_market_stats() {
+        let order_book = r#"{"channel":"order_book:0","last_updated_at":1774884082309144,"order_book":{"code":0,"asks":[{"price":"2064.54","size":"0.3285"}],"bids":[{"price":"2064.12","size":"0.25"}],"offset":1558300,"nonce":42,"begin_nonce":41},"timestamp":1774884082309144,"type":"update/order_book"}"#;
+        let top = parse_lighter_order_book_top(order_book, "ETH").expect("lighter order book");
+        assert_eq!(top.symbol, "ETH");
+        assert_eq!(top.bid_price, "2064.12");
+        assert_eq!(top.bid_qty, "0.25");
+        assert_eq!(top.ask_price, "2064.54");
+        assert_eq!(top.ask_qty, "0.3285");
+
+        let stats = r#"{"channel":"market_stats:0","market_stats":{"symbol":"ETH","market_id":0,"index_price":"2063.80","mark_price":"2064.02","current_funding_rate":"0.0001","funding_rate":"0.00008"},"type":"update/market_stats"}"#;
+        let rows = parse_lighter_market_stats_rows(stats).expect("lighter market stats");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].market_id, "0");
+        assert_eq!(rows[0].symbol, "ETH");
+        assert_eq!(rows[0].mark_price, "2064.02");
+        assert_eq!(rows[0].index_price, "2063.80");
+        assert_eq!(rows[0].current_funding_rate, "0.0001");
+        assert_eq!(rows[0].last_funding_rate.as_deref(), Some("0.00008"));
+    }
+
+    #[test]
+    fn staged_lighter_direct_public_snapshot_requires_native_mark_index_before_candidate() {
+        let funding = r#"{"code":200,"funding_rates":[
+          {"market_id":0,"exchange":"lighter","symbol":"ETH","rate":-0.000032000000000000001},
+          {"market_id":1,"exchange":"binance","symbol":"ETH","rate":0.0001}
+        ]}"#;
+        let details = r#"{"code":200,"order_book_details":[
+          {"symbol":"ETH","market_id":0,"market_type":"perp","status":"active","last_trade_price":1616.35}
+        ],"spot_order_book_details":[]}"#;
+        let wss_status = r#"{"status":"streaming","updated_at":"2026-05-13T00:00:00Z","rows":[
+          {"symbol":"ETH","best_bid":"1616.30","best_ask":"1616.40","bid_size":"0.25","ask_size":"0.30","freshness_status":"Fresh"}
+        ]}"#;
+
+        let snapshot = build_lighter_funding_arb_public_venue_snapshot_from_json(
+            funding,
+            details,
+            Some(wss_status),
+        )
+        .expect("lighter snapshot");
+
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.rows.len(), 1);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.venue_family, "lighter");
+        assert_eq!(row.symbol, "ETH");
+        assert_eq!(row.base_asset, "ETH");
+        assert_eq!(row.perp_bid.as_deref(), Some("1616.30"));
+        assert_eq!(row.perp_ask_qty.as_deref(), Some("0.30"));
+        assert_eq!(row.mark_price.as_deref(), Some("1616.35"));
+        assert_eq!(row.index_price.as_deref(), Some("1616.35"));
+        assert_eq!(row.funding_rate, "-0.000032");
+        assert_eq!(row.funding_interval_hours, "1");
+        assert_eq!(row.source_status, "missing_mark_index");
+    }
+
+    #[test]
+    fn staged_lighter_direct_public_snapshot_can_be_complete_with_native_mark_index() {
+        let funding = r#"{"funding_rates":[
+          {"market_id":1,"exchange":"lighter","symbol":"BTC","rate":0.00009599999999999999}
+        ]}"#;
+        let details = r#"{"order_book_details":[
+          {"symbol":"BTC","market_id":1,"status":"active","last_trade_price":61724.4,"mark_price":"61724.5","index_price":"61720.0"}
+        ]}"#;
+        let wss_status = r#"{"rows":[
+          {"symbol":"BTC","best_bid":"61724.4","best_ask":"61724.6","bid_size":"0.01","ask_size":"0.02"}
+        ]}"#;
+
+        let snapshot = build_lighter_funding_arb_public_venue_snapshot_from_json(
+            funding,
+            details,
+            Some(wss_status),
+        )
+        .expect("lighter snapshot");
+
+        assert_eq!(snapshot.rows.len(), 1);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.source_status, "complete");
+        assert_eq!(row.mark_price.as_deref(), Some("61724.5"));
+        assert_eq!(row.index_price.as_deref(), Some("61720"));
+        assert_eq!(row.funding_rate, "0.000095999999999999");
+    }
+
+    #[test]
+    fn lighter_wss_args_metadata_and_ticker_parser_are_readonly() {
+        let args = vec![
+            "--bind".to_owned(),
+            "127.0.0.1:9924".to_owned(),
+            "--symbol".to_owned(),
+            "btcusdt,eth-usd".to_owned(),
+            "--market".to_owned(),
+            "perp".to_owned(),
+            "--updates".to_owned(),
+            "5".to_owned(),
+            "--once".to_owned(),
+        ];
+        let options = parse_lighter_wss_book_ticker_args(&args).expect("lighter options");
+        assert_eq!(options.bind_addr, "127.0.0.1:9924");
+        assert_eq!(
+            normalize_lighter_wss_symbol_scope(&options.symbol).expect("symbol scope"),
+            "BTC,ETH"
+        );
+        assert_eq!(options.market, LighterPublicWssMarket::Perp);
+        assert_eq!(options.updates, 5);
+        assert!(options.once);
+        assert_eq!(
+            lighter_order_books_url(LighterPublicWssMarket::Perp),
+            "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks?market_id=255&filter=perp"
+        );
+        assert_eq!(
+            lighter_wss_ticker_subscribe_payload("0").expect("payload"),
+            r#"{"type":"subscribe","channel":"ticker/0"}"#
+        );
+
+        let metadata = r#"{"order_books":[{"market_id":0,"symbol":"ETH"},{"market_id":1,"symbol":"BTC-USDT"},{"market_id":2,"name":"BAD/USDC"}]}"#;
+        let rows = parse_lighter_order_book_metadata_rows(metadata).expect("metadata");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.market_id.as_str(), row.symbol.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("0", "ETH"), ("1", "BTC")]
+        );
+
+        let nested_metadata =
+            r#"{"data":{"order_books":[{"market_index":42,"market_symbol":"SOL-USD"}]}}"#;
+        let nested_rows =
+            parse_lighter_order_book_metadata_rows(nested_metadata).expect("nested metadata");
+        assert_eq!(nested_rows[0].market_id, "42");
+        assert_eq!(nested_rows[0].symbol, "SOL");
+
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        let ack = r#"{"type":"subscribed/ticker","channel":"ticker:0"}"#;
+        assert!(parse_lighter_wss_ticker_runtime_raw(ack, ingested_at)
+            .expect("ack")
+            .is_none());
+        let ticker = r#"{"type":"update/ticker","channel":"ticker:0","ticker":{"market_id":0,"s":"ETH","b":{"price":"2064.12","size":"0.25"},"a":{"price":"2064.54","size":"0.3285"},"last_updated_at":1774884082309144},"timestamp":1774884082309,"nonce":1558301}"#;
+        let parsed = parse_lighter_wss_ticker_runtime_raw(ticker, ingested_at)
+            .expect("ticker")
+            .expect("ticker update");
+        assert_eq!(parsed.symbol, "ETH");
+        assert_eq!(parsed.update_id, 1558301);
+        assert_eq!(parsed.best_bid.to_string(), "2064.12");
+        assert_eq!(parsed.ask_size.to_string(), "0.3285");
+    }
+
+    #[test]
+    fn lighter_wss_ticker_bootstraps_then_updates_local_quote() {
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        let mut state = lighter_wss_test_market_state("ETH", false);
+
+        let first = r#"{"type":"update/ticker","channel":"ticker:0","ticker":{"market_id":0,"symbol":"ETH","b":{"price":"2064.12","size":"0.25"},"a":{"price":"2064.54","size":"0.3285"},"last_updated_at":1774884082309144},"timestamp":1774884082309,"nonce":1558301}"#;
+        let bootstrap_update = apply_lighter_wss_book_ticker_text(
+            first,
+            ingested_at,
+            LighterPublicWssMarket::Perp,
+            &mut state,
+        )
+        .expect("lighter bootstrap update")
+        .expect("bootstrap quote");
+        let bootstrap_quote = bootstrap_update.quote.expect("bootstrap quote");
+        assert_eq!(
+            bootstrap_quote.best_bid.expect("bid").to_string(),
+            "2064.12"
+        );
+        assert_eq!(bootstrap_quote.source_sequence, None);
+        assert_eq!(
+            bootstrap_quote.source_event_id.as_deref(),
+            Some("lighter:wss-book-ticker:perp:ETH:1558301")
+        );
+        assert_eq!(state.local_sequences.get("ETH"), Some(&1));
+        assert_eq!(state.last_exchange_update_ids.get("ETH"), Some(&1558301));
+
+        let second = r#"{"type":"update/ticker","channel":"ticker:0","ticker":{"market_id":0,"symbol":"ETH","b":{"price":"2065.12","size":"0.35"},"a":{"price":"2065.54","size":"0.4285"},"last_updated_at":1774884083309144},"timestamp":1774884083309,"nonce":1558302}"#;
+        let update = apply_lighter_wss_book_ticker_text(
+            second,
+            ingested_at,
+            LighterPublicWssMarket::Perp,
+            &mut state,
+        )
+        .expect("lighter wss update")
+        .expect("wss quote");
+        let quote = update.quote.expect("quote");
+        assert_eq!(quote.best_ask.expect("ask").to_string(), "2065.54");
+        assert_eq!(quote.source_sequence.as_deref(), Some("2"));
+        assert_eq!(
+            quote.source_event_id.as_deref(),
+            Some("lighter:wss-book-ticker:perp:ETH:1558302")
+        );
+
+        let duplicate = apply_lighter_wss_book_ticker_text(
+            second,
+            ingested_at,
+            LighterPublicWssMarket::Perp,
+            &mut state,
+        )
+        .expect("duplicate produces gap update")
+        .expect("gap update");
+        assert!(duplicate.fail_closed);
+
+        let mut all_scope_state = lighter_wss_test_market_state("ETH", true);
+        let btc = r#"{"type":"update/ticker","channel":"ticker:1","ticker":{"market_id":1,"symbol":"BTC","b":{"price":"100000","size":"0.01"},"a":{"price":"100001","size":"0.02"},"last_updated_at":1774884082309144},"timestamp":1774884082309,"nonce":1558301}"#;
+        assert!(apply_lighter_wss_book_ticker_text(
+            btc,
+            ingested_at,
+            LighterPublicWssMarket::Perp,
+            &mut all_scope_state,
+        )
+        .expect("all scope missing symbol skipped")
+        .is_none());
+    }
+
+    #[test]
+    fn gate_wss_args_rest_rows_and_parser_are_readonly() {
+        let args = vec![
+            "--bind".to_owned(),
+            "127.0.0.1:9925".to_owned(),
+            "--symbol".to_owned(),
+            "btcusdt,eth_usdt".to_owned(),
+            "--market".to_owned(),
+            "usdt-futures".to_owned(),
+            "--updates".to_owned(),
+            "5".to_owned(),
+            "--once".to_owned(),
+        ];
+        let options = parse_gate_wss_book_ticker_args(&args).expect("gate options");
+        assert_eq!(options.bind_addr, "127.0.0.1:9925");
+        assert_eq!(
+            normalize_gate_wss_symbol_scope(&options.symbol).expect("symbol scope"),
+            "BTC_USDT,ETH_USDT"
+        );
+        assert_eq!(options.market, GatePublicWssMarket::UsdtFutures);
+        assert_eq!(options.updates, 5);
+        assert!(options.once);
+        let payload = gate_wss_book_ticker_subscribe_payload("BTCUSDT").expect("payload");
+        assert!(payload.contains(r#""channel":"futures.book_ticker""#));
+        assert!(payload.contains(r#""payload":["BTC_USDT"]"#));
+
+        let tickers = r#"[
+          {"contract":"BTC_USDT","mark_price":"37985.6","index_price":"37954.92","funding_rate":"0.002053","highest_bid":"37985.5","highest_size":"12","lowest_ask":"37986.0","lowest_size":"9"},
+          {"contract":"ETH_USDT","mark_price":"2064.6","index_price":"2064.2","funding_rate":"0.0001","highest_bid":"2064.5","lowest_ask":"2064.8"},
+          {"contract":"TEST_USDT","mark_price":"1","index_price":"1","funding_rate":"0.1","highest_bid":"1","highest_size":"1","lowest_ask":"1.1","lowest_size":"1"}
+        ]"#;
+        let rows = parse_gate_futures_ticker_rows(tickers).expect("gate tickers");
+        let prepared = prepare_gate_wss_book_ticker_rest_rows(
+            rows,
+            GATE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+            true,
+        )
+        .expect("prepared all");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].symbol, "BTC_USDT");
+
+        let explicit_missing = prepare_gate_wss_book_ticker_rest_rows(
+            parse_gate_futures_ticker_rows(tickers).expect("gate tickers"),
+            "ETH_USDT",
+            false,
+        )
+        .expect_err("explicit incomplete top-of-book must fail");
+        assert!(explicit_missing
+            .to_string()
+            .contains("incomplete top-of-book"));
+
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        let ack = r#"{"time":1606293275,"channel":"futures.book_ticker","event":"subscribe","result":{"status":"success"}}"#;
+        assert!(parse_gate_wss_book_ticker_runtime_raw(ack, ingested_at)
+            .expect("ack")
+            .is_none());
+        let update = r#"{"time":1606293275,"time_ms":1606293275123,"channel":"futures.book_ticker","event":"update","result":{"t":1606293275123,"u":48733182,"s":"BTC_USDT","b":"37985.5","B":"12","a":"37986.0","A":"9"}}"#;
+        let parsed = parse_gate_wss_book_ticker_runtime_raw(update, ingested_at)
+            .expect("gate update")
+            .expect("book ticker");
+        assert_eq!(parsed.symbol, "BTC_USDT");
+        assert_eq!(parsed.update_id, 48733182);
+        assert_eq!(parsed.best_bid.to_string(), "37985.5");
+        assert_eq!(parsed.ask_size.to_string(), "9");
+    }
+
+    #[test]
+    fn gate_wss_book_ticker_updates_monitor_quote_and_duplicate_fails_closed() {
+        let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
+        let mut state = gate_wss_test_market_state("BTCUSDT", false);
+        let update = r#"{"time":1606293275,"time_ms":1606293275123,"channel":"futures.book_ticker","event":"update","result":{"t":1606293275123,"u":48733182,"s":"BTC_USDT","b":"37985.5","B":"12","a":"37986.0","A":"9"}}"#;
+        let applied = apply_gate_wss_book_ticker_text(
+            update,
+            ingested_at,
+            GatePublicWssMarket::UsdtFutures,
+            &mut state,
+        )
+        .expect("gate update")
+        .expect("quote");
+        let quote = applied.quote.expect("quote");
+        assert_eq!(quote.best_ask.expect("ask").to_string(), "37986.0");
+        assert_eq!(quote.source_sequence.as_deref(), Some("2"));
+        assert_eq!(
+            quote.source_event_id.as_deref(),
+            Some("gate:wss-book-ticker:usdt-futures:BTC_USDT:48733182")
+        );
+        assert_eq!(
+            state.last_exchange_update_ids.get("BTC_USDT"),
+            Some(&48733182)
+        );
+
+        let duplicate = apply_gate_wss_book_ticker_text(
+            update,
+            ingested_at,
+            GatePublicWssMarket::UsdtFutures,
+            &mut state,
+        )
+        .expect("duplicate produces gap update")
+        .expect("gap update");
+        assert!(duplicate.fail_closed);
+
+        let mut all_scope_state = gate_wss_test_market_state("BTCUSDT", true);
+        let eth = r#"{"time":1606293275,"time_ms":1606293275123,"channel":"futures.book_ticker","event":"update","result":{"t":1606293275123,"u":48733182,"s":"ETH_USDT","b":"2064.5","B":"3","a":"2064.8","A":"4"}}"#;
+        assert!(apply_gate_wss_book_ticker_text(
+            eth,
+            ingested_at,
+            GatePublicWssMarket::UsdtFutures,
+            &mut all_scope_state,
+        )
+        .expect("all scope missing symbol skipped")
+        .is_none());
     }
 
     #[test]

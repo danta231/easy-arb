@@ -103,6 +103,7 @@ name = "arb-signing"
 version = "0.1.0"
 dependencies = [
  "arb-domain",
+ "sha2",
 ]
 
 [[package]]

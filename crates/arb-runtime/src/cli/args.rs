@@ -45,6 +45,8 @@ pub(crate) type OkxWssBookTickerCliOptions = OkxWssBookTickerMonitorOptions;
 pub(crate) type BitgetWssBookTickerCliOptions = BitgetWssBookTickerMonitorOptions;
 pub(crate) type AsterWssBookTickerCliOptions = AsterWssBookTickerMonitorOptions;
 pub(crate) type HyperliquidWssBookTickerCliOptions = HyperliquidWssBookTickerMonitorOptions;
+pub(crate) type LighterWssBookTickerCliOptions = LighterWssBookTickerMonitorOptions;
+pub(crate) type GateWssBookTickerCliOptions = GateWssBookTickerMonitorOptions;
 pub(crate) type BybitBasisMonitorCliOptions = BybitBasisMonitorOptions;
 pub(crate) type OkxBasisMonitorCliOptions = OkxBasisMonitorOptions;
 pub(crate) type BitgetBasisMonitorCliOptions = BitgetBasisMonitorOptions;
@@ -2665,6 +2667,142 @@ pub(crate) fn parse_hyperliquid_wss_book_ticker_args(
     Ok(options)
 }
 
+pub(crate) fn parse_lighter_wss_book_ticker_args(
+    args: &[String],
+) -> RuntimeResult<LighterWssBookTickerCliOptions> {
+    let mut options = LighterWssBookTickerMonitorOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires host:port"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                options.symbol = value.clone();
+            }
+            "--market" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--market requires perp"));
+                };
+                options.market = parse_lighter_public_wss_market(value)?;
+            }
+            "--updates" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--updates requires a value"));
+                };
+                options.updates = value
+                    .parse::<usize>()
+                    .map_err(|_| cli_arg_error("--updates must be an integer"))?;
+            }
+            "--reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reconnect-delay-secs requires a value"));
+                };
+                options.reconnect_delay_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--reconnect-delay-secs must be an integer"))?;
+            }
+            "--once" => {
+                options.once = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown lighter-wss-book-ticker option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected lighter-wss-book-ticker positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_lighter_wss_probe_options(&options)?;
+    Ok(options)
+}
+
+pub(crate) fn parse_gate_wss_book_ticker_args(
+    args: &[String],
+) -> RuntimeResult<GateWssBookTickerCliOptions> {
+    let mut options = GateWssBookTickerMonitorOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--bind requires host:port"));
+                };
+                options.bind_addr = value.clone();
+            }
+            "--symbol" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--symbol requires a value"));
+                };
+                options.symbol = value.clone();
+            }
+            "--market" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--market requires usdt-futures"));
+                };
+                options.market = parse_gate_public_wss_market(value)?;
+            }
+            "--updates" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--updates requires a value"));
+                };
+                options.updates = value
+                    .parse::<usize>()
+                    .map_err(|_| cli_arg_error("--updates must be an integer"))?;
+            }
+            "--reconnect-delay-secs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(cli_arg_error("--reconnect-delay-secs requires a value"));
+                };
+                options.reconnect_delay_secs = value
+                    .parse::<u64>()
+                    .map_err(|_| cli_arg_error("--reconnect-delay-secs must be an integer"))?;
+            }
+            "--once" => {
+                options.once = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(cli_arg_error(format!(
+                    "unknown gate-wss-book-ticker option `{value}`"
+                )));
+            }
+            value => {
+                return Err(cli_arg_error(format!(
+                    "unexpected gate-wss-book-ticker positional argument `{value}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    validate_gate_wss_probe_options(&options)?;
+    Ok(options)
+}
+
 pub(crate) fn parse_binance_basis_monitor_args(
     args: &[String],
 ) -> RuntimeResult<BinanceBasisMonitorCliOptions> {
@@ -3584,6 +3722,7 @@ pub(crate) fn parse_portfolio_dashboard_args(
                 };
                 options.navigation_wss_pid_file = Some(PathBuf::from(value));
             }
+            "--enable-manual-close" => options.manual_close_enabled = true,
             "--once" => options.once = true,
             value if value.starts_with('-') => {
                 return Err(cli_arg_error(format!(
@@ -4611,6 +4750,7 @@ pub(crate) fn parse_funding_arb_resident_live_args(
         allow_unknown_recovery,
         auto_residual_de_risk,
         exit_only,
+        manual_close_request: None,
         hyperliquid_user,
         hyperliquid_source,
         hyperliquid_vault_address,

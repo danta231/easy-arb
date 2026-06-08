@@ -1203,8 +1203,26 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                     .join("exit")
                     .join(&position.position_id)
                     .join(resident_cycle_dir_name(cycles)?);
+                let manual_close_request = funding_arb_pending_manual_close_request_for_position(
+                    &output_root,
+                    &position.position_id,
+                )?;
+                let mut exit_options = options.clone();
+                if let Some(request) = manual_close_request.clone() {
+                    append_funding_arb_manual_close_status_event(
+                        &output_root,
+                        &request,
+                        "manual_close_started",
+                        "running",
+                        Some(cycles),
+                        Some(&exit_dir),
+                        Some("resident exit cycle accepted manual close request"),
+                        None,
+                    )?;
+                    exit_options.manual_close_request = Some(request);
+                }
                 match run_funding_arb_resident_exit_cycle(
-                    &options,
+                    &exit_options,
                     &position.position_state_path,
                     &exit_dir,
                 ) {
@@ -1227,6 +1245,18 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                                 &exit_dir,
                                 &report,
                             )?;
+                            if let Some(request) = manual_close_request.as_ref() {
+                                append_funding_arb_manual_close_status_event(
+                                    &output_root,
+                                    request,
+                                    "manual_close_closed",
+                                    "closed",
+                                    Some(cycles),
+                                    Some(&exit_dir),
+                                    Some("manual close verified flat or already flat"),
+                                    Some(&report.decision),
+                                )?;
+                            }
                         } else if report.dispatch_attempted
                             && (report.residual_risk.is_some()
                                 || !report.blocking_reasons.is_empty())
@@ -1239,6 +1269,20 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                                 &report,
                                 "funding arb exit/de-risk dispatch left unknown or residual state",
                             )?;
+                            if let Some(request) = manual_close_request.as_ref() {
+                                append_funding_arb_manual_close_status_event(
+                                    &output_root,
+                                    request,
+                                    "manual_close_failed",
+                                    "failed",
+                                    Some(cycles),
+                                    Some(&exit_dir),
+                                    report.residual_risk.as_deref().or_else(|| {
+                                        report.blocking_reasons.first().map(String::as_str)
+                                    }),
+                                    Some(&report.decision),
+                                )?;
+                            }
                             if options.auto_residual_de_risk {
                                 append_funding_arb_resident_residual_retry_event(
                                     &output_root,
@@ -1257,9 +1301,37 @@ pub(crate) fn run_funding_arb_resident_live_inner(
                                 );
                             }
                             break;
+                        } else if let Some(request) = manual_close_request.as_ref() {
+                            append_funding_arb_manual_close_status_event(
+                                &output_root,
+                                request,
+                                "manual_close_blocked",
+                                "blocked",
+                                Some(cycles),
+                                Some(&exit_dir),
+                                report
+                                    .blocking_reasons
+                                    .first()
+                                    .map(String::as_str)
+                                    .or(report.residual_risk.as_deref())
+                                    .or(Some("manual close did not dispatch in this cycle")),
+                                Some(&report.decision),
+                            )?;
                         }
                     }
                     Err(error) => {
+                        if let Some(request) = manual_close_request.as_ref() {
+                            append_funding_arb_manual_close_status_event(
+                                &output_root,
+                                request,
+                                "manual_close_failed",
+                                "failed",
+                                Some(cycles),
+                                Some(&exit_dir),
+                                Some(&error.to_string()),
+                                None,
+                            )?;
+                        }
                         append_funding_arb_resident_error_event(
                             &output_root,
                             cycles,

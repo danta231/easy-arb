@@ -24,22 +24,25 @@ use crate::{
     bitget_ticker_value_to_string, bitget_usdt_futures_tickers_url, bybit_linear_tickers_url,
     bybit_spot_tickers_url, cli_arg_error, current_utc_timestamp, current_utc_timestamp_string,
     decode_json_string_literal, fetch_public_json_post_with_curl, fetch_public_json_with_curl,
-    funding_display_symbol, hyperliquid_info_request_body, json_array_value_slices,
-    json_option_string, json_string, json_string_end, normalize_cex_usdt_basis_symbol,
-    normalize_okx_usdt_basis_symbol, okx_tickers_url, optional_json_value_string,
-    parse_bitget_spot_ticker_rows, parse_bitget_usdt_futures_ticker_rows, parse_book_ticker_rows,
-    parse_bybit_linear_ticker_rows, parse_bybit_spot_ticker_rows, parse_flat_json_object,
+    funding_display_symbol, gate_usdt_futures_tickers_url, hyperliquid_info_request_body,
+    json_array_value_slices, json_object_slices, json_option_string, json_string, json_string_end,
+    normalize_cex_usdt_basis_symbol, normalize_okx_usdt_basis_symbol, okx_tickers_url,
+    optional_json_value_string, parse_bitget_spot_ticker_rows,
+    parse_bitget_usdt_futures_ticker_rows, parse_book_ticker_rows, parse_bybit_linear_ticker_rows,
+    parse_bybit_spot_ticker_rows, parse_flat_json_object, parse_gate_futures_ticker_rows,
     parse_hyperliquid_perp_context_rows, parse_json_object_value_slices, parse_okx_ticker_rows,
     required_first_json_value_string, required_json_string, required_json_value_string,
-    runtime_timestamp_millis, static_dashboard_gone_json, write_http_json, MonitorBookTickerRow,
-    MonitorJsonScalar, OkxTickerRow, RuntimeError, RuntimeResult, BASIS_SYMBOL,
-    BITGET_BASIS_SYMBOL, BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID,
+    runtime_timestamp_millis, static_dashboard_gone_json, write_http_json, GateFuturesTickerRow,
+    MonitorBookTickerRow, MonitorJsonScalar, OkxTickerRow, RuntimeError, RuntimeResult,
+    BASIS_SYMBOL, BITGET_BASIS_SYMBOL, BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID,
     HYPERLIQUID_INFO_URL, MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR,
     MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
 };
 
 pub(crate) const HYPERLIQUID_PUBLIC_WSS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub(crate) const ASTER_PUBLIC_WSS_BASE_URL: &str = "wss://fstream.asterdex.com";
+pub(crate) const GATE_PUBLIC_FUTURES_WSS_URL: &str = "wss://fx-ws.gateio.ws/v4/ws/usdt";
+pub(crate) const LIGHTER_PUBLIC_WSS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 pub(crate) const PUBLIC_WSS_MONITOR_MAX_AGE_MS: u64 = 20_000;
 pub(crate) const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
 pub(crate) const PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL: u32 = 500;
@@ -62,11 +65,19 @@ pub(crate) const BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES: usize = 4096;
 pub(crate) const BITGET_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD: usize = 50;
 pub(crate) const ASTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8794";
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8795";
+pub(crate) const LIGHTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8824";
+pub(crate) const GATE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8825";
 pub(crate) const ASTER_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+pub(crate) const LIGHTER_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+pub(crate) const GATE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const HYPERLIQUID_WSS_SUBSCRIBE_DELAY_MS: u64 = 10;
+pub(crate) const LIGHTER_WSS_SUBSCRIBE_DELAY_MS: u64 = 10;
+pub(crate) const GATE_WSS_SUBSCRIBE_DELAY_MS: u64 = 10;
 pub(crate) const ASTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+pub(crate) const LIGHTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
+pub(crate) const GATE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const BYBIT_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 pub(crate) const BYBIT_LINEAR_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 pub(crate) const BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT: usize = 100;
@@ -230,6 +241,49 @@ impl HyperliquidPublicWssMarket {
     }
 }
 
+/// Lighter 公开 WSS 顶层盘口支持的市场。
+///
+/// 中文说明：该 staged 接入只订阅公开 `ticker/{MARKET_INDEX}`，不使用账户、
+/// auth token、API key、nonce 或 sendTx。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LighterPublicWssMarket {
+    Perp,
+}
+
+impl LighterPublicWssMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Perp => "perp",
+        }
+    }
+
+    pub(crate) fn venue_id(self) -> &'static str {
+        match self {
+            Self::Perp => "venue:LIGHTER-PERP",
+        }
+    }
+}
+
+/// Gate 公开 WSS `futures.book_ticker` 支持的市场。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GatePublicWssMarket {
+    UsdtFutures,
+}
+
+impl GatePublicWssMarket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UsdtFutures => "usdt-futures",
+        }
+    }
+
+    pub(crate) fn venue_id(self) -> &'static str {
+        match self {
+            Self::UsdtFutures => "venue:GATE-USDT-FUTURES",
+        }
+    }
+}
+
 /// OKX `tickers` WSS 公开行情常驻任务选项。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OkxWssBookTickerMonitorOptions {
@@ -321,6 +375,54 @@ impl Default for HyperliquidWssBookTickerMonitorOptions {
             market: HyperliquidPublicWssMarket::Perp,
             updates: 3,
             reconnect_delay_secs: HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
+            once: false,
+        }
+    }
+}
+
+/// Lighter `ticker/{MARKET_INDEX}` WSS 公开行情常驻任务选项。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LighterWssBookTickerMonitorOptions {
+    pub bind_addr: String,
+    pub symbol: String,
+    pub market: LighterPublicWssMarket,
+    pub updates: usize,
+    pub reconnect_delay_secs: u64,
+    pub once: bool,
+}
+
+impl Default for LighterWssBookTickerMonitorOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: LIGHTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR.to_owned(),
+            symbol: LIGHTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+            market: LighterPublicWssMarket::Perp,
+            updates: 3,
+            reconnect_delay_secs: LIGHTER_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
+            once: false,
+        }
+    }
+}
+
+/// Gate `futures.book_ticker` WSS 公开行情常驻任务选项。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateWssBookTickerMonitorOptions {
+    pub bind_addr: String,
+    pub symbol: String,
+    pub market: GatePublicWssMarket,
+    pub updates: usize,
+    pub reconnect_delay_secs: u64,
+    pub once: bool,
+}
+
+impl Default for GateWssBookTickerMonitorOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: GATE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR.to_owned(),
+            symbol: GATE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS.to_owned(),
+            market: GatePublicWssMarket::UsdtFutures,
+            updates: 3,
+            reconnect_delay_secs: GATE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS,
             once: false,
         }
     }
@@ -1634,6 +1736,370 @@ pub(crate) fn run_hyperliquid_wss_book_ticker_monitor_cycle(
     }
 }
 
+/// 运行 Lighter 公开 `ticker/{MARKET_INDEX}` WSS 常驻任务。
+pub fn run_lighter_wss_book_ticker_monitor(
+    options: LighterWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    validate_lighter_wss_probe_options(&options)?;
+    let symbol_scope = normalize_lighter_wss_symbol_scope(&options.symbol)?;
+    let state = Arc::new(RwLock::new(
+        PublicTopOfBookMonitorSnapshot::empty_with_market(
+            &symbol_scope,
+            options.market.as_str(),
+            "pending-rest-bootstrap",
+        ),
+    ));
+    if !options.once {
+        start_lighter_wss_book_ticker_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "lighter-wss-book-ticker: api=http://{} symbol_scope={} market={} reconnect_delay_secs={} mutable_execution_started=false",
+            options.bind_addr,
+            symbol_scope,
+            options.market.as_str(),
+            options.reconnect_delay_secs,
+        );
+    }
+
+    let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("lighter-wss-book-ticker");
+    loop {
+        let cycle = run_lighter_wss_book_ticker_monitor_cycle(
+            &options,
+            state.clone(),
+            &symbol_scope,
+            rebuild_from_rest,
+        );
+        match cycle {
+            Ok(()) if options.once => return Ok(()),
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
+            Err(error) if options.once => return Err(error),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
+            }
+        }
+        rebuild_from_rest = true;
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
+    }
+}
+
+pub(crate) fn run_lighter_wss_book_ticker_monitor_cycle(
+    options: &LighterWssBookTickerMonitorOptions,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+    symbol_scope: &str,
+    rebuild_from_rest: bool,
+) -> RuntimeResult<()> {
+    if rebuild_from_rest {
+        state
+            .write()
+            .expect("Lighter WSS monitor state lock poisoned")
+            .begin_rest_rebuild();
+    }
+    let mut market_state = match bootstrap_lighter_wss_book_ticker(symbol_scope, options.market) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            state
+                .write()
+                .expect("Lighter WSS monitor state lock poisoned")
+                .record_failure(
+                    format!("REST metadata bootstrap/rebuild failed: {error}"),
+                    false,
+                );
+            return Err(error);
+        }
+    };
+    {
+        let mut snapshot = state
+            .write()
+            .expect("Lighter WSS monitor state lock poisoned");
+        snapshot.stream_url = market_state.stream_url.clone();
+        snapshot.symbol = symbol_scope.to_owned();
+        snapshot.market = options.market.as_str().to_owned();
+        snapshot.rows.clear();
+        snapshot.latest_quote = None;
+        snapshot.total_rows = 0;
+        for update in &market_state.rest_updates {
+            snapshot.record_update(update);
+        }
+    }
+
+    let connected_at = current_utc_timestamp()?;
+    for coordinator in market_state.coordinators.values_mut() {
+        let update = coordinator.apply(HybridMarketDataInput::WssConnected {
+            occurred_at: connected_at,
+            ingested_at: connected_at,
+        })?;
+        state
+            .write()
+            .expect("Lighter WSS monitor state lock poisoned")
+            .record_update(&update);
+    }
+
+    let text_client = PublicJsonWssTextStreamClient::new(
+        VenueId::new(options.market.venue_id())?,
+        market_state.stream_url.clone(),
+        "Lighter",
+    )?;
+    let subscribe_payloads = market_state.subscribe_args.clone();
+    let max_text_messages = if options.once {
+        options.updates
+    } else {
+        usize::MAX
+    };
+    let mut observed_wss_event = false;
+    let mut observer_error = None;
+    let read_result = text_client.read_live_text_messages_observed_many_with_subscribe_delay(
+        &subscribe_payloads,
+        max_text_messages,
+        Duration::from_millis(LIGHTER_WSS_SUBSCRIBE_DELAY_MS),
+        |raw_json, ingested_at| match apply_lighter_wss_book_ticker_text(
+            raw_json,
+            ingested_at,
+            options.market,
+            &mut market_state,
+        ) {
+            Ok(Some(update)) => {
+                observed_wss_event = true;
+                let keep_going = !update.fail_closed;
+                state
+                    .write()
+                    .expect("Lighter WSS monitor state lock poisoned")
+                    .record_update(&update);
+                keep_going
+            }
+            Ok(None) => true,
+            Err(error) => {
+                observer_error = Some(error.to_string());
+                state
+                    .write()
+                    .expect("Lighter WSS monitor state lock poisoned")
+                    .record_failure(error.to_string(), false);
+                false
+            }
+        },
+    );
+
+    if let Some(error) = observer_error {
+        return Err(RuntimeError::LiveMarketData { message: error });
+    }
+    match read_result {
+        Ok(()) => {
+            if !options.once {
+                state
+                    .write()
+                    .expect("Lighter WSS monitor state lock poisoned")
+                    .record_stream_end_with_label_and_observed(
+                        "Lighter public WSS",
+                        observed_wss_event,
+                    );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state
+                .write()
+                .expect("Lighter WSS monitor state lock poisoned")
+                .record_wss_read_error(error.to_string(), observed_wss_event);
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
+        }
+    }
+}
+
+/// 运行 Gate 公开 `futures.book_ticker` WSS 常驻任务。
+pub fn run_gate_wss_book_ticker_monitor(
+    options: GateWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    validate_gate_wss_probe_options(&options)?;
+    let symbol_scope = normalize_gate_wss_symbol_scope(&options.symbol)?;
+    let state = Arc::new(RwLock::new(
+        PublicTopOfBookMonitorSnapshot::empty_with_market(
+            &symbol_scope,
+            options.market.as_str(),
+            "pending-rest-bootstrap",
+        ),
+    ));
+    if !options.once {
+        start_gate_wss_book_ticker_http_api(&options.bind_addr, state.clone())?;
+        println!(
+            "gate-wss-book-ticker: api=http://{} symbol_scope={} market={} reconnect_delay_secs={} mutable_execution_started=false",
+            options.bind_addr,
+            symbol_scope,
+            options.market.as_str(),
+            options.reconnect_delay_secs,
+        );
+    }
+
+    let mut rebuild_from_rest = false;
+    let mut consecutive_failures = 0_u32;
+    let mut failure_logger = PublicWssCycleFailureLogger::new("gate-wss-book-ticker");
+    loop {
+        let cycle = run_gate_wss_book_ticker_monitor_cycle(
+            &options,
+            state.clone(),
+            &symbol_scope,
+            rebuild_from_rest,
+        );
+        match cycle {
+            Ok(()) if options.once => return Ok(()),
+            Ok(()) => {
+                consecutive_failures = 0;
+                failure_logger.record_success();
+            }
+            Err(error) if options.once => return Err(error),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let reconnect_backoff = public_wss_reconnect_backoff(
+                    options.reconnect_delay_secs,
+                    consecutive_failures,
+                );
+                failure_logger.record_failure(&error, consecutive_failures, reconnect_backoff);
+                rebuild_from_rest = true;
+                thread::sleep(reconnect_backoff);
+                continue;
+            }
+        }
+        rebuild_from_rest = true;
+        thread::sleep(public_wss_reconnect_backoff(
+            options.reconnect_delay_secs,
+            consecutive_failures,
+        ));
+    }
+}
+
+pub(crate) fn run_gate_wss_book_ticker_monitor_cycle(
+    options: &GateWssBookTickerMonitorOptions,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+    symbol_scope: &str,
+    rebuild_from_rest: bool,
+) -> RuntimeResult<()> {
+    if rebuild_from_rest {
+        state
+            .write()
+            .expect("Gate WSS monitor state lock poisoned")
+            .begin_rest_rebuild();
+    }
+    let mut market_state = match bootstrap_gate_wss_book_ticker(symbol_scope, options.market) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            state
+                .write()
+                .expect("Gate WSS monitor state lock poisoned")
+                .record_failure(
+                    format!("REST ticker bootstrap/rebuild failed: {error}"),
+                    false,
+                );
+            return Err(error);
+        }
+    };
+    {
+        let mut snapshot = state.write().expect("Gate WSS monitor state lock poisoned");
+        snapshot.stream_url = market_state.stream_url.clone();
+        snapshot.symbol = symbol_scope.to_owned();
+        snapshot.market = options.market.as_str().to_owned();
+        snapshot.rows.clear();
+        snapshot.latest_quote = None;
+        snapshot.total_rows = 0;
+        for update in &market_state.rest_updates {
+            snapshot.record_update(update);
+        }
+    }
+
+    let connected_at = current_utc_timestamp()?;
+    for coordinator in market_state.coordinators.values_mut() {
+        let update = coordinator.apply(HybridMarketDataInput::WssConnected {
+            occurred_at: connected_at,
+            ingested_at: connected_at,
+        })?;
+        state
+            .write()
+            .expect("Gate WSS monitor state lock poisoned")
+            .record_update(&update);
+    }
+
+    let text_client = PublicJsonWssTextStreamClient::new(
+        VenueId::new(options.market.venue_id())?,
+        market_state.stream_url.clone(),
+        "Gate",
+    )?;
+    let subscribe_payloads = market_state.subscribe_args.clone();
+    let max_text_messages = if options.once {
+        options.updates
+    } else {
+        usize::MAX
+    };
+    let mut observed_wss_event = false;
+    let mut observer_error = None;
+    let read_result = text_client.read_live_text_messages_observed_many_with_subscribe_delay(
+        &subscribe_payloads,
+        max_text_messages,
+        Duration::from_millis(GATE_WSS_SUBSCRIBE_DELAY_MS),
+        |raw_json, ingested_at| match apply_gate_wss_book_ticker_text(
+            raw_json,
+            ingested_at,
+            options.market,
+            &mut market_state,
+        ) {
+            Ok(Some(update)) => {
+                observed_wss_event = true;
+                let keep_going = !update.fail_closed;
+                state
+                    .write()
+                    .expect("Gate WSS monitor state lock poisoned")
+                    .record_update(&update);
+                keep_going
+            }
+            Ok(None) => true,
+            Err(error) => {
+                observer_error = Some(error.to_string());
+                state
+                    .write()
+                    .expect("Gate WSS monitor state lock poisoned")
+                    .record_failure(error.to_string(), false);
+                false
+            }
+        },
+    );
+
+    if let Some(error) = observer_error {
+        return Err(RuntimeError::LiveMarketData { message: error });
+    }
+    match read_result {
+        Ok(()) => {
+            if !options.once {
+                state
+                    .write()
+                    .expect("Gate WSS monitor state lock poisoned")
+                    .record_stream_end_with_label_and_observed(
+                        "Gate public WSS",
+                        observed_wss_event,
+                    );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state
+                .write()
+                .expect("Gate WSS monitor state lock poisoned")
+                .record_wss_read_error(error.to_string(), observed_wss_event);
+            public_wss_monitor_cycle_result_after_read_error(error, observed_wss_event)
+        }
+    }
+}
+
 pub(crate) struct PublicTopOfBookAllMarketState {
     pub(crate) venue_id: VenueId,
     pub(crate) stream_url: String,
@@ -1653,6 +2119,12 @@ pub(crate) struct PublicTopOfBookRuntimeRaw {
     pub(crate) bid_size: Quantity,
     pub(crate) ask_size: Quantity,
     pub(crate) observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LighterOrderBookMetadataRow {
+    pub(crate) market_id: String,
+    pub(crate) symbol: String,
 }
 
 pub(crate) struct BybitTopOfBookRuntimeRaw {
@@ -2353,6 +2825,194 @@ pub(crate) fn bootstrap_hyperliquid_wss_book_ticker(
     })
 }
 
+pub(crate) fn bootstrap_lighter_wss_book_ticker(
+    symbol_scope: &str,
+    market: LighterPublicWssMarket,
+) -> RuntimeResult<PublicTopOfBookAllMarketState> {
+    let symbol_scope = normalize_lighter_wss_symbol_scope(symbol_scope)?;
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&symbol_scope, is_lighter_wss_all_symbols_scope);
+    let all_symbols_scope = target_symbols.is_none();
+    let raw_rest_snapshot = fetch_public_json_with_curl(&lighter_order_books_url(market))?;
+    let mut rows = parse_lighter_order_book_metadata_rows(&raw_rest_snapshot)?;
+    rows.retain(|row| {
+        target_symbols
+            .as_ref()
+            .map(|symbols| symbols.contains(&row.symbol))
+            .unwrap_or(true)
+    });
+    rows.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    rows.dedup_by(|left, right| left.symbol == right.symbol);
+    ensure_wss_requested_symbols_present(
+        "Lighter WSS orderBooks metadata bootstrap",
+        target_symbols.as_ref(),
+        rows.iter().map(|row| row.symbol.clone()).collect(),
+    )?;
+    if rows.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Lighter WSS metadata bootstrap returned no rows for `{symbol_scope}`"
+            ),
+        });
+    }
+
+    let observed_at = current_utc_timestamp()?;
+    let venue_id = VenueId::new(market.venue_id())?;
+    let mut coordinators = BTreeMap::new();
+    let mut local_sequences = BTreeMap::new();
+    let mut subscribe_args = Vec::with_capacity(rows.len());
+    for row in rows {
+        let instrument_id = lighter_public_wss_instrument_id(&row.symbol, market)?;
+        let coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id,
+            observed_at,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
+        )?;
+        local_sequences.insert(row.symbol.clone(), 0_u64);
+        subscribe_args.push(lighter_wss_ticker_subscribe_payload(&row.market_id)?);
+        coordinators.insert(row.symbol, coordinator);
+    }
+
+    Ok(PublicTopOfBookAllMarketState {
+        venue_id,
+        stream_url: LIGHTER_PUBLIC_WSS_URL.to_owned(),
+        subscribe_args,
+        ignore_untracked_wss_symbols: all_symbols_scope,
+        coordinators,
+        local_sequences,
+        last_exchange_update_ids: BTreeMap::new(),
+        rest_updates: Vec::new(),
+    })
+}
+
+pub(crate) fn bootstrap_gate_wss_book_ticker(
+    symbol_scope: &str,
+    market: GatePublicWssMarket,
+) -> RuntimeResult<PublicTopOfBookAllMarketState> {
+    let symbol_scope = normalize_gate_wss_symbol_scope(symbol_scope)?;
+    let venue_id = VenueId::new(market.venue_id())?;
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&symbol_scope, is_gate_wss_all_symbols_scope);
+    let all_symbols_scope = target_symbols.is_none();
+    let ignore_untracked_wss_symbols = all_symbols_scope
+        || target_symbols
+            .as_ref()
+            .is_some_and(|symbols| symbols.len() > 1);
+    let raw_rest_snapshot = fetch_public_json_with_curl(&gate_usdt_futures_tickers_url())?;
+    let rows = prepare_gate_wss_book_ticker_rest_rows(
+        parse_gate_futures_ticker_rows(&raw_rest_snapshot)?,
+        &symbol_scope,
+        all_symbols_scope,
+    )?;
+    if rows.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Gate WSS REST ticker bootstrap returned no rows for `{symbol_scope}`"
+            ),
+        });
+    }
+
+    let observed_at = current_utc_timestamp()?;
+    let mut coordinators = BTreeMap::new();
+    let mut local_sequences = BTreeMap::new();
+    let mut rest_updates = Vec::with_capacity(rows.len());
+    let mut subscribe_args = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = row.symbol.clone();
+        let instrument_id = gate_public_wss_instrument_id(&symbol, market)?;
+        let quote = public_wss_top_of_book_quote(
+            &symbol,
+            venue_id.clone(),
+            instrument_id.clone(),
+            PublicTopOfBookRuntimeRaw {
+                symbol: symbol.clone(),
+                update_id: 1,
+                best_bid: Price::from_str(row.bid_price.as_deref().expect("bid present"))?,
+                best_ask: Price::from_str(row.ask_price.as_deref().expect("ask present"))?,
+                bid_size: Quantity::from_str(row.bid_qty.as_deref().expect("bid size present"))?,
+                ask_size: Quantity::from_str(row.ask_qty.as_deref().expect("ask size present"))?,
+                observed_at,
+            },
+            format!("gate:rest-tickers:{}:{}", row.symbol, observed_at),
+        )?;
+        let mut coordinator = RestWssMarketDataCoordinator::new(
+            venue_id.clone(),
+            instrument_id,
+            observed_at,
+            PUBLIC_WSS_MONITOR_MAX_AGE_MS,
+        )?;
+        let update = coordinator.apply(HybridMarketDataInput::RestSnapshot { quote })?;
+        local_sequences.insert(symbol.clone(), 1_u64);
+        subscribe_args.push(gate_wss_book_ticker_subscribe_payload(&symbol)?);
+        coordinators.insert(symbol, coordinator);
+        rest_updates.push(update);
+    }
+
+    Ok(PublicTopOfBookAllMarketState {
+        venue_id,
+        stream_url: GATE_PUBLIC_FUTURES_WSS_URL.to_owned(),
+        subscribe_args,
+        ignore_untracked_wss_symbols,
+        coordinators,
+        local_sequences,
+        last_exchange_update_ids: BTreeMap::new(),
+        rest_updates,
+    })
+}
+
+pub(crate) fn prepare_gate_wss_book_ticker_rest_rows(
+    rows: Vec<GateFuturesTickerRow>,
+    symbol_scope: &str,
+    all_symbols_scope: bool,
+) -> RuntimeResult<Vec<GateFuturesTickerRow>> {
+    let normalized_scope = normalize_gate_wss_symbol_scope(symbol_scope)?;
+    let all_symbols_scope = all_symbols_scope || is_gate_wss_all_symbols_scope(&normalized_scope);
+    let target_symbols =
+        explicit_wss_symbol_scope_set(&normalized_scope, is_gate_wss_all_symbols_scope);
+    let mut prepared = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match validate_gate_public_wss_symbol(&row.symbol) {
+            Ok(symbol)
+                if wss_symbol_in_scope(&symbol, all_symbols_scope, target_symbols.as_ref()) =>
+            {
+                if gate_wss_ticker_row_has_usable_top_of_book(&row) {
+                    row.symbol = symbol;
+                    prepared.push(row);
+                } else if !all_symbols_scope {
+                    return Err(RuntimeError::LiveMarketData {
+                        message: format!(
+                            "Gate WSS REST ticker row for `{symbol}` has incomplete top-of-book"
+                        ),
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(_) if all_symbols_scope || target_symbols.is_some() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    prepared.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    prepared.dedup_by(|left, right| left.symbol == right.symbol);
+    ensure_wss_requested_symbols_present(
+        "Gate WSS REST ticker bootstrap",
+        target_symbols.as_ref(),
+        prepared.iter().map(|row| row.symbol.clone()).collect(),
+    )?;
+    Ok(prepared)
+}
+
+fn gate_wss_ticker_row_has_usable_top_of_book(row: &GateFuturesTickerRow) -> bool {
+    [
+        row.bid_price.as_deref(),
+        row.bid_qty.as_deref(),
+        row.ask_price.as_deref(),
+        row.ask_qty.as_deref(),
+    ]
+    .into_iter()
+    .all(|value| value.is_some_and(|value| !value.trim().is_empty()))
+}
+
 pub(crate) fn prepare_aster_wss_book_ticker_rest_rows(
     rows: Vec<MonitorBookTickerRow>,
     symbol_scope: &str,
@@ -2947,6 +3607,210 @@ pub(crate) fn apply_hyperliquid_wss_book_ticker_text(
     Ok(Some(update))
 }
 
+pub(crate) fn apply_lighter_wss_book_ticker_text(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+    market: LighterPublicWssMarket,
+    state: &mut PublicTopOfBookAllMarketState,
+) -> RuntimeResult<Option<HybridMarketDataUpdate>> {
+    let Some(mut raw) = parse_lighter_wss_ticker_runtime_raw(raw_json, ingested_at)? else {
+        return Ok(None);
+    };
+    raw.symbol = match validate_lighter_public_wss_symbol(&raw.symbol) {
+        Ok(symbol) => symbol,
+        Err(_) if state.ignore_untracked_wss_symbols => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !state.coordinators.contains_key(&raw.symbol) {
+        if state.ignore_untracked_wss_symbols {
+            return Ok(None);
+        }
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Lighter WSS symbol `{}` was not present in metadata bootstrap; metadata rebuild required",
+                raw.symbol
+            ),
+        });
+    }
+    if let Some(previous) = state.last_exchange_update_ids.get(&raw.symbol) {
+        if raw.update_id <= *previous {
+            let update = state
+                .coordinators
+                .get_mut(&raw.symbol)
+                .expect("coordinator exists")
+                .apply(HybridMarketDataInput::WssGapDetected {
+                    expected_sequence: None,
+                    observed_sequence: state.local_sequences.get(&raw.symbol).copied(),
+                    occurred_at: raw.observed_at,
+                    ingested_at,
+                    detail: format!(
+                        "Lighter WSS ticker nonce `{}` did not advance beyond `{previous}`; metadata rebuild required",
+                        raw.update_id
+                    ),
+                })?;
+            return Ok(Some(update));
+        }
+    }
+    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
+    let instrument_id = lighter_public_wss_instrument_id(&raw.symbol, market)?;
+    let source_event_id = format!(
+        "lighter:wss-book-ticker:{}:{}:{}",
+        lighter_public_wss_market_event_scope(market),
+        raw.symbol,
+        raw.update_id
+    );
+    let update = if state
+        .coordinators
+        .get(&raw.symbol)
+        .expect("coordinator exists")
+        .latest_quote_snapshot()
+        .is_none()
+    {
+        let quote = lighter_wss_bootstrap_quote(
+            state.venue_id.clone(),
+            instrument_id,
+            &raw,
+            source_event_id,
+        )?;
+        state
+            .coordinators
+            .get_mut(&raw.symbol)
+            .expect("coordinator exists")
+            .apply(HybridMarketDataInput::RestSnapshot { quote })?
+    } else {
+        state
+            .coordinators
+            .get_mut(&raw.symbol)
+            .expect("coordinator exists")
+            .apply(HybridMarketDataInput::WssQuote {
+                update: WssQuoteUpdate {
+                    venue_id: state.venue_id.clone(),
+                    instrument_id,
+                    last_price: None,
+                    best_bid: Some(raw.best_bid),
+                    best_ask: Some(raw.best_ask),
+                    mark_price: None,
+                    index_price: None,
+                    bid_size: Some(raw.bid_size),
+                    ask_size: Some(raw.ask_size),
+                    source_sequence: local_sequence,
+                    source_event_id: Some(source_event_id),
+                    observed_at: raw.observed_at,
+                    ingested_at,
+                },
+            })?
+    };
+    state
+        .last_exchange_update_ids
+        .insert(raw.symbol, raw.update_id);
+    Ok(Some(update))
+}
+
+pub(crate) fn lighter_wss_bootstrap_quote(
+    venue_id: VenueId,
+    instrument_id: InstrumentId,
+    raw: &PublicTopOfBookRuntimeRaw,
+    source_event_id: String,
+) -> RuntimeResult<MarketQuote> {
+    let freshness = DataFreshness::new(
+        raw.observed_at,
+        raw.observed_at,
+        PUBLIC_WSS_MONITOR_MAX_AGE_MS,
+    )?;
+    Ok(MarketQuote {
+        venue_id,
+        instrument_id,
+        last_price: None,
+        best_bid: Some(raw.best_bid),
+        best_ask: Some(raw.best_ask),
+        mark_price: None,
+        index_price: None,
+        bid_size: Some(raw.bid_size),
+        ask_size: Some(raw.ask_size),
+        source_sequence: None,
+        source_event_id: Some(source_event_id.replace(['\n', '\r'], " ")),
+        freshness,
+    })
+}
+
+pub(crate) fn apply_gate_wss_book_ticker_text(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+    market: GatePublicWssMarket,
+    state: &mut PublicTopOfBookAllMarketState,
+) -> RuntimeResult<Option<HybridMarketDataUpdate>> {
+    let Some(mut raw) = parse_gate_wss_book_ticker_runtime_raw(raw_json, ingested_at)? else {
+        return Ok(None);
+    };
+    raw.symbol = match validate_gate_public_wss_symbol(&raw.symbol) {
+        Ok(symbol) => symbol,
+        Err(_) if state.ignore_untracked_wss_symbols => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !state.coordinators.contains_key(&raw.symbol) {
+        if state.ignore_untracked_wss_symbols {
+            return Ok(None);
+        }
+        return Err(RuntimeError::LiveMarketData {
+            message: format!(
+                "Gate WSS symbol `{}` was not present in REST ticker bootstrap; REST rebuild required",
+                raw.symbol
+            ),
+        });
+    }
+    if let Some(previous) = state.last_exchange_update_ids.get(&raw.symbol) {
+        if raw.update_id <= *previous {
+            let update = state
+                .coordinators
+                .get_mut(&raw.symbol)
+                .expect("coordinator exists")
+                .apply(HybridMarketDataInput::WssGapDetected {
+                    expected_sequence: None,
+                    observed_sequence: state.local_sequences.get(&raw.symbol).copied(),
+                    occurred_at: raw.observed_at,
+                    ingested_at,
+                    detail: format!(
+                        "Gate WSS bookTicker updateId `{}` did not advance beyond `{previous}`; REST rebuild required",
+                        raw.update_id
+                    ),
+                })?;
+            return Ok(Some(update));
+        }
+    }
+    let local_sequence = next_public_wss_local_sequence(state, &raw.symbol)?;
+    let instrument_id = gate_public_wss_instrument_id(&raw.symbol, market)?;
+    let update = state
+        .coordinators
+        .get_mut(&raw.symbol)
+        .expect("coordinator exists")
+        .apply(HybridMarketDataInput::WssQuote {
+            update: WssQuoteUpdate {
+                venue_id: state.venue_id.clone(),
+                instrument_id,
+                last_price: None,
+                best_bid: Some(raw.best_bid),
+                best_ask: Some(raw.best_ask),
+                mark_price: None,
+                index_price: None,
+                bid_size: Some(raw.bid_size),
+                ask_size: Some(raw.ask_size),
+                source_sequence: local_sequence,
+                source_event_id: Some(format!(
+                    "gate:wss-book-ticker:{}:{}:{}",
+                    gate_public_wss_market_event_scope(market),
+                    raw.symbol,
+                    raw.update_id
+                )),
+                observed_at: raw.observed_at,
+                ingested_at,
+            },
+        })?;
+    state
+        .last_exchange_update_ids
+        .insert(raw.symbol, raw.update_id);
+    Ok(Some(update))
+}
+
 pub(crate) fn next_public_wss_local_sequence(
     state: &mut PublicTopOfBookAllMarketState,
     symbol: &str,
@@ -3305,6 +4169,309 @@ pub(crate) fn parse_hyperliquid_wss_bbo_runtime_raw(
         ask_size,
         observed_at,
     }))
+}
+
+pub(crate) fn parse_lighter_wss_ticker_runtime_raw(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<Option<PublicTopOfBookRuntimeRaw>> {
+    let root = parse_json_object_value_slices(raw_json)?;
+    let channel = optional_json_value_string(&root, "channel", "lighter wss")?;
+    if channel
+        .as_deref()
+        .is_some_and(|channel| !channel.starts_with("ticker:") && !channel.starts_with("ticker/"))
+    {
+        return Ok(None);
+    }
+    if let Some(event_type) = optional_json_value_string(&root, "type", "lighter wss")? {
+        if event_type == "error" {
+            return Err(RuntimeError::LiveMarketData {
+                message: "Lighter public WSS ticker returned error event".to_owned(),
+            });
+        }
+        if event_type != "update/ticker"
+            && !event_type.starts_with("subscribed/")
+            && !event_type.starts_with("unsubscribed/")
+        {
+            return Ok(None);
+        }
+        if event_type != "update/ticker" {
+            return Ok(None);
+        }
+    }
+    let Some(ticker) = root.get("ticker") else {
+        return Ok(None);
+    };
+    let fields = parse_json_object_value_slices(ticker)?;
+    let symbol = required_first_json_value_string(&fields, &["s", "symbol"], "lighter wss ticker")?;
+    let update_id = optional_json_scalar_u64(&root, "nonce", "lighter wss ticker")?
+        .or(optional_json_scalar_u64(
+            &fields,
+            "nonce",
+            "lighter wss ticker",
+        )?)
+        .or(optional_json_scalar_u64(
+            &fields,
+            "last_updated_at",
+            "lighter wss ticker",
+        )?)
+        .or(optional_json_scalar_u64(
+            &root,
+            "last_updated_at",
+            "lighter wss ticker",
+        )?)
+        .or(optional_json_scalar_u64(
+            &root,
+            "timestamp",
+            "lighter wss ticker",
+        )?)
+        .unwrap_or_else(|| {
+            u64::try_from(runtime_timestamp_millis(ingested_at).unwrap_or(0)).unwrap_or(0)
+        });
+    let Some((best_bid, bid_size)) = fields
+        .get("b")
+        .map(|level| lighter_wss_ticker_level(level, "bid"))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let Some((best_ask, ask_size)) = fields
+        .get("a")
+        .map(|level| lighter_wss_ticker_level(level, "ask"))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let observed_at = lighter_wss_timestamp(&root, &fields, ingested_at)?;
+    Ok(Some(PublicTopOfBookRuntimeRaw {
+        symbol,
+        update_id,
+        best_bid,
+        best_ask,
+        bid_size,
+        ask_size,
+        observed_at,
+    }))
+}
+
+fn lighter_wss_ticker_level(
+    value: &str,
+    side: &'static str,
+) -> RuntimeResult<Option<(Price, Quantity)>> {
+    let value = value.trim();
+    if value == "null" {
+        return Ok(None);
+    }
+    let fields = parse_json_object_value_slices(value)?;
+    let price = required_json_value_string(&fields, "price", "lighter wss ticker level")?;
+    let size = required_json_value_string(&fields, "size", "lighter wss ticker level")?;
+    let price = price.trim();
+    let size = size.trim();
+    if price.is_empty() || size.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((
+        Price::from_str(price).map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("Lighter WSS `{side}` price `{price}` is invalid: {error}"),
+        })?,
+        Quantity::from_str(size).map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("Lighter WSS `{side}` size `{size}` is invalid: {error}"),
+        })?,
+    )))
+}
+
+fn lighter_wss_timestamp(
+    root: &BTreeMap<String, &str>,
+    fields: &BTreeMap<String, &str>,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<UtcTimestamp> {
+    let observed = optional_json_scalar_u64(root, "timestamp", "lighter wss ticker")?
+        .map(timestamp_from_lighter_millis_or_micros)
+        .transpose()?
+        .or(
+            optional_json_scalar_u64(root, "last_updated_at", "lighter wss ticker")?
+                .map(timestamp_from_lighter_millis_or_micros)
+                .transpose()?,
+        )
+        .or(
+            optional_json_scalar_u64(fields, "last_updated_at", "lighter wss ticker")?
+                .map(timestamp_from_lighter_millis_or_micros)
+                .transpose()?,
+        );
+    observed_at_not_after_ingested(observed.unwrap_or(ingested_at), ingested_at)
+}
+
+fn timestamp_from_lighter_millis_or_micros(value: u64) -> RuntimeResult<UtcTimestamp> {
+    if value >= 10_000_000_000_000 {
+        timestamp_from_unix_millis(value / 1_000)
+    } else {
+        timestamp_from_unix_millis(value)
+    }
+}
+
+pub(crate) fn parse_lighter_order_book_metadata_rows(
+    input: &str,
+) -> RuntimeResult<Vec<LighterOrderBookMetadataRow>> {
+    let rows = lighter_order_book_metadata_object_slices(input)?
+        .into_iter()
+        .filter_map(|object| {
+            let fields = parse_json_object_value_slices(object).ok()?;
+            let market_id = required_first_json_value_string(
+                &fields,
+                &["market_id", "market_index", "id"],
+                "lighter orderBooks metadata",
+            )
+            .ok()?;
+            let symbol = required_first_json_value_string(
+                &fields,
+                &["symbol", "name", "market_symbol", "ticker"],
+                "lighter orderBooks metadata",
+            )
+            .ok()
+            .and_then(|symbol| validate_lighter_public_wss_symbol(&symbol).ok())?;
+            Some(LighterOrderBookMetadataRow { market_id, symbol })
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Err(RuntimeError::LiveMarketData {
+            message: "Lighter orderBooks metadata contains no usable perp rows".to_owned(),
+        });
+    }
+    Ok(rows)
+}
+
+fn lighter_order_book_metadata_object_slices(input: &str) -> RuntimeResult<Vec<&str>> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        let fields = parse_json_object_value_slices(trimmed)?;
+        for key in ["order_books", "orderBooks", "data", "result", "items"] {
+            if let Some(value) = fields.get(key) {
+                if value.trim_start().starts_with('{') {
+                    let nested = parse_json_object_value_slices(value)?;
+                    for nested_key in ["order_books", "orderBooks", "data", "result", "items"] {
+                        if let Some(nested_value) = nested.get(nested_key) {
+                            return json_object_slices(nested_value);
+                        }
+                    }
+                }
+                return json_object_slices(value);
+            }
+        }
+    }
+    json_object_slices(trimmed)
+}
+
+pub(crate) fn parse_gate_wss_book_ticker_runtime_raw(
+    raw_json: &str,
+    ingested_at: UtcTimestamp,
+) -> RuntimeResult<Option<PublicTopOfBookRuntimeRaw>> {
+    let root = parse_json_object_value_slices(raw_json)?;
+    let channel = optional_json_value_string(&root, "channel", "gate wss")?;
+    if channel.as_deref() != Some("futures.book_ticker") {
+        return Ok(None);
+    }
+    let event = optional_json_value_string(&root, "event", "gate wss")?;
+    match event.as_deref() {
+        Some("update") | None => {}
+        Some("subscribe") => {
+            if gate_wss_subscribe_failed(&root)? {
+                return Err(RuntimeError::LiveMarketData {
+                    message: "Gate public WSS futures.book_ticker subscribe failed".to_owned(),
+                });
+            }
+            return Ok(None);
+        }
+        Some(_) => return Ok(None),
+    }
+    let Some(result) = root.get("result") else {
+        return Ok(None);
+    };
+    let fields = parse_json_object_value_slices(result)?;
+    let symbol =
+        required_first_json_value_string(&fields, &["s", "symbol"], "gate wss bookTicker")?;
+    let update_id = optional_json_scalar_u64(&fields, "u", "gate wss bookTicker")?
+        .or(optional_json_scalar_u64(
+            &fields,
+            "t",
+            "gate wss bookTicker",
+        )?)
+        .or(optional_json_scalar_u64(
+            &root,
+            "time_ms",
+            "gate wss bookTicker",
+        )?)
+        .or(optional_json_scalar_u64(
+            &root,
+            "time",
+            "gate wss bookTicker",
+        )?)
+        .unwrap_or_else(|| {
+            u64::try_from(runtime_timestamp_millis(ingested_at).unwrap_or(0)).unwrap_or(0)
+        });
+    let bid_price =
+        required_first_json_value_string(&fields, &["b", "bid"], "gate wss bookTicker")?;
+    let bid_qty =
+        required_first_json_value_string(&fields, &["B", "bid_size"], "gate wss bookTicker")?;
+    let ask_price =
+        required_first_json_value_string(&fields, &["a", "ask"], "gate wss bookTicker")?;
+    let ask_qty =
+        required_first_json_value_string(&fields, &["A", "ask_size"], "gate wss bookTicker")?;
+    if [
+        bid_price.as_str(),
+        bid_qty.as_str(),
+        ask_price.as_str(),
+        ask_qty.as_str(),
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
+    {
+        return Ok(None);
+    }
+    let observed_at = optional_json_scalar_u64(&fields, "t", "gate wss bookTicker")?
+        .or(optional_json_scalar_u64(
+            &root,
+            "time_ms",
+            "gate wss bookTicker",
+        )?)
+        .map(timestamp_from_gate_seconds_or_millis)
+        .transpose()?
+        .unwrap_or(ingested_at);
+    let observed_at = observed_at_not_after_ingested(observed_at, ingested_at)?;
+    Ok(Some(PublicTopOfBookRuntimeRaw {
+        symbol,
+        update_id,
+        best_bid: Price::from_str(&bid_price)?,
+        best_ask: Price::from_str(&ask_price)?,
+        bid_size: Quantity::from_str(&bid_qty)?,
+        ask_size: Quantity::from_str(&ask_qty)?,
+        observed_at,
+    }))
+}
+
+fn gate_wss_subscribe_failed(fields: &BTreeMap<String, &str>) -> RuntimeResult<bool> {
+    let Some(result) = fields.get("result") else {
+        return Ok(false);
+    };
+    if result.trim() == "null" {
+        return Ok(false);
+    }
+    let result_fields = parse_json_object_value_slices(result)?;
+    if let Some(status) =
+        optional_json_value_string(&result_fields, "status", "gate wss subscribe")?
+    {
+        return Ok(!status.eq_ignore_ascii_case("success"));
+    }
+    Ok(false)
+}
+
+fn timestamp_from_gate_seconds_or_millis(value: u64) -> RuntimeResult<UtcTimestamp> {
+    if value < 10_000_000_000 {
+        timestamp_from_unix_millis(value.saturating_mul(1_000))
+    } else {
+        timestamp_from_unix_millis(value)
+    }
 }
 
 fn hyperliquid_wss_bbo_top_of_book(
@@ -3709,6 +4876,15 @@ pub(crate) fn hyperliquid_wss_top_of_book_subscribe_payload(coin: &str) -> Runti
     ))
 }
 
+pub(crate) fn lighter_order_books_url(market: LighterPublicWssMarket) -> String {
+    match market {
+        LighterPublicWssMarket::Perp => {
+            "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks?market_id=255&filter=perp"
+                .to_owned()
+        }
+    }
+}
+
 pub(crate) fn public_wss_reconnect_backoff(base_secs: u64, consecutive_failures: u32) -> Duration {
     let jitter_seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3918,6 +5094,42 @@ pub(crate) fn validate_hyperliquid_wss_probe_options(
     Ok(())
 }
 
+pub(crate) fn validate_lighter_wss_probe_options(
+    options: &LighterWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    if options.bind_addr.trim().is_empty() {
+        return Err(cli_arg_error("--bind must not be empty"));
+    }
+    if options.updates == 0 {
+        return Err(cli_arg_error("--updates must be greater than zero"));
+    }
+    if options.reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    normalize_lighter_wss_symbol_scope(&options.symbol)?;
+    Ok(())
+}
+
+pub(crate) fn validate_gate_wss_probe_options(
+    options: &GateWssBookTickerMonitorOptions,
+) -> RuntimeResult<()> {
+    if options.bind_addr.trim().is_empty() {
+        return Err(cli_arg_error("--bind must not be empty"));
+    }
+    if options.updates == 0 {
+        return Err(cli_arg_error("--updates must be greater than zero"));
+    }
+    if options.reconnect_delay_secs == 0 {
+        return Err(cli_arg_error(
+            "--reconnect-delay-secs must be greater than zero",
+        ));
+    }
+    normalize_gate_wss_symbol_scope(&options.symbol)?;
+    Ok(())
+}
+
 pub(crate) fn normalize_binance_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
     normalize_wss_symbol_scope_list(
         symbol,
@@ -4007,7 +5219,39 @@ pub(crate) fn normalize_hyperliquid_wss_symbol_scope(symbol: &str) -> RuntimeRes
     )
 }
 
+pub(crate) fn normalize_lighter_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
+    normalize_wss_symbol_scope_list(
+        symbol,
+        LIGHTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_lighter_wss_all_symbols_scope,
+        validate_lighter_public_wss_symbol,
+    )
+}
+
+pub(crate) fn normalize_gate_wss_symbol_scope(symbol: &str) -> RuntimeResult<String> {
+    normalize_wss_symbol_scope_list(
+        symbol,
+        GATE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+        is_gate_wss_all_symbols_scope,
+        validate_gate_public_wss_symbol,
+    )
+}
+
 pub(crate) fn is_hyperliquid_wss_all_symbols_scope(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "ALL" | "ALL_USDT" | "*"
+    )
+}
+
+pub(crate) fn is_lighter_wss_all_symbols_scope(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "ALL" | "ALL_USDT" | "*"
+    )
+}
+
+pub(crate) fn is_gate_wss_all_symbols_scope(symbol: &str) -> bool {
     matches!(
         symbol.trim().to_ascii_uppercase().as_str(),
         "ALL" | "ALL_USDT" | "*"
@@ -4184,6 +5428,60 @@ pub(crate) fn validate_hyperliquid_public_wss_coin(symbol: &str) -> RuntimeResul
     Ok(coin.to_owned())
 }
 
+pub(crate) fn validate_lighter_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {
+    let trimmed = symbol.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err(cli_arg_error("Lighter WSS symbol length must be 1..=64"));
+    }
+    let uppercase = trimmed.to_ascii_uppercase();
+    let symbol = uppercase
+        .strip_suffix("-USDT")
+        .or_else(|| uppercase.strip_suffix("_USDT"))
+        .or_else(|| uppercase.strip_suffix("/USDT"))
+        .or_else(|| uppercase.strip_suffix("USDT"))
+        .or_else(|| uppercase.strip_suffix("-USD"))
+        .or_else(|| uppercase.strip_suffix("_USD"))
+        .or_else(|| uppercase.strip_suffix("/USD"))
+        .or_else(|| uppercase.strip_suffix("USD"))
+        .unwrap_or(&uppercase)
+        .to_owned();
+    if symbol.is_empty()
+        || !symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(cli_arg_error(
+            "Lighter WSS symbol must contain only uppercase ASCII letters and digits",
+        ));
+    }
+    Ok(symbol)
+}
+
+pub(crate) fn validate_gate_public_wss_symbol(symbol: &str) -> RuntimeResult<String> {
+    let mut symbol = symbol.trim().to_ascii_uppercase().replace('-', "_");
+    if !symbol.contains('_') && symbol.ends_with("USDT") && symbol.len() > 4 {
+        let base = symbol.trim_end_matches("USDT");
+        symbol = format!("{base}_USDT");
+    }
+    if symbol.len() < 6 || symbol.len() > 64 {
+        return Err(cli_arg_error("Gate WSS symbol length must be 6..=64"));
+    }
+    if !symbol
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(cli_arg_error(
+            "Gate WSS symbol must contain only uppercase ASCII letters, digits, and underscore",
+        ));
+    }
+    if !symbol.ends_with("_USDT") || symbol.starts_with("TEST_") {
+        return Err(cli_arg_error(
+            "current Gate WSS monitor maps only non-test USDT futures contracts",
+        ));
+    }
+    Ok(symbol)
+}
+
 pub(crate) fn parse_binance_public_wss_market(value: &str) -> RuntimeResult<BinancePublicMarket> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spot" => Ok(BinancePublicMarket::Spot),
@@ -4244,6 +5542,28 @@ pub(crate) fn parse_hyperliquid_public_wss_market(
         "perp" | "perps" => Ok(HyperliquidPublicWssMarket::Perp),
         _ => Err(cli_arg_error(
             "--market must be `perp` for Hyperliquid WSS bookTicker",
+        )),
+    }
+}
+
+pub(crate) fn parse_lighter_public_wss_market(
+    value: &str,
+) -> RuntimeResult<LighterPublicWssMarket> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "perp" | "perps" => Ok(LighterPublicWssMarket::Perp),
+        _ => Err(cli_arg_error(
+            "--market must be `perp` for Lighter WSS bookTicker",
+        )),
+    }
+}
+
+pub(crate) fn parse_gate_public_wss_market(value: &str) -> RuntimeResult<GatePublicWssMarket> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "usdt-futures" | "usdt_futures" | "perp" | "futures" => {
+            Ok(GatePublicWssMarket::UsdtFutures)
+        }
+        _ => Err(cli_arg_error(
+            "--market must be `usdt-futures` for Gate WSS bookTicker",
         )),
     }
 }
@@ -4365,6 +5685,28 @@ pub(crate) fn hyperliquid_public_wss_instrument_id(
     Ok(InstrumentId::new(value)?)
 }
 
+pub(crate) fn lighter_public_wss_instrument_id(
+    symbol: &str,
+    market: LighterPublicWssMarket,
+) -> RuntimeResult<InstrumentId> {
+    let symbol = validate_lighter_public_wss_symbol(symbol)?;
+    let value = match market {
+        LighterPublicWssMarket::Perp => format!("inst:LIGHTER:{symbol}:PERP"),
+    };
+    Ok(InstrumentId::new(value)?)
+}
+
+pub(crate) fn gate_public_wss_instrument_id(
+    symbol: &str,
+    market: GatePublicWssMarket,
+) -> RuntimeResult<InstrumentId> {
+    let symbol = validate_gate_public_wss_symbol(symbol)?;
+    let value = match market {
+        GatePublicWssMarket::UsdtFutures => format!("inst:GATE:{symbol}:USDT-FUTURES"),
+    };
+    Ok(InstrumentId::new(value)?)
+}
+
 pub(crate) fn bybit_public_market_event_scope(market: BybitPublicMarket) -> &'static str {
     match market {
         BybitPublicMarket::Spot => "spot",
@@ -4405,6 +5747,20 @@ pub(crate) fn hyperliquid_public_wss_market_event_scope(
 ) -> &'static str {
     match market {
         HyperliquidPublicWssMarket::Perp => "perp",
+    }
+}
+
+pub(crate) fn lighter_public_wss_market_event_scope(
+    market: LighterPublicWssMarket,
+) -> &'static str {
+    match market {
+        LighterPublicWssMarket::Perp => "perp",
+    }
+}
+
+pub(crate) fn gate_public_wss_market_event_scope(market: GatePublicWssMarket) -> &'static str {
+    match market {
+        GatePublicWssMarket::UsdtFutures => "usdt-futures",
     }
 }
 
@@ -4560,6 +5916,35 @@ pub(crate) fn bitget_wss_ticker_subscribe_payload_len(
         }
     }
     len
+}
+
+pub(crate) fn lighter_wss_ticker_subscribe_payload(market_id: &str) -> RuntimeResult<String> {
+    let market_id = validate_lighter_wss_market_id(market_id)?;
+    Ok(format!(
+        "{{\"type\":\"subscribe\",\"channel\":\"ticker/{market_id}\"}}"
+    ))
+}
+
+pub(crate) fn gate_wss_book_ticker_subscribe_payload(symbol: &str) -> RuntimeResult<String> {
+    let symbol = validate_gate_public_wss_symbol(symbol)?;
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Ok(format!(
+        "{{\"time\":{seconds},\"channel\":\"futures.book_ticker\",\"event\":\"subscribe\",\"payload\":[{}]}}",
+        json_string(&symbol)
+    ))
+}
+
+pub(crate) fn validate_lighter_wss_market_id(value: &str) -> RuntimeResult<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(cli_arg_error(
+            "Lighter WSS market_id must be a non-empty decimal integer",
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 pub(crate) fn bybit_wss_orderbook_topic(symbol: &str) -> String {
@@ -5316,6 +6701,56 @@ pub(crate) fn handle_hyperliquid_wss_book_ticker_http_connection(
     state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
 ) {
     handle_public_wss_book_ticker_http_connection(stream, state, "hyperliquid-wss-book-ticker");
+}
+
+pub(crate) fn start_lighter_wss_book_ticker_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind Lighter WSS bookTicker HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_lighter_wss_book_ticker_http_connection(stream, &state),
+                Err(error) => eprintln!("lighter-wss-book-ticker api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+pub(crate) fn handle_lighter_wss_book_ticker_http_connection(
+    stream: TcpStream,
+    state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) {
+    handle_public_wss_book_ticker_http_connection(stream, state, "lighter-wss-book-ticker");
+}
+
+pub(crate) fn start_gate_wss_book_ticker_http_api(
+    bind_addr: &str,
+    state: Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) -> RuntimeResult<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(bind_addr).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!("cannot bind Gate WSS bookTicker HTTP API on {bind_addr}: {error}"),
+    })?;
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_gate_wss_book_ticker_http_connection(stream, &state),
+                Err(error) => eprintln!("gate-wss-book-ticker api accept failed: {error}"),
+            }
+        }
+    });
+    Ok(handle)
+}
+
+pub(crate) fn handle_gate_wss_book_ticker_http_connection(
+    stream: TcpStream,
+    state: &Arc<RwLock<PublicTopOfBookMonitorSnapshot>>,
+) {
+    handle_public_wss_book_ticker_http_connection(stream, state, "gate-wss-book-ticker");
 }
 
 pub(crate) fn handle_public_wss_book_ticker_http_connection(

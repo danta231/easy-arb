@@ -9,3 +9,4 @@ real-signing = []
 
 [dependencies]
 arb-domain = { path = "../arb-domain" }
+sha2 = "0.9.9"

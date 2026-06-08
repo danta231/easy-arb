@@ -24,6 +24,10 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
                 format!(
                     "funding arb exit market snapshot unavailable before dispatch; exit will retry: {error}"
                 ),
+                options
+                    .manual_close_request
+                    .as_ref()
+                    .map(|request| request.request_id.clone()),
             );
         }
         Err(error) => return Err(error),
@@ -54,6 +58,10 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
                 "funding arb exit snapshot does not contain active pair_id `{}`; position remains open and exit will retry",
                 state.pair_id
             ),
+            options
+                .manual_close_request
+                .as_ref()
+                .map(|request| request.request_id.clone()),
         );
     };
     let row = &row;
@@ -90,6 +98,10 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
                 format!(
                     "funding arb exit private read-only snapshot unavailable before dispatch; exit will retry: {error}"
                 ),
+                options
+                    .manual_close_request
+                    .as_ref()
+                    .map(|request| request.request_id.clone()),
             );
         }
         Err(error) => return Err(error),
@@ -229,6 +241,7 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
             financial_risk: Some(&financial_risk),
             unknown_recovery_exit: funding_arb_unknown_recovery_enabled(options)
                 && state.plan_hash.is_none(),
+            manual_close_requested: options.manual_close_request.is_some(),
         },
         &mut reason_codes,
         &mut blocking_reasons,
@@ -241,17 +254,21 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         write_funding_arb_position_state_path(position_state_path, &state)?;
     }
 
-    if matches!(decision.as_str(), "close" | "emergency_de_risk") {
+    if matches!(
+        decision.as_str(),
+        "close" | "emergency_de_risk" | "manual_close"
+    ) {
         let mut close_legs = [leg_a.clone(), leg_b.clone()];
         let mut close_blocked = false;
-        let close_liquidity_blocking_reasons = if decision == "close" {
-            funding_arb_exit_close_liquidity_blocking_reasons(
-                row,
-                [&close_legs[0], &close_legs[1]],
-            )?
-        } else {
-            Vec::new()
-        };
+        let close_liquidity_blocking_reasons =
+            if matches!(decision.as_str(), "close" | "manual_close") {
+                funding_arb_exit_close_liquidity_blocking_reasons(
+                    row,
+                    [&close_legs[0], &close_legs[1]],
+                )?
+            } else {
+                Vec::new()
+            };
         if !close_liquidity_blocking_reasons.is_empty() {
             if financial_risk.is_triggered() {
                 if let Some((partial_legs, quantity)) =
@@ -380,6 +397,10 @@ pub(crate) fn run_funding_arb_resident_exit_cycle(
         pair_id: state.pair_id,
         symbol: state.symbol,
         decision,
+        manual_close_request_id: options
+            .manual_close_request
+            .as_ref()
+            .map(|request| request.request_id.clone()),
         reason_codes,
         runtime_risk,
         financial_risk,

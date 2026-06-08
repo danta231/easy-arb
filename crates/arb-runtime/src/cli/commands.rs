@@ -580,6 +580,38 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
             "ok: Hyperliquid public WSS top-of-book monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
         ));
     }
+    if args[0] == "lighter-wss-book-ticker" {
+        let options = parse_lighter_wss_book_ticker_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        let market = options.market.as_str();
+        let symbol = normalize_lighter_wss_symbol_scope(&options.symbol)?;
+        run_lighter_wss_book_ticker_monitor(options)?;
+        if once {
+            return Ok(format!(
+                "ok: ran one Lighter public WSS ticker monitor cycle; market={market}; symbol={symbol}; api_bind={bind_addr}; mutable_execution_started=false"
+            ));
+        }
+        return Ok(format!(
+            "ok: Lighter public WSS ticker monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
+    if args[0] == "gate-wss-book-ticker" {
+        let options = parse_gate_wss_book_ticker_args(&args[1..])?;
+        let once = options.once;
+        let bind_addr = options.bind_addr.clone();
+        let market = options.market.as_str();
+        let symbol = normalize_gate_wss_symbol_scope(&options.symbol)?;
+        run_gate_wss_book_ticker_monitor(options)?;
+        if once {
+            return Ok(format!(
+                "ok: ran one Gate public WSS futures.book_ticker monitor cycle; market={market}; symbol={symbol}; api_bind={bind_addr}; mutable_execution_started=false"
+            ));
+        }
+        return Ok(format!(
+            "ok: Gate public WSS futures.book_ticker monitor stopped; api_bind={bind_addr}; mutable_execution_started=false"
+        ));
+    }
     if args[0] == "binance-basis-monitor" {
         let options = parse_binance_basis_monitor_args(&args[1..])?;
         let once = options.once;
@@ -930,7 +962,7 @@ pub(crate) fn run_cli(args: Vec<String>) -> RuntimeResult<String> {
         return Err(RuntimeError::Module {
             module: "arb-runtime",
             message: format!(
-                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live, funding-carry-resident-live, opportunity-recorder",
+                "unknown command `{}`; supported commands: replay, health, health-config, live-market-sim, binance-basis-scan, binance-basis-pipeline, bybit-basis-scan, bybit-basis-pipeline, binance-guarded-live-preview, binance-guarded-live-gate-release-preview, binance-guarded-live-pre-dispatch-dry-run, binance-guarded-live-dispatch, binance-basis-live-stack, binance-basis-resident-live, multi-venue-basis-resident-live, multi-venue-basis-live-stack, binance-wss-book-ticker, bybit-wss-book-ticker, okx-wss-book-ticker, bitget-wss-book-ticker, aster-wss-book-ticker, hyperliquid-wss-book-ticker, lighter-wss-book-ticker, gate-wss-book-ticker, binance-basis-monitor, bybit-basis-monitor, okx-basis-monitor, bitget-basis-monitor, hyperliquid-basis-monitor, aster-basis-monitor, funding-arb-monitor, portfolio-dashboard, wallet-signer-preflight, funding-arb-private-readonly-snapshot-once, portfolio-private-readonly-snapshot, portfolio-private-readonly-snapshot-once, funding-arb-guarded-dry-run-once, funding-arb-guarded-live-canary-once, funding-arb-resident-live, funding-carry-resident-live, opportunity-recorder",
                 args[0]
             ),
         });
