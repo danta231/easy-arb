@@ -1536,7 +1536,9 @@ pub(crate) fn run_funding_arb_resident_live_inner(
             ResidentEntryCapacity::Blocked(reason) => {
                 append_funding_arb_resident_capacity_event(&output_root, cycles, &reason)?;
                 let registry = load_funding_arb_resident_position_registry(&output_root)?;
-                if registry.active_positions().is_empty() {
+                if registry.active_positions().is_empty()
+                    && !funding_arb_resident_capacity_block_should_wait(&reason)
+                {
                     halt_reason = Some(reason);
                     break;
                 }
@@ -1596,6 +1598,11 @@ fn funding_arb_position_recovery_drain_is_complete(
     registry.active_positions().is_empty() && registry.unknown_position_count() == 0
 }
 
+#[cfg(feature = "live-exec")]
+fn funding_arb_resident_capacity_block_should_wait(reason: &str) -> bool {
+    reason.starts_with(FUNDING_ARB_TERMINAL_PNL_UNCONFIRMED_BLOCK_REASON_PREFIX)
+}
+
 #[cfg(all(test, feature = "live-exec"))]
 mod tests {
     use super::*;
@@ -1645,5 +1652,15 @@ mod tests {
             },
         );
         assert!(!funding_arb_position_recovery_drain_is_complete(&registry));
+    }
+
+    #[test]
+    fn funding_arb_resident_waits_on_terminal_pnl_capacity_block() {
+        assert!(funding_arb_resident_capacity_block_should_wait(
+            "terminal funding arb resident position requires exchange PnL confirmation before new entries: count=1"
+        ));
+        assert!(!funding_arb_resident_capacity_block_should_wait(
+            "unknown funding arb resident position exists; new entries are blocked"
+        ));
     }
 }

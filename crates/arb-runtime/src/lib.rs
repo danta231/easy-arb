@@ -36426,6 +36426,10 @@ fn funding_arb_resident_pair_cooldown_clear_event_type(event_type: &str) -> bool
 }
 
 #[cfg(feature = "live-exec")]
+const FUNDING_ARB_TERMINAL_PNL_UNCONFIRMED_BLOCK_REASON_PREFIX: &str =
+    "terminal funding arb resident position requires exchange PnL confirmation before new entries:";
+
+#[cfg(feature = "live-exec")]
 impl FundingArbResidentPositionRegistry {
     fn active_positions(&self) -> Vec<FundingArbResidentPosition> {
         self.positions
@@ -36478,7 +36482,7 @@ impl FundingArbResidentPositionRegistry {
         }
         let sample = sample?;
         Some(format!(
-            "terminal funding arb resident position requires exchange PnL confirmation before new entries: count={} sample_position_id={} sample_pair_id={} sample_exchange_pnl_status={} sample_reconciliation_state={}",
+            "{FUNDING_ARB_TERMINAL_PNL_UNCONFIRMED_BLOCK_REASON_PREFIX} count={} sample_position_id={} sample_pair_id={} sample_exchange_pnl_status={} sample_reconciliation_state={}",
             count,
             sample.position_id,
             sample.pair_id,
@@ -53310,6 +53314,31 @@ mod tests {
         assert!(explicit_bad_error
             .to_string()
             .contains("Bitget WSS REST bootstrap row for `BADUSDT` has empty top-of-book field"));
+        let mut broad_bitget_scope = (0..PUBLIC_WSS_BROAD_EXPLICIT_SYMBOL_SCOPE_MIN_SYMBOLS)
+            .map(|index| format!("SYM{index}USDT"))
+            .collect::<Vec<_>>();
+        broad_bitget_scope.push("SPCXUSDT".to_owned());
+        broad_bitget_scope.push("BTCUSDT".to_owned());
+        let broad_bitget_rows = prepare_bitget_wss_book_ticker_rest_rows(
+            vec![monitor_book_ticker_row_with_top_depth(
+                "BTCUSDT".to_owned(),
+                "100".to_owned(),
+                "1".to_owned(),
+                "101".to_owned(),
+                "1".to_owned(),
+            )],
+            &broad_bitget_scope.join(","),
+            BitgetPublicWssMarket::UsdtFutures,
+            false,
+        )
+        .expect("broad Bitget scope should skip missing delisted symbols");
+        assert_eq!(
+            broad_bitget_rows
+                .iter()
+                .map(|row| row.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTCUSDT"]
+        );
         let bitget_symbols = (0..123)
             .map(|index| format!("SYM{index}USDT"))
             .collect::<Vec<_>>();
@@ -61000,6 +61029,36 @@ mod tests {
             .as_deref()
             .expect("halt reason")
             .contains("--allow-unknown-recovery"));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_resident_live_waits_on_terminal_pnl_confirmation_block() {
+        let root = RuntimeTempDir::new().expect("temp dir");
+        write_utf8(
+            root.path().join("funding_arb_resident_positions.jsonl"),
+            "{\"closed_at\":\"2026-05-13T00:10:00Z\",\"event_type\":\"position_flat_cancelled\",\"notional_usdt\":\"0\",\"pair_id\":\"binance:bybit:LAUSDT:LAUSDT\",\"position_id\":\"pos:flat-cancelled\",\"private_confirmation_count\":1,\"status\":\"flat_cancelled\",\"submitted_receipt_count\":1,\"symbol\":\"LAUSDT\"}\n",
+        )
+        .expect("write flat-cancelled registry");
+        let mut options = funding_arb_test_resident_options();
+        options.output_dir = Some(root.path().to_path_buf());
+        options.snapshot_path = Some(root.path().join("unused-snapshot.json"));
+        options.max_cycles = Some(1);
+        options.execute_live = true;
+        options.acknowledge_funding_arb_live_orders = true;
+
+        let report =
+            live::resident::run_funding_arb_resident_live_inner(options).expect("resident report");
+
+        assert_eq!(report.phase, "halted");
+        assert_eq!(report.cycles, 1);
+        assert_eq!(report.halt_reason.as_deref(), Some("max cycles reached"));
+        assert_eq!(report.open_position_count, 0);
+        assert_eq!(report.live_entry_count, 1);
+        let events = read_utf8(&root.path().join("funding_arb_resident_live_events.jsonl"))
+            .expect("resident events");
+        assert!(events.contains("\"event_type\":\"entry_capacity_blocked\""));
+        assert!(events.contains("requires exchange PnL confirmation"));
     }
 
     #[test]

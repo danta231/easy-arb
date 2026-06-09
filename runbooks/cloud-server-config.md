@@ -116,9 +116,12 @@ EASY_TOOL_HEALTH_BASE_URL=http://127.0.0.1:8787
 RUNTIME_ALLOWED_ORIGIN=https://easy-tool.example.com
 HISTORY_DATABASE_URL=postgres://easy_tool:<password>@127.0.0.1:5432/easy_tool
 HISTORY_PG_POOL_MAX=4
+EASY_ARB_CONFIG_ENV_FILE=/etc/easy-arb/easy-arb-live.env
 ```
 
 这里的 `<password>` 只表示本机要替换的数据库密码，不要把真实值写入仓库。
+
+`Easy Tool` 的 easy-arb 配置页只写入 `EASY_ARB_CONFIG_ENV_FILE` 指向的非密钥 env 文件，并按白名单更新运行参数。凭证仍然放在 `/etc/easy-arb/easy-arb-secrets.env`，不要给页面写入权限。若生产机启用该页面保存功能，需要让 `easy-tool-runtime` 的 systemd（系统服务管理器）沙箱允许写入该 env 文件，并只给 `easytool` 用户或受控用户组写这个文件的权限；保存后仍需重启 `easy-arb-runtime-live` 才会被 systemd 重新加载。
 
 构建和迁移：
 

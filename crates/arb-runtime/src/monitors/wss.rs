@@ -74,6 +74,7 @@ pub(crate) const GATE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const HYPERLIQUID_WSS_SUBSCRIBE_DELAY_MS: u64 = 10;
 pub(crate) const LIGHTER_WSS_SUBSCRIBE_DELAY_MS: u64 = 10;
 pub(crate) const GATE_WSS_SUBSCRIBE_DELAY_MS: u64 = 10;
+pub(crate) const PUBLIC_WSS_BROAD_EXPLICIT_SYMBOL_SCOPE_MIN_SYMBOLS: usize = 32;
 pub(crate) const ASTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const LIGHTER_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
@@ -5328,6 +5329,9 @@ fn ensure_wss_requested_symbols_present(
     let Some(target_symbols) = target_symbols else {
         return Ok(());
     };
+    if target_symbols.len() > PUBLIC_WSS_BROAD_EXPLICIT_SYMBOL_SCOPE_MIN_SYMBOLS {
+        return Ok(());
+    }
     let missing = target_symbols
         .difference(&available_symbols)
         .cloned()
