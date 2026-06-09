@@ -6,6 +6,8 @@ use crate::*;
 use super::args::*;
 use super::help::help_text;
 
+const ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED_ENV: &str = "ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED";
+
 /// CLI 入口。
 pub(crate) fn main_cli_impl() -> i32 {
     match run_cli(std::env::args().skip(1).collect()) {
@@ -31,6 +33,13 @@ pub(crate) fn run_unified_runtime(
         .unwrap_or_else(|_| UNIFIED_RUNTIME_DEFAULT_STRATEGIES.to_owned());
     let monitors = std::env::var("BASIS_OBSERVER_MONITORS")
         .unwrap_or_else(|_| UNIFIED_RUNTIME_DEFAULT_MONITORS.to_owned());
+    let auto_order_enabled = options.mode.execute_live()
+        && runtime_bool_env(ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED_ENV, false)?;
+    if options.mode.execute_live() && !auto_order_enabled {
+        eprintln!(
+            "arb-runtime live: automatic live order entry is disabled by {ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED_ENV}=0; running market scan, risk checks, and monitoring only"
+        );
+    }
     let status = Command::new("bash")
         .arg(&script_path)
         .current_dir(&repo_root)
@@ -49,19 +58,11 @@ pub(crate) fn run_unified_runtime(
         .env("BASIS_OBSERVER_FOREGROUND", "1")
         .env(
             "BASIS_OBSERVER_EXECUTE_LIVE",
-            if options.mode.execute_live() {
-                "1"
-            } else {
-                "0"
-            },
+            if auto_order_enabled { "1" } else { "0" },
         )
         .env(
             "BASIS_OBSERVER_LIVE_ACK",
-            if options.mode.execute_live() {
-                "1"
-            } else {
-                "0"
-            },
+            if auto_order_enabled { "1" } else { "0" },
         )
         .env(ARB_RUNTIME_LEGACY_COMMANDS_ENV, "1")
         .status()

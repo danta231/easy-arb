@@ -17,7 +17,7 @@ usage() {
   1. 构建 arb-runtime live-exec。
   2. 按策略自动解析需要订阅的 symbol 后，启动对应交易所 WSS monitor。
   3. 等待 WSS monitor 进入 streaming，且已收到真实 WSS 更新。
-  4. 启动 arb-runtime live --i-understand-live-orders。
+  4. 启动 arb-runtime live --i-understand-live-orders；默认只做行情扫描、机会记录和风控监测。
   5. arb-runtime live 默认只启动 cross-exchange-funding-arb 常驻 runner；
      spot-perp-basis 需要显式加入 ARB_RUNTIME_LIVE_STRATEGIES，避免无关策略限流拖垮 funding-arb。
   6. 打印所有实时 JSON API、日志和停止命令。
@@ -26,6 +26,8 @@ usage() {
   ARB_RUNTIME_LIVE_ROOT=target/arb-runtime/live # 实盘主运行目录，保存 resident 状态、机会和报告。
   ARB_RUNTIME_LIVE_PREREQ_ROOT=target/arb-runtime/live-prereq # WSS 前置 monitor 的日志和 pid 状态目录。
   ARB_RUNTIME_LIVE_ENV_FILE=.env.local # 可选 env 文件路径；等价于命令行 --env-file。
+  EASY_ARB_MANAGED_CONFIG_ENABLED=0 # Easy Tool 线上配置开关；0 表示只使用本地环境变量，1 表示再加载 managed 配置文件覆盖。
+  EASY_ARB_MANAGED_CONFIG_FILE=/etc/easy-arb/easy-arb-live.managed.env # Easy Tool 线上配置覆盖文件，只放非密钥运行参数。
   ARB_RUNTIME_LIVE_DETACH=0 # 是否后台运行 arb-runtime live；1 表示 detach。
   ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED=1 # 是否把启动脚本自身输出写入 live-prereq/logs/arb-runtime-live-precheck.log。
   ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120 # 等待 WSS monitor 就绪的最长秒数。
@@ -34,6 +36,7 @@ usage() {
   ARB_RUNTIME_LIVE_CONFIG=templates/personal_guarded_live.preflight.yaml # arb-runtime live 使用的风控和执行配置。
   ARB_RUNTIME_LIVE_INTERVAL_SECS=5 # observer 公开 monitor 轮询间隔秒数。
   ARB_RUNTIME_LIVE_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps。
+  ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED=0 # 自动实盘开单开关；0 表示只扫描和监测，1 才允许常驻 runner 自动提交真实开仓订单。
   ARB_RUNTIME_LOCAL_TZ=Asia/Shanghai # 面向人读的日志展示时区；默认 UTC+8。
   ARB_RUNTIME_LIVE_DERISK_ONLY=0 # 事故处理模式；1 表示只启动 funding arb resident 一轮恢复/减仓，不启动 spot-perp 实盘 resident。
   ARB_RUNTIME_LIVE_STRATEGIES=cross-exchange-funding-arb # live 默认只启用 funding-arb；需要 spot-perp 时显式改为 spot-perp-basis,cross-exchange-funding-arb。
@@ -94,6 +97,15 @@ USAGE
 die() {
   echo "error: $*" >&2
   exit 1
+}
+
+is_truthy_env() {
+  local value="${1:-}"
+  value="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+  case "${value}" in
+    1|true|yes|y|on|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 local_log_timestamp() {
@@ -334,6 +346,16 @@ if [[ -n "${ENV_FILE}" ]]; then
   set +a
 fi
 
+if is_truthy_env "${EASY_ARB_MANAGED_CONFIG_ENABLED:-0}"; then
+  MANAGED_CONFIG_FILE="${EASY_ARB_MANAGED_CONFIG_FILE:-}"
+  [[ -n "${MANAGED_CONFIG_FILE}" ]] || die "EASY_ARB_MANAGED_CONFIG_ENABLED=1 requires EASY_ARB_MANAGED_CONFIG_FILE"
+  [[ -r "${MANAGED_CONFIG_FILE}" ]] || die "managed config file is not readable: ${MANAGED_CONFIG_FILE}"
+  set -a
+  # shellcheck disable=SC1090
+  source "${MANAGED_CONFIG_FILE}"
+  set +a
+fi
+
 if [[ "${DETACH_FROM_CLI}" != "1" ]]; then
   DETACH="${ARB_RUNTIME_LIVE_DETACH:-${DETACH}}"
 fi
@@ -425,6 +447,7 @@ PORTFOLIO_PRIVATE_READONLY_VENUES="${ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_VENU
 LIVE_CONFIG="${ARB_RUNTIME_LIVE_CONFIG:-${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}}"
 LIVE_INTERVAL_SECS="${ARB_RUNTIME_LIVE_INTERVAL_SECS:-${BASIS_OBSERVER_INTERVAL_SECS:-5}}"
 LIVE_MIN_NET_BPS="${ARB_RUNTIME_LIVE_MIN_NET_BPS:-${BASIS_OBSERVER_MIN_NET_BPS:-5}}"
+LIVE_AUTO_ORDER_ENABLED="${ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED:-0}"
 LIVE_DERISK_ONLY="${ARB_RUNTIME_LIVE_DERISK_ONLY:-0}"
 LIVE_STRATEGIES="${ARB_RUNTIME_LIVE_STRATEGIES:-cross-exchange-funding-arb}"
 LIVE_SPOT_PERP_BASIS_MODE="${ARB_RUNTIME_LIVE_SPOT_PERP_BASIS_MODE:-auto-once}"
@@ -441,6 +464,10 @@ fi
 case "${LIVE_DERISK_ONLY}" in
   0|1) ;;
   *) die "ARB_RUNTIME_LIVE_DERISK_ONLY must be 0 or 1" ;;
+esac
+case "${LIVE_AUTO_ORDER_ENABLED}" in
+  0|1) ;;
+  *) die "ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED must be 0 or 1" ;;
 esac
 case "${PORTFOLIO_PRIVATE_READONLY_ENABLED}" in
   0|1) ;;
@@ -600,7 +627,7 @@ if [[ "${ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED:-1}" != "0" ]]; then
     echo "repo_root=${REPO_ROOT}"
     echo "run_root=${RUN_ROOT}"
     echo "prereq_root=${PREREQ_ROOT}"
-    echo "detach=${DETACH} build=${BUILD} config=${LIVE_CONFIG} interval_secs=${LIVE_INTERVAL_SECS} min_net_bps=${LIVE_MIN_NET_BPS} strategies=${LIVE_STRATEGIES} monitors=${LIVE_MONITORS} spot_perp_basis_mode=${LIVE_SPOT_PERP_BASIS_MODE} funding_arb_mode=${LIVE_FUNDING_ARB_MODE} funding_arb_direct_public_sources=${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED} staged_exchanges=${STAGED_EXCHANGES_ENABLED} derisk_only=${LIVE_DERISK_ONLY} cex_wss_scope=${CEX_WSS_SCOPE} shared_cex_wss_required=${SHARED_CEX_WSS_REQUIRED} target_wss_enabled=${TARGET_WSS_ENABLED}"
+    echo "detach=${DETACH} build=${BUILD} config=${LIVE_CONFIG} interval_secs=${LIVE_INTERVAL_SECS} min_net_bps=${LIVE_MIN_NET_BPS} auto_order_enabled=${LIVE_AUTO_ORDER_ENABLED} strategies=${LIVE_STRATEGIES} monitors=${LIVE_MONITORS} spot_perp_basis_mode=${LIVE_SPOT_PERP_BASIS_MODE} funding_arb_mode=${LIVE_FUNDING_ARB_MODE} funding_arb_direct_public_sources=${FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED} staged_exchanges=${STAGED_EXCHANGES_ENABLED} derisk_only=${LIVE_DERISK_ONLY} cex_wss_scope=${CEX_WSS_SCOPE} shared_cex_wss_required=${SHARED_CEX_WSS_REQUIRED} target_wss_enabled=${TARGET_WSS_ENABLED}"
   } >> "${PRECHECK_LOG}"
   exec > >(tee -a "${PRECHECK_LOG}") 2>&1
 fi
@@ -1177,6 +1204,8 @@ BASIS_LIGHTER_PERP_WSS_BIND="${LIGHTER_PERP_WSS_BIND}"
 LIVE_ENV=(
   BASIS_OBSERVER_ROOT="${RUN_ROOT}"
   BASIS_OBSERVER_LIVE_ACK=1
+  ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED="${LIVE_AUTO_ORDER_ENABLED}"
+  BASIS_OBSERVER_EXECUTE_LIVE="${LIVE_AUTO_ORDER_ENABLED}"
   BASIS_OBSERVER_STRATEGIES="${LIVE_STRATEGIES}"
   BASIS_OBSERVER_MONITORS="${LIVE_MONITORS}"
   BASIS_OBSERVER_SPOT_PERP_BASIS_MODE="${LIVE_SPOT_PERP_BASIS_MODE}"

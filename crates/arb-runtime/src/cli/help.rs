@@ -21,11 +21,12 @@ pub(crate) fn public_help_text() -> String {
         "  --interval-secs n             监控轮询间隔，默认 5",
         "  --min-net-bps n               最小净收益门槛，默认 5",
         "Live-only option:",
-        "  --i-understand-live-orders    正式实盘必须显式提供；表示接受真实下单风险",
+        "  --i-understand-live-orders    正式 live 运行栈必须显式提供；自动实盘开单还必须设置 ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED=1",
         "",
         "Examples:",
         "  target/debug/arb-runtime paper",
         "  target/debug/arb-runtime live --i-understand-live-orders",
+        "  ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED=1 target/debug/arb-runtime live --i-understand-live-orders",
         "",
         "内部调试命令默认关闭；portfolio-dashboard 是只读 JSON API，不需要启用内部调试命令。",
     ]

@@ -79,7 +79,8 @@ usage() {
   ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Aster spot-perp 不可执行时默认跳过 spot/depth REST；1 表示恢复 spot 扫描。
   ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED=0 # Hyperliquid spot-perp 不可执行时默认跳过 spot context；1 表示恢复 spot 扫描。
   ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED= # funding-arb 是否直接读取 perp/funding 公开源；留空时仅 funding-arb 单独运行才默认启用。
-  BASIS_OBSERVER_EXECUTE_LIVE=0 # 是否允许正式实盘下单；1 表示允许。
+  ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED=0 # 自动实盘开单开关；0 表示只扫描和监测，1 才允许自动开仓。
+  BASIS_OBSERVER_EXECUTE_LIVE=0 # 是否允许正式实盘下单；默认可由 ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED 控制，1 表示允许。
   BASIS_OBSERVER_LIVE_ACK=0 # 正式实盘确认开关；进入 live 必须为 1。
   BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2 # 自动价格保护缓冲，单位 bps。
   BASIS_OBSERVER_CURL_RETRIES=3 # 拉取本地/公开 HTTP 端点的重试次数。
@@ -2888,8 +2889,12 @@ if [[ "${1:-}" == "--recorder" ]]; then
   STATE_DIR="${RUN_ROOT}/state"
   SNAPSHOT_DIR="${RUN_ROOT}/snapshots"
   OPPORTUNITY_DIR="${RUN_ROOT}/opportunities"
-  EXECUTE_LIVE="${BASIS_OBSERVER_EXECUTE_LIVE:-0}"
+  EXECUTE_LIVE="${BASIS_OBSERVER_EXECUTE_LIVE:-${ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED:-0}}"
   LIVE_ACK="${BASIS_OBSERVER_LIVE_ACK:-0}"
+  case "${EXECUTE_LIVE}" in
+    0|1) ;;
+    *) die "BASIS_OBSERVER_EXECUTE_LIVE or ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED must be 0 or 1" ;;
+  esac
   if [[ "${EXECUTE_LIVE}" == "1" ]]; then
     [[ "${LIVE_ACK}" == "1" ]] || die "recorder live mode requires BASIS_OBSERVER_LIVE_ACK=1"
     EXECUTION_MODE="live"
@@ -3033,9 +3038,13 @@ LOG_DIR="${RUN_ROOT}/logs"
 STATE_DIR="${RUN_ROOT}/state"
 SNAPSHOT_DIR="${RUN_ROOT}/snapshots"
 OPPORTUNITY_DIR="${RUN_ROOT}/opportunities"
-EXECUTE_LIVE="${CLI_EXECUTE_LIVE:-${BASIS_OBSERVER_EXECUTE_LIVE:-0}}"
+EXECUTE_LIVE="${CLI_EXECUTE_LIVE:-${BASIS_OBSERVER_EXECUTE_LIVE:-${ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED:-0}}}"
 LIVE_PAUSE_FILE="${BASIS_OBSERVER_LIVE_PAUSE_FILE:-${RUN_ROOT}/LIVE_TRADING_PAUSED}"
 LIVE_ACK="${BASIS_OBSERVER_LIVE_ACK:-0}"
+case "${EXECUTE_LIVE}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_EXECUTE_LIVE or ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED must be 0 or 1" ;;
+esac
 if [[ "${EXECUTE_LIVE}" == "1" ]]; then
   if [[ -e "${LIVE_PAUSE_FILE}" && "${BASIS_OBSERVER_IGNORE_LIVE_PAUSE:-0}" != "1" ]]; then
     die "live trading is paused by ${LIVE_PAUSE_FILE}; remove the file only after exchange-side risk is flat"

@@ -116,12 +116,15 @@ EASY_TOOL_HEALTH_BASE_URL=http://127.0.0.1:8787
 RUNTIME_ALLOWED_ORIGIN=https://easy-tool.example.com
 HISTORY_DATABASE_URL=postgres://easy_tool:<password>@127.0.0.1:5432/easy_tool
 HISTORY_PG_POOL_MAX=4
-EASY_ARB_CONFIG_ENV_FILE=/etc/easy-arb/easy-arb-live.env
+EASY_ARB_LOCAL_ENV_FILE=/etc/easy-arb/easy-arb-live.env
+EASY_ARB_CONFIG_ENV_FILE=/etc/easy-arb/easy-arb-live.managed.env
 ```
 
 这里的 `<password>` 只表示本机要替换的数据库密码，不要把真实值写入仓库。
 
-`Easy Tool` 的 easy-arb 配置页只写入 `EASY_ARB_CONFIG_ENV_FILE` 指向的非密钥 env 文件，并按白名单更新运行参数。凭证仍然放在 `/etc/easy-arb/easy-arb-secrets.env`，不要给页面写入权限。若生产机启用该页面保存功能，需要让 `easy-tool-runtime` 的 systemd（系统服务管理器）沙箱允许写入该 env 文件，并只给 `easytool` 用户或受控用户组写这个文件的权限；保存后仍需重启 `easy-arb-runtime-live` 才会被 systemd 重新加载。
+`Easy Tool` 的 easy-arb 配置页只按白名单写入非密钥运行参数。`EASY_ARB_LOCAL_ENV_FILE` 指向本地 env 文件，页面只在其中更新 `EASY_ARB_MANAGED_CONFIG_ENABLED`（线上配置开关）和 `EASY_ARB_MANAGED_CONFIG_FILE`（线上配置覆盖文件路径）；`EASY_ARB_CONFIG_ENV_FILE` 指向线上配置覆盖文件，保存各项页面参数。`easy-arb-runtime-live` 重启时，开关开启才加载线上配置覆盖文件，关闭时只使用本地环境变量。凭证仍然放在 `/etc/easy-arb/easy-arb-secrets.env`，不要给页面写入权限。若生产机启用该页面保存功能，需要让 `easy-tool-runtime` 的 systemd（系统服务管理器）沙箱允许写入本地 env 文件和线上配置覆盖文件，并只给 `easytool` 用户或受控用户组写这两个文件的权限；保存后仍需重启 `easy-arb-runtime-live` 才会生效。
+
+`ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED` 是自动实盘开单门禁，默认必须为 `0`。关闭时 `arb-runtime live` 仍可启动行情扫描、机会记录、风控预检和风险监测，但不会向常驻 runner 传递真实开仓执行开关；只有设置为 `1` 并重启 `easy-arb-runtime-live` 后，才允许自动提交实盘开仓订单。
 
 构建和迁移：
 
