@@ -80,12 +80,26 @@ sudo cp deploy/env/easy-arb-live.env.example /etc/easy-arb/easy-arb-live.env
 sudo install -m 0644 deploy/systemd/easy-arb-runtime-live.service /etc/systemd/system/easy-arb-runtime-live.service
 sudo chown root:root /etc/systemd/system/easy-arb-runtime-live.service
 sudo chmod 600 /etc/easy-arb/easy-arb-live.env
+sudo touch /etc/easy-arb/easy-arb-live.managed.env
+sudo chmod 600 /etc/easy-arb/easy-arb-live.managed.env
 sudo touch /etc/easy-arb/easy-arb-secrets.env
 sudo chmod 600 /etc/easy-arb/easy-arb-secrets.env
 sudo systemctl daemon-reload
 ```
 
 `systemd` 会直接读取 `/etc/easy-arb/easy-arb-live.env` 和 `/etc/easy-arb/easy-arb-secrets.env`，服务启动命令不再额外 `source`（加载）这些文件，因此可以保持 root-only（仅 root 可读）权限。
+
+如果启用 `Easy Tool` 页面保存 easy-arb 配置，`easytool` 运行用户必须能进入 `/etc/easy-arb`，并且只能读写两个非密钥文件：`easy-arb-live.env`（本地 env 与线上配置开关）和 `easy-arb-live.managed.env`（线上配置覆盖项）。不要给 `easytool` 读取或写入 `easy-arb-secrets.env` 的权限：
+
+```bash
+sudo chgrp easytool /etc/easy-arb
+sudo chmod 750 /etc/easy-arb
+sudo chown root:easytool /etc/easy-arb/easy-arb-live.env /etc/easy-arb/easy-arb-live.managed.env
+sudo chmod 660 /etc/easy-arb/easy-arb-live.env /etc/easy-arb/easy-arb-live.managed.env
+sudo chown root:root /etc/easy-arb/easy-arb-secrets.env
+sudo chmod 600 /etc/easy-arb/easy-arb-secrets.env
+sudo systemctl restart easy-tool-runtime
+```
 
 `/etc/easy-arb/easy-arb-live.env` 默认使用 `ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=target`，用于降低同机部署压力。确认 dry-run（模拟运行）和小额 live（实盘）稳定后，再考虑改成 `all`。
 
