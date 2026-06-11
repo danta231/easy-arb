@@ -98,7 +98,16 @@ sudo chown root:easytool /etc/easy-arb/easy-arb-live.env /etc/easy-arb/easy-arb-
 sudo chmod 660 /etc/easy-arb/easy-arb-live.env /etc/easy-arb/easy-arb-live.managed.env
 sudo chown root:root /etc/easy-arb/easy-arb-secrets.env
 sudo chmod 600 /etc/easy-arb/easy-arb-secrets.env
+sudo cp /opt/easy-tool/current/deploy/systemd/easy-tool-runtime.service /etc/systemd/system/easy-tool-runtime.service
+sudo systemctl daemon-reload
 sudo systemctl restart easy-tool-runtime
+systemctl cat easy-tool-runtime | grep 'ReadWritePaths=.*easy-arb-live.env.*easy-arb-live.managed.env'
+sudo -u easytool test -r /etc/easy-arb/easy-arb-live.env
+sudo -u easytool test -w /etc/easy-arb/easy-arb-live.env
+sudo -u easytool test -r /etc/easy-arb/easy-arb-live.managed.env
+sudo -u easytool test -w /etc/easy-arb/easy-arb-live.managed.env
+sudo -u easytool test ! -r /etc/easy-arb/easy-arb-secrets.env
+sudo -u easytool test ! -w /etc/easy-arb/easy-arb-secrets.env
 ```
 
 `/etc/easy-arb/easy-arb-live.env` 默认使用 `ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=target`，用于降低同机部署压力。确认 dry-run（模拟运行）和小额 live（实盘）稳定后，再考虑改成 `all`。
