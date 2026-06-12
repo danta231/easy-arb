@@ -5,6 +5,25 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+source_env_file() {
+  local env_file="$1"
+  [[ -r "${env_file}" ]] || {
+    echo "base env file is not readable: ${env_file}" >&2
+    exit 1
+  }
+  set -a
+  # shellcheck disable=SC1090
+  source "${env_file}"
+  set +a
+}
+
+DEFAULT_BASE_ENV_FILE="${REPO_ROOT}/deploy/env/easy-arb-live.env"
+BASE_ENV_FILE="${ARB_RUNTIME_LIVE_BASE_ENV_FILE:-${DEFAULT_BASE_ENV_FILE}}"
+if [[ -n "${BASE_ENV_FILE}" ]]; then
+  source_env_file "${BASE_ENV_FILE}"
+fi
+
 RUN_ROOT="${ARB_RUNTIME_LIVE_ROOT:-${REPO_ROOT}/target/arb-runtime/live}"
 PREREQ_ROOT="${ARB_RUNTIME_LIVE_PREREQ_ROOT:-${REPO_ROOT}/target/arb-runtime/live-prereq}"
 STATE_DIR="${PREREQ_ROOT}/state"
@@ -21,6 +40,7 @@ usage() {
   scripts/stop-arb-runtime-live.sh
 
 常用环境变量:
+  ARB_RUNTIME_LIVE_BASE_ENV_FILE=deploy/env/easy-arb-live.env
   ARB_RUNTIME_LIVE_ROOT=target/arb-runtime/live
   ARB_RUNTIME_LIVE_PREREQ_ROOT=target/arb-runtime/live-prereq
   ARB_RUNTIME_LIVE_STOP_GRACE_SECS=3

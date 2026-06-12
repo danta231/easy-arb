@@ -343,7 +343,12 @@ done
 source_env_file() {
   local env_file="$1"
   local label="$2"
-  [[ -r "${env_file}" ]] || die "${label} env file is not readable: ${env_file}"
+  if [[ ! -r "${env_file}" ]]; then
+    if [[ "${label}" == "extra" ]]; then
+      die "extra env file is not readable: ${env_file}. Remove --env-file / unset ARB_RUNTIME_LIVE_ENV_FILE if secrets are already injected, or point it to a real secrets env file readable by the live runtime user."
+    fi
+    die "${label} env file is not readable: ${env_file}"
+  fi
   set -a
   # shellcheck disable=SC1090
   source "${env_file}"

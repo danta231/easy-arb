@@ -212,6 +212,9 @@ terminate_rescue_processes() {
   local seen=" "
 
   read_rescue_pid_lines
+  if (( ${#PID_LINES[@]} == 0 )); then
+    return 0
+  fi
   for line in "${PID_LINES[@]}"; do
     IFS=$'\t' read -r pid name log_file <<< "${line}"
     [[ "${pid}" =~ ^[0-9]+$ ]] || continue

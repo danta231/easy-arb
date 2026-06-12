@@ -56,11 +56,14 @@ target/debug/arb-runtime health-config templates/personal_guarded_live.preflight
 
 `deploy/env/easy-arb-live.env` 只允许保存运行参数、端口、阈值、杠杆、扫描范围、输出路径等非密钥配置。API key、secret、私钥、token、签名材料和 webhook secret 必须继续放在项目外的密钥文件或进程环境中，例如服务器上的 `/etc/easy-arb/easy-arb-secrets.env`。
 
-本地或服务器密钥文件权限建议限制为运行用户可读写：
+本地或服务器密钥文件权限必须限制为 live 运行用户可读，且不能给 Easy Tool 读取权限。下面示例使用 `easyarb` 作为 live 运行用户；如果当前服务器实际用 `deploy` 用户直接运行，把 `easyarb` 替换为 `deploy`：
 
 ```bash
+sudo chown root:easyarb /etc/easy-arb
+sudo chmod 750 /etc/easy-arb
 sudo touch /etc/easy-arb/easy-arb-secrets.env
-sudo chmod 600 /etc/easy-arb/easy-arb-secrets.env
+sudo chown root:easyarb /etc/easy-arb/easy-arb-secrets.env
+sudo chmod 640 /etc/easy-arb/easy-arb-secrets.env
 ```
 
 密钥文件里只放凭证或必须按机器隔离的本地覆盖项。带 `<...>` 的值必须由本机真实配置替换，不能原样启动；不要把实际密钥或签名命令正文写入本手册、提交记录、日志或聊天内容。
