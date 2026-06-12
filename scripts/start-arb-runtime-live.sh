@@ -3,7 +3,8 @@ set -euo pipefail
 
 # 中文说明：一键启动正式实盘链路。
 # 该脚本会先启动实盘下单前置所需的公开 WSS bookTicker monitor，再启动
-# arb-runtime live。脚本不会打印密钥；如需加载凭证，可传 --env-file .env.local。
+# arb-runtime live。脚本会默认加载仓库内非密钥基础配置；脚本不会打印密钥。
+# 如需加载凭证，可传 --env-file 指向密钥 env，或在调用前由 shell 注入密钥环境变量。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -25,9 +26,8 @@ usage() {
 常用环境变量:
   ARB_RUNTIME_LIVE_ROOT=target/arb-runtime/live # 实盘主运行目录，保存 resident 状态、机会和报告。
   ARB_RUNTIME_LIVE_PREREQ_ROOT=target/arb-runtime/live-prereq # WSS 前置 monitor 的日志和 pid 状态目录。
-  ARB_RUNTIME_LIVE_ENV_FILE=.env.local # 可选 env 文件路径；等价于命令行 --env-file。
-  EASY_ARB_MANAGED_CONFIG_ENABLED=0 # Easy Tool 线上配置开关；0 表示只使用本地环境变量，1 表示再加载 managed 配置文件覆盖。
-  EASY_ARB_MANAGED_CONFIG_FILE=/etc/easy-arb/easy-arb-live.managed.env # Easy Tool 线上配置覆盖文件，只放非密钥运行参数。
+  ARB_RUNTIME_LIVE_BASE_ENV_FILE=deploy/env/easy-arb-live.env # 仓库内非密钥基础配置；默认自动加载。
+  ARB_RUNTIME_LIVE_ENV_FILE=.env.local # 可选额外 env 文件路径；等价于命令行 --env-file，通常只放密钥或机器本地覆盖。
   ARB_RUNTIME_LIVE_DETACH=0 # 是否后台运行 arb-runtime live；1 表示 detach。
   ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED=1 # 是否把启动脚本自身输出写入 live-prereq/logs/arb-runtime-live-precheck.log。
   ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120 # 等待 WSS monitor 就绪的最长秒数。
@@ -302,6 +302,8 @@ tail_log_on_error() {
   [[ -f "${log_file}" ]] && tail -n 40 "${log_file}" >&2 || true
 }
 
+DEFAULT_BASE_ENV_FILE="${REPO_ROOT}/deploy/env/easy-arb-live.env"
+BASE_ENV_FILE="${ARB_RUNTIME_LIVE_BASE_ENV_FILE:-${DEFAULT_BASE_ENV_FILE}}"
 DETACH="${ARB_RUNTIME_LIVE_DETACH:-0}"
 ENV_FILE="${ARB_RUNTIME_LIVE_ENV_FILE:-}"
 BUILD="${ARB_RUNTIME_LIVE_BUILD:-1}"
@@ -338,22 +340,22 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -n "${ENV_FILE}" ]]; then
-  [[ -r "${ENV_FILE}" ]] || die "env file is not readable: ${ENV_FILE}"
+source_env_file() {
+  local env_file="$1"
+  local label="$2"
+  [[ -r "${env_file}" ]] || die "${label} env file is not readable: ${env_file}"
   set -a
   # shellcheck disable=SC1090
-  source "${ENV_FILE}"
+  source "${env_file}"
   set +a
+}
+
+if [[ -n "${BASE_ENV_FILE}" ]]; then
+  source_env_file "${BASE_ENV_FILE}" "base"
 fi
 
-if is_truthy_env "${EASY_ARB_MANAGED_CONFIG_ENABLED:-0}"; then
-  MANAGED_CONFIG_FILE="${EASY_ARB_MANAGED_CONFIG_FILE:-}"
-  [[ -n "${MANAGED_CONFIG_FILE}" ]] || die "EASY_ARB_MANAGED_CONFIG_ENABLED=1 requires EASY_ARB_MANAGED_CONFIG_FILE"
-  [[ -r "${MANAGED_CONFIG_FILE}" ]] || die "managed config file is not readable: ${MANAGED_CONFIG_FILE}"
-  set -a
-  # shellcheck disable=SC1090
-  source "${MANAGED_CONFIG_FILE}"
-  set +a
+if [[ -n "${ENV_FILE}" ]]; then
+  source_env_file "${ENV_FILE}" "extra"
 fi
 
 if [[ "${DETACH_FROM_CLI}" != "1" ]]; then

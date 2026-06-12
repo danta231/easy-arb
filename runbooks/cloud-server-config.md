@@ -73,44 +73,38 @@ cargo build --release -p arb-runtime --features live-exec
 cargo build --release -p arb-wallet-signer
 ```
 
-安装环境模板和服务：
+安装仓库内非密钥配置、密钥文件和服务：
 
 ```bash
-sudo cp deploy/env/easy-arb-live.env.example /etc/easy-arb/easy-arb-live.env
+test -f deploy/env/easy-arb-live.env
 sudo install -m 0644 deploy/systemd/easy-arb-runtime-live.service /etc/systemd/system/easy-arb-runtime-live.service
 sudo chown root:root /etc/systemd/system/easy-arb-runtime-live.service
-sudo chmod 600 /etc/easy-arb/easy-arb-live.env
-sudo touch /etc/easy-arb/easy-arb-live.managed.env
-sudo chmod 600 /etc/easy-arb/easy-arb-live.managed.env
 sudo touch /etc/easy-arb/easy-arb-secrets.env
 sudo chmod 600 /etc/easy-arb/easy-arb-secrets.env
 sudo systemctl daemon-reload
 ```
 
-`systemd` 会直接读取 `/etc/easy-arb/easy-arb-live.env` 和 `/etc/easy-arb/easy-arb-secrets.env`，服务启动命令不再额外 `source`（加载）这些文件，因此可以保持 root-only（仅 root 可读）权限。
+`scripts/start-arb-runtime-live.sh` 会默认读取仓库内 `deploy/env/easy-arb-live.env`。密钥仍由 `/etc/easy-arb/easy-arb-secrets.env` 或调用前的 shell 环境提供；不要把密钥写入仓库配置。
 
-如果启用 `Easy Tool` 页面保存 easy-arb 配置，`easytool` 运行用户必须能进入 `/etc/easy-arb`，并且只能读写两个非密钥文件：`easy-arb-live.env`（本地 env 与线上配置开关）和 `easy-arb-live.managed.env`（线上配置覆盖项）。不要给 `easytool` 读取或写入 `easy-arb-secrets.env` 的权限：
+如果启用 `Easy Tool` 页面保存 easy-arb 配置，`easytool` 运行用户只能读写仓库内非密钥配置文件。不要给 `easytool` 读取或写入 `easy-arb-secrets.env` 的权限：
 
 ```bash
-sudo chgrp easytool /etc/easy-arb
-sudo chmod 750 /etc/easy-arb
-sudo chown root:easytool /etc/easy-arb/easy-arb-live.env /etc/easy-arb/easy-arb-live.managed.env
-sudo chmod 660 /etc/easy-arb/easy-arb-live.env /etc/easy-arb/easy-arb-live.managed.env
+sudo chgrp easytool /opt/easy-arb/deploy/env /opt/easy-arb/deploy/env/easy-arb-live.env
+sudo chmod 750 /opt/easy-arb/deploy/env
+sudo chmod 660 /opt/easy-arb/deploy/env/easy-arb-live.env
 sudo chown root:root /etc/easy-arb/easy-arb-secrets.env
 sudo chmod 600 /etc/easy-arb/easy-arb-secrets.env
 sudo cp /opt/easy-tool/current/deploy/systemd/easy-tool-runtime.service /etc/systemd/system/easy-tool-runtime.service
 sudo systemctl daemon-reload
 sudo systemctl restart easy-tool-runtime
-systemctl cat easy-tool-runtime | grep 'ReadWritePaths=.*easy-arb-live.env.*easy-arb-live.managed.env'
-sudo -u easytool test -r /etc/easy-arb/easy-arb-live.env
-sudo -u easytool test -w /etc/easy-arb/easy-arb-live.env
-sudo -u easytool test -r /etc/easy-arb/easy-arb-live.managed.env
-sudo -u easytool test -w /etc/easy-arb/easy-arb-live.managed.env
+systemctl cat easy-tool-runtime | grep 'ReadWritePaths=.*deploy/env/easy-arb-live.env'
+sudo -u easytool test -r /opt/easy-arb/deploy/env/easy-arb-live.env
+sudo -u easytool test -w /opt/easy-arb/deploy/env/easy-arb-live.env
 sudo -u easytool test ! -r /etc/easy-arb/easy-arb-secrets.env
 sudo -u easytool test ! -w /etc/easy-arb/easy-arb-secrets.env
 ```
 
-`/etc/easy-arb/easy-arb-live.env` 默认使用 `ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=target`，用于降低同机部署压力。确认 dry-run（模拟运行）和小额 live（实盘）稳定后，再考虑改成 `all`。
+`deploy/env/easy-arb-live.env` 默认使用 `ARB_RUNTIME_LIVE_CEX_WSS_SCOPE=auto`。确认 dry-run（模拟运行）和小额 live（实盘）稳定后，再考虑按需要调整扫描范围。
 
 启动和查看：
 
@@ -139,13 +133,12 @@ EASY_TOOL_HEALTH_BASE_URL=http://127.0.0.1:8787
 RUNTIME_ALLOWED_ORIGIN=https://easy-tool.example.com
 HISTORY_DATABASE_URL=postgres://easy_tool:<password>@127.0.0.1:5432/easy_tool
 HISTORY_PG_POOL_MAX=4
-EASY_ARB_LOCAL_ENV_FILE=/etc/easy-arb/easy-arb-live.env
-EASY_ARB_CONFIG_ENV_FILE=/etc/easy-arb/easy-arb-live.managed.env
+EASY_ARB_CONFIG_FILE=/opt/easy-arb/deploy/env/easy-arb-live.env
 ```
 
 这里的 `<password>` 只表示本机要替换的数据库密码，不要把真实值写入仓库。
 
-`Easy Tool` 的 easy-arb 配置页只按白名单写入非密钥运行参数。`EASY_ARB_LOCAL_ENV_FILE` 指向本地 env 文件，页面只在其中更新 `EASY_ARB_MANAGED_CONFIG_ENABLED`（线上配置开关）和 `EASY_ARB_MANAGED_CONFIG_FILE`（线上配置覆盖文件路径）；`EASY_ARB_CONFIG_ENV_FILE` 指向线上配置覆盖文件，保存各项页面参数。`easy-arb-runtime-live` 重启时，开关开启才加载线上配置覆盖文件，关闭时只使用本地环境变量。凭证仍然放在 `/etc/easy-arb/easy-arb-secrets.env`，不要给页面写入权限。若生产机启用该页面保存功能，需要让 `easy-tool-runtime` 的 systemd（系统服务管理器）沙箱允许写入本地 env 文件和线上配置覆盖文件，并只给 `easytool` 用户或受控用户组写这两个文件的权限；保存后仍需重启 `easy-arb-runtime-live` 才会生效。
+`Easy Tool` 的 easy-arb 配置页只按白名单写入非密钥运行参数。`EASY_ARB_CONFIG_FILE` 指向仓库内唯一非密钥配置文件；页面保存和人工线下编辑都更新这同一个文件。凭证仍然放在 `/etc/easy-arb/easy-arb-secrets.env` 或启动 shell 环境里，不要给页面读取权限。保存后仍需重启 easy-arb live 链路才会生效。
 
 `ARB_RUNTIME_LIVE_AUTO_ORDER_ENABLED` 是自动实盘开单门禁，默认必须为 `0`。关闭时 `arb-runtime live` 仍可启动行情扫描、机会记录、风控预检和风险监测，但不会向常驻 runner 传递真实开仓执行开关；只有设置为 `1` 并重启 `easy-arb-runtime-live` 后，才允许自动提交实盘开仓订单。
 

@@ -50,62 +50,34 @@ target/debug/arb-runtime health-config templates/personal_guarded_live.preflight
 
 `health-config` 必须明确看到 `GuardedLive` 配置形态，并确认 `kill_switch.global=false`、`kill_switch.execution=false` 是本次实盘的主动选择。如果任何 kill switch 被打开，执行链路应 fail closed，不要绕过。
 
-## 本地环境文件
+## 配置与密钥
 
-建议使用项目外的本地未提交文件，例如 `~/easy-arb-live.env`。文件权限建议限制为当前用户可读写：
+长时间实盘的非密钥基础配置放在仓库内 `deploy/env/easy-arb-live.env`，启动脚本会自动先读取这个文件。线下修改和 Easy Tool 页面保存都应更新同一个仓库配置文件，不再维护两套外部配置。
+
+`deploy/env/easy-arb-live.env` 只允许保存运行参数、端口、阈值、杠杆、扫描范围、输出路径等非密钥配置。API key、secret、私钥、token、签名材料和 webhook secret 必须继续放在项目外的密钥文件或进程环境中，例如服务器上的 `/etc/easy-arb/easy-arb-secrets.env`。
+
+本地或服务器密钥文件权限建议限制为运行用户可读写：
 
 ```bash
-chmod 600 ~/easy-arb-live.env
+sudo touch /etc/easy-arb/easy-arb-secrets.env
+sudo chmod 600 /etc/easy-arb/easy-arb-secrets.env
 ```
 
-下面是变量清单模板。带 `<...>` 的值必须由本机真实配置替换，不能原样启动；不要把实际密钥或签名命令正文写入本手册、提交记录、日志或聊天内容。
+密钥文件里只放凭证或必须按机器隔离的本地覆盖项。带 `<...>` 的值必须由本机真实配置替换，不能原样启动；不要把实际密钥或签名命令正文写入本手册、提交记录、日志或聊天内容。
 
 ```bash
-BASIS_OBSERVER_CONFIG=templates/personal_guarded_live.preflight.yaml # 风控和执行配置文件路径，长时间实盘默认使用个人 guarded live 配置。
-BASIS_OBSERVER_STRATEGIES=spot-perp-basis,cross-exchange-funding-arb # 启用的策略列表，默认同时运行现货-永续 basis 和跨交易所资金费率套利。
-BASIS_OBSERVER_MIN_NET_BPS=5 # 最小净收益阈值，单位 bps；低于该阈值的机会不会进入执行。
-BASIS_OBSERVER_MIN_ABS_FUNDING_RATE=0 # 最小绝对资金费率过滤阈值，0 表示不按资金费率绝对值预过滤。
-BASIS_OBSERVER_NOTIONAL_USD=100.00 # 单次候选机会用于计算和下单的目标名义本金，单位美元。
-BASIS_OBSERVER_AUTO_PRICE_GUARD_BPS=2 # 自动价格保护缓冲，单位 bps，用于限制可接受成交价偏离。
-
-ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=180 # 等待全部 WSS monitor 进入 streaming 且收到真实更新的最长秒数。
-
-BASIS_OBSERVER_BASIS_RESIDENT_INTERVAL_SECS=60 # spot-perp-basis 常驻 runner 每轮扫描间隔秒数。
-BASIS_OBSERVER_BASIS_RESIDENT_MAX_LIVE_ENTRIES=1 # spot-perp-basis 单轮最多新开实盘 entry 数。
-BASIS_OBSERVER_BASIS_RESIDENT_MAX_CONCURRENT_POSITIONS=1 # spot-perp-basis 最多同时持有的未平仓 position 数。
-BASIS_OBSERVER_BASIS_RESIDENT_MAX_TOTAL_NOTIONAL_USDT=100.00 # spot-perp-basis 总名义本金上限，单位 USDT。
-
-BASIS_OBSERVER_PERP_TARGET_LEVERAGE=1 # 所有永续交易所默认目标杠杆；非 reduce-only 实盘开仓前会先设置该杠杆。
-BASIS_OBSERVER_BINANCE_USDM_LEVERAGE=1 # 可选覆盖 Binance USD-M 永续目标杠杆。
-BASIS_OBSERVER_BYBIT_LINEAR_LEVERAGE=1 # 可选覆盖 Bybit linear 永续目标杠杆。
-BASIS_OBSERVER_OKX_SWAP_LEVERAGE=1 # 可选覆盖 OKX swap 永续目标杠杆。
-BASIS_OBSERVER_BITGET_USDT_FUTURES_LEVERAGE=1 # 可选覆盖 Bitget USDT-FUTURES 目标杠杆。
-BASIS_OBSERVER_ASTER_PERP_LEVERAGE=1 # 可选覆盖 Aster USDT perp 目标杠杆。
-BASIS_OBSERVER_HYPERLIQUID_PERP_LEVERAGE=1 # 可选覆盖 Hyperliquid perp 目标杠杆。
-
-BASIS_OBSERVER_FUNDING_ARB_MODE=resident # cross-exchange-funding-arb 运行模式；resident 表示常驻扫描、入场和退出监督。
-BASIS_OBSERVER_FUNDING_ARB_RESIDENT_INTERVAL_SECS=60 # cross-exchange-funding-arb 常驻 runner 每轮扫描间隔秒数。
-BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_LIVE_ENTRIES=1 # cross-exchange-funding-arb 单轮最多新开实盘 entry 数。
-BASIS_OBSERVER_FUNDING_ARB_RESIDENT_MAX_CYCLES= # cross-exchange-funding-arb 最大循环次数；留空表示长期运行。
-
-BASIS_OBSERVER_FUNDING_SETTLEMENT_RAW_SNAPSHOT=target/arb-runtime/live/private-readonly/funding_settlement_raw_snapshot.json # 资金费率结算原始只读快照输出路径，当前推荐启用。
-BASIS_OBSERVER_FUNDING_SETTLEMENT_LEDGER= # 稳定结算账本输入路径；接 raw snapshot 时必须留空，不能同时启用。
-
-ARB_RUNTIME_PORTFOLIO_ACCOUNT_SNAPSHOT= # portfolio JSON API 可选账户快照覆盖输入；留空时从 resident root 自动发现私有只读账户快照。
-ARB_RUNTIME_PORTFOLIO_POSITION_SNAPSHOT= # portfolio JSON API 可选仓位快照覆盖输入；留空时从 resident root 自动汇总常驻仓位。
-
 ASTER_USER=<aster-user-address> # Aster 账户/user 地址，用于账户归属、查询和订单归属。
 ASTER_SIGNER=<aster-signer-address> # Aster 实际签名/API 地址，必须与 signer 私钥匹配。
-ASTER_SIGNER_PRIVATE=<aster-signer-private-key> # Aster signer/API 地址对应的私钥，只放在本机 env 文件，不要提交或写入日志。
+ASTER_SIGNER_PRIVATE=<aster-signer-private-key> # Aster signer/API 地址对应的私钥，只放在本机密钥文件或进程环境，不要提交或写入日志。
 
 HYPERLIQUID_USER=<hyperliquid-user-address> # Hyperliquid 账户/user 地址，用于账户归属、查询和订单归属。
 HYPERLIQUID_SIGNER=<hyperliquid-signer-address> # Hyperliquid 实际签名/API/agent 地址，必须与 signer 私钥匹配。
-HYPERLIQUID_SIGNER_PRIVATE=<hyperliquid-signer-private-key> # Hyperliquid signer/API/agent 地址对应的私钥，只放在本机 env 文件，不要提交或写入日志。
+HYPERLIQUID_SIGNER_PRIVATE=<hyperliquid-signer-private-key> # Hyperliquid signer/API/agent 地址对应的私钥，只放在本机密钥文件或进程环境，不要提交或写入日志。
 ```
 
 如果某个交易所的 user 和 signer 确认是同一个地址，可以改用便捷别名：`ASTER_ADDRESS` + `ASTER_PRIVATE_KEY`，或 `HYPERLIQUID_ADDRESS` + `HYPERLIQUID_PRIVATE_KEY`。如果两者不同，必须使用上面的 user/signer 分离配置，不要用单地址别名。
 
-高级覆盖项只在确实需要时再加：`BASIS_OBSERVER_ASTER_USER`、`BASIS_OBSERVER_ASTER_SIGNER`、`ASTER_SIGNER_ADDRESS`、`ASTER_API_ADDRESS`、`ARB_WALLET_SIGNER_PATH`、`BASIS_OBSERVER_HYPERLIQUID_SOURCE`、`HYPERLIQUID_SIGNER_ADDRESS`、`HYPERLIQUID_API_ADDRESS`、`BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS`、`BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS`、`BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS`。其中 `BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS` 只是自动解析失败或你要强制指定 asset id 时的覆盖项，不再是默认必填项。
+高级密钥覆盖项只在确实需要时再加：`BASIS_OBSERVER_ASTER_USER`、`BASIS_OBSERVER_ASTER_SIGNER`、`ASTER_SIGNER_ADDRESS`、`ASTER_API_ADDRESS`、`BASIS_OBSERVER_HYPERLIQUID_SOURCE`、`HYPERLIQUID_SIGNER_ADDRESS`、`HYPERLIQUID_API_ADDRESS`、`BASIS_OBSERVER_HYPERLIQUID_VAULT_ADDRESS`、`BASIS_OBSERVER_HYPERLIQUID_EXPIRES_AFTER_MS`、`BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS`。其中 `BASIS_OBSERVER_HYPERLIQUID_ASSET_IDS` 只是自动解析失败或你要强制指定 asset id 时的覆盖项，不再是默认必填项。
 
 杠杆设置是开仓前置门禁：Binance USD-M、Bybit linear、OKX swap、Bitget USDT-FUTURES、Aster perp、Hyperliquid perp 都会在非 reduce-only 下单前设置 `BASIS_OBSERVER_PERP_TARGET_LEVERAGE` 或对应交易所覆盖值。默认值是 1；如果交易所返回拒绝、网络状态未知或配置值超出 1 到 125，开仓会 fail closed。reduce-only 平仓不会先改杠杆，避免事故退出被杠杆设置拦住。
 
@@ -118,7 +90,7 @@ HYPERLIQUID_SIGNER_PRIVATE=<hyperliquid-signer-private-key> # Hyperliquid signer
 首次进入长时间实盘建议使用 detach 模式，让进程独立于当前终端：
 
 ```bash
-scripts/start-arb-runtime-live.sh --detach --env-file ~/easy-arb-live.env
+scripts/start-arb-runtime-live.sh --detach --env-file /etc/easy-arb/easy-arb-secrets.env
 ```
 
 启动脚本会先构建 `arb-runtime` 的 `live-exec` 版本和本地 `arb-wallet-signer`，然后启动 10 个 WSS monitor：
