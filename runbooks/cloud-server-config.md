@@ -100,7 +100,8 @@ sudo chmod 750 /etc/easy-arb
 sudo chmod 640 /etc/easy-arb/easy-arb-secrets.env
 sudo cp /opt/easy-tool/current/deploy/systemd/easy-tool-runtime.service /etc/systemd/system/easy-tool-runtime.service
 sudo systemctl daemon-reload
-sudo systemctl restart easy-tool-runtime
+# 按线上实际部署方式重启 Easy Tool runtime，使权限、systemd 沙箱或进程环境重新加载。
+# 如果线上服务名不是 easy-tool-runtime，不要使用这个模板名，改用实际 unit / supervisor / 容器命令。
 systemctl cat easy-tool-runtime | grep 'ReadWritePaths=.*deploy/env/easy-arb-live.env'
 sudo -u easytool test -r /opt/easy-arb/deploy/env/easy-arb-live.env
 sudo -u easytool test -w /opt/easy-arb/deploy/env/easy-arb-live.env
