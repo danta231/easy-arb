@@ -53297,6 +53297,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["BTCUSDT", "1INCHUSDT", "ETHUSDT"]
         );
+        let bitget_bootstrap_raw = r#"{
+          "code": "00000",
+          "msg": "success",
+          "requestTime": 1778584221117,
+          "data": [
+            {"symbol":"BTCUSDT","bidPr":["100"],"bidSz":"1","askPr":"101","askSz":"1","ts":"1778584221117"},
+            {"symbol":"ETHUSDT","bidPr":{"price":"50"},"bidSz":"2","askPr":"51","askSz":"2","ts":"1778584221117"},
+            {"symbol":"BADUSDT","bidPr":"bad-price","bidSz":"3","askPr":"61","askSz":"3","ts":"1778584221117"},
+            {"symbol":"XRPUSDT","bidPr":"0.50","bidSz":["4"],"askPr":"0.51","askSz":[["4"]],"ts":"1778584221117"}
+          ]
+        }"#;
+        let bitget_bootstrap_rows =
+            parse_bitget_usdt_futures_ticker_rows_for_wss_bootstrap(bitget_bootstrap_raw)
+                .expect("bitget WSS bootstrap rows");
+        assert_eq!(
+            bitget_bootstrap_rows
+                .iter()
+                .map(|row| row.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTCUSDT", "BADUSDT", "XRPUSDT"]
+        );
+        let prepared_bitget_bootstrap = prepare_bitget_wss_book_ticker_rest_rows(
+            bitget_bootstrap_rows,
+            BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS,
+            BitgetPublicWssMarket::UsdtFutures,
+            true,
+        )
+        .expect("bitget WSS bootstrap should skip unusable rows in all scope");
+        assert_eq!(
+            prepared_bitget_bootstrap
+                .iter()
+                .map(|row| row.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTCUSDT", "XRPUSDT"]
+        );
         let explicit_bad_bitget_rows = vec![monitor_book_ticker_row_with_top_depth(
             "BADUSDT".to_owned(),
             String::new(),
@@ -53314,6 +53349,22 @@ mod tests {
         assert!(explicit_bad_error
             .to_string()
             .contains("Bitget WSS REST bootstrap row for `BADUSDT` has empty top-of-book field"));
+        let explicit_bad_price_error = prepare_bitget_wss_book_ticker_rest_rows(
+            vec![monitor_book_ticker_row_with_top_depth(
+                "BADUSDT".to_owned(),
+                "bad-price".to_owned(),
+                "2".to_owned(),
+                "51".to_owned(),
+                "2".to_owned(),
+            )],
+            "BADUSDT",
+            BitgetPublicWssMarket::UsdtFutures,
+            false,
+        )
+        .expect_err("single bad Bitget price should fail closed");
+        assert!(explicit_bad_price_error
+            .to_string()
+            .contains("Bitget WSS REST bootstrap row for `BADUSDT` has invalid bid price"));
         let mut broad_bitget_scope = (0..PUBLIC_WSS_BROAD_EXPLICIT_SYMBOL_SCOPE_MIN_SYMBOLS)
             .map(|index| format!("SYM{index}USDT"))
             .collect::<Vec<_>>();

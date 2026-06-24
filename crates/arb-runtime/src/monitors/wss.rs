@@ -27,14 +27,14 @@ use crate::{
     funding_display_symbol, gate_usdt_futures_tickers_url, hyperliquid_info_request_body,
     json_array_value_slices, json_object_slices, json_option_string, json_string, json_string_end,
     normalize_cex_usdt_basis_symbol, normalize_okx_usdt_basis_symbol, okx_tickers_url,
-    optional_json_value_string, parse_bitget_spot_ticker_rows,
-    parse_bitget_usdt_futures_ticker_rows, parse_book_ticker_rows, parse_bybit_linear_ticker_rows,
-    parse_bybit_spot_ticker_rows, parse_flat_json_object, parse_gate_futures_ticker_rows,
-    parse_hyperliquid_perp_context_rows, parse_json_object_value_slices, parse_okx_ticker_rows,
-    required_first_json_value_string, required_json_string, required_json_value_string,
-    runtime_timestamp_millis, static_dashboard_gone_json, write_http_json, GateFuturesTickerRow,
-    MonitorBookTickerRow, MonitorJsonScalar, OkxTickerRow, RuntimeError, RuntimeResult,
-    BASIS_SYMBOL, BITGET_BASIS_SYMBOL, BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID,
+    optional_json_value_string, parse_bitget_spot_ticker_rows, parse_book_ticker_rows,
+    parse_bybit_linear_ticker_rows, parse_bybit_spot_ticker_rows, parse_flat_json_object,
+    parse_gate_futures_ticker_rows, parse_hyperliquid_perp_context_rows,
+    parse_json_object_value_slices, parse_okx_ticker_rows, required_first_json_value_string,
+    required_json_string, required_json_value_string, runtime_timestamp_millis,
+    static_dashboard_gone_json, write_http_json, GateFuturesTickerRow, MonitorBookTickerRow,
+    MonitorJsonScalar, OkxTickerRow, RuntimeError, RuntimeResult, BASIS_SYMBOL,
+    BITGET_BASIS_SYMBOL, BYBIT_BASIS_PERP_VENUE_ID, BYBIT_BASIS_SPOT_VENUE_ID,
     HYPERLIQUID_INFO_URL, MULTI_VENUE_BITGET_SPOT_WSS_BIND_ADDR,
     MULTI_VENUE_OKX_SPOT_WSS_BIND_ADDR, OKX_BASIS_SYMBOL,
 };
@@ -2477,18 +2477,7 @@ pub(crate) fn bootstrap_bitget_wss_book_ticker(
             .into_iter()
             .collect::<Vec<_>>(),
         BitgetPublicWssMarket::UsdtFutures => {
-            parse_bitget_usdt_futures_ticker_rows(&raw_rest_snapshot)?
-                .into_iter()
-                .map(|row| MonitorBookTickerRow {
-                    symbol: row.symbol,
-                    bid_price: row.bid_price,
-                    bid_qty: row.bid_qty,
-                    ask_price: row.ask_price,
-                    ask_qty: row.ask_qty,
-                    bid_depth: row.bid_depth,
-                    ask_depth: row.ask_depth,
-                })
-                .collect::<Vec<_>>()
+            parse_bitget_usdt_futures_ticker_rows_for_wss_bootstrap(&raw_rest_snapshot)?
         }
     };
     let rows =
@@ -2636,6 +2625,12 @@ pub(crate) fn prepare_bitget_wss_book_ticker_rest_rows(
                         ),
                     });
                 }
+                if let Err(error) = validate_bitget_wss_rest_top_of_book(&row) {
+                    if all_symbols_scope {
+                        continue;
+                    }
+                    return Err(error);
+                }
                 row.symbol = symbol;
                 prepared.push(row);
             }
@@ -2660,6 +2655,104 @@ pub(crate) fn prepare_bitget_wss_book_ticker_rest_rows(
         prepared.iter().map(|row| row.symbol.clone()).collect(),
     )?;
     Ok(prepared)
+}
+
+fn validate_bitget_wss_rest_top_of_book(row: &MonitorBookTickerRow) -> RuntimeResult<()> {
+    Price::from_str(&row.bid_price).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!(
+            "Bitget WSS REST bootstrap row for `{}` has invalid bid price `{}`: {error}",
+            row.symbol, row.bid_price
+        ),
+    })?;
+    Price::from_str(&row.ask_price).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!(
+            "Bitget WSS REST bootstrap row for `{}` has invalid ask price `{}`: {error}",
+            row.symbol, row.ask_price
+        ),
+    })?;
+    Quantity::from_str(&row.bid_qty).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!(
+            "Bitget WSS REST bootstrap row for `{}` has invalid bid size `{}`: {error}",
+            row.symbol, row.bid_qty
+        ),
+    })?;
+    Quantity::from_str(&row.ask_qty).map_err(|error| RuntimeError::LiveMarketData {
+        message: format!(
+            "Bitget WSS REST bootstrap row for `{}` has invalid ask size `{}`: {error}",
+            row.symbol, row.ask_qty
+        ),
+    })?;
+    Ok(())
+}
+
+pub(crate) fn parse_bitget_usdt_futures_ticker_rows_for_wss_bootstrap(
+    input: &str,
+) -> RuntimeResult<Vec<MonitorBookTickerRow>> {
+    const SOURCE: &str = "bitget usdt-futures WSS REST bootstrap tickers";
+    let top_fields = parse_json_object_value_slices(input)?;
+    let code = required_json_value_string(&top_fields, "code", SOURCE)?;
+    if code != "00000" {
+        let msg = optional_json_value_string(&top_fields, "msg", SOURCE)?
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Err(RuntimeError::LiveMarketData {
+            message: format!("{SOURCE} returned code={code}, msg={msg}"),
+        });
+    }
+    let data = top_fields
+        .get("data")
+        .ok_or_else(|| RuntimeError::LiveMarketData {
+            message: format!("{SOURCE} response is missing data"),
+        })?;
+    let mut rows = Vec::new();
+    for object in json_object_slices(data)? {
+        let fields = parse_json_object_value_slices(object)?;
+        let symbol = match required_json_value_string(&fields, "symbol", SOURCE) {
+            Ok(symbol) => symbol,
+            Err(_) => continue,
+        };
+        let Some(bid_price) = optional_first_bitget_wss_ticker_value_string(
+            &fields,
+            &["bidPr", "bidPx", "bidPrice"],
+            SOURCE,
+        )?
+        else {
+            continue;
+        };
+        let Some(bid_qty) = optional_first_bitget_wss_ticker_value_string(
+            &fields,
+            &["bidSz", "bidSize", "bidQty"],
+            SOURCE,
+        )?
+        else {
+            continue;
+        };
+        let Some(ask_price) = optional_first_bitget_wss_ticker_value_string(
+            &fields,
+            &["askPr", "askPx", "askPrice"],
+            SOURCE,
+        )?
+        else {
+            continue;
+        };
+        let Some(ask_qty) = optional_first_bitget_wss_ticker_value_string(
+            &fields,
+            &["askSz", "askSize", "askQty"],
+            SOURCE,
+        )?
+        else {
+            continue;
+        };
+        rows.push(MonitorBookTickerRow {
+            symbol,
+            bid_price,
+            bid_qty,
+            ask_price,
+            ask_qty,
+            bid_depth: Vec::new(),
+            ask_depth: Vec::new(),
+        });
+    }
+    Ok(rows)
 }
 
 pub(crate) fn bootstrap_aster_wss_book_ticker(
