@@ -426,9 +426,11 @@ apply_default_perp_leverage_env() {
 
 apply_default_perp_leverage_env
 
-require_command cargo
 require_command curl
 require_command jq
+if [[ "${BUILD}" == "1" ]]; then
+  require_command cargo
+fi
 
 RUN_ROOT="${ARB_RUNTIME_LIVE_ROOT:-${REPO_ROOT}/target/arb-runtime/live}"
 PREREQ_ROOT="${ARB_RUNTIME_LIVE_PREREQ_ROOT:-${REPO_ROOT}/target/arb-runtime/live-prereq}"

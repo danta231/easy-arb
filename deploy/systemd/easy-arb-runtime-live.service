@@ -2,6 +2,8 @@
 Description=easy-arb runtime live stack
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -15,8 +17,6 @@ ExecStart=/opt/easy-arb/scripts/start-arb-runtime-live.sh --no-build
 ExecStop=/opt/easy-arb/scripts/stop-arb-runtime-live.sh
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=3
 TimeoutStartSec=240
 TimeoutStopSec=45
 KillSignal=SIGTERM
