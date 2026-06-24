@@ -262,6 +262,8 @@ require_command systemctl
 [[ -f "${UNIT_SOURCE}" ]] || die "systemd unit source not found: ${UNIT_SOURCE}"
 grep -q '^ReadWritePaths=/var/lib/easy-arb /tmp$' "${UNIT_SOURCE}" \
   || die "systemd unit must include: ReadWritePaths=/var/lib/easy-arb /tmp"
+grep -q '^EnvironmentFile=-/etc/easy-arb/live.env$' "${UNIT_SOURCE}" \
+  || die "systemd unit must include: EnvironmentFile=-/etc/easy-arb/live.env"
 
 info "仓库: ${REPO_ROOT}"
 info "服务: ${SERVICE_NAME}"
@@ -283,7 +285,8 @@ fi
 run_verification
 
 info "构建 release 二进制"
-run_as_deploy_in_repo cargo build --release -p arb-runtime -p arb-wallet-signer
+run_as_deploy_in_repo cargo build --release -p arb-runtime --features live-exec
+run_as_deploy_in_repo cargo build --release -p arb-wallet-signer
 
 info "确认 release 二进制存在"
 run_as_deploy_in_repo test -x "${REPO_ROOT}/target/release/arb-runtime"
@@ -330,11 +333,11 @@ if [[ "${RESTART_SERVICE}" == "1" ]]; then
 fi
 
 if [[ "${HEALTH_CHECK}" == "1" && "${RESTART_SERVICE}" == "1" ]]; then
-  wait_for_http_ok "portfolio" "http://127.0.0.1:8805/health" || {
+  wait_for_http_ok "portfolio" "http://127.0.0.1:8805/api/portfolio/status" || {
     print_service_diagnostics
     exit 1
   }
-  wait_for_http_ok "funding-arb" "http://127.0.0.1:8804/health" || {
+  wait_for_http_ok "funding-arb" "http://127.0.0.1:8804/api/funding-arb/status" || {
     print_service_diagnostics
     exit 1
   }

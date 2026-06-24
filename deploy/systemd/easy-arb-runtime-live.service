@@ -10,6 +10,7 @@ Type=simple
 User=easyarb
 Group=easyarb
 WorkingDirectory=/opt/easy-arb
+EnvironmentFile=-/etc/easy-arb/live.env
 EnvironmentFile=-/etc/easy-arb/easy-arb-secrets.env
 ExecStartPre=/usr/bin/test -x /opt/easy-arb/target/release/arb-runtime
 ExecStartPre=/usr/bin/test -x /opt/easy-arb/target/release/arb-wallet-signer

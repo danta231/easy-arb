@@ -2992,7 +2992,6 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-require_command cargo
 require_command curl
 require_command jq
 
@@ -3064,6 +3063,7 @@ fi
 DRY_RUN_DIR="${EXECUTION_DIR}"
 PID_FILE="${STATE_DIR}/basis-observer.pids"
 RUNTIME_BIN="${BASIS_OBSERVER_RUNTIME_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
+OBSERVER_BUILD="${BASIS_OBSERVER_BUILD:-1}"
 CONFIG_PATH="${BASIS_OBSERVER_CONFIG:-templates/personal_guarded_live.preflight.yaml}"
 INTERVAL_SECS="${BASIS_OBSERVER_INTERVAL_SECS:-5}"
 MIN_ABS_FUNDING_RATE="${BASIS_OBSERVER_MIN_ABS_FUNDING_RATE:-0}"
@@ -3181,6 +3181,13 @@ case "${RUST_RECORDER_ENABLED}" in
   0|1) ;;
   *) die "BASIS_OBSERVER_RUST_RECORDER_ENABLED must be 0 or 1" ;;
 esac
+case "${OBSERVER_BUILD}" in
+  0|1) ;;
+  *) die "BASIS_OBSERVER_BUILD must be 0 or 1" ;;
+esac
+if [[ "${OBSERVER_BUILD}" == "1" ]]; then
+  require_command cargo
+fi
 [[ "${TARGET_WSS_BASE_PORT}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_BASE_PORT must be numeric"
 [[ "${TARGET_WSS_READY_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_READY_TIMEOUT_SECS must be numeric"
 [[ "${TARGET_WSS_RECONNECT_DELAY_SECS}" =~ ^[0-9]+$ ]] || die "BASIS_OBSERVER_TARGET_WSS_RECONNECT_DELAY_SECS must be numeric"
@@ -3241,10 +3248,12 @@ cleanup_safe_stale_resident_locks
 : > "${PID_FILE}"
 
 cd "${REPO_ROOT}"
-echo "building arb-runtime with live-exec feature..."
-cargo build -p arb-runtime --features live-exec --manifest-path "${REPO_ROOT}/Cargo.toml"
-echo "building arb-wallet-signer..."
-cargo build -p arb-wallet-signer --manifest-path "${REPO_ROOT}/Cargo.toml"
+if [[ "${OBSERVER_BUILD}" == "1" ]]; then
+  echo "building arb-runtime with live-exec feature..."
+  cargo build -p arb-runtime --features live-exec --manifest-path "${REPO_ROOT}/Cargo.toml"
+  echo "building arb-wallet-signer..."
+  cargo build -p arb-wallet-signer --manifest-path "${REPO_ROOT}/Cargo.toml"
+fi
 
 if strategy_enabled "cross-exchange-funding-arb" && [[ "${FUNDING_ARB_MODE}" == "resident" ]]; then
   if ! check_funding_arb_resident_unknown_startup_risk; then
