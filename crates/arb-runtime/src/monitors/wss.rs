@@ -46,6 +46,8 @@ pub(crate) const LIGHTER_PUBLIC_WSS_URL: &str = "wss://mainnet.zklighter.elliot.
 pub(crate) const PUBLIC_WSS_MONITOR_MAX_AGE_MS: u64 = 20_000;
 pub(crate) const PUBLIC_WSS_RECONNECT_BACKOFF_MAX_SECS: u64 = 60;
 pub(crate) const PUBLIC_WSS_FAILURE_LOG_REPEAT_INTERVAL: u32 = 500;
+pub(crate) const PUBLIC_WSS_DEGRADED_STALE_ROW_RATIO_BPS: u64 = 2_500;
+pub(crate) const PUBLIC_WSS_DEGRADED_RECONNECT_COUNT: u64 = 100;
 pub(crate) const BINANCE_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8801";
 pub(crate) const BINANCE_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
 pub(crate) const BINANCE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
@@ -55,14 +57,14 @@ pub(crate) const BYBIT_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const OKX_PUBLIC_WSS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 pub(crate) const BITGET_PUBLIC_WSS_URL: &str = "wss://ws.bitget.com/v2/ws/public";
 pub(crate) const OKX_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
-pub(crate) const BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 2;
+pub(crate) const BITGET_WSS_BOOK_TICKER_DEFAULT_RECONNECT_DELAY_SECS: u64 = 10;
 pub(crate) const OKX_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const BITGET_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const BITGET_WSS_TICKER_DEFAULT_INST_ID: &str = "default";
 pub(crate) const OKX_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES: usize = 4096;
 pub(crate) const OKX_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD: usize = 50;
 pub(crate) const BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES: usize = 4096;
-pub(crate) const BITGET_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD: usize = 50;
+pub(crate) const BITGET_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD: usize = 25;
 pub(crate) const ASTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8794";
 pub(crate) const HYPERLIQUID_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8795";
 pub(crate) const LIGHTER_WSS_BOOK_TICKER_DEFAULT_BIND_ADDR: &str = "127.0.0.1:8824";
@@ -6423,8 +6425,13 @@ impl PublicTopOfBookMonitorSnapshot {
         if self.fail_closed {
             return "fail_closed".to_owned();
         }
-        if now.is_some_and(|now| self.has_current_usable_wss_quote(now)) {
-            return "streaming".to_owned();
+        if let Some(current_time) = now {
+            if self.has_current_usable_wss_quote(current_time) {
+                if self.degraded_reason(current_time).is_some() {
+                    return "degraded".to_owned();
+                }
+                return "streaming".to_owned();
+            }
         }
         if self.status == "reconnecting"
             && self.rows.is_empty()
@@ -6445,6 +6452,57 @@ impl PublicTopOfBookMonitorSnapshot {
         self.status.clone()
     }
 
+    fn freshness_counts(&self, now: Option<UtcTimestamp>) -> (usize, usize, usize) {
+        let Some(now) = now else {
+            return (0, 0, 0);
+        };
+        let mut current_usable = 0_usize;
+        let mut stale = 0_usize;
+        let mut unusable = 0_usize;
+        for quote in &self.rows {
+            if public_wss_quote_is_current_usable(quote, now) {
+                current_usable += 1;
+            } else if public_wss_source_event_id_is_book_ticker(quote.source_event_id.as_deref()) {
+                stale += 1;
+            } else {
+                unusable += 1;
+            }
+        }
+        (current_usable, stale, unusable)
+    }
+
+    fn degraded_reason(&self, now: UtcTimestamp) -> Option<String> {
+        if self.fail_closed || self.total_rows == 0 {
+            return None;
+        }
+        if self.status != "streaming" && self.status != "reconnecting" {
+            return None;
+        }
+        let (current_usable_count, stale_row_count, unusable_row_count) =
+            self.freshness_counts(Some(now));
+        if current_usable_count == 0 {
+            return None;
+        }
+        let staleish_row_count = stale_row_count.saturating_add(unusable_row_count);
+        let staleish_ratio_bps = public_wss_row_ratio_bps(staleish_row_count, self.total_rows);
+        if staleish_ratio_bps >= PUBLIC_WSS_DEGRADED_STALE_ROW_RATIO_BPS {
+            return Some(format!(
+                "stale_or_unusable_row_ratio_bps={staleish_ratio_bps}; current_usable_row_count={current_usable_count}; stale_row_count={stale_row_count}; unusable_row_count={unusable_row_count}; total_rows={}",
+                self.total_rows
+            ));
+        }
+        if self.disconnect_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT
+            || self.rest_rebuild_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT
+            || self.fail_closed_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT
+        {
+            return Some(format!(
+                "high_reconnect_pressure; disconnect_count={}; rest_rebuild_count={}; fail_closed_count={}",
+                self.disconnect_count, self.rest_rebuild_count, self.fail_closed_count
+            ));
+        }
+        None
+    }
+
     fn has_current_usable_wss_quote(&self, now: UtcTimestamp) -> bool {
         self.latest_quote
             .as_ref()
@@ -6455,7 +6513,11 @@ impl PublicTopOfBookMonitorSnapshot {
                 .any(|quote| public_wss_quote_is_current_usable(quote, now))
     }
 
-    fn effective_last_error(&self, availability_status: &str) -> Option<String> {
+    fn effective_last_error(
+        &self,
+        availability_status: &str,
+        now: Option<UtcTimestamp>,
+    ) -> Option<String> {
         if availability_status == "stale" {
             Some(self.last_error.clone().unwrap_or_else(|| {
                 format!(
@@ -6463,6 +6525,9 @@ impl PublicTopOfBookMonitorSnapshot {
                     self.updated_at
                 )
             }))
+        } else if availability_status == "degraded" {
+            now.and_then(|now| self.degraded_reason(now))
+                .or_else(|| self.last_error.clone())
         } else {
             self.last_error.clone()
         }
@@ -6470,7 +6535,8 @@ impl PublicTopOfBookMonitorSnapshot {
 
     pub(crate) fn health_http_status(&self) -> u16 {
         let status = self.availability_status(current_utc_timestamp().ok());
-        if self.fail_closed || status == "stale" || status == "reconnecting" {
+        if self.fail_closed || status == "stale" || status == "reconnecting" || status == "degraded"
+        {
             503
         } else {
             200
@@ -6480,15 +6546,22 @@ impl PublicTopOfBookMonitorSnapshot {
     pub(crate) fn health_json(&self) -> String {
         let now = current_utc_timestamp().ok();
         let status = self.availability_status(now);
+        let (current_usable_row_count, stale_row_count, unusable_row_count) =
+            self.freshness_counts(now);
+        let degraded_reason = now.and_then(|now| self.degraded_reason(now));
         format!(
-            "{{\"disconnect_count\":{},\"fail_closed\":{},\"latest_quote\":{},\"rest_rebuild_count\":{},\"status\":{},\"stream_status\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
+            "{{\"current_usable_row_count\":{},\"degraded_reason\":{},\"disconnect_count\":{},\"fail_closed\":{},\"latest_quote\":{},\"rest_rebuild_count\":{},\"stale_row_count\":{},\"status\":{},\"stream_status\":{},\"total_rows\":{},\"unusable_row_count\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
+            current_usable_row_count,
+            json_option_string(&degraded_reason),
             self.disconnect_count,
             self.fail_closed,
             self.latest_quote_json_value_with_now(now),
             self.rest_rebuild_count,
+            stale_row_count,
             json_string(&status),
             json_string(&self.status),
             self.total_rows,
+            unusable_row_count,
             json_string(&self.updated_at),
             self.wss_update_count,
         )
@@ -6510,17 +6583,22 @@ impl PublicTopOfBookMonitorSnapshot {
     pub(crate) fn quotes_json(&self) -> String {
         let now = current_utc_timestamp().ok();
         let status = self.availability_status(now);
+        let (current_usable_row_count, stale_row_count, unusable_row_count) =
+            self.freshness_counts(now);
         format!(
-            "{{\"fail_closed\":{},\"rows\":[{}],\"status\":{},\"stream_status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+            "{{\"current_usable_row_count\":{},\"fail_closed\":{},\"rows\":[{}],\"stale_row_count\":{},\"status\":{},\"stream_status\":{},\"total_rows\":{},\"unusable_row_count\":{},\"updated_at\":{}}}",
+            current_usable_row_count,
             self.fail_closed,
             self.rows
                 .iter()
                 .map(|quote| quote.to_json_with_now(now))
                 .collect::<Vec<_>>()
                 .join(","),
+            stale_row_count,
             json_string(&status),
             json_string(&self.status),
             self.total_rows,
+            unusable_row_count,
             json_string(&self.updated_at),
         )
     }
@@ -6528,10 +6606,15 @@ impl PublicTopOfBookMonitorSnapshot {
     pub(crate) fn to_json(&self) -> String {
         let now = current_utc_timestamp().ok();
         let status = self.availability_status(now);
-        let last_error = self.effective_last_error(&status);
+        let last_error = self.effective_last_error(&status, now);
+        let (current_usable_row_count, stale_row_count, unusable_row_count) =
+            self.freshness_counts(now);
+        let degraded_reason = now.and_then(|now| self.degraded_reason(now));
         format!(
-            "{{\"coordinator_status\":{},\"disconnect_count\":{},\"fail_closed\":{},\"fail_closed_count\":{},\"last_error\":{},\"latest_quote\":{},\"market\":{},\"rest_rebuild_count\":{},\"rows\":[{}],\"status\":{},\"stream_status\":{},\"stream_url\":{},\"symbol\":{},\"total_rows\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
+            "{{\"coordinator_status\":{},\"current_usable_row_count\":{},\"degraded_reason\":{},\"disconnect_count\":{},\"fail_closed\":{},\"fail_closed_count\":{},\"last_error\":{},\"latest_quote\":{},\"market\":{},\"rest_rebuild_count\":{},\"rows\":[{}],\"stale_row_count\":{},\"status\":{},\"stream_status\":{},\"stream_url\":{},\"symbol\":{},\"total_rows\":{},\"unusable_row_count\":{},\"updated_at\":{},\"wss_update_count\":{}}}",
             json_string(&self.coordinator_status),
+            current_usable_row_count,
+            json_option_string(&degraded_reason),
             self.disconnect_count,
             self.fail_closed,
             self.fail_closed_count,
@@ -6544,11 +6627,13 @@ impl PublicTopOfBookMonitorSnapshot {
                 .map(|quote| quote.to_json_with_now(now))
                 .collect::<Vec<_>>()
                 .join(","),
+            stale_row_count,
             json_string(&status),
             json_string(&self.status),
             json_string(&self.stream_url),
             json_string(&self.symbol),
             self.total_rows,
+            unusable_row_count,
             json_string(&self.updated_at),
             self.wss_update_count,
         )
@@ -6578,6 +6663,13 @@ pub(crate) fn public_wss_monitor_status(
     } else {
         status
     }
+}
+
+fn public_wss_row_ratio_bps(row_count: usize, total_rows: usize) -> u64 {
+    if total_rows == 0 {
+        return 0;
+    }
+    (row_count as u64).saturating_mul(10_000) / (total_rows as u64)
 }
 
 pub(crate) fn start_binance_wss_book_ticker_http_api(
@@ -6986,6 +7078,53 @@ mod tests {
 
         let stale_now = UtcTimestamp::from_str("2026-05-13T00:00:22Z").expect("stale now");
         assert_eq!(snapshot.availability_status(Some(stale_now)), "stale");
+    }
+
+    #[test]
+    fn public_wss_monitor_reports_degraded_when_many_rows_are_stale() {
+        let now = current_utc_timestamp().expect("now");
+        let current_at = now.to_string();
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BybitPublicMarket::LinearPerpetual.as_str(),
+            BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+        );
+        for (symbol, ingested_at) in [
+            ("BTCUSDT", current_at.as_str()),
+            ("ETHUSDT", "2000-01-01T00:00:00Z"),
+            ("SOLUSDT", "2000-01-01T00:00:00Z"),
+            ("XRPUSDT", "2000-01-01T00:00:00Z"),
+        ] {
+            let quote = PublicTopOfBookQuoteSnapshot {
+                symbol: symbol.to_owned(),
+                venue_id: "venue:BYBIT-PERP".to_owned(),
+                instrument_id: format!("inst:BYBIT:{symbol}:LINEAR-PERP"),
+                best_bid: Some("100.01".to_owned()),
+                best_ask: Some("100.02".to_owned()),
+                bid_size: Some("1.2".to_owned()),
+                ask_size: Some("1.3".to_owned()),
+                source_sequence: Some("42".to_owned()),
+                source_event_id: Some(format!("bybit:wss-book-ticker:linear-perp:{symbol}:42")),
+                observed_at: ingested_at.to_owned(),
+                ingested_at: ingested_at.to_owned(),
+                freshness_status: "Fresh".to_owned(),
+            };
+            if symbol == "BTCUSDT" {
+                snapshot.latest_quote = Some(quote.clone());
+            }
+            snapshot.upsert_quote_row(quote);
+        }
+        snapshot.status = "streaming".to_owned();
+        snapshot.updated_at = current_at;
+        snapshot.wss_update_count = 4;
+
+        let status = snapshot.to_json();
+
+        assert_eq!(snapshot.availability_status(Some(now)), "degraded");
+        assert_eq!(snapshot.health_http_status(), 503);
+        assert!(status.contains("\"current_usable_row_count\":1"));
+        assert!(status.contains("\"stale_row_count\":3"));
+        assert!(status.contains("stale_or_unusable_row_ratio_bps=7500"));
     }
 
     #[test]

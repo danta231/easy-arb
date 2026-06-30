@@ -160,6 +160,41 @@ fn parse_monitor_http_query(path: &str) -> (&str, MonitorHttpQuery) {
     (route, parsed)
 }
 
+fn monitor_health_http_status(status: &str) -> u16 {
+    match status {
+        "healthy" | "starting" => 200,
+        _ => 503,
+    }
+}
+
+fn basis_monitor_health_json(snapshot: &BinanceBasisMonitorSnapshot) -> String {
+    format!(
+        "{{\"candidate_count\":{},\"last_error\":{},\"missing_perp_count\":{},\"missing_spot_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{},\"wss_missing_quote_count\":{},\"wss_unusable_quote_count\":{}}}",
+        snapshot.candidate_count,
+        json_option_string(&snapshot.last_error),
+        snapshot.missing_perp_count,
+        snapshot.missing_spot_count,
+        json_string(&snapshot.status),
+        snapshot.total_rows,
+        json_string(&snapshot.updated_at),
+        snapshot.wss_missing_quote_count,
+        snapshot.wss_unusable_quote_count,
+    )
+}
+
+fn funding_arb_monitor_health_json(snapshot: &FundingArbMonitorSnapshot) -> String {
+    format!(
+        "{{\"candidate_count\":{},\"last_error\":{},\"mutable_execution_started\":false,\"source_count\":{},\"source_error_count\":{},\"status\":{},\"total_rows\":{},\"updated_at\":{}}}",
+        snapshot.candidate_count,
+        json_option_string(&snapshot.last_error),
+        snapshot.source_count,
+        snapshot.source_error_count,
+        json_string(&snapshot.status),
+        snapshot.total_rows,
+        json_string(&snapshot.updated_at),
+    )
+}
+
 fn handle_basis_http_connection(
     mut stream: TcpStream,
     state: &Arc<RwLock<BinanceBasisMonitorSnapshot>>,
@@ -191,12 +226,8 @@ fn handle_basis_http_connection(
     let snapshot = state.read().expect("monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
-            200,
-            format!(
-                "{{\"status\":{},\"updated_at\":{}}}",
-                json_string(&snapshot.status),
-                json_string(&snapshot.updated_at)
-            ),
+            monitor_health_http_status(&snapshot.status),
+            basis_monitor_health_json(&snapshot),
         )
     } else if route == "/api/basis/status" {
         (
@@ -255,12 +286,8 @@ fn handle_bybit_basis_http_connection(
     let snapshot = state.read().expect("monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
-            200,
-            format!(
-                "{{\"status\":{},\"updated_at\":{}}}",
-                json_string(&snapshot.status),
-                json_string(&snapshot.updated_at)
-            ),
+            monitor_health_http_status(&snapshot.status),
+            basis_monitor_health_json(&snapshot),
         )
     } else if route == "/api/bybit-basis/status" {
         (
@@ -319,12 +346,8 @@ fn handle_okx_basis_http_connection(
     let snapshot = state.read().expect("monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
-            200,
-            format!(
-                "{{\"status\":{},\"updated_at\":{}}}",
-                json_string(&snapshot.status),
-                json_string(&snapshot.updated_at)
-            ),
+            monitor_health_http_status(&snapshot.status),
+            basis_monitor_health_json(&snapshot),
         )
     } else if route == "/api/okx-basis/status" {
         (
@@ -387,12 +410,8 @@ fn handle_bitget_basis_http_connection(
     let snapshot = state.read().expect("monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
-            200,
-            format!(
-                "{{\"status\":{},\"updated_at\":{}}}",
-                json_string(&snapshot.status),
-                json_string(&snapshot.updated_at)
-            ),
+            monitor_health_http_status(&snapshot.status),
+            basis_monitor_health_json(&snapshot),
         )
     } else if route == "/api/bitget-basis/status" {
         (
@@ -455,12 +474,8 @@ fn handle_hyperliquid_basis_http_connection(
     let snapshot = state.read().expect("monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
-            200,
-            format!(
-                "{{\"status\":{},\"updated_at\":{}}}",
-                json_string(&snapshot.status),
-                json_string(&snapshot.updated_at)
-            ),
+            monitor_health_http_status(&snapshot.status),
+            basis_monitor_health_json(&snapshot),
         )
     } else if route == "/api/hyperliquid-basis/status" {
         (
@@ -519,12 +534,8 @@ fn handle_aster_basis_http_connection(
     let snapshot = state.read().expect("monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
-            200,
-            format!(
-                "{{\"status\":{},\"updated_at\":{}}}",
-                json_string(&snapshot.status),
-                json_string(&snapshot.updated_at)
-            ),
+            monitor_health_http_status(&snapshot.status),
+            basis_monitor_health_json(&snapshot),
         )
     } else if route == "/api/aster-basis/status" {
         (
@@ -584,12 +595,8 @@ fn handle_funding_arb_http_connection(
     let snapshot = state.read().expect("monitor state lock poisoned");
     let (status, body) = if route == "/health" {
         (
-            200,
-            format!(
-                "{{\"status\":{},\"updated_at\":{},\"mutable_execution_started\":false}}",
-                json_string(&snapshot.status),
-                json_string(&snapshot.updated_at)
-            ),
+            monitor_health_http_status(&snapshot.status),
+            funding_arb_monitor_health_json(&snapshot),
         )
     } else if route == "/api/funding-arb/status" {
         (

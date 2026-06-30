@@ -31,6 +31,8 @@ usage() {
   ARB_RUNTIME_LIVE_DETACH=0 # 是否后台运行 arb-runtime live；1 表示 detach。
   ARB_RUNTIME_LIVE_PRECHECK_LOG_ENABLED=1 # 是否把启动脚本自身输出写入 live-prereq/logs/arb-runtime-live-precheck.log。
   ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS=120 # 等待 WSS monitor 就绪的最长秒数。
+  ARB_RUNTIME_LIVE_WSS_RECONNECT_DELAY_SECS=2 # 默认 WSS 断线重连基础间隔秒数；runtime 会做指数退避。
+  ARB_RUNTIME_LIVE_BITGET_WSS_RECONNECT_DELAY_SECS=10 # Bitget WSS 重连基础间隔秒数，默认更保守以降低反复断线后的重订阅压力。
   ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS=1 # 启动前是否回收本仓库 arb-runtime 残留只读 API/WSS 端口；0 表示只报错。
   ARB_RUNTIME_LIVE_BUILD=1 # 启动前是否构建 arb-runtime 和 arb-wallet-signer。
   ARB_RUNTIME_LIVE_CONFIG=templates/personal_guarded_live.preflight.yaml # arb-runtime live 使用的风控和执行配置。
@@ -446,6 +448,14 @@ PRECHECK_LOG="${LOG_DIR}/arb-runtime-live-precheck.log"
 RUNTIME_BIN="${ARB_RUNTIME_LIVE_BIN:-${REPO_ROOT}/target/debug/arb-runtime}"
 WSS_READY_TIMEOUT_SECS="${ARB_RUNTIME_LIVE_WSS_READY_TIMEOUT_SECS:-120}"
 WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_WSS_RECONNECT_DELAY_SECS:-2}"
+BINANCE_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_BINANCE_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
+BYBIT_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_BYBIT_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
+OKX_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_OKX_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
+BITGET_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_BITGET_WSS_RECONNECT_DELAY_SECS:-10}"
+ASTER_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_ASTER_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
+HYPERLIQUID_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_HYPERLIQUID_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
+GATE_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_GATE_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
+LIGHTER_WSS_RECONNECT_DELAY_SECS="${ARB_RUNTIME_LIVE_LIGHTER_WSS_RECONNECT_DELAY_SECS:-${WSS_RECONNECT_DELAY_SECS}}"
 RECLAIM_STALE_MONITOR_PORTS="${ARB_RUNTIME_LIVE_RECLAIM_STALE_MONITOR_PORTS:-1}"
 PORTFOLIO_BIND="${ARB_RUNTIME_LIVE_PORTFOLIO_BIND:-127.0.0.1:8805}"
 PORTFOLIO_PRIVATE_READONLY_ENABLED="${ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_ENABLED:-1}"
@@ -485,6 +495,22 @@ esac
 if ! [[ "${PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS}" =~ ^[0-9]+$ ]] || (( PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS < 1 )); then
   die "ARB_RUNTIME_PORTFOLIO_PRIVATE_READONLY_INTERVAL_SECS must be a positive integer"
 fi
+for reconnect_var in \
+  WSS_RECONNECT_DELAY_SECS \
+  BINANCE_WSS_RECONNECT_DELAY_SECS \
+  BYBIT_WSS_RECONNECT_DELAY_SECS \
+  OKX_WSS_RECONNECT_DELAY_SECS \
+  BITGET_WSS_RECONNECT_DELAY_SECS \
+  ASTER_WSS_RECONNECT_DELAY_SECS \
+  HYPERLIQUID_WSS_RECONNECT_DELAY_SECS \
+  GATE_WSS_RECONNECT_DELAY_SECS \
+  LIGHTER_WSS_RECONNECT_DELAY_SECS
+do
+  reconnect_value="${!reconnect_var}"
+  if ! [[ "${reconnect_value}" =~ ^[0-9]+$ ]] || (( reconnect_value < 1 )); then
+    die "${reconnect_var} must be a positive integer"
+  fi
+done
 if [[ "${LIVE_DERISK_ONLY}" == "1" ]]; then
   LIVE_STRATEGIES="cross-exchange-funding-arb"
   LIVE_SPOT_PERP_BASIS_MODE="auto-once"
@@ -706,6 +732,7 @@ start_wss_monitor() {
   local api_prefix="$6"
   local ready_symbol="${7:-}"
   local required="${8:-1}"
+  local reconnect_delay_secs="${9:-${WSS_RECONNECT_DELAY_SECS}}"
   local ready_symbol_field
   local log_file="${LOG_DIR}/${name}.log"
   local status_url="http://${bind_addr}${api_prefix}/status"
@@ -717,12 +744,12 @@ start_wss_monitor() {
     --bind "${bind_addr}" \
     --symbol "${symbol}" \
     --market "${market}" \
-    --reconnect-delay-secs "${WSS_RECONNECT_DELAY_SECS}" \
+    --reconnect-delay-secs "${reconnect_delay_secs}" \
     >> "${log_file}" 2>&1 &
   pid="$!"
   ready_symbol_field="${ready_symbol:-__none__}"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pid}" "${name}" "${log_file}" "${status_url}" "${ready_symbol_field}" "${required}" >> "${WSS_PID_FILE}"
-  echo "  pid=${pid} log=${log_file}"
+  echo "  pid=${pid} log=${log_file} reconnect_delay_secs=${reconnect_delay_secs}"
 }
 
 start_wss_monitor_if_configured() {
@@ -734,12 +761,13 @@ start_wss_monitor_if_configured() {
   local api_prefix="$6"
   local ready_symbol="${7:-}"
   local required="${8:-1}"
+  local reconnect_delay_secs="${9:-${WSS_RECONNECT_DELAY_SECS}}"
 
   if [[ -z "${symbol}" ]]; then
     echo "skipping ${name}: no symbols resolved for current live strategies"
     return 0
   fi
-  start_wss_monitor "${name}" "${command_name}" "${bind_addr}" "${symbol}" "${market}" "${api_prefix}" "${ready_symbol}" "${required}"
+  start_wss_monitor "${name}" "${command_name}" "${bind_addr}" "${symbol}" "${market}" "${api_prefix}" "${ready_symbol}" "${required}" "${reconnect_delay_secs}"
 }
 
 wss_quote_ready_for_symbol() {
@@ -790,7 +818,7 @@ wait_for_wss_monitor() {
       status="$(printf '%s\n' "${body}" | jq -r '.status // "unknown"' 2>/dev/null || printf 'unknown')"
       total_rows="$(printf '%s\n' "${body}" | jq -r '.total_rows // 0' 2>/dev/null || printf '0')"
       wss_update_count="$(printf '%s\n' "${body}" | jq -r '.wss_update_count // 0' 2>/dev/null || printf '0')"
-      if [[ "${status}" == "streaming" && "${total_rows}" =~ ^[0-9]+$ && "${total_rows}" -gt 0 && "${wss_update_count}" =~ ^[0-9]+$ && "${wss_update_count}" -gt 0 ]]; then
+      if [[ ( "${status}" == "streaming" || "${status}" == "degraded" ) && "${total_rows}" =~ ^[0-9]+$ && "${total_rows}" -gt 0 && "${wss_update_count}" =~ ^[0-9]+$ && "${wss_update_count}" -gt 0 ]]; then
         if wss_quote_ready_for_symbol "${body}" "${ready_symbol}"; then
           echo "wss_ready name=${name} status_url=${status_url} rows=${total_rows} wss_updates=${wss_update_count} ready_symbol=${ready_symbol:-none}"
           return 0
@@ -1110,28 +1138,28 @@ fi
 start_portfolio_private_readonly_snapshot
 start_portfolio_dashboard
 
-start_wss_monitor_if_configured binance-spot binance-wss-book-ticker "${BINANCE_SPOT_WSS_BIND}" "${BINANCE_SPOT_WSS_SYMBOL}" spot /api/binance-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured binance-perp binance-wss-book-ticker "${BINANCE_PERP_WSS_BIND}" "${BINANCE_PERP_WSS_SYMBOL}" usdm-perp /api/binance-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured bybit-spot bybit-wss-book-ticker "${BYBIT_SPOT_WSS_BIND}" "${BYBIT_SPOT_WSS_SYMBOL}" spot /api/bybit-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured bybit-perp bybit-wss-book-ticker "${BYBIT_PERP_WSS_BIND}" "${BYBIT_PERP_WSS_SYMBOL}" linear-perp /api/bybit-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured okx-spot okx-wss-book-ticker "${OKX_SPOT_WSS_BIND}" "${OKX_SPOT_WSS_SYMBOL}" spot /api/okx-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured okx-perp okx-wss-book-ticker "${OKX_PERP_WSS_BIND}" "${OKX_PERP_WSS_SYMBOL}" swap /api/okx-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured bitget-spot bitget-wss-book-ticker "${BITGET_SPOT_WSS_BIND}" "${BITGET_SPOT_WSS_SYMBOL}" spot /api/bitget-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured bitget-perp bitget-wss-book-ticker "${BITGET_PERP_WSS_BIND}" "${BITGET_PERP_WSS_SYMBOL}" usdt-futures /api/bitget-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}"
-start_wss_monitor_if_configured aster-perp aster-wss-book-ticker "${ASTER_PERP_WSS_BIND}" "${ASTER_WSS_SYMBOL}" usdt-futures /api/aster-wss-book-ticker "" 0
-start_wss_monitor_if_configured hyperliquid-perp hyperliquid-wss-book-ticker "${HYPERLIQUID_PERP_WSS_BIND}" "${HYPERLIQUID_WSS_SYMBOL}" perp /api/hyperliquid-wss-book-ticker "" 0
-start_wss_monitor_if_configured gate-perp gate-wss-book-ticker "${GATE_PERP_WSS_BIND}" "${GATE_WSS_SYMBOL}" usdt-futures /api/gate-wss-book-ticker "" 0
-start_wss_monitor_if_configured lighter-perp lighter-wss-book-ticker "${LIGHTER_PERP_WSS_BIND}" "${LIGHTER_WSS_SYMBOL}" perp /api/lighter-wss-book-ticker "" 0
+start_wss_monitor_if_configured binance-spot binance-wss-book-ticker "${BINANCE_SPOT_WSS_BIND}" "${BINANCE_SPOT_WSS_SYMBOL}" spot /api/binance-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${BINANCE_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured binance-perp binance-wss-book-ticker "${BINANCE_PERP_WSS_BIND}" "${BINANCE_PERP_WSS_SYMBOL}" usdm-perp /api/binance-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${BINANCE_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured bybit-spot bybit-wss-book-ticker "${BYBIT_SPOT_WSS_BIND}" "${BYBIT_SPOT_WSS_SYMBOL}" spot /api/bybit-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${BYBIT_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured bybit-perp bybit-wss-book-ticker "${BYBIT_PERP_WSS_BIND}" "${BYBIT_PERP_WSS_SYMBOL}" linear-perp /api/bybit-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${BYBIT_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured okx-spot okx-wss-book-ticker "${OKX_SPOT_WSS_BIND}" "${OKX_SPOT_WSS_SYMBOL}" spot /api/okx-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${OKX_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured okx-perp okx-wss-book-ticker "${OKX_PERP_WSS_BIND}" "${OKX_PERP_WSS_SYMBOL}" swap /api/okx-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${OKX_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured bitget-spot bitget-wss-book-ticker "${BITGET_SPOT_WSS_BIND}" "${BITGET_SPOT_WSS_SYMBOL}" spot /api/bitget-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${BITGET_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured bitget-perp bitget-wss-book-ticker "${BITGET_PERP_WSS_BIND}" "${BITGET_PERP_WSS_SYMBOL}" usdt-futures /api/bitget-wss-book-ticker "" "${SHARED_CEX_WSS_REQUIRED}" "${BITGET_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured aster-perp aster-wss-book-ticker "${ASTER_PERP_WSS_BIND}" "${ASTER_WSS_SYMBOL}" usdt-futures /api/aster-wss-book-ticker "" 0 "${ASTER_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured hyperliquid-perp hyperliquid-wss-book-ticker "${HYPERLIQUID_PERP_WSS_BIND}" "${HYPERLIQUID_WSS_SYMBOL}" perp /api/hyperliquid-wss-book-ticker "" 0 "${HYPERLIQUID_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured gate-perp gate-wss-book-ticker "${GATE_PERP_WSS_BIND}" "${GATE_WSS_SYMBOL}" usdt-futures /api/gate-wss-book-ticker "" 0 "${GATE_WSS_RECONNECT_DELAY_SECS}"
+start_wss_monitor_if_configured lighter-perp lighter-wss-book-ticker "${LIGHTER_PERP_WSS_BIND}" "${LIGHTER_WSS_SYMBOL}" perp /api/lighter-wss-book-ticker "" 0 "${LIGHTER_WSS_RECONNECT_DELAY_SECS}"
 
 if [[ "${TARGET_WSS_ENABLED}" == "1" ]]; then
-  start_wss_monitor target-binance-spot binance-wss-book-ticker "${TARGET_BINANCE_SPOT_WSS_BIND}" "${BINANCE_BASIS_READY_SYMBOL}" spot /api/binance-wss-book-ticker "${BINANCE_BASIS_READY_SYMBOL}" 1
-  start_wss_monitor target-binance-perp binance-wss-book-ticker "${TARGET_BINANCE_PERP_WSS_BIND}" "${BINANCE_BASIS_READY_SYMBOL}" usdm-perp /api/binance-wss-book-ticker "${BINANCE_BASIS_READY_SYMBOL}" 1
-  start_wss_monitor target-bybit-spot bybit-wss-book-ticker "${TARGET_BYBIT_SPOT_WSS_BIND}" "${BYBIT_BASIS_READY_SYMBOL}" spot /api/bybit-wss-book-ticker "${BYBIT_BASIS_READY_SYMBOL}" 1
-  start_wss_monitor target-bybit-perp bybit-wss-book-ticker "${TARGET_BYBIT_PERP_WSS_BIND}" "${BYBIT_BASIS_READY_SYMBOL}" linear-perp /api/bybit-wss-book-ticker "${BYBIT_BASIS_READY_SYMBOL}" 1
-  start_wss_monitor target-okx-spot okx-wss-book-ticker "${TARGET_OKX_SPOT_WSS_BIND}" "${OKX_BASIS_READY_SYMBOL}" spot /api/okx-wss-book-ticker "${OKX_BASIS_READY_SYMBOL}" 1
-  start_wss_monitor target-okx-perp okx-wss-book-ticker "${TARGET_OKX_PERP_WSS_BIND}" "${OKX_BASIS_READY_SYMBOL}" swap /api/okx-wss-book-ticker "${OKX_BASIS_READY_SYMBOL}" 1
-  start_wss_monitor target-bitget-spot bitget-wss-book-ticker "${TARGET_BITGET_SPOT_WSS_BIND}" "${BITGET_BASIS_READY_SYMBOL}" spot /api/bitget-wss-book-ticker "${BITGET_BASIS_READY_SYMBOL}" 1
-  start_wss_monitor target-bitget-perp bitget-wss-book-ticker "${TARGET_BITGET_PERP_WSS_BIND}" "${BITGET_BASIS_READY_SYMBOL}" usdt-futures /api/bitget-wss-book-ticker "${BITGET_BASIS_READY_SYMBOL}" 1
+  start_wss_monitor target-binance-spot binance-wss-book-ticker "${TARGET_BINANCE_SPOT_WSS_BIND}" "${BINANCE_BASIS_READY_SYMBOL}" spot /api/binance-wss-book-ticker "${BINANCE_BASIS_READY_SYMBOL}" 1 "${BINANCE_WSS_RECONNECT_DELAY_SECS}"
+  start_wss_monitor target-binance-perp binance-wss-book-ticker "${TARGET_BINANCE_PERP_WSS_BIND}" "${BINANCE_BASIS_READY_SYMBOL}" usdm-perp /api/binance-wss-book-ticker "${BINANCE_BASIS_READY_SYMBOL}" 1 "${BINANCE_WSS_RECONNECT_DELAY_SECS}"
+  start_wss_monitor target-bybit-spot bybit-wss-book-ticker "${TARGET_BYBIT_SPOT_WSS_BIND}" "${BYBIT_BASIS_READY_SYMBOL}" spot /api/bybit-wss-book-ticker "${BYBIT_BASIS_READY_SYMBOL}" 1 "${BYBIT_WSS_RECONNECT_DELAY_SECS}"
+  start_wss_monitor target-bybit-perp bybit-wss-book-ticker "${TARGET_BYBIT_PERP_WSS_BIND}" "${BYBIT_BASIS_READY_SYMBOL}" linear-perp /api/bybit-wss-book-ticker "${BYBIT_BASIS_READY_SYMBOL}" 1 "${BYBIT_WSS_RECONNECT_DELAY_SECS}"
+  start_wss_monitor target-okx-spot okx-wss-book-ticker "${TARGET_OKX_SPOT_WSS_BIND}" "${OKX_BASIS_READY_SYMBOL}" spot /api/okx-wss-book-ticker "${OKX_BASIS_READY_SYMBOL}" 1 "${OKX_WSS_RECONNECT_DELAY_SECS}"
+  start_wss_monitor target-okx-perp okx-wss-book-ticker "${TARGET_OKX_PERP_WSS_BIND}" "${OKX_BASIS_READY_SYMBOL}" swap /api/okx-wss-book-ticker "${OKX_BASIS_READY_SYMBOL}" 1 "${OKX_WSS_RECONNECT_DELAY_SECS}"
+  start_wss_monitor target-bitget-spot bitget-wss-book-ticker "${TARGET_BITGET_SPOT_WSS_BIND}" "${BITGET_BASIS_READY_SYMBOL}" spot /api/bitget-wss-book-ticker "${BITGET_BASIS_READY_SYMBOL}" 1 "${BITGET_WSS_RECONNECT_DELAY_SECS}"
+  start_wss_monitor target-bitget-perp bitget-wss-book-ticker "${TARGET_BITGET_PERP_WSS_BIND}" "${BITGET_BASIS_READY_SYMBOL}" usdt-futures /api/bitget-wss-book-ticker "${BITGET_BASIS_READY_SYMBOL}" 1 "${BITGET_WSS_RECONNECT_DELAY_SECS}"
 fi
 
 while IFS=$'\t' read -r pid name log_file status_url ready_symbol required; do

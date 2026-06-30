@@ -19,6 +19,8 @@ VERIFY_MODE="${EASY_ARB_DEPLOY_VERIFY:-none}"
 STOP_LEGACY="${EASY_ARB_DEPLOY_STOP_LEGACY:-auto}"
 HEALTH_WAIT_SECS="${EASY_ARB_DEPLOY_HEALTH_WAIT_SECS:-120}"
 JOURNAL_LINES="${EASY_ARB_DEPLOY_JOURNAL_LINES:-80}"
+CONFIGURE_LOGREADER="${EASY_ARB_DEPLOY_CONFIGURE_LOGREADER:-1}"
+LOG_READER_USER="${EASY_ARB_LOG_READER_USER:-logreader}"
 
 PULL=1
 INSTALL_UNIT=1
@@ -75,6 +77,8 @@ usage() {
   EASY_ARB_DEPLOY_STOP_LEGACY        auto、always、never；默认 auto
   EASY_ARB_DEPLOY_HEALTH_WAIT_SECS   健康检查最长等待秒数，默认 120
   EASY_ARB_DEPLOY_JOURNAL_LINES      journal 输出行数，默认 80
+  EASY_ARB_DEPLOY_CONFIGURE_LOGREADER 是否配置日志读取用户只读权限，默认 1
+  EASY_ARB_LOG_READER_USER            日志读取系统用户，默认 logreader
 USAGE
 }
 
@@ -191,6 +195,60 @@ print_service_diagnostics() {
   sudo journalctl -u "${SERVICE_NAME}" -n "${JOURNAL_LINES}" --no-pager || true
   sudo ss -H -ltnp 2>/dev/null | grep -E ':(8796|8797|8798|8799|8800|8803|8804|8805|8806|8789|8791|8793|8794|8795|8816|8817|8818|8819|8820|8821|8822|8823)\b' || true
   ps -eo user,pid,ppid,lstart,cmd | grep -E '[a]rb-runtime|[s]tart-arb-runtime-live' || true
+}
+
+configure_logreader_read_access() {
+  case "${CONFIGURE_LOGREADER}" in
+    0|false|False|FALSE|no|No|NO)
+      info "跳过日志读取用户权限配置"
+      return 0
+      ;;
+    1|true|True|TRUE|yes|Yes|YES)
+      ;;
+    *)
+      die "EASY_ARB_DEPLOY_CONFIGURE_LOGREADER must be 0 or 1: ${CONFIGURE_LOGREADER}"
+      ;;
+  esac
+
+  if ! id -u "${LOG_READER_USER}" >/dev/null 2>&1; then
+    warn "日志读取用户不存在，跳过 ACL 配置: ${LOG_READER_USER}"
+    return 0
+  fi
+
+  info "配置 ${LOG_READER_USER} 的 journal 和 easy-arb 日志只读权限"
+  if command -v getent >/dev/null 2>&1 && getent group systemd-journal >/dev/null 2>&1; then
+    sudo usermod -aG systemd-journal "${LOG_READER_USER}" \
+      || warn "无法把 ${LOG_READER_USER} 加入 systemd-journal 组；journalctl 可能仍不可读"
+  else
+    warn "未找到 systemd-journal 组；journalctl 读取权限保持系统默认"
+  fi
+
+  if ! command -v setfacl >/dev/null 2>&1; then
+    warn "未找到 setfacl，无法配置 /var/lib/easy-arb 日志目录 ACL"
+    return 0
+  fi
+
+  local path
+  for path in /var/lib/easy-arb /var/lib/easy-arb/live /var/lib/easy-arb/live-prereq; do
+    [[ -d "${path}" ]] || continue
+    sudo setfacl -m "u:${LOG_READER_USER}:--x" "${path}" \
+      || warn "无法配置目录穿透 ACL: ${path}"
+  done
+
+  for path in \
+    /var/lib/easy-arb/live/logs \
+    /var/lib/easy-arb/live-prereq/logs \
+    /var/lib/easy-arb/live/resident-live \
+    /var/log/easy-arb
+  do
+    [[ -e "${path}" ]] || continue
+    sudo setfacl -R -m "u:${LOG_READER_USER}:rX" "${path}" \
+      || warn "无法配置只读 ACL: ${path}"
+    if [[ -d "${path}" ]]; then
+      sudo find "${path}" -type d -exec setfacl -d -m "u:${LOG_READER_USER}:rX" {} + \
+        || warn "无法配置默认只读 ACL: ${path}"
+    fi
+  done
 }
 
 while [[ $# -gt 0 ]]; do
@@ -344,6 +402,8 @@ if [[ "${HEALTH_CHECK}" == "1" && "${RESTART_SERVICE}" == "1" ]]; then
 else
   info "跳过健康检查"
 fi
+
+configure_logreader_read_access
 
 info "部署完成"
 sudo systemctl status "${SERVICE_NAME}" --no-pager -l

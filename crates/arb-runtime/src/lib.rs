@@ -16277,8 +16277,12 @@ fn build_binance_basis_monitor_snapshot_from_parsed_with_depth(
     });
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
 
+    let has_warnings = !warnings.is_empty();
+    let status = basis_monitor_runtime_status(&rows, 0, 0, has_warnings);
+    let last_error = has_warnings.then(|| warnings.join("; "));
+
     Ok(BinanceBasisMonitorSnapshot {
-        status: "healthy".to_owned(),
+        status,
         updated_at,
         min_abs_funding_rate: options.min_abs_funding_rate.clone(),
         min_net_bps: options.min_net_bps.to_string(),
@@ -16289,7 +16293,7 @@ fn build_binance_basis_monitor_snapshot_from_parsed_with_depth(
         missing_perp_count,
         wss_missing_quote_count: 0,
         wss_unusable_quote_count: 0,
-        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        last_error,
         rows,
     })
 }
@@ -16756,8 +16760,17 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         ));
     }
 
+    let has_warnings = !warnings.is_empty();
+    let status = basis_monitor_runtime_status(
+        &rows,
+        missing_wss_quote_count,
+        unusable_wss_quote_count,
+        has_warnings,
+    );
+    let last_error = has_warnings.then(|| warnings.join("; "));
+
     Ok(AsterBasisMonitorSnapshot {
-        status: "healthy".to_owned(),
+        status,
         updated_at,
         min_abs_funding_rate: options.min_abs_funding_rate.clone(),
         min_net_bps: options.min_net_bps.to_string(),
@@ -16768,7 +16781,7 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         missing_perp_count,
         wss_missing_quote_count: missing_wss_quote_count,
         wss_unusable_quote_count: unusable_wss_quote_count,
-        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        last_error,
         rows,
     })
 }
@@ -17176,8 +17189,12 @@ fn build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
     });
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
 
+    let has_warnings = !warnings.is_empty();
+    let status = basis_monitor_runtime_status(&rows, 0, 0, has_warnings);
+    let last_error = has_warnings.then(|| warnings.join("; "));
+
     Ok(BybitBasisMonitorSnapshot {
-        status: "healthy".to_owned(),
+        status,
         updated_at,
         min_abs_funding_rate: options.min_abs_funding_rate.clone(),
         min_net_bps: options.min_net_bps.to_string(),
@@ -17188,7 +17205,7 @@ fn build_bybit_basis_monitor_snapshot_from_parsed_with_depth(
         missing_perp_count,
         wss_missing_quote_count: 0,
         wss_unusable_quote_count: 0,
-        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        last_error,
         rows,
     })
 }
@@ -17859,8 +17876,12 @@ fn build_okx_basis_monitor_snapshot_from_parsed_with_depth(
     });
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
 
+    let has_warnings = !warnings.is_empty();
+    let status = basis_monitor_runtime_status(&rows, 0, 0, has_warnings);
+    let last_error = has_warnings.then(|| warnings.join("; "));
+
     Ok(OkxBasisMonitorSnapshot {
-        status: "healthy".to_owned(),
+        status,
         updated_at,
         min_abs_funding_rate: options.min_abs_funding_rate.clone(),
         min_net_bps: options.min_net_bps.to_string(),
@@ -17871,7 +17892,7 @@ fn build_okx_basis_monitor_snapshot_from_parsed_with_depth(
         missing_perp_count,
         wss_missing_quote_count: 0,
         wss_unusable_quote_count: 0,
-        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        last_error,
         rows,
     })
 }
@@ -18224,8 +18245,12 @@ fn build_bitget_basis_monitor_snapshot_from_parsed_with_depth(
     });
     let candidate_count = rows.iter().filter(|row| row.is_candidate).count();
 
+    let has_warnings = !warnings.is_empty();
+    let status = basis_monitor_runtime_status(&rows, 0, 0, has_warnings);
+    let last_error = has_warnings.then(|| warnings.join("; "));
+
     Ok(BitgetBasisMonitorSnapshot {
-        status: "healthy".to_owned(),
+        status,
         updated_at,
         min_abs_funding_rate: options.min_abs_funding_rate.clone(),
         min_net_bps: options.min_net_bps.to_string(),
@@ -18236,7 +18261,7 @@ fn build_bitget_basis_monitor_snapshot_from_parsed_with_depth(
         missing_perp_count,
         wss_missing_quote_count: 0,
         wss_unusable_quote_count: 0,
-        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        last_error,
         rows,
     })
 }
@@ -18592,8 +18617,17 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         ));
     }
 
+    let has_warnings = !warnings.is_empty();
+    let status = basis_monitor_runtime_status(
+        &rows,
+        missing_wss_quote_count,
+        unusable_wss_quote_count,
+        has_warnings,
+    );
+    let last_error = has_warnings.then(|| warnings.join("; "));
+
     Ok(HyperliquidBasisMonitorSnapshot {
-        status: "healthy".to_owned(),
+        status,
         updated_at,
         min_abs_funding_rate: options.min_abs_funding_rate.clone(),
         min_net_bps: options.min_net_bps.to_string(),
@@ -18604,7 +18638,7 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
         missing_perp_count,
         wss_missing_quote_count: missing_wss_quote_count,
         wss_unusable_quote_count: unusable_wss_quote_count,
-        last_error: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        last_error,
         rows,
     })
 }
@@ -49258,12 +49292,6 @@ fn basis_monitor_blocking_path(
 }
 
 fn basis_candidate_count_zero_reason(snapshot: &BinanceBasisMonitorSnapshot) -> String {
-    if snapshot.status != "healthy" {
-        return format!(
-            "阻断点：candidate_count=0；阻断原因：spot-perp-basis 上游状态不完整；snapshot_status={}",
-            snapshot.status
-        );
-    }
     if snapshot.total_rows == 0 && snapshot.filtered_funding_count > 0 {
         return "阻断点：candidate_count=0；阻断原因：funding rate 被 min_abs_funding_rate 过滤后没有可评估行"
             .to_owned();
@@ -49287,11 +49315,43 @@ fn basis_candidate_count_zero_reason(snapshot: &BinanceBasisMonitorSnapshot) -> 
         return "阻断点：candidate_count=0；阻断原因：所有 spot-perp-basis 行的现货或永续 top-of-book 不完整"
             .to_owned();
     }
+    if snapshot.status != "healthy" {
+        return format!(
+            "阻断点：candidate_count=0；阻断原因：spot-perp-basis 上游状态不完整；snapshot_status={}",
+            snapshot.status
+        );
+    }
     if basis_snapshot_has_disabled_execution_profile(snapshot) {
         return "阻断点：candidate_count=0；阻断原因：该 venue 的 spot-perp-basis dry-run/execution profile 未启用；完整行情行按 fail closed，缺失行情行继续报告 top-of-book 缺失"
             .to_owned();
     }
     "阻断点：candidate_count=0；阻断原因：所有 spot-perp-basis 行均未通过候选门槛".to_owned()
+}
+
+const BASIS_MONITOR_DEGRADED_INCOMPLETE_ROW_RATIO_BPS: usize = 2_500;
+
+fn basis_monitor_runtime_status(
+    rows: &[BinanceBasisMarketRow],
+    wss_missing_quote_count: usize,
+    wss_unusable_quote_count: usize,
+    has_warnings: bool,
+) -> String {
+    if has_warnings || wss_missing_quote_count > 0 || wss_unusable_quote_count > 0 {
+        return "degraded".to_owned();
+    }
+    if rows.is_empty() {
+        return "healthy".to_owned();
+    }
+    let incomplete_row_count = rows
+        .iter()
+        .filter(|row| basis_row_has_incomplete_top_of_book(row))
+        .count();
+    let incomplete_ratio_bps = incomplete_row_count.saturating_mul(10_000) / rows.len();
+    if incomplete_ratio_bps >= BASIS_MONITOR_DEGRADED_INCOMPLETE_ROW_RATIO_BPS {
+        "degraded".to_owned()
+    } else {
+        "healthy".to_owned()
+    }
 }
 
 fn basis_row_has_incomplete_top_of_book(row: &BinanceBasisMarketRow) -> bool {
@@ -53395,25 +53455,28 @@ mod tests {
             .collect::<Vec<_>>();
         let bitget_payloads =
             bitget_wss_ticker_subscribe_payloads(&bitget_symbols, BitgetPublicWssMarket::Spot);
-        assert_eq!(bitget_payloads.len(), 3);
+        assert_eq!(bitget_payloads.len(), 5);
         assert!(bitget_payloads
             .iter()
             .all(|payload| payload.len() <= BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES));
-        assert!(bitget_payloads[0].matches("\"channel\":\"ticker\"").count() <= 50);
+        assert!(
+            bitget_payloads[0].matches("\"channel\":\"ticker\"").count()
+                <= BITGET_WSS_SUBSCRIBE_MAX_ARGS_PER_PAYLOAD
+        );
         assert!(bitget_payloads[0].contains("\"instId\":\"SYM0USDT\""));
-        assert!(bitget_payloads[2].contains("\"instId\":\"SYM122USDT\""));
+        assert!(bitget_payloads[4].contains("\"instId\":\"SYM122USDT\""));
 
         let bitget_all_scope_payloads = bitget_wss_ticker_subscribe_payloads_for_scope(
             &bitget_symbols,
             BitgetPublicWssMarket::Spot,
             true,
         );
-        assert_eq!(bitget_all_scope_payloads.len(), 3);
+        assert_eq!(bitget_all_scope_payloads.len(), 5);
         assert!(bitget_all_scope_payloads
             .iter()
             .all(|payload| payload.len() <= BITGET_WSS_SUBSCRIBE_PAYLOAD_MAX_BYTES));
         assert!(bitget_all_scope_payloads[0].contains("\"instId\":\"SYM0USDT\""));
-        assert!(bitget_all_scope_payloads[2].contains("\"instId\":\"SYM122USDT\""));
+        assert!(bitget_all_scope_payloads[4].contains("\"instId\":\"SYM122USDT\""));
         assert!(!bitget_all_scope_payloads[0].contains("\"instId\":\"default\""));
 
         let bitget_scoped_payloads = bitget_wss_ticker_subscribe_payloads_for_scope(
@@ -53421,7 +53484,7 @@ mod tests {
             BitgetPublicWssMarket::Spot,
             false,
         );
-        assert_eq!(bitget_scoped_payloads.len(), 3);
+        assert_eq!(bitget_scoped_payloads.len(), 5);
         assert!(bitget_scoped_payloads[0].contains("\"instId\":\"SYM0USDT\""));
     }
 
@@ -70068,6 +70131,7 @@ mod tests {
                 .expect("snapshot");
 
         assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.status, "degraded");
         assert_eq!(snapshot.candidate_count, 0);
         assert_eq!(snapshot.missing_spot_count, 1);
         assert_eq!(snapshot.rows[0].source_status, "missing_spot");
@@ -70195,6 +70259,7 @@ mod tests {
             .expect("snapshot");
 
         assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.status, "degraded");
         assert_eq!(snapshot.candidate_count, 0);
         assert_eq!(snapshot.missing_spot_count, 1);
         assert_eq!(snapshot.rows[0].source_status, "missing_spot");
@@ -70226,7 +70291,7 @@ mod tests {
         )
         .expect("snapshot");
 
-        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.status, "degraded");
         assert_eq!(snapshot.total_rows, 1);
         assert_eq!(snapshot.missing_spot_count, 1);
         assert_eq!(snapshot.rows[0].source_status, "missing_spot");
@@ -70235,8 +70300,8 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("Aster spot REST unavailable")));
         let status_json = snapshot.to_json();
-        assert!(!status_json.contains("status!=healthy"));
-        assert!(!status_json.contains("spot-perp-basis 上游状态不完整"));
+        assert!(status_json.contains("status!=healthy"));
+        assert!(status_json.contains("spot-perp-basis 上游状态不完整"));
         assert!(status_json.contains("所有 spot-perp-basis 行的现货或永续 top-of-book 不完整"));
     }
 
@@ -70279,6 +70344,7 @@ mod tests {
             .expect("snapshot");
 
         assert_eq!(snapshot.candidate_count, 0);
+        assert_eq!(snapshot.status, "degraded");
         assert_eq!(snapshot.missing_spot_count, 1);
         let status_json = snapshot.to_json();
         assert!(status_json.contains("Hyperliquid 多数永续合约没有 USDC 现货 context"));
@@ -70687,6 +70753,7 @@ mod tests {
                 .expect("snapshot");
 
         assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.status, "degraded");
         assert_eq!(snapshot.candidate_count, 0);
         assert_eq!(snapshot.missing_spot_count, 1);
         assert_eq!(snapshot.rows[0].source_status, "missing_spot");
@@ -71198,6 +71265,7 @@ mod tests {
                 .expect("snapshot");
 
         assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.status, "degraded");
         assert_eq!(snapshot.candidate_count, 0);
         assert_eq!(snapshot.missing_spot_count, 1);
         assert_eq!(snapshot.rows[0].source_status, "missing_spot");
