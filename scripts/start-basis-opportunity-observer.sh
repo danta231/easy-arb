@@ -1558,6 +1558,55 @@ wait_for_monitor_opportunities() {
   return 1
 }
 
+wait_for_monitor_status_snapshot() {
+  local venue="$1"
+  local process_name="${venue}-basis-monitor"
+  local pid
+  local log_file
+  local url
+  local deadline
+  local body
+  local last_body=""
+  local snapshot_status="unknown"
+  local row_count="0"
+
+  pid="$(pid_for_name "${process_name}")"
+  log_file="$(log_for_name "${process_name}")"
+  url="$(status_url "${venue}")"
+  deadline="$((SECONDS + STARTUP_WAIT_SECS))"
+
+  while (( SECONDS <= deadline )); do
+    if [[ -n "${pid}" ]] && ! is_alive "${pid}"; then
+      echo "error: ${venue} monitor exited before /status returned a source snapshot" >&2
+      if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+        tail -n 40 "${log_file}" >&2 || true
+      fi
+      return 1
+    fi
+
+    if body="$(curl -fsS --max-time "${CURL_TIMEOUT_SECS}" "${url}" 2>> "${LOG_DIR}/curl-errors.log")"; then
+      last_body="${body}"
+      snapshot_status="$(printf '%s\n' "${body}" | jq -r '.status // "unknown"' 2>> "${LOG_DIR}/jq-errors.log" || printf 'unknown')"
+      row_count="$(printf '%s\n' "${body}" | jq -r '((.rows // []) | if type == "array" then length else 0 end)' 2>> "${LOG_DIR}/jq-errors.log" || printf '0')"
+      if printf '%s\n' "${body}" | jq -e 'has("status") and has("updated_at") and ((.rows // []) | type == "array" and length > 0)' >/dev/null 2>> "${LOG_DIR}/jq-errors.log"; then
+        echo "startup_check_ok venue=${venue} readiness=status endpoint=${url} status=${snapshot_status} rows=${row_count}"
+        return 0
+      fi
+    fi
+
+    sleep 1
+  done
+
+  echo "error: ${venue} monitor did not provide a non-empty /status source snapshot within ${STARTUP_WAIT_SECS}s: ${url}; last_status=${snapshot_status}; rows=${row_count}" >&2
+  if [[ -n "${last_body}" ]]; then
+    printf '%s\n' "${last_body}" | jq -c '{status:(.status // "unknown"),candidate_count:(.candidate_count // 0),updated_at:(.updated_at // "unknown"),last_error:(.last_error // null),rows:((.rows // []) | length),source_status_counts:(.source_status_counts // {})}' >&2 2>> "${LOG_DIR}/jq-errors.log" || true
+  fi
+  if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+    tail -n 40 "${log_file}" >&2 || true
+  fi
+  return 1
+}
+
 wait_for_funding_arb_opportunities() {
   local process_name="funding-arb-monitor"
   local pid
@@ -3492,10 +3541,18 @@ if strategy_enabled "cross-exchange-funding-arb"; then
 fi
 
 if [[ "${STARTUP_CHECK}" == "1" ]]; then
-  echo "checking /opportunities endpoints before starting recorder..."
-  if strategy_enabled "spot-perp-basis" || [[ "${ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}" != "1" ]]; then
+  echo "checking monitor readiness before starting recorder..."
+  if strategy_enabled "spot-perp-basis"; then
     for monitor in "${MONITORS[@]}"; do
       if ! wait_for_monitor_opportunities "${monitor}"; then
+        stop_started_processes
+        rm -f "${PID_FILE}"
+        exit 1
+      fi
+    done
+  elif [[ "${ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED}" != "1" ]]; then
+    for monitor in "${MONITORS[@]}"; do
+      if ! wait_for_monitor_status_snapshot "${monitor}"; then
         stop_started_processes
         rm -f "${PID_FILE}"
         exit 1
