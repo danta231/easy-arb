@@ -2309,13 +2309,13 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
             ),
         });
     }
-    let rows = bybit_wss_tracked_rest_rows_for_subscribe_scope(rows, market, all_symbols_scope);
+    let (rows, subscribe_args) =
+        bybit_wss_tracked_rest_rows_and_subscribe_topics(rows, market, all_symbols_scope);
 
     let started_at = current_utc_timestamp()?;
     let mut coordinators = BTreeMap::new();
     let mut local_sequences = BTreeMap::new();
     let mut rest_updates = Vec::with_capacity(rows.len());
-    let subscribe_args = bybit_wss_subscribe_topics_for_rows(&rows, market, all_symbols_scope);
     for row in rows {
         let symbol = row.symbol.clone();
         let instrument = bybit_public_wss_instrument(&symbol, market)?;
@@ -6097,6 +6097,17 @@ pub(crate) fn bybit_wss_subscribe_topics_for_rows(
         .into_iter()
         .map(|row| bybit_wss_top_of_book_topic(&row.symbol, use_ticker_topics))
         .collect()
+}
+
+pub(crate) fn bybit_wss_tracked_rest_rows_and_subscribe_topics(
+    rows: Vec<MonitorBookTickerRow>,
+    market: BybitPublicMarket,
+    all_symbols_scope: bool,
+) -> (Vec<MonitorBookTickerRow>, Vec<String>) {
+    let subscribe_args = bybit_wss_subscribe_topics_for_rows(&rows, market, all_symbols_scope);
+    let tracked_rows =
+        bybit_wss_tracked_rest_rows_for_subscribe_scope(rows, market, all_symbols_scope);
+    (tracked_rows, subscribe_args)
 }
 
 pub(crate) fn bybit_wss_tracked_rest_rows_for_subscribe_scope(

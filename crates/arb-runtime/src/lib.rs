@@ -54370,6 +54370,27 @@ mod tests {
     }
 
     #[test]
+    fn bybit_linear_large_scope_keeps_ticker_topics_after_tracking_cap() {
+        let mut rows = (0..=BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT + 20)
+            .map(|index| monitor_book_ticker_row(&format!("SYM{index:03}USDT")))
+            .collect::<Vec<_>>();
+        rows.push(monitor_book_ticker_row("ETHUSDT"));
+        rows.push(monitor_book_ticker_row("BTCUSDT"));
+
+        let (tracked, topics) = bybit_wss_tracked_rest_rows_and_subscribe_topics(
+            rows,
+            BybitPublicMarket::LinearPerpetual,
+            false,
+        );
+
+        assert_eq!(tracked.len(), BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT);
+        assert_eq!(topics.len(), BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT);
+        assert_eq!(tracked[0].symbol, "BTCUSDT");
+        assert_eq!(topics[0], "tickers.BTCUSDT");
+        assert!(topics.iter().all(|topic| topic.starts_with("tickers.")));
+    }
+
+    #[test]
     fn bybit_wss_empty_top_of_book_payloads_are_ignored() {
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
         let empty_ticker_raw = r#"{"topic":"tickers.PRLUSDT","type":"delta","ts":1778630401000,"data":{"symbol":"PRLUSDT","bid1Price":"","bid1Size":"","ask1Price":"","ask1Size":"","seq":9002}}"#;
