@@ -54326,7 +54326,7 @@ mod tests {
 
     #[test]
     fn bybit_linear_large_scope_caps_ticker_topics_with_priority_symbols() {
-        let mut rows = (0..=BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT + 20)
+        let mut rows = (0..=BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT + 20)
             .map(|index| monitor_book_ticker_row(&format!("SYM{index:03}USDT")))
             .collect::<Vec<_>>();
         rows.push(monitor_book_ticker_row("ETHUSDT"));
@@ -54351,7 +54351,7 @@ mod tests {
 
     #[test]
     fn bybit_linear_large_scope_tracks_only_subscribed_priority_rows() {
-        let mut rows = (0..=BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT + 20)
+        let mut rows = (0..=BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT + 20)
             .map(|index| monitor_book_ticker_row(&format!("SYM{index:03}USDT")))
             .collect::<Vec<_>>();
         rows.push(monitor_book_ticker_row("ETHUSDT"));

@@ -84,7 +84,7 @@ pub(crate) const GATE_WSS_BOOK_TICKER_ALL_USDT_SYMBOLS: &str = "ALL_USDT";
 pub(crate) const BYBIT_SPOT_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 pub(crate) const BYBIT_LINEAR_PUBLIC_WSS_BASE_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 pub(crate) const BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT: usize = 100;
-pub(crate) const BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT: usize = 100;
+pub(crate) const BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT: usize = 50;
 pub(crate) const BYBIT_LINEAR_WSS_PRIORITY_SYMBOLS: &[&str] = &[
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "SUIUSDT",
     "TRXUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT",
@@ -6078,7 +6078,7 @@ pub(crate) fn bybit_wss_subscribe_topic_limit(
     all_symbols_scope: bool,
 ) -> Option<usize> {
     if market == BybitPublicMarket::LinearPerpetual
-        && (all_symbols_scope || symbol_count > BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT)
+        && (all_symbols_scope || symbol_count > BYBIT_LINEAR_WSS_ORDERBOOK_TOPIC_SCOPE_LIMIT)
     {
         Some(BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT)
     } else {
@@ -6500,10 +6500,10 @@ impl PublicTopOfBookMonitorSnapshot {
                 self.total_rows
             ));
         }
-        if self.disconnect_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT
+        let high_reconnect_pressure = self.disconnect_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT
             || self.rest_rebuild_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT
-            || self.fail_closed_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT
-        {
+            || self.fail_closed_count >= PUBLIC_WSS_DEGRADED_RECONNECT_COUNT;
+        if self.status == "reconnecting" && high_reconnect_pressure {
             return Some(format!(
                 "high_reconnect_pressure; disconnect_count={}; rest_rebuild_count={}; fail_closed_count={}",
                 self.disconnect_count, self.rest_rebuild_count, self.fail_closed_count
@@ -7180,6 +7180,84 @@ mod tests {
         assert_eq!(snapshot.health_http_status(), 200);
         assert!(status.contains("\"current_usable_row_count\":1"));
         assert!(status.contains("\"unusable_row_count\":3"));
+        assert!(status.contains("\"degraded_reason\":null"));
+    }
+
+    #[test]
+    fn public_wss_monitor_reports_degraded_when_reconnecting_under_high_pressure() {
+        let now = current_utc_timestamp().expect("now");
+        let current_at = now.to_string();
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BybitPublicMarket::LinearPerpetual.as_str(),
+            BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+        );
+        let quote = PublicTopOfBookQuoteSnapshot {
+            symbol: "BTCUSDT".to_owned(),
+            venue_id: "venue:BYBIT-PERP".to_owned(),
+            instrument_id: "inst:BYBIT:BTCUSDT:LINEAR-PERP".to_owned(),
+            best_bid: Some("100.01".to_owned()),
+            best_ask: Some("100.02".to_owned()),
+            bid_size: Some("1.2".to_owned()),
+            ask_size: Some("1.3".to_owned()),
+            source_sequence: Some("42".to_owned()),
+            source_event_id: Some("bybit:wss-book-ticker:linear-perp:BTCUSDT:42".to_owned()),
+            observed_at: current_at.clone(),
+            ingested_at: current_at.clone(),
+            freshness_status: "Fresh".to_owned(),
+        };
+        snapshot.status = "reconnecting".to_owned();
+        snapshot.updated_at = current_at;
+        snapshot.disconnect_count = PUBLIC_WSS_DEGRADED_RECONNECT_COUNT;
+        snapshot.rest_rebuild_count = PUBLIC_WSS_DEGRADED_RECONNECT_COUNT;
+        snapshot.fail_closed_count = PUBLIC_WSS_DEGRADED_RECONNECT_COUNT;
+        snapshot.wss_update_count = 1;
+        snapshot.latest_quote = Some(quote.clone());
+        snapshot.upsert_quote_row(quote);
+
+        let status = snapshot.to_json();
+
+        assert_eq!(snapshot.availability_status(Some(now)), "degraded");
+        assert_eq!(snapshot.health_http_status(), 503);
+        assert!(status.contains("high_reconnect_pressure"));
+    }
+
+    #[test]
+    fn public_wss_monitor_does_not_degrade_after_streaming_recovers_from_high_pressure() {
+        let now = current_utc_timestamp().expect("now");
+        let current_at = now.to_string();
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BybitPublicMarket::LinearPerpetual.as_str(),
+            BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+        );
+        let quote = PublicTopOfBookQuoteSnapshot {
+            symbol: "BTCUSDT".to_owned(),
+            venue_id: "venue:BYBIT-PERP".to_owned(),
+            instrument_id: "inst:BYBIT:BTCUSDT:LINEAR-PERP".to_owned(),
+            best_bid: Some("100.01".to_owned()),
+            best_ask: Some("100.02".to_owned()),
+            bid_size: Some("1.2".to_owned()),
+            ask_size: Some("1.3".to_owned()),
+            source_sequence: Some("42".to_owned()),
+            source_event_id: Some("bybit:wss-book-ticker:linear-perp:BTCUSDT:42".to_owned()),
+            observed_at: current_at.clone(),
+            ingested_at: current_at.clone(),
+            freshness_status: "Fresh".to_owned(),
+        };
+        snapshot.status = "streaming".to_owned();
+        snapshot.updated_at = current_at;
+        snapshot.disconnect_count = PUBLIC_WSS_DEGRADED_RECONNECT_COUNT;
+        snapshot.rest_rebuild_count = PUBLIC_WSS_DEGRADED_RECONNECT_COUNT;
+        snapshot.fail_closed_count = PUBLIC_WSS_DEGRADED_RECONNECT_COUNT;
+        snapshot.wss_update_count = 1;
+        snapshot.latest_quote = Some(quote.clone());
+        snapshot.upsert_quote_row(quote);
+
+        let status = snapshot.to_json();
+
+        assert_eq!(snapshot.availability_status(Some(now)), "streaming");
+        assert_eq!(snapshot.health_http_status(), 200);
         assert!(status.contains("\"degraded_reason\":null"));
     }
 
