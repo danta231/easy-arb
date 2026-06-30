@@ -2309,6 +2309,7 @@ pub(crate) fn bootstrap_bybit_wss_book_ticker_all_market(
             ),
         });
     }
+    let rows = bybit_wss_tracked_rest_rows_for_subscribe_scope(rows, market, all_symbols_scope);
 
     let started_at = current_utc_timestamp()?;
     let mut coordinators = BTreeMap::new();
@@ -6092,8 +6093,18 @@ pub(crate) fn bybit_wss_subscribe_topics_for_rows(
 ) -> Vec<String> {
     let use_ticker_topics =
         bybit_wss_should_use_ticker_topics(market, rows.len(), all_symbols_scope);
+    bybit_wss_tracked_rest_rows_for_subscribe_scope(rows.to_vec(), market, all_symbols_scope)
+        .into_iter()
+        .map(|row| bybit_wss_top_of_book_topic(&row.symbol, use_ticker_topics))
+        .collect()
+}
+
+pub(crate) fn bybit_wss_tracked_rest_rows_for_subscribe_scope(
+    mut rows: Vec<MonitorBookTickerRow>,
+    market: BybitPublicMarket,
+    all_symbols_scope: bool,
+) -> Vec<MonitorBookTickerRow> {
     let topic_limit = bybit_wss_subscribe_topic_limit(market, rows.len(), all_symbols_scope);
-    let mut rows = rows.iter().collect::<Vec<_>>();
     if market == BybitPublicMarket::LinearPerpetual && topic_limit.is_some() {
         rows.sort_by(|left, right| {
             let left_rank = bybit_linear_wss_priority_rank(&left.symbol).unwrap_or(usize::MAX);
@@ -6105,7 +6116,6 @@ pub(crate) fn bybit_wss_subscribe_topics_for_rows(
     }
     rows.into_iter()
         .take(topic_limit.unwrap_or(usize::MAX))
-        .map(|row| bybit_wss_top_of_book_topic(&row.symbol, use_ticker_topics))
         .collect()
 }
 

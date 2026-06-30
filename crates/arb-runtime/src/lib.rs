@@ -20119,7 +20119,9 @@ fn funding_arb_degraded_source_error_messages(
     snapshots
         .iter()
         .enumerate()
-        .filter(|(_, snapshot)| snapshot.status != "healthy")
+        .filter(|(_, snapshot)| {
+            snapshot.status != "healthy" && !funding_arb_snapshot_has_perp_usable_row(snapshot)
+        })
         .map(|(index, snapshot)| {
             let venue_family = snapshot
                 .rows
@@ -20139,6 +20141,43 @@ fn funding_arb_degraded_source_error_messages(
             )
         })
         .collect()
+}
+
+fn funding_arb_snapshot_has_perp_usable_row(snapshot: &FundingArbVenueSnapshot) -> bool {
+    snapshot
+        .rows
+        .iter()
+        .any(funding_arb_venue_market_has_perp_usable_fields)
+}
+
+fn funding_arb_venue_market_has_perp_usable_fields(market: &FundingArbVenueMarket) -> bool {
+    funding_arb_source_status_allows_perp(&market.source_status)
+        && market
+            .perp_bid
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && market
+            .perp_ask
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && market
+            .perp_bid_qty
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && market
+            .perp_ask_qty
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && market
+            .mark_price
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && market
+            .index_price
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && !market.funding_rate.trim().is_empty()
+        && !market.funding_interval_hours.trim().is_empty()
 }
 
 fn funding_arb_monitor_last_error(
@@ -49328,26 +49367,20 @@ fn basis_candidate_count_zero_reason(snapshot: &BinanceBasisMonitorSnapshot) -> 
     "阻断点：candidate_count=0；阻断原因：所有 spot-perp-basis 行均未通过候选门槛".to_owned()
 }
 
-const BASIS_MONITOR_DEGRADED_INCOMPLETE_ROW_RATIO_BPS: usize = 2_500;
-
 fn basis_monitor_runtime_status(
     rows: &[BinanceBasisMarketRow],
     wss_missing_quote_count: usize,
     wss_unusable_quote_count: usize,
     has_warnings: bool,
 ) -> String {
-    if has_warnings || wss_missing_quote_count > 0 || wss_unusable_quote_count > 0 {
-        return "degraded".to_owned();
-    }
     if rows.is_empty() {
-        return "healthy".to_owned();
+        return if has_warnings || wss_missing_quote_count > 0 || wss_unusable_quote_count > 0 {
+            "degraded".to_owned()
+        } else {
+            "healthy".to_owned()
+        };
     }
-    let incomplete_row_count = rows
-        .iter()
-        .filter(|row| basis_row_has_incomplete_top_of_book(row))
-        .count();
-    let incomplete_ratio_bps = incomplete_row_count.saturating_mul(10_000) / rows.len();
-    if incomplete_ratio_bps >= BASIS_MONITOR_DEGRADED_INCOMPLETE_ROW_RATIO_BPS {
+    if rows.iter().all(basis_row_has_incomplete_top_of_book) {
         "degraded".to_owned()
     } else {
         "healthy".to_owned()
@@ -54250,6 +54283,26 @@ mod tests {
     }
 
     #[test]
+    fn bybit_linear_large_scope_tracks_only_subscribed_priority_rows() {
+        let mut rows = (0..=BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT + 20)
+            .map(|index| monitor_book_ticker_row(&format!("SYM{index:03}USDT")))
+            .collect::<Vec<_>>();
+        rows.push(monitor_book_ticker_row("ETHUSDT"));
+        rows.push(monitor_book_ticker_row("BTCUSDT"));
+
+        let tracked = bybit_wss_tracked_rest_rows_for_subscribe_scope(
+            rows,
+            BybitPublicMarket::LinearPerpetual,
+            false,
+        );
+
+        assert_eq!(tracked.len(), BYBIT_LINEAR_WSS_TICKER_TOPIC_SUBSCRIBE_LIMIT);
+        assert_eq!(tracked[0].symbol, "BTCUSDT");
+        assert_eq!(tracked[1].symbol, "ETHUSDT");
+        assert!(tracked.iter().all(|row| row.symbol != "SYM120USDT"));
+    }
+
+    #[test]
     fn bybit_wss_empty_top_of_book_payloads_are_ignored() {
         let ingested_at = UtcTimestamp::from_str("2026-05-13T00:00:01Z").expect("time");
         let empty_ticker_raw = r#"{"topic":"tickers.PRLUSDT","type":"delta","ts":1778630401000,"data":{"symbol":"PRLUSDT","bid1Price":"","bid1Size":"","ask1Price":"","ask1Size":"","seq":9002}}"#;
@@ -57312,6 +57365,47 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("bybit source status is degraded")));
+    }
+
+    #[test]
+    fn funding_arb_monitor_allows_degraded_basis_source_when_perp_fields_are_usable() {
+        let binance = funding_arb_test_venue_snapshot(
+            "binance",
+            &funding_arb_basis_status_json(
+                "BTCUSDT",
+                "0.00010000",
+                "complete",
+                Some("2.0"),
+                Some("2.0"),
+            ),
+        );
+        let aster = funding_arb_test_venue_snapshot(
+            "aster",
+            r#"{"status":"degraded","updated_at":"2026-05-13T00:00:00Z","rows":[{"symbol":"BTCUSDT","perp_bid":"100.05","perp_ask":"100.10","perp_bid_qty":"2.0","perp_ask_qty":"2.0","mark_price":"100.05","index_price":"100.00","last_funding_rate":"0.00600000","funding_interval_hours":"1","next_funding_time_ms":"1778601600000","source_status":"missing_spot"}]}"#,
+        );
+        let options = FundingArbMonitorOptions {
+            sources: vec![
+                FundingArbVenueSource {
+                    venue_family: "binance".to_owned(),
+                    status_url: "http://127.0.0.1/binance/status".to_owned(),
+                },
+                FundingArbVenueSource {
+                    venue_family: "aster".to_owned(),
+                    status_url: "http://127.0.0.1/aster/status".to_owned(),
+                },
+            ],
+            ..FundingArbMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_funding_arb_monitor_snapshot_from_sources(vec![binance, aster], vec![], &options)
+                .expect("funding arb snapshot");
+
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.source_error_count, 0);
+        assert_eq!(snapshot.last_error, None);
+        assert_eq!(snapshot.total_rows, 1);
+        assert_ne!(snapshot.rows[0].source_status, "source_not_ready");
     }
 
     #[test]
@@ -70147,6 +70241,41 @@ mod tests {
         assert!(opportunities_json.contains("\"blocking_path\""));
         assert!(opportunities_json.contains("\"rows\":[]"));
         assert!(opportunities_json.contains("MISSING_SPOT_BOOK_TICKER"));
+    }
+
+    #[test]
+    fn binance_basis_monitor_partial_missing_spot_keeps_service_healthy() {
+        let spot = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"99.90","bidQty":"1.0","askPrice":"100.00","askQty":"2.0","time":1778584221117}
+        ]"#;
+        let perp = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"100.10","bidQty":"1.5","askPrice":"100.20","askQty":"2.5","time":1778584221117},
+          {"symbol":"ETHUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"BTCUSDT","markPrice":"100.10","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000},
+          {"symbol":"ETHUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let options = BinanceBasisMonitorOptions {
+            once: true,
+            ..BinanceBasisMonitorOptions::default()
+        };
+
+        let snapshot =
+            build_binance_basis_monitor_snapshot_from_json(spot, perp, premium, &options)
+                .expect("snapshot");
+
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.total_rows, 2);
+        assert_eq!(snapshot.missing_spot_count, 1);
+        assert!(snapshot
+            .rows
+            .iter()
+            .any(|row| row.source_status == "complete"));
+        assert!(snapshot
+            .rows
+            .iter()
+            .any(|row| row.source_status == "missing_spot"));
     }
 
     #[test]
