@@ -6493,11 +6493,10 @@ impl PublicTopOfBookMonitorSnapshot {
         if current_usable_count == 0 {
             return None;
         }
-        let staleish_row_count = stale_row_count.saturating_add(unusable_row_count);
-        let staleish_ratio_bps = public_wss_row_ratio_bps(staleish_row_count, self.total_rows);
-        if staleish_ratio_bps >= PUBLIC_WSS_DEGRADED_STALE_ROW_RATIO_BPS {
+        let stale_ratio_bps = public_wss_row_ratio_bps(stale_row_count, self.total_rows);
+        if stale_ratio_bps >= PUBLIC_WSS_DEGRADED_STALE_ROW_RATIO_BPS {
             return Some(format!(
-                "stale_or_unusable_row_ratio_bps={staleish_ratio_bps}; current_usable_row_count={current_usable_count}; stale_row_count={stale_row_count}; unusable_row_count={unusable_row_count}; total_rows={}",
+                "stale_wss_row_ratio_bps={stale_ratio_bps}; current_usable_row_count={current_usable_count}; stale_row_count={stale_row_count}; unusable_row_count={unusable_row_count}; total_rows={}",
                 self.total_rows
             ));
         }
@@ -7134,7 +7133,54 @@ mod tests {
         assert_eq!(snapshot.health_http_status(), 503);
         assert!(status.contains("\"current_usable_row_count\":1"));
         assert!(status.contains("\"stale_row_count\":3"));
-        assert!(status.contains("stale_or_unusable_row_ratio_bps=7500"));
+        assert!(status.contains("stale_wss_row_ratio_bps=7500"));
+    }
+
+    #[test]
+    fn public_wss_monitor_does_not_degrade_for_fresh_rest_bootstrap_rows() {
+        let now = current_utc_timestamp().expect("now");
+        let current_at = now.to_string();
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            "ALL_USDT",
+            BybitPublicMarket::LinearPerpetual.as_str(),
+            BYBIT_LINEAR_PUBLIC_WSS_BASE_URL,
+        );
+        for (symbol, source_event_id) in [
+            ("BTCUSDT", "bybit:wss-book-ticker:linear-perp:BTCUSDT:42"),
+            ("ETHUSDT", "bybit:rest-tickers:linear-perp:ETHUSDT"),
+            ("SOLUSDT", "bybit:rest-tickers:linear-perp:SOLUSDT"),
+            ("XRPUSDT", "bybit:rest-tickers:linear-perp:XRPUSDT"),
+        ] {
+            let quote = PublicTopOfBookQuoteSnapshot {
+                symbol: symbol.to_owned(),
+                venue_id: "venue:BYBIT-PERP".to_owned(),
+                instrument_id: format!("inst:BYBIT:{symbol}:LINEAR-PERP"),
+                best_bid: Some("100.01".to_owned()),
+                best_ask: Some("100.02".to_owned()),
+                bid_size: Some("1.2".to_owned()),
+                ask_size: Some("1.3".to_owned()),
+                source_sequence: Some("42".to_owned()),
+                source_event_id: Some(source_event_id.to_owned()),
+                observed_at: current_at.clone(),
+                ingested_at: current_at.clone(),
+                freshness_status: "Fresh".to_owned(),
+            };
+            if symbol == "BTCUSDT" {
+                snapshot.latest_quote = Some(quote.clone());
+            }
+            snapshot.upsert_quote_row(quote);
+        }
+        snapshot.status = "streaming".to_owned();
+        snapshot.updated_at = current_at;
+        snapshot.wss_update_count = 1;
+
+        let status = snapshot.to_json();
+
+        assert_eq!(snapshot.availability_status(Some(now)), "streaming");
+        assert_eq!(snapshot.health_http_status(), 200);
+        assert!(status.contains("\"current_usable_row_count\":1"));
+        assert!(status.contains("\"unusable_row_count\":3"));
+        assert!(status.contains("\"degraded_reason\":null"));
     }
 
     #[test]

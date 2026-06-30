@@ -519,6 +519,9 @@ const BYBIT_LINEAR_INSTRUMENT_CACHE_TTL_DEFAULT_SECS: u64 = 300;
 const ASTER_SPOT_PERP_SPOT_SCAN_ENV: &str = "ARB_RUNTIME_ASTER_SPOT_PERP_SPOT_SCAN_ENABLED";
 const HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENV: &str =
     "ARB_RUNTIME_HYPERLIQUID_SPOT_PERP_SPOT_SCAN_ENABLED";
+const ASTER_SPOT_PERP_SPOT_SCAN_DISABLED_REASON: &str = "ASTER_SPOT_PERP_SPOT_SCAN_DISABLED";
+const HYPERLIQUID_SPOT_PERP_SPOT_SCAN_DISABLED_REASON: &str =
+    "HYPERLIQUID_SPOT_PERP_SPOT_SCAN_DISABLED";
 const FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENV: &str =
     "ARB_RUNTIME_FUNDING_ARB_DIRECT_PUBLIC_SOURCES_ENABLED";
 const FUNDING_ARB_INCLUDE_STAGED_PUBLIC_SOURCES_ENV: &str =
@@ -16554,6 +16557,10 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
             .collect::<BTreeMap<_, _>>(),
         None => BTreeMap::new(),
     };
+    let spot_scan_disabled = spot_json.is_none()
+        && !warnings
+            .iter()
+            .any(|warning| warning.contains("Aster spot REST unavailable"));
     let perp_books = parse_book_ticker_rows(perp_json, "aster perp")?
         .into_iter()
         .map(|row| (row.symbol.clone(), row))
@@ -16631,7 +16638,14 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
                 missing_spot_count += 1;
                 (
                     "missing_spot".to_owned(),
-                    Some("MISSING_ASTER_SPOT_BOOK_TICKER".to_owned()),
+                    Some(
+                        if spot_scan_disabled {
+                            ASTER_SPOT_PERP_SPOT_SCAN_DISABLED_REASON
+                        } else {
+                            "MISSING_ASTER_SPOT_BOOK_TICKER"
+                        }
+                        .to_owned(),
+                    ),
                 )
             }
             (Some(_), None) => {
@@ -16646,7 +16660,13 @@ fn build_aster_basis_monitor_snapshot_from_optional_spot_json_with_depth(
                 missing_perp_count += 1;
                 (
                     "missing_spot_and_perp".to_owned(),
-                    Some("MISSING_ASTER_SPOT_AND_PERP_BOOK_TICKER".to_owned()),
+                    Some(if spot_scan_disabled {
+                        format!(
+                            "{ASTER_SPOT_PERP_SPOT_SCAN_DISABLED_REASON}; MISSING_ASTER_PERP_BOOK_TICKER"
+                        )
+                    } else {
+                        "MISSING_ASTER_SPOT_AND_PERP_BOOK_TICKER".to_owned()
+                    }),
                 )
             }
         };
@@ -18437,6 +18457,7 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
             .collect::<BTreeMap<_, _>>(),
         None => BTreeMap::new(),
     };
+    let spot_scan_disabled = spot_json.is_none();
     let perp_contexts = parse_hyperliquid_perp_context_rows(perp_json)?;
     let perp_wss_quotes = match options.perp_wss_monitor_url.as_deref() {
         Some(url) => match fetch_public_wss_monitor_quote_map_for_basis(
@@ -18515,7 +18536,14 @@ fn build_hyperliquid_basis_monitor_snapshot_from_optional_spot_json_with_depth(
                 missing_spot_count += 1;
                 (
                     "missing_spot".to_owned(),
-                    Some("MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT".to_owned()),
+                    Some(
+                        if spot_scan_disabled {
+                            HYPERLIQUID_SPOT_PERP_SPOT_SCAN_DISABLED_REASON
+                        } else {
+                            "MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT"
+                        }
+                        .to_owned(),
+                    ),
                 )
             }
         };
@@ -49343,6 +49371,10 @@ fn basis_candidate_count_zero_reason(snapshot: &BinanceBasisMonitorSnapshot) -> 
         .iter()
         .all(basis_row_has_incomplete_top_of_book)
     {
+        if basis_snapshot_has_reason(snapshot, "SPOT_PERP_SPOT_SCAN_DISABLED") {
+            return "阻断点：candidate_count=0；阻断原因：spot-perp-basis 现货扫描按配置关闭；该 venue 当前仅作为 funding-arb 永续行情源"
+                .to_owned();
+        }
         if basis_snapshot_has_reason(snapshot, "MISSING_HYPERLIQUID_USDC_SPOT_CONTEXT") {
             if basis_snapshot_has_reason(snapshot, "MISSING_HYPERLIQUID_TOP_OF_BOOK_SIZE") {
                 return "阻断点：candidate_count=0；阻断原因：Hyperliquid 多数永续合约没有 USDC 现货 context（现货上下文）；已有现货 context 的行缺少 perp WSS top-of-book 数量"
@@ -49381,10 +49413,45 @@ fn basis_monitor_runtime_status(
         };
     }
     if rows.iter().all(basis_row_has_incomplete_top_of_book) {
-        "degraded".to_owned()
+        if basis_rows_have_configured_perp_only_data(rows) {
+            "healthy".to_owned()
+        } else {
+            "degraded".to_owned()
+        }
     } else {
         "healthy".to_owned()
     }
+}
+
+fn basis_rows_have_configured_perp_only_data(rows: &[BinanceBasisMarketRow]) -> bool {
+    rows.iter().all(|row| {
+        matches!(
+            row.source_status.as_str(),
+            "missing_spot" | "missing_spot_and_perp"
+        ) && row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("SPOT_PERP_SPOT_SCAN_DISABLED"))
+    }) && rows.iter().any(basis_row_has_usable_perp_market_data)
+}
+
+fn basis_row_has_usable_perp_market_data(row: &BinanceBasisMarketRow) -> bool {
+    row.source_status == "missing_spot"
+        && option_string_has_value(row.perp_bid.as_deref())
+        && option_string_has_value(row.perp_ask.as_deref())
+        && option_string_has_value(row.perp_bid_qty.as_deref())
+        && option_string_has_value(row.perp_ask_qty.as_deref())
+        && string_has_value(&row.mark_price)
+        && string_has_value(&row.index_price)
+        && string_has_value(&row.last_funding_rate)
+}
+
+fn option_string_has_value(value: Option<&str>) -> bool {
+    value.is_some_and(string_has_value)
+}
+
+fn string_has_value(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 fn basis_row_has_incomplete_top_of_book(row: &BinanceBasisMarketRow) -> bool {
@@ -55141,6 +55208,7 @@ mod tests {
         let json = error_logs_json(&snapshot);
 
         assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.status, "healthy");
         assert_eq!(snapshot.entries[0].severity, "warning");
         assert_eq!(snapshot.entries[0].pair_id.as_deref(), None);
         assert_eq!(snapshot.entries[0].symbol.as_deref(), None);
@@ -70435,6 +70503,40 @@ mod tests {
     }
 
     #[test]
+    fn aster_basis_monitor_snapshot_treats_disabled_spot_scan_as_perp_only_healthy() {
+        let perp = r#"[
+          {"symbol":"BTCUSDT","bidPrice":"101.00","bidQty":"1.5","askPrice":"101.10","askQty":"2.5","time":1778584221117}
+        ]"#;
+        let premium = r#"[
+          {"symbol":"BTCUSDT","markPrice":"101.00","indexPrice":"100.00","lastFundingRate":"0.00010000","interestRate":"0.00010000","nextFundingTime":1778601600000,"time":1778584220000}
+        ]"#;
+        let options = AsterBasisMonitorOptions {
+            once: true,
+            ..AsterBasisMonitorOptions::default()
+        };
+
+        let snapshot = build_aster_basis_monitor_snapshot_from_optional_spot_json(
+            None,
+            perp,
+            premium,
+            &options,
+            Vec::new(),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.status, "healthy");
+        assert_eq!(snapshot.missing_spot_count, 1);
+        assert_eq!(snapshot.rows[0].source_status, "missing_spot");
+        assert_eq!(
+            snapshot.rows[0].reason.as_deref(),
+            Some(ASTER_SPOT_PERP_SPOT_SCAN_DISABLED_REASON)
+        );
+        let status_json = snapshot.to_json();
+        assert!(status_json.contains("spot-perp-basis 现货扫描按配置关闭"));
+        assert!(!status_json.contains("status!=healthy"));
+    }
+
+    #[test]
     fn hyperliquid_basis_monitor_snapshot_explains_missing_usdc_spot_context() {
         let spot = r#"[
           {
@@ -70550,15 +70652,23 @@ mod tests {
         .expect("snapshot");
 
         assert_eq!(snapshot.total_rows, 1);
+        assert_eq!(snapshot.status, "healthy");
         assert_eq!(snapshot.missing_spot_count, 1);
         let row = snapshot.rows.first().expect("row");
         assert_eq!(row.source_status, "missing_spot");
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(HYPERLIQUID_SPOT_PERP_SPOT_SCAN_DISABLED_REASON)
+        );
         assert_eq!(row.perp_bid.as_deref(), Some("100.90"));
         assert_eq!(row.perp_ask.as_deref(), Some("101.10"));
         assert_eq!(row.perp_bid_qty.as_deref(), Some("0.25"));
         assert_eq!(row.perp_ask_qty.as_deref(), Some("0.30"));
         assert_eq!(row.perp_bid_depth.len(), 1);
         assert_eq!(row.perp_ask_depth.len(), 1);
+        let status_json = snapshot.to_json();
+        assert!(status_json.contains("spot-perp-basis 现货扫描按配置关闭"));
+        assert!(!status_json.contains("status!=healthy"));
     }
 
     #[test]

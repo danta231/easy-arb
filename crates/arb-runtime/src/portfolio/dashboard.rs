@@ -898,14 +898,15 @@ pub(crate) fn build_error_logs_snapshot(options: &PortfolioDashboardOptions) -> 
     for source_notice in &mut source_notices {
         *source_notice = truncate_for_json(source_notice, ERROR_LOG_SOURCE_ERROR_CHAR_LIMIT);
     }
+    let has_error_entries = entries
+        .iter()
+        .any(|entry| matches!(entry.severity.as_str(), "error" | "critical"));
     let status = if source_count == 0 {
         "missing"
-    } else if !source_errors.is_empty() {
+    } else if !source_errors.is_empty() || has_error_entries {
         "degraded"
-    } else if entries.is_empty() {
-        "healthy"
     } else {
-        "degraded"
+        "healthy"
     }
     .to_owned();
 
