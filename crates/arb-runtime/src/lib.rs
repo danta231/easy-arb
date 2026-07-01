@@ -275,6 +275,13 @@ const ASTER_PRIVATE_READONLY_MAX_SIGNING_ATTEMPTS: u32 = 3;
 #[cfg(feature = "live-exec")]
 const ASTER_PRIVATE_READONLY_RETRY_DELAY_MS: u64 = 150;
 #[cfg(feature = "live-exec")]
+const ASTER_PRIVATE_READONLY_MIN_INTERVAL_ENV: &str =
+    "ARB_RUNTIME_ASTER_PRIVATE_READONLY_MIN_INTERVAL_MS";
+#[cfg(feature = "live-exec")]
+const ASTER_PRIVATE_READONLY_DEFAULT_MIN_INTERVAL_MS: u64 = 750;
+#[cfg(feature = "live-exec")]
+const ASTER_PRIVATE_READONLY_MAX_MIN_INTERVAL_MS: u64 = 60_000;
+#[cfg(feature = "live-exec")]
 const LIGHTER_READONLY_AUTH_TOKEN_ENV_NAMES: &[&str] =
     &["LIGHTER_READONLY_AUTH_TOKEN", "LIGHTER_AUTH_TOKEN"];
 #[cfg(feature = "live-exec")]
@@ -4347,6 +4354,92 @@ fn fetch_aster_funding_private_readonly_snapshots(
 }
 
 #[cfg(feature = "live-exec")]
+static ASTER_PRIVATE_READONLY_THROTTLE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+#[cfg(feature = "live-exec")]
+fn aster_private_readonly_min_interval() -> RuntimeResult<Duration> {
+    let value = match std::env::var(ASTER_PRIVATE_READONLY_MIN_INTERVAL_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => {
+            return Ok(Duration::from_millis(
+                ASTER_PRIVATE_READONLY_DEFAULT_MIN_INTERVAL_MS,
+            ));
+        }
+        Err(error) => {
+            return Err(RuntimeError::UnsafeConfig {
+                message: format!(
+                    "{ASTER_PRIVATE_READONLY_MIN_INTERVAL_ENV} is not readable: {error}"
+                ),
+            });
+        }
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Duration::from_millis(
+            ASTER_PRIVATE_READONLY_DEFAULT_MIN_INTERVAL_MS,
+        ));
+    }
+    let millis = trimmed.parse::<u64>().map_err(|_| RuntimeError::UnsafeConfig {
+        message: format!(
+            "{ASTER_PRIVATE_READONLY_MIN_INTERVAL_ENV} must be an integer between 0 and {ASTER_PRIVATE_READONLY_MAX_MIN_INTERVAL_MS}"
+        ),
+    })?;
+    if millis > ASTER_PRIVATE_READONLY_MAX_MIN_INTERVAL_MS {
+        return Err(RuntimeError::UnsafeConfig {
+            message: format!(
+                "{ASTER_PRIVATE_READONLY_MIN_INTERVAL_ENV} must be between 0 and {ASTER_PRIVATE_READONLY_MAX_MIN_INTERVAL_MS}"
+            ),
+        });
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+#[cfg(feature = "live-exec")]
+fn wait_for_aster_private_readonly_slot() -> RuntimeResult<()> {
+    let min_interval = aster_private_readonly_min_interval()?;
+    if min_interval.is_zero() {
+        return Ok(());
+    }
+    let throttle = ASTER_PRIVATE_READONLY_THROTTLE.get_or_init(|| Mutex::new(None));
+    let mut guard = throttle
+        .lock()
+        .map_err(|error| RuntimeError::LiveMarketData {
+            message: format!("Aster private readonly throttle lock poisoned: {error}"),
+        })?;
+    if let Some(last_started_at) = *guard {
+        let elapsed = last_started_at.elapsed();
+        if elapsed < min_interval {
+            thread::sleep(min_interval - elapsed);
+        }
+    }
+    *guard = Some(Instant::now());
+    Ok(())
+}
+
+#[cfg(feature = "live-exec")]
+fn aster_private_readonly_rate_limit_error(error: &RuntimeError) -> bool {
+    match error {
+        RuntimeError::LiveMarketData { message } => {
+            let message_lower = message.to_ascii_lowercase();
+            message_lower.contains("http 429")
+                || message_lower.contains("too many requests")
+                || message_lower.contains("rate limit")
+                || message_lower.contains("rate-limit")
+                || message_lower.contains("current limit")
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "live-exec")]
+fn aster_private_readonly_payload_is_rate_limited(payload: &RuntimeResult<String>) -> bool {
+    match payload {
+        Ok(_) => false,
+        Err(error) => aster_private_readonly_rate_limit_error(error),
+    }
+}
+
+#[cfg(feature = "live-exec")]
 #[allow(clippy::too_many_arguments)]
 fn fetch_signed_aster_readonly_get_with_retry<S>(
     signer: &S,
@@ -4362,6 +4455,7 @@ where
     S: AsterRealSigningProvider,
 {
     for attempt in 1..=ASTER_PRIVATE_READONLY_MAX_SIGNING_ATTEMPTS {
+        wait_for_aster_private_readonly_slot()?;
         let request_id = if attempt == 1 {
             request_id_base.to_owned()
         } else {
@@ -33977,6 +34071,7 @@ fn funding_arb_exchange_history_fetch_aster(
     let mut errors = Vec::new();
     let mut income_records = Vec::new();
     let window = FundingArbExchangeHistoryWindow { start_ms, end_ms };
+    let mut rate_limited = false;
     for (income_type, record_type) in [
         ("REALIZED_PNL", "realized_pnl"),
         ("COMMISSION", "commission"),
@@ -33997,6 +34092,7 @@ fn funding_arb_exchange_history_fetch_aster(
             ],
             "/fapi/v3/income",
         );
+        rate_limited = aster_private_readonly_payload_is_rate_limited(&payload);
         funding_arb_exchange_history_capture_payload(
             &mut income_records,
             &mut errors,
@@ -34006,34 +34102,43 @@ fn funding_arb_exchange_history_fetch_aster(
             payload,
             window,
         );
+        if rate_limited {
+            break;
+        }
     }
     let mut trade_records = Vec::new();
-    let symbols = funding_arb_exchange_history_record_symbols(&income_records)?;
-    for symbol in symbols {
-        let payload = fetch_signed_aster_readonly_get_with_retry(
-            &signer,
-            &signing_policy,
-            &format!("signing-request/funding-arb-exchange-history/aster-user-trades/{symbol}"),
-            &leg.venue_id,
-            &leg.account_id,
-            &aster_signer,
-            vec![
-                AsterRequestParam::new("symbol", symbol.clone())?,
-                AsterRequestParam::new("startTime", start_ms.to_string())?,
-                AsterRequestParam::new("endTime", end_ms.to_string())?,
-                AsterRequestParam::new("limit", limit.min(1000).to_string())?,
-            ],
-            "/fapi/v3/userTrades",
-        );
-        funding_arb_exchange_history_capture_payload(
-            &mut trade_records,
-            &mut errors,
-            leg,
-            "aster /fapi/v3/userTrades",
-            "trade_fill",
-            payload,
-            window,
-        );
+    if !rate_limited {
+        let symbols = funding_arb_exchange_history_record_symbols(&income_records)?;
+        for symbol in symbols {
+            let payload = fetch_signed_aster_readonly_get_with_retry(
+                &signer,
+                &signing_policy,
+                &format!("signing-request/funding-arb-exchange-history/aster-user-trades/{symbol}"),
+                &leg.venue_id,
+                &leg.account_id,
+                &aster_signer,
+                vec![
+                    AsterRequestParam::new("symbol", symbol.clone())?,
+                    AsterRequestParam::new("startTime", start_ms.to_string())?,
+                    AsterRequestParam::new("endTime", end_ms.to_string())?,
+                    AsterRequestParam::new("limit", limit.min(1000).to_string())?,
+                ],
+                "/fapi/v3/userTrades",
+            );
+            rate_limited = aster_private_readonly_payload_is_rate_limited(&payload);
+            funding_arb_exchange_history_capture_payload(
+                &mut trade_records,
+                &mut errors,
+                leg,
+                "aster /fapi/v3/userTrades",
+                "trade_fill",
+                payload,
+                window,
+            );
+            if rate_limited {
+                break;
+            }
+        }
     }
     funding_arb_exchange_history_extend_funding_records(&mut records, &income_records)?;
     funding_arb_exchange_history_extend_pnl_records_without_existing_symbol_pnl(
@@ -65174,6 +65279,20 @@ mod tests {
             &waf_error,
             "/fapi/v3/income"
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn aster_private_readonly_rate_limit_error_is_detected() {
+        let rate_limit_error = RuntimeError::LiveMarketData {
+            message: "Aster private signed GET /fapi/v3/income returned HTTP 429: {\"code\":-1003,\"msg\":\"Too many requests; current limit of IP is 2400 requests per minute.\"}".to_owned(),
+        };
+        let waf_error = RuntimeError::LiveMarketData {
+            message: "Aster private signed GET /fapi/v3/income returned HTTP 403: <html>403 Forbidden</html>".to_owned(),
+        };
+
+        assert!(aster_private_readonly_rate_limit_error(&rate_limit_error));
+        assert!(!aster_private_readonly_rate_limit_error(&waf_error));
     }
 
     #[test]
