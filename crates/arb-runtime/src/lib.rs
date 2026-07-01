@@ -33085,7 +33085,17 @@ fn funding_arb_exchange_history_record_json(
     let business_type = funding_arb_exchange_history_string_from_field_sets(
         &fields,
         delta_fields_ref,
-        &["businessType", "bizType", "type", "subType", "category"],
+        &[
+            "businessType",
+            "bizType",
+            "type",
+            "subType",
+            "category",
+            "execType",
+            "transactionType",
+            "billType",
+            "event",
+        ],
         "exchange history row",
     )?;
     let income_type = funding_arb_exchange_history_string_from_field_sets(
@@ -33235,11 +33245,7 @@ fn funding_arb_exchange_history_record_json(
             "funding_pnl_usd",
         ],
     )?;
-    let kind_lower = kind.to_ascii_lowercase();
-    let is_funding_kind = kind_lower.contains("fund")
-        || kind_lower.contains("settlement")
-        || kind_lower.contains("settle")
-        || kind_lower == "8";
+    let is_funding_kind = funding_arb_exchange_history_kind_is_funding(kind);
     let fee_usd = if is_funding_kind {
         None
     } else {
@@ -33287,6 +33293,43 @@ fn funding_arb_exchange_history_record_json(
 }
 
 #[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_kind_is_funding(kind: &str) -> bool {
+    let kind_lower = kind.to_ascii_lowercase();
+    kind_lower.contains("fund")
+        || kind_lower.contains("settlement")
+        || kind_lower.contains("settle")
+        || kind_lower.contains("contract_settle_fee")
+        || kind_lower == "8"
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_row_is_funding(row: &str) -> RuntimeResult<bool> {
+    let fields = parse_json_object_value_slices(row)?;
+    let delta_fields = funding_arb_exchange_history_optional_delta_fields(&fields)?;
+    let delta_fields_ref = delta_fields.as_ref();
+    let kind = funding_arb_exchange_history_string_from_field_sets(
+        &fields,
+        delta_fields_ref,
+        &[
+            "incomeType",
+            "income_type",
+            "businessType",
+            "bizType",
+            "type",
+            "subType",
+            "category",
+            "execType",
+            "transactionType",
+            "billType",
+            "event",
+        ],
+        "exchange history row",
+    )?
+    .unwrap_or_default();
+    Ok(funding_arb_exchange_history_kind_is_funding(&kind))
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_source_error_json(
     venue_family: &str,
     source: &str,
@@ -33308,6 +33351,15 @@ struct FundingArbExchangeHistoryWindow {
 }
 
 #[cfg(feature = "live-exec")]
+struct FundingArbExchangeHistoryCaptureSpec<'a> {
+    leg: &'a FundingArbPositionLegState,
+    source: &'a str,
+    record_type: &'a str,
+    window: FundingArbExchangeHistoryWindow,
+    keep_row: Option<fn(&str) -> RuntimeResult<bool>>,
+}
+
+#[cfg(feature = "live-exec")]
 fn funding_arb_exchange_history_capture_payload(
     records: &mut Vec<String>,
     errors: &mut Vec<String>,
@@ -33317,12 +33369,33 @@ fn funding_arb_exchange_history_capture_payload(
     payload: RuntimeResult<String>,
     window: FundingArbExchangeHistoryWindow,
 ) {
+    funding_arb_exchange_history_capture_payload_with_spec(
+        records,
+        errors,
+        payload,
+        FundingArbExchangeHistoryCaptureSpec {
+            leg,
+            source,
+            record_type,
+            window,
+            keep_row: None,
+        },
+    );
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_capture_payload_with_spec(
+    records: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    payload: RuntimeResult<String>,
+    spec: FundingArbExchangeHistoryCaptureSpec<'_>,
+) {
     let payload = match payload {
         Ok(payload) => payload,
         Err(error) => {
             errors.push(funding_arb_exchange_history_source_error_json(
-                &leg.venue_family,
-                source,
+                &spec.leg.venue_family,
+                spec.source,
                 &error.to_string(),
             ));
             return;
@@ -33332,8 +33405,8 @@ fn funding_arb_exchange_history_capture_payload(
         Ok(rows) => rows,
         Err(error) => {
             errors.push(funding_arb_exchange_history_source_error_json(
-                &leg.venue_family,
-                source,
+                &spec.leg.venue_family,
+                spec.source,
                 &error.to_string(),
             ));
             return;
@@ -33344,32 +33417,60 @@ fn funding_arb_exchange_history_capture_payload(
             Ok(fields) => fields,
             Err(error) => {
                 errors.push(funding_arb_exchange_history_source_error_json(
-                    &leg.venue_family,
-                    source,
+                    &spec.leg.venue_family,
+                    spec.source,
                     &error.to_string(),
                 ));
                 continue;
             }
         };
-        match funding_arb_exchange_pnl_row_in_range(&fields, window.start_ms, window.end_ms) {
+        match funding_arb_exchange_pnl_row_in_range(
+            &fields,
+            spec.window.start_ms,
+            spec.window.end_ms,
+        ) {
             Ok(true) => {
-                match funding_arb_exchange_history_record_json(leg, source, record_type, row) {
+                if let Some(keep_row) = spec.keep_row {
+                    match keep_row(row) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            errors.push(funding_arb_exchange_history_source_error_json(
+                                &spec.leg.venue_family,
+                                spec.source,
+                                &error.to_string(),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                match funding_arb_exchange_history_record_json(
+                    spec.leg,
+                    spec.source,
+                    spec.record_type,
+                    row,
+                ) {
                     Ok(record) => records.push(record),
                     Err(error) => errors.push(funding_arb_exchange_history_source_error_json(
-                        &leg.venue_family,
-                        source,
+                        &spec.leg.venue_family,
+                        spec.source,
                         &error.to_string(),
                     )),
                 }
             }
             Ok(false) => {}
             Err(error) => errors.push(funding_arb_exchange_history_source_error_json(
-                &leg.venue_family,
-                source,
+                &spec.leg.venue_family,
+                spec.source,
                 &error.to_string(),
             )),
         }
     }
+}
+
+#[cfg(feature = "live-exec")]
+fn funding_arb_exchange_history_row_is_not_funding(row: &str) -> RuntimeResult<bool> {
+    funding_arb_exchange_history_row_is_funding(row).map(|is_funding| !is_funding)
 }
 
 #[cfg(feature = "live-exec")]
@@ -33611,14 +33712,17 @@ fn funding_arb_exchange_history_fetch_bybit(
         )?;
         fetch_signed_bybit_get_with_curl(BYBIT_REST_BASE_URL, "/v5/execution/list", &signed)
     })();
-    funding_arb_exchange_history_capture_payload(
+    funding_arb_exchange_history_capture_payload_with_spec(
         &mut records,
         &mut errors,
-        leg,
-        "bybit /v5/execution/list",
-        "execution",
         execution_payload,
-        window,
+        FundingArbExchangeHistoryCaptureSpec {
+            leg,
+            source: "bybit /v5/execution/list",
+            record_type: "execution",
+            window,
+            keep_row: Some(funding_arb_exchange_history_row_is_not_funding),
+        },
     );
 
     let settlement_limit = limit.min(100);
@@ -61135,6 +61239,37 @@ mod tests {
                 "venue {venue} should normalize fee {fee_value} as a negative cost: {record}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "live-exec")]
+    fn funding_arb_exchange_history_bybit_execution_filter_skips_funding_rows() {
+        let leg = funding_arb_exchange_history_leg("bybit").expect("bybit history leg");
+        let payload = r#"{"retCode":0,"result":{"list":[{"symbol":"LABUSDT","execType":"Funding","execFee":"0.011902","execPrice":"12.99292","execQty":"3","execTime":"1779978266000","execId":"funding-1"},{"symbol":"IWMUSDT","execType":"Trade","execFee":"0.0023909","execPrice":"284.63","execQty":"0.03","execTime":"1779978276000","execId":"trade-1"}]}}"#;
+        let mut records = Vec::new();
+        let mut errors = Vec::new();
+
+        funding_arb_exchange_history_capture_payload_with_spec(
+            &mut records,
+            &mut errors,
+            Ok(payload.to_owned()),
+            FundingArbExchangeHistoryCaptureSpec {
+                leg: &leg,
+                source: "bybit /v5/execution/list",
+                record_type: "execution",
+                window: FundingArbExchangeHistoryWindow {
+                    start_ms: 1779978260000,
+                    end_ms: 1779978280000,
+                },
+                keep_row: Some(funding_arb_exchange_history_row_is_not_funding),
+            },
+        );
+
+        assert!(errors.is_empty(), "unexpected filter errors: {errors:?}");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].contains("\"tradeId\":\"trade-1\""));
+        assert!(records[0].contains("\"feeUsd\":-0.0023909"));
+        assert!(!records[0].contains("funding-1"));
     }
 
     #[test]
