@@ -6238,6 +6238,19 @@ fn public_wss_quote_timestamps_are_current(
         && public_wss_timestamp_string_is_current(&quote.ingested_at, now)
 }
 
+fn public_wss_symbol_scope_is_broad<A>(symbol_scope: &str, is_all_scope: A) -> bool
+where
+    A: Fn(&str) -> bool,
+{
+    is_all_scope(symbol_scope)
+        || symbol_scope
+            .split(',')
+            .map(str::trim)
+            .filter(|symbol| !symbol.is_empty())
+            .count()
+            > PUBLIC_WSS_BROAD_EXPLICIT_SYMBOL_SCOPE_MIN_SYMBOLS
+}
+
 fn public_wss_timestamp_string_is_current(value: &str, now: UtcTimestamp) -> bool {
     let Ok(timestamp) = UtcTimestamp::from_str(value) else {
         return false;
@@ -6505,7 +6518,9 @@ impl PublicTopOfBookMonitorSnapshot {
             return None;
         }
         let stale_ratio_bps = public_wss_row_ratio_bps(stale_row_count, self.total_rows);
-        if stale_ratio_bps >= PUBLIC_WSS_DEGRADED_STALE_ROW_RATIO_BPS {
+        if stale_ratio_bps >= PUBLIC_WSS_DEGRADED_STALE_ROW_RATIO_BPS
+            && !self.allows_sparse_all_market_stale_rows()
+        {
             return Some(format!(
                 "stale_wss_row_ratio_bps={stale_ratio_bps}; current_usable_row_count={current_usable_count}; stale_row_count={stale_row_count}; unusable_row_count={unusable_row_count}; total_rows={}",
                 self.total_rows
@@ -6521,6 +6536,12 @@ impl PublicTopOfBookMonitorSnapshot {
             ));
         }
         None
+    }
+
+    fn allows_sparse_all_market_stale_rows(&self) -> bool {
+        self.market == AsterPublicWssMarket::UsdtFutures.as_str()
+            && self.stream_url == format!("{ASTER_PUBLIC_WSS_BASE_URL}/ws/!bookTicker")
+            && public_wss_symbol_scope_is_broad(&self.symbol, is_aster_wss_all_symbols_scope)
     }
 
     fn has_current_usable_wss_quote(&self, now: UtcTimestamp) -> bool {
@@ -7145,6 +7166,56 @@ mod tests {
         assert!(status.contains("\"current_usable_row_count\":1"));
         assert!(status.contains("\"stale_row_count\":3"));
         assert!(status.contains("stale_wss_row_ratio_bps=7500"));
+    }
+
+    #[test]
+    fn public_wss_monitor_keeps_aster_broad_all_market_streaming_with_sparse_stale_rows() {
+        let now = current_utc_timestamp().expect("now");
+        let current_at = now.to_string();
+        let symbols = (0..=PUBLIC_WSS_BROAD_EXPLICIT_SYMBOL_SCOPE_MIN_SYMBOLS)
+            .map(|index| format!("T{index:03}USDT"))
+            .collect::<Vec<_>>();
+        let mut snapshot = PublicTopOfBookMonitorSnapshot::empty_with_market(
+            &symbols.join(","),
+            AsterPublicWssMarket::UsdtFutures.as_str(),
+            &format!("{ASTER_PUBLIC_WSS_BASE_URL}/ws/!bookTicker"),
+        );
+        for (index, symbol) in symbols.iter().enumerate() {
+            let ingested_at = if index == 0 {
+                current_at.as_str()
+            } else {
+                "2000-01-01T00:00:00Z"
+            };
+            let quote = PublicTopOfBookQuoteSnapshot {
+                symbol: symbol.to_owned(),
+                venue_id: "venue:ASTER-USDT-FUTURES".to_owned(),
+                instrument_id: format!("inst:ASTER:{symbol}:USDT-FUTURES"),
+                best_bid: Some("100.01".to_owned()),
+                best_ask: Some("100.02".to_owned()),
+                bid_size: Some("1.2".to_owned()),
+                ask_size: Some("1.3".to_owned()),
+                source_sequence: Some("42".to_owned()),
+                source_event_id: Some(format!("aster:wss-book-ticker:usdt-futures:{symbol}:42")),
+                observed_at: ingested_at.to_owned(),
+                ingested_at: ingested_at.to_owned(),
+                freshness_status: "Fresh".to_owned(),
+            };
+            if index == 0 {
+                snapshot.latest_quote = Some(quote.clone());
+            }
+            snapshot.upsert_quote_row(quote);
+        }
+        snapshot.status = "streaming".to_owned();
+        snapshot.updated_at = current_at;
+        snapshot.wss_update_count = symbols.len() as u64;
+
+        let status = snapshot.to_json();
+
+        assert_eq!(snapshot.availability_status(Some(now)), "streaming");
+        assert_eq!(snapshot.health_http_status(), 200);
+        assert!(status.contains("\"current_usable_row_count\":1"));
+        assert!(status.contains(&format!("\"stale_row_count\":{}", symbols.len() - 1)));
+        assert!(status.contains("\"degraded_reason\":null"));
     }
 
     #[test]
